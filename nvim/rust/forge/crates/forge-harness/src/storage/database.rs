@@ -23,7 +23,7 @@ pub(crate) struct HistoryConnection {
 
 impl HistoryConnection {
     /// Open only this executable's history version, leaving older hosts undisturbed.
-    pub(crate) fn open(root: &Path) -> Result<Self, DatabaseError> {
+    pub(in crate::storage) fn open(root: &Path) -> Result<Self, DatabaseError> {
         let lease = super::state::StateLease::open(root).map_err(DatabaseError::Initialization)?;
         let directory = super::state::directory(root);
         let _bootstrap = super::schema::bootstrap_lock(&directory, "harness")
@@ -57,7 +57,7 @@ impl HistoryConnection {
     }
 
     /// Read current history without admitting schema writes.
-    pub(crate) fn read_only(root: &Path) -> Result<Self, DatabaseError> {
+    pub(in crate::storage) fn read_only(root: &Path) -> Result<Self, DatabaseError> {
         let lease = super::state::StateLease::open(root).map_err(DatabaseError::Initialization)?;
         let connection = connection_open(root, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         if super::schema::validate(&connection).map_err(DatabaseError::Initialization)?
@@ -93,24 +93,14 @@ impl DerefMut for HistoryConnection {
 /// Wait this long for a competing SQLite writer before reporting contention.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(test)]
-thread_local! {
-    static BUSY_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
-fn busy_timeout() -> Duration {
-    #[cfg(test)]
-    if let Some(timeout) = BUSY_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
-        return timeout;
-    }
-    BUSY_TIMEOUT
-}
-
 /// Apply one contention and durability policy to every history handle.
 fn connection_open(root: &Path, flags: OpenFlags) -> Result<Connection, rusqlite::Error> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the one place a history connection is opened"
+    )]
     let connection = Connection::open_with_flags(super::state::database(root), flags)?;
-    connection.busy_timeout(busy_timeout())?;
+    connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)

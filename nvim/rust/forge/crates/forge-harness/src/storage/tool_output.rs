@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, params};
 use serde_json::Value;
 
 use super::SqliteStore;
@@ -95,6 +95,60 @@ pub(super) fn initialize_positions(connection: &Connection) -> Result<()> {
         FOREIGN KEY(exchange_id,turn_id,tool_id) REFERENCES tool_output_owner(exchange_id,turn_id,tool_id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS tool_output_character_order ON tool_output_position(exchange_id,turn_id,tool_id,char_offset);")?;
     Ok(())
+}
+
+/// Carry one shown tool-output append to the writer thread.
+struct ToolOutputAppend {
+    exchange_id: String,
+    turn_id: String,
+    tool_id: String,
+    delta: String,
+    /// Bytes of output that precede the delta.
+    offset: usize,
+    /// Summary of the whole output after the delta.
+    bytes: usize,
+    characters: usize,
+    digest: String,
+}
+
+impl ToolOutputAppend {
+    /// Append the delta only where it continues the saved output.
+    fn save(&self, connection: &Connection) -> Result<()> {
+        let (persisted, characters): (i64, i64) = connection
+            .query_row(
+                "SELECT bytes,characters FROM tool_output_summary WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
+                params![self.exchange_id, self.turn_id, self.tool_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("tool output append has no saved output to extend")?;
+        let persisted = usize::try_from(persisted).context("invalid stored byte count")?;
+        let characters = usize::try_from(characters).context("invalid stored character count")?;
+        ensure!(
+            persisted == self.offset,
+            "tool output append does not follow the committed byte offset"
+        );
+        append_chunks(
+            connection,
+            &self.exchange_id,
+            &self.turn_id,
+            &self.tool_id,
+            &self.delta,
+            self.offset,
+            characters,
+        )?;
+        connection.execute(
+            "UPDATE tool_output_summary SET bytes=?4,characters=?5,digest=?6 WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
+            params![
+                self.exchange_id,
+                self.turn_id,
+                self.tool_id,
+                self.bytes as i64,
+                self.characters as i64,
+                self.digest
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn append_chunks(
@@ -329,8 +383,10 @@ impl SqliteStore {
         })
     }
 
-    pub(crate) fn save_tool_output_delta(
-        &mut self,
+    /// Queue one tool-output append whose text is already shown. The writer thread checks
+    /// that the append follows the saved byte offset, so the saved output stays a prefix.
+    pub(crate) fn save_tool_output_delta_behind(
+        &self,
         exchange: &Exchange,
         event: &crate::provider::ProviderEvent,
     ) -> Result<()> {
@@ -360,44 +416,32 @@ impl SqliteStore {
             .tools_for_turn(turn.id())
             .find(|tool| tool.id == item_id.as_str())
             .context("tool output call is missing")?;
-        let admitted: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tool_output_owner WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3)",
-            params![exchange.id,turn.id(),tool.id], |row| row.get(0))?;
-        if !admitted {
-            return self.save_exchange(exchange);
-        }
         let offset = tool
             .output
             .len()
             .checked_sub(delta.len())
             .context("tool delta exceeds output")?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (persisted,characters): (i64,i64) = transaction.query_row("SELECT bytes,characters FROM tool_output_summary WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",params![exchange.id,turn.id(),tool.id],|row|Ok((row.get(0)?,row.get(1)?)))?;
-        let persisted = usize::try_from(persisted).context("invalid stored byte count")?;
-        let characters = usize::try_from(characters).context("invalid stored character count")?;
-        ensure!(
-            persisted == offset,
-            "tool output append does not follow the committed byte offset"
-        );
-        append_chunks(
-            &transaction,
-            &exchange.id,
-            turn.id(),
-            &tool.id,
-            delta,
+        let owner = (exchange.id.clone(), turn.id().to_owned(), tool.id.clone());
+        // The first append of a call saves the whole exchange, which creates the call's
+        // output rows; later appends then extend them.
+        if self.appended_tool_output.borrow_mut().insert(owner) {
+            return self.save_exchange_behind(exchange);
+        }
+        let append = ToolOutputAppend {
+            exchange_id: exchange.id.clone(),
+            turn_id: turn.id().to_owned(),
+            tool_id: tool.id.clone(),
+            delta: delta.clone(),
             offset,
-            characters,
+            bytes: tool.output.len(),
+            characters: tool.output.characters(),
+            digest: tool.output.digest().to_owned(),
+        };
+        let ticket = self.connection.writer(&self.data_root)?.enqueue(
+            super::writer::WriteScope::Session(exchange.session_id.clone()),
+            move |transaction| append.save(transaction),
         )?;
-        save_summary(
-            &transaction,
-            &exchange.id,
-            turn.id(),
-            &tool.id,
-            &tool.output,
-        )?;
-        transaction.commit()?;
+        self.connection.retain(ticket);
         Ok(())
     }
 

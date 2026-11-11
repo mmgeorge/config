@@ -52,6 +52,32 @@ local function ensure_language()
   return false
 end
 
+---@type string|false|nil
+local transcript_highlights
+
+--- Returns the installed Markdown highlight query without its `conceal_lines` directives.
+--- A highlighter whose query hides whole lines parses every visible row synchronously inside each
+--- buffer edit, so transcript edits would wait on Tree-sitter. render-markdown hides fence rows.
+---@return string? query Query text, or nil when the installed query cannot be read.
+local function transcript_highlight_query()
+  if transcript_highlights ~= nil then return transcript_highlights or nil end
+  local part_list = {}
+  for _, path in ipairs(vim.treesitter.query.get_files("markdown", "highlights")) do
+    local file = io.open(path, "r")
+    if file then
+      part_list[#part_list + 1] = file:read("*a")
+      file:close()
+    end
+  end
+  local text = table.concat(part_list, "\n")
+  if text == "" then
+    transcript_highlights = false
+    return nil
+  end
+  transcript_highlights = text:gsub('%(#set!%s+conceal_lines%s+""%)', "")
+  return transcript_highlights
+end
+
 --- Tests whether a zero-based row index is enclosed by any range in the list.
 ---@param row integer Zero-based row index.
 ---@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
@@ -276,7 +302,8 @@ function M.render(buf, win, range_list)
       return
     end
     local highlight_ok, highlight_error = pcall(perf.trace, "harness", "ui.markdown.highlight", { buf = buf }, function()
-      vim.treesitter.start(buf, "markdown")
+      local query = transcript_highlight_query()
+      vim.treesitter.highlighter.new(parser, query and { queries = { markdown = query } } or nil)
     end)
     if not highlight_ok then
       if not failed then

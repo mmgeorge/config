@@ -8,7 +8,7 @@ use crate::plan::PlanElicitation;
 const REVIEW_ELICITATION_PATH: &str = "$.review.elicitation";
 
 pub(super) fn preserve_answers(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     table: &str,
     id: &str,
     encoded: String,

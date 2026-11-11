@@ -575,6 +575,27 @@ impl ExchangeDriver {
         }
     }
 
+    /// Fence the session once a write-behind save for it failed.
+    ///
+    /// Content already shown was not saved, so no later command can certify its outcome.
+    pub(super) fn history_failure_apply(&mut self, env: &DriverEnv, step: u64) {
+        if self.commands.storage_unavailable() {
+            return;
+        }
+        let scope = crate::storage::writer::WriteScope::Session(env.session_id.clone());
+        let Some(failure) = env.services.history.failure(&scope) else {
+            return;
+        };
+        env.trace.record(
+            &env.session_id,
+            "exchange.storage.write_behind_failed",
+            serde_json::json!({"update_step":step,"reason":failure.to_string()}),
+        );
+        self.commands
+            .retention_failed(&env.trace, &env.session_id, step);
+        env.services.execution.close();
+    }
+
     /// Stop admitting work after owner storage fails, and fail the work it can no longer commit.
     ///
     /// The active command loses its observation, the active turn is collected as failed, queued

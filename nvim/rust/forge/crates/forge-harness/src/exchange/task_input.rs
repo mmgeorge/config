@@ -84,7 +84,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                 .filter(|(_, input)| input.delivery == TaskInputDelivery::Pending)
             {
                 if continuation.work.is_checks()
-                    || !crate::storage::SqliteStore::read_only(&services.root)?
+                    || !crate::storage::HistoryReader::current(&services.root)?
                         .continuation_source_complete(services.observer.session_id(), &turn.id)?
                 {
                     return Ok(PreparedProduction::Idle);
@@ -153,7 +153,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
             Ok(TaskInputProduction::Updated(updates))
         }
         PreparedProduction::Cancel { permit, input } => {
-            let mut store = crate::storage::SqliteStore::open(&services.root)
+            let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)
                 .map_err(InputOfferError::Queue)?;
             let elapsed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

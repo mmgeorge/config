@@ -10,7 +10,7 @@ pub(crate) fn is_current(
     target: &InputSubmissionTarget,
     allow_started: bool,
 ) -> anyhow::Result<bool> {
-    let store = crate::storage::SqliteStore::read_only(root)?;
+    let store = crate::storage::HistoryReader::current(root)?;
     let valid =
         |questions: &crate::plan::PlanElicitation, set: &str, revision: u32, question: &str| {
             questions.question_set.id == set

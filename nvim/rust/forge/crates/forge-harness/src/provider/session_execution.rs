@@ -40,6 +40,48 @@ pub enum OwnerObservation {
     },
 }
 impl OwnerObservation {
+    /// Append `following` to this observation when both are adjacent output for one native item.
+    ///
+    /// Output deltas queue faster than the owner publishes them while a publication is in
+    /// flight. Merging neighbours there keeps the owner's work proportional to the publication
+    /// rate. The merged observation takes the later publication position.
+    pub fn coalesce_output(&mut self, following: &OwnerObservation) -> bool {
+        let (
+            Self::Event(super::HarnessEvent::Native {
+                source,
+                scope,
+                event,
+            }),
+            Self::Event(super::HarnessEvent::Native {
+                source: following_source,
+                scope: following_scope,
+                event: following_event,
+            }),
+        ) = (self, following)
+        else {
+            return false;
+        };
+        if source.binding_id != following_source.binding_id
+            || scope != following_scope
+            || !event.coalesce_output(following_event)
+        {
+            return false;
+        }
+        source.sequence = following_source.sequence;
+        true
+    }
+
+    /// Queue `observation`, merging it into the last queued output delta where it continues it.
+    pub fn retain_in(queue: &mut std::collections::VecDeque<Self>, observation: Self) {
+        if queue
+            .back_mut()
+            .is_some_and(|last| last.coalesce_output(&observation))
+        {
+            return;
+        }
+        queue.push_back(observation);
+    }
+
     /// Get the immutable owner captured before input dispatch or event publication.
     pub fn scope(&self) -> super::EventScope {
         match self {

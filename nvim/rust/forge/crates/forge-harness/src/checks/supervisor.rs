@@ -201,7 +201,7 @@ impl CheckSupervisor {
         &self,
         exchange_id: &str,
     ) -> Result<crate::timeline::TimelineOwner> {
-        crate::storage::SqliteStore::open(&self.data_root)?
+        crate::storage::writer::HistoryWriter::lease_for(&self.data_root)?
             .capture_timeline_owner(&self.session_id, exchange_id)
     }
 
@@ -210,7 +210,8 @@ impl CheckSupervisor {
             run.owner.session_id() == self.session_id,
             "check ownership crosses sessions"
         );
-        crate::storage::SqliteStore::open(&self.data_root)?.validate_timeline_owner(&run.owner)
+        crate::storage::writer::HistoryWriter::lease_for(&self.data_root)?
+            .validate_timeline_owner(&run.owner)
     }
 
     /// Reopens current-format history and marks detached execution interrupted without replaying commands.

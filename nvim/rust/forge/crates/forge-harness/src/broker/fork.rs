@@ -6,7 +6,6 @@ use crate::provider::{
 use crate::session::{
     HarnessSession, ProviderForkPoint, ProviderForkState, SessionPurpose, SessionStore,
 };
-use crate::storage::SqliteStore;
 use crate::timeline::{
     SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjection, TimelineProjector,
 };
@@ -38,7 +37,7 @@ pub fn prepare_provider_fork(
 ) -> Result<ForkPreparation> {
     let fork_started = Instant::now();
     let persistence_started = Instant::now();
-    let mut store = SqliteStore::open(data_root)?;
+    let mut store = crate::storage::writer::HistoryWriter::lease_for(data_root)?;
     let source_session_id = params
         .get("session_id")
         .and_then(Value::as_str)

@@ -2395,6 +2395,10 @@ impl HarnessBroker {
         let startup_started = std::time::Instant::now();
         let mut startup_timing = std::collections::BTreeMap::new();
         let data_root = PathBuf::from(&request.data_root);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the broker owns its store for the session's lifetime and orders it behind the writer through `OrderedConnection`"
+        )]
         let mut store = SqliteStore::open(&data_root)?;
         startup_timing.insert(
             "database_open_ms",
@@ -4935,7 +4939,11 @@ impl HarnessBroker {
                 ) =>
             {
                 self.store
-                    .save_tool_output_delta(&runtime.exchange, event)?
+                    .save_tool_output_delta_behind(&runtime.exchange, event)?
+            }
+            // Streamed text is shown before it is saved; the writer thread saves it.
+            HarnessEvent::Native { event, .. } if event.is_output_delta() => {
+                self.store.save_exchange_behind(&runtime.exchange)?
             }
             HarnessEvent::Native { .. } | HarnessEvent::Host { .. } => {
                 self.store.save_exchange(&runtime.exchange)?
@@ -8144,9 +8152,13 @@ impl HarnessBroker {
                 {
                     wakeup.notify_one();
                 }
-                let payload = publication::encode_session_update(&update)?;
-                self.trace
-                    .record(&self.session.id, "lua.event.emitted", payload.clone());
+                if self.trace.is_enabled() {
+                    self.trace.record(
+                        &self.session.id,
+                        "lua.event.emitted",
+                        publication::encode_session_update(&update)?,
+                    );
+                }
                 if self.event_sink.is_none() {
                     events.push(publication::encode_session_event(
                         &self.session.id,
@@ -8858,7 +8870,12 @@ impl HarnessBroker {
                     }
                 ) =>
             {
-                self.store.save_tool_output_delta(interaction, event)?
+                self.store
+                    .save_tool_output_delta_behind(interaction, event)?
+            }
+            // Streamed text is shown before it is saved; the writer thread saves it.
+            HarnessEvent::Native { event, .. } if event.is_output_delta() => {
+                self.store.save_exchange_behind(interaction)?
             }
             HarnessEvent::Native { .. } | HarnessEvent::Host { .. } => {
                 self.store.save_exchange(interaction)?
@@ -9018,7 +9035,7 @@ impl HarnessBroker {
                             ),
                     },
                 ..
-            } => self.store.save_tool_output_delta(&owner, event)?,
+            } => self.store.save_tool_output_delta_behind(&owner, event)?,
             ProviderEvent::Provider { .. }
             | ProviderEvent::Thread { .. }
             | ProviderEvent::Turn { .. }

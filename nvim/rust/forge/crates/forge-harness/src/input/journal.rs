@@ -4,16 +4,17 @@ use rusqlite::{OptionalExtension, params};
 
 /// Persist active input separately from immutable idempotency receipts.
 pub(super) struct InputJournal {
-    connection: crate::storage::database::HistoryConnection,
+    /// The state root's history writer; every queue statement runs on its connection.
+    writer: crate::storage::writer::HistoryWriter,
     session_id: String,
 }
 
 impl InputJournal {
     /// Delete this owner's active queue and every idempotency record atomically.
     pub(super) fn delete(&mut self) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut connection = self.writer.connection()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for table in [
             "input_session",
             "input_operation",
@@ -31,17 +32,17 @@ impl InputJournal {
 
     /// Open the queue journal using the same durable SQLite policy as provider submissions.
     pub(super) fn open(root: &std::path::Path, session_id: &str) -> Result<Self> {
-        let connection = crate::storage::database::HistoryConnection::open(root)?;
+        let writer = crate::storage::writer::HistoryWriter::for_root(root)?;
         Ok(Self {
-            connection,
+            writer,
             session_id: session_id.into(),
         })
     }
 
     /// Load active queue metadata and durable duplicate-detection records for one owner.
     pub(super) fn load(&self) -> Result<(InputState, bool)> {
-        let snapshot: Option<String> = self
-            .connection
+        let connection = self.writer.connection()?;
+        let snapshot: Option<String> = connection
             .query_row(
                 "SELECT payload FROM input_session WHERE session_id=?1",
                 [&self.session_id],
@@ -56,8 +57,7 @@ impl InputJournal {
                 .unwrap_or_default(),
             ..Default::default()
         };
-        let mut query = self
-            .connection
+        let mut query = connection
             .prepare("SELECT id,request,payload FROM input_operation WHERE session_id=?1")?;
         for row in query.query_map([&self.session_id], |row| {
             Ok((
@@ -81,9 +81,7 @@ impl InputJournal {
             );
             state.operation.insert(id, (request, receipt));
         }
-        let mut query = self
-            .connection
-            .prepare("SELECT id FROM input_submitted WHERE session_id=?1")?;
+        let mut query = connection.prepare("SELECT id FROM input_submitted WHERE session_id=?1")?;
         for id in query.query_map([&self.session_id], |row| row.get::<_, String>(0))? {
             let id = id?;
             ensure!(!id.is_empty(), "input message identity is corrupt");
@@ -124,10 +122,10 @@ impl InputJournal {
 
     /// Commit only active state and newly admitted receipts, never rewrite historical receipts.
     pub(super) fn save(&mut self, previous: &InputState, next: &InputState) -> Result<()> {
+        let mut connection = self.writer.connection()?;
         let snapshot = serde_json::to_string(&next.snapshot)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         transaction.execute("INSERT INTO input_session(session_id,payload) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",params![self.session_id,snapshot])?;
         for (id, (request, outcome)) in &next.operation {
             if !previous.operation.contains_key(id) {

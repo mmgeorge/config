@@ -71,7 +71,7 @@ fn commit_configuration(
                         ConfigurationRejection::CheckTaskChanged,
                     ));
                 }
-                let session = crate::storage::SqliteStore::read_only(&services.root)
+                let session = crate::storage::HistoryReader::current(&services.root)
                     .map_err(ConfigurationCommitError::Session)?
                     .load_session(services.observer.session_id())
                     .map_err(ConfigurationCommitError::Session)?
@@ -133,7 +133,7 @@ fn commit_configuration(
                     configuration: Box::new(configuration),
                 });
             }
-            let session = crate::storage::SqliteStore::read_only(&services.root)
+            let session = crate::storage::HistoryReader::current(&services.root)
                 .map_err(ConfigurationCommitError::Session)?
                 .load_session(services.observer.session_id())
                 .map_err(ConfigurationCommitError::Session)?
@@ -176,7 +176,7 @@ fn commit_configuration(
             })
         }
         ConfigurationChange::InputTimeouts(patch) => {
-            let session = crate::storage::SqliteStore::read_only(&services.root)
+            let session = crate::storage::HistoryReader::current(&services.root)
                 .map_err(ConfigurationCommitError::Session)?
                 .load_session(services.observer.session_id())
                 .map_err(ConfigurationCommitError::Session)?

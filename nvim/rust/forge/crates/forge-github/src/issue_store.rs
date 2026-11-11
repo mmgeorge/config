@@ -258,6 +258,11 @@ fn open_database_observing_lock_waits(
                     && Instant::now().duration_since(started) < timeout =>
             {
                 on_lock_wait();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the issue store opens on a dedicated blocking thread and has no \
+                              signal for another process releasing the database lock"
+                )]
                 thread::sleep(
                     Duration::from_millis(DB_LOCK_RETRY_MS)
                         .min(timeout.saturating_sub(started.elapsed())),

@@ -2348,20 +2348,24 @@ impl Driver {
                 .await;
                 return;
             }
-            let core = crate::exchange::core_log::CoreRecord::provider_event_metadata(
-                binding.clone(),
-                *sequence,
-                scope.clone(),
-                provider_event,
-            );
-            if let Err(error) = self.provider.record_core_event(&self.owner, &core) {
-                self.refuse_native_event(
-                    native.as_ref(),
-                    ObservationFailure::LifecycleUnavailable,
-                    FailureOrigin::Error(error),
-                )
-                .await;
-                return;
+            // Output deltas arrive at stream rate and carry no lifecycle decision, so the core
+            // log records every other native event and leaves deltas to the exchange text.
+            if !provider_event.is_output_delta() {
+                let core = crate::exchange::core_log::CoreRecord::provider_event_metadata(
+                    binding.clone(),
+                    *sequence,
+                    scope.clone(),
+                    provider_event,
+                );
+                if let Err(error) = self.provider.record_core_event(&self.owner, &core) {
+                    self.refuse_native_event(
+                        native.as_ref(),
+                        ObservationFailure::LifecycleUnavailable,
+                        FailureOrigin::Error(error),
+                    )
+                    .await;
+                    return;
+                }
             }
         }
         // Identity reducers consult consumed binding metadata; publish only after that metadata advances.

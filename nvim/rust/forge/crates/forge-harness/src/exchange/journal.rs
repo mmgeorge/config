@@ -104,7 +104,8 @@ pub(crate) enum CommandJournalError {
 
 /// Own the session's admission journal; domain commits can use the same SQL tables.
 pub(crate) struct CommandJournal {
-    connection: crate::storage::database::HistoryConnection,
+    /// The state root's history writer; every journal statement runs on its connection.
+    writer: crate::storage::writer::HistoryWriter,
     session: String,
 }
 
@@ -114,18 +115,27 @@ impl CommandJournal {
         if session.trim().is_empty() {
             return Err(CommandJournalError::InvalidSession);
         }
-        let connection = crate::storage::database::HistoryConnection::open(root)?;
+        let writer = crate::storage::writer::HistoryWriter::for_root(root)
+            .map_err(crate::storage::database::DatabaseError::Initialization)?;
         Ok(Self {
-            connection,
+            writer,
             session: session.into(),
         })
+    }
+
+    /// Borrow the history writer's connection for one journal operation.
+    fn history(&self) -> Result<crate::storage::writer::ConnectionLease, CommandJournalError> {
+        Ok(self
+            .writer
+            .connection()
+            .map_err(crate::storage::database::DatabaseError::Initialization)?)
     }
 
     /// Open metadata-only ownership with foreign-key enforcement against concurrent session deletion.
     pub(crate) fn open_metadata(root: &Path, session: &str) -> Result<Self, CommandJournalError> {
         let journal = Self::open(root, session)?;
         journal
-            .connection
+            .history()?
             .pragma_update(None, "foreign_keys", "ON")?;
         Ok(journal)
     }
@@ -133,17 +143,23 @@ impl CommandJournal {
     /// Append required lifecycle evidence through this owner's existing durable connection.
     /// Failure is observable by the owner; no optional trace queue or filesystem writer is involved.
     pub(crate) fn append_core(&mut self, record: &CoreRecord) -> Result<u64, CommandJournalError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence = append_core_record(&transaction, &self.session, record)?;
-        transaction.commit()?;
-        Ok(sequence)
+        let session = self.session.clone();
+        let record = record.clone();
+        // The record joins whatever batch the writer commits next, so a burst of lifecycle
+        // events shares one sync. The caller still waits for that commit.
+        self.writer
+            .commit(move |transaction| Ok(append_core_record(transaction, &session, &record)?))
+            .map_err(|error| {
+                error
+                    .downcast::<CommandJournalError>()
+                    .unwrap_or(CommandJournalError::CoreUnavailable)
+            })
     }
 
     /// Check whether this owner has durable host history without allocating a hidden session.
     pub(crate) fn has_durable_session(&self) -> Result<bool, CommandJournalError> {
-        Ok(self.connection.query_row(
+        let connection = self.history()?;
+        Ok(connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM session_record WHERE id=?1)",
             [&self.session],
             |row| row.get(0),
@@ -152,9 +168,8 @@ impl CommandJournal {
 
     /// Recover unfinished intent as an explicit failure, never as implicit native replay.
     pub(crate) fn recover(&mut self) -> Result<(), CommandJournalError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.history()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let records = {
             let mut query = transaction.prepare(
                 "SELECT id,state,request FROM owner_command WHERE session_id=?1 AND json_extract(state,'$.state') IN ('queued','active') ORDER BY sequence",
@@ -233,7 +248,8 @@ impl CommandJournal {
         &self,
         id: &CommandId,
     ) -> Result<Option<CommandRecord>, CommandJournalError> {
-        read_record(&self.connection, &self.session, id.as_str())
+        let connection = self.history()?;
+        read_record(&connection, &self.session, id.as_str())
     }
 
     /// Find a failed creation checkpoint for this exact task input, including interruption on host restart.
@@ -241,11 +257,12 @@ impl CommandJournal {
         &self,
         input: &crate::task::TaskInputId,
     ) -> Result<Option<CommandRecord>, CommandJournalError> {
-        let id: Option<String> = self.connection.query_row(
+        let connection = self.history()?;
+        let id: Option<String> = connection.query_row(
             "SELECT id FROM owner_command WHERE session_id=?1 AND json_extract(state,'$.state')='finished' AND json_extract(state,'$.outcome.Err.failure')='task_synchronization' AND json_extract(state,'$.outcome.Err.reason.committed.stage')='input_pending' AND json_extract(state,'$.outcome.Err.reason.committed.input')=?2 ORDER BY sequence DESC LIMIT 1",
             params![self.session, input.as_str()], |row| row.get(0),
         ).optional()?;
-        id.map(|id| read_record(&self.connection, &self.session, &id))
+        id.map(|id| read_record(&connection, &self.session, &id))
             .transpose()
             .map(Option::flatten)
     }
@@ -255,9 +272,8 @@ impl CommandJournal {
         &mut self,
         request: &CommandRequest,
     ) -> Result<CommandRecord, CommandJournalError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.history()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(previous) = read_record(&transaction, &self.session, request.id.as_str())? {
             if serde_json::to_vec(&previous.request)? != serde_json::to_vec(request)? {
                 return Err(CommandJournalError::IdentityConflict);
@@ -297,6 +313,7 @@ impl CommandJournal {
         &mut self,
         record: &CommandRecord,
     ) -> Result<CommandRecord, CommandJournalError> {
+        let mut connection = self.history()?;
         if !matches!(record.state, CommandState::Queued { .. }) {
             return Err(CommandJournalError::NotActive);
         }
@@ -310,9 +327,7 @@ impl CommandJournal {
             revision,
             task_commit: None,
         };
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "UPDATE owner_command SET state=?3 WHERE session_id=?1 AND id=?2",
             params![
@@ -339,9 +354,8 @@ impl CommandJournal {
         id: &CommandId,
         outcome: Result<CommandOutcome, CommandFailure>,
     ) -> Result<CommandRecord, CommandJournalError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.history()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut record = read_record(&transaction, &self.session, id.as_str())?
             .ok_or(CommandJournalError::NotActive)?;
         if record.completion().is_some() {
@@ -759,7 +773,7 @@ fn finish_record(
 
 /// Append one safe core fact atomically with any domain mutation on this transaction.
 fn append_core_record(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Connection,
     session: &str,
     record: &CoreRecord,
 ) -> Result<u64, CommandJournalError> {
@@ -788,7 +802,8 @@ mod tests {
 
     /// Read only the metadata journal so assertions cannot accidentally inspect the command payload table.
     fn core_records(journal: &CommandJournal) -> anyhow::Result<Vec<(i64, String)>> {
-        let mut statement = journal.connection.prepare(
+        let connection = journal.history()?;
+        let mut statement = connection.prepare(
             "SELECT sequence,record FROM owner_core_log WHERE session_id=?1 ORDER BY sequence",
         )?;
         Ok(statement
@@ -805,15 +820,15 @@ mod tests {
         let mut journal = CommandJournal::open(root.path(), "session")?;
         let request = CommandRequest::from_input(operation())?;
         let reject = "CREATE TRIGGER reject_core BEFORE INSERT ON owner_core_log BEGIN SELECT RAISE(ABORT,'fixture core storage failure'); END;";
-        journal.connection.execute_batch(reject)?;
+        journal.history()?.execute_batch(reject)?;
         assert!(journal.admit(&request).is_err());
         assert!(journal.lookup(&request.id)?.is_none());
         assert!(core_records(&journal)?.is_empty());
         journal
-            .connection
+            .history()?
             .execute_batch("DROP TRIGGER reject_core")?;
         let queued = journal.admit(&request)?;
-        journal.connection.execute_batch(reject)?;
+        journal.history()?.execute_batch(reject)?;
         assert!(journal.start(&queued).is_err());
         assert!(matches!(
             journal.lookup(&request.id)?.unwrap().state,
@@ -821,10 +836,10 @@ mod tests {
         ));
         assert_eq!(core_records(&journal)?.len(), 1);
         journal
-            .connection
+            .history()?
             .execute_batch("DROP TRIGGER reject_core")?;
         journal.start(&queued)?;
-        journal.connection.execute_batch(reject)?;
+        journal.history()?.execute_batch(reject)?;
         assert!(
             journal
                 .finish(&request.id, Err(CommandFailure::Interrupted))
@@ -836,7 +851,7 @@ mod tests {
         ));
         assert_eq!(core_records(&journal)?.len(), 2);
         journal
-            .connection
+            .history()?
             .execute_batch("DROP TRIGGER reject_core")?;
         journal.finish(&request.id, Err(CommandFailure::Interrupted))?;
         assert_eq!(core_records(&journal)?.len(), 4);

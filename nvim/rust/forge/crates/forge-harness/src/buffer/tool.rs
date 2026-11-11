@@ -183,7 +183,7 @@ impl ToolOutputView {
 
     pub(super) fn load_prefix(&mut self, limit: usize) -> Result<()> {
         if let Some(mut source) = self.database.clone() {
-            let store = crate::storage::SqliteStore::read_only(&source.root)?;
+            let store = crate::storage::HistoryReader::current(&source.root)?;
             let wanted = (limit as u64).saturating_sub(source.loaded);
             if wanted == 0 {
                 return Ok(());

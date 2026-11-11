@@ -130,7 +130,7 @@ impl BrokerObserver {
             session_id != self.session_id,
             "cannot delete the active session"
         );
-        let mut store = SqliteStore::open(&self.data_root)?;
+        let mut store = crate::storage::writer::HistoryWriter::lease_for(&self.data_root)?;
         let session =
             super::SessionNotFound::require(store.load_session(&session_id)?, &session_id)?;
         store.delete_session_with(&session_id, || self.plan_file.delete_session(&session.id))?;
@@ -145,7 +145,7 @@ impl BrokerObserver {
         &self,
         params: Value,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut store = SqliteStore::open(&self.data_root)?;
+        let mut store = crate::storage::writer::HistoryWriter::lease_for(&self.data_root)?;
         let mut comment: ExchangeComment = serde_json::from_value(params)?;
         anyhow::ensure!(
             store
@@ -171,7 +171,7 @@ impl BrokerObserver {
             .get("baseline")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let plan = store
             .load_plan(&plan_id)?
             .context("plan artifact not found")?;
@@ -240,7 +240,7 @@ impl BrokerObserver {
 
     /// Persists conversation-scoped check editing without starting or interrupting a turn.
     pub(crate) fn set_check_editing(&self, enabled: bool) -> Result<Value> {
-        let session = SqliteStore::read_only(&self.data_root)?
+        let session = crate::storage::HistoryReader::current(&self.data_root)?
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
         let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
@@ -262,7 +262,7 @@ impl BrokerObserver {
     /// Reads current durable state together with the last published runtime metadata.
     pub(crate) fn snapshot(&self) -> Result<BrokerSnapshot> {
         let revision = self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1;
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         store.read_snapshot(|| {
             let session = store
                 .load_session(&self.session_id)?
@@ -587,7 +587,7 @@ impl BrokerObserver {
             RuntimeMethod::SessionDelete => self.delete_session(params)?.0,
             RuntimeMethod::SessionExchangeCommentSave => self.save_exchange_comment(params)?.0,
             RuntimeMethod::SessionExchangeRollbackPreview => {
-                let store = SqliteStore::read_only(&self.data_root)?;
+                let store = crate::storage::HistoryReader::current(&self.data_root)?;
                 let id = required_text(&params, "preview_id")?;
                 crate::checkpoint::RestorePreview::load(&store.objects, &self.session_id, &id)?
                     .summary(params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize)
@@ -611,7 +611,7 @@ impl BrokerObserver {
     /// Reads a submitted plan without selecting or resuming its owning task.
     pub(super) fn plan(&self, params: Value) -> Result<Value> {
         let plan_id = required_text(&params, "plan_id")?;
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let plan = store
             .load_plan(&plan_id)?
             .context("plan artifact not found")?;
@@ -646,7 +646,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn list_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let session = store
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
@@ -683,7 +683,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn preview_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let session_id = required_text(&params, "session_id")?;
         let preview_session =
             super::SessionNotFound::require(store.load_session(&session_id)?, &session_id)?;
@@ -734,7 +734,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn list_exchange_review(&self) -> Result<Vec<Exchange>> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let session = store
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
@@ -750,7 +750,7 @@ impl BrokerObserver {
         params: Value,
         now_ms: i64,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut store = SqliteStore::open(&self.data_root)?;
+        let mut store = crate::storage::writer::HistoryWriter::lease_for(&self.data_root)?;
         let draft: crate::attachment::PromptDraft = serde_json::from_value(params)?;
         store.record_prompt_history(&draft, now_ms)?;
         Ok((
@@ -781,7 +781,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn list_replanning_choices(&self) -> Result<(Value, Vec<SessionEvent>)> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let session = store
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
@@ -811,7 +811,7 @@ impl BrokerObserver {
         plan_id: &str,
         expected_digest: &str,
     ) -> Result<crate::plan::review_source::PlanReviewSource> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         anyhow::ensure!(
             !plan_id.is_empty() && plan_id.len() <= 256,
             "invalid plan identity"
@@ -848,7 +848,7 @@ impl BrokerObserver {
         plan_id: &str,
         revision: u32,
     ) -> Result<crate::plan::review_source::PlanReviewSource> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let plan = store
             .load_plan(plan_id)?
             .context("plan artifact not found")?;
@@ -868,7 +868,7 @@ impl BrokerObserver {
     }
 
     pub(super) fn execution_review(&self, plan_id: &str) -> Result<Option<String>> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let Some(execution) = store
             .list_plan_execution(&self.session_id)?
             .into_iter()

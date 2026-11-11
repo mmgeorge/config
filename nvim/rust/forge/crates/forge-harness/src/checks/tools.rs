@@ -750,7 +750,8 @@ impl CheckSupervisor {
             owner.session_id() == self.session_id,
             "check configuration crosses sessions"
         );
-        crate::storage::SqliteStore::open(&self.data_root)?.validate_timeline_owner(&owner)?;
+        crate::storage::writer::HistoryWriter::lease_for(&self.data_root)?
+            .validate_timeline_owner(&owner)?;
         ensure!(
             self.active()?.is_none(),
             "check setup cannot change an active run"

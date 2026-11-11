@@ -218,6 +218,9 @@ pub(super) fn registry(root: &Path) -> Result<Arc<AdmissionRegistry>> {
 
 impl AdmissionRegistry {
     fn bind(&self, store: &SqliteStore, session_id: &str) -> Result<Arc<SessionAdmission>> {
+        // The writer thread publishes admission after its commits. Wait for this handle's
+        // queued writes before taking a registry lock, or the two threads wait on each other.
+        store.settle_write_behind();
         let mut session = self
             .session
             .lock()
@@ -254,6 +257,9 @@ impl AdmissionRegistry {
         membership: Option<(&str, Option<bool>)>,
         refresh_membership: bool,
     ) -> Result<()> {
+        // The writer thread publishes admission after its commits. Wait for this handle's
+        // queued writes before taking a registry lock, or the two threads wait on each other.
+        store.settle_write_behind();
         let session = self
             .session
             .lock()

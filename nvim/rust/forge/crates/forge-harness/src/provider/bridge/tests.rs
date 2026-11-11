@@ -529,7 +529,7 @@ async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
     async {
         let root = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(root.path())?);
-        let database = rusqlite::Connection::open(crate::storage::state::database(root.path()))?;
+        let database = crate::storage::test::raw_connection(root.path())?;
         database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}'),('second-bridge-owner','workspace',1,'{}')", [])?;
         let native = BridgeFixtureProvider::new(false);
         let provider = Arc::new(bridge(root.path(), native.clone()).await?);

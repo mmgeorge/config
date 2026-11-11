@@ -59,6 +59,7 @@ pub(super) fn storage_failure(error: &anyhow::Error) -> bool {
         cause.is::<rusqlite::Error>()
             || cause.is::<std::io::Error>()
             || cause.is::<crate::storage::database::DatabaseError>()
+            || cause.is::<crate::storage::writer::WriteBehindFailure>()
             || cause.is::<super::journal::CommandJournalError>()
             || cause.is::<super::input_receipts::InputReceiptError>()
             || cause.is::<OwnerStorageUnavailable>()

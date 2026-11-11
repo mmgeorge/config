@@ -124,7 +124,7 @@ fn validate_new_effect(
             Err(QuestionEventError::ForeignScope)
         };
     };
-    let store = crate::storage::SqliteStore::read_only(&services.root)
+    let store = crate::storage::HistoryReader::current(&services.root)
         .map_err(QuestionEventError::State)?;
     let source = store
         .load_exchange(call.scope().exchange_id.as_str())

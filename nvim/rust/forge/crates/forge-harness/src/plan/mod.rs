@@ -1607,7 +1607,7 @@ impl PlanFileStore {
         }
         if crate::storage::state::database(&self.root).exists()
             && let Some(prior) =
-                crate::storage::SqliteStore::read_only(&self.root)?.load_plan(plan_id)?
+                crate::storage::HistoryReader::current(&self.root)?.load_plan(plan_id)?
         {
             self.require_reconciled_artifacts(session_id, plan_id)?;
             self.journal_revision_locked(
@@ -1683,7 +1683,7 @@ impl PlanFileStore {
         }
         self.require_reconciled_artifacts(session_id, &revision.document.plan_id)?;
         if crate::storage::state::database(&self.root).exists()
-            && let Some(prior) = crate::storage::SqliteStore::read_only(&self.root)?
+            && let Some(prior) = crate::storage::HistoryReader::current(&self.root)?
                 .load_plan(&revision.document.plan_id)?
         {
             measure(trace, "persist.journal_revision", || {

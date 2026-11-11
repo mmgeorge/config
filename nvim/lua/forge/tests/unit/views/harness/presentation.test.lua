@@ -727,12 +727,13 @@ T["publication"] = function()
   timer:start(0, 1, vim.schedule_wrap(function()
     observations = observations + 1
     local text = buffer.lines(transcript)
-    assert(#text == 1 and (text[1] == "frame 0" or text[1] == "frame 64"), "partial batch reached the main loop")
+    -- A backlog may yield between patches, but only at a complete revision.
+    assert(#text == 1 and text[1] == "frame " .. (owner.transcript.revision or 0), "a partial patch reached the main loop")
   end))
   local completed = vim.uv.hrtime()
   local initial_publications = publications
   requests[2].callback({ patch = patch })
-  eq(owner.transcript.revision, 64)
+  wait_until(function() return owner.transcript.revision == 64 end, "patch backlog did not reach its final revision")
   assert(publications == initial_publications + 1, "batch notified before its final revision")
   wait_until(function() return #requests == 3 end, "in-flight burst lost its trailing update")
   assert((requests[3].time - completed) / 1e6 >= 1000 / 60, "trailing publication exceeded the 60 Hz target")

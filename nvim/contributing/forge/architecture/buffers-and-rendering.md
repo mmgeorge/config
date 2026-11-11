@@ -16,6 +16,10 @@ An external buffer wipe revokes the replica, while an ordinary close removes its
 
 Updates validate source identities, ranges, and revisions before publication. `forge.cooperative` prepares large updates in slices of about four milliseconds or 1024 work units, keeping the committed frame visible and cursor movement available. Each resume checks the document owner, host generation, buffer validity, and changedtick. A completed update then publishes text, metadata, node ranges, and view restoration in one non-yielding callback.
 
+Three rules keep a publication's cost proportional to what changed. The host emits one text edit per changed block when a replacement keeps its block identities, so two distant changes never replace the rows between them. `apply_text_edits` diffs a multi-row edit against the buffer and writes only the differing row runs, because Neovim charges Tree-sitter and extmark bookkeeping for every replaced row. A sync that carries several patches commits each patch atomically and yields between them, so a backlog costs frames and a withdrawn backlog rests at the last complete revision.
+
+The transcript's Tree-sitter highlighter uses the installed Markdown highlight query with its `conceal_lines` directives removed (`render/harness/markdown.lua`). A highlighter whose query hides whole lines answers each visible row's concealment by parsing synchronously inside the buffer edit, which made every transcript edit wait on Tree-sitter. render-markdown hides fence rows itself.
+
 The writer captures every attached window's cursor and viewport immediately before that commit and restores them in the same commit, so movement during preparation is included, and no snapshot crosses an asynchronous boundary. In Visual or Select mode it also captures the anchor and restores both endpoints with their type and direction, clamping each independently, so a replacement cannot extend a selection into appended rows.
 
 The replica's `before_commit` and `after_commit` callbacks run at that same boundary. Harness uses them to save outgoing timeline views and align status spacing, without overriding cursor restoration.

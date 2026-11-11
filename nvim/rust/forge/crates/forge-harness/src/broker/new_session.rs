@@ -1,5 +1,4 @@
 use crate::session::{ApprovalMode, HarnessSession, ProviderForkState, SessionStore};
-use crate::storage::SqliteStore;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -15,7 +14,7 @@ pub fn prepare_new_session(
     params: &Value,
     now_ms: i64,
 ) -> Result<HarnessSession> {
-    let mut store = SqliteStore::open(data_root)?;
+    let mut store = crate::storage::writer::HistoryWriter::lease_for(data_root)?;
     let source = store
         .load_session(source_session_id)?
         .context("source session not found")?;

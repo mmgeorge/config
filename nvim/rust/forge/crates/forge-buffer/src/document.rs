@@ -502,6 +502,33 @@ impl BufferDocument {
         }))
     }
 
+    /// Replace the rows between the common leading and trailing rows of one contiguous span.
+    fn row_edit(
+        start_row: usize,
+        old_rows: &[&str],
+        new_rows: &[&str],
+    ) -> Result<Option<TextEdit>, ContractError> {
+        if old_rows == new_rows {
+            return Ok(None);
+        }
+        let prefix = old_rows
+            .iter()
+            .zip(new_rows)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = old_rows[prefix..]
+            .iter()
+            .rev()
+            .zip(new_rows[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        Ok(Some(TextEdit {
+            start_row: start_row + prefix,
+            removed_rows: old_rows.len() - prefix - suffix,
+            text: BufferText::from_rows(new_rows[prefix..new_rows.len() - suffix].iter())?,
+        }))
+    }
+
     fn prepare_edit(
         &self,
         range: Range<usize>,
@@ -530,25 +557,32 @@ impl BufferDocument {
             .iter()
             .flat_map(|block| block.text.wire_rows())
             .collect();
-        let prefix = old_rows
-            .iter()
-            .zip(&new_rows)
-            .take_while(|(old, new)| old == new)
-            .count();
-        let suffix = old_rows[prefix..]
-            .iter()
-            .rev()
-            .zip(new_rows[prefix..].iter().rev())
-            .take_while(|(old, new)| old == new)
-            .count();
-        let text_edit = if old_rows == new_rows {
-            Vec::new()
+        let aligned =
+            old.len() == block.len() && old.iter().zip(block).all(|(old, new)| old.id == new.id);
+        let text_edit = if aligned {
+            // Blocks keep their identities, so each changed block gets its own edit. One edit
+            // spanning the first to the last changed row would replace every unchanged row
+            // between two distant changes, and the editor pays for a replaced row as a change.
+            let mut block_start = start_row + old_rows.len();
+            let mut text_edit = Vec::new();
+            for (old, new) in old.iter().zip(block).rev() {
+                let old_block_rows = old.text.wire_rows();
+                block_start -= old_block_rows.len();
+                if old.text == new.text {
+                    continue;
+                }
+                let new_block_rows = new.text.wire_rows();
+                text_edit.extend(Self::row_edit(
+                    block_start,
+                    &old_block_rows,
+                    &new_block_rows,
+                )?);
+            }
+            text_edit
         } else {
-            vec![TextEdit {
-                start_row: start_row + prefix,
-                removed_rows: old_rows.len() - prefix - suffix,
-                text: BufferText::from_rows(new_rows[prefix..new_rows.len() - suffix].iter())?,
-            }]
+            Self::row_edit(start_row, &old_rows, &new_rows)?
+                .into_iter()
+                .collect()
         };
         let old_block: HashMap<_, _> = old.iter().map(|block| (&block.id, *block)).collect();
         let metadata_edit = block

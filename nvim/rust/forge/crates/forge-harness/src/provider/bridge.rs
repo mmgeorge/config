@@ -2636,6 +2636,7 @@ impl ProviderBridge {
     }
 
     /// Persist consumption metadata before publishing the native consumer's watermark.
+    /// Callers skip output deltas, whose only durable form is the exchange text.
     pub(crate) fn record_core_event(
         &self,
         owner: &ThreadOwner,

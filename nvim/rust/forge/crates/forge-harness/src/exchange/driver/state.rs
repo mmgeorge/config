@@ -32,6 +32,8 @@ pub(super) struct DriverState {
     pub(super) publication_delivery: PublicationDelivery,
     /// When the driver next retries opening publication storage.
     pub(super) publication_recovery_at: Option<tokio::time::Instant>,
+    /// Wakes the driver when a write-behind save fails anywhere in the state root.
+    pub(super) history_failures: tokio::sync::watch::Receiver<u64>,
     /// Publications the transport has not accepted yet.
     pub(super) deferred_publications: DeferredPublications,
     /// Background jobs that must finish before a restart or shutdown.
@@ -148,6 +150,7 @@ impl DriverState {
             command_messages: None,
             publication_delivery: PublicationDelivery::default(),
             publication_recovery_at: None,
+            history_failures: services.history.failed(),
             deferred_publications: DeferredPublications::default(),
             tasks: RunningTasks::default(),
             retained_inputs: Vec::new(),

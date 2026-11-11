@@ -182,7 +182,7 @@ impl ExchangeDriver {
     /// Serialize snapshot leases after earlier output offers settle, without blocking the owner.
     async fn advance_reconnect(
         &mut self,
-        broker: &Mutex<HarnessBroker>,
+        broker: &Arc<Mutex<HarnessBroker>>,
         context: OwnerUpdateContext<'_>,
     ) {
         let OwnerUpdateContext {
@@ -201,18 +201,33 @@ impl ExchangeDriver {
             }
             // A running turn may hold the broker for its whole duration. Reconnect then reads the
             // committed state with the last published runtime metadata instead of waiting.
-            let result = super::reconnect::capture(
-                || match broker.try_lock() {
-                    Ok(broker) => broker.snapshot(),
-                    Err(_) => services.observer.snapshot(),
-                },
-                services,
-                request.cursor,
-                request.limit,
-                step,
-                !self.commands.storage_unavailable()
-                    && matches!(self.execution_state, ExecutionState::Ready),
-            );
+            // The capture reads history and the publication outbox, so it runs on the blocking pool.
+            let execution_available = !self.commands.storage_unavailable()
+                && matches!(self.execution_state, ExecutionState::Ready);
+            let capture_broker = broker.clone();
+            let capture_services = services.clone();
+            let (cursor, limit) = (request.cursor, request.limit);
+            let span = tracing::Span::current();
+            let result = tokio::task::spawn_blocking(move || {
+                let _entered = span.enter();
+                super::reconnect::capture(
+                    || match capture_broker.try_lock() {
+                        Ok(broker) => broker.snapshot(),
+                        Err(_) => capture_services.observer.snapshot(),
+                    },
+                    &capture_services,
+                    cursor,
+                    limit,
+                    step,
+                    execution_available,
+                )
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(super::ReconnectError::Snapshot(anyhow::anyhow!(
+                    "reconnect capture worker failed: {error}"
+                )))
+            });
             if matches!(
                 &result,
                 Err(super::ReconnectError::Publication(
@@ -332,6 +347,7 @@ impl ExchangeDriver {
             self.events_receive(&env, &mut state, step, continuing_event_phase, &mut closed)
                 .await;
             self.publications_flush(&env, &mut state, step).await;
+            self.history_failure_apply(&env, step);
             self.storage_failure_apply(&env, &mut state, step, closed)
                 .await;
             self.deliveries_advance(&env, &mut state, step, closed)
@@ -479,7 +495,8 @@ impl ExchangeDriver {
                         .any(|message| matches!(message.purpose, crate::input::InputPurpose::User))
                 {
                     let cancelled = (|| -> Result<()> {
-                        let mut store = crate::storage::SqliteStore::open(&services.root)?;
+                        let mut store =
+                            crate::storage::writer::HistoryWriter::lease_for(&services.root)?;
                         let now =
                             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
                         services
@@ -754,6 +771,8 @@ type InternalCompletion = Option<
 
 enum DriverWake {
     PublicationStoreRetry,
+    /// A write-behind save failed in this state root; the next step checks this session.
+    HistoryWriteFailed,
     QuestionTool,
     PublicationRetry,
     ObservationRecovery(super::observation_recovery::RecoveryEvent),
@@ -1290,10 +1309,13 @@ async fn publish_updates(
                 event,
                 messages,
             )?;
-            trace.record(session, "exchange.publication.committed", serde_json::json!({
-                "publication_sequence":publication.sequence().get(),"delivery":publication.state(),
-                "event":publication.event().event,"update_step":step,
-            }));
+            // A document wake has no sequence and no retained row to report.
+            if let Some(publication) = publication {
+                trace.record(session, "exchange.publication.committed", serde_json::json!({
+                    "publication_sequence":publication.sequence().get(),"delivery":publication.state(),
+                    "event":publication.event().event,"update_step":step,
+                }));
+            }
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -1325,7 +1347,9 @@ fn retain_publication(
     session: &str,
     step: u64,
 ) -> Result<(), super::publication::PublicationError> {
-    let publication = services.publications.publish(event, messages)?;
+    let Some(publication) = services.publications.publish(event, messages)? else {
+        return Ok(());
+    };
     trace.record(
         session,
         "exchange.publication.committed",
@@ -1749,7 +1773,7 @@ impl ActiveTurn {
     /// Commit one reducer transition before launching its authorized effects.
     async fn update(
         &mut self,
-        broker: &Mutex<HarnessBroker>,
+        broker: &Arc<Mutex<HarnessBroker>>,
         signal: ForegroundSignal,
         completed_publication: bool,
         commit: ForegroundCommit,
@@ -1805,7 +1829,7 @@ impl ActiveTurn {
 
     async fn apply_update(
         &mut self,
-        broker: &Mutex<HarnessBroker>,
+        broker: &Arc<Mutex<HarnessBroker>>,
         signal: ForegroundSignal,
         completed_publication: bool,
         commit: ForegroundCommit,
@@ -1838,13 +1862,26 @@ impl ActiveTurn {
         }
         let action = {
             let publication_sink = self.transaction.publication_sink()?;
-            let mut broker = broker.lock().await;
-            broker.with_publication_sink(&publication_sink, |broker| {
-                match broker.step_foreground(&mut self.transaction, signal) {
+            let mut broker = broker.clone().lock_owned().await;
+            // The reducer step commits to SQLite and projects the timeline, so it runs on the
+            // blocking pool. The transaction travels with it and returns with the outcome.
+            let mut transaction =
+                std::mem::replace(&mut self.transaction, TurnTransaction::Transitioning);
+            let span = tracing::Span::current();
+            let (transaction, action) = tokio::task::spawn_blocking(move || {
+                let _entered = span.enter();
+                let action = broker.with_publication_sink(&publication_sink, |broker| match broker
+                    .step_foreground(&mut transaction, signal)
+                {
                     Ok(action) => Ok(action),
-                    Err(error) => broker.fail_foreground_dispatch(&mut self.transaction, error),
-                }
-            })?
+                    Err(error) => broker.fail_foreground_dispatch(&mut transaction, error),
+                });
+                (transaction, action)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("foreground step worker failed: {error}"))?;
+            self.transaction = transaction;
+            action?
         };
         if collection_started {
             let pending = self.staged_effects.len();
@@ -1904,7 +1941,7 @@ impl ActiveTurn {
     /// Dispatch retained effects only from the owner's post-command effect phase.
     async fn dispatch_live_effects(
         &mut self,
-        broker: &Mutex<HarnessBroker>,
+        broker: &Arc<Mutex<HarnessBroker>>,
         gate: ForegroundEffectGate,
     ) {
         if self.settled {
@@ -2026,7 +2063,7 @@ fn retain_review_answer(
         .and_then(|value| value.pointer("/exchange/id"))
         .and_then(serde_json::Value::as_str)
         .context("review answer has no completed exchange")?;
-    let exchange = crate::storage::SqliteStore::read_only(root)?
+    let exchange = crate::storage::HistoryReader::current(root)?
         .load_exchange(id)?
         .context("review answer exchange is missing")?;
     anyhow::ensure!(

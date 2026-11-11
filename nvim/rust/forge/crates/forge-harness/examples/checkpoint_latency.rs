@@ -1,3 +1,5 @@
+// This fixture builds storage through a handle of its own, outside any running host.
+#![allow(clippy::disallowed_methods)]
 use anyhow::{Context, Result, ensure};
 use forge_git::store::RepositoryStore;
 use forge_harness::session::{HarnessSession, SessionStore};

@@ -91,6 +91,80 @@ T["fold_failure_recovery"] = function()
   buffer.close(owner)
 end
 
+T["narrowed_edit"] = function()
+  local replica = require("forge.buffer")
+  local buffer = vim.api.nvim_create_buf(false, true)
+  MiniTest.finally(function() pcall(vim.api.nvim_buf_delete, buffer, { force = true }) end)
+  local rows = {}
+  for index = 1, 500 do rows[index] = "row " .. index end
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, true, rows)
+  local namespace = vim.api.nvim_create_namespace("narrowed-edit")
+  local untouched = vim.api.nvim_buf_set_extmark(buffer, namespace, 250, 2, {})
+  local written = 0
+  vim.api.nvim_buf_attach(buffer, false, { on_lines = function(_, _, _, first, last, last_updated)
+    written = written + math.max(last - first, last_updated - first)
+  end })
+
+  -- Two distant rows differ inside a span that replaces everything between them.
+  local replacement = {}
+  for index = 11, 490 do replacement[#replacement + 1] = rows[index] end
+  replacement[1], replacement[#replacement] = "first changed", "last changed"
+  replica.apply_text_edits(buffer, { { start_row = 10, removed_rows = 480, text = replacement } })
+  rows[11], rows[490] = "first changed", "last changed"
+  MiniTest.expect.equality(vim.api.nvim_buf_get_lines(buffer, 0, -1, true), rows)
+  MiniTest.expect.equality(written, 2)
+  MiniTest.expect.equality(vim.api.nvim_buf_get_extmark_by_id(buffer, namespace, untouched, {}), { 250, 2 })
+
+  -- Insertions, deletions and a changed row count all land on the right rows.
+  replacement = { "row 1", "inserted", "row 2", "row 4", "row 5 changed", "appended" }
+  replica.apply_text_edits(buffer, { { start_row = 0, removed_rows = 5, text = replacement } })
+  MiniTest.expect.equality(vim.api.nvim_buf_get_lines(buffer, 0, 7, true),
+    { "row 1", "inserted", "row 2", "row 4", "row 5 changed", "appended", "row 6" })
+  MiniTest.expect.equality(vim.api.nvim_buf_line_count(buffer), 501)
+end
+
+T["multi_patch_slices"] = function()
+  local buffer = require("forge.buffer")
+  local replica = buffer.open("multi-patch")
+  MiniTest.finally(function() pcall(buffer.close, replica) end)
+  local metadata = { target = {}, decoration = {}, editable_region = {} }
+  local text = {}
+  for row = 1, 600 do text[row] = "row " .. row end
+  assert(buffer.apply_snapshot(replica, { document = replica.document, revision = 0,
+    block = { { id = "body", text = text, metadata = metadata } } }).kind == "Applied")
+
+  ---@param revision integer
+  local function rewrite(revision)
+    local replacement = {}
+    for row = 1, 600 do replacement[row] = "revision " .. revision .. " row " .. row end
+    return { document = replica.document, base = revision - 1, next = revision, base_rows = 600, next_rows = 600,
+      base_blocks = 1, next_blocks = 1, block_edit = {}, removed_block = {}, metadata_edit = {},
+      text_edit = { { start_row = 0, removed_rows = 600, text = replacement } } }
+  end
+
+  -- Each patch spends more than the scheduler's unit budget, so the backlog must yield between them.
+  local result
+  buffer.apply_async(replica, { patch = { rewrite(1), rewrite(2), rewrite(3) } },
+    function() return true end, function(adopted) result = adopted end)
+  assert(result == nil and replica.update_pending, "a patch backlog committed without yielding")
+  MiniTest.expect.equality(replica.revision, 1)
+  wait_until(function() return result ~= nil end, "patch backlog did not settle")
+  MiniTest.expect.equality(result.kind, "Applied")
+  MiniTest.expect.equality(replica.revision, 3)
+  MiniTest.expect.equality(vim.api.nvim_buf_get_lines(replica.buffer, 599, 600, true)[1], "revision 3 row 600")
+  assert(replica.update_timing.slices >= 3, "patch backlog ran in one slice")
+
+  -- A withdrawn backlog keeps the last revision it fully applied.
+  local alive, withdrawn = true, nil
+  buffer.apply_async(replica, { patch = { rewrite(4), rewrite(5) } },
+    function() return alive end, function(adopted) withdrawn = adopted end)
+  alive = false
+  wait_until(function() return withdrawn ~= nil end, "withdrawn backlog did not report its result")
+  MiniTest.expect.equality(withdrawn.kind, "Cancelled")
+  MiniTest.expect.equality(replica.revision, 4)
+  MiniTest.expect.equality(replica.status, "Applied")
+end
+
 T["replica"] = function()
   local replica = require("forge.buffer")
   local editable = require("forge.editable")

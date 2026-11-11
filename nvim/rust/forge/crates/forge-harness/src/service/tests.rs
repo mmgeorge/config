@@ -795,6 +795,8 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
             .coordinator
             .submissions
             .apply(submit("queued", InputIntent::Queue))?;
+        // A reducer step may still hold the broker on the blocking pool; wait for it to finish.
+        drop(controller.broker.lock().await);
         assert!(
             controller.broker.try_lock().is_ok(),
             "fixture must exercise an unlocked broker"

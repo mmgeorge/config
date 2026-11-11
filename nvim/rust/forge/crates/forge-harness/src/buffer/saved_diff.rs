@@ -1,8 +1,5 @@
 use super::projection::SavedCheckpoint;
-use crate::{
-    checkpoint::CheckpointRecord,
-    storage::{SqliteStore, objects::ObjectStore},
-};
+use crate::{checkpoint::CheckpointRecord, storage::objects::ObjectStore};
 use anyhow::{Context, Result, ensure};
 use forge_diff::{
     patch::UnifiedPatch,
@@ -63,7 +60,7 @@ fn load_checkpoint_pair(
     data_root: &Path,
     checkpoint: &SavedCheckpoint,
 ) -> Result<(CheckpointRecord, CheckpointRecord, ObjectStore)> {
-    let store = SqliteStore::read_only(data_root)?;
+    let store = crate::storage::HistoryReader::current(data_root)?;
     let before = store
         .load_checkpoint(&checkpoint.before)?
         .context("saved before checkpoint is unavailable")?;
@@ -111,8 +108,8 @@ mod tests {
         let workspace = tempfile::tempdir()?;
         forge_git::test_support::init_repository(workspace.path());
         let data = tempfile::tempdir()?;
-        let mut store = SqliteStore::open(data.path())?;
-        let connection = rusqlite::Connection::open(crate::storage::state::database(data.path()))?;
+        let mut store = crate::storage::SqliteStore::open(data.path())?;
+        let connection = crate::storage::test::raw_connection(data.path())?;
         connection.execute("INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('captured-session', ?1, 0, '{}')", [workspace.path().to_string_lossy().as_ref()])?;
         let before_text = b"pub fn saved() { previous(); }\n";
         let after_text = b"pub fn saved() { updated(); }\n";

@@ -421,7 +421,7 @@ impl QuestionCreation {
         self.authority
             .validate_scope()
             .map_err(QuestionEventError::Authority)?;
-        let source = crate::storage::SqliteStore::read_only(&services.root)
+        let source = crate::storage::HistoryReader::current(&services.root)
             .map_err(QuestionEventError::State)?
             .load_exchange(self.exchange.as_str())
             .map_err(QuestionEventError::State)?

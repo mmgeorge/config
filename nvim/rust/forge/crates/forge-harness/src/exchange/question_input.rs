@@ -140,7 +140,7 @@ impl QuestionInputs {
             .into_iter()
             .take(ADMISSION_BUDGET - admitted)
         {
-            let original = crate::storage::SqliteStore::read_only(&services.root)
+            let original = crate::storage::HistoryReader::current(&services.root)
                 .map_err(QuestionInputError::SourceState)?
                 .load_exchange(&exchange)
                 .map_err(QuestionInputError::SourceState)?

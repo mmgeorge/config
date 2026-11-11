@@ -14,6 +14,10 @@ struct PreferenceImport {
 pub(super) fn open(root: &Path) -> Result<Connection> {
     std::fs::create_dir_all(root)?;
     let _bootstrap = super::bootstrap_lock(root, "preferences")?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "preferences live in their own database outside versioned state"
+    )]
     let mut connection = Connection::open(root.join("preferences.sqlite3"))?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.pragma_update(None, "synchronous", "FULL")?;
@@ -85,6 +89,10 @@ pub(super) fn apply_configuration(
 /// prevent the remaining compatible settings from importing or the store from opening.
 /// SQLite failures still abort the import, leaving the destination schema unversioned.
 fn import(destination: &Connection, path: &Path) -> Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this reads a legacy preference database once, to import it"
+    )]
     let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     source.busy_timeout(std::time::Duration::from_secs(5))?;
     source.execute_batch("BEGIN")?;

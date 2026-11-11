@@ -1,0 +1,13 @@
+# History storage has one writer thread and one reader pool per state root
+# (`forge-harness/src/storage/writer.rs` and `reader.rs`). A handle opened anywhere else commits
+# outside the writer's order and pays the open cost on the calling thread, so each remaining
+# direct open carries an `#[expect(clippy::disallowed_methods, reason = "..")]` that names why
+# it cannot use them.
+disallowed-methods = [
+    { path = "rusqlite::Connection::open", reason = "open history through `HistoryWriter` or `HistoryReader`; other stores state why they own a connection" },
+    { path = "rusqlite::Connection::open_with_flags", reason = "open history through `HistoryWriter` or `HistoryReader`; other stores state why they own a connection" },
+    { path = "rusqlite::Connection::open_in_memory", reason = "open history through `HistoryWriter` or `HistoryReader`; other stores state why they own a connection" },
+    { path = "forge_harness::storage::SqliteStore::open", reason = "lease the root's store with `HistoryWriter::lease_for`" },
+    { path = "forge_harness::storage::SqliteStore::read_only", reason = "borrow a pooled handle with `HistoryReader::current`" },
+    { path = "std::thread::sleep", reason = "a sleeping thread stalls every task queued behind it; wait on a channel, a condition variable, or the Tokio clock" },
+]

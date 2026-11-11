@@ -198,7 +198,7 @@ impl BrokerObserver {
         if matches!(&task.workflow, WorkflowSnapshot::Execute { execution }
             if execution.record.phase == crate::plan::PlanPhase::Checking)
         {
-            let store = SqliteStore::read_only(&self.data_root)?;
+            let store = crate::storage::HistoryReader::current(&self.data_root)?;
             let exchange = store
                 .latest_exchange(&self.session_id)?
                 .context("execution checks require a completed source exchange")?;
@@ -269,7 +269,7 @@ impl BrokerObserver {
         completed: Option<&crate::task::TaskTurnId>,
         now_ms: i64,
     ) -> Result<TaskChange> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let exchange = store
             .latest_exchange(&self.session_id)?
             .context("task has no completed exchange")?;
@@ -329,7 +329,7 @@ impl BrokerObserver {
                     .prepare_entry(&self.session_id, objective, None, now_ms)?
             }
             PlanTaskRequest::Attach { plan_id } => {
-                let store = SqliteStore::read_only(&self.data_root)?;
+                let store = crate::storage::HistoryReader::current(&self.data_root)?;
                 let record = store
                     .load_plan(&plan_id)?
                     .context("selected plan is missing")?;
@@ -366,7 +366,7 @@ impl BrokerObserver {
                 return Task::try_from(task);
             }
             PlanTaskRequest::Fork { plan_id } => {
-                let store = SqliteStore::read_only(&self.data_root)?;
+                let store = crate::storage::HistoryReader::current(&self.data_root)?;
                 let source = store
                     .load_plan(&plan_id)?
                     .context("source plan is missing")?;
@@ -397,7 +397,7 @@ impl BrokerObserver {
                     .prepare_entry(&self.session_id, objective, Some(document), now_ms)?
             }
             PlanTaskRequest::Replan { plan_id, revision } => {
-                let store = SqliteStore::read_only(&self.data_root)?;
+                let store = crate::storage::HistoryReader::current(&self.data_root)?;
                 let source = store
                     .load_plan(&plan_id)?
                     .context("source plan not found")?;

@@ -109,7 +109,7 @@ impl PlanAuthoringScope {
             .and_then(|design| design.authoring_fingerprint.as_ref())
             != design.authoring_fingerprint.as_ref();
         let revision = if crate::storage::state::database(&self.files.root).exists() {
-            crate::storage::SqliteStore::read_only(&self.files.root)?
+            crate::storage::HistoryReader::current(&self.files.root)?
                 .load_plan(&self.plan_id)?
                 .filter(|plan| plan.session_id == self.session_id && plan.model_revision > 0)
                 .map(|plan| plan.model_revision.to_string())

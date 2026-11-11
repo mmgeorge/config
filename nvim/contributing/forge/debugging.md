@@ -65,6 +65,13 @@ and missing-entry draft recovery. These editor-local records use the same
 to show the host log. The loop watcher runs only while a Harness transcript is
 displayed. Changing `/log` updates both detailed and sparse recording.
 
+The host reports its own scheduling delay. `src/runtime_lag.rs` asks the Tokio
+runtime for a wakeup every 100 ms and logs `runtime.scheduling_lag` at Warn, at most
+once per second, when a wakeup arrives 50 ms or more late. A record means a worker
+thread blocked on a disk, a lock, or a long computation while other tasks waited.
+The alarm is coarse: another worker can run the timer on time, so a short stall of
+one worker passes unseen.
+
 Each of the five fixed event categories emits immediately, then at most once per
 ten seconds per editor. The next emitted record includes the suppressed count
 and maximum duration from the preceding interval; a final quiet interval has no

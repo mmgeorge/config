@@ -66,6 +66,10 @@ fn command_child_wait() {
     if let Some(ready) = std::env::var_os("FORGE_TEST_READY") {
         std::fs::write(ready, b"ready").unwrap();
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this fixture is the child process whose termination the ownership tests verify"
+    )]
     std::thread::sleep(Duration::from_secs(10));
 }
 

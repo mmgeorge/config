@@ -414,6 +414,8 @@ impl CoreEventLog {
 
     /// Append safe metadata using the existing schema and transaction sequence allocator.
     /// Hold no asynchronous guard or lifecycle resource while SQLite commits this evidence.
+    /// Streamed output deltas are never appended: nothing reads them back, and one commit per
+    /// delta would pace the stream by the disk.
     pub(crate) fn append(
         &self,
         session: &str,
@@ -429,7 +431,7 @@ impl CoreEventLog {
                 // Native owners may start before a caller command opens its journal.
                 // Reuse shared bootstrap rather than maintaining a separate metadata schema.
                 drop(
-                    crate::storage::SqliteStore::open(&self.root)
+                    crate::storage::writer::HistoryWriter::lease_for(&self.root)
                         .map_err(|_| CommandJournalError::CoreUnavailable)?,
                 );
                 entry.insert(CommandJournal::open_metadata(&self.root, session)?)
@@ -447,7 +449,7 @@ impl CoreEventLog {
 #[cfg(test)]
 pub(crate) fn persist_test_session(root: &std::path::Path, id: &str) -> anyhow::Result<()> {
     use crate::session::SessionStore;
-    let mut store = crate::storage::SqliteStore::open(root)?;
+    let mut store = crate::storage::writer::HistoryWriter::lease_for(root)?;
     if store.load_session(id)?.is_some() {
         return Ok(());
     }

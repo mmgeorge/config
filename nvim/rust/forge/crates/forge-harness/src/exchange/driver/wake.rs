@@ -148,6 +148,7 @@ impl ExchangeDriver {
             DriverWake::Publication => WakeEnd::Finished,
             DriverWake::PublicationRetry => WakeEnd::Finished,
             DriverWake::PublicationStoreRetry => WakeEnd::Finished,
+            DriverWake::HistoryWriteFailed => WakeEnd::Finished,
             DriverWake::QuestionInput => WakeEnd::Finished,
             DriverWake::QuestionTool => WakeEnd::Finished,
             DriverWake::QuestionWait => WakeEnd::Finished,
@@ -180,6 +181,7 @@ impl ExchangeDriver {
             command,
             publication_delivery,
             publication_recovery_at,
+            history_failures,
             deferred_publications,
             steering_ready,
             shutdown,
@@ -247,6 +249,13 @@ impl ExchangeDriver {
                         None => std::future::pending().await,
                     }
                 } => DriverWake::PublicationStoreRetry,
+                changed = history_failures.changed(), if !self.commands.storage_unavailable() => {
+                    // A closed writer reports nothing further; stop polling its channel.
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    DriverWake::HistoryWriteFailed
+                },
                 _ = async {
                     match deferred_publications.retry_at {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,

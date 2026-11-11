@@ -84,4 +84,32 @@ T["queue"] = function()
   assert(state.closed)
 end
 
+T["time_budget"] = function()
+  local receive = require("forge.receive")
+  local scheduled = {}
+  local schedule, defer, hrtime = vim.schedule, vim.defer_fn, vim.uv.hrtime
+  MiniTest.finally(function() vim.schedule, vim.defer_fn, vim.uv.hrtime = schedule, defer, hrtime end)
+  local deferred = 0
+  vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
+  vim.defer_fn = function(callback)
+    deferred = deferred + 1
+    scheduled[#scheduled + 1] = callback
+  end
+  -- Each dispatched frame costs three milliseconds on the mocked clock.
+  local now = 0
+  vim.uv.hrtime = function() return now end
+  local dispatched = 0
+  local state = receive.new({ decode = vim.json.decode, dispatch = function()
+    dispatched = dispatched + 1
+    now = now + 3 * 1000 * 1000
+  end })
+  for sequence = 1, 5 do assert(receive.push(state, tostring(sequence) .. "\n")) end
+  table.remove(scheduled, 1)()
+  MiniTest.expect.equality(dispatched, 2)
+  MiniTest.expect.equality(#scheduled, 1)
+  MiniTest.expect.equality(deferred, 1)
+  while #scheduled > 0 do table.remove(scheduled, 1)() end
+  MiniTest.expect.equality(dispatched, 5)
+end
+
 return T

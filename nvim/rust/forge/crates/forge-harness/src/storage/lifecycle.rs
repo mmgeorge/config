@@ -25,6 +25,10 @@ impl SessionMetadataWriter {
             .owner
             .upgrade()
             .context("session runtime ownership ended")?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "history clearing must hold the only handle of the version it deletes"
+        )]
         let mut store = SqliteStore::open(&self.data_root)?;
         store.session_lock.insert(self.session_id.clone(), owner);
         store.rename_owned_session(

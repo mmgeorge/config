@@ -145,14 +145,36 @@ impl RetainedPublication {
 /// Serialize publication identity and delivery evidence independently of exchange mutation ownership.
 pub(crate) struct SessionPublications {
     session: String,
-    connection: Mutex<crate::storage::database::HistoryConnection>,
+    /// The state root's history writer. Every outbox statement runs on its connection, in
+    /// queue order with every other history write.
+    writer: crate::storage::writer::HistoryWriter,
     changed: tokio::sync::Notify,
     reconciliation: Mutex<Option<PublicationBarrier>>,
     failed: AtomicBool,
     recovery: Mutex<std::collections::VecDeque<PublicationRecovery>>,
-    /// A direct offer whose transport outcome is known but whose final state write failed,
-    /// leaving its row `offering` with no delivery worker to settle it.
-    stranded_offer: Mutex<Option<(PublicationSequence, PublicationState)>>,
+    /// The newest undelivered document notification. It is never stored: a lost wake heals
+    /// through the reconnect snapshot's timeline revision.
+    document_wake: Mutex<Option<SessionEvent>>,
+    /// Whether a non-admitted row may exist. Only a drained delivery scan clears it, so a
+    /// streaming session skips the offer transaction while its outbox is empty.
+    unadmitted: AtomicBool,
+}
+
+/// Name the notification that only tells the editor a newer document revision exists.
+const DOCUMENT_WAKE: &str = "document_changed";
+
+/// Overlay a newer wake on an older one so status fields from a superseded wake survive.
+fn overlay_wake(mut older: SessionEvent, newer: SessionEvent) -> SessionEvent {
+    let revision = |event: &SessionEvent| event.payload["revision"].as_u64();
+    let newest = revision(&older).max(revision(&newer));
+    match (older.payload.as_object_mut(), newer.payload) {
+        (Some(merged), serde_json::Value::Object(fields)) => merged.extend(fields),
+        (_, payload) => older.payload = payload,
+    }
+    if let (Some(newest), Some(merged)) = (newest, older.payload.as_object_mut()) {
+        merged.insert("revision".into(), newest.into());
+    }
+    older
 }
 
 /// Retain the exact identities and bytes whose commit or delivery evidence was not observed.
@@ -187,16 +209,79 @@ impl SessionPublications {
         if session.trim().is_empty() {
             return Err(PublicationError::SessionMismatch);
         }
-        let connection = crate::storage::database::HistoryConnection::open(root)?;
+        let writer = crate::storage::writer::HistoryWriter::for_root(root)
+            .map_err(crate::storage::database::DatabaseError::Initialization)?;
         Ok(Self {
             session: session.into(),
-            connection: Mutex::new(connection),
+            writer,
             changed: tokio::sync::Notify::new(),
             reconciliation: Mutex::new(None),
             failed: AtomicBool::new(false),
             recovery: Mutex::new(std::collections::VecDeque::new()),
-            stranded_offer: Mutex::new(None),
+            document_wake: Mutex::new(None),
+            unadmitted: AtomicBool::new(true),
         })
+    }
+
+    /// Borrow the history writer's connection for one outbox operation.
+    ///
+    /// A failed admission record leaves a sent row `pending`. No later operation may read
+    /// that row as unsent, so the outbox stays unavailable for the rest of the owner epoch.
+    fn history(&self) -> Result<crate::storage::writer::ConnectionLease, PublicationError> {
+        let scope = crate::storage::writer::WriteScope::Session(self.session.clone());
+        if self.writer.failure(&scope).is_some() {
+            self.failed.store(true, Ordering::Release);
+            return Err(PublicationError::Unavailable);
+        }
+        self.writer
+            .connection()
+            .map_err(|_| PublicationError::Unavailable)
+    }
+
+    /// Wake delivery after a change that may have left a non-admitted row.
+    fn mark_ready(&self) {
+        self.unadmitted.store(true, Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    /// Keep only the newest document notification; delivery sends it once the outbox drains.
+    fn retain_wake(&self, event: SessionEvent) -> Result<(), PublicationError> {
+        self.validate(&event)?;
+        let mut wake = self
+            .document_wake
+            .lock()
+            .map_err(|_| PublicationError::Unavailable)?;
+        *wake = Some(match wake.take() {
+            Some(older) => overlay_wake(older, event),
+            None => event,
+        });
+        drop(wake);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Take the wake only when no sequenced publication or reconnect response precedes it.
+    fn take_wake(&self) -> Result<Option<SessionEvent>, PublicationError> {
+        if self.unadmitted.load(Ordering::Acquire) || self.reconciliation_pending()? {
+            return Ok(None);
+        }
+        Ok(self
+            .document_wake
+            .lock()
+            .map_err(|_| PublicationError::Unavailable)?
+            .take())
+    }
+
+    /// Send the wake ahead of a sequenced direct send; a full channel keeps it for delivery.
+    fn flush_wake(&self, transport: &MessageSender) {
+        let Ok(mut wake) = self.document_wake.lock() else {
+            return;
+        };
+        if let Some(event) = wake.take()
+            && transport.try_send_event(&event).is_err()
+        {
+            *wake = Some(event);
+        }
     }
 
     /// Get whether any required publication lost storage certification in this owner epoch.
@@ -242,7 +327,7 @@ impl SessionPublications {
             self.append_batch(&batch.events)?;
             pending.pop_front();
         }
-        self.changed.notify_one();
+        self.mark_ready();
         Ok(())
     }
 
@@ -261,7 +346,7 @@ impl SessionPublications {
         } else {
             pending.push_back(PublicationRecovery { key, events });
         }
-        self.changed.notify_one();
+        self.mark_ready();
         Ok(())
     }
 
@@ -269,10 +354,7 @@ impl SessionPublications {
     pub(super) fn begin_reconciliation(
         self: &Arc<Self>,
     ) -> Result<PublicationLease, PublicationError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let connection = self.history()?;
         let mut barrier = self
             .reconciliation
             .lock()
@@ -292,7 +374,7 @@ impl SessionPublications {
             id,
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
         });
-        self.changed.notify_one();
+        self.mark_ready();
         Ok(PublicationLease {
             publications: Arc::downgrade(self),
             id,
@@ -346,7 +428,7 @@ impl SessionPublications {
             && barrier.as_ref().is_some_and(|barrier| barrier.id == id)
         {
             *barrier = None;
-            self.changed.notify_one();
+            self.mark_ready();
         }
     }
 
@@ -374,10 +456,7 @@ impl SessionPublications {
             .recovery
             .lock()
             .map_err(|_| PublicationError::Unavailable)?;
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let mut connection = self.history()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "UPDATE owner_publication SET state=?2 WHERE session_id=?1 AND json_extract(state,'$.state')!='admitted'",
@@ -389,37 +468,6 @@ impl SessionPublications {
         transaction.commit()?;
         drop(connection);
         drop(recovery);
-        *self
-            .stranded_offer
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)? = None;
-        Ok(())
-    }
-
-    /// Settle a direct offer stranded by a failed final state write, once no worker delivery is
-    /// active.
-    ///
-    /// The direct path holds the connection lock across its offer, so a recorded stranded
-    /// offer is never still in flight here. Its transport outcome is known, so the row receives
-    /// that exact state rather than being re-sent or left `offering`, which would block every
-    /// later offer and every reconnect with `DeliveryInProgress`.
-    fn settle_stranded_offer(&self) -> Result<(), PublicationError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
-        let mut stranded = self
-            .stranded_offer
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
-        let Some((sequence, state)) = *stranded else {
-            return Ok(());
-        };
-        self.write_state(&connection, sequence, state)?;
-        *stranded = None;
-        drop(stranded);
-        drop(connection);
-        self.changed.notify_one();
         Ok(())
     }
 
@@ -467,7 +515,7 @@ impl SessionPublications {
         &self,
         event: SessionEvent,
         transport: Option<&MessageSender>,
-    ) -> Result<RetainedPublication, PublicationError> {
+    ) -> Result<Option<RetainedPublication>, PublicationError> {
         self.publish_once(
             PublicationOrigin::OwnerUpdate(uuid::Uuid::new_v4().to_string()),
             event,
@@ -477,6 +525,12 @@ impl SessionPublications {
 
     /// Retain one logical notification group atomically before the owner offers any of its frames.
     pub(super) fn publish_batch(&self, events: Vec<SessionEvent>) -> Result<(), PublicationError> {
+        let (wakes, events): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|event| event.event == DOCUMENT_WAKE);
+        for wake in wakes {
+            self.retain_wake(wake)?;
+        }
         if events.is_empty() {
             return Ok(());
         }
@@ -515,10 +569,7 @@ impl SessionPublications {
         &self,
         events: &[(PublicationOrigin, SessionEvent)],
     ) -> Result<(), PublicationError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let mut connection = self.history()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (origin, event) in events {
             Self::append_transaction(
@@ -529,7 +580,7 @@ impl SessionPublications {
             )?;
         }
         transaction.commit()?;
-        self.changed.notify_one();
+        self.mark_ready();
         Ok(())
     }
 
@@ -540,7 +591,10 @@ impl SessionPublications {
         origin: PublicationOrigin,
         event: SessionEvent,
         transport: Option<&MessageSender>,
-    ) -> Result<RetainedPublication, PublicationError> {
+    ) -> Result<Option<RetainedPublication>, PublicationError> {
+        if event.event == DOCUMENT_WAKE {
+            return self.retain_wake(event).map(|()| None);
+        }
         let key = serde_json::to_string(&origin)?;
         let mut pending = self
             .recovery
@@ -558,7 +612,7 @@ impl SessionPublications {
         {
             self.retain_failure(&mut pending, key, vec![(origin, event)])?;
         }
-        result
+        result.map(Some)
     }
 
     /// Atomically retain the event and optional producer identity before authorizing any output.
@@ -569,46 +623,60 @@ impl SessionPublications {
         transport: Option<&MessageSender>,
     ) -> Result<RetainedPublication, PublicationError> {
         self.validate(&event)?;
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let mut connection = self.history()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (mut retained, insertion) =
             Self::append_transaction(&transaction, &self.session, event, origin)?;
         transaction.commit()?;
-        self.changed.notify_one();
-        if matches!(insertion, PublicationInsertion::Existing) {
-            return Ok(retained);
-        }
-        let sequence = retained.sequence;
-        let Some(transport) = transport else {
+        // Every exit except direct admission leaves this row for the delivery scan.
+        let direct = transport.filter(|_| matches!(insertion, PublicationInsertion::New));
+        let Some(transport) = direct else {
+            self.mark_ready();
             return Ok(retained);
         };
+        let sequence = retained.sequence;
         if self.reconciliation_pending()? {
+            self.mark_ready();
             return Ok(retained);
         }
         let blocked: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM owner_publication WHERE session_id=?1 AND sequence<?2 AND json_extract(state,'$.state')!='admitted')",
             params![self.session, sequence.sql()], |row| row.get(0))?;
         if blocked {
+            self.mark_ready();
             return Ok(retained);
         }
 
-        // Keep local publication-before-output lock order; try_send_event performs no callbacks or waits.
-        self.write_state(&connection, sequence, PublicationState::Offering)?;
-        let state = match transport.try_send_event(&retained.delivery_event()) {
-            Ok(()) => PublicationState::Admitted,
-            Err(_) => PublicationState::Pending,
-        };
-        if let Err(error) = self.write_state(&connection, sequence, state) {
-            // No worker owns this offer; the delivery loop settles it with the known outcome.
-            *self
-                .stranded_offer
-                .lock()
-                .map_err(|_| PublicationError::Unavailable)? = Some((sequence, state));
-            return Err(error);
+        // The lease keeps publication-before-output order; try_send_event performs no callbacks
+        // or waits. The row stays `pending` across the send: a crash here leaves it for
+        // `recover_interrupted_offers`, which marks it uncertain for the next reconnect.
+        self.flush_wake(transport);
+        if transport
+            .try_send_event(&retained.delivery_event())
+            .is_err()
+        {
+            self.mark_ready();
+            return Ok(retained);
         }
-        retained.state = state;
+        // Admission is evidence, not content, so the writer records it behind this call. A
+        // later outbox operation still observes it, because the queue keeps its order.
+        let session = self.session.clone();
+        let admitted = serde_json::to_string(&PublicationState::Admitted)?;
+        let recorded = self.writer.enqueue(
+            crate::storage::writer::WriteScope::Session(session.clone()),
+            move |transaction| {
+                transaction.execute(
+                    "UPDATE owner_publication SET state=?3 WHERE session_id=?1 AND sequence=?2",
+                    params![session, sequence.sql(), admitted],
+                )?;
+                Ok(())
+            },
+        );
+        if recorded.is_err() {
+            self.mark_ready();
+            return Err(PublicationError::Unavailable);
+        }
+        self.changed.notify_one();
+        retained.state = PublicationState::Admitted;
         Ok(retained)
     }
 
@@ -637,7 +705,7 @@ impl SessionPublications {
 
     /// Wake output delivery after another domain transaction commits retained notifications.
     pub(super) fn notify_ready(&self) {
-        self.changed.notify_one();
+        self.mark_ready();
     }
 
     /// Allocate or recover one producer fact within the caller's existing SQLite transaction.
@@ -719,10 +787,24 @@ impl SessionPublications {
 
     /// Authorize only the oldest undelivered event, retaining an offer boundary before external work.
     fn begin_offer(&self) -> Result<Option<RetainedPublication>, PublicationError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        // Clear before scanning: a row retained during the scan sets the flag again.
+        if !self.unadmitted.swap(false, Ordering::AcqRel) {
+            return Ok(None);
+        }
+        let mut drained = false;
+        let offer = self.scan_offer(&mut drained);
+        if !drained {
+            self.unadmitted.store(true, Ordering::Release);
+        }
+        offer
+    }
+
+    /// Scan for the oldest undelivered row, reporting `drained` only when none remains.
+    fn scan_offer(
+        &self,
+        drained: &mut bool,
+    ) -> Result<Option<RetainedPublication>, PublicationError> {
+        let mut connection = self.history()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if self.reconciliation_pending()? {
             return Ok(None);
@@ -732,6 +814,7 @@ impl SessionPublications {
             [&self.session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
         let Some((sequence, encoded, state)) = first else {
+            *drained = true;
             return Ok(None);
         };
         match serde_json::from_str::<PublicationState>(&state)? {
@@ -759,10 +842,7 @@ impl SessionPublications {
         sequence: PublicationSequence,
         outcome: DeliveryOutcome,
     ) -> Result<(), PublicationError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let connection = self.history()?;
         self.write_state(
             &connection,
             sequence,
@@ -780,10 +860,7 @@ impl SessionPublications {
         cursor: Option<PublicationSequence>,
         limit: NonZeroU16,
     ) -> Result<Vec<RetainedPublication>, PublicationError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let connection = self.history()?;
         let mut query = connection.prepare("SELECT sequence,event,state FROM owner_publication WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3")?;
         let rows = query
             .query_map(
@@ -824,10 +901,7 @@ impl SessionPublications {
         limit: NonZeroU16,
     ) -> Result<PublicationSnapshot, PublicationError> {
         // Capture the high-water mark and page under one read transaction.
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let mut connection = self.history()?;
         let transaction = connection.transaction()?;
         let maximum: Option<i64> = transaction.query_row(
             "SELECT MAX(sequence) FROM owner_publication WHERE session_id=?1",
@@ -942,10 +1016,7 @@ impl SessionPublications {
             .recovery
             .lock()
             .map_err(|_| PublicationError::Unavailable)?;
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PublicationError::Unavailable)?;
+        let mut connection = self.history()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let offering: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM owner_publication WHERE session_id=?1 AND sequence>?2 AND sequence<=?3 AND json_extract(state,'$.state')='offering')",
@@ -966,7 +1037,7 @@ impl SessionPublications {
         transaction.commit()?;
         drop(connection);
         drop(recovery);
-        self.changed.notify_one();
+        self.mark_ready();
         Ok(())
     }
 
@@ -1026,6 +1097,8 @@ enum ActiveDelivery {
         sequence: PublicationSequence,
         outcome: DeliveryOutcome,
     },
+    /// An unsequenced document wake waiting for outbound capacity.
+    Waking { worker: tokio::task::JoinHandle<()> },
 }
 
 /// Describe one delivery boundary for correlated owner logs without claiming receipt by the UI.
@@ -1077,6 +1150,10 @@ impl PublicationDelivery {
                 self.active = Some(ActiveDelivery::Observed { sequence, outcome });
             }
             Some(ActiveDelivery::Observed { .. }) => {}
+            Some(ActiveDelivery::Waking { worker }) => {
+                let _ = worker.await;
+                self.active = None;
+            }
             None => std::future::pending().await,
         }
     }
@@ -1088,13 +1165,15 @@ impl PublicationDelivery {
         transport: Option<&MessageSender>,
     ) -> Result<Option<PublicationProgress>, PublicationError> {
         match &self.active {
-            Some(ActiveDelivery::Sending { .. }) => return Ok(None),
+            Some(ActiveDelivery::Sending { .. } | ActiveDelivery::Waking { .. }) => {
+                return Ok(None);
+            }
             Some(ActiveDelivery::Observed { sequence, outcome }) => {
                 let sequence = *sequence;
                 let outcome = *outcome;
                 publications.complete_offer(sequence, outcome)?;
                 self.active = None;
-                publications.changed.notify_one();
+                publications.mark_ready();
                 return Ok(Some(match outcome {
                     DeliveryOutcome::Admitted => PublicationProgress::Admitted(sequence),
                     DeliveryOutcome::Uncertain => PublicationProgress::Uncertain(sequence),
@@ -1102,9 +1181,6 @@ impl PublicationDelivery {
             }
             None => {}
         }
-        // Settle before the transport checks: a withheld transport during reconnect must not
-        // leave a stranded `offering` row blocking that same reconnect.
-        publications.settle_stranded_offer()?;
         let Some(transport) = transport else {
             return Ok(None);
         };
@@ -1112,6 +1188,17 @@ impl PublicationDelivery {
             return Ok(None);
         }
         let Some(publication) = publications.begin_offer()? else {
+            if let Some(wake) = publications.take_wake()?
+                && transport.try_send_event(&wake).is_err()
+            {
+                let transport = transport.clone();
+                self.active = Some(ActiveDelivery::Waking {
+                    worker: tokio::spawn(async move {
+                        // A closed transport loses the wake; the reconnect snapshot replaces it.
+                        let _ = transport.send_event(wake).await;
+                    }),
+                });
+            }
             return Ok(None);
         };
         let transport = transport.clone();
@@ -1135,8 +1222,10 @@ impl PublicationDelivery {
 impl Drop for PublicationDelivery {
     /// Stop only output forwarding at owner shutdown; its durable offer remains uncertain on recovery.
     fn drop(&mut self) {
-        if let Some(ActiveDelivery::Sending { worker, .. }) = &self.active {
-            worker.abort();
+        match &self.active {
+            Some(ActiveDelivery::Sending { worker, .. }) => worker.abort(),
+            Some(ActiveDelivery::Waking { worker }) => worker.abort(),
+            Some(ActiveDelivery::Observed { .. }) | None => {}
         }
     }
 }
@@ -1244,7 +1333,9 @@ mod tests {
     -> Result<(), PublicationError> {
         let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
         let publications = SessionPublications::open(root.path(), "session")?;
-        let first = publications.publish(event("uncertain"), None)?;
+        let first = publications
+            .publish(event("uncertain"), None)?
+            .expect("a sequenced event is retained");
         publications.begin_offer()?.unwrap();
         drop(publications);
         let publications = SessionPublications::open(root.path(), "session")?;
@@ -1260,7 +1351,9 @@ mod tests {
             ),
             "an unconfirmed client cursor skipped the uncertain head"
         );
-        let second = publications.publish(event("after snapshot"), None)?;
+        let second = publications
+            .publish(event("after snapshot"), None)?
+            .expect("a sequenced event is retained");
         assert_eq!(
             records(&publications)[0].state(),
             PublicationState::Uncertain
@@ -1285,120 +1378,106 @@ mod tests {
         Ok(())
     }
 
-    /// A direct offer whose final state write fails is settled by the delivery loop with its
-    /// known outcome, so the row cannot stay `offering` and block reconnect forever.
+    /// A direct offer records admission behind the send; a failed record fences the session
+    /// and never resends the event.
     #[tokio::test]
-    async fn stranded_direct_offer_is_settled_once_no_worker_is_active()
+    async fn failed_admission_record_fences_the_session_without_resending()
     -> Result<(), PublicationError> {
         let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
         let publications = Arc::new(SessionPublications::open(root.path(), "session")?);
-        let database =
-            rusqlite::Connection::open(crate::storage::state::database(root.path())).unwrap();
+        let database = crate::storage::test::raw_connection(root.path()).unwrap();
         database.execute_batch("CREATE TRIGGER fail_admitted_state BEFORE UPDATE ON owner_publication WHEN json_extract(NEW.state,'$.state')='admitted' BEGIN SELECT RAISE(ABORT,'state write failed'); END;").unwrap();
         let (sender, mut receiver) = forge_protocol::outbound::channel();
 
-        assert!(matches!(
-            publications.publish(event("stranded"), Some(&sender)),
-            Err(PublicationError::DeliveryState { .. })
-        ));
-        assert_eq!(
-            records(&publications)[0].state(),
-            PublicationState::Offering
-        );
-        assert!(matches!(
-            publications.begin_reconciliation(),
-            Err(PublicationError::DeliveryInProgress)
-        ));
-
-        database
-            .execute_batch("DROP TRIGGER fail_admitted_state;")
+        let sent = publications
+            .publish(event("direct"), Some(&sender))?
+            .expect("a sequenced event is retained");
+        assert_eq!(sent.state(), PublicationState::Admitted);
+        // The barrier waits for the queued admission record, which the trigger refuses.
+        publications.writer.barrier();
+        let state: String = database
+            .query_row(
+                "SELECT json_extract(state,'$.state') FROM owner_publication",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        let mut delivery = PublicationDelivery::default();
-        delivery.update(&publications, None)?;
+        assert_eq!(state, "pending");
+        let scope = crate::storage::writer::WriteScope::Session("session".into());
+        assert!(publications.writer.failure(&scope).is_some());
+        assert!(!publications.storage_failed());
+        assert!(matches!(
+            publications.publish(event("after failure"), Some(&sender)),
+            Err(PublicationError::Unavailable)
+        ));
+        assert!(publications.storage_failed());
 
-        assert_eq!(
-            records(&publications)[0].state(),
-            PublicationState::Admitted
-        );
-        drop(publications.begin_reconciliation()?);
         let frame = receiver.recv().await.unwrap().unwrap();
         let sent: SessionEvent = serde_json::from_slice(frame.bytes()).unwrap();
-        assert_eq!(sent.payload["text"], "stranded");
+        assert_eq!(sent.payload["text"], "direct");
         assert!(
             receiver.try_recv().is_err(),
-            "the stranded offer was resent"
+            "the admitted event was resent"
         );
         Ok(())
     }
 
-    /// A pending row left by the previous host epoch is never offered live in the next one; the
-    /// first reconnect page carries it as uncertain instead.
+    /// Document wakes merge in memory, never reach SQLite, and never pass a sequenced event.
     #[tokio::test]
-    async fn owner_start_withholds_prior_epoch_pending_publications() -> Result<(), PublicationError>
-    {
-        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        let stale = publications.publish(event("previous epoch"), None)?;
-        assert_eq!(stale.state(), PublicationState::Pending);
-        drop(publications);
-
-        let publications = SessionPublications::open(root.path(), "session")?;
-        publications.recover_interrupted_offers()?;
-        let (sender, mut receiver) = forge_protocol::outbound::channel();
-        let mut delivery = PublicationDelivery::default();
-        assert!(delivery.update(&publications, Some(&sender))?.is_none());
-        assert!(
-            receiver.try_recv().is_err(),
-            "a prior-epoch row was offered live"
-        );
-
-        let (page, _receipt) = publications
-            .snapshot(None, NonZeroU16::new(8).unwrap())?
-            .into_parts();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0].sequence(), stale.sequence());
-        assert_eq!(page[0].state(), PublicationState::Uncertain);
-        Ok(())
-    }
-
-    /// Confirmed history is pruned except the highest row, a cursorless page starts after the
-    /// admitted prefix, and sequence allocation never reuses a pruned identity.
-    #[tokio::test]
-    async fn confirmed_history_is_pruned_and_cursorless_pages_skip_the_admitted_prefix()
+    async fn document_wakes_merge_outside_the_outbox_behind_sequenced_events()
     -> Result<(), PublicationError> {
         let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
-        let publications = SessionPublications::open(root.path(), "session")?;
-        for text in ["first", "second", "third"] {
-            publications.publish(event(text), None)?;
-        }
-        let page = publications.snapshot(None, NonZeroU16::new(8).unwrap())?;
-        assert_eq!(page.page_start(), None);
-        let (retained, receipt) = page.into_parts();
-        assert_eq!(retained.len(), 3);
-        let last = retained[2].sequence();
-        publications.confirm_reconciled(&receipt)?;
+        let publications = Arc::new(SessionPublications::open(root.path(), "session")?);
+        let (sender, mut receiver) = forge_protocol::outbound::channel();
+        let mut delivery = PublicationDelivery::default();
+        let mut received = move || {
+            let frame = receiver.try_recv().ok()?;
+            serde_json::from_slice::<SessionEvent>(frame.bytes()).ok()
+        };
 
-        let remaining = records(&publications);
-        assert_eq!(remaining.len(), 1, "admitted history was not pruned");
-        assert_eq!(remaining[0].sequence(), last);
-        let page = publications.snapshot(None, NonZeroU16::new(8).unwrap())?;
-        assert_eq!(page.page_start(), Some(last));
-        assert_eq!(page.high_water(), Some(last));
-        assert!(page.into_parts().0.is_empty());
+        // A sequenced row with no transport stays pending, so the wakes wait behind it.
+        publications.publish(event("first"), None)?;
+        let status = serde_json::json!({"kind":"idle"});
         assert!(
             publications
-                .snapshot(Some(last), NonZeroU16::new(8).unwrap())
-                .is_ok()
+                .publish(
+                    wake(serde_json::json!({"revision":7,"status":status})),
+                    Some(&sender)
+                )?
+                .is_none()
         );
+        publications.publish_batch(vec![wake(serde_json::json!({"revision":9}))])?;
+        assert_eq!(records(&publications).len(), 1, "a wake reached the outbox");
+        assert!(received().is_none());
 
-        let next = publications.publish(event("fourth"), None)?;
-        assert_eq!(next.sequence().get(), last.get() + 1);
-        let (retained, _receipt) = publications
-            .snapshot(None, NonZeroU16::new(8).unwrap())?
-            .into_parts();
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].sequence(), next.sequence());
+        delivery.update(&publications, Some(&sender))?;
+        delivery.next().await;
+        delivery.update(&publications, Some(&sender))?;
+        assert_eq!(received().unwrap().payload["text"], "first");
+        delivery.update(&publications, Some(&sender))?;
+        let merged = received().unwrap();
+        assert_eq!(merged.event, "document_changed");
+        assert_eq!(merged.payload["revision"], 9);
+        assert_eq!(merged.payload["status"], status);
+        assert!(merged.payload.get("_publication").is_none());
+
+        // With the outbox drained, a later wake precedes the next direct sequenced send.
+        publications.publish(wake(serde_json::json!({"revision":10})), Some(&sender))?;
+        publications.publish(event("second"), Some(&sender))?;
+        assert_eq!(received().unwrap().payload["revision"], 10);
+        assert_eq!(received().unwrap().payload["text"], "second");
+        assert!(received().is_none());
         Ok(())
+    }
+
+    /// Create a document notification for the test session.
+    fn wake(mut payload: serde_json::Value) -> SessionEvent {
+        payload["session_id"] = "session".into();
+        SessionEvent {
+            session_id: "session".into(),
+            event: "document_changed".into(),
+            payload,
+        }
     }
 
     /// Create valid transport content whose exact order and body survive retention.

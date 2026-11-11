@@ -31,6 +31,10 @@ pub(crate) fn exclusive_file_lock(path: &std::path::Path, purpose: &str) -> Resu
             Err(std::fs::TryLockError::WouldBlock)
                 if started.elapsed() < std::time::Duration::from_secs(5) =>
             {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "schema bootstrap polls a lock file held by another process, which offers no wake signal"
+                )]
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(

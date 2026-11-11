@@ -124,8 +124,9 @@ impl HarnessService {
         let _activity = self.admit().await?;
         let mut model = config.model;
         if model == "default"
-            && let Some(preference) = SqliteStore::open(&config.data_root)?
-                .load_preference(workspace, config.provider.kind.as_str())?
+            && let Some(preference) =
+                crate::storage::writer::HistoryWriter::lease_for(&config.data_root)?
+                    .load_preference(workspace, config.provider.kind.as_str())?
         {
             model = preference.model;
         }
@@ -1206,7 +1207,9 @@ impl HarnessService {
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
         );
         if mode == InitializationMode::Services {
-            SqliteStore::open(PathBuf::from(&initialize.data_root).as_path())?;
+            crate::storage::writer::HistoryWriter::lease_for(
+                PathBuf::from(&initialize.data_root).as_path(),
+            )?;
             *harness = Some(SessionControllerRegistry::new(None, runtime, initialize));
             return Ok(json!({"initialized":true,"startup_timing":{"phases":startup_timing}}));
         }
@@ -1412,7 +1415,7 @@ impl SessionController {
         broker.snapshot()?;
         let catalog_request = broker.provider_catalog_request()?;
         let observer = broker.observer();
-        let store = SqliteStore::read_only(&broker.data_root)?;
+        let store = crate::storage::HistoryReader::current(&broker.data_root)?;
         for plan in store.list_plan(observer.session_id())? {
             observer.plan_file.reconcile_plan_artifacts(&plan)?;
         }
@@ -1480,6 +1483,7 @@ impl SessionController {
                 catalog: controller.catalog_request.clone(),
                 resource_revision: controller.mcp_revision.clone(),
                 root: controller.data_root.clone(),
+                history: crate::storage::writer::HistoryWriter::for_root(&controller.data_root)?,
                 tasks: controller.task_controller.clone(),
                 questions: controller.questions.clone(),
                 observer: controller.observer.clone(),
@@ -2158,9 +2162,11 @@ async fn route_request(
     }
     if method == RuntimeMethod::SessionProviderModelList {
         let catalog = controller.catalog_request.read().await.clone();
-        let selected = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
-            .load_session(&session_id)?
-            .context("model catalog session is missing")?;
+        let selected = crate::storage::writer::HistoryWriter::lease_for(
+            PathBuf::from(&registry.initialize.data_root).as_path(),
+        )?
+        .load_session(&session_id)?
+        .context("model catalog session is missing")?;
         let mut model_list = tokio::time::timeout(
             Duration::from_secs(30),
             controller
@@ -2169,9 +2175,10 @@ async fn route_request(
         )
         .await
         .context("model catalog exceeded 30 seconds")??;
-        let preference =
-            SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
-                .load_preference(&selected.workspace, &selected.provider)?;
+        let preference = crate::storage::writer::HistoryWriter::lease_for(
+            PathBuf::from(&registry.initialize.data_root).as_path(),
+        )?
+        .load_preference(&selected.workspace, &selected.provider)?;
         crate::provider::select_model_settings(&mut model_list, preference.as_ref());
         message_sink
             .send_response(Response::success(request.id, model_list)?)
@@ -2199,10 +2206,11 @@ async fn route_request(
         if method == RuntimeMethod::SessionCheckList {
             controller.checks.refresh_changes().await?;
         }
-        let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-        let session = store
-            .load_session(&session_id)?
-            .context("checks session is missing")?;
+        let session = crate::storage::writer::HistoryWriter::lease_for(
+            PathBuf::from(&registry.initialize.data_root).as_path(),
+        )?
+        .load_session(&session_id)?
+        .context("checks session is missing")?;
         let task = controller.task_controller.current()?;
         let task_id = task.as_ref().map(|task| task.id.as_str());
         let result = match operation {
@@ -2722,6 +2730,12 @@ async fn delete_stopping_session(
         require_idle_deletion(controller)?;
         controller.broker.lock().await.release_lease()?;
     }
+    // Deletion runs the plan and input owners inside its transaction, and the input owner
+    // takes the writer's lease, so this store keeps a connection of its own.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "deletion runs owners that take the writer's lease inside its transaction"
+    )]
     let mut store = SqliteStore::open(std::path::Path::new(&registry.initialize.data_root))?;
     let session = crate::broker::SessionNotFound::require(store.load_session(target)?, target)?;
     let plans = crate::plan::PlanFileStore::new(

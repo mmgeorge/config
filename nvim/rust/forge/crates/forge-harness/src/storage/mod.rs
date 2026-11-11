@@ -13,6 +13,8 @@ mod observed_agent;
 mod ownership;
 mod preferences;
 mod question;
+mod reader;
+pub(crate) use reader::HistoryReader;
 mod recovery;
 mod schema;
 pub mod state;
@@ -20,6 +22,7 @@ mod task;
 pub(crate) use schema::{bootstrap_lock, exclusive_file_lock};
 pub(crate) use task::{PlanArtifactGuard, TaskEffects};
 mod tool_output;
+pub(crate) mod writer;
 
 #[cfg(test)]
 mod concurrency_tests;
@@ -95,9 +98,12 @@ struct SessionEnvelope {
 
 /// Owns SQLite metadata and content-addressed objects for the Harness broker.
 pub struct SqliteStore {
-    connection: database::HistoryConnection,
+    connection: writer::OrderedConnection,
     admission: std::sync::Arc<admission::AdmissionRegistry>,
     current_exchange: std::cell::RefCell<Option<current::CurrentExchangeCache>>,
+    /// Tool calls whose output rows this handle created through a queued whole-exchange save.
+    /// A direct exchange write clears it, because that write can remove a call's rows.
+    appended_tool_output: std::cell::RefCell<std::collections::HashSet<(String, String, String)>>,
     session_lock: std::collections::HashMap<String, std::sync::Arc<fs::File>>,
     data_root: std::path::PathBuf,
     pub objects: objects::ObjectStore,
@@ -166,9 +172,10 @@ impl SqliteStore {
         let objects = objects::ObjectStore::open(data_root)?;
         let connection = database::HistoryConnection::open(data_root)?;
         Ok(Self {
-            connection,
+            connection: writer::OrderedConnection::new(connection),
             admission: admission::registry(data_root)?,
             current_exchange: Default::default(),
+            appended_tool_output: Default::default(),
             session_lock: Default::default(),
             data_root: data_root.to_owned(),
             objects,
@@ -179,9 +186,10 @@ impl SqliteStore {
     pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
         let connection = database::HistoryConnection::read_only(data_root)?;
         Ok(Self {
-            connection,
+            connection: writer::OrderedConnection::new(connection),
             admission: admission::registry(data_root)?,
             current_exchange: Default::default(),
+            appended_tool_output: Default::default(),
             session_lock: Default::default(),
             data_root: data_root.to_owned(),
             objects: objects::ObjectStore::open(data_root)?,
@@ -331,6 +339,12 @@ impl SqliteStore {
 
     /// Persist an exchange and admit its delegated child requests atomically.
     pub fn save_exchange(&mut self, interaction: &Exchange) -> Result<()> {
+        // A queued save that failed ended this session's saved prefix; a later direct save
+        // must not paper over the content that was shown and lost.
+        if let Some(failure) = self.write_behind_failure(&interaction.session_id) {
+            return Err(failure.into());
+        }
+        self.appended_tool_output.borrow_mut().clear();
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -344,10 +358,48 @@ impl SqliteStore {
         )
     }
 
-    fn write_exchange(
-        transaction: &rusqlite::Transaction<'_>,
-        interaction: &Exchange,
-    ) -> Result<()> {
+    /// Queue an exchange whose content is already shown; the writer thread encodes and saves
+    /// it. A crash loses the queued tail, and a failed save fences the session.
+    pub(crate) fn save_exchange_behind(&self, interaction: &Exchange) -> Result<()> {
+        let ticket = self
+            .connection
+            .writer(&self.data_root)?
+            .enqueue_exchange(interaction.clone())?;
+        self.connection.retain(ticket);
+        Ok(())
+    }
+
+    /// Get the failure that ended this session's saved prefix, if a queued save failed.
+    pub(crate) fn write_behind_failure(
+        &self,
+        session_id: &str,
+    ) -> Option<writer::WriteBehindFailure> {
+        self.connection
+            .started_writer()?
+            .failure(&writer::WriteScope::Session(session_id.to_owned()))
+    }
+
+    /// Report whether this handle is outside any transaction, so another reader may reuse it.
+    fn is_idle(&self) -> bool {
+        self.connection.unordered().is_autocommit()
+    }
+
+    /// Wait for the write-behind work this handle queued.
+    pub(super) fn settle_write_behind(&self) {
+        self.connection.settle();
+    }
+
+    /// Borrow SQLite without waiting for queued work, for the writer thread's own handle.
+    fn connection(&self) -> &Connection {
+        self.connection.unordered()
+    }
+
+    /// Borrow SQLite mutably without waiting for queued work.
+    fn connection_mut(&mut self) -> &mut Connection {
+        self.connection.unordered_mut()
+    }
+
+    fn write_exchange(transaction: &Connection, interaction: &Exchange) -> Result<()> {
         let belongs: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE id=?1 AND session_id=?2)",
             params![interaction.agent_id, interaction.session_id],
@@ -529,6 +581,7 @@ impl SqliteStore {
 
     /// Remove one provisional interaction after its provider turn is retracted.
     pub fn delete_exchange(&mut self, interaction_id: &str) -> Result<()> {
+        self.appended_tool_output.borrow_mut().clear();
         let session_id: Option<String> = self
             .connection
             .query_row(
@@ -1342,6 +1395,15 @@ pub(crate) mod test {
         Ok(())
     }
 
+    /// Open a second, unmanaged connection to a root's history database.
+    ///
+    /// Tests use it to install a trigger that makes one statement fail, to seed rows a
+    /// production path never writes, and to observe committed state from outside the writer.
+    /// It is the only raw history connection the test suites open.
+    pub(crate) fn raw_connection(root: &Path) -> rusqlite::Result<rusqlite::Connection> {
+        rusqlite::Connection::open(state::database(root))
+    }
+
     pub(crate) fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {
             purpose: crate::session::SessionPurpose::Conversation,
@@ -1380,14 +1442,9 @@ pub(crate) mod test {
         }
     }
 
-    #[test]
-    fn recovery_is_atomic_and_preserves_waiting_exchanges() {
-        use crate::exchange::ExchangeState;
-        let temporary = tempfile::tempdir().unwrap();
-        let mut store = SqliteStore::open(temporary.path()).unwrap();
-        store.save_session(&session("session", "D:/work")).unwrap();
-        store.save_agent_run(&Agent::primary("session", 0)).unwrap();
-        let mut exchange = Exchange {
+    /// Create a running exchange owned by the primary agent of session `session`.
+    pub(crate) fn running_exchange(id: &str) -> Exchange {
+        Exchange {
             finalization_error: None,
             check_owner: None,
             output_store: None,
@@ -1395,7 +1452,7 @@ pub(crate) mod test {
             input_message_id: None,
             provider_retry: None,
             agent_id: "session:agent:primary".into(),
-            id: "active".into(),
+            id: id.into(),
             session_id: "session".into(),
             ordinal: 1,
             prompt: "work".into(),
@@ -1425,7 +1482,17 @@ pub(crate) mod test {
                 elapsed_ms: 20,
                 started_at_ms: 30,
             },
-        };
+        }
+    }
+
+    #[test]
+    fn recovery_is_atomic_and_preserves_waiting_exchanges() {
+        use crate::exchange::ExchangeState;
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
+        store.save_session(&session("session", "D:/work")).unwrap();
+        store.save_agent_run(&Agent::primary("session", 0)).unwrap();
+        let mut exchange = running_exchange("active");
         exchange.observe_blocker("approval:recovery".into(), true, 70);
         store.save_exchange(&exchange).unwrap();
         exchange.id = "waiting".into();

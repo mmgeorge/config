@@ -650,7 +650,12 @@ impl HarnessBroker {
             && transaction.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES
         {
             match transaction.native.events.try_next() {
-                Ok(Some(event)) => transaction.pending_session_observations.push_back(event),
+                Ok(Some(event)) => {
+                    crate::provider::session_execution::OwnerObservation::retain_in(
+                        &mut transaction.pending_session_observations,
+                        event,
+                    );
+                }
                 Ok(None) => break,
                 Err(error) => {
                     transaction.native.stream_open = false;
@@ -668,7 +673,12 @@ impl HarnessBroker {
                     if events.is_empty() && transaction.session_events.is_closed() {
                         transaction.failure_inbox_open = false;
                     }
-                    transaction.pending_session_observations.extend(events);
+                    for event in events {
+                        crate::provider::session_execution::OwnerObservation::retain_in(
+                            &mut transaction.pending_session_observations,
+                            event,
+                        );
+                    }
                 }
                 Err(error) => {
                     transaction.failure_inbox_open = false;

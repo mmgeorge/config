@@ -4,12 +4,24 @@ local MAX_PENDING_FRAMES = 4096
 local MAX_BATCH_BYTES = 256 * 1024
 local MAX_BATCH_FRAMES = 16
 
+-- One drain callback stops after this long so redraw and input run between batches.
+local BATCH_BUDGET_NS = 4 * 1000 * 1000
+
 local drain
 
 local function schedule(state)
   if state.scheduled or state.closed then return end
   state.scheduled = true
   vim.schedule(function() drain(state) end)
+end
+
+--- Continues a slow backlog from a timer: callbacks queued with `vim.schedule` run back to back,
+--- so a rescheduled drain would hold the main loop until the queue emptied. Cheap batches keep
+--- the scheduled path, because a timer tick per batch would cap throughput.
+local function continue_later(state)
+  if state.scheduled or state.closed then return end
+  state.scheduled = true
+  vim.defer_fn(function() drain(state) end, 1)
 end
 
 local function fail(state, message)
@@ -90,9 +102,14 @@ drain = function(state)
     return
   end
   local frames, bytes = 0, 0
+  local batch_started, over_budget = vim.uv.hrtime(), false
   while state.head <= state.tail and frames < MAX_BATCH_FRAMES do
     local frame = state.queue[state.head]
     if frames > 0 and bytes + frame.bytes > MAX_BATCH_BYTES then break end
+    if frames > 0 and vim.uv.hrtime() - batch_started >= BATCH_BUDGET_NS then
+      over_budget = true
+      break
+    end
     local decode_started = vim.uv.hrtime()
     local ok, message, decode_error = pcall(state.options.decode, frame.line)
     local timing = { received_at = frame.received_at, bytes = frame.bytes,
@@ -117,7 +134,7 @@ drain = function(state)
   end
   if state.closed or state.failure then return end
   if state.head <= state.tail then
-    schedule(state)
+    if over_budget then continue_later(state) else schedule(state) end
   else
     state.queue, state.head, state.tail = {}, 1, 0
     if state.ending then

@@ -1830,7 +1830,14 @@ fn apply_projection<'operation>(
                 message,
                 ..
             } => {
-                if message.kind() != crate::turn::MessageKind::Assistant {
+                // A provider that cannot tell commentary from the response until the turn
+                // ends streams its prose unclassified. That prose is as visible as classified
+                // prose, so both kinds update their block; skipping it froze the transcript
+                // at the first delta until the turn completed.
+                if !matches!(
+                    message.kind(),
+                    crate::turn::MessageKind::Assistant | crate::turn::MessageKind::Unknown
+                ) {
                     continue;
                 }
                 let block_id = forge_buffer::identity::BlockId(block_id.clone());
@@ -2336,7 +2343,7 @@ mod tests {
         tokio::task::spawn_blocking(move || -> Result<()> {
             forge_git::test_support::init_repository(&saved_workspace);
             let mut store = crate::storage::SqliteStore::open(&saved_data)?;
-            let connection = rusqlite::Connection::open(crate::storage::state::database(&saved_data))?;
+            let connection = crate::storage::test::raw_connection(&saved_data)?;
             connection.execute("INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('session', ?1, 0, '{}')", [saved_workspace.to_string_lossy().as_ref()])?;
             for (id, text) in [("before", before), ("after", saved_after.as_str())] {
                 store.save_checkpoint(&crate::checkpoint::CheckpointRecord {

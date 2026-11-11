@@ -213,3 +213,50 @@ fn randomized_transactions_match_independent_block_model() {
         assert_eq!(actual, reference);
     }
 }
+
+#[test]
+fn distant_block_changes_publish_separate_edits_without_the_rows_between_them() {
+    let mut document = BufferDocument::new(
+        DocumentId("wide".into()),
+        (0..400)
+            .map(|identity| block(identity, &["first", "last"]))
+            .collect(),
+    )
+    .unwrap();
+    let before = document.snapshot();
+    let mut replacement: Vec<_> = (0..400)
+        .map(|identity| block(identity, &["first", "last"]))
+        .collect();
+    replacement[1] = block(1, &["first", "header changed"]);
+    replacement[399] = block(399, &["first", "streamed", "tail"]);
+    let patch = document.edit(0..400, replacement).unwrap().unwrap();
+    assert_eq!(patch.text_edit.len(), 2);
+    assert_eq!(patch.text_edit[0].start_row, 799);
+    assert_eq!(patch.text_edit[0].removed_rows, 1);
+    assert_eq!(patch.text_edit[0].text.wire_rows(), ["streamed", "tail"]);
+    assert_eq!(patch.text_edit[1].start_row, 3);
+    assert_eq!(patch.text_edit[1].removed_rows, 1);
+    assert_eq!(patch.text_edit[1].text.wire_rows(), ["header changed"]);
+    assert_eq!(patch.metadata_edit.len(), 2);
+    assert_eq!(
+        apply_snapshot_reference(&before, &patch).unwrap(),
+        document.snapshot()
+    );
+
+    // Neighbouring changed blocks still publish one contiguous edit.
+    let before = document.snapshot();
+    let patch = document
+        .edit(
+            10..12,
+            vec![block(10, &["first", "ten"]), block(11, &["eleven", "last"])],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(patch.text_edit.len(), 1);
+    assert_eq!(patch.text_edit[0].start_row, 21);
+    assert_eq!(patch.text_edit[0].text.wire_rows(), ["ten", "eleven"]);
+    assert_eq!(
+        apply_snapshot_reference(&before, &patch).unwrap(),
+        document.snapshot()
+    );
+}

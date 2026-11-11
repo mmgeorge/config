@@ -288,6 +288,10 @@ impl SettingsStore {
         Ok(())
     }
     pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "settings live in their own database outside versioned state"
+        )]
         let connection = Connection::open_with_flags(
             data_root.join("settings.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -304,6 +308,10 @@ impl SettingsStore {
     /// Opens settings without repeating schema writes for a current database.
     pub fn open(data_root: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_root)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "settings live in their own database outside versioned state"
+        )]
         let mut connection = Connection::open(data_root.join("settings.db"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;

@@ -138,6 +138,21 @@ T["markdown_viewport"] = function()
   wait_until(function() return owner.ready end, "snapshot did not settle", { timeout_ms = 4000 })
   vim.cmd("redraw")
   assert(owner.markdown_ranges[1].id == "history:1" and #owner.markdown_ranges == 1)
+  -- A highlighter that hides whole lines parses each visible row inside the buffer edit itself.
+  local parser = assert(vim.treesitter.get_parser(transcript, "markdown"))
+  local parse, edit_parses, editing = parser.parse, 0, false
+  parser.parse = function(tree, range, on_parse)
+    if editing then edit_parses = edit_parses + 1 end
+    return parse(tree, range, on_parse)
+  end
+  local set_text = vim.api.nvim_buf_set_text
+  vim.api.nvim_buf_set_text = function(...)
+    editing = true
+    local ok, failure = pcall(set_text, ...)
+    editing = false
+    assert(ok, failure)
+  end
+  MiniTest.finally(function() vim.api.nvim_buf_set_text = set_text end)
   for revision = 1, 100 do
     markdown_visits = 0
     local count = #requests
@@ -169,6 +184,15 @@ T["markdown_viewport"] = function()
   owner.resize()
   assert(#owner.markdown_ranges == 2, "split windows lost one visible Markdown region")
   assert(owner.markdown_ranges[1].id == "history:1" and owner.markdown_ranges[2].id == "history:3000")
+  -- With concealment on, a highlighter that hides whole lines answers each visible row's
+  -- concealment by parsing inside the edit, so one drawn window is enough to expose it.
+  assert(vim.treesitter.highlighter.active[transcript], "transcript lost its Tree-sitter highlighter")
+  vim.wo[second].conceallevel = 3
+  vim.cmd("redraw")
+  vim.bo[transcript].modifiable, vim.bo[transcript].readonly = true, false
+  edit_parses = 0
+  vim.api.nvim_buf_set_text(transcript, 1, 0, 1, 0, { "changed " })
+  assert(edit_parses == 0, "a transcript edit ran " .. edit_parses .. " synchronous Tree-sitter parses")
   owner.close()
 end
 

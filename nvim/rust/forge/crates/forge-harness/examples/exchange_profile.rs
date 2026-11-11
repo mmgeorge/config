@@ -1,3 +1,5 @@
+// This fixture builds storage through a handle of its own, outside any running host.
+#![allow(clippy::disallowed_methods)]
 //! Measure exchange serialization and timeline replacement without modifying retained state.
 
 use std::{hint::black_box, time::Instant};

@@ -690,48 +690,38 @@ impl TrackedInput {
         {
             return Ok(());
         }
-        match &self.purpose {
+        let acknowledgement = match &self.purpose {
             InputPurpose::TaskEntry { revision, id, .. } => {
-                let mut store = crate::storage::SqliteStore::open(&services.root)
-                    .map_err(InputReceiptError::Task)?;
-                match &self.task_permit {
-                    Some(permit) => services.tasks.acknowledge_dispatched_input(
-                        &mut store,
-                        permit,
-                        id,
-                        crate::task::TaskReceiptInput::Entry,
-                        now_ms()?,
-                    ),
-                    None => services
-                        .tasks
-                        .acknowledge_entry(&mut store, revision, id, now_ms()?),
-                }
-                .map_err(InputReceiptError::Task)?;
+                Some((crate::task::TaskReceiptInput::Entry, revision, id))
             }
             InputPurpose::TaskContinuation { revision, id, .. } => {
-                let mut store = crate::storage::SqliteStore::open(&services.root)
-                    .map_err(InputReceiptError::Task)?;
-                match &self.task_permit {
-                    Some(permit) => services.tasks.acknowledge_dispatched_input(
-                        &mut store,
-                        permit,
-                        id,
-                        crate::task::TaskReceiptInput::Continuation,
-                        now_ms()?,
-                    ),
-                    None => {
-                        services
-                            .tasks
-                            .acknowledge_continuation(&mut store, revision, id, now_ms()?)
-                    }
-                }
-                .map_err(InputReceiptError::Task)?;
+                Some((crate::task::TaskReceiptInput::Continuation, revision, id))
             }
             InputPurpose::Clarification { .. }
             | InputPurpose::User
             | InputPurpose::Question { .. }
             | InputPurpose::QuestionContinuation { .. }
-            | InputPurpose::WorkflowContinuation { .. } => {}
+            | InputPurpose::WorkflowContinuation { .. } => None,
+        };
+        if let Some((kind, revision, id)) = acknowledgement {
+            let now = now_ms()?;
+            // The acknowledgement commits through the history writer, after every write queued
+            // before it.
+            services
+                .history
+                .exclusive(|store| match (&self.task_permit, kind) {
+                    (Some(permit), kind) => services
+                        .tasks
+                        .acknowledge_dispatched_input(store, permit, id, kind, now),
+                    (None, crate::task::TaskReceiptInput::Entry) => {
+                        services.tasks.acknowledge_entry(store, revision, id, now)
+                    }
+                    (None, crate::task::TaskReceiptInput::Continuation) => services
+                        .tasks
+                        .acknowledge_continuation(store, revision, id, now),
+                })
+                .and_then(|acknowledged| acknowledged)
+                .map_err(InputReceiptError::Task)?;
         }
         self.accepted = true;
         Ok(())
@@ -748,8 +738,8 @@ impl TrackedInput {
             | InputPurpose::QuestionContinuation { .. }
             | InputPurpose::WorkflowContinuation { .. } => return Ok(()),
         };
-        let mut store =
-            crate::storage::SqliteStore::open(&services.root).map_err(InputReceiptError::Task)?;
+        let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)
+            .map_err(InputReceiptError::Task)?;
         match services.tasks.change(
             &mut store,
             Some(revision),

@@ -25,6 +25,8 @@ pub(crate) struct OwnerServices {
     pub(crate) resource_revision: Arc<std::sync::atomic::AtomicU64>,
     /// Root of retained attachments and command storage.
     pub(crate) root: PathBuf,
+    /// The state root's history writer, watched for failed write-behind saves.
+    pub(crate) history: crate::storage::writer::HistoryWriter,
     /// Task authority affected by accepting explicit caller input.
     pub(crate) tasks: Arc<crate::task::SessionTaskController>,
     /// Revision-scoped question authority revalidated before input dispatch.

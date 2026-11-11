@@ -299,7 +299,8 @@ pub(crate) enum QuestionCreationReplayError {
 
 /// Serialize question changes in their own transaction, without an execution lock.
 pub(crate) struct QuestionController {
-    connection: Mutex<crate::storage::database::HistoryConnection>,
+    /// The state root's history writer; every question statement runs on its connection.
+    writer: crate::storage::writer::HistoryWriter,
     /// Each guard registers once per ID; repeated IDs represent independently owned waits.
     waiting: Mutex<Vec<QuestionId>>,
     session_id: String,
@@ -309,11 +310,10 @@ pub(crate) struct QuestionController {
 impl QuestionController {
     /// Create a controller using the session database's durable SQLite policy.
     pub(crate) fn open(root: &Path, session_id: &str) -> Result<Self> {
-        let connection = crate::storage::database::HistoryConnection::open(root)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS session_question_state(session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,format_version INTEGER NOT NULL,payload TEXT NOT NULL);")?;
+        let writer = crate::storage::writer::HistoryWriter::for_root(root)?;
+        writer.connection()?.execute_batch("CREATE TABLE IF NOT EXISTS session_question_state(session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,format_version INTEGER NOT NULL,payload TEXT NOT NULL);")?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            writer,
             waiting: Mutex::new(Vec::new()),
             session_id: session_id.into(),
             changed: tokio::sync::watch::channel(0).0,
@@ -322,28 +322,19 @@ impl QuestionController {
 
     /// Get current durable questions, including answers and discussion history.
     pub(crate) fn snapshot(&self) -> Result<QuestionSnapshot> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let connection = self.writer.connection()?;
         Ok(self.load(&connection)?.snapshot)
     }
 
     /// Get user messages that have not yet entered the input journal.
     pub(crate) fn outbox(&self) -> Result<Vec<QuestionOutbox>> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let connection = self.writer.connection()?;
         Ok(self.load(&connection)?.outbox)
     }
 
     /// Reject queued answer delivery after its originating execution was cancelled.
     pub(crate) fn delivery_is_current(&self, id: &QuestionId) -> Result<bool> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let connection = self.writer.connection()?;
         let state = self.load(&connection)?;
         let Some(question) = state
             .snapshot
@@ -375,10 +366,7 @@ impl QuestionController {
 
     /// Get interrupted chat requests whose required decisions are all resolved.
     pub(crate) fn ready_chat_continuations(&self) -> Result<Vec<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let connection = self.writer.connection()?;
         let state = self.load(&connection)?;
         if state.snapshot.required_pending() || !state.outbox.is_empty() {
             return Ok(Vec::new());
@@ -417,10 +405,7 @@ impl QuestionController {
 
     /// Reject already queued work after its owning chat request was cancelled.
     pub(crate) fn chat_continuation_is_current(&self, exchange_id: &str) -> Result<bool> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let connection = self.writer.connection()?;
         Ok(matches!(
             self.load(&connection)?.chat_continuation.get(exchange_id),
             Some(ChatContinuation::Waiting | ChatContinuation::Admitted)
@@ -432,10 +417,7 @@ impl QuestionController {
         &self,
         selection: &crate::exchange::command::ExchangeContinuationSelection,
     ) -> Result<bool> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let connection = self.writer.connection()?;
         let latest: Option<String> = connection.query_row("SELECT id FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal DESC LIMIT 1", params![self.session_id,crate::session::HarnessSession::primary_agent_id(&self.session_id)], |row| row.get(0)).optional()?;
         if latest.as_deref() != Some(selection.id().as_str()) {
             return Ok(false);
@@ -501,9 +483,10 @@ impl QuestionController {
         &self,
         command: &QuestionCommand,
     ) -> std::result::Result<Option<QuestionSnapshot>, QuestionCreationReplayError> {
-        let connection = self.connection.lock().map_err(|_| {
-            QuestionCreationReplayError::State(anyhow::anyhow!("question store poisoned"))
-        })?;
+        let connection = self
+            .writer
+            .connection()
+            .map_err(QuestionCreationReplayError::State)?;
         let state = self
             .load(&connection)
             .map_err(QuestionCreationReplayError::State)?;
@@ -531,9 +514,10 @@ impl QuestionController {
         origin: QuestionOrigin<'_>,
         drafts: &[QuestionDraft],
     ) -> std::result::Result<Option<Vec<QuestionId>>, QuestionCreationReplayError> {
-        let connection = self.connection.lock().map_err(|_| {
-            QuestionCreationReplayError::State(anyhow::anyhow!("question store poisoned"))
-        })?;
+        let connection = self
+            .writer
+            .connection()
+            .map_err(QuestionCreationReplayError::State)?;
         let state = self
             .load(&connection)
             .map_err(QuestionCreationReplayError::State)?;
@@ -589,8 +573,8 @@ impl QuestionController {
         ids: &[QuestionId],
     ) -> std::result::Result<Option<Vec<QuestionRecord>>, QuestionWaitError> {
         let connection = self
-            .connection
-            .lock()
+            .writer
+            .connection()
             .map_err(|_| QuestionWaitError::StateUnavailable)?;
         let state = self.load(&connection).map_err(QuestionWaitError::State)?;
         let key = wait_result_key(ids)?;
@@ -815,8 +799,8 @@ impl QuestionController {
     ) -> std::result::Result<Option<Vec<QuestionRecord>>, QuestionWaitError> {
         // Keep question-store-before-wait-registry order, matching answer admission.
         let mut connection = self
-            .connection
-            .lock()
+            .writer
+            .connection()
             .map_err(|_| QuestionWaitError::StateUnavailable)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut state = self.load(&transaction).map_err(QuestionWaitError::State)?;
@@ -954,10 +938,7 @@ impl QuestionController {
         );
         let encoded = serde_json::to_string(&command)?;
         let operation_id = command.operation_id.clone();
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let mut connection = self.writer.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut state = self.load(&transaction)?;
         if let Some(previous) = state.operations.get(&operation_id) {
@@ -1226,10 +1207,7 @@ impl QuestionController {
         task: Option<&crate::task::Task>,
         change: impl FnOnce(&mut QuestionState) -> Result<Output>,
     ) -> Result<Output> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let mut connection = self.writer.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(task) = task {
             let current: Option<(String, String)> = transaction.query_row(

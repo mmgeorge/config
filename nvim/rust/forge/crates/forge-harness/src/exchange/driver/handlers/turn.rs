@@ -191,12 +191,29 @@ impl ExchangeDriver {
                             _execution: execution,
                             ..
                         } = runtime;
+                        // Settlement commits the turn's final state, so it runs on the blocking pool.
                         let (outcome, catalog) = {
-                            let mut broker = broker.lock().await;
-                            (
-                                broker.finish_foreground(transaction),
-                                broker.provider_catalog_request(),
-                            )
+                            let mut broker = broker.clone().lock_owned().await;
+                            let span = tracing::Span::current();
+                            let settled = tokio::task::spawn_blocking(move || {
+                                let _entered = span.enter();
+                                (
+                                    broker.finish_foreground(transaction),
+                                    broker.provider_catalog_request(),
+                                )
+                            })
+                            .await;
+                            match settled {
+                                Ok(settled) => settled,
+                                Err(error) => (
+                                    Err(anyhow::anyhow!(
+                                        "foreground settlement worker failed: {error}"
+                                    )),
+                                    Err(anyhow::anyhow!(
+                                        "foreground settlement worker failed: {error}"
+                                    )),
+                                ),
+                            }
                         };
                         let outcome = match catalog {
                             Ok(catalog) => {

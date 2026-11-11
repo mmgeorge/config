@@ -104,8 +104,7 @@ async fn plan_answers_commit_under_owner_and_replay_original_publication() -> Re
 async fn plan_answer_publication_failure_rolls_back_decision_and_receipt() -> Result<()> {
     let (_root, controller, request) = fixture().await?;
     let session = controller.observer.session_id();
-    let database =
-        rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
+    let database = crate::storage::test::raw_connection(&controller.data_root)?;
     database.execute_batch("CREATE TRIGGER fail_plan_answer_publication BEFORE INSERT ON owner_publication WHEN json_extract(NEW.event,'$.event')='question_updated' BEGIN SELECT RAISE(ABORT,'publication failed'); END;")?;
     let events = controller.exchange_owner.question_events();
     let error = events

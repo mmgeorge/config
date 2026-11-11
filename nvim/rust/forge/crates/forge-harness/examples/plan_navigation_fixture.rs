@@ -1,3 +1,5 @@
+// This fixture builds storage through a handle of its own, outside any running host.
+#![allow(clippy::disallowed_methods)]
 //! Seeds a disposable mock Harness session with real captured language fixtures.
 
 use anyhow::{Context, Result};

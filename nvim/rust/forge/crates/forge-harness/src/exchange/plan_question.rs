@@ -9,7 +9,7 @@ pub(super) fn commit(
     request: &PlanQuestionAnswerRequest,
     services: &OwnerServices,
 ) -> Result<PlanQuestionAnswerCommit, QuestionEventError> {
-    let mut store = crate::storage::SqliteStore::open(&services.root)
+    let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)
         .map_err(PlanQuestionAnswerError::State)
         .map_err(QuestionEventError::PlanAnswer)?;
     let result =

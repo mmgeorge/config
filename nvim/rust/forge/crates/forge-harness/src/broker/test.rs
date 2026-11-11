@@ -712,6 +712,9 @@ fn saturating_provider(
     completed: bool,
     wait_for_capacity: bool,
     cancelled: Arc<AtomicBool>,
+    // When set, each delta is one Markdown paragraph and the provider sends the next only after
+    // the reader signals that it has seen the previous one, as a model streams to an editor.
+    paragraph_pace: Option<Arc<Notify>>,
 ) -> Arc<Provider> {
     let descriptor = forge_provider_api::ProviderDescriptor {
         kind: forge_providers::registry::nonselectable_id().expect("fixture identity is available"),
@@ -723,6 +726,7 @@ fn saturating_provider(
         descriptor,
         move |request, sink, start, mut cancellation| {
             let cancelled = cancelled.clone();
+            let paragraph_pace = paragraph_pace.clone();
             async move {
                 let native_outcome = forge_provider_api::turn::TurnOutcome::Completed {
                     stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
@@ -748,18 +752,30 @@ fn saturating_provider(
                 // A waiting burst proves bounded delivery drains. The non-waiting variant
                 // sends one event and then injects the overflow a full outbound queue
                 // reports, instead of filling that queue by volume.
-                let event_count = if wait_for_capacity { 384 } else { 1 };
+                let event_count = match (&paragraph_pace, wait_for_capacity) {
+                    (Some(_), _) => 12,
+                    (None, true) => 384,
+                    (None, false) => 1,
+                };
                 for sequence in 0..event_count {
-                    let delta = sequence.to_string();
+                    let delta = match &paragraph_pace {
+                        Some(_) => format!("paragraph {sequence}\n\n"),
+                        None => sequence.to_string(),
+                    };
                     text.push_str(&delta);
                     let update = if sequence == 0 {
                         forge_provider_api::ItemEvent::Started(
                             forge_provider_api::ItemStart::AgentMessage(
                                 forge_provider_api::AgentMessageStart {
-                                    classification:
+                                    // A provider that streams prose before it knows whether
+                                    // a tool call follows leaves the message unclassified.
+                                    classification: if paragraph_pace.is_some() {
+                                        forge_provider_api::MessageClassification::Unclassified
+                                    } else {
                                         forge_provider_api::MessageClassification::Known(
                                             forge_provider_api::AgentMessageRole::Response,
-                                        ),
+                                        )
+                                    },
                                     text: delta,
                                 },
                             ),
@@ -778,6 +794,9 @@ fn saturating_provider(
                     if wait_for_capacity {
                         sink.send_wait(crate::provider::test_support::activity(event)?)
                             .await?;
+                        if let Some(pace) = &paragraph_pace {
+                            pace.notified().await;
+                        }
                     } else {
                         sink.send(crate::provider::test_support::activity(event)?)?;
                     }
@@ -874,7 +893,8 @@ async fn event_saturation_cancels_pending_and_completed_provider_turns() {
         )
         .unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let fixture_provider = saturating_provider(&broker, completed, false, cancelled.clone());
+        let fixture_provider =
+            saturating_provider(&broker, completed, false, cancelled.clone(), None);
         broker.provider = fixture_provider;
         let admitted = broker
             .dispatch(Request {
@@ -903,10 +923,12 @@ async fn event_saturation_cancels_pending_and_completed_provider_turns() {
     }
 }
 
-#[tokio::test]
-async fn burst_delivery_drains_both_queues_and_keeps_the_next_prompt_usable() {
-    let repository = repository();
-    let data = tempfile::tempdir().unwrap();
+/// Create a broker whose fixture provider streams a burst of 384 text deltas per prompt.
+fn burst_broker(
+    repository: &tempfile::TempDir,
+    data: &tempfile::TempDir,
+    cancelled: Arc<AtomicBool>,
+) -> HarnessBroker {
     let mut broker = HarnessBroker::initialize_with_clock(
         InitializeRequest {
             background: None,
@@ -931,9 +953,137 @@ async fn burst_delivery_drains_both_queues_and_keeps_the_next_prompt_usable() {
         Box::new(FixedClock(200)),
     )
     .unwrap();
+    broker.provider = saturating_provider(&broker, true, true, cancelled, None);
+    broker
+}
+
+/// A streamed save that fails after its text was shown fences the session at the next save.
+#[tokio::test]
+async fn failed_write_behind_save_fails_the_turn_instead_of_healing() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = burst_broker(&repository, &data, Arc::new(AtomicBool::new(false)));
+    let database = crate::storage::test::raw_connection(data.path()).unwrap();
+    // Refuse the exchange once its streamed text reaches the sixteenth digit of the burst.
+    database
+        .execute_batch(
+            "CREATE TRIGGER refuse_streamed_text BEFORE UPDATE ON exchange_record
+             WHEN instr(NEW.payload,'0123456789101112')>0
+             BEGIN SELECT RAISE(ABORT,'streamed text refused'); END;",
+        )
+        .unwrap();
+    let (sink, mut stream) = publication::channel();
+    let dispatch = broker.dispatch_stream(
+        Request {
+            id: 1,
+            method: "session.prompt.submit".into(),
+            params: json!({ "text": "burst then final answer" }),
+        },
+        sink,
+    );
+    let consume = async move { while stream.recv().await.unwrap().is_some() {} };
+    let (result, ()) = tokio::join!(dispatch, consume);
+    assert!(
+        result.response.error().is_some(),
+        "the turn completed although its shown text was never saved"
+    );
+    let failure = broker
+        .store
+        .write_behind_failure(&broker.session.id)
+        .expect("the failed save fences the session");
+    assert!(failure.to_string().contains("streamed text refused"));
+}
+
+/// Each streamed paragraph of a response reaches the open transcript while the turn is still
+/// running. A transcript that shows the first delta and then nothing until completion fails.
+#[tokio::test]
+async fn streamed_response_paragraphs_reach_the_open_transcript_while_the_turn_runs() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = burst_broker(&repository, &data, Arc::new(AtomicBool::new(false)));
+    let pace = Arc::new(Notify::new());
+    broker.provider = saturating_provider(
+        &broker,
+        true,
+        true,
+        Arc::new(AtomicBool::new(false)),
+        Some(pace.clone()),
+    );
+    let document = forge_buffer::identity::DocumentId("streaming-transcript".into());
+    let presentation = broker.presentation();
+    let opened = presentation
+        .lock()
+        .unwrap()
+        .open(
+            document.clone(),
+            forge_buffer::identity::ViewId("streaming-view".into()),
+            forge_buffer::width::WidthProfile::default(),
+        )
+        .unwrap();
+    let (sink, mut stream) = publication::channel();
+    let dispatch = broker.dispatch_stream(
+        Request {
+            id: 1,
+            method: "session.prompt.submit".into(),
+            params: json!({ "text": "stream twelve paragraphs" }),
+        },
+        sink,
+    );
+    let consume = async move {
+        let mut revision = opened.transcript.revision;
+        // The newest paragraph the transcript had shown at each synchronization.
+        let mut newest_shown = std::collections::BTreeSet::new();
+        let mut newest = None;
+        while let Some(event) = stream.recv().await.unwrap() {
+            if !matches!(event, SessionUpdate::DocumentChanged { .. }) {
+                continue;
+            }
+            let sync = presentation
+                .lock()
+                .unwrap()
+                .sync(&document, revision)
+                .unwrap();
+            let mut rows = Vec::new();
+            if let Some(snapshot) = &sync.snapshot {
+                revision = snapshot.revision;
+                for block in &snapshot.block {
+                    rows.extend(block.text.wire_rows().into_iter().map(str::to_owned));
+                }
+            }
+            for patch in &sync.patch {
+                revision = patch.next;
+                for edit in &patch.text_edit {
+                    rows.extend(edit.text.wire_rows().into_iter().map(str::to_owned));
+                }
+            }
+            newest = rows
+                .iter()
+                .filter_map(|row| row.trim().strip_prefix("paragraph ")?.parse::<usize>().ok())
+                .max()
+                .max(newest);
+            newest_shown.extend(newest);
+            pace.notify_one();
+        }
+        newest_shown
+    };
+    let (result, newest_shown) = tokio::join!(dispatch, consume);
+    assert!(
+        result.response.error().is_none(),
+        "{:?}",
+        result.response.error()
+    );
+    assert!(
+        newest_shown.len() >= 6,
+        "the transcript advanced only at these paragraphs of 12: {newest_shown:?}"
+    );
+}
+
+#[tokio::test]
+async fn burst_delivery_drains_both_queues_and_keeps_the_next_prompt_usable() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let fixture_provider = saturating_provider(&broker, true, true, cancelled.clone());
-    broker.provider = fixture_provider;
+    let mut broker = burst_broker(&repository, &data, cancelled.clone());
     for request_id in 1..=2 {
         let session_id = broker.session.id.clone();
         let (sink, mut stream) = publication::channel();
@@ -967,6 +1117,11 @@ async fn burst_delivery_drains_both_queues_and_keeps_the_next_prompt_usable() {
                     .expect("broker notifications must satisfy the editor wire contract");
             }
             assert!(notifications > 0);
+            // The consumer was held while the burst queued, so adjacent deltas merged.
+            assert!(
+                notifications < 384,
+                "{notifications} publications for 384 deltas"
+            );
         };
         let (result, ()) = async { tokio::join!(dispatch, consume) }.await;
         assert!(
@@ -988,7 +1143,9 @@ async fn burst_delivery_drains_both_queues_and_keeps_the_next_prompt_usable() {
             .turn
             .iter()
             .flat_map(|turn| turn.messages())
-            .any(|message| message.text.ends_with("383"))
+            .any(|message| {
+                message.text == (0..384).map(|delta| delta.to_string()).collect::<String>()
+            })
     }));
 }
 

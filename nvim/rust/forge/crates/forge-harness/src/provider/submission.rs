@@ -278,6 +278,10 @@ impl SubmissionStore {
         }
         let lease = crate::storage::state::StateLease::open(root)?;
         let directory = crate::storage::state::directory(root);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the submission journal is a separate database with its own writer"
+        )]
         let connection = Connection::open(directory.join("provider-submissions.sqlite3"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let _bootstrap = crate::storage::bootstrap_lock(&directory, "provider-submissions")?;

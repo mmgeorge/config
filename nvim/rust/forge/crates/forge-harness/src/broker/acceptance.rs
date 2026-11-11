@@ -66,7 +66,7 @@ impl BrokerObserver {
     > {
         use crate::exchange::command::{PlanEditChange, PlanEntitySelection, TaskCommandFailure};
         edit.validate_target(current)?;
-        let store = SqliteStore::read_only(&self.data_root)
+        let store = crate::storage::HistoryReader::current(&self.data_root)
             .map_err(|_| TaskCommandFailure::StateUnavailable)?;
         let mut plan = store
             .load_plan(edit.source().id().as_str())
@@ -231,7 +231,7 @@ impl BrokerObserver {
             }
             _ => anyhow::bail!("command is not a plan review decision"),
         };
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let plan_id = review
             .plan_id
             .as_deref()
@@ -482,7 +482,7 @@ impl BrokerObserver {
             .model_revision
             .checked_add(1)
             .context("plan revision exhausted")?;
-        let prior = SqliteStore::read_only(&self.data_root)?
+        let prior = crate::storage::HistoryReader::current(&self.data_root)?
             .load_plan(&plan.id)?
             .context("plan record is missing before artifact preparation")?;
         self.plan_file
@@ -583,7 +583,7 @@ impl BrokerObserver {
             crate::exchange::command::TaskCommandFailure::PreparationUnavailable
         })?;
         selection.source().validate(&captured.plan)?;
-        let store = SqliteStore::read_only(&self.data_root)
+        let store = crate::storage::HistoryReader::current(&self.data_root)
             .map_err(|_| crate::exchange::command::TaskCommandFailure::StateUnavailable)?;
         crate::exchange::command::PlanSourceGuard::Working(selection.source().clone())
             .validate_storage(&store, &self.session_id)?;
@@ -607,7 +607,7 @@ impl BrokerObserver {
     {
         use crate::exchange::command::TaskCommandFailure;
         let mut validated = self.validate_plan_execution(command, selection)?;
-        let store = SqliteStore::read_only(&self.data_root)
+        let store = crate::storage::HistoryReader::current(&self.data_root)
             .map_err(|_| TaskCommandFailure::StateUnavailable)?;
         let mut plan = store
             .load_plan(selection.source().id().as_str())
@@ -700,7 +700,7 @@ impl BrokerObserver {
         &self,
         selection: &crate::task::command::ExecuteSelection,
     ) -> Result<ExecutionCapture> {
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let mut session = store
             .load_session(&self.session_id)?
             .context("session is missing")?;
@@ -850,7 +850,7 @@ impl BrokerObserver {
             approval_modes.contains(&approval_mode),
             "execution requires an available approval decision"
         );
-        let store = SqliteStore::read_only(&self.data_root)?;
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let digest = plan
             .review_digest
             .clone()

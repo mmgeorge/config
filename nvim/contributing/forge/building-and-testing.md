@@ -28,6 +28,8 @@ No check declares a dependency on the build. Lua tests that launch the Forge hos
 
 The commands in this guide show what each check runs, and they do not give agents a separate validation path.
 
+`nvim/rust/forge/clippy.toml` makes `rust-lint` reject three calls: a direct `rusqlite::Connection` open, `SqliteStore::open` or `SqliteStore::read_only`, and `std::thread::sleep`. History goes through `HistoryWriter` and `HistoryReader`, and a thread that must wait uses a channel, a condition variable, or the Tokio clock. A production call that cannot comply carries `#[expect(clippy::disallowed_methods, reason = "..")]` stating why; test modules, examples, and stdio fixtures are exempt because they build storage through handles of their own. A Harness test that needs a second connection to the history database, to install a failing trigger or to seed and observe rows, opens it through `storage::test::raw_connection`.
+
 `rust-lint-no-deps` keeps warnings fatal in the selected library while omitting diagnostics from dependencies. Use it to distinguish modified-library findings from a recorded baseline failure in another crate; it does not replace or weaken `rust-lint`.
 
 ## Build the executable

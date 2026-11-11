@@ -1,3 +1,5 @@
+// This fixture builds storage through a handle of its own, outside any running host.
+#![allow(clippy::disallowed_methods)]
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::process::Stdio;

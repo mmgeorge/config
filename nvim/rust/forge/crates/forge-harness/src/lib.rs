@@ -1,5 +1,8 @@
 // Proving Send for the broker's nested async futures exceeds the default depth.
 #![recursion_limit = "256"]
+// Tests build fixtures and inject storage faults through handles of their own, which the
+// production rule in `clippy.toml` forbids.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 #[cfg(test)]
 extern crate self as forge_harness;

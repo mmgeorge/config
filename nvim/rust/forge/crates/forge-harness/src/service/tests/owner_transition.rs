@@ -424,3 +424,112 @@ async fn forked_child_input_waits_for_native_fork() -> Result<()> {
     );
     Ok(())
 }
+
+/// A reconnect captured while a turn is still running carries a transcript revision no lower
+/// than the newest `document_changed` wake already sent. Wakes are not retained, so the
+/// snapshot's revision is the only thing that heals an editor that missed one.
+#[tokio::test]
+async fn reconnect_during_a_running_turn_covers_every_sent_document_wake() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = super::bootstrap::service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let frames = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let received = frames.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            received
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(frame.bytes())?);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.start_provider(&sink).await;
+    controller.attach_input(&sink).await?;
+    let newest_wake = || {
+        frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame["event"] == "document_changed")
+            .filter_map(|frame| frame["payload"]["revision"].as_u64())
+            .max()
+    };
+    let scenario = async {
+        let hold = script
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
+            .await?;
+        let hold_id = hold["id"].as_str().context("hold id missing")?.to_owned();
+        submit_input(
+            &service,
+            &controller,
+            &session_id,
+            10,
+            "running-input",
+            "Stay running",
+            &sink,
+        )
+        .await?;
+        script
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Wait {
+                    id: hold_id.clone(),
+                },
+            )
+            .await?;
+        while newest_wake().is_none() {
+            tokio::task::yield_now().await;
+        }
+
+        let reconnect = controller
+            .exchange_owner
+            .reconnect_snapshot(None, std::num::NonZeroU16::new(1).unwrap())
+            .await?;
+        let (response, confirmation) = reconnect.into_parts();
+        let captured = response["timeline_revision"]
+            .as_u64()
+            .context("reconnect snapshot carries no transcript revision")?;
+        let sent = newest_wake().context("the running turn sent no document wake")?;
+        assert!(
+            captured >= sent,
+            "reconnect captured revision {captured} behind sent wake {sent}"
+        );
+        assert!(
+            response["owner_publication"]["events"]
+                .as_array()
+                .context("publication page missing")?
+                .iter()
+                .all(|record| record["event"]["event"] != "document_changed"),
+            "a document wake entered the retained outbox"
+        );
+        controller
+            .exchange_owner
+            .confirm_reconnect_to(confirmation, Some(sink.clone()))
+            .await?;
+        script
+            .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
+            .await?;
+        settle_exchanges(&controller, &session_id, 1).await
+    }
+    .await;
+    service.shutdown(Duration::from_secs(5)).await?;
+    reader.abort();
+    scenario
+}

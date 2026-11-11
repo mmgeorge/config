@@ -191,13 +191,26 @@ impl SessionObservationInbox {
         if self.is_closed() {
             return Err(inbox_poisoned("session observation generation is closed"));
         }
+        // An output delta that continues the last queued one takes no new slot, so a burst of
+        // deltas cannot overflow the inbox while the owner is busy.
+        let observation = OwnerObservation::Event(event);
+        if pending
+            .back_mut()
+            .is_some_and(|last| last.coalesce_output(&observation))
+        {
+            drop(pending);
+            self.ready.notify_one();
+            return Ok(());
+        }
         if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
             return Err(crate::provider::ProviderError::Observation(
                 forge_provider_api::lifecycle::ObservationFailure::Overflow,
             ));
         }
-        let availability = match &event {
-            HarnessEvent::Native { source, event, .. } => match event.as_ref() {
+        let availability = match &observation {
+            OwnerObservation::Event(HarnessEvent::Native { source, event, .. }) => match event
+                .as_ref()
+            {
                 forge_provider_api::ProviderEvent::Turn {
                     event: forge_provider_api::TurnEvent::Completed(_),
                     ..
@@ -217,7 +230,7 @@ impl SessionObservationInbox {
                 }),
                 _ => None,
             },
-            HarnessEvent::Host { .. } => None,
+            _ => None,
         };
         if let Some(availability) = availability {
             *self
@@ -225,7 +238,7 @@ impl SessionObservationInbox {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(availability);
         }
-        pending.push_back(OwnerObservation::Event(event));
+        pending.push_back(observation);
         drop(pending);
         self.ready.notify_one();
         Ok(())

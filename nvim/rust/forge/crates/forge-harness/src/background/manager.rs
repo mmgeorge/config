@@ -582,6 +582,10 @@ impl BackgroundManager {
             .background_generation,
             "This provider does not support tool-free persistent Background sessions"
         );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a Background run owns a store for its whole asynchronous preparation, and a writer lease cannot cross an await"
+        )]
         let store = SqliteStore::open(&request.config.data_root)?;
         let directory =
             crate::storage::state::directory(&request.config.data_root).join("background-owner");
@@ -895,6 +899,10 @@ impl BackgroundManager {
             expected_revision: Option<u64>,
         }
         let query: Query = serde_json::from_value(params)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a Background query owns a store for its whole asynchronous preparation, and a writer lease cannot cross an await"
+        )]
         let store = SqliteStore::open(&query.data_root)?;
         let context = BackgroundContext::read(&self.repositories, &query.workspace).await?;
         let sessions = store

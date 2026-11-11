@@ -501,18 +501,45 @@ local function attach_regions(session, prepared)
   end
 end
 
+--- Writes one row run, keeping a one-row replacement on the cheaper in-row path.
+---@param buffer integer
+---@param start_row integer
+---@param finish integer
+---@param text string[]
+local function write_rows(buffer, start_row, finish, text)
+  if finish - start_row == 1 and #text == 1 then
+    local previous = vim.api.nvim_buf_get_lines(buffer, start_row, finish, true)[1]
+    vim.api.nvim_buf_set_text(buffer, start_row, 0, start_row, #previous, text)
+  else
+    vim.api.nvim_buf_set_lines(buffer, start_row, finish, true, text)
+  end
+end
+
 --- Applies descending edits while retaining untouched text and extmarks.
+--- A multi-row edit is written as its differing row runs only: replacing unchanged rows makes
+--- Tree-sitter and extmark bookkeeping pay for the whole span instead of the change.
 ---@param buffer integer
 ---@param edits {start_row: integer, removed_rows: integer, text: string[]}[]
 ---@param empty? boolean Whether the old document consists only of Neovim's placeholder line.
 function M.apply_text_edits(buffer, edits, empty)
   for _, edit in ipairs(edits) do
     local finish = empty and 1 or edit.start_row + edit.removed_rows
-    if edit.removed_rows == 1 and #edit.text == 1 then
-      local previous = vim.api.nvim_buf_get_lines(buffer, edit.start_row, finish, true)[1]
-      vim.api.nvim_buf_set_text(buffer, edit.start_row, 0, edit.start_row, #previous, edit.text)
+    if empty or edit.removed_rows < 2 or #edit.text < 2 then
+      write_rows(buffer, edit.start_row, finish, edit.text)
     else
-      vim.api.nvim_buf_set_lines(buffer, edit.start_row, finish, true, edit.text)
+      local previous = vim.api.nvim_buf_get_lines(buffer, edit.start_row, finish, true)
+      local hunk_list = vim.text.diff(table.concat(previous, "\n") .. "\n", table.concat(edit.text, "\n") .. "\n",
+        { result_type = "indices" })
+      ---@cast hunk_list integer[][]
+      for index = #hunk_list, 1, -1 do
+        local hunk = hunk_list[index]
+        local removed_first, removed_count, inserted_first, inserted_count = hunk[1], hunk[2], hunk[3], hunk[4]
+        -- An insertion names the row it follows; a replacement or deletion names its first row.
+        local first = edit.start_row + (removed_count == 0 and removed_first or removed_first - 1)
+        local text = {}
+        for row = inserted_first, inserted_first + inserted_count - 1 do text[#text + 1] = edit.text[row] end
+        write_rows(buffer, first, first + removed_count, text)
+      end
     end
   end
 end
@@ -737,14 +764,17 @@ function M.apply_async(session, update, alive, done)
     if update.patch then
       array(update.patch)
       assert(#update.patch <= 64, "publication exceeds the native pending-patch limit")
-      return cooperative.atomic(function()
-        local result = { kind = "Applied", revision = session.revision }
-        for _, patch in ipairs(update.patch) do
-          result = M.apply_patch(session, patch)
-          if result.kind ~= "Applied" then return result end
-        end
-        return result
-      end)
+      -- Each patch commits atomically and leaves a complete revision, so a backlog yields between
+      -- patches instead of holding the main loop for the whole catch-up.
+      local result = { kind = "Applied", revision = session.revision }
+      for _, patch in ipairs(update.patch) do
+        result = cooperative.atomic(function() return M.apply_patch(session, patch) end)
+        if result.kind ~= "Applied" then return result end
+        local touched_rows = 0
+        for _, edit in ipairs(patch.text_edit or {}) do touched_rows = touched_rows + edit.removed_rows + #edit.text end
+        cooperative.checkpoint(touched_rows + 1)
+      end
+      return result
     end
     if update.block then return M.apply_snapshot(session, update) end
     return M.apply_patch(session, update)

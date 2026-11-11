@@ -75,11 +75,12 @@ async fn apply_owned_command(
                 TaskCommand::legacy_plan_id(&command.action),
             ) {
                 (crate::task::command::SessionAction::Execute { selection }, _) => {
-                    let store = SqliteStore::read_only(&controller.data_root).map_err(|_| {
-                        ExecuteCommandError::Failed(CommandFailure::Task(
-                            TaskCommandFailure::StateUnavailable,
-                        ))
-                    })?;
+                    let store = crate::storage::HistoryReader::current(&controller.data_root)
+                        .map_err(|_| {
+                            ExecuteCommandError::Failed(CommandFailure::Task(
+                                TaskCommandFailure::StateUnavailable,
+                            ))
+                        })?;
                     match selection.plan_id.as_deref().filter(|id| *id != "last") {
                         Some(id) => store.load_plan(id),
                         None => store
@@ -112,7 +113,7 @@ async fn apply_owned_command(
                         })
                     });
                     match selected {
-                        Some(id) => SqliteStore::read_only(&controller.data_root)
+                        Some(id) => crate::storage::HistoryReader::current(&controller.data_root)
                             .and_then(|store| store.load_plan(id))
                             .map_err(|_| {
                                 ExecuteCommandError::Failed(CommandFailure::Task(
@@ -122,7 +123,7 @@ async fn apply_owned_command(
                         None => None,
                     }
                 }
-                (_, Some(plan)) => SqliteStore::read_only(&controller.data_root)
+                (_, Some(plan)) => crate::storage::HistoryReader::current(&controller.data_root)
                     .and_then(|store| store.load_plan(plan))
                     .map_err(|_| {
                         ExecuteCommandError::Failed(CommandFailure::Task(
@@ -409,7 +410,7 @@ fn capture_continuation(
     );
     let snapshot = controller.observer.snapshot()?;
     let current = snapshot.session.active_task.as_ref();
-    let store = SqliteStore::read_only(&controller.data_root)?;
+    let store = crate::storage::HistoryReader::current(&controller.data_root)?;
     let target = if let Some(target) = &ingress.target {
         let (id, set_id, revision) = match target {
             ContinuationTargetIngress::PlanReview {
@@ -597,7 +598,7 @@ async fn apply_plan_edit_inner(
         );
         edit
     } else {
-        let plan = SqliteStore::read_only(&controller.data_root)?
+        let plan = crate::storage::HistoryReader::current(&controller.data_root)?
             .load_plan(intent.plan.as_str())?
             .context("selected plan is missing")?;
         ensure!(
@@ -814,7 +815,7 @@ async fn refresh_edited_review(
         anyhow::bail!("plan edit returned another command outcome");
     };
     let validate = || -> Result<()> {
-        let current = SqliteStore::read_only(&controller.data_root)?
+        let current = crate::storage::HistoryReader::current(&controller.data_root)?
             .load_plan(&plan.id)?
             .context("edited plan is missing")?;
         selected.validate(&current)?;

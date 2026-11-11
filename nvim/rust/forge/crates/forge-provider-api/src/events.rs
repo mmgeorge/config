@@ -125,6 +125,8 @@ pub struct ProviderEventStream {
     pending: Option<BoundProviderEvent>,
     queued: Option<BoundProviderEvent>,
     deadline: tokio::time::Instant,
+    /// When the last output delta left the stream; the next one waits out the rest of the window.
+    last_output_emission: Option<tokio::time::Instant>,
     deferred_error: Option<EventDeliveryError>,
     ownership: std::sync::Arc<std::sync::Mutex<ActivityOwnership>>,
     published: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -243,6 +245,7 @@ pub fn channel(
             pending: None,
             queued: None,
             deadline: tokio::time::Instant::now(),
+            last_output_emission: None,
             deferred_error: None,
             ownership,
             published,
@@ -1119,7 +1122,12 @@ impl ProviderEventStream {
                 Some(event) => Some(event),
                 None => self.input.receive().await?,
             };
-            self.deadline = tokio::time::Instant::now() + Duration::from_millis(16);
+            // The first delta of a burst leaves at once. Later deltas merge until one window has
+            // passed since the previous emission, so a burst still publishes at most once a window.
+            let now = tokio::time::Instant::now();
+            self.deadline = self
+                .last_output_emission
+                .map_or(now, |emitted| (emitted + OUTPUT_WINDOW).max(now));
         }
         while let Some(pending) = self.pending.as_mut() {
             if !batchable(&pending.event) || output_bytes(&pending.event) >= 64 * 1024 {
@@ -1138,6 +1146,13 @@ impl ProviderEventStream {
                 break;
             }
             pending.sequence = event.sequence;
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| batchable(&pending.event))
+        {
+            self.last_output_emission = Some(tokio::time::Instant::now());
         }
         Ok(self.pending.take())
     }
@@ -1169,6 +1184,24 @@ impl ProviderEventStream {
             event.sequence = next.sequence;
         }
         Ok(event)
+    }
+}
+
+/// How long output deltas for one item merge before the stream emits them.
+const OUTPUT_WINDOW: Duration = Duration::from_millis(16);
+
+impl ProviderEvent {
+    /// Report whether this event only appends message or tool output text.
+    pub fn is_output_delta(&self) -> bool {
+        batchable(self)
+    }
+
+    /// Append `following` to this output delta when both extend the same item.
+    ///
+    /// Returns `false` and leaves both events unchanged when they are not adjacent output for one
+    /// thread, turn, and item, or when the merged text would pass the 64 KiB merge boundary.
+    pub fn coalesce_output(&mut self, following: &ProviderEvent) -> bool {
+        merge_output(self, following)
     }
 }
 
@@ -1744,6 +1777,63 @@ mod tests {
             }
         ));
         assert!(writer.send_wait(item(completion("changed"))).await.is_err());
+    }
+
+    /// The first delta of a burst leaves at once; later deltas merge for the rest of the window.
+    #[tokio::test(start_paused = true)]
+    async fn output_deltas_emit_on_the_leading_edge_and_merge_within_a_window() {
+        let (sink, mut stream, address) = fixture();
+        let item = |event| AdapterActivity::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: crate::ItemId::new("streamed").unwrap(),
+            event,
+        };
+        let delta = |text: &str| crate::ItemEvent::Message {
+            event: crate::MessageItemEvent::Delta(text.into()),
+        };
+        let delta_text = |event: BoundProviderEvent| match event.event {
+            ProviderEvent::Item {
+                event:
+                    crate::ItemEvent::Message {
+                        event: crate::MessageItemEvent::Delta(text),
+                    },
+                ..
+            } => text,
+            other => panic!("expected an output delta, received {other:?}"),
+        };
+        let writer = sink.activity_writer();
+        writer
+            .send_wait(item(crate::ItemEvent::Started(
+                crate::ItemStart::Reasoning(crate::ReasoningStart {
+                    text: String::new(),
+                    kind: crate::ReasoningKind::Full,
+                }),
+            )))
+            .await
+            .unwrap();
+        stream.recv().await.unwrap().unwrap();
+
+        let started = tokio::time::Instant::now();
+        writer.send_wait(item(delta("first"))).await.unwrap();
+        assert_eq!(delta_text(stream.recv().await.unwrap().unwrap()), "first");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // Deltas that follow inside the window wait for its end and leave as one event.
+        writer.send_wait(item(delta("second "))).await.unwrap();
+        writer.send_wait(item(delta("third"))).await.unwrap();
+        assert_eq!(
+            delta_text(stream.recv().await.unwrap().unwrap()),
+            "second third"
+        );
+        assert_eq!(started.elapsed(), OUTPUT_WINDOW);
+
+        // After an idle window the next delta is a new leading edge.
+        tokio::time::advance(OUTPUT_WINDOW).await;
+        let resumed = tokio::time::Instant::now();
+        writer.send_wait(item(delta("fourth"))).await.unwrap();
+        assert_eq!(delta_text(stream.recv().await.unwrap().unwrap()), "fourth");
+        assert_eq!(resumed.elapsed(), Duration::ZERO);
     }
 
     /// A fence whose best-effort notice loses the delivery lock to a waiting send still

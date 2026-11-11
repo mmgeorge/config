@@ -457,7 +457,7 @@ impl TaskCommandRun {
                     unreachable!("task commit consumes its prepared mutation once")
                 };
                 // Commit task state with its finite result or journaled input checkpoint.
-                let mut store = crate::storage::SqliteStore::open(&services.root)
+                let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)
                     .map_err(OperationFailure::Domain)?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -851,7 +851,7 @@ impl TaskCommandRun {
             _ => None,
         };
         if let Some(source) = source {
-            let store = crate::storage::SqliteStore::read_only(&services.root)
+            let store = crate::storage::HistoryReader::current(&services.root)
                 .map_err(|_| rejected(TaskCommandFailure::StateUnavailable))?;
             if let Some(plan) = store
                 .load_plan(source.id().as_str())
@@ -1067,7 +1067,7 @@ impl TaskCommandRun {
         self.stage = TaskStage::PreparingOperation {
             task: tokio::task::spawn_blocking(move || {
                 if let Some(source) = intent.plan_source() {
-                    let store = crate::storage::SqliteStore::read_only(&services.root)
+                    let store = crate::storage::HistoryReader::current(&services.root)
                         .map_err(OperationFailure::Domain)?;
                     source
                         .validate_storage(&store, services.observer.session_id())
@@ -1129,7 +1129,7 @@ impl TaskCommandRun {
         let now_ms = owner_now_ms()?;
         self.stage = TaskStage::PreparingExecution {
             task: tokio::task::spawn_blocking(move || {
-                let store = crate::storage::SqliteStore::read_only(&root)
+                let store = crate::storage::HistoryReader::current(&root)
                     .map_err(|_| TaskCommandFailure::StateUnavailable)?;
                 PlanSourceGuard::Working(selection.source().clone())
                     .validate_storage(&store, observer.session_id())?;
@@ -1211,7 +1211,7 @@ impl TaskCommandRun {
                     ),
                 };
                 if let Some(source) = &source {
-                    let store = crate::storage::SqliteStore::read_only(&root)
+                    let store = crate::storage::HistoryReader::current(&root)
                         .map_err(|_| TaskCommandFailure::StateUnavailable)?;
                     source.validate_storage(&store, observer.session_id())?;
                 }
@@ -1356,7 +1356,7 @@ impl TaskCommandRun {
                     ) => source,
                     _ => return Err(TaskSynchronizationFailure::TargetChanged),
                 };
-                let store = crate::storage::SqliteStore::read_only(&services.root)
+                let store = crate::storage::HistoryReader::current(&services.root)
                     .map_err(|_| TaskSynchronizationFailure::StateUnavailable)?;
                 let exchange = store
                     .load_exchange(source.id().as_str())
@@ -1450,7 +1450,7 @@ impl TaskCommandRun {
             _ => None,
         };
         if let Some(id) = source {
-            let store = crate::storage::SqliteStore::read_only(&services.root)
+            let store = crate::storage::HistoryReader::current(&services.root)
                 .map_err(OperationFailure::Domain)?;
             if let Some(plan) = store.load_plan(&id).map_err(OperationFailure::Domain)? {
                 services
@@ -1722,7 +1722,7 @@ fn validate_question_continuation(
         return Ok(());
     };
     let store =
-        crate::storage::SqliteStore::read_only(&services.root).map_err(OperationFailure::Domain)?;
+        crate::storage::HistoryReader::current(&services.root).map_err(OperationFailure::Domain)?;
     match &selection.workflow {
         QuestionWorkflow::PlanReview(source) => {
             source.validate_target(current).map_err(rejected)?;
@@ -1784,7 +1784,7 @@ fn prepare_workflow_continuation(
 ) -> Result<TaskCommit, OperationFailure> {
     use super::command::{QuestionWorkflow, WorkflowContinuationTarget};
     let store =
-        crate::storage::SqliteStore::read_only(&services.root).map_err(OperationFailure::Domain)?;
+        crate::storage::HistoryReader::current(&services.root).map_err(OperationFailure::Domain)?;
     let now_ms = owner_now_ms()?;
     let prior = current.map(|task| task.permit());
     let mut effects = crate::storage::TaskEffects::default();

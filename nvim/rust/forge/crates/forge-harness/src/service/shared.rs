@@ -32,9 +32,11 @@ pub(super) async fn dispatch(
     let method = RuntimeMethod::decode(&request.method)?;
     if let Some(id) = &session_id {
         ensure!(
-            SqliteStore::read_only(PathBuf::from(&registry.initialize.data_root).as_path())?
-                .load_session(id)?
-                .is_some(),
+            crate::storage::HistoryReader::current(
+                PathBuf::from(&registry.initialize.data_root).as_path()
+            )?
+            .load_session(id)?
+            .is_some(),
             "session context does not exist"
         );
     }
@@ -469,7 +471,9 @@ async fn list_sessions(
         matches!(scope, "repo" | "all"),
         "unknown session list scope"
     );
-    let store = SqliteStore::read_only(PathBuf::from(&registry.initialize.data_root).as_path())?;
+    let store = crate::storage::HistoryReader::current(
+        PathBuf::from(&registry.initialize.data_root).as_path(),
+    )?;
     let sessions = store
         .list_session((scope != "all").then_some(workspace.as_str()))?
         .into_iter()

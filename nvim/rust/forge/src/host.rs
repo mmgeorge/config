@@ -325,6 +325,7 @@ impl ConnectionHost {
             forge_protocol::MAX_FRAME_BYTES,
         )?;
         let (sink, stream) = outbound::channel();
+        let _scheduling_lag = crate::runtime_lag::spawn();
         let writer_credit = Arc::clone(&credit);
         let (writer_stop, stopped) = oneshot::channel();
         let mut writer = tokio::spawn(async move {

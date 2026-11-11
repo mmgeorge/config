@@ -4,6 +4,7 @@
 mod host;
 mod router;
 mod runtime;
+mod runtime_lag;
 mod shutdown;
 
 use anyhow::Result;

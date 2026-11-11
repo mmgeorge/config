@@ -198,8 +198,16 @@ function M.maximum_content_topline(transcript_buf, transcript_win)
     })
     return ok and height.all or (line_count - start_row)
   end
-  if tail_height(0) <= window_height then return 1 end
-  local low = 0
+  -- Measure backward from the tail in doubling spans, so the cost follows the window height and
+  -- not the transcript length. Folded and concealed rows can have no height, so a span of
+  -- `window_height` rows is only the first guess.
+  local span = window_height
+  local low = math.max(0, line_count - span)
+  while low > 0 and tail_height(low) <= window_height do
+    span = span * 2
+    low = math.max(0, line_count - span)
+  end
+  if low == 0 and tail_height(0) <= window_height then return 1 end
   local high = line_count - 1
   local first_fitting_row = line_count - 1
   while low <= high do

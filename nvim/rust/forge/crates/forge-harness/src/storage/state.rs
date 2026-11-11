@@ -105,6 +105,10 @@ pub fn clear(root: &Path) -> Result<ClearReport> {
                     .extension()
                     .is_some_and(|extension| extension == "sqlite3")
                 {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "cleanup probes another state version's database, which has no writer in this process"
+                    )]
                     let connection = rusqlite::Connection::open_with_flags(
                         file.path(),
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
