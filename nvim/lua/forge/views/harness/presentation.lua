@@ -115,7 +115,9 @@ function M.open(options, callback)
     return true
   end
   local markdown = require("forge.render.harness.markdown")
-  local function render_markdown(force)
+  ---@param force boolean Render even when the visible messages are unchanged.
+  ---@param scrolled? boolean A window or cursor moved, so the rows near a window may have changed.
+  local function render_markdown(force, scrolled)
     if not alive() or owner.transcript.status ~= "Applied" or owner.transcript.applying or owner.transcript.update_pending then return end
     local range_list, retained, window_list = {}, {}, {}
     for window in pairs(owner.views) do
@@ -132,6 +134,14 @@ function M.open(options, callback)
     table.sort(range_list, function(left, right) return left.first0 < right.first0 end)
     table.sort(window_list)
     local changedtick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
+    -- Rendering changes row heights without scrolling, so a window resting on the final row can
+    -- be left showing empty rows below it until the scroll boundary is applied again.
+    local function clamp_after_render()
+      markdown.after_render(options.transcript_buffer, guard(function()
+        local layout = require("forge.views.harness.layout")
+        for _, window in ipairs(window_list) do layout.clamp_scroll(options.transcript_buffer, window) end
+      end))
+    end
     -- The pass is skipped while the visible messages, their versions and their rows are those of
     -- the last pass. A buffer change elsewhere, such as streamed tool output or a status tick,
     -- needs a pass only when it moved the parser's regions, which `markdown.current` detects.
@@ -139,6 +149,12 @@ function M.open(options, callback)
       and vim.deep_equal(owner.markdown_windows, window_list)
       and (owner.markdown_tick == changedtick or markdown.current(options.transcript_buffer, range_list)) then
       owner.markdown_tick = changedtick
+      -- The same messages surround the window, but a scroll inside a long message can still
+      -- bring rows into view that were too far from the window to be rendered.
+      if scrolled then
+        for _, window in ipairs(window_list) do markdown.follow_view(options.transcript_buffer, window) end
+        clamp_after_render()
+      end
       return
     end
     owner.markdown_ranges, owner.markdown_windows = range_list, window_list
@@ -151,6 +167,7 @@ function M.open(options, callback)
         markdown.render(options.transcript_buffer, window, range_list)
       end)
     end
+    clamp_after_render()
   end
   local function dispatch_next()
     if active or owner.applying then return end
@@ -1100,7 +1117,7 @@ function M.open(options, callback)
     group = owner.group, callback = function()
       if markdown_scheduled then return end
       markdown_scheduled = true
-      vim.schedule(function() markdown_scheduled = false render_markdown(false) owner.observe_sections() end)
+      vim.schedule(function() markdown_scheduled = false render_markdown(false, true) owner.observe_sections() end)
     end,
   })
   vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "WinClosed" }, {

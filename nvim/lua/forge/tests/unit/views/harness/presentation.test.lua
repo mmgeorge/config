@@ -1742,6 +1742,7 @@ T["markdown_pass_skips_unchanged_messages"] = function()
     render = function() passes = passes + 1 end,
     current = function() return regions_current end,
     after_render = function(_, done) done(true) end,
+    follow_view = function() end,
     clear = function() end,
   }
   MiniTest.finally(function() package.loaded["forge.render.harness.markdown"] = nil end)
@@ -1777,6 +1778,47 @@ T["markdown_pass_skips_unchanged_messages"] = function()
   regions_current = false
   patch_once()
   MiniTest.expect.equality(passes, settled + 1)
+  owner.close()
+end
+
+T["markdown_pass_reapplies_scroll_boundary_after_render"] = function()
+  local client = require("forge.client")
+  local requests = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    requests[#requests + 1] = { params = params, callback = callback }
+  end
+  -- The fake holds each render open until the test settles it, as an asynchronous parse would.
+  local settle_list = {}
+  package.loaded["forge.render.harness.markdown"] = {
+    viewport = function() return { { id = "message", version = 1, first0 = 0, after0 = 1 } } end,
+    render = function() end,
+    current = function() return true end,
+    after_render = function(_, done) settle_list[#settle_list + 1] = done end,
+    follow_view = function() end,
+    clear = function() end,
+  }
+  MiniTest.finally(function() package.loaded["forge.render.harness.markdown"] = nil end)
+  local layout = require("forge.views.harness.layout")
+  local clamped = {}
+  layout.clamp_scroll = function(_, window) clamped[#clamped + 1] = window end
+  local transcript, composer = buffer.scratch(), buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local owner = require("forge.views.harness.presentation").open({ session_id = "markdown-boundary",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function() end,
+  }, function(value, failure) assert(value and not failure, failure) end)
+  requests[#requests].callback({ transcript = { document = owner.document, revision = 0,
+    block = { { id = "body", text = { "initial" },
+      metadata = { target = {}, decoration = {}, editable_region = {} } } } } })
+  wait_until(function() return #settle_list > 0 end, "the first publication did not render Markdown")
+  -- Row heights are those of the previous render until this one settles.
+  MiniTest.expect.equality(clamped, {})
+  for _, settle in ipairs(settle_list) do settle(true) end
+  MiniTest.expect.equality(clamped, { window })
   owner.close()
 end
 

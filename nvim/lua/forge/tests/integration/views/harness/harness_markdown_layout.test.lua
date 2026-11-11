@@ -330,4 +330,71 @@ T["live_tail_with_wrapped_table"] = function()
   end
 end
 
+T["wrapped_table_stays_rendered_under_the_cursor"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.api.nvim_ui_attach(100, 40, { rgb = true })
+  child.lua([[
+    local config_path = ...
+    vim.opt.runtimepath:prepend(config_path)
+    vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/site")
+    vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/render-markdown.nvim")
+    vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/nvim-treesitter")
+    require("render-markdown").setup({})
+    vim.o.showtabline, vim.o.laststatus = 0, 0
+    vim.wo.wrap, vim.wo.linebreak = true, true
+    local lines = { "Prose before the table.", "", "| Area | Contract |", "| --- | --- |" }
+    for row = 1, 4 do
+      lines[#lines + 1] = "| Area " .. row .. " | " .. string.rep("Preserve the current invariant. ", 10) .. "|"
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Prose after the table."
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+    vim.bo.filetype = "ForgeHarness"
+    require("forge.render.harness.markdown").render(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win(), {
+      { first0 = 0, after0 = #lines, id = "message", version = 1 },
+    })
+  ]], { config_path })
+  wait_until(function()
+    return child.lua([[
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(0,
+        vim.api.nvim_get_namespaces()["render-markdown.nvim"], 0, -1, { details = true })) do
+        if mark[4].virt_lines then return true end
+      end
+      return false
+    ]])
+  end, "wrapped table did not render")
+  -- Each cursor move makes render-markdown decide again which marks to draw, so counting those
+  -- decisions tells the test when the move has taken effect.
+  child.lua([[
+    local updater = require("render-markdown.core.ui").updater
+    local display = updater.display
+    vim.g.display_count = 0
+    function updater:display()
+      display(self)
+      vim.g.display_count = vim.g.display_count + 1
+    end
+  ]])
+  local function hidden_rows_with_cursor_on(row)
+    local displayed = child.lua_get("vim.g.display_count")
+    child.type_keys(row .. "G")
+    wait_until(function() return child.lua_get("vim.g.display_count") > displayed end, "cursor move did not update Markdown")
+    return child.lua([[
+      local hidden = 0
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(0,
+        vim.api.nvim_get_namespaces()["render-markdown.nvim"], 0, -1, { details = true })) do
+        if mark[4].conceal_lines then hidden = hidden + 1 end
+      end
+      return hidden
+    ]])
+  end
+  local hidden_rows = hidden_rows_with_cursor_on(10)
+  MiniTest.expect.equality(hidden_rows, 4)
+  -- A wrapped row is hidden and drawn as virtual lines. Revealing its source under the cursor
+  -- would change the transcript's height with cursor moves and unsettle the scroll boundary.
+  MiniTest.expect.equality(hidden_rows_with_cursor_on(6), hidden_rows)
+  MiniTest.expect.equality(hidden_rows_with_cursor_on(8), hidden_rows)
+end
+
 return T

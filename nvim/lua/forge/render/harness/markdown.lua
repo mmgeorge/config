@@ -7,7 +7,7 @@ local layout_ranges = {}
 local layout_handlers = false
 local cursor_attached = {}
 local render_epoch = {}
----@type table<integer, {epoch: integer, window: integer, tick: integer, rendered?: boolean, done?: fun(rendered: boolean)}>
+---@type table<integer, {epoch: integer, window: integer, tick: integer, rendered?: boolean, done?: (fun(rendered: boolean))[]}>
 local render_pending = {}
 local render_observer_installed = false
 
@@ -18,18 +18,24 @@ local function finish_render(buf, epoch, rendered)
   local pending = render_pending[buf]
   if not pending or pending.epoch ~= epoch or pending.rendered ~= nil then return end
   pending.rendered = rendered
-  local done = pending.done
+  local done_list = pending.done or {}
   pending.done = nil
-  if done then done(rendered) end
+  for _, done in ipairs(done_list) do done(rendered) end
 end
 
----Run the latest publication's navigation only after its Markdown geometry settles.
+---Run `done` once the Markdown geometry of the render in flight settles, or at once when none is.
+---Navigation and scroll limits read rendered heights, so they wait here. Each caller checks for
+---itself whether its request is still the latest when `done` runs.
 ---@param buf integer
 ---@param done fun(rendered: boolean)
 function M.after_render(buf, done)
   local pending = render_pending[buf]
-  if pending and pending.rendered == nil then pending.done = done
-  else done(not pending or pending.rendered == true) end
+  if pending and pending.rendered == nil then
+    pending.done = pending.done or {}
+    table.insert(pending.done, done)
+  else
+    done(not pending or pending.rendered == true)
+  end
 end
 
 --- Registers markdown Tree-sitter parser support for the Harness filetype.
@@ -172,7 +178,10 @@ local function install_final_replacement_anchor()
   end
 end
 
---- Resolves visible Markdown owners without traversing folded or off-screen history.
+--- Resolves the Markdown owners in and near the window without traversing distant history.
+--- An unrendered message has different row heights from its rendered form, so a message that
+--- scrolled into view unrendered made the text jump once its render landed. The margin of one
+--- window height on each side renders a message before a page or half-page scroll can reach it.
 ---@param session table Native document replica with an indexed block sequence.
 ---@param window integer Transcript window.
 ---@return table[] range_list Full message ranges with retained content versions.
@@ -180,7 +189,9 @@ function M.viewport(session, window)
   if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then return {} end
   return vim.api.nvim_win_call(window, function()
     local range_list = {}
-    local row, after = vim.fn.line("w0") - 1, math.min(vim.fn.line("w$"), session.sequence:rows())
+    local margin = vim.api.nvim_win_get_height(window)
+    local row = math.max(0, vim.fn.line("w0") - 1 - margin)
+    local after = math.min(vim.fn.line("w$") + margin, session.sequence:rows())
     while row < after do
         local node = session.sequence:locate(row)
         if not node then break end
@@ -252,6 +263,72 @@ local function install_complete_table_rows()
     end
     return overlaps(self, node)
   end
+end
+
+--- Keeps a wrapped table row rendered while the cursor is on it.
+--- render-markdown hides a wrapped row and draws it as virtual lines, then reveals the row's source
+--- under the cursor because a hidden row has no cell to edit. The transcript is read, not edited,
+--- and the reveal changes the row's height: every cursor move through a wide table then shifted
+--- the text below it and moved the last row the scroll boundary allows.
+local function install_cursor_independent_rows()
+  local updater = require("render-markdown.core.ui").updater
+  local hide = updater.hide
+  function updater:hide(extmark, range)
+    if not layout_ranges[self.buf] then return hide(self, extmark, range) end
+    local mark = extmark:get()
+    local replace = mark.replace
+    -- The cursor-row reveal applies only to a mark flagged as a replacement.
+    mark.replace = nil
+    local hidden = hide(self, extmark, range)
+    mark.replace = replace
+    return hidden
+  end
+end
+
+--- Renders a transcript one window height beyond each window, and renders again once a window
+--- comes within half a window height of the rendered edge.
+--- render-markdown renders ten rows beyond a window and waits for the window to leave that span.
+--- A rendered row differs in height from its source, so a page or half-page scroll showed source
+--- rows first and the text jumped when their render landed.
+local function install_scroll_margin()
+  local View = require("render-markdown.request.view")
+  local env = require("render-markdown.lib.env")
+  local interval = require("render-markdown.lib.interval")
+  local new, contains = View.new, View.contains
+  function View.new(buf)
+    local view = new(buf)
+    if not layout_ranges[buf] then return view end
+    local rendered = {}
+    for _, win in ipairs(env.buf.wins(buf)) do
+      rendered[#rendered + 1] = env.range(buf, win, vim.api.nvim_win_get_height(win))
+    end
+    view.ranges = interval.coalesce(rendered)
+    return view
+  end
+  function View:contains(win)
+    if not layout_ranges[self.buf] then return contains(self, win) end
+    local approached = env.range(self.buf, win, math.floor(vim.api.nvim_win_get_height(win) / 2))
+    for _, range in ipairs(self.ranges) do
+      if interval.contains(range, approached) then return true end
+    end
+    return false
+  end
+end
+
+--- Lets render-markdown render the rows a scroll brought toward a window's edge.
+--- A scroll that keeps the same messages near the window needs no new parser regions, but
+--- render-markdown renders only the rows around the window, and nothing else tells it the window
+--- moved when the cursor did not. `after_render` then waits for the rows this call renders.
+---@param buf integer
+---@param win integer
+function M.follow_view(buf, win)
+  if not layout_ranges[buf] or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then return end
+  if require("render-markdown.request.context").contains(buf, win) then return end
+  local pending = render_pending[buf]
+  if pending and pending.rendered ~= nil then
+    render_pending[buf] = { epoch = pending.epoch, window = win, tick = vim.api.nvim_buf_get_changedtick(buf) }
+  end
+  require("render-markdown.core.ui").update(buf, win, "WinScrolled", false)
 end
 
 --- Removes render-markdown extmarks that fall outside designated markdown ranges.
@@ -408,6 +485,8 @@ function M.render(buf, win, range_list)
       install_final_replacement_anchor()
       install_linear_sibling_count()
       install_complete_table_rows()
+      install_cursor_independent_rows()
+      install_scroll_margin()
       local state = require("render-markdown.state")
       -- A handler the editor configured wins; otherwise `markdown_math` converts math when the
       -- editor provides it, and render-markdown's built-in handler renders it unconverted.

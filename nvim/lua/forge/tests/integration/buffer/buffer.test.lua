@@ -167,14 +167,16 @@ T["markdown_viewport"] = function()
     assert(owner.transcript.revision == revision)
     assert(markdown_visits < 300, "Markdown traversed off-screen history")
   end
-  -- Scrolling brings another message into view, which always needs a pass.
+  -- Scrolling brings another message within a page of the window, which always needs a pass. The
+  -- message is rendered before it is visible, so its rows do not change height once it scrolls in.
   local rendered_before_scroll = rendered
-  vim.api.nvim_win_set_cursor(window, { 29991, 0 })
-  vim.cmd("normal! zt")
+  vim.api.nvim_win_set_cursor(window, { 29985, 0 })
+  vim.cmd("normal! zb")
+  assert(vim.fn.line("w$") < 29991, "the last message is already visible")
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = transcript })
   wait_until(function() return owner.markdown_ranges[1].id == "history:3000" end,
-    "scrolling did not select the last message's Markdown range")
-  assert(rendered > rendered_before_scroll, "scrolling did not render the newly visible message")
+    "scrolling did not select the Markdown range of the message below the window")
+  assert(rendered > rendered_before_scroll, "scrolling did not render the approaching message")
   vim.cmd("split")
   local second = vim.api.nvim_get_current_win()
   owner.views[second] = require("forge.input").open(owner.transcript, second)
@@ -203,6 +205,53 @@ T["markdown_viewport"] = function()
   assert(markdown.current(transcript, owner.markdown_ranges), "an edit outside every message required a pass")
   vim.api.nvim_buf_set_lines(transcript, message_end, message_end, true, { "appended at the boundary" })
   assert(not markdown.current(transcript, owner.markdown_ranges), "a stretched parser region went undetected")
+  owner.close()
+end
+
+T["markdown_follows_scroll_inside_a_message"] = function()
+  local data = vim.fn.stdpath("data")
+  vim.opt.runtimepath:append(data .. "/site")
+  vim.opt.runtimepath:append(data .. "/lazy/render-markdown.nvim")
+  vim.opt.runtimepath:append(data .. "/lazy/nvim-treesitter")
+  require("render-markdown").setup({})
+  local client = require("forge.client")
+  local requests = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+    callback = presentation_status(params, callback)
+    requests[#requests + 1] = { params = params, callback = callback }
+  end
+  package.loaded["forge.views.harness.terminals"] = { watch = function() return { close = function() end } end }
+  local transcript, composer = buffer.scratch(), buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local owner = require("forge.views.harness.presentation").open({ session_id = "markdown-scroll",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function(message) error(message) end,
+  }, function(value, failure) assert(value, failure) end)
+  -- One message far taller than the window, with a heading on every row so each row carries a mark.
+  local text = {}
+  for row = 1, 600 do text[row] = "# Heading " .. row end
+  requests[1].callback({ transcript = { document = owner.document, revision = 0, block = {
+    { id = "message", text = text, metadata = { target = {}, decoration = {}, editable_region = {}, markdown = true } },
+  } } })
+  wait_until(function() return owner.ready end, "snapshot did not settle")
+  local namespace = vim.api.nvim_get_namespaces()["render-markdown.nvim"]
+  local function rendered(row)
+    return #vim.api.nvim_buf_get_extmarks(transcript, namespace, { row - 1, 0 }, { row - 1, -1 }, {}) > 0
+  end
+  wait_until(function() return rendered(1) end, "the visible rows did not render")
+  local height = vim.api.nvim_win_get_height(window)
+  assert(rendered(2 * height - 1), "rows within a window height below the window were not rendered")
+  -- A scroll that leaves the cursor in the window fires no cursor event, and the message near the
+  -- window is the same one, so only the scroll itself can ask for the rows now approaching.
+  local pass_ranges = owner.markdown_ranges
+  vim.api.nvim_win_set_cursor(window, { 3 * height, 0 })
+  vim.cmd("normal! zb")
+  vim.api.nvim_exec_autocmds("WinScrolled", {})
+  wait_until(function() return rendered(4 * height - 1) end, "a scroll inside one message did not render the approaching rows")
+  assert(owner.markdown_ranges == pass_ranges, "the scroll ran a full Markdown pass")
   owner.close()
 end
 

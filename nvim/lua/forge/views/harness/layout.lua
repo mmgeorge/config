@@ -231,26 +231,31 @@ function M.maximum_content_topline(transcript_buf, transcript_win)
   return first_fitting_row + 1
 end
 
+---Pull a transcript window back when it shows empty rows below the final row.
+---The boundary depends on rendered heights, so it must be applied again whenever those change
+---without a scroll, such as when Markdown finishes rendering rows that entered the window.
+---@param transcript_buf integer
+---@param transcript_win integer
+function M.clamp_scroll(transcript_buf, transcript_win)
+  if not vim.api.nvim_win_is_valid(transcript_win)
+    or vim.api.nvim_win_get_buf(transcript_win) ~= transcript_buf then return end
+  local maximum_topline = M.maximum_content_topline(transcript_buf, transcript_win)
+  vim.api.nvim_win_call(transcript_win, function()
+    local view = vim.fn.winsaveview()
+    if view.topline <= maximum_topline then return end
+    view.topline = maximum_topline
+    vim.fn.winrestview(view)
+  end)
+end
+
 ---@param transcript_buf integer
 ---@param transcript_win integer
 function M.attach_scroll_boundary(transcript_buf, transcript_win)
   local group = vim.api.nvim_create_augroup("ForgeHarnessScroll" .. transcript_buf, { clear = true })
-  local clamping = false
   vim.api.nvim_create_autocmd("WinScrolled", {
     group = group,
     buffer = transcript_buf,
-    callback = function()
-      if clamping or not vim.api.nvim_win_is_valid(transcript_win) then return end
-      local maximum_topline = M.maximum_content_topline(transcript_buf, transcript_win)
-      vim.api.nvim_win_call(transcript_win, function()
-        local view = vim.fn.winsaveview()
-        if view.topline <= maximum_topline then return end
-        clamping = true
-        view.topline = maximum_topline
-        vim.fn.winrestview(view)
-        clamping = false
-      end)
-    end,
+    callback = function() M.clamp_scroll(transcript_buf, transcript_win) end,
   })
 end
 

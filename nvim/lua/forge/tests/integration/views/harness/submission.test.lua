@@ -154,7 +154,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             end
           end
         end
+        -- The failed edit's outcome reaches the group summary in a later publication than its rows.
         return found["Read fixture"] and found["Reported edits"]
+          and buffer.text(state.transcript_buf):find("1 unsuccessful", 1, true) ~= nil
       end
       wait_until(assert_activity, "activity events did not render", { timeout_ms = 4000,
         context = function() return buffer.text(state.transcript_buf) .. "\n" .. table.concat(errors, "\n") end })
