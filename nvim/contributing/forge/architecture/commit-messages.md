@@ -40,4 +40,18 @@ Overloads are never paired by position, and ambiguous matches keep body excerpts
 
 `background.settings` stores the Background provider, per-provider model and thinking defaults, and a compaction policy at 128,000 tokens. The Background provider is chosen independently of interactive Harness: Lua sends it in every generation selection, and `BackgroundManager` runs it in its own runtime, so the active chat's provider never decides which provider generates. Changing it starts a new Background conversation, like a model change. `:ForgeDebugBackgroundTimeline` inspects these conversations. Generation failures notify even after the buffer closes, and they never replace an existing draft.
 
+When Codex cannot launch, generation reports its configured executable and the
+normalized launch cause, rather than a model-list transport failure. The remedy
+is to check that executable's installation or the independently selected
+Background provider settings; generation never changes those settings on failure.
+
 Background generation cancels when its request is cancelled, its two-minute deadline expires, or provider observation fails. Observation failure does not imply user cancellation. A failed generation or unreliable observer retires its runtime, and the next explicit request retries pending cleanup before acquiring a replacement. Cleanup failure keeps the old owner fenced; successful cleanup permits a fresh runtime to resume the retained conversation without replaying the failed request.
+
+`BackgroundManager` retains a trace lease for each data root and gives its workers
+an explicit logging destination from preparation through cleanup. It closes those
+leases only after workers and retained runtimes finish, so a failed preparation
+cannot remove its destination and a reusable runtime cannot inherit a closed one.
+The worker's span carries the originating IPC request ID, host process ID, and
+Background session ID once assigned; catalog spans add the provider operation ID.
+These fields remain in JSONL diagnostics, not user notifications. Explicit routing
+also prevents another active data root from suppressing or receiving these records.

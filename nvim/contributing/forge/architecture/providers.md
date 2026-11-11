@@ -46,6 +46,23 @@ Provider errors expose typed operations and categories, never native response co
 
 Native adapters additionally emit Rust `tracing` diagnostics before normalization discards their causes. The host subscriber sends redacted display errors and source chains to the existing JSONL writer, not to the provider contract or host stdout. Provider operations carry session and operation spans, and retained workers and cleanup inherit their dispatcher and span. Severity filtering controls diagnostic recording only; it cannot change delivery evidence, retry decisions, or cleanup ownership. See [Debugging](../debugging.md) for levels, storage, and inspection boundaries.
 
+Codex classifies process-creation failures at the spawn boundary as
+`ProviderError::RuntimeLaunch`, retaining the selected provider, configured
+executable without arguments, and a normalized missing, permission-denied, or
+unavailable cause. Catalog discovery, session opening, configuration replacement,
+and input reconciliation preserve that evidence instead of replacing it with
+`Transport`. The displayed error names the executable and suggests checking its
+installation or provider settings; native operating-system details stay in JSONL.
+Other connection failures retain their transport classification. The retained
+catalog startup worker inherits its caller's diagnostic dispatcher and span.
+
+Copilot's shared transport-error conversion records native display causes before
+discarding them, including configuration, skill and MCP inspection, terminal
+inventory, history reads, and disconnect failures. Interruption and runtime
+collection retain their existing typed dispositions while also logging the native
+cause. Catalog spans carry their host-issued operation IDs; Background requests
+provide an explicit diagnostic destination independently of interactive sessions.
+
 Terminal inventory protocol failures additionally retain a typed field failure: missing inventory, missing or invalid identity, or missing display command. `ProviderFailure` stores that optional detail without native values; records without it remain readable. Operation traces retain `kind`, `phase`, `disposition`, and `terminal_inventory_error` through both storage and inspection. Free-form `reason` text remains excluded by the trace policy. `ObservationCleanup` renders its retained original failure separately from fencing, cancellation, and collection failures, so a failed close does not replace the initiating cause in the displayed diagnostic.
 
 `ProviderCapability.integration` declares optional operations, resource targets, isolation choices, and implementation limitations in each adapter. The compiled-in registry supplies identities, launch defaults, and declarations before a session starts; Lua does not maintain a duplicate provider catalog. `CapabilityManifest` records only provider facts: each provider operation's support, typed restrictions, and application boundary. Menu groups, labels, ownership, and explanations belong to `forge-harness::provider::capability_menu`, which also adds the Harness-owned workflows such as goals, queues, plans, and child agents, so an adapter never declares a host workflow. Steering policy is likewise Harness's: an active task of any kind accepts steering whenever the binding supports `native_steer`. Open and configuration results publish effective support; later changes arrive on the ordered binding stream. The bridge retains the snapshot consumed by the owner, and `/capabilities` reads that snapshot without calling native discovery. Schema and effective revisions have separate counters. Unsupported optional operations return a typed feature error. Cancellation identifies both the binding and exact invocation, so a repeated or delayed request cannot interrupt a successor. Terminal operations use a binding-scoped typed terminal identity.

@@ -1,5 +1,6 @@
 use super::connection::CodexConnection;
 use anyhow::{Context, Result};
+use forge_provider_api::{ProviderError, error::RuntimeLaunchFailure};
 use forge_shell::process;
 use process_wrap::tokio::ChildWrapper;
 use std::net::TcpListener;
@@ -174,8 +175,19 @@ impl CodexRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = process::spawn_owned(command)
-            .with_context(|| format!("start shared Codex app-server {program}"))?;
+        let mut child = process::spawn_owned(command).map_err(|error| {
+            tracing::error!(target: "forge::provider", event_name = "provider.startup.failed",
+                provider = "codex", error = %format_args!("start shared Codex app-server {program}: {error}"));
+            ProviderError::RuntimeLaunch {
+                provider: crate::registry::select("codex").expect("Codex is registered"),
+                runtime: program.into(),
+                failure: match error.kind() {
+                    std::io::ErrorKind::NotFound => RuntimeLaunchFailure::NotFound,
+                    std::io::ErrorKind::PermissionDenied => RuntimeLaunchFailure::PermissionDenied,
+                    _ => RuntimeLaunchFailure::Unavailable,
+                },
+            }
+        })?;
         // SAFETY: Taking stderr preserves the process identity and lifecycle owned by the wrappers.
         let mut stderr_pipe = unsafe { child.try_inner_child_mut() }
             .context("owned Codex app-server has no native child")?

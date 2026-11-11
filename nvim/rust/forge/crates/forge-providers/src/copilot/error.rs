@@ -104,6 +104,7 @@ pub(crate) fn trace_failure_kind(error: &ProviderError) -> ProviderFailureKind {
         | ProviderError::Unsupported(_)
         | ProviderError::Observation(_)
         | ProviderError::RuntimeVersion(_)
+        | ProviderError::RuntimeLaunch { .. }
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
         | ProviderError::Cancelled

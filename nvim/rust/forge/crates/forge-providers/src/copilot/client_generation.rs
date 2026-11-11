@@ -9,6 +9,7 @@ use forge_provider_api::lifecycle::ObservationFailure;
 use github_copilot_sdk::Client;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 /// Identifies a failed shared client without granting access to a successor.
 #[derive(Clone)]
@@ -185,14 +186,22 @@ impl ClientGeneration {
         let mut collection = self.0.collection.lock().await;
         if matches!(*collection, Collection::Idle) {
             let client = self.0.client.clone();
-            *collection = Collection::Running(tokio::spawn(async move {
-                client.stop().await.map_err(|_| {
-                    Arc::new(native_failure(
-                        forge_provider_api::error::ProviderOperation::Shutdown,
-                        forge_provider_api::error::ProviderFailureKind::Transport,
-                    ))
-                })
-            }));
+            *collection = Collection::Running(tokio::spawn(
+                async move {
+                    client.stop().await.map_err(|error| {
+                        super::handle::log_native_failure(
+                            forge_provider_api::ProviderOperation::Shutdown,
+                            &error,
+                        );
+                        Arc::new(native_failure(
+                            forge_provider_api::error::ProviderOperation::Shutdown,
+                            forge_provider_api::error::ProviderFailureKind::Transport,
+                        ))
+                    })
+                }
+                .in_current_span()
+                .with_current_subscriber(),
+            ));
         }
         if let Collection::Running(task) = &mut *collection {
             let result = super::operation::wait(task).await.map_err(|_| {

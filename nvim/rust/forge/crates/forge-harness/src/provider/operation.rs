@@ -453,6 +453,7 @@ pub(super) fn primary_failure(error: &ProviderError) -> Option<ProviderFailure> 
         | ProviderError::Unsupported(_)
         | ProviderError::Observation(_)
         | ProviderError::RuntimeVersion(_)
+        | ProviderError::RuntimeLaunch { .. }
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
         | ProviderError::Cancelled

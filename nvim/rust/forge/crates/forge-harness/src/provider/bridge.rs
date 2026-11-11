@@ -1512,7 +1512,12 @@ impl ProviderBridge {
         };
         context.check_admission(ProviderOperation::ModelList)?;
         self.register_query_operation(&context, &query).await?;
-        self.native.model_list(context, query).await
+        let span = tracing::info_span!(
+            "provider.catalog",
+            operation_id = context.id().as_str(),
+            operation = ?ProviderOperation::ModelList,
+        );
+        tracing::Instrument::instrument(self.native.model_list(context, query), span).await
     }
 
     /// Read skill choices without changing enablement.
@@ -1523,7 +1528,12 @@ impl ProviderBridge {
         self.ensure_admission(ProviderOperation::SkillList)?;
         let operation = OperationControl::fresh(ProviderOperation::SkillList)?.context();
         self.register_query_operation(&operation, &context).await?;
-        self.native.skill_list(operation, context).await
+        let span = tracing::info_span!(
+            "provider.catalog",
+            operation_id = operation.id().as_str(),
+            operation = ?ProviderOperation::SkillList,
+        );
+        tracing::Instrument::instrument(self.native.skill_list(operation, context), span).await
     }
 
     /// Read configured definitions or observed readiness without hidden configuration writes.
@@ -1539,7 +1549,12 @@ impl ProviderBridge {
                 self.register_query_operation(&context, query).await?
             }
         }
-        self.native.mcp_list(context, query).await
+        let span = tracing::info_span!(
+            "provider.catalog",
+            operation_id = context.id().as_str(),
+            operation = ?ProviderOperation::McpList,
+        );
+        tracing::Instrument::instrument(self.native.mcp_list(context, query), span).await
     }
 
     /// Register an operation against the exact retained generation before native request dispatch.

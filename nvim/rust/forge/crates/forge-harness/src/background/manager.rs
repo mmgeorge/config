@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use super::{BackgroundContext, BackgroundIdentity};
 use crate::{
@@ -48,6 +49,7 @@ pub struct BackgroundResult {
 /// Retain the native owner and its observer between tool-free generation requests.
 struct RetainedBackground {
     runtime: Arc<BrokerRuntime>,
+    trace: Arc<crate::trace::TraceStore>,
     session_id: String,
     observer: Arc<crate::provider::session_execution::SessionObservationInbox>,
     leased: AtomicBool,
@@ -92,6 +94,7 @@ pub struct BackgroundManager {
     syntax: Arc<forge_diff::syntax::SyntaxEngine>,
     admission: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     tasks: Mutex<JoinSet<()>>,
+    trace: Mutex<HashMap<PathBuf, Arc<crate::trace::TraceStore>>>,
     runtime_admission: Semaphore,
     preparation: Mutex<()>,
     shutdown: super::CancellationToken,
@@ -114,6 +117,7 @@ impl BackgroundManager {
             syntax,
             admission: Mutex::new(HashMap::new()),
             tasks: Mutex::new(JoinSet::new()),
+            trace: Mutex::new(HashMap::new()),
             runtime_admission: Semaphore::new(4),
             preparation: Mutex::new(()),
             shutdown: super::CancellationToken::new(),
@@ -136,9 +140,35 @@ impl BackgroundManager {
             "Background manager is shutting down"
         );
         while tasks.try_join_next().is_some() {}
-        tasks.spawn(async move {
-            owner.run(request, sender).await;
+        let trace = {
+            let mut trace = self.trace.lock().await;
+            match trace.entry(request.config.data_root.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry
+                    .insert(Arc::new(crate::trace::TraceStore::open(
+                        &request.config.data_root,
+                    )?))
+                    .clone(),
+            }
+        };
+        let dispatch = trace.dispatch();
+        let span = tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info_span!(
+                "background.generation",
+                request_id = request.delivery.as_ref().map(|(_, request_id)| *request_id),
+                process_id = std::process::id(),
+                session_id = tracing::field::Empty,
+                method = "repository.generation",
+                provider = request.config.provider.kind.as_str(),
+            )
         });
+        tasks.spawn(
+            async move {
+                owner.run(request, sender, trace).await;
+            }
+            .instrument(span)
+            .with_subscriber(dispatch),
+        );
         drop(tasks);
         receiver
             .await
@@ -149,6 +179,7 @@ impl BackgroundManager {
         &self,
         request: BackgroundRequest,
         sender: oneshot::Sender<Result<BackgroundResult>>,
+        trace: Arc<crate::trace::TraceStore>,
     ) {
         let key = format!(
             "{}:{}",
@@ -183,10 +214,12 @@ impl BackgroundManager {
             }
             admitted = admitted => admitted,
         };
-        let prepared = self.prepare(&request, &key).await;
+        let prepared = self.prepare(&request, &key, trace).await;
         let (mut broker, runtime, _ownership, model) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                tracing::error!(target: "forge::provider", event_name = "background.preparation.failed",
+                    error = %format_args!("{error:#}"));
                 let _ = sender.send(Err(error));
                 return;
             }
@@ -199,7 +232,11 @@ impl BackgroundManager {
         let (sink, events) = crate::broker::publication::channel();
         let delivery = request.delivery.clone();
         let progress_session = session_id.clone();
-        let forward = tokio::spawn(forward_progress(events, delivery, progress_session));
+        let forward = tokio::spawn(
+            forward_progress(events, delivery, progress_session)
+                .in_current_span()
+                .with_current_subscriber(),
+        );
         let policy = crate::settings::SettingsStore::open(&request.config.data_root)
             .and_then(|store| {
                 store.get(
@@ -225,6 +262,8 @@ impl BackgroundManager {
                         error.context(format!("Background lease release also failed: {release:#}"))
                     }
                 };
+                tracing::error!(target: "forge::provider", event_name = "background.preparation.failed",
+                    error = %format_args!("{error:#}"));
                 let _ = sender.send(Err(error));
                 return;
             }
@@ -272,6 +311,10 @@ impl BackgroundManager {
                 "Background publication also failed: {publication:#}"
             ))),
         };
+        if let Err(error) = &result {
+            tracing::error!(target: "forge::provider", event_name = "background.generation.failed",
+                error = %format_args!("{error:#}"));
+        }
         if let Err(error) = &result
             && let Err(storage) =
                 broker.background_failure("background_generation", format!("{error:#}"))
@@ -493,6 +536,7 @@ impl BackgroundManager {
         &self,
         request: &BackgroundRequest,
         key: &str,
+        trace: Arc<crate::trace::TraceStore>,
     ) -> Result<(
         HarnessBroker,
         BackgroundLease,
@@ -624,6 +668,7 @@ impl BackgroundManager {
                 initialize,
                 retained.retained.runtime.clone(),
             )?;
+            tracing::Span::current().record("session_id", retained.retained.session_id.as_str());
             let recovery = async {
                 let registry = broker.execution_registry();
                 let owner = crate::provider::ThreadOwner::root(&retained.retained.session_id);
@@ -650,6 +695,7 @@ impl BackgroundManager {
                     broker.observer().replace_session_events(observer.clone());
                     let replacement = Arc::new(RetainedBackground {
                         runtime: retained.retained.runtime.clone(),
+                        trace: retained.retained.trace.clone(),
                         session_id: retained.retained.session_id.clone(),
                         observer,
                         leased: AtomicBool::new(false),
@@ -733,12 +779,14 @@ impl BackgroundManager {
         )?;
         let mut broker = HarnessBroker::initialize_with_runtime(initialize, Arc::clone(&runtime))?;
         let session_id = broker.snapshot()?.session.id;
+        tracing::Span::current().record("session_id", session_id.as_str());
         let registry = broker.execution_registry();
         let owner = crate::provider::ThreadOwner::root(&session_id);
         registry.owner(owner.clone()).await?;
         let observer = registry.observer(owner)?;
         let retained = Arc::new(RetainedBackground {
             runtime,
+            trace,
             session_id,
             observer,
             leased: AtomicBool::new(false),
@@ -820,7 +868,18 @@ impl BackgroundManager {
         }
         match failure {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => {
+                let traces = std::mem::take(&mut *self.trace.lock().await);
+                tokio::task::spawn_blocking(move || {
+                    for trace in traces.into_values() {
+                        trace.close()?;
+                    }
+                    Ok::<_, crate::trace::TraceError>(())
+                })
+                .await
+                .context("collect Background trace writers")??;
+                Ok(())
+            }
         }
     }
 
@@ -959,7 +1018,19 @@ impl BackgroundManager {
 
 /// Collect a retired Background owner's trace only after native execution cleanup succeeds.
 async fn collect_retained_runtime(retained: &RetainedBackground) -> Result<()> {
-    retained.runtime.shutdown().await?;
+    let dispatch = retained.trace.dispatch();
+    let span = tracing::dispatcher::with_default(&dispatch, || {
+        tracing::info_span!(
+            "background.collection",
+            session_id = retained.session_id.as_str()
+        )
+    });
+    retained
+        .runtime
+        .shutdown()
+        .instrument(span)
+        .with_subscriber(dispatch)
+        .await?;
     // Background runtimes own separate trace leases even when they share a data
     // root with Main. Releasing this lease leaves other live owners usable.
     let trace = retained.runtime.trace();
@@ -1000,6 +1071,8 @@ async fn forward_progress(
 }
 
 async fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: String) {
+    tracing::error!(target: "forge::provider", event_name = "background.cleanup.failed",
+        session_id = session, error = %error);
     if let Some((delivery, _)) = delivery {
         let _ = delivery
             .send_event(SessionEvent {

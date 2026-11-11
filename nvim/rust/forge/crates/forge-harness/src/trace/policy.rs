@@ -107,6 +107,7 @@ pub(super) fn diagnostic_field(key: &str) -> bool {
             | "from_state"
             | "to_state"
             | "request_id"
+            | "process_id"
             | "session_id"
             | "agent_id"
             | "exchange_id"

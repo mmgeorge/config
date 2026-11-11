@@ -98,6 +98,20 @@ pub enum ProviderFailureKind {
     ResourceConflict,
 }
 
+/// Classify a failed executable launch without exposing native operating-system diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RuntimeLaunchFailure {
+    /// The configured executable or its required interpreter could not be found.
+    #[error("executable not found")]
+    NotFound,
+    /// The operating system refused permission to execute the configured program.
+    #[error("permission denied")]
+    PermissionDenied,
+    /// Another operating-system failure prevented process creation.
+    #[error("process creation failed; see Forge JSONL logs for details")]
+    Unavailable,
+}
+
 /// Identify a lifecycle subphase independently of the requested operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -416,6 +430,15 @@ pub enum ProviderError {
     Observation(crate::lifecycle::ObservationFailure),
     /// The selected runtime does not satisfy the adapter version contract.
     RuntimeVersion(crate::version::RuntimeVersionError),
+    /// The selected executable could not be launched; native details remain in diagnostic logs.
+    RuntimeLaunch {
+        /// Provider selected by the caller, independent of the failing catalog or session operation.
+        provider: crate::ProviderId,
+        /// Configured executable, without command arguments.
+        runtime: std::path::PathBuf,
+        /// Normalized operating-system launch failure.
+        failure: RuntimeLaunchFailure,
+    },
     /// Native preparation failed before its requested execution could be admitted.
     PreparationFailed(Box<ProviderError>),
     /// Preparation failed and required preparation cleanup failed independently.
@@ -459,6 +482,7 @@ impl ProviderError {
             | Self::Unsupported(_)
             | Self::Observation(_)
             | Self::RuntimeVersion(_)
+            | Self::RuntimeLaunch { .. }
             | Self::NotConsumed
             | Self::DeliveryUncertain
             | Self::Cancelled
@@ -481,6 +505,7 @@ impl ProviderError {
             | Self::Unsupported(_)
             | Self::Observation(_)
             | Self::RuntimeVersion(_)
+            | Self::RuntimeLaunch { .. }
             | Self::PreparationCleanup { .. }
             | Self::NotConsumed
             | Self::DeliveryUncertain
@@ -506,6 +531,15 @@ impl std::fmt::Display for ProviderError {
             Self::Unsupported(error) => std::fmt::Display::fmt(error, formatter),
             Self::Observation(error) => write!(formatter, "provider observation failed: {error}"),
             Self::RuntimeVersion(error) => std::fmt::Display::fmt(error, formatter),
+            Self::RuntimeLaunch {
+                provider,
+                runtime,
+                failure,
+            } => write!(
+                formatter,
+                "cannot launch provider {provider} (`{}`): {failure}. Check its installation or provider settings",
+                runtime.display()
+            ),
             Self::PreparationFailed(error) => {
                 write!(formatter, "provider preparation failed: {error}")
             }
@@ -532,6 +566,7 @@ impl std::error::Error for ProviderError {
             Self::Unsupported(error) => Some(error),
             Self::Observation(error) => Some(error),
             Self::RuntimeVersion(error) => Some(error),
+            Self::RuntimeLaunch { failure, .. } => Some(failure),
             Self::PreparationFailed(error) => Some(error.as_ref()),
             Self::PreparationCleanup { cause, .. } => Some(cause.as_ref()),
             Self::Retryable(error) => Some(error.as_ref()),

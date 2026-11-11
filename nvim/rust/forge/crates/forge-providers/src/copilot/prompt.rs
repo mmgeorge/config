@@ -229,6 +229,7 @@ pub async fn run(
                         | ProviderError::Unsupported(_)
                         | ProviderError::Observation(_)
                         | ProviderError::RuntimeVersion(_)
+                        | ProviderError::RuntimeLaunch { .. }
                         | ProviderError::PreparationFailed(_)
                         | ProviderError::PreparationCleanup { .. }
                         | ProviderError::DeliveryUncertain

@@ -168,6 +168,7 @@ fn invalidates_binding(error: &ProviderError) -> bool {
             invalidates_binding(cause) || invalidates_binding(cleanup)
         }
         ProviderError::RuntimeVersion(_)
+        | ProviderError::RuntimeLaunch { .. }
         | ProviderError::Unsupported(_)
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
@@ -191,6 +192,7 @@ fn normalized_failure(error: &ProviderError, phase: ProviderPhase) -> ProviderFa
                 .at_phase(phase, FailureDisposition::Invalidated)
         }
         ProviderError::RuntimeVersion(_)
+        | ProviderError::RuntimeLaunch { .. }
         | ProviderError::Unsupported(_)
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain

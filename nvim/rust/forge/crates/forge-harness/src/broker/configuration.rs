@@ -285,6 +285,7 @@ impl ConfigurationReconcileJob {
             | ProviderError::Cleanup(_)
             | ProviderError::Observation(_)
             | ProviderError::RuntimeVersion(_)
+            | ProviderError::RuntimeLaunch { .. }
             | ProviderError::PreparationCleanup { .. }
             | ProviderError::NotConsumed
             | ProviderError::DeliveryUncertain

@@ -3,6 +3,7 @@ use github_copilot_sdk::{CliProgram, Client, ClientOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use super::handle::CopilotClient;
 
@@ -231,17 +232,25 @@ impl CopilotRuntime {
         let mut shutdown = self.shutdown.lock().await;
         if matches!(*shutdown, Shutdown::Idle | Shutdown::Complete(Err(_))) {
             let client = self.client.lock().await.clone();
-            *shutdown = Shutdown::Running(tokio::spawn(async move {
-                match client {
-                    Some(client) => client.client().stop().await.map_err(|_| {
-                        std::sync::Arc::new(provider_failure(
-                            forge_provider_api::error::ProviderOperation::Shutdown,
-                            forge_provider_api::error::ProviderFailureKind::Transport,
-                        ))
-                    }),
-                    None => Ok(()),
+            *shutdown = Shutdown::Running(tokio::spawn(
+                async move {
+                    match client {
+                        Some(client) => client.client().stop().await.map_err(|error| {
+                            super::handle::log_native_failure(
+                                forge_provider_api::ProviderOperation::Shutdown,
+                                &error,
+                            );
+                            std::sync::Arc::new(provider_failure(
+                                forge_provider_api::error::ProviderOperation::Shutdown,
+                                forge_provider_api::error::ProviderFailureKind::Transport,
+                            ))
+                        }),
+                        None => Ok(()),
+                    }
                 }
-            }));
+                .in_current_span()
+                .with_current_subscriber(),
+            ));
         }
         if let Shutdown::Running(task) = &mut *shutdown {
             let result = task.await.unwrap_or_else(|_| {

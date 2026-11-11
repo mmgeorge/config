@@ -191,6 +191,175 @@ fn serial_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Keep Background preparation diagnostics after its failed runtime releases the last writer.
+#[test]
+fn background_model_failure_retains_native_cause_and_request_identity() {
+    verify_background_failure_logs(None, BackgroundFailureProvider::Copilot);
+}
+
+/// Route diagnostics to their owning Background root rather than the interactive writer.
+#[test]
+fn background_model_failure_isolates_logging_roots() {
+    let interactive_data = tempfile::tempdir().unwrap();
+    verify_background_failure_logs(
+        Some(interactive_data.path()),
+        BackgroundFailureProvider::Copilot,
+    );
+}
+
+/// Explain a missing configured executable instead of reporting model discovery as a transport loss.
+#[test]
+fn background_missing_codex_names_executable_and_remedy() {
+    let interactive_data = tempfile::tempdir().unwrap();
+    verify_background_failure_logs(
+        Some(interactive_data.path()),
+        BackgroundFailureProvider::Codex,
+    );
+}
+
+/// Select the real native startup boundary exercised by the missing-executable fixture.
+#[derive(Clone, Copy)]
+enum BackgroundFailureProvider {
+    Copilot,
+    Codex,
+}
+
+/// Exercise native launch failure through IPC without contacting a live provider.
+fn verify_background_failure_logs(
+    interactive_data: Option<&Path>,
+    provider: BackgroundFailureProvider,
+) {
+    let provider_name = match provider {
+        BackgroundFailureProvider::Copilot => "copilot",
+        BackgroundFailureProvider::Codex => "codex",
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    initialize_repository(workspace.path());
+    std::fs::write(workspace.path().join("change.txt"), "Background fixture\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let missing_program = data.path().join(format!("missing-{provider_name}"));
+    let mut broker = BrokerProcess::start();
+    if let Some(interactive_data) = interactive_data {
+        broker.request(json!({
+            "id": 40, "method": "session.initialize", "params": {
+                "workspace": workspace.path(), "data_root": interactive_data,
+                "client_id": "diagnostic-fixture", "provider": {"kind": "mock", "command": ["mock"]}
+            }
+        }));
+        assert!(
+            broker
+                .read_response(40)
+                .pop()
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+    }
+    let params = json!({
+            "operation": "generate", "workspace": workspace.path(), "comparison": "head",
+            "generation": {
+                "provider": {"kind": provider_name, "command": [missing_program]},
+                "model": "default", "data_root": data.path()
+            }
+    });
+    for request_id in [41, 43] {
+        broker.request(json!({
+            "id": request_id, "method": "repository.generation", "params": params
+        }));
+        let response = broker.read_response(request_id).pop().unwrap();
+        let message = response["error"]["message"].as_str().unwrap();
+        match provider {
+            BackgroundFailureProvider::Codex => {
+                assert!(
+                    message.contains("cannot launch provider codex"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(missing_program.to_string_lossy().as_ref()),
+                    "{message}"
+                );
+                assert!(message.contains("executable not found"), "{message}");
+                assert!(
+                    message.contains("installation or provider settings"),
+                    "{message}"
+                );
+                assert!(!message.contains("Transport"), "{message}");
+            }
+            BackgroundFailureProvider::Copilot => {
+                assert!(message.contains("ModelList"), "{message}");
+            }
+        }
+        assert!(!message.contains("os error"), "{message}");
+        assert!(!message.contains("request_id"), "{message}");
+        assert!(!message.contains("operation_id"), "{message}");
+    }
+    broker.request(json!({"id": 42, "method": "host.shutdown", "params": {}}));
+    assert!(
+        broker
+            .read_response(42)
+            .pop()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    assert!(broker.child.wait().unwrap().success());
+    let path = forge_harness::storage::state::directory(data.path()).join("harness-trace.jsonl");
+    let contents = std::fs::read_to_string(path).unwrap();
+    let records = contents
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    for request_id in [41, 43] {
+        let failure = records
+            .iter()
+            .find(|record| {
+                record["event"] == "provider.startup.failed"
+                    && record["payload"]["request_id"] == request_id
+            })
+            .unwrap_or_else(|| panic!("missing native startup diagnostic: {contents}"));
+        assert!(
+            !failure["payload"]["error"].as_str().unwrap().is_empty(),
+            "{failure}"
+        );
+        if let BackgroundFailureProvider::Codex = provider {
+            let native_error = failure["payload"]["error"].as_str().unwrap();
+            assert!(native_error.contains("os error"), "{native_error}");
+            assert!(
+                native_error.contains(missing_program.to_string_lossy().as_ref()),
+                "{native_error}"
+            );
+        }
+        assert!(
+            failure["payload"]["process_id"].as_u64().unwrap() > 0,
+            "{failure}"
+        );
+        assert!(failure["payload"]["operation_id"].is_string(), "{failure}");
+        assert_ne!(failure["session_id"], "global", "{failure}");
+        assert!(
+            records
+                .iter()
+                .any(|record| record["event"] == "background.preparation.failed"
+                    && record["payload"]["request_id"] == request_id),
+            "{contents}"
+        );
+    }
+    assert!(!contents.contains("Background fixture"));
+    if let Some(interactive_data) = interactive_data {
+        let path =
+            forge_harness::storage::state::directory(interactive_data).join("harness-trace.jsonl");
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(!contents.contains("provider.startup.failed"), "{contents}");
+    } else {
+        for request_id in [41, 43] {
+            assert!(
+                records.iter().any(|record| record["event"] == "ipc.failed"
+                    && record["payload"]["request_id"] == request_id),
+                "{contents}"
+            );
+        }
+    }
+}
+
 #[test]
 fn shutdown_cancels_all_sessions_before_its_terminal_response() {
     let _serial_guard = serial_test();

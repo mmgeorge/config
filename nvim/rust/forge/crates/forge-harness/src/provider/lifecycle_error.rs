@@ -57,7 +57,9 @@ pub(crate) fn diagnostic(
             ProviderError::Unsupported(_)
             | ProviderError::NotConsumed
             | ProviderError::Cancelled => ProviderFailureKind::Rejected,
-            ProviderError::RuntimeVersion(_) => ProviderFailureKind::Initialization,
+            ProviderError::RuntimeVersion(_) | ProviderError::RuntimeLaunch { .. } => {
+                ProviderFailureKind::Initialization
+            }
         };
         ProviderFailure::new(operation, kind)
     }

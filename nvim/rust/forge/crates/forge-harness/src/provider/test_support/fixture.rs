@@ -1089,6 +1089,7 @@ impl EventFixtureProvider {
                     Ok(_)
                     | Err(
                         ProviderError::RuntimeVersion(_)
+                        | ProviderError::RuntimeLaunch { .. }
                         | ProviderError::Unsupported(_)
                         | ProviderError::Delivery(_)
                         | ProviderError::Contract(_)

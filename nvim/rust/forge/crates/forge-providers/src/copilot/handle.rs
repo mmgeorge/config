@@ -251,10 +251,10 @@ impl CopilotSession {
             // Keep cleanup ownership until the runtime supplies a CollectedClient witness.
             return intake.and_then(|()| self.generation.ensure_healthy());
         }
-        let native = self.inner.disconnect().await.map_err(|_| {
-            native_failure(
+        let native = self.inner.disconnect().await.map_err(|error| {
+            transport_failure(
                 forge_provider_api::error::ProviderOperation::TurnInterrupt,
-                forge_provider_api::error::ProviderFailureKind::Transport,
+                &error,
             )
         });
         match (intake, native) {
@@ -274,7 +274,8 @@ impl CopilotSession {
             .rpc()
             .abort(AbortRequest::default())
             .await
-            .map_err(|_| {
+            .map_err(|error| {
+                log_native_failure(forge_provider_api::ProviderOperation::TurnInterrupt, &error);
                 ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
                         forge_provider_api::ProviderOperation::TurnInterrupt,
@@ -324,17 +325,11 @@ impl CopilotSession {
     /// Refresh native liveness before reading task rows for display or cancellation.
     async fn native_terminal_tasks(&self) -> Result<TaskList, ProviderError> {
         self.ensure_healthy()?;
-        self.inner.rpc().tasks().refresh().await.map_err(|_| {
-            native_failure(
-                forge_provider_api::ProviderOperation::TerminalList,
-                forge_provider_api::ProviderFailureKind::Transport,
-            )
+        self.inner.rpc().tasks().refresh().await.map_err(|error| {
+            transport_failure(forge_provider_api::ProviderOperation::TerminalList, &error)
         })?;
-        self.inner.rpc().tasks().list().await.map_err(|_| {
-            native_failure(
-                forge_provider_api::ProviderOperation::TerminalList,
-                forge_provider_api::ProviderFailureKind::Transport,
-            )
+        self.inner.rpc().tasks().list().await.map_err(|error| {
+            transport_failure(forge_provider_api::ProviderOperation::TerminalList, &error)
         })
     }
 
@@ -373,10 +368,10 @@ impl CopilotSession {
             .set_model(model, Some(model_options(effort, context)?))
             .await
             .map(|_| ())
-            .map_err(|_| {
-                native_failure(
+            .map_err(|error| {
+                transport_failure(
                     forge_provider_api::error::ProviderOperation::ThreadConfigure,
-                    forge_provider_api::error::ProviderFailureKind::Transport,
+                    &error,
                 )
             })
     }
@@ -401,10 +396,10 @@ impl CopilotSession {
                 ..Default::default()
             })
             .await
-            .map_err(|_| {
-                native_failure(
+            .map_err(|error| {
+                transport_failure(
                     forge_provider_api::ProviderOperation::ThreadConfigure,
-                    forge_provider_api::ProviderFailureKind::Transport,
+                    &error,
                 )
             })?;
         confirm_model_switch(model, &result)
@@ -438,10 +433,10 @@ impl CopilotSession {
                 .collect())
         }
         .await;
-        result.map_err(|_| {
-            native_failure(
+        result.map_err(|error| {
+            transport_failure(
                 forge_provider_api::error::ProviderOperation::TurnStart,
-                forge_provider_api::error::ProviderFailureKind::Transport,
+                error.as_ref(),
             )
         })
     }
@@ -596,10 +591,10 @@ impl CopilotSession {
             Ok(definition_list)
         }
         .await;
-        result.map_err(|_| {
-            native_failure(
+        result.map_err(|error| {
+            transport_failure(
                 forge_provider_api::error::ProviderOperation::TurnStart,
-                forge_provider_api::error::ProviderFailureKind::Transport,
+                error.as_ref(),
             )
         })
     }
@@ -635,21 +630,18 @@ impl CopilotSession {
         }
         .await;
         result.map_err(|error| {
-            error.downcast::<ProviderError>().unwrap_or_else(|_| {
-                native_failure(
+            error.downcast::<ProviderError>().unwrap_or_else(|error| {
+                transport_failure(
                     forge_provider_api::ProviderOperation::TerminalTerminate,
-                    forge_provider_api::ProviderFailureKind::Transport,
+                    error.as_ref(),
                 )
             })
         })
     }
     /// Capture a durable event anchor before sending, independently of process-local cursors.
     pub async fn delivery_boundary(&self) -> Result<(String, Option<String>), ProviderError> {
-        let tail = self.inner.rpc().event_log().tail().await.map_err(|_| {
-            native_failure(
-                forge_provider_api::ProviderOperation::TurnStart,
-                forge_provider_api::ProviderFailureKind::Transport,
-            )
+        let tail = self.inner.rpc().event_log().tail().await.map_err(|error| {
+            transport_failure(forge_provider_api::ProviderOperation::TurnStart, &error)
         })?;
         let history = self
             .inner
@@ -666,11 +658,8 @@ impl CopilotSession {
                 wait_ms: Some(0),
             })
             .await
-            .map_err(|_| {
-                native_failure(
-                    forge_provider_api::ProviderOperation::TurnStart,
-                    forge_provider_api::ProviderFailureKind::Transport,
-                )
+            .map_err(|error| {
+                transport_failure(forge_provider_api::ProviderOperation::TurnStart, &error)
             })?;
         if history.cursor_status != EventsCursorStatus::Ok {
             return Err(native_failure(
@@ -706,10 +695,10 @@ impl CopilotSession {
                     max: Some(100),
                 })
                 .await
-                .map_err(|_| {
-                    native_failure(
+                .map_err(|error| {
+                    transport_failure(
                         forge_provider_api::ProviderOperation::InputReconcile,
-                        forge_provider_api::ProviderFailureKind::Transport,
+                        &error,
                     )
                 })?;
             if history.cursor_status != EventsCursorStatus::Ok {
@@ -835,10 +824,10 @@ impl CopilotSession {
         }
         .await;
         result.map_err(|error| {
-            error.downcast::<ProviderError>().unwrap_or_else(|_| {
-                native_failure(
+            error.downcast::<ProviderError>().unwrap_or_else(|error| {
+                transport_failure(
                     forge_provider_api::ProviderOperation::InputRetract,
-                    forge_provider_api::ProviderFailureKind::Transport,
+                    error.as_ref(),
                 )
             })
         })
@@ -907,7 +896,7 @@ impl CopilotSession {
                     wait_ms: Some(0),
                 })
                 .await
-                .map_err(|_| transport())?;
+                .map_err(|error| transport_failure(OPERATION, &error))?;
             if history.cursor_status != EventsCursorStatus::Ok {
                 return Err(transport());
             }
@@ -965,10 +954,10 @@ impl CopilotSession {
         }
         .await;
         result.map_err(|error| {
-            error.downcast::<ProviderError>().unwrap_or_else(|_| {
-                native_failure(
+            error.downcast::<ProviderError>().unwrap_or_else(|error| {
+                transport_failure(
                     forge_provider_api::ProviderOperation::ThreadCompact,
-                    forge_provider_api::ProviderFailureKind::Transport,
+                    error.as_ref(),
                 )
             })
         })
@@ -1086,10 +1075,10 @@ impl CopilotSession {
             .and_then(|result| result)
         }
         .await;
-        result.map_err(|_| {
-            native_failure(
+        result.map_err(|error| {
+            transport_failure(
                 forge_provider_api::error::ProviderOperation::TurnStart,
-                forge_provider_api::error::ProviderFailureKind::Transport,
+                error.as_ref(),
             )
         })
     }
@@ -1171,6 +1160,27 @@ pub(super) fn resolve_unclaimed_submissions(
     }
 }
 
+/// Retain the native cause before replacing it with the provider's sanitized transport category.
+fn transport_failure(
+    operation: forge_provider_api::ProviderOperation,
+    error: &(dyn std::error::Error + 'static),
+) -> ProviderError {
+    log_native_failure(operation, error);
+    native_failure(
+        operation,
+        forge_provider_api::ProviderFailureKind::Transport,
+    )
+}
+
+/// Record native display causes without serializing SDK response payloads.
+pub(super) fn log_native_failure(
+    operation: forge_provider_api::ProviderOperation,
+    error: &(dyn std::error::Error + 'static),
+) {
+    tracing::error!(target: "forge::provider", event_name = "provider.failure",
+        provider = "copilot", operation = ?operation, error = %super::super::error::Diagnostic(error));
+}
+
 fn native_failure(
     operation: forge_provider_api::error::ProviderOperation,
     kind: forge_provider_api::error::ProviderFailureKind,
@@ -1236,6 +1246,37 @@ mod tests {
             recorded.contains("list Copilot models") && recorded.contains("native-catalog-cause"),
             "{recorded}"
         );
+        assert!(!recorded.contains("private-rpc-data"));
+        client.stop().await.unwrap();
+        peer.collected().await;
+    }
+
+    /// Keep persisted-history failures actionable without exposing native RPC data to callers.
+    #[tokio::test]
+    async fn reconciliation_failure_logs_native_cause_before_normalization() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::Registry::default().with(CapturedError(captured.clone()));
+        let (client, peer) = super::super::test_peer::client(|request| {
+            vec![
+                serde_json::json!({"jsonrpc":"2.0","id":request["id"],"error":{
+                    "code":-32603,"message":"native-history-cause","data":{"token":"private-rpc-data"}
+                }}),
+            ]
+        });
+        let error = CopilotSession::find_unclaimed_submission_in(
+            &client,
+            "native-session",
+            None,
+            &HashSet::new(),
+            None,
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().contains("native-history-cause"));
+        let recorded = captured.lock().unwrap().join("\n");
+        assert!(recorded.contains("native-history-cause"), "{recorded}");
         assert!(!recorded.contains("private-rpc-data"));
         client.stop().await.unwrap();
         peer.collected().await;

@@ -30,6 +30,7 @@ use std::{
     },
 };
 use tokio::sync::{Mutex, mpsc, watch};
+use tracing::{Instrument, instrument::WithSubscriber};
 
 /// Own Codex app-server conversations, execution correlation, and native cleanup.
 #[derive(Clone)]
@@ -103,9 +104,7 @@ impl CodexProvider {
             *catalog = Some(CatalogConnection::Starting(tokio::spawn(async move {
                 let connect = async move {
                     let connection = runtime.connect().await.map_err(|error| {
-                        tracing::error!(target: "forge::provider", event_name = "provider.startup.failed",
-                            provider = "codex", error = %format_args!("{error:#}"));
-                        failure(ProviderOperation::Inspect, ProviderFailureKind::Transport)
+                        connection_failure(ProviderOperation::Inspect, error)
                     })?;
                     let rpc = Arc::new(NativeRpc::new(connection));
                     discovery.lock().await.push(rpc.clone());
@@ -134,7 +133,7 @@ impl CodexProvider {
                     Some(native) => super::operations::scope(native, connect).await,
                     None => connect.await,
                 }
-            })));
+            }.instrument(tracing::Span::current()).with_current_subscriber())));
         }
         let result = match catalog.as_mut().expect("catalog initialization installed") {
             CatalogConnection::Ready(rpc) => return Ok(rpc.clone()),
@@ -331,12 +330,10 @@ impl CodexProvider {
         self.preparing.lock().await.remove(&operation_id);
         super::operations::mark_changed();
         super::operations::check()?;
-        let connection = runtime.connect().await.map_err(|_| {
-            failure(
-                ProviderOperation::ThreadOpen,
-                ProviderFailureKind::Transport,
-            )
-        })?;
+        let connection = runtime
+            .connect()
+            .await
+            .map_err(|error| connection_failure(ProviderOperation::ThreadOpen, error))?;
         let rpc = Arc::new(NativeRpc::new(connection));
         *pending.rpc.lock().await = Some(rpc.clone());
         let initialized = rpc.request("initialize", json!({
@@ -1030,18 +1027,10 @@ impl CodexProvider {
         let next_runtime = session.runtime.lock().await.clone();
         let connection = match next_runtime.connect().await {
             Ok(connection) => connection,
-            Err(_) => {
+            Err(error) => {
                 return Err(invalidate_configuration(
                     &session,
-                    ProviderFailure::new(
-                        ProviderOperation::ThreadConfigure,
-                        ProviderFailureKind::Transport,
-                    )
-                    .at_phase(
-                        forge_provider_api::ProviderPhase::Preparation,
-                        forge_provider_api::FailureDisposition::Invalidated,
-                    )
-                    .into(),
+                    connection_failure(ProviderOperation::ThreadConfigure, error),
                     forge_provider_api::ProviderPhase::Preparation,
                 ));
             }
@@ -1611,11 +1600,8 @@ impl CodexProvider {
         }
         let connection = match self.runtime.connect().await {
             Ok(connection) => connection,
-            Err(_) => {
-                return Err(failure(
-                    ProviderOperation::InputReconcile,
-                    ProviderFailureKind::Transport,
-                ));
+            Err(error) => {
+                return Err(connection_failure(ProviderOperation::InputReconcile, error));
             }
         };
         let rpc = Arc::new(NativeRpc::new(connection));
@@ -4006,6 +3992,18 @@ fn invalidate_configuration(
     }
 }
 
+/// Preserve launch and cancellation evidence; log other native connection causes before normalization.
+fn connection_failure(operation: ProviderOperation, error: anyhow::Error) -> ProviderError {
+    match error.downcast::<ProviderError>() {
+        Ok(error) => error.for_operation(operation),
+        Err(error) => {
+            tracing::error!(target: "forge::provider", event_name = "provider.startup.failed",
+                provider = "codex", error = %format_args!("{error:#}"));
+            failure(operation, ProviderFailureKind::Transport)
+        }
+    }
+}
+
 /// Normalize specialized safe evidence without losing its separately retained typed detail.
 fn configuration_failure(
     error: &ProviderError,
@@ -4054,6 +4052,9 @@ fn configuration_failure(
             },
             Phase::Preparation,
         ),
+        ProviderError::RuntimeLaunch { .. } => {
+            (ProviderFailureKind::Initialization, Phase::Preparation)
+        }
         ProviderError::Observation(observation) => (
             match observation {
                 Observation::LifecycleUnavailable => ProviderFailureKind::Runtime,
@@ -6315,6 +6316,53 @@ mod continuation_tests {
         turn_control::{HostTurnStatus, TurnControl},
     };
     use forge_provider_api::{ProviderEvent, turn::TurnOutcome};
+
+    /// Keep a non-launch I/O failure distinct from an executable lookup failure.
+    #[test]
+    fn non_launch_not_found_stays_transport_failure() {
+        let error = connection_failure(
+            ProviderOperation::ModelList,
+            std::io::Error::from(std::io::ErrorKind::NotFound).into(),
+        );
+        assert!(matches!(
+            error,
+            ProviderError::Failure(failure)
+                if failure.kind() == ProviderFailureKind::Transport
+        ));
+    }
+
+    /// Preserve a denied executable launch through catalog discovery without calling it missing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_launch_permission_denied_retains_cause() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("not-executable");
+        std::fs::write(&program, "not an executable").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let provider = CodexProvider::new(
+            vec![program.to_str().unwrap().to_owned()],
+            directory.path().join("runtime"),
+        )
+        .unwrap();
+        let error = match provider.catalog_connection().await {
+            Err(error) => error.for_operation(ProviderOperation::ModelList),
+            Ok(_) => panic!("a non-executable file cannot start a Codex runtime"),
+        };
+        assert!(matches!(
+            &error,
+            ProviderError::RuntimeLaunch {
+                runtime,
+                failure: forge_provider_api::error::RuntimeLaunchFailure::PermissionDenied,
+                ..
+            } if runtime == &program
+        ));
+        let message = error.to_string();
+        assert!(message.contains("permission denied"), "{message}");
+        assert!(!message.contains("executable not found"), "{message}");
+        provider.runtime.shutdown().await.unwrap();
+    }
 
     /// Allocate one immutable host operation identity; dropping its source never requests cancellation.
     fn context() -> OperationContext {
