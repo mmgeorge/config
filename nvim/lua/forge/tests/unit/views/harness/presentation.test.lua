@@ -1629,6 +1629,30 @@ T["update_scheduling"] = function()
       text_edit = { { start_row = 0, removed_rows = 1, text = { "update " .. (base + 1) } } },
       block_edit = {}, removed_block = {}, metadata_edit = {} }
   end
+  -- A transcript outside the current tab page synchronizes once a second, and at once when its
+  -- tab page is entered.
+  open()
+  refresh().callback({ patch = {} })
+  wait_until(function() return not owner.syncing end, "the settling refresh did not complete")
+  local defer, delays = vim.defer_fn, {}
+  vim.defer_fn = function(callback, delay)
+    delays[#delays + 1] = delay
+    return { stop = function() end, close = function() end, callback = callback }
+  end
+  local transcript_tabpage = vim.api.nvim_get_current_tabpage()
+  vim.cmd.tabnew()
+  local hidden_count = #requests
+  owner.sync()
+  assert(delays[#delays] == 1000 and #requests == hidden_count, "a hidden transcript kept the displayed pace")
+  vim.api.nvim_set_current_tabpage(transcript_tabpage)
+  wait_until(function() return #requests > hidden_count and requests[#requests].params.operation == "sync" end,
+    "entering the transcript's tab page did not synchronize it")
+  vim.defer_fn = defer
+  requests[#requests].callback({ patch = {} })
+  vim.cmd.tabonly()
+  owner.close()
+  requests[#requests].callback({})
+
   open()
   local pending = refresh()
   local observed_revision

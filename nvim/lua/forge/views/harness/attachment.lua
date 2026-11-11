@@ -91,7 +91,7 @@ function M.capture(buffer, metadata_only)
   if not metadata_only then draft.text = table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n") end
   local owner = owner_by_buffer[buffer]
   if not owner then return draft end
-  local sequence = vim.api.nvim_buf_call(buffer, function() return vim.fn.undotree().seq_cur end)
+  local sequence = vim.api.nvim_buf_call(buffer, vim.fn.changenr)
   if owner.undo_sequence ~= sequence and owner.undo[sequence] then
     M.restore(buffer, owner.undo[sequence])
   end
@@ -118,7 +118,7 @@ function M.restore(buffer, attachments)
   if not owner then return end
   for _, object in ipairs(owner.objects) do release(owner, object) end
   owner.objects = {}
-  local sequence = vim.api.nvim_buf_call(buffer, function() return vim.fn.undotree().seq_cur end)
+  local sequence = vim.api.nvim_buf_call(buffer, vim.fn.changenr)
   owner.undo_sequence, owner.undo[sequence] = sequence, vim.deepcopy(attachments or {})
   local lines = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
   for _, selected in ipairs(attachments or {}) do

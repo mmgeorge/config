@@ -5,6 +5,10 @@ local input = require("forge.input")
 local perf = require("forge.infra.perf")
 local diagnostic = require("forge.views.harness.diagnostic")
 local refresh_interval_ns = 1e9 / 60
+-- A transcript that no window of the current tab page shows still has to stay within the host's
+-- retained patch history, but nobody watches it, so it synchronizes once a second and leaves the
+-- frame budget to the session on screen. Entering its tab page synchronizes it at once.
+local hidden_refresh_interval_ns = 1e9
 local transcript_options = {
   margin = 0,
   scrolloff = 3,
@@ -535,6 +539,29 @@ function M.open(options, callback)
     end
   end
 
+  ---@return boolean displayed Whether a window of the current tab page shows the transcript.
+  function owner.displayed()
+    local tabpage = vim.api.nvim_get_current_tabpage()
+    for window in pairs(owner.views) do
+      if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_tabpage(window) == tabpage
+        and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then return true end
+    end
+    return false
+  end
+
+  --- End the hidden pace once the transcript is on screen, so its tab page shows current text.
+  function owner.hasten_displayed_refresh()
+    if not owner.refresh_timer or not owner.displayed() then return end
+    local displayed_deadline = vim.uv.hrtime() + refresh_interval_ns
+    if owner.refresh_deadline <= displayed_deadline then return end
+    owner.refresh_deadline = displayed_deadline
+    owner.refresh_timer:stop()
+    owner.refresh_timer:close()
+    owner.refresh_timer = nil
+    owner.refresh_ready = true
+    owner.sync()
+  end
+
   function owner.sync()
     if not alive() or not owner.ready or owner.failure then return end
     owner.pending = true
@@ -545,11 +572,12 @@ function M.open(options, callback)
     end
     if not owner.refresh_ready then
       if not owner.refresh_timer then
-        local deadline = vim.uv.hrtime() + refresh_interval_ns
+        local interval_ns = owner.displayed() and refresh_interval_ns or hidden_refresh_interval_ns
+        owner.refresh_deadline = vim.uv.hrtime() + interval_ns
         local function publish()
           owner.refresh_timer = nil
           if not alive() then return end
-          local remaining = math.ceil((deadline - vim.uv.hrtime()) / 1000000)
+          local remaining = math.ceil((owner.refresh_deadline - vim.uv.hrtime()) / 1000000)
           if remaining > 0 then
             vim.uv.update_time()
             owner.refresh_timer = vim.defer_fn(publish, remaining)
@@ -559,7 +587,7 @@ function M.open(options, callback)
           owner.sync()
         end
         vim.uv.update_time()
-        owner.refresh_timer = vim.defer_fn(publish, math.ceil(refresh_interval_ns / 1e6))
+        owner.refresh_timer = vim.defer_fn(publish, math.ceil(interval_ns / 1e6))
       end
       return
     end
@@ -1071,6 +1099,9 @@ function M.open(options, callback)
   })
   vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "WinClosed" }, {
     group = owner.group, callback = function() vim.schedule(owner.refresh_views) end,
+  })
+  vim.api.nvim_create_autocmd({ "TabEnter", "BufWinEnter" }, {
+    group = owner.group, callback = function() vim.schedule(owner.hasten_displayed_refresh) end,
   })
   for _, buffer in ipairs({ options.transcript_buffer, options.composer_buffer }) do
     vim.api.nvim_create_autocmd("BufWipeout", { group = owner.group, buffer = buffer, once = true,

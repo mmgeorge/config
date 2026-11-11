@@ -1321,11 +1321,19 @@ impl SessionPresentation {
             } => open
                 .tool_display(entry_id, exchange_id, call)
                 .is_none_or(|id| !open.sections.nodes.tool.contains_key(&id)),
-            TimelineOperation::Message { block_id, .. } => open
-                .transcript
-                .document
-                .block(&forge_buffer::identity::BlockId(block_id.clone()))
-                .is_none(),
+            // Reasoning has no transcript block: its summary reaches the status row through its
+            // own `Replace` operation. Only prose whose block is missing needs the reflow that
+            // creates it, so a reasoning delta must not re-project every entry of the session.
+            TimelineOperation::Message {
+                block_id, message, ..
+            } => {
+                streams_into_transcript(message)
+                    && open
+                        .transcript
+                        .document
+                        .block(&forge_buffer::identity::BlockId(block_id.clone()))
+                        .is_none()
+            }
             _ => false,
         }) {
             reflow(
@@ -1343,6 +1351,19 @@ impl SessionPresentation {
             open.pending_bytes = 0;
         }
     }
+}
+
+/// Whether each delta of `message` updates a transcript block.
+///
+/// A provider that cannot tell commentary from the response until the turn ends streams its prose
+/// unclassified. That prose is as visible as classified prose, so both kinds update their block;
+/// excluding it froze the transcript at the first delta until the turn completed. Reasoning never
+/// has a block of its own.
+fn streams_into_transcript(message: &crate::turn::Message) -> bool {
+    matches!(
+        message.kind(),
+        crate::turn::MessageKind::Assistant | crate::turn::MessageKind::Unknown
+    )
 }
 
 /// Identify unanalysed sources without inspecting their potentially large bodies.
@@ -1830,14 +1851,7 @@ fn apply_projection<'operation>(
                 message,
                 ..
             } => {
-                // A provider that cannot tell commentary from the response until the turn
-                // ends streams its prose unclassified. That prose is as visible as classified
-                // prose, so both kinds update their block; skipping it froze the transcript
-                // at the first delta until the turn completed.
-                if !matches!(
-                    message.kind(),
-                    crate::turn::MessageKind::Assistant | crate::turn::MessageKind::Unknown
-                ) {
+                if !streams_into_transcript(message) {
                     continue;
                 }
                 let block_id = forge_buffer::identity::BlockId(block_id.clone());

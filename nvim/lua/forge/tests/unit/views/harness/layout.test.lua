@@ -38,4 +38,28 @@ T["scroll_clamp_measures_the_tail"] = function()
   MiniTest.expect.equality(layout.maximum_content_topline(buffer, window), 1)
 end
 
+T["composer_edit_notifies_geometry_only_on_height_change"] = function()
+  local layout = require("forge.views.harness.layout")
+  local composer = vim.api.nvim_create_buf(false, true)
+  vim.cmd("belowright split")
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, composer)
+  MiniTest.finally(function() pcall(vim.api.nvim_buf_delete, composer, { force = true }) end)
+  local notified = 0
+  layout.observe_composer(window, function() notified = notified + 1 end)
+
+  layout.resize_composer(composer, window)
+  MiniTest.expect.equality(notified, 1)
+  local height = vim.api.nvim_win_get_height(window)
+
+  vim.api.nvim_buf_set_lines(composer, 0, -1, true, { "one row" })
+  layout.resize_composer(composer, window, true)
+  MiniTest.expect.equality({ notified, vim.api.nvim_win_get_height(window) }, { 1, height })
+
+  vim.api.nvim_buf_set_lines(composer, 0, -1, true, { "1", "2", "3", "4", "5", "6" })
+  layout.resize_composer(composer, window, true)
+  assert(vim.api.nvim_win_get_height(window) > height, "six rows did not grow the composer")
+  MiniTest.expect.equality(notified, 2)
+end
+
 return T

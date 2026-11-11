@@ -57,6 +57,9 @@ local function label_for(tab)
   return name == "" and "[No Name]" or vim.fn.fnamemodify(name, ":t")
 end
 
+---@type string? Tabline text at the last redraw this module requested.
+local drawn_tabline
+
 ---@return string
 function M.render()
   local parts = {}
@@ -84,7 +87,12 @@ local function synchronize(closing_tab)
     vim.o.tabline = previous_tabline
     previous_tabline = nil
   end
-  if displayed then vim.cmd.redrawtabline() end
+  -- Views refresh on every host event; the tabline is redrawn only when its text would differ.
+  local rendered = displayed and M.render() or nil
+  if rendered ~= drawn_tabline then
+    drawn_tabline = rendered
+    if displayed then vim.cmd.redrawtabline() end
+  end
 end
 
 --- Redraw labels after any session change (switch, rename, deletion), whichever view made it.

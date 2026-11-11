@@ -29,7 +29,7 @@ file starts over at its 100 MiB threshold without keeping an older segment.
 
 ## Startup log
 
-`:ForgeStartupLog` opens `stdpath("cache")/rust-sidecar/forge/startup-<pid>.jsonl`, and `:ForgeStartupLog harness` opens `harness-startup-<pid>.jsonl`. They record executable selection, host spawn, request dispatch, snapshot application, and the first redraw. Entries use monotonic microsecond timestamps and exclude prompts and source content. Queue waits overlap across frames, so do not add them together.
+`:ForgeStartupLog` opens `stdpath("cache")/rust-sidecar/forge/startup-<pid>.jsonl`, and `:ForgeStartupLog harness` opens `harness-startup-<pid>.jsonl`. They record executable selection, host spawn, request dispatch, snapshot application, and the first redraw. Entries use monotonic microsecond timestamps and exclude prompts and source content. Queue waits overlap across frames, so do not add them together. The per-request events `host.request.send`, `host.response.received`, and `host.result.decoded` are written only at the Trace logging level, because a streaming session issues several requests per rendered frame; lifecycle events are written at every level.
 
 Both writers rotate at a 2 MiB threshold and retain the previous segment as `.1`.
 The general startup stream also includes host stderr excerpts. Rotation happens

@@ -252,8 +252,9 @@ local function status_text()
   return segment_list
 end
 
-function M.refresh_winbar()
-  local state = harness_state()
+--- Write the winbar of every window that shows `state`'s transcript.
+---@param state table
+local function write_winbar(state)
   if not state.command_set then return end
   local active_session = not state.initial_snapshot_pending and state.session or nil
   tabline.refresh()
@@ -282,6 +283,12 @@ function M.refresh_winbar()
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.wo[state.composer_win].winbar = ""
   end
+end
+
+function M.refresh_winbar()
+  local state = harness_state()
+  if not state.command_set then return end
+  write_winbar(state)
   render_status_hint(state)
 end
 
@@ -342,7 +349,8 @@ local function render()
     state.presentation = nil
     owner = nil
   end
-  if owner and not owner.closed then owner.sync() M.refresh_winbar() return end
+  -- The status hint was composed above, so this path writes the winbar alone.
+  if owner and not owner.closed then owner.sync() write_winbar(state) return end
   if not (state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win)) then
     state.transcript_win = vim.fn.win_findbuf(state.transcript_buf)[1]
     if not state.transcript_win then return end

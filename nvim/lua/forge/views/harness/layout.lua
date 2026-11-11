@@ -137,7 +137,12 @@ function M.attach_auto_height(composer_buf, composer_win)
   local function resize()
     M.resize_composer(composer_buf, composer_win)
   end
-  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "BufWinEnter" }, {
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    group = group,
+    buffer = composer_buf,
+    callback = function() M.resize_composer(composer_buf, composer_win, true) end,
+  })
+  vim.api.nvim_create_autocmd("BufWinEnter", {
     group = group,
     buffer = composer_buf,
     callback = resize,
@@ -150,7 +155,10 @@ end
 
 ---@param composer_buf integer
 ---@param composer_win integer
-function M.resize_composer(composer_buf, composer_win)
+---@param text_edit? boolean The caller is a composer text edit. Such an edit moves the geometry
+---observer's windows only when it changes the composer height, so an edit that keeps the height
+---skips the observer, which otherwise captures and restores every transcript view per keystroke.
+function M.resize_composer(composer_buf, composer_win, text_edit)
   if not (vim.api.nvim_buf_is_valid(composer_buf) and vim.api.nvim_win_is_valid(composer_win)) then return end
   if vim.api.nvim_win_get_buf(composer_win) ~= composer_buf then return end
   local options = config.options.harness
@@ -161,7 +169,8 @@ function M.resize_composer(composer_buf, composer_win)
   local height = math.max(options.composer_min_height,
     math.min(options.composer_max_height, measured.all + 1 + winbar_height))
   local view = vim.api.nvim_win_call(composer_win, vim.fn.winsaveview)
-  local restore = vim.api.nvim_win_get_height(composer_win) ~= height
+  local height_changed = vim.api.nvim_win_get_height(composer_win) ~= height
+  local restore = height_changed
   if restore then vim.api.nvim_win_set_height(composer_win, height) end
   local text_rows = vim.api.nvim_win_get_height(composer_win) - winbar_height
   -- Insert-mode scrolling can precede window growth and leave the first row hidden.
@@ -172,7 +181,7 @@ function M.resize_composer(composer_buf, composer_win)
   if restore then
     vim.api.nvim_win_call(composer_win, function() vim.fn.winrestview(view) end)
   end
-  if composer_observer[composer_win] then composer_observer[composer_win]() end
+  if composer_observer[composer_win] and (height_changed or not text_edit) then composer_observer[composer_win]() end
 end
 
 ---Align the final display row without changing the focused window.

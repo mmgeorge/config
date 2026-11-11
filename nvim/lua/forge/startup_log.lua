@@ -7,6 +7,11 @@ local input_buffer, input_at
 local host_startup = { ["host.start"] = true, ["host.binary.result"] = true, ["host.spawn"] = true,
   ["host.spawned"] = true, ["host.first_stdout"] = true, ["host.lease.finished"] = true, ["host.initialize.finished"] = true }
 
+-- One of these events is written for every host request, which during a stream means several per
+-- rendered frame. Each costs a date format, a JSON encode and a file append on the main loop, so
+-- they are recorded only at the Trace level. Lifecycle events are rare and are always recorded.
+local per_request = { ["host.request.send"] = true, ["host.response.received"] = true, ["host.result.decoded"] = true }
+
 ---@return nil
 function M.observe_input()
   if input_namespace then return end
@@ -37,6 +42,7 @@ end)
 ---@param fields? table<string, any> Diagnostic metadata, excluding request bodies and credentials.
 ---@param captured_at? integer Original monotonic event time when writing after a scheduled callback.
 function M.write(event, fields, captured_at)
+  if per_request[event] and not require("forge.infra.perf").enabled("harness") then return end
   captured_at = captured_at or vim.uv.hrtime()
   if vim.in_fast_event() then
     vim.schedule(function() M.write(event, fields, captured_at) end)

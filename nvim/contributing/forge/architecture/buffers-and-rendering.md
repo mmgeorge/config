@@ -34,7 +34,7 @@ exchange aligns to the bottom if its prompt through tail fits, or places its
 prompt at the top otherwise. Both decisions use current focus and geometry, never
 a saved cursor or viewport. See [Timeline](timeline.md#transcript-window-and-pickers).
 
-Transcript synchronization coalesces event bursts at a 60 Hz target and keeps one trailing refresh for events that arrive mid-update. Closing the view cancels its timer, and host replacement cancels preparation before publication.
+Transcript synchronization coalesces event bursts at a 60 Hz target and keeps one trailing refresh for events that arrive mid-update. A transcript that no window of the current tab page shows synchronizes once a second instead, which keeps it inside the host's retained patch history without spending the displayed session's frame budget; `TabEnter` or `BufWinEnter` synchronizes it at once. A composer text edit notifies the composer geometry observer only when it changes the composer height, and the winbar and tabline are rewritten only when their text differs. Closing the view cancels its timer, and host replacement cancels preparation before publication.
 
 ## Editable regions
 

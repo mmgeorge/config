@@ -203,6 +203,14 @@ function M.view_hint_entries(group, command_set, context, surface)
   return segments
 end
 
+--- Write a window's winbar only when its text differs. Assigning an equal value still schedules a
+--- redraw of the window's status area, and views refresh their winbar on every host event.
+---@param win integer
+---@param text string
+local function set_winbar(win, text)
+  if vim.wo[win].winbar ~= text then vim.wo[win].winbar = text end
+end
+
 ---@param win integer
 ---@param title string
 ---@param group string
@@ -239,13 +247,13 @@ function M.apply_view_winbar(win, title, group, command_set, status, context, ri
       local rendered_center = title_text ~= "" and status_rendered or ""
       local rendered_right = right_status_rendered
       if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. separator end
-      vim.wo[win].winbar = ("%s%%=%s%%=%s%%#ForgeStatusHint#%s%%*"):format(rendered_left, rendered_center, rendered_right, hint)
+      set_winbar(win, ("%s%%=%s%%=%s%%#ForgeStatusHint#%s%%*"):format(rendered_left, rendered_center, rendered_right, hint))
       return
     end
     local rendered_right = right_status_rendered
     if rendered_right ~= "" and hint ~= "" then rendered_right = rendered_right .. separator end
-    vim.wo[win].winbar = ("%%#ForgeStatusLabel#%s%%*%%=%%#ForgeStatusHint#%s%%*%%=%s%%#ForgeStatusHint#%s%%*")
-      :format(left, center, rendered_right, hint)
+    set_winbar(win, ("%%#ForgeStatusLabel#%s%%*%%=%%#ForgeStatusHint#%s%%*%%=%s%%#ForgeStatusHint#%s%%*")
+      :format(left, center, rendered_right, hint))
     return
   end
   local compact_hint = {}
@@ -264,10 +272,10 @@ function M.apply_view_winbar(win, title, group, command_set, status, context, ri
   if status_rendered then
     local rendered_left = title_text ~= "" and ("%%#ForgeStatusLabel#%s%%*"):format(left) or status_rendered
     local rendered_center = title_text ~= "" and status_rendered or ""
-    vim.wo[win].winbar = ("%s  %s%s"):format(rendered_left, rendered_center, compact_right)
+    set_winbar(win, ("%s  %s%s"):format(rendered_left, rendered_center, compact_right))
     return
   end
-  vim.wo[win].winbar = ("%%#ForgeStatusLabel#%s%%*  %%#ForgeStatusHint#%s%%*%s"):format(left, center, compact_right)
+  set_winbar(win, ("%%#ForgeStatusLabel#%s%%*  %%#ForgeStatusHint#%s%%*%s"):format(left, center, compact_right))
 end
 
 ---@param group string
