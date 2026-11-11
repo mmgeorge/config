@@ -145,13 +145,16 @@ local function build_spec(instance)
       key = key, modes = { "n", "i" }, desc = request.execution_kind == "native_observed" and "Cancel permission request" or "Interrupt Harness task",
       callback = function()
         if request.execution_kind == "native_observed" then submit(instance, true)
-        else picker.close(true) host.interrupt() end
+        else picker.close(true, "user") host.interrupt() end
       end,
     }
   end
   local page_list = {}
   for _, item in ipairs(request.targets) do
-      local option_list, selected_index = {}, 1
+      -- No decision starts selected: the popup can take focus from a composer while the user is
+      -- still typing, and the host lists allow choices first, so an Enter already in flight must
+      -- confirm nothing. A decision staged earlier for this target stays selected.
+      local option_list, selected_index = {}, 0
       for index, choice in ipairs(item.choices) do
         option_list[#option_list + 1] = {
           key = config.options.picker.choice_keys[index], value = choice.choice_id,
@@ -206,9 +209,10 @@ local function build_spec(instance)
       submit(instance, false)
       return false
     end,
-    on_close = function()
+    ---@param reason? "user"|"programmatic"
+    on_close = function(_, reason)
       if active == instance then active = nil end
-      host.closed()
+      host.closed(reason)
     end,
   }
 end

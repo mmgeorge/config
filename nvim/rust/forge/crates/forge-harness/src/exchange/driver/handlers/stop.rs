@@ -111,6 +111,11 @@ impl ExchangeDriver {
                         });
                     }
                     CancellationCleanupPhase::HostDrained { collected } => {
+                        if let Err(error) = retained.abandon_settlement(&mut *broker.lock().await) {
+                            trace.record(session_id, "exchange.stop.settlement_release_failed", serde_json::json!({
+                                "command_id":command_id.as_str(),"update_step":step,"reason":error.to_string(),
+                            }));
+                        }
                         retained.release_legacy_control();
                         *retained_cancellation = Some(retained);
                         if matches!(self.execution_state, ExecutionState::Stopping) {

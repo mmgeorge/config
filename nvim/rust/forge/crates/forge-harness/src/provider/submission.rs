@@ -31,6 +31,10 @@ pub enum SubmissionState {
     },
     /// The user explicitly cancelled this submission.
     Cancelled,
+    /// The user discarded input whose delivery stayed uncertain. The provider may or may not
+    /// hold it, so the record is terminal: it never returns to Prepared, never accepts later
+    /// evidence, and no longer blocks dispatch of other input.
+    Discarded,
 }
 
 impl SubmissionState {
@@ -38,7 +42,7 @@ impl SubmissionState {
     fn require_prepared(&self) -> Result<(), super::ProviderError> {
         match self {
             Self::Prepared => Ok(()),
-            Self::Cancelled => Err(super::ProviderError::Cancelled),
+            Self::Cancelled | Self::Discarded => Err(super::ProviderError::Cancelled),
             Self::Sending { .. } => Err(super::ProviderError::DeliveryUncertain),
             Self::Accepted { .. } => Err(super::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
@@ -68,6 +72,7 @@ enum SubmissionPhase {
     Sending,
     Accepted,
     Cancelled,
+    Discarded,
 }
 
 impl From<&SubmissionState> for SubmissionPhase {
@@ -77,6 +82,7 @@ impl From<&SubmissionState> for SubmissionPhase {
             SubmissionState::Sending { .. } => Self::Sending,
             SubmissionState::Accepted { .. } => Self::Accepted,
             SubmissionState::Cancelled => Self::Cancelled,
+            SubmissionState::Discarded => Self::Discarded,
         }
     }
 }
@@ -834,7 +840,9 @@ impl Submission {
                     )
                     .into());
                 }
-                SubmissionState::Cancelled => return Err(super::ProviderError::Cancelled.into()),
+                SubmissionState::Cancelled | SubmissionState::Discarded => {
+                    return Err(super::ProviderError::Cancelled.into());
+                }
             }
             let ProviderRequest {
                 dispatch: _,
@@ -1168,8 +1176,11 @@ impl Submission {
             return Ok(());
         }
         ensure!(
-            !matches!(record.delivery, SubmissionState::Cancelled),
-            "cancelled submission cannot be acknowledged"
+            !matches!(
+                record.delivery,
+                SubmissionState::Cancelled | SubmissionState::Discarded
+            ),
+            "cancelled or discarded submission cannot be acknowledged"
         );
         let target = match &record.delivery {
             SubmissionState::Sending { target } => target.clone(),
@@ -1263,6 +1274,25 @@ impl Submission {
         })
     }
 
+    /// Retire uncertain input at the user's explicit request without replaying it.
+    ///
+    /// A `Sending` record may already be in the provider's conversation, so it becomes the
+    /// terminal `Discarded` state instead of `Cancelled`, which a later preparation of the same
+    /// input identity could revive. Prepared input retires to `Cancelled` as usual, and accepted
+    /// or already discarded input is left unchanged.
+    pub(crate) fn discard(&self) -> Result<()> {
+        self.update(|record| {
+            match record.delivery {
+                SubmissionState::Sending { .. } => record.delivery = SubmissionState::Discarded,
+                SubmissionState::Prepared => record.delivery = SubmissionState::Cancelled,
+                SubmissionState::Accepted { .. }
+                | SubmissionState::Cancelled
+                | SubmissionState::Discarded => {}
+            }
+            Ok(())
+        })
+    }
+
     /// Excludes explicitly cancelled input from automatic recovery.
     pub fn cancel(&self) -> Result<()> {
         self.retire_prepared().map(drop).map_err(Into::into)
@@ -1302,7 +1332,10 @@ impl Submission {
                     SubmissionRetirement::Cancelled
                 }
                 SubmissionState::Cancelled => SubmissionRetirement::Cancelled,
-                SubmissionState::Sending { .. } => SubmissionRetirement::Sending,
+                // A discarded record keeps its uncertainty; retirement never authorizes replay.
+                SubmissionState::Sending { .. } | SubmissionState::Discarded => {
+                    SubmissionRetirement::Sending
+                }
                 SubmissionState::Accepted { .. } => SubmissionRetirement::Accepted,
             })
         })

@@ -17,7 +17,8 @@ An explicit `NotConsumed` result proves that the addressed delivery did not cons
 | `Prepared` | No adapter has entered dispatch. A later prompt can include this input as earlier context. |
 | `Sending` | The adapter committed its native correlation target before the write. A timeout or disconnect leaves this state uncertain. |
 | `Accepted` | A native response or positively correlated history proves acceptance. The input is never replayed. |
-| `Cancelled` | The user cancelled, so automatic recovery skips the input. |
+| `Cancelled` | No adapter dispatched the input and its owner retired it, through a user cancel or through settlement of a failed or undispatched delivery. Automatic recovery skips it. A later preparation of the same identified input can return it to `Prepared`, so the input queue, not this state, records whether the user retracted it. |
+| `Discarded` | The user removed input whose delivery stayed uncertain. The provider may hold it, so the state is terminal: it never returns to `Prepared`, accepts no later evidence, and no longer blocks other dispatch. |
 
 ## Recovery checkpoints
 

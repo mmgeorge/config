@@ -185,6 +185,8 @@ struct InputState {
 pub(crate) struct SessionInputQueue {
     state: Mutex<InputState>,
     journal: Option<Mutex<journal::InputJournal>>,
+    /// Provider journal whose records an explicit discard of uncertain input retires.
+    submissions: Option<Arc<crate::provider::submission::SubmissionStore>>,
     pub changed: Arc<tokio::sync::Notify>,
 }
 
@@ -210,7 +212,7 @@ impl SessionInputQueue {
                 .revision
                 .checked_add(1)
                 .context("input revision exhausted")?;
-            // Preserve uncertain sends; accepted or explicitly cancelled inputs cannot be replayed.
+            // Preserve uncertain sends; accepted, retracted, or discarded inputs cannot be replayed.
             let mut cancelled = std::collections::HashSet::new();
             for message in &mut state.snapshot.messages {
                 if message.reservation().is_some() {
@@ -246,7 +248,14 @@ impl SessionInputQueue {
                                 ),
                             )?;
                         }
-                        crate::provider::submission::SubmissionState::Cancelled => {
+                        // Settlement retires every unsent failure to Cancelled while the queue
+                        // keeps the entry Failed, so the entry stays visible and keeps blocking
+                        // later follow-ups. A user retraction removes the entry instead, so only
+                        // an entry interrupted mid-settlement reaches here in another phase.
+                        crate::provider::submission::SubmissionState::Cancelled
+                            if message.delivery() == InputDelivery::Failed => {}
+                        crate::provider::submission::SubmissionState::Cancelled
+                        | crate::provider::submission::SubmissionState::Discarded => {
                             cancelled.insert(message.id.clone());
                         }
                     }
@@ -274,6 +283,7 @@ impl SessionInputQueue {
         Ok(Self {
             state: Mutex::new(state),
             journal: Some(Mutex::new(journal)),
+            submissions: Some(submissions.clone()),
             changed: Arc::default(),
         })
     }
@@ -528,6 +538,23 @@ impl SessionInputQueue {
             Self::validate_retry_evidence(&mut candidate, &operation, evidence)
                 .and_then(|()| Self::validate(&candidate, &operation))
         };
+        // Retire the uncertain provider record before the queue forgets it. A failed queue
+        // commit then leaves a discarded record behind an entry the next removal still finds.
+        let validation = match (&validation, &operation.action) {
+            (Ok(()), InputAction::Remove { id, revision }) => {
+                match Self::uncertain(&state.snapshot, id, *revision) {
+                    Some(submission) => match &self.submissions {
+                        Some(submissions) => {
+                            submissions.submission(submission)?.discard()?;
+                            validation
+                        }
+                        None => Err(InputRejection::DeliveryStarted),
+                    },
+                    None => validation,
+                }
+            }
+            _ => validation,
+        };
         if validation.is_ok() {
             state.snapshot = candidate;
         }
@@ -657,10 +684,33 @@ impl SessionInputQueue {
             }
             InputAction::Release { .. } => {}
             InputAction::Remove { id, revision } => {
-                Self::editable(snapshot, id, *revision)?;
+                if Self::uncertain(snapshot, id, *revision).is_none() {
+                    Self::editable(snapshot, id, *revision)?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Select the receipt of uncertain input that an explicit removal discards.
+    ///
+    /// Uncertain input otherwise has no exit: it blocks every later claim, no provider supplies
+    /// evidence that would let it be retried, and it survives restarts. Removing it retires its
+    /// provider record to the terminal `Discarded` state, which never replays it.
+    fn uncertain<'state>(
+        snapshot: &'state InputSnapshot,
+        id: &str,
+        revision: u64,
+    ) -> Option<&'state str> {
+        snapshot
+            .messages
+            .iter()
+            .find(|message| {
+                message.id == id
+                    && message.revision == revision
+                    && message.delivery() == InputDelivery::Unknown
+            })
+            .and_then(InputMessage::submission_id)
     }
 
     fn apply_action(

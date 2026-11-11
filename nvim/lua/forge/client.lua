@@ -917,8 +917,11 @@ local function host_spawn(binary, callback, launch_token, lease)
         bytes = consumed_bytes, frames = consumed_frames,
       }))
     end,
-    failed = function(message)
-      M.host_stop()
+    failed = function(message, exit_result)
+      -- A receiver that fails after the process exited, such as on a frame cut off by the exit,
+      -- finishes that exit directly. `host_stop` would drain a process that can no longer answer
+      -- and wait on a forced collection that cannot succeed, leaving the client draining.
+      if exit_result then finish_exit(exit_result) else M.host_stop() end
       if not pcall(notifications.error, message, "ForgeHarness") then pcall(vim.api.nvim_echo, { { message, "ErrorMsg" } }, true, { err = true }) end
     end,
     finished = finish_exit,

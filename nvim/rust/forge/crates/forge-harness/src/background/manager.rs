@@ -1058,7 +1058,9 @@ async fn forward_progress(
             _ => None,
         };
         if let (Some((delivery, request_id)), Some(progress)) = (&delivery, progress) {
-            delivery.send(Message::RequestEvent(RequestEvent {
+            // Progress is advisory and the generated text arrives in the response, so a stalled
+            // editor drops progress rather than closing its connection.
+            delivery.send_progress(Message::RequestEvent(RequestEvent {
                 request_id: *request_id,
                 event: forge_protocol::contract::RequestEventName::RepositoryGenerationProgress
                     .as_str()

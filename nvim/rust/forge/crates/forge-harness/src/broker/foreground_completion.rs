@@ -307,7 +307,14 @@ impl HarnessBroker {
             self.acknowledge_user_child_reports(&transaction.state.scope, receipt)?;
         }
         if let Some(timeout) = transaction.native.watchdog.timeout()? {
-            return self.handle_foreground_timeout(transaction, timeout);
+            if transaction.collection.is_none() {
+                return self.handle_foreground_timeout(transaction, timeout);
+            }
+            // A cancel or restart took this turn before its elapsed deadline was examined, so the
+            // collected outcome settles it and a cancelled prompt can still be restored. Claiming
+            // the report keeps the session's tool monitor from later publishing a stale timeout
+            // and collecting the already settled invocation.
+            timeout.claim_report();
         }
         let (mut output, question_override) = match outcome {
             ForegroundOutcome::NativeReady(Ok(output)) => (output, None),
@@ -315,18 +322,24 @@ impl HarnessBroker {
                 if Self::cancellation_restores_prompt(transaction) {
                     return self.settle_collected_cancellation(dispatch);
                 }
-                let submission = admission.take_submission()?;
-                let events = std::mem::take(&mut admission.events);
-                transaction.finalization =
-                    Some(foreground_finalization::ForegroundFinalization::new(
-                        submission,
-                        transaction.mode,
-                        events,
-                        Err(ProviderError::Cancelled),
-                        transaction.settlement.clone(),
-                        None,
-                        transaction.collection,
-                    ));
+                if let Some(finalization) = transaction.finalization.as_mut() {
+                    // A continuation turn reuses the envelope that already owns the submission.
+                    finalization.mode = transaction.mode;
+                    finalization.resume_cancelled()?;
+                } else {
+                    let submission = admission.take_submission()?;
+                    let events = std::mem::take(&mut admission.events);
+                    transaction.finalization =
+                        Some(foreground_finalization::ForegroundFinalization::new(
+                            submission,
+                            transaction.mode,
+                            events,
+                            Err(ProviderError::Cancelled),
+                            transaction.settlement.clone(),
+                            None,
+                            transaction.collection,
+                        ));
+                }
                 let old = std::mem::replace(dispatch, TurnTransaction::Transitioning);
                 let TurnTransaction::Running {
                     transaction,

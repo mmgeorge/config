@@ -133,3 +133,67 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
             .is_err()
     );
 }
+
+/// A model follow-up queued behind a child that requires user authorization cannot launch, so
+/// its parent must not wait for it.
+#[test]
+fn parent_does_not_wait_for_followup_blocked_on_authorization() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let spawn = SpawnAgentRequest {
+        profile: Some("review".into()),
+        text: "bounded task".into(),
+    };
+    let request = AgentRequest {
+        operation_id: "model-spawn".into(),
+        source: AgentSource::Model,
+        operation: AgentOperation::Spawn(spawn.clone()),
+    };
+    let first = match coordinator
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            1,
+        )
+        .unwrap()
+        .commit()
+        .unwrap()
+    {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("new request reused an admission"),
+    };
+    let mut stopped = first.task.clone();
+    stopped.state = crate::exchange::ExchangeState::Interrupted;
+    stopped.completed_at_ms = Some(2);
+    let mut agent = first.agent.clone();
+    agent.continuation = super::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: stopped.id.clone().into(),
+    };
+    coordinator.retain(agent.clone(), stopped.clone()).unwrap();
+    coordinator
+        .settled(
+            &agent.id,
+            &stopped.id,
+            super::AgentSettlementDisposition::RequiresAuthorization,
+        )
+        .unwrap();
+    let followup = AgentRequest {
+        operation_id: "model-followup".into(),
+        source: AgentSource::Model,
+        operation: AgentOperation::Followup {
+            target: agent.id.clone(),
+            message: "next task".into(),
+        },
+    };
+    let queued = coordinator
+        .reserve_followup(&followup, &agent.id, "next task", "parent", 3)
+        .unwrap();
+    assert!(!queued.launch);
+    queued.commit().unwrap();
+    assert!(coordinator.ready_launch().unwrap().is_none());
+    assert!(!coordinator.has_active_task("parent"));
+}

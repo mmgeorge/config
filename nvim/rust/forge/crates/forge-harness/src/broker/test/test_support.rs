@@ -167,7 +167,7 @@ pub(super) async fn settle_managed_children(
     let mut event = Vec::new();
     async {
         loop {
-            event.extend(broker.drain_agent_commands(None).await?);
+            while broker.drain_next_agent_command(None, &mut event).await {}
             if broker.agent_coordinator.active_count() == 0 {
                 return Ok::<_, anyhow::Error>(());
             }

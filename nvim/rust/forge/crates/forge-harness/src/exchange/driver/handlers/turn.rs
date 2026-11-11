@@ -80,6 +80,7 @@ impl ExchangeDriver {
         let DriverState {
             foreground,
             command,
+            command_messages,
             deferred_publications,
             tasks:
                 RunningTasks {
@@ -90,30 +91,46 @@ impl ExchangeDriver {
         } = state;
         match wake {
             ForegroundInput::Update(update) => {
-                let runtime = foreground
-                    .as_ref()
-                    .expect("publication belongs to the active foreground");
+                // Committed output stays publishable even when its runtime already left the
+                // driver, for example to failure collection after owner storage failed.
+                let (work_id, messages) = match foreground.as_ref() {
+                    Some(runtime) => (Some(runtime.id), runtime.messages.as_ref()),
+                    None => (None, command_messages.as_ref()),
+                };
                 trace.record(
                     session_id,
                     "exchange.event.read",
                     serde_json::json!({
-                        "work_id":runtime.id,"source":"committed_publication","update_step":step,
+                        "work_id":work_id,"source":"committed_publication","update_step":step,
                     }),
                 );
                 publish_updates(
                     deferred_publications,
                     &mut self.commands,
                     vec![*update],
-                    runtime.messages.as_ref(),
+                    messages,
                     env.context(step),
                 )
                 .await;
             }
             ForegroundInput::PublicationClosed => {}
             ForegroundInput::Signal(signal, publication) => {
-                let runtime = foreground
-                    .as_mut()
-                    .expect("foreground input belongs to the active runtime");
+                let Some(runtime) = foreground.as_mut() else {
+                    // The runtime that yielded this signal already left the driver, so no
+                    // reducer can apply it. A live host request still needs its answer.
+                    trace.record(
+                        session_id,
+                        "exchange.event.ignored",
+                        serde_json::json!({
+                            "source":"foreground_input","signal":signal.diagnostic_name(),
+                            "update_step":step,"reason":"foreground_owner_changed",
+                        }),
+                    );
+                    if let ForegroundSignal::LiveHost(request) = *signal {
+                        request.reject(crate::provider::ProviderError::DeliveryUncertain);
+                    }
+                    return WakeEnd::Finished;
+                };
                 trace.record(session_id, "exchange.event.read", serde_json::json!({
                         "work_id":runtime.id,"update_step":step,
                         "source":if publication { "publication_result" } else { "foreground_input" },

@@ -330,11 +330,9 @@ impl HarnessBroker {
             ForegroundSignal::AgentApprovalsCancelled { completion, result } => {
                 self.apply_foreground_agent_completion(transaction, *completion, result)
             }
-            ForegroundSignal::AgentInterrupted {
-                operation,
-                completed,
-                result,
-            } => self.apply_foreground_agent_interrupt(transaction, operation, completed, result),
+            ForegroundSignal::AgentInterrupted(operation) => {
+                self.apply_foreground_agent_interrupt(transaction, operation)
+            }
             ForegroundSignal::AgentSpawnSelected { request, selection } => {
                 self.apply_foreground_agent_selection(transaction, request, *selection)
             }
@@ -453,8 +451,6 @@ impl HarnessBroker {
                     self.apply_foreground_session_observations(transaction)
                 } else if transaction.failure.is_some() {
                     Ok(ForegroundAction::Wait)
-                } else if transaction.pending_agent_interrupt.is_some() {
-                    self.continue_foreground_agent_interrupt(transaction)
                 } else {
                     self.prepare_foreground_agent_launch(transaction)
                 }

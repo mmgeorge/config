@@ -44,28 +44,9 @@ impl SqliteStore {
         let Some(intent) = self.pending_configuration_intent(session)? else {
             return Ok(false);
         };
-        let mut settings = crate::settings::SettingsStore::open(data_root)?;
-        if !settings.configuration_applied(&intent)? {
-            settings
-                .commit_configuration(
-                    intent.revision,
-                    crate::settings::SettingTarget {
-                        scope: intent.scope,
-                        workspace: &intent.workspace,
-                        session: &intent.session,
-                    },
-                    intent.portable.as_ref(),
-                    intent
-                        .provider_setting
-                        .as_ref()
-                        .map(|value| (intent.provider.as_str(), value)),
-                    Some(&intent),
-                    || Ok(()),
-                )
-                .context(
-                    "configuration recovery could not safely apply the captured settings revision",
-                )?;
-        }
+        crate::settings::SettingsStore::open(data_root)?
+            .recover_configuration(&intent)
+            .context("configuration recovery could not apply the captured settings")?;
         self.clear_configuration_intent(&intent)?;
         Ok(true)
     }

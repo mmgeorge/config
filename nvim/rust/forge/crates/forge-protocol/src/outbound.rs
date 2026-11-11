@@ -250,6 +250,17 @@ impl MessageSender {
         self.admit(message, false, false)
     }
 
+    /// Admit one advisory frame, such as request progress, that a later frame supersedes.
+    ///
+    /// Saturation discards the frame instead of waiting, because a stalled consumer must not hold
+    /// the producing work. Encoding and transport failures still return an error.
+    pub fn send_progress(&self, message: impl Serialize) -> io::Result<()> {
+        match self.send(message) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            result => result,
+        }
+    }
+
     /// Admit one reserved control frame, or return `WouldBlock` without closing the transport.
     pub fn send_control(&self, message: impl Serialize) -> io::Result<()> {
         self.admit(message, true, false)
@@ -520,6 +531,33 @@ mod tests {
         let actual: Response = serde_json::from_slice(frame.bytes()).unwrap();
         assert_eq!(actual.result(), expected.result());
         receiver.check().unwrap();
+    }
+
+    /// Progress under saturation is discarded without poisoning the connection for later responses.
+    #[tokio::test]
+    async fn saturated_progress_is_discarded_without_failing_the_transport() {
+        let (sender, mut receiver) = channel();
+        for sequence in 0..MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS {
+            sender.send(sequence).unwrap();
+        }
+        sender.send_progress("discarded progress").unwrap();
+        assert!(!sender.is_closed());
+        let response = sender.send_response(Response::success(7, "answer").unwrap());
+        tokio::pin!(response);
+        assert!(
+            poll_fn(|context| Poll::Ready(response.as_mut().poll(context)))
+                .await
+                .is_pending()
+        );
+        drop(receiver.recv().await.unwrap().unwrap());
+        response.await.unwrap();
+        receiver.check().unwrap();
+        let mut last = None;
+        while let Ok(frame) = receiver.try_recv() {
+            last = Some(frame.bytes().to_vec());
+        }
+        let last: Response = serde_json::from_slice(&last.unwrap()).unwrap();
+        assert_eq!(last.result(), Some(&serde_json::json!("answer")));
     }
 
     #[tokio::test]

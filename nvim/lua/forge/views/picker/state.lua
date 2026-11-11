@@ -111,6 +111,14 @@ local function option_identity(option)
   return nil
 end
 
+--- Get the lowest selectable index. A page whose `selected_index` is 0 opens with no row selected,
+--- so confirming before the user chooses a row selects nothing; navigation then selects a row.
+---@param page table
+---@return integer
+local function first_index(page)
+  return page.selected_index == 0 and 0 or 1
+end
+
 ---@param state ForgePickerState
 ---@param spec ForgePickerSpec
 ---@return table
@@ -150,7 +158,7 @@ function PickerState.selected_index(state, spec)
   local page = PickerState.page(state, spec)
   local count = math.max(1, #page.option_list)
   local selected = state.selected_index_by_page[page.id] or page.selected_index or 1
-  selected = math.max(1, math.min(count, selected))
+  selected = math.max(first_index(page), math.min(count, selected))
   state.selected_index_by_page[page.id] = selected
   return selected
 end
@@ -162,6 +170,10 @@ function PickerState.move(state, spec, delta)
   local page = PickerState.page(state, spec)
   if #page.option_list == 0 then return end
   local selected = PickerState.selected_index(state, spec)
+  if selected == 0 then
+    state.selected_index_by_page[page.id] = delta > 0 and 1 or #page.option_list
+    return
+  end
   if page.wrap_selection == false then
     state.selected_index_by_page[page.id] = math.max(1, math.min(#page.option_list, selected + delta))
     return
@@ -258,7 +270,7 @@ function PickerState.capture(state, spec)
   }
   for _, page in ipairs(spec.page_list) do
     local options = page_options(state, page)
-    local index = math.max(1, math.min(math.max(1, #options), state.selected_index_by_page[page.id] or page.selected_index or 1))
+    local index = math.max(first_index(page), math.min(math.max(1, #options), state.selected_index_by_page[page.id] or page.selected_index or 1))
     local option = options[index]
     snapshot.selected_index_by_page[page.id] = index
     snapshot.selected_option_id_by_page[page.id] = option_identity(option)
@@ -306,7 +318,7 @@ function PickerState.restore(state, spec, resume_state)
         if option_identity(option) == selected_id then selected_index = index break end
       end
     end
-    state.selected_index_by_page[page_id] = math.max(1, math.min(math.max(1, #options), selected_index))
+    state.selected_index_by_page[page_id] = math.max(first_index(page), math.min(math.max(1, #options), selected_index))
   end
 end
 

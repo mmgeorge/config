@@ -64,7 +64,12 @@ impl ExchangeDriver {
             drop(retained_cancellation.take());
             return StepGate::Exit;
         }
+        // The effect phase that would consume a startable command or a finished check runs only
+        // once deferred publications drain. Restarting the step for them before then repeats this
+        // check without awaiting anything, so the driver waits for the publication retry instead.
+        let effect_phase_ran = deferred_publications.updates.is_empty();
         if ready_wake.is_none()
+            && effect_phase_ran
             && foreground.is_none()
             && steering_ready.is_none()
             && admission.start_command
@@ -72,6 +77,7 @@ impl ExchangeDriver {
             return StepGate::Restart;
         }
         if ready_wake.is_none()
+            && effect_phase_ran
             && (matches!(
                 automatic_action,
                 Some(crate::broker::OwnedCheckProgress::Ready(_))
@@ -297,6 +303,11 @@ impl ExchangeDriver {
         let DriverState {
             foreground,
             command,
+            tasks:
+                RunningTasks {
+                    stops: running_stops,
+                    ..
+                },
             ..
         } = state;
         // Start only one command per update step, including immediate rejection.
@@ -351,13 +362,52 @@ impl ExchangeDriver {
                         Ok((events, input)) => {
                             let id = active.queued_mut().record.request.id.clone();
                             publish_control(events, input.as_ref(), env.context(step), &id);
+                            *command = Some(active);
                         }
-                        Err(_) => {
+                        Err(TransitionFailure::Domain(error))
+                            if super::super::failure::storage_failure(&error) =>
+                        {
                             self.execution_fail(services);
                             self.commands.retention_failed(trace, session_id, step);
+                            *command = Some(active);
+                        }
+                        // Only storage failure fences the session. Any other pin failure rejects
+                        // this cancel, but the cancel may already have marked the foreground as
+                        // collecting and started acquiring control, so its stop is collected as
+                        // a failed one: success reopens execution and failure restarts the
+                        // provider.
+                        Err(failure) => {
+                            let ActiveCommand::Cancel {
+                                command: queued,
+                                transition,
+                            } = active
+                            else {
+                                unreachable!("only cancellation pins a target")
+                            };
+                            let id = queued.record.request.id.clone();
+                            trace.record(session_id, "exchange.command.pin_failed", serde_json::json!({
+                                "command_id":id.as_str(),"update_step":step,"reason":failure.to_string(),
+                            }));
+                            if let TransitionFailure::Rejected(failure) = failure {
+                                self.commands
+                                    .finish(queued, Err(failure), trace, session_id, step);
+                            } else {
+                                self.execution_stop_begin(services);
+                                self.stopped_command_finish(
+                                    env,
+                                    step,
+                                    queued,
+                                    OperationFailure::Transition(failure),
+                                );
+                                stop_collect_spawn(
+                                    running_stops,
+                                    id,
+                                    transition.into_retained(),
+                                    services,
+                                );
+                            }
                         }
                     }
-                    *command = Some(active);
                 } else {
                     let mut queued = queued;
                     self.commands
@@ -514,8 +564,14 @@ impl ExchangeDriver {
         {
             *steering_ready = next_steering(&mut self.steering, steering_status).now_or_never();
         }
-        if closed {
-            self.observation_recovery.close_pending();
+        // A restart that shutdown cancels never reopens execution, so the owner leaves
+        // `Restarting` for `Failed`; otherwise its turn status stays blocked and shutdown never
+        // sees it idle.
+        if closed
+            && self.observation_recovery.close_pending()
+            && self.execution_state == ExecutionState::Restarting
+        {
+            self.execution_fail(services);
         }
     }
 
@@ -541,6 +597,9 @@ impl ExchangeDriver {
             pending,
             foreground,
             command,
+            command_messages,
+            deferred_publications,
+            pending_wake,
             tasks:
                 RunningTasks {
                     failed_turns: failed_foregrounds,
@@ -556,8 +615,35 @@ impl ExchangeDriver {
                 .lose_observation(command.queued_mut(), trace, session_id, step);
         }
         if self.commands.storage_unavailable()
-            && let Some(runtime) = foreground.take()
+            && let Some(mut runtime) = foreground.take()
         {
+            // A wake selected from this runtime on the previous pass belongs to it, not to
+            // whichever foreground the driver holds next. Its committed output is still published,
+            // and its signal stays with the runtime the failed collection now owns.
+            if matches!(pending_wake, Some(DriverWake::Foreground(_))) {
+                let Some(DriverWake::Foreground(input)) = pending_wake.take() else {
+                    unreachable!("the pending wake was matched as foreground input")
+                };
+                match input {
+                    ForegroundInput::Update(update) => {
+                        publish_updates(
+                            deferred_publications,
+                            &mut self.commands,
+                            vec![*update],
+                            runtime.messages.as_ref().or(command_messages.as_ref()),
+                            env.context(step),
+                        )
+                        .await;
+                    }
+                    ForegroundInput::Signal(signal, _) => match *signal {
+                        ForegroundSignal::LiveHost(request) => {
+                            request.reject(crate::provider::ProviderError::DeliveryUncertain);
+                        }
+                        signal => runtime.uncommitted_signals.push(signal),
+                    },
+                    ForegroundInput::PublicationClosed => {}
+                }
+            }
             self.execution_stop_begin(services);
             let (provider, permissions) = {
                 let broker = broker.lock().await;

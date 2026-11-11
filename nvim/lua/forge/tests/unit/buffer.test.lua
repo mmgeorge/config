@@ -397,6 +397,46 @@ T["cooperative_snapshot"] = function()
   buffer.close(interrupted)
 end
 
+-- An owner that stops being alive mid-apply, as a presentation does when its host stops, withdraws
+-- the update. The replica keeps its last applied revision and decorations, and neither notices the
+-- user nor requests recovery, because nothing about the document went wrong.
+T["withdrawn_apply"] = function()
+  local buffer = require("forge.buffer")
+  local notices, recoveries = {}, 0
+  local replica = buffer.open("withdrawn-snapshot", {
+    notice = function(message) notices[#notices + 1] = message end,
+    recover = function() recoveries = recoveries + 1 end,
+  })
+  local function block_list(count, label)
+    local block = {}
+    for index = 1, count do
+      block[index] = { id = label .. ":" .. index, text = { label .. " row " .. index }, metadata = {
+        target = {}, decoration = {}, editable_region = {},
+      } }
+    end
+    return block
+  end
+  eq(buffer.apply_snapshot(replica, { document = replica.document, revision = 1, block = block_list(1, "applied") }).kind,
+    "Applied")
+  vim.api.nvim_buf_set_extmark(replica.buffer, replica.namespace, 0, 0, { end_col = 1 })
+  local marks_before = #vim.api.nvim_buf_get_extmarks(replica.buffer, replica.namespace, 0, -1, {})
+  assert(marks_before > 0, "fixture decoration was not installed")
+  local alive, withdrawn = true, nil
+  buffer.apply_async(replica, { document = replica.document, revision = 2, block = block_list(3000, "pending") },
+    function() return alive end, function(result) withdrawn = result end)
+  assert(replica.update_pending, "large snapshot finished without yielding")
+  alive = false
+  wait_until(function() return withdrawn ~= nil end, "withdrawn snapshot did not report its result")
+  eq(withdrawn.kind, "Cancelled")
+  eq(replica.status, "Applied")
+  eq(replica.revision, 1)
+  eq(#vim.api.nvim_buf_get_extmarks(replica.buffer, replica.namespace, 0, -1, {}), marks_before)
+  eq(notices, {})
+  eq(recoveries, 0)
+  assert(not vim.bo[replica.buffer].modifiable)
+  buffer.close(replica)
+end
+
 T["mixed_edit_patch"] = function()
   local buffer = require("forge.buffer")
   local editable = require("forge.editable")

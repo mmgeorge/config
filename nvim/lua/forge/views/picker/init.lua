@@ -764,7 +764,7 @@ install_keymaps = function(instance)
   command_set.register(set, "scroll_previous", function() Picker.scroll_content(-1) end)
   command_set.register(set, "scroll_next", function() Picker.scroll_content(1) end)
   command_set.register(set, "focus_input", function() focus_input(instance) end)
-  command_set.register(set, "close", function() Picker.close(true) end)
+  command_set.register(set, "close", function() Picker.close(true, "user") end)
   if picker_state.page(instance.state, instance.spec).field_navigation then
     for _, entry in ipairs({ { "next_field", 1 }, { "previous_field", -1 } }) do
       command_set.register(set, entry[1], function()
@@ -836,7 +836,7 @@ local function install_search_keymaps(instance)
       { buffer = buf, silent = true, nowait = true, desc = "Confirm picker option" })
   end
   for _, key in ipairs(picker_keys(instance, "close")) do
-    vim.keymap.set("n", key, function() Picker.close(true) end,
+    vim.keymap.set("n", key, function() Picker.close(true, "user") end,
       { buffer = buf, silent = true, nowait = true, desc = "Close picker" })
   end
   install_option_keymaps(instance, buf, false)
@@ -987,8 +987,27 @@ function Picker.update(spec)
   if editor_focused and active.field_editor then field_input.focus(active.field_editor) end
 end
 
+---Callbacks waiting for a moment when no picker is open, in registration order.
+---@type fun()[]
+local idle_waiter_list = {}
+
+---Run `callback` once no picker is open: now when none is, otherwise after the open picker closes
+---without another replacing it. A caller whose popup another picker displaced uses this to show
+---the popup again instead of fighting the newer picker for the screen.
+---@param callback fun()
+function Picker.when_idle(callback)
+  if not active then callback() return end
+  idle_waiter_list[#idle_waiter_list + 1] = callback
+end
+
+---Close the open picker.
+---
+---`on_close(resume, reason)` hears `"user"` only when the user's own key closed the picker; every
+---other close, including replacement by `Picker.open`, reports `"programmatic"`, so an owner can
+---tell a dismissal from a displacement.
 ---@param notify? boolean
-function Picker.close(notify)
+---@param reason? "user"|"programmatic"
+function Picker.close(notify, reason)
   local instance = active
   if not instance then return end
   local resume = Picker.capture_state()
@@ -1003,7 +1022,16 @@ function Picker.close(notify)
   close_search(instance)
   popup_window.close(instance.win)
   if instance.spec.on_dispose then instance.spec.on_dispose() end
-  if notify ~= false and instance.spec.on_close then instance.spec.on_close(resume) end
+  if notify ~= false and instance.spec.on_close then instance.spec.on_close(resume, reason or "programmatic") end
+  if not active and #idle_waiter_list > 0 then
+    local waiter_list = idle_waiter_list
+    idle_waiter_list = {}
+    -- A picker opened synchronously after this close, such as by `Picker.open`, becomes active
+    -- before the scheduled waiters run, and they wait again for it.
+    vim.schedule(function()
+      for _, waiter in ipairs(waiter_list) do Picker.when_idle(waiter) end
+    end)
+  end
 end
 
 ---@param owner? string

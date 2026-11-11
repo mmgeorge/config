@@ -104,6 +104,12 @@ impl PublicationSnapshot {
         self.high_water
     }
 
+    /// Get the sequence this page continues after, which for a cursorless read is the end of
+    /// the admitted prefix rather than the caller's absent cursor.
+    pub(crate) fn page_start(&self) -> Option<PublicationSequence> {
+        self.receipt.after
+    }
+
     /// Separate retained content from the evidence required after its complete outbound admission.
     pub(crate) fn into_parts(self) -> (Vec<RetainedPublication>, PublicationReconciliation) {
         (self.records, self.receipt)
@@ -144,6 +150,9 @@ pub(crate) struct SessionPublications {
     reconciliation: Mutex<Option<PublicationBarrier>>,
     failed: AtomicBool,
     recovery: Mutex<std::collections::VecDeque<PublicationRecovery>>,
+    /// A direct offer whose transport outcome is known but whose final state write failed,
+    /// leaving its row `offering` with no delivery worker to settle it.
+    stranded_offer: Mutex<Option<(PublicationSequence, PublicationState)>>,
 }
 
 /// Retain the exact identities and bytes whose commit or delivery evidence was not observed.
@@ -186,6 +195,7 @@ impl SessionPublications {
             reconciliation: Mutex::new(None),
             failed: AtomicBool::new(false),
             recovery: Mutex::new(std::collections::VecDeque::new()),
+            stranded_offer: Mutex::new(None),
         })
     }
 
@@ -348,15 +358,105 @@ impl SessionPublications {
             .map_err(|_| PublicationError::Unavailable)
     }
 
-    /// Classify interrupted offers once at owner startup, before any output worker is launched.
+    /// Classify every earlier epoch's unadmitted publication once at owner startup, before any
+    /// output worker is launched.
+    ///
+    /// An `offering` row may or may not have entered the old transport. A `pending` row never
+    /// did, but it describes the previous host epoch: its timeline revisions and one-shot effects
+    /// belong to state the new epoch's snapshot already supersedes, so offering it live would
+    /// let a stale revision raise the editor's floor. Both become `uncertain`, which live output
+    /// never sends; the editor's first reconnect page carries them and admits them. Admitted
+    /// history from the earlier epoch is pruned, because a new epoch's editor adopts current
+    /// state without replaying it.
     pub(super) fn recover_interrupted_offers(&self) -> Result<(), PublicationError> {
+        // Lock order matches `publish_once`: recovery queue, then connection.
+        let recovery = self
+            .recovery
+            .lock()
+            .map_err(|_| PublicationError::Unavailable)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| PublicationError::Unavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE owner_publication SET state=?2 WHERE session_id=?1 AND json_extract(state,'$.state')!='admitted'",
+            params![self.session, serde_json::to_string(&PublicationState::Uncertain)?],
+        )?;
+        if recovery.is_empty() {
+            Self::prune_admitted(&transaction, &self.session, None)?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        drop(recovery);
+        *self
+            .stranded_offer
+            .lock()
+            .map_err(|_| PublicationError::Unavailable)? = None;
+        Ok(())
+    }
+
+    /// Settle a direct offer stranded by a failed final state write, once no worker delivery is
+    /// active.
+    ///
+    /// The direct path holds the connection lock across its offer, so a recorded stranded
+    /// offer is never still in flight here. Its transport outcome is known, so the row receives
+    /// that exact state rather than being re-sent or left `offering`, which would block every
+    /// later offer and every reconnect with `DeliveryInProgress`.
+    fn settle_stranded_offer(&self) -> Result<(), PublicationError> {
         let connection = self
             .connection
             .lock()
             .map_err(|_| PublicationError::Unavailable)?;
-        connection.execute(
-            "UPDATE owner_publication SET state=?2 WHERE session_id=?1 AND json_extract(state,'$.state')='offering'",
-            params![self.session, serde_json::to_string(&PublicationState::Uncertain)?],
+        let mut stranded = self
+            .stranded_offer
+            .lock()
+            .map_err(|_| PublicationError::Unavailable)?;
+        let Some((sequence, state)) = *stranded else {
+            return Ok(());
+        };
+        self.write_state(&connection, sequence, state)?;
+        *stranded = None;
+        drop(stranded);
+        drop(connection);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Delete admitted history that neither live delivery nor any reconnect page still needs.
+    ///
+    /// Kept rows are: everything unadmitted and everything after the first unadmitted row, so
+    /// order evidence is intact; the highest sequence, because sequence allocation and cursor
+    /// validation read the maximum and a reused sequence would alias a client cursor; rows after
+    /// `through_bound` when it is given, because the confirmed client cursor has not covered
+    /// them; and rows whose origin is a durable producer identity (question input,
+    /// question snapshot, or plan answer), because a retried producer finds its original
+    /// retention through that row instead of publishing again. Owner-update origins are random
+    /// per publication and replayed only from this process's recovery queue, so pruning is
+    /// skipped by callers while that queue is non-empty.
+    fn prune_admitted(
+        transaction: &rusqlite::Transaction<'_>,
+        session: &str,
+        through_bound: Option<PublicationSequence>,
+    ) -> Result<(), PublicationError> {
+        transaction.execute(
+            "DELETE FROM owner_publication AS p
+             WHERE p.session_id=?1
+               AND json_extract(p.state,'$.state')='admitted'
+               AND p.sequence < (SELECT MAX(sequence) FROM owner_publication WHERE session_id=?1)
+               AND p.sequence < COALESCE((SELECT MIN(sequence) FROM owner_publication
+                    WHERE session_id=?1 AND json_extract(state,'$.state')!='admitted'), 9223372036854775807)
+               AND (?2 IS NULL OR p.sequence <= ?2)
+               AND NOT EXISTS (SELECT 1 FROM owner_publication_origin o
+                    WHERE o.session_id=p.session_id AND o.sequence=p.sequence
+                      AND json_extract(o.origin,'$.kind')!='owner_update')",
+            params![session, through_bound.map(PublicationSequence::sql)],
+        )?;
+        transaction.execute(
+            "DELETE FROM owner_publication_origin AS o WHERE o.session_id=?1
+               AND NOT EXISTS (SELECT 1 FROM owner_publication p
+                    WHERE p.session_id=o.session_id AND p.sequence=o.sequence)",
+            [session],
         )?;
         Ok(())
     }
@@ -500,7 +600,14 @@ impl SessionPublications {
             Ok(()) => PublicationState::Admitted,
             Err(_) => PublicationState::Pending,
         };
-        self.write_state(&connection, sequence, state)?;
+        if let Err(error) = self.write_state(&connection, sequence, state) {
+            // No worker owns this offer; the delivery loop settles it with the known outcome.
+            *self
+                .stranded_offer
+                .lock()
+                .map_err(|_| PublicationError::Unavailable)? = Some((sequence, state));
+            return Err(error);
+        }
         retained.state = state;
         Ok(retained)
     }
@@ -748,6 +855,27 @@ impl SessionPublications {
                 return Err(PublicationError::InvalidCursor);
             }
         }
+        // A cursorless reader is a newly attached view that adopts the snapshot's current state
+        // without replaying history, so it pages only from the end of the admitted prefix.
+        // Starting at sequence 1 would make it page through every admitted row of a long
+        // session before it could confirm anything.
+        let cursor = match cursor {
+            Some(cursor) => Some(cursor),
+            None => {
+                let admitted_prefix: i64 = transaction.query_row(
+                    "SELECT COALESCE(
+                        (SELECT MAX(sequence) FROM owner_publication WHERE session_id=?1 AND sequence <
+                            (SELECT MIN(sequence) FROM owner_publication WHERE session_id=?1 AND json_extract(state,'$.state')!='admitted')),
+                        CASE WHEN EXISTS(SELECT 1 FROM owner_publication WHERE session_id=?1 AND json_extract(state,'$.state')!='admitted')
+                            THEN 0 ELSE (SELECT COALESCE(MAX(sequence),0) FROM owner_publication WHERE session_id=?1) END)",
+                    [&self.session],
+                    |row| row.get(0),
+                )?;
+                u64::try_from(admitted_prefix)
+                    .ok()
+                    .and_then(|prefix| PublicationSequence::try_from(prefix).ok())
+            }
+        };
         // Validate the complete retained page before exposing its reconciliation receipt.
         let records = {
             let mut query = transaction.prepare(
@@ -809,6 +937,11 @@ impl SessionPublications {
         let Some(through) = receipt.through else {
             return Ok(());
         };
+        // Lock order matches `publish_once`: recovery queue, then connection.
+        let recovery = self
+            .recovery
+            .lock()
+            .map_err(|_| PublicationError::Unavailable)?;
         let mut connection = self
             .connection
             .lock()
@@ -825,7 +958,14 @@ impl SessionPublications {
             "UPDATE owner_publication SET state=?4 WHERE session_id=?1 AND sequence>?2 AND sequence<=?3",
             params![self.session, receipt.after.map_or(0, PublicationSequence::sql), through.sql(), serde_json::to_string(&PublicationState::Admitted)?],
         )?;
+        // The client promotes its cursor to `through` only after this confirmation, so history
+        // at or below it is no longer needed by that reader's next page.
+        if recovery.is_empty() {
+            Self::prune_admitted(&transaction, &self.session, Some(through))?;
+        }
         transaction.commit()?;
+        drop(connection);
+        drop(recovery);
         self.changed.notify_one();
         Ok(())
     }
@@ -962,6 +1102,9 @@ impl PublicationDelivery {
             }
             None => {}
         }
+        // Settle before the transport checks: a withheld transport during reconnect must not
+        // leave a stranded `offering` row blocking that same reconnect.
+        publications.settle_stranded_offer()?;
         let Some(transport) = transport else {
             return Ok(None);
         };
@@ -1124,11 +1267,11 @@ mod tests {
         );
         publications.confirm_reconciled(&receipt)?;
         publications.confirm_reconciled(&receipt)?;
-        assert_eq!(
-            records(&publications)[0].state(),
-            PublicationState::Admitted
-        );
-        assert_eq!(records(&publications)[1].state(), PublicationState::Pending);
+        // Confirmation admits the uncertain head, and pruning then removes it as confirmed history.
+        let remaining = records(&publications);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sequence(), second.sequence());
+        assert_eq!(remaining[0].state(), PublicationState::Pending);
         let (sender, mut receiver) = forge_protocol::outbound::channel();
         let mut delivery = PublicationDelivery::default();
         assert!(matches!(delivery.update(&publications, Some(&sender))?,
@@ -1139,6 +1282,122 @@ mod tests {
         let sent: SessionEvent = serde_json::from_slice(frame.bytes()).unwrap();
         assert_eq!(sent.payload["text"], "after snapshot");
         assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    /// A direct offer whose final state write fails is settled by the delivery loop with its
+    /// known outcome, so the row cannot stay `offering` and block reconnect forever.
+    #[tokio::test]
+    async fn stranded_direct_offer_is_settled_once_no_worker_is_active()
+    -> Result<(), PublicationError> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let publications = Arc::new(SessionPublications::open(root.path(), "session")?);
+        let database =
+            rusqlite::Connection::open(crate::storage::state::database(root.path())).unwrap();
+        database.execute_batch("CREATE TRIGGER fail_admitted_state BEFORE UPDATE ON owner_publication WHEN json_extract(NEW.state,'$.state')='admitted' BEGIN SELECT RAISE(ABORT,'state write failed'); END;").unwrap();
+        let (sender, mut receiver) = forge_protocol::outbound::channel();
+
+        assert!(matches!(
+            publications.publish(event("stranded"), Some(&sender)),
+            Err(PublicationError::DeliveryState { .. })
+        ));
+        assert_eq!(
+            records(&publications)[0].state(),
+            PublicationState::Offering
+        );
+        assert!(matches!(
+            publications.begin_reconciliation(),
+            Err(PublicationError::DeliveryInProgress)
+        ));
+
+        database
+            .execute_batch("DROP TRIGGER fail_admitted_state;")
+            .unwrap();
+        let mut delivery = PublicationDelivery::default();
+        delivery.update(&publications, None)?;
+
+        assert_eq!(
+            records(&publications)[0].state(),
+            PublicationState::Admitted
+        );
+        drop(publications.begin_reconciliation()?);
+        let frame = receiver.recv().await.unwrap().unwrap();
+        let sent: SessionEvent = serde_json::from_slice(frame.bytes()).unwrap();
+        assert_eq!(sent.payload["text"], "stranded");
+        assert!(
+            receiver.try_recv().is_err(),
+            "the stranded offer was resent"
+        );
+        Ok(())
+    }
+
+    /// A pending row left by the previous host epoch is never offered live in the next one; the
+    /// first reconnect page carries it as uncertain instead.
+    #[tokio::test]
+    async fn owner_start_withholds_prior_epoch_pending_publications() -> Result<(), PublicationError>
+    {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let publications = SessionPublications::open(root.path(), "session")?;
+        let stale = publications.publish(event("previous epoch"), None)?;
+        assert_eq!(stale.state(), PublicationState::Pending);
+        drop(publications);
+
+        let publications = SessionPublications::open(root.path(), "session")?;
+        publications.recover_interrupted_offers()?;
+        let (sender, mut receiver) = forge_protocol::outbound::channel();
+        let mut delivery = PublicationDelivery::default();
+        assert!(delivery.update(&publications, Some(&sender))?.is_none());
+        assert!(
+            receiver.try_recv().is_err(),
+            "a prior-epoch row was offered live"
+        );
+
+        let (page, _receipt) = publications
+            .snapshot(None, NonZeroU16::new(8).unwrap())?
+            .into_parts();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].sequence(), stale.sequence());
+        assert_eq!(page[0].state(), PublicationState::Uncertain);
+        Ok(())
+    }
+
+    /// Confirmed history is pruned except the highest row, a cursorless page starts after the
+    /// admitted prefix, and sequence allocation never reuses a pruned identity.
+    #[tokio::test]
+    async fn confirmed_history_is_pruned_and_cursorless_pages_skip_the_admitted_prefix()
+    -> Result<(), PublicationError> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let publications = SessionPublications::open(root.path(), "session")?;
+        for text in ["first", "second", "third"] {
+            publications.publish(event(text), None)?;
+        }
+        let page = publications.snapshot(None, NonZeroU16::new(8).unwrap())?;
+        assert_eq!(page.page_start(), None);
+        let (retained, receipt) = page.into_parts();
+        assert_eq!(retained.len(), 3);
+        let last = retained[2].sequence();
+        publications.confirm_reconciled(&receipt)?;
+
+        let remaining = records(&publications);
+        assert_eq!(remaining.len(), 1, "admitted history was not pruned");
+        assert_eq!(remaining[0].sequence(), last);
+        let page = publications.snapshot(None, NonZeroU16::new(8).unwrap())?;
+        assert_eq!(page.page_start(), Some(last));
+        assert_eq!(page.high_water(), Some(last));
+        assert!(page.into_parts().0.is_empty());
+        assert!(
+            publications
+                .snapshot(Some(last), NonZeroU16::new(8).unwrap())
+                .is_ok()
+        );
+
+        let next = publications.publish(event("fourth"), None)?;
+        assert_eq!(next.sequence().get(), last.get() + 1);
+        let (retained, _receipt) = publications
+            .snapshot(None, NonZeroU16::new(8).unwrap())?
+            .into_parts();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].sequence(), next.sequence());
         Ok(())
     }
 

@@ -1986,7 +1986,15 @@ fn prepare_workflow_continuation(
                         services.goal_max_turns,
                         now_ms,
                     )
-                    .map_err(OperationFailure::Domain)?;
+                    // Preparation refuses a task that is paused, unaccepted, or planning; that is
+                    // a rejection of this continuation, not a storage failure of the session.
+                    .map_err(|error| {
+                        if super::failure::storage_failure(&error) {
+                            OperationFailure::Domain(error)
+                        } else {
+                            rejected(TaskCommandFailure::Changed)
+                        }
+                    })?;
                 instruction = match &prepared.change {
                     crate::task::TaskChange::Update(task) => task
                         .turn

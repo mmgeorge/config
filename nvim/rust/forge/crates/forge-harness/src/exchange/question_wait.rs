@@ -125,6 +125,20 @@ struct Retirement {
 }
 
 impl Retirement {
+    /// Treat an observation whose tool stopped listening as abandonment.
+    ///
+    /// A tool cancelled after reporting its answers drops the reply before the owner commits
+    /// them as observed. Marking them observed would keep them out of the outbox although no
+    /// tool result ever carried them, so they return through ordinary message delivery instead.
+    fn abandon_unreceived_observation(&mut self) {
+        if matches!(self.end, QuestionWaitEnd::Observed(_))
+            && self.reply.as_ref().is_some_and(oneshot::Sender::is_closed)
+        {
+            self.end = QuestionWaitEnd::Abandoned;
+            self.reply = None;
+        }
+    }
+
     /// End a live response wait without dropping the report that still requires durable retirement.
     fn release_uncommitted_observer(&mut self) {
         if let Some(reply) = self.reply.take() {
@@ -276,8 +290,10 @@ impl QuestionWaits {
             }
             let retired = self
                 .retained
-                .front()
+                .front_mut()
                 .expect("a ready or closing retirement was retained before applying it");
+            retired.abandon_unreceived_observation();
+            let retired = &*retired;
             let Some(registration) = self.active.get(&retired.id) else {
                 self.retained.pop_front();
                 continue;
@@ -422,5 +438,39 @@ impl Drop for QuestionWaits {
     /// Release blocked observation on abrupt owner loss without mutating state outside the update owner.
     fn drop(&mut self) {
         self.owner_closed.send_replace(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a retained observation whose reply belongs to the returned receiver.
+    fn observed_retirement() -> (
+        Retirement,
+        oneshot::Receiver<Result<Vec<crate::question::QuestionRecord>, QuestionWaitError>>,
+    ) {
+        let (reply, receiver) = oneshot::channel();
+        let retirement = Retirement {
+            id: WaitId(uuid::Uuid::new_v4()),
+            end: QuestionWaitEnd::Observed(QuestionWaitReport::observed(&[])),
+            reply: Some(reply),
+        };
+        (retirement, receiver)
+    }
+
+    /// Answers reported by a tool that was cancelled before receiving them are not observed.
+    #[test]
+    fn cancelled_observer_turns_its_report_into_abandonment() {
+        let (mut cancelled, receiver) = observed_retirement();
+        drop(receiver);
+        cancelled.abandon_unreceived_observation();
+        assert!(matches!(cancelled.end, QuestionWaitEnd::Abandoned));
+        assert!(cancelled.reply.is_none());
+
+        let (mut listening, _receiver) = observed_retirement();
+        listening.abandon_unreceived_observation();
+        assert!(matches!(listening.end, QuestionWaitEnd::Observed(_)));
+        assert!(listening.reply.is_some());
     }
 }

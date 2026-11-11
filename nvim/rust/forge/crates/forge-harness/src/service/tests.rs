@@ -5,6 +5,7 @@ mod owner_fixture;
 mod owner_storage_failure;
 mod owner_transition;
 mod reconnect_overlap;
+mod session_lifecycle;
 mod task_state;
 
 use super::*;
@@ -607,6 +608,8 @@ async fn cancelled_deferred_input_is_retracted_without_replay() -> Result<()> {
         crate::provider::submission::SubmissionState::Prepared
     );
     controller.coordinator.submissions.suspend(true, None)?;
+    // The user's cancel, not lane retirement alone, retracts undispatched steering.
+    controller.cancellation.request();
     active.retire();
     command.cancel_undispatched().await?;
     let deferred_retained = || -> Result<bool> {
@@ -636,6 +639,84 @@ async fn cancelled_deferred_input_is_retracted_without_replay() -> Result<()> {
     controller.coordinator.submissions.apply(fresh)?;
     assert!(!deferred_retained()?, "cancelled input was replayed");
     controller.coordinator.submissions.suspend(true, None)?;
+    drop(active);
+    drop(execution);
+    service.shutdown(Duration::from_secs(5)).await?;
+    drop(sink);
+    reader.await??;
+    Ok(())
+}
+
+/// Steering that a turn never dispatched before ending on a user decision returns to the queue.
+///
+/// Settlement cancels the undispatched receipt when the turn's lane retires, so without a user
+/// cancel the queue must keep the message instead of treating that retirement as a retraction.
+#[tokio::test]
+async fn retired_lane_returns_undispatched_steering_to_the_queue() -> Result<()> {
+    use crate::input::{InputDelivery, InputOperation};
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let execution = controller
+        .coordinator
+        .execution
+        .clone()
+        .acquire_owned()
+        .await?;
+    let mut active = controller.parent_input.activate(None)?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    let operation: InputOperation = serde_json::from_value(json!({
+        "id":"steer-op","action":{"kind":"submit","message":{
+            "id":"steer-input","text":"Also update the changelog","intent":"auto"
+        }}
+    }))?;
+    controller.coordinator.submissions.apply(operation)?;
+    controller.attach_input(&sink).await?;
+    let command = active.receive().await.context("missing steering input")?;
+    let submission = command
+        .submission
+        .as_ref()
+        .context("missing steering receipt")?
+        .clone();
+    // Hold delivery while the turn ends so the requeued message stays observable.
+    controller.coordinator.submissions.suspend(true, None)?;
+    active.retire();
+    command.cancel_undispatched().await?;
+    let steering_delivery = || -> Result<Option<InputDelivery>> {
+        Ok(controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .iter()
+            .find(|message| message.id == "steer-input")
+            .map(crate::input::InputMessage::delivery))
+    };
+    async {
+        while steering_delivery()? == Some(InputDelivery::Delivering) {
+            tokio::task::yield_now().await;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await?;
+    assert_eq!(
+        steering_delivery()?,
+        Some(InputDelivery::Queued),
+        "undispatched steering was removed instead of returning to the queue"
+    );
+    assert_eq!(
+        submission.record()?.delivery,
+        crate::provider::submission::SubmissionState::Cancelled
+    );
     drop(active);
     drop(execution);
     service.shutdown(Duration::from_secs(5)).await?;

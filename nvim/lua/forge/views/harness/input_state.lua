@@ -233,7 +233,13 @@ function M.perform(state, action, callback, target)
       end
       for _, waiter in ipairs(waiters) do waiter() end
     end
-    if not owns_input(state, input) then settle_commits() return end
+    if not owns_input(state, input) then
+      -- The view moved to another session, epoch, or host while the command was in flight. The
+      -- caller still owns state tied to this command, so it hears the settlement as a failure.
+      if callback then callback(failure or "Harness input changed before the host answered") end
+      settle_commits()
+      return
+    end
     local admitted = draft and not index_of(input.drafts, draft.id)
     if result then
       M.receive(state, result)
@@ -300,7 +306,23 @@ end
 function M.submit(state, text, attachments, intent, config, callback, retracted, target)
   local message = { id = command.identity(), text = text, attachments = attachments,
     purpose = { kind = "user" }, config = config, intent = intent }
-  if retracted then state.input.retraction[message.id] = retracted end
+  if retracted then
+    local input = state.input
+    input.retraction[message.id] = function()
+      if retracted() then return true end
+      -- The composer holds newer work, so the retracted prompt becomes an editor-only draft in
+      -- the queue instead of surviving only in prompt history. It takes a fresh identity because
+      -- the host retires the original one, and it is never delivered until the user retries it.
+      if state.input ~= input then return false end
+      input.drafts[#input.drafts + 1] = {
+        id = command.identity(), text = text, attachments = attachments, purpose = { kind = "user" },
+        config = config, intent = intent, local_only = true, draft_state = "rejected",
+        error = "Retracted while the composer held newer text. Retry to send it again.",
+      }
+      render(state)
+      return false
+    end
+  end
   M.perform(state, { kind = "submit", message = message }, callback, target)
   return message.id
 end

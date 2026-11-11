@@ -505,6 +505,10 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
         fixture.controller.exchange_owner.execute_command(
             Command::CancelExchange(CancelExchangeRequest::default())
         ).await.context("cancel was refused after late collection completed")?;
+        // The overdue stop's retained transition outlives it; a child quiescence left in it
+        // would park every later root turn at completion.
+        ensure!(!fixture.controller.agent_coordinator.is_quiescing(),
+            "the overdue stop retained its child quiescence after it settled");
         let completions = fixture.events.lock().expect("fixture events poisoned")
             .iter().filter(|(_, event)| event["event"] == "command_completed"
                 && event["payload"]["id"] == operation_id).count();

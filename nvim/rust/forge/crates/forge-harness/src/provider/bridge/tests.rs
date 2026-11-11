@@ -933,3 +933,59 @@ async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow:
     );
     Ok(())
 }
+
+/// A close waits only for positions its owner can still consume: a position the fenced owner
+/// refused, or one whose receiver is gone, ends the wait instead of holding admission forever.
+#[tokio::test(start_paused = true)]
+async fn close_watermark_ends_when_the_owner_refuses_or_drops_a_published_event()
+-> anyhow::Result<()> {
+    for receiver_dropped in [false, true] {
+        let root = tempfile::tempdir()?;
+        let native = BridgeFixtureProvider::new(false);
+        let provider = Arc::new(bridge(root.path(), native.clone()).await?);
+        let request = provider_request(root.path());
+        let owner = request.owner()?;
+        let mut events = provider.session_events(owner.clone()).await?;
+        provider.thread_open(request).await?;
+        let binding = provider
+            .session(owner.clone())
+            .await
+            .initialized
+            .get()
+            .unwrap()
+            .binding
+            .id
+            .clone();
+        let sink = native.sinks.lock().unwrap().get(&binding).unwrap().clone();
+        sink.capabilities_changed(forge_provider_api::CapabilityManifest::from_descriptor(
+            native.descriptor(),
+        ))
+        .await?;
+        let (event_binding, sequence) = loop {
+            let observation = events
+                .recv()
+                .await?
+                .expect("the native event reaches the owner");
+            if let Some(position) = observation.native {
+                break position;
+            }
+        };
+        if receiver_dropped {
+            drop(events);
+        } else {
+            // A fenced owner refuses the event instead of consuming it.
+            provider.event_rejected(&event_binding, sequence).await?;
+        }
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            provider.session_close_owner(&owner),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "close waited forever for an unconsumable watermark (receiver dropped: {receiver_dropped})"
+        );
+        let _ = provider.shutdown().await;
+    }
+    Ok(())
+}

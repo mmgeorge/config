@@ -1571,6 +1571,8 @@ struct ActiveTurn {
     collection_signals: VecDeque<ForegroundSignal>,
     staged_effects: VecDeque<ForegroundJob>,
     publication_drain_requested: bool,
+    /// The reducer finished the turn while work it started earlier was still running.
+    settled: bool,
     handoff: TurnDispatch,
     updates: Option<crate::broker::publication::SessionUpdateStream>,
     _execution: Option<crate::command::ExecutionPermit>,
@@ -1602,6 +1604,7 @@ impl ActiveTurn {
             staged_effects: VecDeque::new(),
             publication_job: JoinSet::new(),
             publication_drain_requested: false,
+            settled: false,
             handoff: TurnDispatch::NotStarted,
             updates,
             _execution: execution,
@@ -1751,12 +1754,53 @@ impl ActiveTurn {
         completed_publication: bool,
         commit: ForegroundCommit,
     ) -> Result<ForegroundProgress> {
+        if self.settled {
+            return Ok(self.settled_update(signal, completed_publication));
+        }
         if let ForegroundSignal::LiveHost(request) = signal {
             self.pending_live_effects.stage(request);
             return Ok(ForegroundProgress::Waiting);
         }
         self.apply_update(broker, signal, completed_publication, commit)
             .await
+    }
+
+    /// Join work that was running when the reducer settled, without stepping the reducer again.
+    ///
+    /// Output that still needs forwarding is published in order; any other result belongs to the
+    /// settled transaction and is dropped. The turn finishes once nothing remains running.
+    fn settled_update(
+        &mut self,
+        signal: ForegroundSignal,
+        completed_publication: bool,
+    ) -> ForegroundProgress {
+        match signal {
+            ForegroundSignal::LiveHost(request) => {
+                request.reject(crate::provider::ProviderError::DeliveryUncertain);
+            }
+            signal if needs_forward(&signal) => {
+                if completed_publication {
+                    self.launch_publication(Publication::Forward(signal));
+                } else {
+                    self.publication(Publication::Forward(signal));
+                }
+                return ForegroundProgress::Waiting;
+            }
+            _ => {}
+        }
+        if completed_publication && let Some(publication) = self.publications.pop_front() {
+            self.launch_publication(publication);
+        }
+        if self.drained() {
+            ForegroundProgress::Finished
+        } else {
+            ForegroundProgress::Waiting
+        }
+    }
+
+    /// Report whether no job or publication of this turn is running or queued.
+    fn drained(&self) -> bool {
+        self.jobs.is_empty() && self.publication_job.is_empty() && self.publications.is_empty()
     }
 
     async fn apply_update(
@@ -1824,13 +1868,14 @@ impl ActiveTurn {
                 self.effect(job);
             }
             ForegroundAction::Finish => {
-                anyhow::ensure!(
-                    self.jobs.is_empty()
-                        && self.publication_job.is_empty()
-                        && self.publications.is_empty()
-                        && self.staged_effects.is_empty(),
-                    "foreground settlement still has pending effects"
-                );
+                // An observation or scan tick read while the settlement commit ran can stage or
+                // start work after the reducer's final drain. The transaction is settled, so
+                // staged work never starts; work already running is joined before finishing.
+                self.staged_effects.clear();
+                if !self.drained() {
+                    self.settled = true;
+                    return Ok(ForegroundProgress::Waiting);
+                }
                 return Ok(ForegroundProgress::Finished);
             }
             ForegroundAction::FinishFailure(error) => {
@@ -1862,6 +1907,10 @@ impl ActiveTurn {
         broker: &Mutex<HarnessBroker>,
         gate: ForegroundEffectGate,
     ) {
+        if self.settled {
+            self.reject_pending_live_effects();
+            return;
+        }
         if !matches!(gate, ForegroundEffectGate::Open) {
             let _ = self
                 .pending_live_effects

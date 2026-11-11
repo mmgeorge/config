@@ -36,6 +36,27 @@ pub(crate) enum NativeAvailabilityReceipt {
     BindingRetired(forge_provider_api::BindingId),
 }
 
+/// Route tool observations by exchange rather than by invocation.
+///
+/// A steering message, child result, or check repair continues the exchange under a successor
+/// invocation with a new id but the same owner and exchange. Its events pass this inbox before the
+/// foreground adopts the successor scope, so a registry keyed by invocation id never delivered
+/// them to the foreground's watchdog and a hung tool in any continuation had no deadline.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WatchdogKey {
+    thread_id: forge_provider_api::ThreadId,
+    exchange_id: forge_provider_api::ExchangeId,
+}
+
+impl WatchdogKey {
+    fn of(scope: &crate::provider::InvocationScope) -> Self {
+        Self {
+            thread_id: scope.thread_id.clone(),
+            exchange_id: scope.exchange_id.clone(),
+        }
+    }
+}
+
 /// Retain provider session events while the foreground request owns the broker.
 #[derive(Default)]
 pub(crate) struct SessionObservationInbox {
@@ -48,15 +69,9 @@ pub(crate) struct SessionObservationInbox {
     collected: Mutex<Option<super::OwnerCloseReason>>,
     retired_binding: Mutex<Option<forge_provider_api::BindingId>>,
     availability: Mutex<Option<NativeAvailabilityReceipt>>,
-    watchdogs: Mutex<
-        HashMap<
-            crate::provider::InvocationId,
-            Vec<Weak<crate::provider::tool_timeout::ToolWatchdog>>,
-        >,
-    >,
-    retained_watchdogs: Mutex<
-        HashMap<crate::provider::InvocationId, Arc<crate::provider::tool_timeout::ToolWatchdog>>,
-    >,
+    watchdogs: Mutex<HashMap<WatchdogKey, Vec<Weak<crate::provider::tool_timeout::ToolWatchdog>>>>,
+    /// The watchdog of the exchange whose foreground most recently registered, if any.
+    retained_watchdog: Mutex<Option<Arc<crate::provider::tool_timeout::ToolWatchdog>>>,
     background_tasks: Mutex<tokio::task::JoinSet<()>>,
     background_collection: tokio::sync::Mutex<()>,
     watchdog_failure: Mutex<Option<Arc<forge_provider_api::error::ObservationCleanup>>>,
@@ -295,7 +310,7 @@ impl SessionObservationInbox {
                 .watchdogs
                 .lock()
                 .map_err(|_| inbox_poisoned("tool watchdog registry poisoned"))?
-                .get(&scope.invocation_id)
+                .get(&WatchdogKey::of(scope))
                 .into_iter()
                 .flatten()
                 .filter_map(Weak::upgrade)
@@ -312,14 +327,20 @@ impl SessionObservationInbox {
         Ok(())
     }
 
-    /// Route late command observations to the watchdog that owns their original invocation.
+    /// Route this exchange's tool observations, including those of its successor invocations, to
+    /// `watchdog`, and late command observations to the watchdog that admitted them.
+    ///
+    /// Registering a new foreground's watchdog retires the previously registered one: it keeps
+    /// its admitted background deadlines but adopts no later native execution, so its session
+    /// monitor ends once none of its tools is still running instead of parking for the session's
+    /// lifetime. Only the newest watchdog stays strongly retained here.
     pub(crate) fn watch_tools(
         &self,
         scope: &crate::provider::InvocationScope,
         watchdog: &Arc<crate::provider::tool_timeout::ToolWatchdog>,
     ) -> Result<()> {
         let mut current = self
-            .retained_watchdogs
+            .retained_watchdog
             .lock()
             .map_err(|_| inbox_poisoned("retained watchdog lock poisoned"))?;
         let mut watchdogs = self
@@ -330,14 +351,14 @@ impl SessionObservationInbox {
             retained.retain(|watchdog| watchdog.strong_count() > 0);
         }
         watchdogs.retain(|_, retained| !retained.is_empty());
-        let retained = watchdogs.entry(scope.invocation_id.clone()).or_default();
+        let retained = watchdogs.entry(WatchdogKey::of(scope)).or_default();
         if !retained
             .iter()
             .any(|previous| previous.ptr_eq(&Arc::downgrade(watchdog)))
         {
             retained.push(Arc::downgrade(watchdog));
         }
-        if let Some(previous) = current.get(&scope.invocation_id)
+        if let Some(previous) = current.as_ref()
             && !Arc::ptr_eq(previous, watchdog)
         {
             previous.retire_idle().map_err(|error| {
@@ -347,7 +368,7 @@ impl SessionObservationInbox {
                 )
             })?;
         }
-        current.insert(scope.invocation_id.clone(), watchdog.clone());
+        *current = Some(watchdog.clone());
         Ok(())
     }
 
@@ -805,6 +826,82 @@ mod tests {
                 result,
             })
         }
+    }
+
+    /// Create a tool start observation in the given invocation.
+    fn tool_started(scope: &crate::provider::InvocationScope, item: &str) -> Result<HarnessEvent> {
+        Ok(tool_observation(
+            crate::provider::ToolAddress {
+                turn: crate::provider::TurnAddress {
+                    scope: scope.clone(),
+                    thread_id: scope.owner().thread_id(),
+                    turn_id: scope.turn_id()?,
+                },
+                item_id: forge_provider_api::ItemId::new(item)?,
+            },
+            forge_provider_api::message::ItemEvent::Tool {
+                event: forge_provider_api::tool::ToolItemEvent::ExecutionStarted,
+            },
+        ))
+    }
+
+    /// Create a one-second watchdog under the paused clock.
+    fn one_second_watchdog() -> Result<Arc<crate::provider::tool_timeout::ToolWatchdog>> {
+        Ok(Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
+            crate::session::InputTimeout {
+                amount: 1,
+                unit: crate::session::TimeoutUnit::S,
+            },
+        )?))
+    }
+
+    /// A continuation runs under a successor invocation of the same exchange, and its hung tool
+    /// must still reach the foreground's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn successor_invocation_tools_reach_the_exchange_watchdog() -> Result<()> {
+        let inbox = SessionObservationInbox::default();
+        let watchdog = one_second_watchdog()?;
+        let initial = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "exchange",
+        );
+        inbox.watch_tools(&initial, &watchdog)?;
+        let successor = crate::provider::InvocationScope::new(initial.owner().clone(), "exchange");
+        assert_ne!(successor.invocation_id, initial.invocation_id);
+        inbox.push(tool_started(&successor, "continuation-tool")?)?;
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let expired = watchdog.expired().await?;
+        assert_eq!(
+            expired.map(|timeout| timeout.address.turn.scope),
+            Some(successor)
+        );
+        Ok(())
+    }
+
+    /// A newer foreground retires the previous watchdog, so its parked monitor ends.
+    #[tokio::test(start_paused = true)]
+    async fn newer_foreground_retires_the_previous_idle_watchdog() -> Result<()> {
+        let inbox = SessionObservationInbox::default();
+        let previous = one_second_watchdog()?;
+        let first = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "first-exchange",
+        );
+        inbox.watch_tools(&first, &previous)?;
+        assert!(!previous.finish_foreground()?);
+        let mut resumed = Box::pin(previous.resumed());
+        assert!(futures_util::poll!(resumed.as_mut()).is_pending());
+        let second = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "second-exchange",
+        );
+        inbox.watch_tools(&second, &one_second_watchdog()?)?;
+        assert!(
+            !resumed.await?,
+            "the retired watchdog's monitor must stop waiting"
+        );
+        assert!(previous.expired().await?.is_none());
+        Ok(())
     }
 
     /// Preserve typed loss and still cancel native work when timeout publication meets a full inbox.

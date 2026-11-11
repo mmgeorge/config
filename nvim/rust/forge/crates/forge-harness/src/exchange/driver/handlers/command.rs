@@ -654,26 +654,16 @@ impl ExchangeDriver {
                                     session_id,
                                     step,
                                 ),
-                                OperationFailure::Domain(error)
-                                | OperationFailure::Transition(TransitionFailure::Domain(error)) => {
+                                failure @ (OperationFailure::Domain(_)
+                                | OperationFailure::Transition(
+                                    TransitionFailure::Domain(_),
+                                )
+                                | OperationFailure::StorageUncommitted) => {
                                     trace.record(session_id, "exchange.configuration.commit_failed", serde_json::json!({
-                                            "command_id":command_id.as_str(),"update_step":step,"reason":error.to_string(),
+                                            "command_id":command_id.as_str(),"update_step":step,"reason":failure.to_string(),
                                         }));
-                                    self.commands.uncommitted(
-                                        queued,
-                                        CommandJournalError::DomainCommit,
-                                        trace,
-                                        session_id,
-                                        step,
-                                    );
+                                    self.stopped_command_finish(env, step, queued, failure);
                                 }
-                                OperationFailure::StorageUncommitted => self.commands.uncommitted(
-                                    queued,
-                                    CommandJournalError::DomainCommit,
-                                    trace,
-                                    session_id,
-                                    step,
-                                ),
                                 OperationFailure::Transition(TransitionFailure::Rejected(_)) => {
                                     unreachable!("safe rejection is handled separately")
                                 }
@@ -713,9 +703,9 @@ impl ExchangeDriver {
                     ),
                     Ok(()) => {
                         transition.retain_uncommitted(event);
-                        Err(TransitionFailure::Domain(anyhow::anyhow!(
-                            "owner storage is unavailable"
-                        )))
+                        Err(TransitionFailure::Domain(
+                            crate::exchange::failure::OwnerStorageUnavailable.into(),
+                        ))
                     }
                     Err(error) => {
                         transition.retain_uncommitted(event);

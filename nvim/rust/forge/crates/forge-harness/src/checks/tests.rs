@@ -48,6 +48,20 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
     .unwrap()
 }
 
+/// A torn run record is skipped rather than failing the supervisor that session open builds.
+#[test]
+fn undecodable_check_record_does_not_block_session_open() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    std::fs::create_dir_all(data.path().join("torn-run"))?;
+    std::fs::write(data.path().join("torn-run/record.json"), br#"{"version":"#)?;
+    let runner = make_runner(workspace.path(), data.path());
+    assert!(runner.history()?.is_empty());
+    assert!(CheckSupervisor::saved_history(data.path())?.is_empty());
+    assert!(data.path().join("torn-run/record.json").exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn revoked_callback_cannot_write_check_configuration() -> Result<()> {
     let workspace = tempfile::tempdir()?;

@@ -99,6 +99,9 @@ if vim.g.forge_approval_grid then
     end
     assert(highlighted > 0, "the real renderer must apply the approval marker")
     assert(base_priority and syntax_priority and base_priority < syntax_priority, "whole-line text cannot override shell syntax colors")
+    -- The popup can take focus mid-typing, so an Enter before any choice decides nothing.
+    keymap.invoke("<CR>")
+    assert(submitted == 0 and picker._state_for_test().state.page_index == 1, "an Enter without a choice made a decision")
     choose("allow_exact")
     assert(submitted == 0, "incomplete decisions must not submit")
     assert(picker._state_for_test().state.page_index == 2)

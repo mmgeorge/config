@@ -17,7 +17,7 @@ mod recovery;
 mod schema;
 pub mod state;
 mod task;
-pub(crate) use schema::bootstrap_lock;
+pub(crate) use schema::{bootstrap_lock, exclusive_file_lock};
 pub(crate) use task::{PlanArtifactGuard, TaskEffects};
 mod tool_output;
 

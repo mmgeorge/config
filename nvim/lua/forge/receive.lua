@@ -82,9 +82,11 @@ drain = function(state)
   if state.closed then return end
   if state.options.active and not state.options.active() then M.close(state) return end
   if state.failure then
-    local failure = state.failure
+    -- A failure after `finish` means the process has already exited, so `failed` receives its
+    -- exit result and the owner completes the exit path instead of stopping a dead process.
+    local failure, ending = state.failure, state.ending
     M.close(state)
-    if state.options.failed then state.options.failed(failure) end
+    if state.options.failed then state.options.failed(failure, ending and ending.result) end
     return
   end
   local frames, bytes = 0, 0

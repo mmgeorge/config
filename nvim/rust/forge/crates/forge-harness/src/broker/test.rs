@@ -422,7 +422,8 @@ async fn manual_child_admission_streams_and_followup_reuses_only_child_history()
     };
     let response = tokio::spawn(async move { sender.request(request).await });
     tokio::task::yield_now().await;
-    broker.drain_agent_commands(None).await?;
+    let mut drained = Vec::new();
+    while broker.drain_next_agent_command(None, &mut drained).await {}
     assert_eq!(response.await??["agent"]["id"], agent_id);
     settle_managed_children(&mut broker).await?;
     let exchange = broker.store.list_agent_exchange(&agent_id)?;

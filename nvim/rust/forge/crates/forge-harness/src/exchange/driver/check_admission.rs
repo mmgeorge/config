@@ -33,7 +33,14 @@ impl ExchangeDriver {
             ..
         } = state;
         // Advance automatic work only after caller-command admission and under the same resource gates.
-        if admission.cancel_automatic_checks {
+        // A Ready outcome is a finished run still publishing its updates, so closing tool
+        // admission leaves it to complete below rather than reporting the run as interrupted.
+        if admission.cancel_automatic_checks
+            && !matches!(
+                automatic_action,
+                Some(crate::broker::OwnedCheckProgress::Ready(_))
+            )
+        {
             if let Some(checks) = automatic_checks.as_mut() {
                 let _ = checks.cancel();
             }

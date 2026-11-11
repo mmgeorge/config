@@ -76,6 +76,21 @@ impl ForegroundFinalization {
         outcome: ProviderCompletion,
         question_override: Option<ProviderCompletion>,
     ) -> Result<()> {
+        self.resume(Ok(outcome), question_override)
+    }
+
+    /// Settle a cancelled same-invocation follow-up through the envelope that already owns the
+    /// prompt submission. The original turn transferred that authority when it first finalized,
+    /// so a cancelled clarification, check-repair, or retry turn cannot take it again.
+    pub(crate) fn resume_cancelled(&mut self) -> Result<()> {
+        self.resume(Err(ProviderError::Cancelled), None)
+    }
+
+    fn resume(
+        &mut self,
+        outcome: Result<ProviderCompletion, ProviderError>,
+        question_override: Option<ProviderCompletion>,
+    ) -> Result<()> {
         anyhow::ensure!(
             matches!(
                 self.phase,
@@ -85,7 +100,7 @@ impl ForegroundFinalization {
             ),
             "host continuation is not active"
         );
-        self.outcome = Ok(outcome);
+        self.outcome = outcome;
         self.question_override = question_override;
         self.staged = None;
         self.plan_mutations = None;

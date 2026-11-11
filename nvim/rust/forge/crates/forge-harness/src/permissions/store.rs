@@ -43,14 +43,17 @@ impl PermissionStore {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create permission directory {}", parent.display()))?;
         }
-        if !path.exists() {
-            let source = serialize_permission_document(&default_permission_document())?;
-            atomic_write(&path, &source)?;
-        }
-        let source = fs::read_to_string(&path)
-            .with_context(|| format!("read permission document {}", path.display()))?;
-        let document = parse_permission_document(&source)
-            .with_context(|| format!("validate permission document {}", path.display()))?;
+        let document = {
+            let _writer = permission_writer_lock(&path)?;
+            match read_disk_document(&path)? {
+                Some(document) => document,
+                None => {
+                    let document = default_permission_document();
+                    atomic_write(&path, &serialize_permission_document(&document)?)?;
+                    document
+                }
+            }
+        };
         let source = serialize_permission_document(&document)?;
         let compiled = Arc::new(CompiledPermissionDocument::compile(document, &workspace));
         Ok(Self {
@@ -69,33 +72,69 @@ impl PermissionStore {
         )
     }
 
+    /// Replace the whole document with an edited source, as `:ForgePermissions` does.
+    ///
+    /// A replacement is the user's complete intended policy, so it does not merge with disk.
     pub fn save(&mut self, source: &str) -> Result<()> {
-        self.save_policy(source, PermissionEdit::Replacement)
+        let document = parse_permission_document(source)?;
+        let _writer = permission_writer_lock(&self.path)?;
+        let disk = read_disk_document(&self.path)?;
+        self.commit(document, disk, PermissionEdit::Replacement)
     }
 
-    /// Preserve compiled identity for equivalent documents, even when disk formatting changed.
-    fn save_policy(&mut self, source: &str, edit: PermissionEdit) -> Result<()> {
-        let document = parse_permission_document(source)?;
+    /// Install `document` in memory and on disk while the caller holds the writer lock.
+    ///
+    /// `disk` is the document read under that lock. Equivalent documents keep compiled identity,
+    /// even when disk formatting changed. An approved allow keeps the revocation epoch only when
+    /// it extended exactly the policy this store already enforced; when another process changed
+    /// the file, the merged result may be stricter, so captured callbacks are revoked.
+    fn commit(
+        &mut self,
+        document: PermissionDocument,
+        disk: Option<PermissionDocument>,
+        edit: PermissionEdit,
+    ) -> Result<()> {
         let source = serialize_permission_document(&document)?;
+        let disk_matches = disk.as_ref() == Some(&document)
+            && fs::read_to_string(&self.path).ok().as_deref() == Some(source.as_str());
+        if !disk_matches {
+            atomic_write(&self.path, &source)?;
+        }
         if source == self.source {
-            if fs::read_to_string(&self.path).ok().as_deref() != Some(source.as_str()) {
-                atomic_write(&self.path, &source)?;
-            }
             return Ok(());
         }
+        let extends_enforced = disk.as_ref() == Some(&self.compiled.document);
         let epoch = match edit {
-            PermissionEdit::Replacement => PermissionRevocationEpoch(Arc::new(())),
-            PermissionEdit::ApprovedAllow => self.revocation_epoch.clone(),
+            PermissionEdit::ApprovedAllow if extends_enforced => self.revocation_epoch.clone(),
+            PermissionEdit::ApprovedAllow | PermissionEdit::Replacement => {
+                PermissionRevocationEpoch(Arc::new(()))
+            }
         };
-        let compiled = Arc::new(CompiledPermissionDocument::compile(
+        self.compiled = Arc::new(CompiledPermissionDocument::compile(
             document,
             &self.workspace,
         ));
-        atomic_write(&self.path, &source)?;
         self.source = source;
-        self.compiled = compiled;
         self.revocation_epoch = epoch;
         Ok(())
+    }
+
+    /// Apply exact rules to the document currently on disk, so rules saved by another editor
+    /// sharing the file survive, and install the merged result.
+    fn merge_rules(
+        &mut self,
+        rule_list: &[(String, String, PermissionDecision)],
+        edit: PermissionEdit,
+    ) -> Result<()> {
+        let _writer = permission_writer_lock(&self.path)?;
+        let disk = read_disk_document(&self.path)?;
+        let mut document = disk
+            .clone()
+            .unwrap_or_else(|| self.compiled.document.clone());
+        for (category, pattern, decision) in rule_list {
+            set_permission_rule(&mut document, category, pattern, *decision)?;
+        }
+        self.commit(document, disk, edit)
     }
 
     /// Commit allow-only rules from a validated approval without revoking stricter captured policies.
@@ -110,14 +149,7 @@ impl PermissionStore {
                     .all(|(_, _, decision)| *decision == PermissionDecision::Allow),
             "approved permission grant must contain only allow decisions"
         );
-        let mut document = self.compiled.document.clone();
-        for (category, pattern, decision) in rules {
-            set_permission_rule(&mut document, category, pattern, *decision)?;
-        }
-        self.save_policy(
-            &serialize_permission_document(&document)?,
-            PermissionEdit::ApprovedAllow,
-        )
+        self.merge_rules(rules, PermissionEdit::ApprovedAllow)
     }
 
     pub(crate) fn revocation_epoch(&self) -> PermissionRevocationEpoch {
@@ -128,11 +160,7 @@ impl PermissionStore {
         &mut self,
         rule_list: &[(String, String, PermissionDecision)],
     ) -> Result<()> {
-        let mut document: PermissionDocument = self.compiled.document.clone();
-        for (category, pattern, decision) in rule_list {
-            set_permission_rule(&mut document, category, pattern, *decision)?;
-        }
-        self.save(&serialize_permission_document(&document)?)
+        self.merge_rules(rule_list, PermissionEdit::Replacement)
     }
 
     pub fn compiled(&self) -> Arc<CompiledPermissionDocument> {
@@ -174,29 +202,165 @@ impl PermissionStore {
     }
 }
 
+/// Serialize read-merge-write cycles across every host that shares the permission document.
+///
+/// The lock file sits beside the document rather than replacing it, because the document itself
+/// is swapped by rename and a lock on a renamed-away inode would exclude nobody.
+fn permission_writer_lock(path: &Path) -> Result<fs::File> {
+    crate::storage::exclusive_file_lock(
+        &path.with_extension("json.lock"),
+        "permission document writer",
+    )
+}
+
+/// Read and validate the document on disk, or `None` when no document exists yet.
+///
+/// An invalid document is an error rather than an absent one, so a hand-edited file with a
+/// mistake is reported and never overwritten by a merge.
+fn read_disk_document(path: &Path) -> Result<Option<PermissionDocument>> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read permission document {}", path.display()));
+        }
+    };
+    parse_permission_document(&source)
+        .map(Some)
+        .with_context(|| format!("validate permission document {}", path.display()))
+}
+
+/// Replace the document with one rename, so a concurrent reader sees either the old or the new
+/// document and never a missing file. Both platforms' `rename` replace an existing destination.
 fn atomic_write(path: &Path, source: &str) -> Result<()> {
     let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let backup = path.with_extension(format!("json.{}.bak", std::process::id()));
-    fs::write(&temporary, source).with_context(|| {
-        format!(
-            "write temporary permission document {}",
-            temporary.display()
-        )
-    })?;
-    if path.exists() {
-        fs::rename(path, &backup)
-            .with_context(|| format!("backup permission document {}", path.display()))?;
+    let write_temporary = || -> std::io::Result<()> {
+        let mut file = fs::File::create(&temporary)?;
+        std::io::Write::write_all(&mut file, source.as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(error) = write_temporary() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "write temporary permission document {}",
+                temporary.display()
+            )
+        });
     }
     if let Err(error) = fs::rename(&temporary, path) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, path);
-        }
+        let _ = fs::remove_file(&temporary);
         return Err(error)
             .with_context(|| format!("replace permission document {}", path.display()));
     }
-    if backup.exists() {
-        fs::remove_file(&backup)
-            .with_context(|| format!("remove permission backup {}", backup.display()))?;
-    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::document::{CATEGORY_BASH, CATEGORY_TOOL};
+
+    fn rule(
+        category: &str,
+        pattern: &str,
+        decision: PermissionDecision,
+    ) -> (String, String, PermissionDecision) {
+        (category.into(), pattern.into(), decision)
+    }
+
+    fn disk_rule(path: &Path, category: &str, pattern: &str) -> Option<PermissionDecision> {
+        read_disk_document(path)
+            .unwrap()
+            .unwrap()
+            .permission
+            .get(category)
+            .and_then(|rule_map| rule_map.get(pattern))
+            .copied()
+    }
+
+    /// Two hosts sharing one document keep each other's grants instead of saving private snapshots.
+    #[test]
+    fn grants_from_two_hosts_merge_into_the_shared_document() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("permissions.json");
+        let mut first_host = PermissionStore::load(&path, directory.path())?;
+        let mut second_host = PermissionStore::load(&path, directory.path())?;
+
+        first_host.grant_approved(&[rule(CATEGORY_TOOL, "first", PermissionDecision::Allow)])?;
+        second_host.grant_approved(&[rule(CATEGORY_TOOL, "second", PermissionDecision::Allow)])?;
+
+        assert_eq!(
+            disk_rule(&path, CATEGORY_TOOL, "first"),
+            Some(PermissionDecision::Allow)
+        );
+        assert_eq!(
+            disk_rule(&path, CATEGORY_TOOL, "second"),
+            Some(PermissionDecision::Allow)
+        );
+        assert_eq!(
+            second_host.compiled().document.permission[CATEGORY_TOOL].get("first"),
+            Some(&PermissionDecision::Allow)
+        );
+        Ok(())
+    }
+
+    /// A rule tightened to deny by one host is not resurrected by another host's later grant, and
+    /// the grant revokes captured authority because the enforced policy became stricter.
+    #[test]
+    fn a_denial_saved_by_another_host_survives_a_later_grant() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("permissions.json");
+        let mut first_host = PermissionStore::load(&path, directory.path())?;
+        let mut second_host = PermissionStore::load(&path, directory.path())?;
+        first_host.set_rule_list(&[rule(CATEGORY_BASH, "git push", PermissionDecision::Allow)])?;
+        second_host.set_rule_list(&[rule(CATEGORY_BASH, "cargo", PermissionDecision::Allow)])?;
+        first_host.set_rule_list(&[rule(CATEGORY_BASH, "git push", PermissionDecision::Deny)])?;
+        let epoch_before_grant = second_host.revocation_epoch();
+
+        second_host.grant_approved(&[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)])?;
+
+        assert_eq!(
+            disk_rule(&path, CATEGORY_BASH, "git push"),
+            Some(PermissionDecision::Deny)
+        );
+        assert_eq!(
+            disk_rule(&path, CATEGORY_BASH, "cargo"),
+            Some(PermissionDecision::Allow)
+        );
+        assert!(second_host.revocation_epoch() != epoch_before_grant);
+        Ok(())
+    }
+
+    /// A grant that only extends the enforced policy keeps captured callbacks valid.
+    #[test]
+    fn an_uncontended_grant_keeps_the_revocation_epoch() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("permissions.json");
+        let mut store = PermissionStore::load(&path, directory.path())?;
+        let epoch_before_grant = store.revocation_epoch();
+
+        store.grant_approved(&[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)])?;
+
+        assert!(store.revocation_epoch() == epoch_before_grant);
+        Ok(())
+    }
+
+    /// An invalid hand-edited document is reported, never replaced by a merged snapshot.
+    #[test]
+    fn a_merge_refuses_to_overwrite_an_invalid_document() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("permissions.json");
+        let mut store = PermissionStore::load(&path, directory.path())?;
+        fs::write(&path, "{ not json")?;
+
+        let failure = store
+            .grant_approved(&[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)])
+            .unwrap_err();
+
+        assert!(format!("{failure:#}").contains("validate permission document"));
+        assert_eq!(fs::read_to_string(&path)?, "{ not json");
+        Ok(())
+    }
 }

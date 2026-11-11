@@ -20,7 +20,11 @@ function M.start(state, prompt, completed)
   local restore = function() return false end
   if context and context.is_current() and vim.api.nvim_buf_is_valid(context.buffer)
     and (prompt.changedtick == nil or prompt.changedtick == vim.api.nvim_buf_get_changedtick(context.buffer)) then
-    restore = require("forge.views.harness.composer_draft").take(context.buffer, assert(source), attachments, context.is_current)
+    -- An active queue edit shows a queued message's text in the composer, so even an empty edit
+    -- belongs to that message rather than to the submitted draft.
+    local function composer_owns_draft() return context.is_current() and not state.queue_edit end
+    restore = require("forge.views.harness.composer_draft").take(context.buffer, assert(source), attachments,
+      composer_owns_draft)
   end
   input_state.submit(state, text, attachments, "auto", nil, function(failure)
     if failure then restore() end

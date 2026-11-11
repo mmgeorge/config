@@ -113,7 +113,7 @@ local function picker_host(state)
     actions[#actions + 1] = {
       key = key, modes = { "n", "i" }, desc = "Interrupt Harness task", input = true, label = "interrupt",
       callback = function()
-        picker.close(true)
+        picker.close(true, "user")
         if session.harness == state then cancel_exchange(state) end
       end,
     }
@@ -391,12 +391,22 @@ local function schedule_render()
   if state.render_pending then return end
   state.render_pending = true
   vim.schedule(function()
-    local active_state = session.harness
-    session.activate_harness(state)
     state.render_pending = false
-    M.render()
-    if active_state ~= state then session.activate_harness(active_state) end
+    M.with_state(state, M.render)
   end)
+end
+
+---Render the Harness view whose transcript window is `window`, such as after a session preview
+---returns that window to its transcript. Rendering skips the transcript while a preview covers it,
+---so a snapshot that arrived during the preview is presented only by this call.
+---@param window integer
+function M.render_window(window)
+  local owner
+  if session.harness.transcript_win == window then owner = session.harness end
+  for _, candidate in pairs(session.harness_by_id) do
+    if not owner and candidate.transcript_win == window then owner = candidate end
+  end
+  if owner then M.with_state(owner, M.render) end
 end
 
 local function remove_approval(state, approval_id)
@@ -425,21 +435,75 @@ local function reconcile_approval_presentation(state)
   state.presented_approval_id = nil
 end
 
+---Delays before the first, second, and third retry of a failed `session.state.get`. A read that
+---still fails after the third retry leaves its failure visible until a later read succeeds.
+M.state_sync_retry_delays_ms = { 1000, 2000, 4000 }
+
+---Answer every caller waiting on a state read of `target`, exactly once.
+---@param target table
+---@param result? table
+---@param failure? string
+function M.settle_state_sync(target, result, failure)
+  local callbacks = target.state_sync_callback or {}
+  target.state_sync_callback = nil
+  for _, completed in ipairs(callbacks) do completed(result, failure) end
+end
+
+---Run `action` with `target` as the active Harness state and restore the previous selection, even
+---when `action` raises. Callbacks that complete for a background tab use this so that code reading
+---the active state acts on the tab that issued the request.
+---@param target table
+---@param action fun()
+function M.with_state(target, action)
+  local active_state = session.harness
+  session.activate_harness(target)
+  local ok, failure = xpcall(action, debug.traceback)
+  if session.harness == target and active_state ~= target then session.activate_harness(active_state) end
+  if not ok then error(failure, 0) end
+end
+
+---Retry a failed state read of `target` after the next delay in `state_sync_retry_delays_ms`.
+---@param target table
+---@param session_id string
+function M.schedule_state_sync_retry(target, session_id)
+  local retry = target.state_sync_retry
+  if not retry or retry.session_id ~= session_id then
+    retry = { session_id = session_id, attempt = 0 }
+    target.state_sync_retry = retry
+  end
+  retry.attempt = retry.attempt + 1
+  local delay = M.state_sync_retry_delays_ms[retry.attempt]
+  if not delay then return end
+  local attempt = retry.attempt
+  vim.defer_fn(function()
+    if target.state_sync_retry ~= retry or retry.attempt ~= attempt or target.host_error
+      or not target.session or target.session.id ~= session_id then return end
+    M.synchronize_state(nil, target)
+  end, delay)
+end
+
 ---@param callback? fun(result?: table, failure?: string)
 ---@param target_state? table
 local function synchronize_state(callback, target_state)
   local synchronized_state = target_state or harness_state()
   local synchronized_session = synchronized_state.session and synchronized_state.session.id
   local synchronized_generation = client.host_get_generation()
-  if synchronized_state.host_error then M.render() return end
   if callback then
     synchronized_state.state_sync_callback = synchronized_state.state_sync_callback or {}
     table.insert(synchronized_state.state_sync_callback, callback)
   end
-  if synchronized_state.state_sync_pending then
+  if synchronized_state.host_error then
+    M.settle_state_sync(synchronized_state, nil, synchronized_state.host_error)
+    M.render()
     return
   end
-  local observation = {}
+  -- One read is in flight per session and host. A read issued for an earlier session of this view
+  -- does not satisfy the current one, so an in-place session switch supersedes it.
+  local pending = synchronized_state.state_sync_pending
+  if pending and pending.session_id == synchronized_session and pending.host_generation == synchronized_generation then
+    return
+  end
+  local observation = { session_id = synchronized_session, host_generation = synchronized_generation }
   synchronized_state.state_sync_pending = observation
   local invalidation = synchronized_state.state_invalidation or 0
   client.request({ session_id = synchronized_session, method = "session.state.get", params = {
@@ -448,7 +512,16 @@ local function synchronize_state(callback, target_state)
     if synchronized_state.state_sync_pending ~= observation then return end
     synchronized_state.state_sync_pending = nil
     if client.host_get_generation() ~= synchronized_generation or not synchronized_state.session
-      or synchronized_state.session.id ~= synchronized_session then return end
+      or synchronized_state.session.id ~= synchronized_session then
+      -- The view now shows another session or host, and no read was issued for it since. Read
+      -- the current one so its reconciliation still runs and waiting callers are answered.
+      if synchronized_state.session and not synchronized_state.host_error then
+        vim.schedule(function() synchronize_state(nil, synchronized_state) end)
+      else
+        M.settle_state_sync(synchronized_state, nil, "Harness session changed before its state arrived")
+      end
+      return
+    end
     if result and invalidation ~= (synchronized_state.state_invalidation or 0) then
       vim.schedule(function() synchronize_state(nil, synchronized_state) end)
       return
@@ -457,9 +530,7 @@ local function synchronize_state(callback, target_state)
       local failure = "Snapshot belongs to another conversation"
       diagnostic.set(synchronized_state, "sync_error", failure,
         { owner = synchronized_session, category = "protocol", severity = "error", recovery = "reconnect" })
-      local callbacks = synchronized_state.state_sync_callback or {}
-      synchronized_state.state_sync_callback = nil
-      for _, completed in ipairs(callbacks) do completed(nil, failure) end
+      M.settle_state_sync(synchronized_state, nil, failure)
       if harness_state() == synchronized_state then M.render() end
       return
     end
@@ -483,17 +554,21 @@ local function synchronize_state(callback, target_state)
         { owner = synchronized_session, category = "snapshot", recovery = "retry",
           severity = (not request_error or error_detail and code ~= "not_admitted" and code ~= "outcome_unknown") and "error" or "info" })
       if harness_state() == synchronized_state then M.render() end
-      local callbacks = synchronized_state.state_sync_callback or {}
-      synchronized_state.state_sync_callback = nil
-      for _, completed in ipairs(callbacks) do completed(nil, failure) end
+      M.schedule_state_sync_retry(synchronized_state, synchronized_session)
+      M.settle_state_sync(synchronized_state, nil, failure)
       return
     end
     diagnostic.set(synchronized_state, "sync_error", nil)
+    synchronized_state.state_sync_retry = nil
     local state = synchronized_state
     snapshot.apply(state, result)
     if state.input and (state.input.runtime_epoch ~= state.runtime_epoch
       or state.input.host_generation ~= client.host_get_generation()) then input_state.refresh(state) end
-    if harness_state() ~= state then state.state_sync_callback = nil return end
+    if harness_state() ~= state then
+      -- A background tab adopts the snapshot but leaves its presentation to its next activation.
+      M.settle_state_sync(state, result, nil)
+      return
+    end
     M.attach_transcript(state.transcript_buf)
     require("forge.views.harness.agent_picker").refresh()
     reconcile_approval_presentation(state)
@@ -505,14 +580,12 @@ local function synchronize_state(callback, target_state)
       end
       vim.schedule(function() M.present_plan_question(false) end)
     end
-    if #state.approval > 0 then vim.schedule(M.present_approval) end
+    if #state.approval > 0 then vim.schedule(function() M.present_approval(false, state) end) end
     M.render()
     if result.owner_publication then
       if result.owner_publication.more then return end
     end
-    local callbacks = synchronized_state.state_sync_callback or {}
-    synchronized_state.state_sync_callback = nil
-  for _, completed in ipairs(callbacks) do completed(result, nil) end
+    M.settle_state_sync(synchronized_state, result, nil)
   end)
 end
 
@@ -533,8 +606,11 @@ local function on_event(event, payload)
   -- Snapshot adoption keeps prior usage whenever a snapshot omits it, so the stale
   -- figure must be dropped here or it would outlive the rollback.
   if event == "interaction_rolled_back" and state.session then state.session.context_usage = nil end
+  -- A `document_changed` patch does not invalidate a state read: the read's `timeline_revision`
+  -- comparison already rejects a snapshot older than the patch. Counting it would discard and
+  -- reissue every read that overlaps a streamed patch.
   local changes_session = event ~= "provider_event" and event ~= "input_changed"
-    and event ~= "activity_changed" and event ~= "command_completed"
+    and event ~= "activity_changed" and event ~= "command_completed" and event ~= "document_changed"
   if event == "provider_event" then
     changes_session = payload.kind == "runtime_resolved" or payload.kind == "context_usage"
       or payload.kind == "approval_requested" or payload.kind == "approval_resolved"
@@ -553,7 +629,8 @@ local function on_event(event, payload)
       { owner = tostring(client.host_get_generation()), category = "host", severity = payload.expected and "info" or "error",
         recovery = "reconnect", clear_when = "new host generation" })
     state.execution_notice = payload.message .. ". Reopen Harness to reconnect."
-    state.state_sync_pending, state.state_sync_callback = nil, nil
+    state.state_sync_pending, state.state_sync_retry = nil, nil
+    M.settle_state_sync(state, nil, payload.message)
     state.approval, state.active_wait, state.dismissed_approval_id = {}, nil, nil
     state.ready = false
     if state.presentation and state.presentation.terminals then state.presentation.terminals.close() end
@@ -568,6 +645,11 @@ local function on_event(event, payload)
   end
   if event == "document_changed" then
     if payload.session_id ~= (state.session and state.session.id) then return end
+    -- Timeline revisions restart with each runtime epoch, so a patch published by an earlier
+    -- epoch or host would raise the revision floor above every read of the current one. The
+    -- host does not stamp these fields on `document_changed` yet; the check applies once it does.
+    if payload.runtime_epoch ~= nil and payload.runtime_epoch ~= state.runtime_epoch then return end
+    if payload.host_generation ~= nil and payload.host_generation ~= client.host_get_generation() then return end
     if payload.revision < (state.timeline_revision or 0) then return end
     state.timeline_revision = payload.revision
     if payload.status then state.status = payload.status end
@@ -609,14 +691,14 @@ local function on_event(event, payload)
       end
       M.refresh_winbar()
       render_status_hint(state)
-      vim.schedule(M.present_approval)
+      vim.schedule(function() M.present_approval(false, state) end)
     elseif payload.kind == "approval_resolved" or payload.kind == "approval_cancelled" then
       local request = payload.data or payload
       remove_approval(state, request.request_id)
       reconcile_approval_presentation(state)
       M.refresh_winbar()
       render_status_hint(state)
-      if #state.approval > 0 then vim.schedule(M.present_approval) end
+      if #state.approval > 0 then vim.schedule(function() M.present_approval(false, state) end) end
     elseif payload.kind == "agent_updated" then
       state.agent = vim.deepcopy(payload.data or payload)
       require("forge.views.harness.agent_picker").refresh()
@@ -721,15 +803,20 @@ local function on_event(event, payload)
   end
 end
 
+---Show the first pending approval of `target_state`, or of the active state.
+---
+---The view's windows may be gone, for example after `q` closed the tab while the session kept its
+---event subscription. Presentation then waits: the flags stay clear, so reopening the view
+---presents the approval through `activate_snapshot`.
 ---@param reopen? boolean
-function M.present_approval(reopen)
-  local state = harness_state()
+---@param target_state? table
+function M.present_approval(reopen, target_state)
+  local state = target_state or harness_state()
   local request = state.approval and state.approval[1]
   if state.approval_open or not request then return end
   if not reopen and state.dismissed_approval_id == request.request_id then return end
-  state.dismissed_approval_id = nil
-  state.approval_open = true
-  state.presented_approval_id = request.request_id
+  local host = picker_host(state)
+  if #host.window_list == 0 then return end
   local owner = type(request.execution_owner) == "table" and request.execution_owner or nil
   local child_id = owner and owner.agent_id ~= (state.session.primary_agent_id or (state.session.id .. ":agent:primary"))
     and owner.agent_id or nil
@@ -740,15 +827,15 @@ function M.present_approval(reopen)
     local provider = request.provider
     owner_label = "Agent " .. name .. (provider and (" · " .. provider) or "")
   end
-  require("forge.views.harness.approval").open(request, {
+  local approval_host = {
     owner_label = owner_label,
     interrupt = function()
-      if child_id then M.agent_action("interrupt", child_id)
+      if child_id then M.with_state(state, function() M.agent_action("interrupt", child_id) end)
       else cancel_exchange(state) end
     end,
     transcript_win = state.transcript_win,
-    window_list = picker_host(state).window_list,
-    control_win = picker_host(state).control_win,
+    window_list = host.window_list,
+    control_win = host.control_win,
     resolve = function(approval_id, answer_list, callback)
       client.request({ session_id = state.session.id, method = "session.approval.resolve", params = {
         approval_id = approval_id,
@@ -756,22 +843,41 @@ function M.present_approval(reopen)
       } }, function(_, request_error)
         if request_error then
           notifications.error(request_error, "Harness approval")
-          synchronize_state()
+          synchronize_state(nil, state)
           callback(false)
           return
         end
         callback(true)
       end)
     end,
-    closed = function()
+    ---@param reason? "user"|"programmatic"
+    closed = function(reason)
       state.approval_open = false
       state.presented_approval_id = nil
-      state.dismissed_approval_id = vim.iter(state.approval or {}):any(function(approval)
+      local still_pending = vim.iter(state.approval or {}):any(function(approval)
         return approval.request_id == request.request_id
-      end) and request.request_id or nil
-      M.refresh_winbar()
+      end)
+      if reason == "user" then
+        -- Only the user's own close hides the approval until they reopen it.
+        state.dismissed_approval_id = still_pending and request.request_id or nil
+      elseif still_pending then
+        -- Another picker replaced the popup, so the approval returns once no picker is open.
+        vim.schedule(function()
+          picker.when_idle(function() M.present_approval(false, state) end)
+        end)
+      end
+      if harness_state() == state then M.refresh_winbar() end
     end,
-  })
+  }
+  local opened, failure = pcall(require("forge.views.harness.approval").open, request, approval_host)
+  if not opened then
+    notifications.error("Cannot show the Harness approval: " .. tostring(failure), "Harness approval")
+    return
+  end
+  -- The flags follow a successful open, so a failed presentation never blocks a later one.
+  state.dismissed_approval_id = nil
+  state.approval_open = true
+  state.presented_approval_id = request.request_id
 end
 
 ---@param force? boolean
@@ -790,9 +896,12 @@ function M.present_plan_question(force)
     draft = nil
   end
   if not force and not question_presentation.should_present(state) then return end
+  local host = picker_host(state)
+  -- A view closed with `q` keeps its subscription but has no window to anchor the picker; the
+  -- question stays unpresented until the view reopens.
+  if #host.window_list == 0 then return end
   question_presentation.mark_presented(state)
   state.plan_question_open = true
-  local host = picker_host(state)
   require("forge.views.harness.plan_question").open(elicitation, {
     picker_host = host,
     transcript_win = state.transcript_win,
@@ -836,12 +945,13 @@ function M.present_plan_question(force)
       input_state.submit(state, params.text, {}, "auto", nil, function(failure)
         if not failure and state.question_draft == pending_draft then state.question_draft = nil end
         question_presentation.reset(state)
+        -- The clarification suppresses plan-question popups only until this read settles, whether
+        -- it succeeds or not; a failed read must not disable the popups for the session's life.
         synchronize_state(function(_, sync_failure)
-          if not sync_failure and state.question_clarification == pending_draft then
-            state.question_clarification = nil
-            M.present_plan_question(false)
-          end
-        end)
+          if state.question_clarification ~= pending_draft then return end
+          state.question_clarification = nil
+          if not sync_failure then M.with_state(state, function() M.present_plan_question(false) end) end
+        end, state)
       end, nil, vim.tbl_extend("force", question_target, { question_id = params.question_id }))
     end,
     pending = function()
@@ -1100,9 +1210,29 @@ end
 ---@field state "complete"|"failed"|"cancelled"
 ---@field checkpoint_before string
 
+---Put `text` in the composer and focus it for an immediate follow-up.
+---
+---`composer_free`, from `composer_draft.observe`, marks a restoration that completes long after the
+---user acted, such as a rollback: it then writes only into a composer that holds no newer work,
+---and moves the cursor only when the composer is already the current window, so a user who moved
+---on keeps both their text and their window.
 ---@param text string
-local function restore_composer_prompt(text)
+---@param composer_free? fun(): boolean
+---@return boolean restored
+local function restore_composer_prompt(text, composer_free)
   local state = harness_state()
+  if composer_free then
+    if not composer_free() then return false end
+    set_composer_text(state.composer_buf, text)
+    if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+      layout.resize_composer(state.composer_buf, state.composer_win)
+      if vim.api.nvim_get_current_win() == state.composer_win then
+        local line_list = vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)
+        vim.api.nvim_win_set_cursor(state.composer_win, { math.max(1, #line_list), #(line_list[#line_list] or "") })
+      end
+    end
+    return true
+  end
   set_composer_text(state.composer_buf, text)
   layout.resize_composer(state.composer_buf, state.composer_win)
   vim.schedule(function()
@@ -1117,6 +1247,7 @@ local function restore_composer_prompt(text)
     vim.api.nvim_win_set_cursor(state.composer_win, { math.max(1, #line_list), #last_line })
     vim.cmd("startinsert!")
   end)
+  return true
 end
 
 ---@param preview table
@@ -1150,10 +1281,19 @@ local function confirm_restore_preview(preview, interaction)
     if state.restore_applying or activity.busy(state) then return end
     local operation = {}
     state.restore_applying = operation
+    local composer_free = state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
+      and require("forge.views.harness.composer_draft").observe(state.composer_buf) or function() return false end
     client.request({ session_id = session_id, method = "session.exchange.rollback.apply", params = { preview_id = preview.preview_id } }, function(_, err)
-      if not current() or state.restore_applying ~= operation then return end
+      if state.restore_applying ~= operation then return end
       state.restore_applying = nil
-      synchronize_state()
+      if not (state.session and state.session.id == session_id and client.host_get_generation() == generation) then return end
+      synchronize_state(nil, state)
+      if harness_state() ~= state then
+        if not err and interaction then
+          M.with_state(state, function() M.restore_rolled_back_prompt(interaction, composer_free) end)
+        end
+        return
+      end
       if err then
         notifications.error(err, "Harness undo")
         if err:find("preview is stale", 1, true) and interaction then
@@ -1165,7 +1305,7 @@ local function confirm_restore_preview(preview, interaction)
         end
         return
       end
-      if interaction then M.restore_rolled_back_prompt(interaction) end
+      if interaction then M.restore_rolled_back_prompt(interaction, composer_free) end
     end)
   end)
 end
@@ -1173,10 +1313,18 @@ end
 ---Return a rolled-back exchange's input to the composer when the user wrote it. A task start or
 ---continuation carries Harness-authored instructions, which the user never typed and the next
 ---task transition regenerates, so the composer stays untouched for those exchanges.
+---
+---A native rewind can take seconds, so `composer_free` (from `composer_draft.observe` when the user
+---confirmed the rollback) keeps the prompt out of a composer that now holds newer work.
 ---@param interaction ForgeRollbackInteraction
-function M.restore_rolled_back_prompt(interaction)
+---@param composer_free? fun(): boolean
+function M.restore_rolled_back_prompt(interaction, composer_free)
   if require("forge.render.harness.interaction_tree").host_authored_notice(interaction) then return end
-  restore_composer_prompt(interaction.prompt or "")
+  if not restore_composer_prompt(interaction.prompt or "", composer_free) and composer_free
+    and (interaction.prompt or "") ~= "" then
+    notifications.warn("The rolled-back prompt was not restored because the composer holds newer text",
+      "Harness undo")
+  end
 end
 
 ---@param interaction ForgeRollbackInteraction
@@ -1208,14 +1356,16 @@ local function confirm_rollback(interaction, latest_exchange_id)
     if choice ~= "conversation" then return end
     local operation = {}
     state.restore_applying = operation
+    local composer_free = state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
+      and require("forge.views.harness.composer_draft").observe(state.composer_buf) or function() return false end
     M.task_transition({ action = "undo", rollback = {
       scope = "conversation", exchange_id = interaction.id, latest_exchange_id = latest_exchange_id,
     } }, nil, function(applied)
-      if harness_state() ~= state or not state.session or state.session.id ~= session_id
-        or client.host_get_generation() ~= generation or state.restore_applying ~= operation then return end
+      if state.restore_applying ~= operation then return end
       state.restore_applying = nil
-      if not applied then return end
-      M.restore_rolled_back_prompt(interaction)
+      if not applied or not state.session or state.session.id ~= session_id
+        or client.host_get_generation() ~= generation then return end
+      M.with_state(state, function() M.restore_rolled_back_prompt(interaction, composer_free) end)
     end)
   end)
 end
@@ -1321,17 +1471,31 @@ end
 ---@param selector string
 function M.select_agent(selector)
   local state = harness_state()
-  if selector:lower() == "main" then
-    state.selected_agent_run_id = nil
-  else
+  local previous_run_id = state.selected_agent_run_id
+  local target_run_id
+  if selector:lower() ~= "main" then
     local run, resolve_error = require("forge.views.harness.agent_catalog").resolve(state, selector)
     if not run then
       notifications.warn(resolve_error or ("No child agent matches " .. selector), "Harness agent")
       return
     end
-    state.selected_agent_run_id = run.id
+    target_run_id = run.id
   end
-  if state.presentation then state.presentation.select_agent(state.selected_agent_run_id) end
+  state.selected_agent_run_id = target_run_id
+  -- Composer input goes to the selected timeline, so a selection the presentation failed to show
+  -- reverts: otherwise Ctrl-S would address a child under a transcript still showing Main. The
+  -- presentation reports that failure through this callback, as a failure string or as `false`
+  -- followed by one, or by returning a failure string.
+  local function selection_settled(outcome, detail)
+    local failure = type(outcome) == "string" and outcome or (outcome == false and (detail or true)) or nil
+    if not failure or state.selected_agent_run_id ~= target_run_id then return end
+    state.selected_agent_run_id = previous_run_id
+    M.with_state(state, M.render)
+  end
+  if state.presentation then
+    local immediate = state.presentation.select_agent(target_run_id, selection_settled)
+    if type(immediate) == "string" then selection_settled(immediate) end
+  end
   M.render()
 end
 
@@ -1361,12 +1525,24 @@ function M.agent_action(action, run_id, message)
     if not message or message:match("^%s*$") then return end
   end
   local method = action == "message" and "session.agent.message.send" or "session.agent." .. action
+  -- A message typed in the composer leaves it at submission, as a root prompt does, so a second
+  -- submit before the reply finds an empty composer instead of sending the message again.
+  local restore_draft = function() return false end
+  local buffer = state.composer_buf
+  if message and not state.queue_edit and buffer and vim.api.nvim_buf_is_valid(buffer)
+    and composer_text(buffer) == message then
+    dismiss_composer_completion(buffer)
+    restore_draft = require("forge.views.harness.composer_draft").take(buffer,
+      vim.api.nvim_buf_get_lines(buffer, 0, -1, false), attachment.capture(buffer).attachments,
+      function() return state.composer_buf == buffer and not state.queue_edit end)
+  end
   client.request({ session_id = state.session.id, method = method, params = params }, function(_, failure)
-    if failure then notifications.error(failure, "Harness child " .. action) return end
-    if message and not state.queue_edit and composer_text(state.composer_buf) == message then
-      set_composer_text(state.composer_buf, "")
+    if failure then
+      restore_draft()
+      notifications.error(failure, "Harness child " .. action)
+      return
     end
-    synchronize_state()
+    synchronize_state(nil, state)
   end)
 end
 
@@ -2288,7 +2464,7 @@ function M.activate_snapshot(result, options)
       state.presented_question_key = nil
       vim.schedule(M.present_plan_question)
     end
-    if #state.approval > 0 then vim.schedule(M.present_approval) end
+    if #state.approval > 0 then vim.schedule(function() M.present_approval(false, state) end) end
   end
 end
 

@@ -790,7 +790,7 @@ impl HostRouter {
                             .await?;
                         let serialization_started = std::time::Instant::now();
                         let result = serde_json::to_value(snapshot)?;
-                        sink.send(Message::RequestEvent(RequestEvent {
+                        sink.send_progress(Message::RequestEvent(RequestEvent {
                             request_id: request.id,
                             event: forge_protocol::contract::RequestEventName::RepositoryStatusDocumentProgress.as_str().into(),
                             payload: json!({
@@ -1110,10 +1110,7 @@ impl HostRouter {
             RoutedMethod::GithubReviewDocumentClose => {
                 let params: ReviewDocumentParams = serde_json::from_value(request.params)?;
                 self.host.review.close_document(&params.document)?;
-                sink.send(Message::Response(Response::success(
-                    request.id,
-                    json!({"closed":true}),
-                )?))?;
+                send_completed_result(sink, request.id, json!({"closed":true})).await?;
             }
             RoutedMethod::GithubRepositoryMetadata => {
                 let params: MetadataParams = serde_json::from_value(request.params)?;
@@ -1184,11 +1181,11 @@ impl HostRouter {
                         changed = progress.changed(), if observing => {
                             if changed.is_err() { observing = false; continue; }
                             let payload = serde_json::to_value(progress.borrow_and_update().clone())?;
-                            sink.send(Message::RequestEvent(RequestEvent { request_id: request.id, event: forge_protocol::contract::RequestEventName::GithubIssueSyncProgress.as_str().into(), payload }))?;
+                            sink.send_progress(Message::RequestEvent(RequestEvent { request_id: request.id, event: forge_protocol::contract::RequestEventName::GithubIssueSyncProgress.as_str().into(), payload }))?;
                         }
                     }
                 };
-                sink.send(Message::Response(Response::success(request.id, result)?))?;
+                send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::GithubIssueList => {
                 let params: IssueRequest = serde_json::from_value(request.params)?;
@@ -1285,7 +1282,7 @@ impl HostRouter {
                         .await?
                 };
                 let page = revision_page(&repository, &candidates, params.offset)?;
-                sink.send(Message::Response(Response::success(request.id, page)?))?;
+                send_completed_result(sink, request.id, page).await?;
             }
             RoutedMethod::HostShutdown => {
                 anyhow::bail!("shutdown must route through the Forge connection host")

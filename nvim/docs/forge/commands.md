@@ -334,6 +334,10 @@ including linked worktrees and nested repositories. Non-Git paths use the neares
 existing directory. The popup shows the selected root before approval.
 Permission popups, like every Forge picker, close with `q` or `Esc` without
 approving or rejecting the tool; the request stays pending until you decide it.
+A permission popup opens with no decision selected, so an Enter typed into the
+composer just as the popup takes focus decides nothing; choose a decision with its
+key or the arrow keys first. When another picker replaces a pending permission
+popup, the popup returns once that picker closes.
 
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
 two latest prior responses stay open during the current exchange. Submitting another prompt folds
@@ -420,6 +424,8 @@ restore requires recovery first. Rollback rewinds the provider's own conversatio
 requires a provider that supports native rewind (Codex, Copilot, and Claude). With
 Antigravity, `/undo` reports that conversation rollback is unsupported and changes nothing.
 Claude can rewind only to the end of an earlier interaction, not before the first one.
+A completed rollback returns the rolled-back prompt to the composer only when you have not
+typed there since confirming it, and it does not move focus out of another window.
 
 Live status occupies a non-focusable split immediately above the composer. It stays visible
 while the transcript scrolls through history, and disappears when no work, pending
@@ -486,10 +492,12 @@ explicitly queued follow-ups still wait for the active work to finish.
 `Ctrl-C` only interrupts active work. It never submits or steers the composer,
 including while editing a queued message. Drafts and queued follow-ups remain
 unsent while the task is paused. With a child timeline selected, it interrupts
-that child without sending the draft.
+that child without sending the draft. A message or follow-up sent to a selected child
+leaves the composer at once and returns to it only if the child rejects it.
 Interrupting a prompt before the model shows any reply, reasoning, or tool activity
 removes that exchange and returns the prompt to the composer; the provider's echo of
-your own prompt does not count as activity. After visible activity, the exchange stays
+your own prompt does not count as activity. If the composer already holds newer text,
+the prompt stays in the queue as an unsent draft that you can retry or edit instead. After visible activity, the exchange stays
 in history as cancelled.
 When a turn fails in a way that leaves the provider's state unknown, such as a send
 that ends without confirmation, Harness restarts the provider before it runs anything

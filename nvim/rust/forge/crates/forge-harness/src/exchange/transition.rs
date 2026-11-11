@@ -87,7 +87,7 @@ enum TargetCapture {
 /// Keep legacy admission and child resource gates owned until cancellation settles.
 pub(super) struct ControlOwnership {
     control: Option<OwnedSemaphorePermit>,
-    _children: Option<crate::agent::AgentQuiescence>,
+    children: Option<crate::agent::AgentQuiescence>,
 }
 
 /// Retain one command's internal collection purpose, scope, and asynchronous stage.
@@ -291,7 +291,7 @@ impl ExchangeStop {
             };
             let ownership = ControlOwnership {
                 control: Some(control),
-                _children: match child_policy {
+                children: match child_policy {
                     ChildCollectionPolicy::Collect => Some(children.begin_quiescence()),
                     ChildCollectionPolicy::Preserve => None,
                 },
@@ -311,10 +311,7 @@ impl ExchangeStop {
                         operation: crate::agent::AgentOperation::InterruptAll,
                     })
                     .await?;
-                while children.active_count() != 0 {
-                    changed.changed().await?;
-                }
-                Ok::<(), anyhow::Error>(())
+                children_settled(&children, &mut changed).await
             }
             .await;
             match result {
@@ -404,7 +401,7 @@ impl ExchangeStop {
                 self.stage = TransitionStage::Uncertain {
                     _ownership: ControlOwnership {
                         control: None,
-                        _children: match self.intent.children() {
+                        children: match self.intent.children() {
                             ChildCollectionPolicy::Collect => {
                                 Some(services.children.begin_quiescence())
                             }
@@ -709,18 +706,14 @@ impl ExchangeStop {
                 *job = SettlementJob::Advance;
                 let mut events = Vec::new();
                 let action = match event {
-                    TransitionEvent::Initial(result) => {
-                        broker
-                            .apply_prior_initial(prior, result)
-                            .map_err(transition_failure)?;
-                        broker.advance_prior_finalization(prior, &mut events)
-                    }
+                    TransitionEvent::Initial(result) => broker
+                        .apply_prior_initial(prior, result)
+                        .and_then(|()| broker.advance_prior_finalization(prior, &mut events)),
                     TransitionEvent::Final(result) => {
                         broker.apply_prior_final(prior, result.map(|result| *result), &mut events)
                     }
                     TransitionEvent::Observed(result) => {
-                        result.map_err(transition_failure)?;
-                        broker.advance_prior_finalization(prior, &mut events)
+                        result.and_then(|()| broker.advance_prior_finalization(prior, &mut events))
                     }
                     TransitionEvent::AdvanceSettlement => {
                         broker.advance_prior_finalization(prior, &mut events)
@@ -733,8 +726,11 @@ impl ExchangeStop {
                     | TransitionEvent::ForegroundUnavailable => {
                         unreachable!("settlement event was selected exhaustively")
                     }
-                }
-                .map_err(transition_failure)?;
+                };
+                let action = match action {
+                    Ok(action) => action,
+                    Err(error) => return Err(self.abandon_settlement(broker, error)),
+                };
                 match action {
                     PriorFinalizationAction::Ready => {
                         let outcome = broker
@@ -782,6 +778,22 @@ impl ExchangeStop {
                     }
                 }
             }
+        }
+    }
+
+    /// End a failed cancellation settlement and classify its failure for the command.
+    ///
+    /// The settlement holds the host-settlement fence of the exchange it finalizes. Leaving the
+    /// fence after the failure made every later admission and cancel wait for a settlement that
+    /// no owner would advance again.
+    fn abandon_settlement(
+        &mut self,
+        broker: &mut HarnessBroker,
+        error: anyhow::Error,
+    ) -> TransitionFailure {
+        match self.stage.abandon_settlement(broker, &error) {
+            Ok(()) => transition_failure(error),
+            Err(release) => TransitionFailure::Domain(error.context(release)),
         }
     }
 
@@ -845,7 +857,7 @@ impl RetainedTransition {
             stage: TransitionStage::Uncertain {
                 _ownership: ControlOwnership {
                     control,
-                    _children: None,
+                    children: None,
                 },
             },
             intent: StopIntent::Reconfigure {
@@ -930,7 +942,7 @@ impl RetainedTransition {
                         Acquisition::ObservationLost => TransitionStage::Uncertain {
                             _ownership: ControlOwnership {
                                 control: None,
-                                _children: match self.intent.children() {
+                                children: match self.intent.children() {
                                     ChildCollectionPolicy::Collect => {
                                         Some(services.children.begin_quiescence())
                                     }
@@ -995,7 +1007,7 @@ impl RetainedTransition {
                 Acquisition::ObservationLost => TransitionStage::Uncertain {
                     _ownership: ControlOwnership {
                         control: None,
-                        _children: match self.intent.children() {
+                        children: match self.intent.children() {
                             ChildCollectionPolicy::Collect => {
                                 Some(services.children.begin_quiescence())
                             }
@@ -1082,8 +1094,24 @@ impl RetainedTransition {
         }
     }
 
-    /// Release compatibility admission after all owned host jobs have joined.
-    /// Root execution remains closed and child admission remains fenced during recovery.
+    /// Release the prior finalization of a settlement that its failed or overdue command left.
+    ///
+    /// Call this after `drain_host` joined the settlement's job. No owner advances a retained
+    /// settlement again, so its host-settlement fence is released here and the exchange stays
+    /// finalizing with the recorded error, for the next admission to retry.
+    pub(super) fn abandon_settlement(&mut self, broker: &mut HarnessBroker) -> anyhow::Result<()> {
+        self.stage.abandon_settlement(
+            broker,
+            &anyhow::anyhow!("cancellation settlement ended before it finalized the exchange"),
+        )
+    }
+
+    /// Release compatibility admission and child quiescence after all owned host jobs have joined.
+    ///
+    /// The driver keeps a retained transition for the rest of the session as evidence, so any
+    /// guard left here outlives the stop. A held child quiescence parks every later root turn at
+    /// completion behind children that can no longer start. Root execution stays fenced by the
+    /// driver's execution state until the stop reopens it or a provider restart replaces it.
     pub(super) fn release_legacy_control(&mut self) {
         self.generation.take();
         let ownership = match &mut self.stage {
@@ -1100,6 +1128,7 @@ impl RetainedTransition {
             TransitionStage::Acquiring(_) | TransitionStage::Consumed => return,
         };
         ownership.control.take();
+        ownership.children.take();
     }
 
     /// Apply late collection evidence without rewriting the historical failed command result.
@@ -1263,6 +1292,33 @@ enum TransitionStage {
     Consumed,
 }
 
+impl TransitionStage {
+    /// Release a settlement's prior finalization, keeping its ownership as uncertain evidence.
+    ///
+    /// Any other stage holds no finalization fence and is left unchanged.
+    fn abandon_settlement(
+        &mut self,
+        broker: &mut HarnessBroker,
+        error: &anyhow::Error,
+    ) -> anyhow::Result<()> {
+        if !matches!(self, Self::Settling { .. }) {
+            return Ok(());
+        }
+        let Self::Settling {
+            ownership,
+            mut prior,
+            ..
+        } = std::mem::replace(self, Self::Consumed)
+        else {
+            unreachable!("the settlement stage was matched above")
+        };
+        *self = Self::Uncertain {
+            _ownership: ownership,
+        };
+        broker.abort_prior_finalization(&mut prior, error)
+    }
+}
+
 enum SettlementJob {
     Advance,
     Observation(tokio::task::JoinHandle<anyhow::Result<()>>),
@@ -1373,9 +1429,7 @@ async fn collect_resources(
         }
         if matches!(child_policy, ChildCollectionPolicy::Collect) {
             let mut changed = services.children.activity();
-            while services.children.active_count() != 0 {
-                changed.changed().await?;
-            }
+            children_settled(&services.children, &mut changed).await?;
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -1399,6 +1453,29 @@ async fn collect_resources(
     })
 }
 
+/// Wait until every child execution settled, failing once any settled with failed cleanup.
+///
+/// A child whose cleanup failed keeps its execution slot for the retained cleanup obligation, and
+/// no later event removes it, so waiting for the active count to reach zero never ended. Its
+/// failure instead makes the collection uncertain, which restarts the provider.
+async fn children_settled(
+    children: &crate::agent::AgentCoordinator,
+    changed: &mut tokio::sync::watch::Receiver<u64>,
+) -> anyhow::Result<()> {
+    loop {
+        let count = children.collection_count();
+        if count.running == 0 {
+            anyhow::ensure!(
+                count.cleanup_failed == 0,
+                "{} child agent cleanup failed during collection",
+                count.cleanup_failed
+            );
+            return Ok(());
+        }
+        changed.changed().await?;
+    }
+}
+
 /// Normalize an existing host-effect error at the generic collection boundary.
 fn collection_failure(error: anyhow::Error) -> ProviderError {
     let error = crate::provider::lifecycle_error::classify(
@@ -1420,5 +1497,79 @@ fn transition_failure(error: anyhow::Error) -> TransitionFailure {
         TransitionFailure::Uncertain
     } else {
         TransitionFailure::Domain(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agent::{
+        AgentCommit, AgentCoordinator, AgentOperation, AgentRequest, AgentSelection,
+        AgentSettlementDisposition, AgentSource, AgentWork, SpawnAgentRequest,
+    };
+
+    /// Admit and launch one child task in a coordinator with no other work.
+    fn launched_child(coordinator: &AgentCoordinator) -> AgentWork {
+        let spawn = SpawnAgentRequest {
+            profile: Some("review".into()),
+            text: "bounded task".into(),
+        };
+        let request = AgentRequest {
+            operation_id: "collected-child".into(),
+            source: AgentSource::User,
+            operation: AgentOperation::Spawn(spawn.clone()),
+        };
+        let selection = AgentSelection {
+            profile: "worker".into(),
+            instructions: String::new(),
+            provider: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            model: "model".into(),
+            reasoning_effort: "low".into(),
+            context_window: None,
+            service_tier: crate::provider::ServiceTier::Standard,
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+        };
+        let admission = coordinator
+            .reserve_spawn(&request, &spawn, selection, "parent", 1)
+            .expect("an idle coordinator admits one child");
+        match admission.commit().expect("the child admission commits") {
+            AgentCommit::Admitted(work) => work,
+            AgentCommit::Existing(_) => panic!("a new request reused an admission"),
+        }
+    }
+
+    /// End child collection once the only child settled with failed cleanup.
+    ///
+    /// The failed cleanup keeps the child's execution slot, so a collection that waited for the
+    /// active count to reach zero never ended, and a root stop waited on it forever.
+    #[tokio::test(start_paused = true)]
+    async fn child_collection_ends_when_child_cleanup_failed() {
+        let coordinator = AgentCoordinator::new("root".into());
+        let child = launched_child(&coordinator);
+        assert_eq!(coordinator.active_count(), 1);
+        let mut changed = coordinator.activity();
+        let collection = super::children_settled(&coordinator, &mut changed);
+        tokio::pin!(collection);
+        assert!(futures_util::poll!(collection.as_mut()).is_pending());
+        coordinator
+            .settled(
+                &child.agent.id,
+                &child.task.id,
+                AgentSettlementDisposition::CleanupFailed,
+            )
+            .expect("the running child settles");
+        assert_eq!(
+            coordinator.active_count(),
+            1,
+            "failed cleanup keeps the slot"
+        );
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), collection)
+            .await
+            .expect("collection waited on a child whose cleanup failed");
+        assert!(
+            settled.is_err(),
+            "failed child cleanup must leave collection uncertain"
+        );
     }
 }

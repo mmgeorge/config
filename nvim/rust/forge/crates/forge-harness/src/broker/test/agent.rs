@@ -1095,3 +1095,164 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
     assert!(broker.store.list_agent_task(&broker.session.id)?[0].parent_reported);
     Ok(())
 }
+
+/// Start one fixture child and settle it with a retained process cleanup obligation.
+async fn child_with_cleanup_obligation(
+    broker: &mut HarnessBroker,
+    name: &str,
+    event: &mut Vec<super::super::SessionEvent>,
+) -> Result<crate::agent::AgentWork> {
+    let admission = admit_child_fixture(broker, name)?;
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone())?,
+    )
+    .expect("registered session and agent identities are nonempty");
+    broker
+        .observe_child_fixture(
+            owner.clone(),
+            &admission.task.id,
+            child_event(
+                &child_address(&owner, &admission.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
+            event,
+        )
+        .await?;
+    broker
+        .complete_managed_agent(
+            owner,
+            admission.task.id.clone(),
+            Err(anyhow::anyhow!("provider failed")),
+            Vec::new(),
+            Some("native process outlived its turn".into()),
+            event,
+        )
+        .await?;
+    assert!(
+        broker
+            .agent_coordinator
+            .cleanup_task(&admission.agent.id)
+            .is_some()
+    );
+    Ok(admission)
+}
+
+#[tokio::test]
+async fn interrupt_all_retries_every_child_cleanup_after_one_fails() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let mut event = Vec::new();
+    child_with_cleanup_obligation(&mut broker, "cleanup-first", &mut event).await?;
+    child_with_cleanup_obligation(&mut broker, "cleanup-second", &mut event).await?;
+    let ordered = broker
+        .agent_coordinator
+        .snapshot(None)
+        .into_iter()
+        .map(|(agent, _)| agent.id)
+        .collect::<Vec<_>>();
+    let (failing_native, _) = routing_fixture(
+        forge_providers::registry::nonselectable_id()
+            .expect("registry supplies a nonselectable fixture identity"),
+        false,
+    )?;
+    let failing = crate::provider::test_support::ProviderTestSession::from_native(
+        failing_native.fixture().with_shutdown(|| async {
+            Err(crate::provider::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::ThreadClose,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                ),
+            ))
+        }),
+    )?;
+    let (_succeeding_native, succeeding) = routing_fixture(
+        forge_providers::registry::nonselectable_id()
+            .expect("registry supplies a nonselectable fixture identity"),
+        false,
+    )?;
+    broker
+        .child_provider_by_agent
+        .insert(ordered[0].clone(), failing.provider_handle());
+    broker
+        .child_provider_by_agent
+        .insert(ordered[1].clone(), succeeding.provider_handle());
+    let interrupted = broker
+        .handle_agent_request(
+            crate::agent::AgentRequest {
+                operation_id: "interrupt-all".into(),
+                source: crate::agent::AgentSource::User,
+                operation: crate::agent::AgentOperation::InterruptAll,
+            },
+            None,
+            &mut event,
+        )
+        .await;
+    assert!(interrupted.is_err(), "the failed cleanup must be reported");
+    assert!(
+        broker.agent_coordinator.cleanup_task(&ordered[0]).is_some(),
+        "the failed cleanup remains retryable"
+    );
+    assert!(
+        broker.agent_coordinator.cleanup_task(&ordered[1]).is_none(),
+        "a later child's cleanup runs after an earlier one fails"
+    );
+    assert_eq!(
+        broker.agent_coordinator.resolve(&ordered[1])?.state,
+        crate::agent::AgentState::Ready
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn idle_drain_launches_children_queued_for_capacity() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let mut admitted = Vec::new();
+    while admitted
+        .last()
+        .is_none_or(|work: &crate::agent::AgentWork| work.launch)
+    {
+        let name = format!("capacity-{}", admitted.len());
+        admitted.push(admit_child_fixture(&mut broker, &name)?);
+    }
+    let queued = admitted.pop().context("fixture queued no child")?;
+    let running = admitted.len();
+    assert_eq!(broker.agent_coordinator.active_count(), running);
+    let first = &admitted[0];
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(first.agent.id.clone())?,
+    )
+    .expect("registered session and agent identities are nonempty");
+    let mut event = Vec::new();
+    broker
+        .complete_managed_agent(
+            owner,
+            first.task.id.clone(),
+            Err(anyhow::anyhow!("provider failed")),
+            Vec::new(),
+            None,
+            &mut event,
+        )
+        .await?;
+    assert_eq!(broker.agent_coordinator.active_count(), running - 1);
+    let mut drained = Vec::new();
+    while broker.drain_next_agent_command(None, &mut drained).await {}
+    assert_eq!(
+        broker.agent_coordinator.active_count(),
+        running,
+        "the idle drain must launch the child that waited for capacity"
+    );
+    assert!(
+        broker
+            .agent_coordinator
+            .snapshot(None)
+            .into_iter()
+            .any(|(agent, _)| agent.id == queued.agent.id)
+    );
+    Ok(())
+}

@@ -39,6 +39,15 @@ struct ActivityOwnership {
     identical_replays: u64,
 }
 
+/// Choose whether a non-waiting delivery that loses the delivery lock fences the stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryContention {
+    /// The lost event is required observation, so contention records stream loss.
+    Fence,
+    /// The caller fences with its own known cause immediately afterward.
+    Report,
+}
+
 /// Give publication a checked admission result rather than silently repeating replayed effects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObservationAdmission {
@@ -48,17 +57,57 @@ enum ObservationAdmission {
     IdenticalReplay,
 }
 
+/// Retain one item's ownership for the binding's life so late replays are still validated.
+///
+/// The record outlives its turn, because a provider may replay an item's start or completion
+/// after the turn completed, and an identical replay must be acknowledged while a changed one is
+/// rejected. Only fixed-size fingerprints of the start and completion are kept, not their
+/// serialized bodies, so tool output and message text are not held for the binding's life.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ItemOwner {
     thread_id: crate::ThreadId,
     turn_id: crate::TurnId,
     kind: ItemKind,
-    initial: Vec<u8>,
-    completion: Option<Vec<u8>>,
+    initial: ContentFingerprint,
+    completion: Option<ContentFingerprint>,
     background: bool,
     executing: bool,
     classification: Option<crate::MessageClassification>,
 }
+
+/// Identify serialized observation content by length and two independently seeded 64-bit
+/// hashes, without retaining the content.
+///
+/// Fingerprints are compared only within one process, so the standard hasher's lack of a
+/// stable cross-release algorithm does not matter. An accidental collision between a replay
+/// and changed content requires both hashes and the length to agree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContentFingerprint {
+    length: usize,
+    primary: u64,
+    secondary: u64,
+}
+
+impl ContentFingerprint {
+    fn of(encoded: &[u8]) -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let seeded = |seed: u8| {
+            let mut hasher = FINGERPRINT_HASHER.build_hasher();
+            hasher.write_u8(seed);
+            hasher.write(encoded);
+            hasher.finish()
+        };
+        Self {
+            length: encoded.len(),
+            primary: seeded(0),
+            secondary: seeded(1),
+        }
+    }
+}
+
+/// One process-wide hasher state, so every fingerprint of the same content agrees.
+static FINGERPRINT_HASHER: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+    std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ItemKind {
@@ -360,12 +409,15 @@ impl ProviderEventSink {
         let message =
             crate::SanitizedMessage::new("Provider observation or foreground collection failed")
                 .expect("static normalized failure text is sanitized");
-        let _ = self.send(ProviderEvent::Provider {
-            event: crate::ProviderConnectionEvent::Unavailable(crate::ProviderUnavailable {
-                failure,
-                message,
-            }),
-        });
+        let _ = self.send_immediately(
+            ProviderEvent::Provider {
+                event: crate::ProviderConnectionEvent::Unavailable(crate::ProviderUnavailable {
+                    failure,
+                    message,
+                }),
+            },
+            DeliveryContention::Report,
+        );
         self.fail(EventDeliveryError::Observation(observation));
     }
 
@@ -581,8 +633,9 @@ impl ProviderEventSink {
                         crate::ItemStart::FileChange(_) => ItemKind::FileChange,
                         crate::ItemStart::ToolCall(_) => ItemKind::ToolCall,
                     };
-                    let initial =
-                        serde_json::to_vec(start).map_err(EventDeliveryError::transport)?;
+                    let initial = ContentFingerprint::of(
+                        &serde_json::to_vec(start).map_err(EventDeliveryError::transport)?,
+                    );
                     if let Some(previous) = ownership.items.get(item_id) {
                         if previous.thread_id != *thread_id
                             || previous.turn_id != *turn_id
@@ -713,8 +766,9 @@ impl ProviderEventSink {
                     if owner.kind != kind {
                         return Err(invalid());
                     }
-                    let encoded =
-                        serde_json::to_vec(completion).map_err(EventDeliveryError::transport)?;
+                    let encoded = ContentFingerprint::of(
+                        &serde_json::to_vec(completion).map_err(EventDeliveryError::transport)?,
+                    );
                     match &owner.completion {
                         Some(previous) if previous != &encoded => return Err(invalid()),
                         Some(_) => admission = ObservationAdmission::IdenticalReplay,
@@ -812,13 +866,32 @@ impl ProviderEventSink {
     }
 
     /// Deliver a native event and its host observations without waiting for channel capacity.
+    ///
+    /// Losing the delivery lock to a concurrent waiting send loses this event, so it fences the
+    /// stream.
     fn send(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
+        self.send_immediately(event, DeliveryContention::Fence)
+    }
+
+    /// Deliver without waiting; `contention` decides whether losing the delivery lock to a
+    /// concurrent waiting send fences the stream.
+    ///
+    /// A fencing caller that already knows the real cause passes [`DeliveryContention::Report`],
+    /// because the first recorded failure wins and a contended best-effort notice would
+    /// otherwise record `Overflow` in place of that cause.
+    fn send_immediately(
+        &self,
+        event: ProviderEvent,
+        contention: DeliveryContention,
+    ) -> Result<(), EventDeliveryError> {
         self.validate_scope(&event)
             .inspect_err(|error| self.fail(error.clone()))?;
         let _delivery = self.delivery.try_lock().map_err(|_| {
             let error =
                 EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow);
-            self.fail(error.clone());
+            if contention == DeliveryContention::Fence {
+                self.fail(error.clone());
+            }
             error
         })?;
         let admission = self
@@ -1671,6 +1744,21 @@ mod tests {
             }
         ));
         assert!(writer.send_wait(item(completion("changed"))).await.is_err());
+    }
+
+    /// A fence whose best-effort notice loses the delivery lock to a waiting send still
+    /// records its own cause rather than a spurious overflow.
+    #[tokio::test]
+    async fn contended_unavailable_notice_keeps_the_fence_cause() {
+        let (sink, _stream, _address) = fixture();
+        let held_delivery = sink.delivery.clone().lock_owned().await;
+        sink.observation_unavailable(crate::ObservationFailure::Disconnected)
+            .await;
+        drop(held_delivery);
+        assert!(matches!(
+            sink.failed().await,
+            EventDeliveryError::Observation(crate::ObservationFailure::Disconnected)
+        ));
     }
 
     /// Drain accepted output before exposing the first retained stream failure.

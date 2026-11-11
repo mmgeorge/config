@@ -146,4 +146,20 @@ T["snapshot"] = function()
     "replacement runtime input was applied to the previous runtime's input owner")
 end
 
+T["vanished_child_returns_presentation_to_main"] = function()
+  local snapshot = require("forge.views.harness.snapshot")
+  package.loaded["forge.lsp.startup"] = { start = function() end }
+  local shown = "child"
+  local state = { session = { id = "child-selection" }, selected_agent_run_id = "child",
+    presentation = { select_agent = function(run_id) shown = run_id end } }
+  local result = { session = { id = "child-selection" }, agent = { run = { { id = "child" } }, definition = {}, exchange = {} } }
+  snapshot.apply(state, vim.deepcopy(result))
+  eq(state.selected_agent_run_id, "child")
+  eq(shown, "child")
+  result.agent.run = {}
+  snapshot.apply(state, result)
+  eq(state.selected_agent_run_id, nil)
+  eq(shown, nil)
+end
+
 return T

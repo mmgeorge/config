@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +19,9 @@ use tracing::Instrument;
 use crate::router::{HostRouter, validate_initialize};
 use crate::runtime::{ForgeRuntime, SHUTDOWN_DEADLINE};
 const WRITER_STOP_DEADLINE: Duration = Duration::from_millis(100);
+/// Bounds the wait for cancelled requests and the terminal response after the connection deadline,
+/// so the host releases stdio before the editor's three-second kill instead of relying on it.
+const REQUEST_ABORT_DEADLINE: Duration = Duration::from_millis(500);
 const RESERVED_CONTROL_REQUESTS: usize = 4;
 
 mod preparation;
@@ -102,6 +105,8 @@ struct ConnectionInput<Input> {
     input: JsonLineReader<BufReader<Input>>,
     input_open: bool,
     credit: Arc<ReceiveCredit>,
+    /// Survives the request loop so shutdown still answers rejections queued under saturation.
+    rejections: RejectionQueue,
 }
 
 struct ConnectionDrain<Input> {
@@ -183,18 +188,19 @@ impl RequestTaskStore {
             .any(|active| *active == request_id)
     }
 
-    fn reap(&self) -> Result<()> {
+    fn reap(&self) -> Result<Vec<RequestCompletion>> {
         let mut state = self
             .state
             .lock()
             .expect("Forge request task store poisoned");
+        let mut completion = Vec::new();
         while let Some(outcome) = state.task.try_join_next_with_id() {
-            complete_request(&mut state, outcome)?;
+            completion.push(complete_request(&mut state, outcome)?);
         }
-        Ok(())
+        Ok(completion)
     }
 
-    async fn join_next(&self) -> Option<Result<()>> {
+    async fn join_next(&self) -> Option<Result<RequestCompletion>> {
         poll_fn(|context| {
             let mut state = self
                 .state
@@ -331,6 +337,7 @@ impl ConnectionHost {
             input,
             input_open: true,
             credit,
+            rejections: RejectionQueue::default(),
         };
         let (ending, writer) = tokio::select! {
             result = &mut writer => {
@@ -360,8 +367,13 @@ impl ConnectionHost {
         loop {
             let line = tokio::select! {
                 error = sink.failed() => return Err(error.into()),
+                admitted = connection.rejections.next_admission(Some(sink)) => {
+                    admitted?;
+                    connection.rejections.admitted();
+                    continue;
+                }
                 joined = self.requests.join_next(), if !self.requests.is_empty() => {
-                    if let Some(result) = joined { result?; }
+                    if let Some(completion) = joined { connection.rejections.settle(sink, completion?)?; }
                     continue;
                 }
                 line = connection.input.next_frame() => line?,
@@ -373,11 +385,14 @@ impl ConnectionHost {
             let mut envelope = match serde_json::from_slice::<RoutedRequestEnvelope>(&line) {
                 Ok(envelope) => envelope,
                 Err(error) => {
-                    sink.send(Message::Response(Response::failure(
-                        0,
-                        "invalid_request",
-                        format!("decode Forge request: {error}"),
-                    )))?;
+                    connection.rejections.deliver(
+                        sink,
+                        Response::failure(
+                            0,
+                            "invalid_request",
+                            format!("decode Forge request: {error}"),
+                        ),
+                    )?;
                     continue;
                 }
             };
@@ -386,11 +401,10 @@ impl ConnectionHost {
                 "host.transport.consumed" | "host.shutdown"
             ) && let Err(error) = envelope.validate_context()
             {
-                sink.send_control(Message::Response(Response::failure(
-                    envelope.request.id,
-                    "invalid_request",
-                    format!("{error:#}"),
-                )))?;
+                connection.rejections.deliver(
+                    sink,
+                    Response::failure(envelope.request.id, "invalid_request", format!("{error:#}")),
+                )?;
                 continue;
             }
             if envelope.request.method == "host.transport.consumed" {
@@ -401,7 +415,9 @@ impl ConnectionHost {
                     )?)?;
                 continue;
             }
-            self.requests.reap()?;
+            for completion in self.requests.reap()? {
+                connection.rejections.settle(sink, completion)?;
+            }
             ensure!(
                 !self.requests.contains(envelope.request.id),
                 "duplicate in-flight Forge request id: {}",
@@ -410,11 +426,14 @@ impl ConnectionHost {
             let permit = match admission.acquire(&envelope.request.method) {
                 Ok(permit) => permit,
                 Err(_) => {
-                    sink.send_control(Message::Response(Response::failure(
-                        envelope.request.id,
-                        "busy",
-                        "Forge request admission is full",
-                    )))?;
+                    connection.rejections.deliver(
+                        sink,
+                        Response::failure(
+                            envelope.request.id,
+                            "busy",
+                            "Forge request admission is full",
+                        ),
+                    )?;
                     continue;
                 }
             };
@@ -428,10 +447,9 @@ impl ConnectionHost {
                 {
                     Ok(lease) => envelope.generation_lease = lease,
                     Err(error) => {
-                        sink.send(Message::Response(request_failure_response(
-                            envelope.request.id,
-                            &error,
-                        )))?;
+                        connection
+                            .rejections
+                            .deliver(sink, request_failure_response(envelope.request.id, &error))?;
                         continue;
                     }
                 }
@@ -489,9 +507,10 @@ impl ConnectionHost {
                 if let Err(error) = outcome {
                     tracing::error!(target: "forge::ipc", event_name = "ipc.failed",
                         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, error = %format_args!("{error:#}"));
-                    sink.send(Message::Response(request_failure_response(
-                        request_id, &error,
-                    )))?;
+                    // Wait for capacity: a stalled editor must delay this answer, not lose it or
+                    // close the connection. The task's error reports only a broken transport.
+                    sink.send_response(request_failure_response(request_id, &error))
+                        .await?;
                 } else if major {
                     tracing::info!(target: "forge::ipc", event_name = "ipc.completed",
                         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
@@ -527,7 +546,9 @@ impl ConnectionHost {
         let mut feature_done = false;
         let mut subscription_done = false;
         let mut subscription = None;
-        let mut request_abort_started = false;
+        // Set when the connection deadline cancels unfinished requests; expiry then ends shutdown
+        // even when cancelled work or the terminal response never settles.
+        let mut request_abort_deadline = None;
         loop {
             let pending = self.requests.pending();
             if feature_done && pending.is_empty() && !subscription_done && subscription.is_none() {
@@ -545,6 +566,7 @@ impl ConnectionHost {
             if feature_done
                 && pending.is_empty()
                 && subscription_done
+                && connection.input.rejections.is_empty()
                 && let Some(sink) = connection.sink.take()
                 && let Some(request_id) = request_id
                 && connection.writer.is_some()
@@ -575,7 +597,18 @@ impl ConnectionHost {
                     }
                 }
                 joined = self.requests.join_next(), if !pending.is_empty() => {
-                    if let Some(Err(error)) = joined { failure.push(format!("{error:#}")); }
+                    if let Some(Err(error)) = joined.map(|completion| completion.and_then(RequestCompletion::into_result)) {
+                        failure.push(format!("{error:#}"));
+                    }
+                }
+                admitted = connection.input.rejections.next_admission(connection.sink.as_ref()) => {
+                    match admitted {
+                        Ok(()) => connection.input.rejections.admitted(),
+                        Err(error) => {
+                            failure.push(format!("Forge request rejection was not delivered: {error}"));
+                            connection.input.rejections.clear();
+                        }
+                    }
                 }
                 result = pending_task(&mut subscription) => {
                     subscription.take();
@@ -610,12 +643,16 @@ impl ConnectionHost {
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(deadline), if !request_abort_started => {
+                _ = tokio::time::sleep_until(request_abort_deadline.unwrap_or(deadline)) => {
+                    if request_abort_deadline.is_some() {
+                        failure.push(format!("Forge connection did not settle within its cancellation deadline, unfinished request IDs: {pending:?}, terminal response sent: {}", connection.sink.is_none()));
+                        break;
+                    }
                     if request_id.is_none() {
                         failure.push("Forge connection shutdown deadline expired before output drained after input EOF".into());
                         break;
                     }
-                    request_abort_started = true;
+                    request_abort_deadline = Some(Instant::now() + REQUEST_ABORT_DEADLINE);
                     if !pending.is_empty() {
                         failure.push(format!("Forge connection shutdown deadline expired, cancelling unfinished request IDs: {pending:?}, feature shutdown complete: {feature_done}"));
                         self.requests.abort_all();
@@ -745,7 +782,34 @@ fn request_failure_response(request_id: u64, error: &anyhow::Error) -> Response 
     )
 }
 
-fn complete_request(state: &mut RequestTaskState, outcome: TaskOutcome) -> Result<()> {
+/// How one joined request task ended. Neither failure closes the connection: an undeliverable
+/// response affects only its own request, and an unanswered request still receives a failure.
+enum RequestCompletion {
+    Delivered,
+    /// The task ran to completion, but output rejected its response.
+    DeliveryFailed(anyhow::Error),
+    /// The task panicked or was cancelled before it could answer `request_id`.
+    Unanswered {
+        request_id: u64,
+        error: anyhow::Error,
+    },
+}
+
+impl RequestCompletion {
+    /// Report the completion as a shutdown failure, which no longer has a live request reader.
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Delivered => Ok(()),
+            Self::DeliveryFailed(error) | Self::Unanswered { error, .. } => Err(error),
+        }
+    }
+}
+
+/// Unregister a joined task. Only an unregistered task, which breaks store ownership, is an error.
+fn complete_request(
+    state: &mut RequestTaskState,
+    outcome: TaskOutcome,
+) -> Result<RequestCompletion> {
     let task_id = match &outcome {
         Ok((task_id, _)) => *task_id,
         Err(error) => error.id(),
@@ -754,8 +818,93 @@ fn complete_request(state: &mut RequestTaskState, outcome: TaskOutcome) -> Resul
         .request_by_task
         .remove(&task_id)
         .context("Forge completed an unregistered request task")?;
-    let (_, result) = outcome.with_context(|| format!("Forge request {request_id} task failed"))?;
-    result.with_context(|| format!("Forge request {request_id} failed to deliver its response"))
+    Ok(match outcome {
+        Ok((_, Ok(()))) => RequestCompletion::Delivered,
+        Ok((_, Err(error))) => RequestCompletion::DeliveryFailed(error.context(format!(
+            "Forge request {request_id} failed to deliver its response"
+        ))),
+        Err(error) => RequestCompletion::Unanswered {
+            request_id,
+            error: anyhow::Error::new(error)
+                .context(format!("Forge request {request_id} task failed")),
+        },
+    })
+}
+
+/// Failure responses produced by the request reader itself, which must not wait for output.
+///
+/// The reader also receives the editor's consumption acknowledgements, and the writer cannot drain
+/// until it reads them, so waiting for capacity there would deadlock a saturated connection.
+/// Rejections use the reserved control lane and queue here in order while that lane is full.
+#[derive(Default)]
+struct RejectionQueue {
+    pending: VecDeque<Response>,
+}
+
+impl RejectionQueue {
+    /// Admit the rejection now when nothing precedes it and control capacity remains.
+    fn deliver(&mut self, sink: &MessageSender, response: Response) -> Result<()> {
+        if self.pending.is_empty() {
+            match sink.send_control(Message::Response(response.clone())) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.pending.push_back(response);
+        Ok(())
+    }
+
+    /// Wait for control capacity for the oldest queued rejection, or forever when none is queued.
+    ///
+    /// Admission is synchronous within one poll, so dropping this future never loses a frame. The
+    /// future owns a copy of the rejection, leaving the queue free for the select handler.
+    /// Without a sink, as after the terminal response, it also waits forever.
+    fn next_admission<'sink>(
+        &self,
+        sink: Option<&'sink MessageSender>,
+    ) -> impl Future<Output = std::io::Result<()>> + use<'sink> {
+        let oldest = self.pending.front().cloned();
+        async move {
+            match (sink, oldest) {
+                (Some(sink), Some(response)) => {
+                    sink.send_control_wait(Message::Response(response)).await
+                }
+                _ => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Record that the oldest rejection was admitted by `next_admission`.
+    fn admitted(&mut self) {
+        self.pending.pop_front();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Discard rejections that a failed transport can no longer deliver.
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Settle a joined request without closing the connection for one request's failure.
+    fn settle(&mut self, sink: &MessageSender, completion: RequestCompletion) -> Result<()> {
+        match completion {
+            RequestCompletion::Delivered => Ok(()),
+            RequestCompletion::DeliveryFailed(error) => {
+                tracing::warn!(target: "forge::ipc", event_name = "ipc.delivery_failed",
+                    error = %format_args!("{error:#}"));
+                Ok(())
+            }
+            RequestCompletion::Unanswered { request_id, error } => {
+                tracing::error!(target: "forge::ipc", event_name = "ipc.task_failed",
+                    request_id, error = %format_args!("{error:#}"));
+                self.deliver(sink, request_failure_response(request_id, &error))
+            }
+        }
+    }
 }
 
 fn grant_credit(credit: &ReceiveCredit, line: &[u8]) -> Result<()> {
@@ -795,4 +944,109 @@ async fn write_frame<Output: AsyncWrite + Unpin>(
     credit.reserve(frame.len()).await?;
     output.write_all(frame).await?;
     output.flush().await.context("flush Forge output")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+
+    /// Rejections produced while the editor stops reading output wait for capacity in order, and
+    /// the connection survives to answer each one and shut down cleanly once reading resumes.
+    #[tokio::test]
+    async fn saturated_output_delays_rejections_without_closing_the_connection() -> Result<()> {
+        // Enough malformed requests to fill the ordinary output lane while the writer is blocked.
+        let rejected = forge_protocol::MAX_PENDING_FRAMES + 64;
+        let host = ConnectionHost::new(Arc::new(ForgeRuntime::new()?));
+        let (mut editor_requests, host_input) = tokio::io::duplex(1 << 20);
+        // A small pipe blocks the writer at once, as an editor that stopped draining does.
+        let (host_output, editor_frames) = tokio::io::duplex(1024);
+        let connection = tokio::spawn(async move { host.run(host_input, host_output).await });
+        let mut requests = format!(
+            "{}\n",
+            json!({"id":1,"method":"host.initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}})
+        );
+        for _ in 0..rejected {
+            requests.push_str("not a request\n");
+        }
+        editor_requests.write_all(requests.as_bytes()).await?;
+
+        let scenario = async {
+            let mut frames = tokio::io::BufReader::new(editor_frames);
+            let (mut consumed_bytes, mut consumed_frames) = (0u64, 0u64);
+            let mut rejection_count = 0;
+            let mut shutdown_sent = false;
+            loop {
+                let mut frame = Vec::new();
+                frames.read_until(b'\n', &mut frame).await?;
+                ensure!(!frame.is_empty(), "host output ended before shutdown");
+                consumed_bytes += frame.len() as u64;
+                consumed_frames += 1;
+                let message: Value = serde_json::from_slice(&frame)?;
+                if message["id"] == 0 {
+                    assert_eq!(message["error"]["code"], "invalid_request", "{message}");
+                    rejection_count += 1;
+                }
+                if message["id"] == 2 {
+                    assert_eq!(message["result"]["shutdown"], true, "{message}");
+                    break;
+                }
+                // Acknowledge in batches, as the editor does, so the writer keeps credit.
+                if consumed_frames % 512 == 0 || rejection_count == rejected {
+                    let mut acknowledgement = format!(
+                        "{}\n",
+                        json!({"id":0,"method":"host.transport.consumed","params":{"bytes":consumed_bytes,"frames":consumed_frames}})
+                    );
+                    if rejection_count == rejected && !shutdown_sent {
+                        shutdown_sent = true;
+                        acknowledgement.push_str(&format!(
+                            "{}\n",
+                            json!({"id":2,"method":"host.shutdown","params":{}})
+                        ));
+                    }
+                    editor_requests
+                        .write_all(acknowledgement.as_bytes())
+                        .await?;
+                }
+            }
+            assert_eq!(rejection_count, rejected);
+            Ok::<_, anyhow::Error>(())
+        };
+        // Outer guard against a hung connection; the scenario itself never waits on time.
+        timeout(Duration::from_secs(4), scenario)
+            .await
+            .context("saturated connection stalled")??;
+        connection.await??;
+        Ok(())
+    }
+
+    /// An editor that never drains output cannot hold shutdown past the cancellation deadline
+    /// that follows the connection deadline; the host reports the stall and releases stdio.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ends_after_cancellation_deadline_when_output_never_drains() -> Result<()> {
+        let host = ConnectionHost::new(Arc::new(ForgeRuntime::new()?));
+        let (mut editor_requests, host_input) = tokio::io::duplex(1 << 16);
+        // A one-byte pipe that is never read blocks the writer inside the handshake frame.
+        let (host_output, _editor_frames) = tokio::io::duplex(1);
+        editor_requests
+            .write_all(
+                format!(
+                    "{}\n{}\n",
+                    json!({"id":1,"method":"host.initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}}),
+                    json!({"id":2,"method":"host.shutdown","params":{}}),
+                )
+                .as_bytes(),
+            )
+            .await?;
+        // Outer guard on the paused clock; it fires only if shutdown never ends.
+        let ended = timeout(SHUTDOWN_DEADLINE * 10, host.run(host_input, host_output))
+            .await
+            .context("shutdown waited on undrained output forever")?;
+        let error = ended.expect_err("an undrained terminal response is a shutdown failure");
+        assert!(
+            format!("{error:#}").contains("cancellation deadline"),
+            "{error:#}"
+        );
+        Ok(())
+    }
 }

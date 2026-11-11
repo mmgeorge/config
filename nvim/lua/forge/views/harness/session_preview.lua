@@ -74,6 +74,12 @@ function SessionPreview.close()
     vim.api.nvim_buf_delete(preview.preview_buf, { force = true })
   end
   if preview.status_view then preview.status_view:suspend(false) end
+  -- The controller skips rendering while a preview covers the transcript, so the view that owns
+  -- this window renders now: a snapshot or presentation that became ready meanwhile would
+  -- otherwise leave the restored transcript blank until an unrelated update.
+  if vim.api.nvim_win_is_valid(preview.transcript_win) then
+    require("forge.views.harness.controller").render_window(preview.transcript_win)
+  end
 end
 
 return SessionPreview

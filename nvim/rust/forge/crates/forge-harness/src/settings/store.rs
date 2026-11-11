@@ -577,6 +577,83 @@ impl SettingsStore {
             revision == expected_revision,
             "settings revision conflict: expected {expected_revision}, current {revision}"
         );
+        let value = Self::write_configuration(
+            &transaction,
+            revision,
+            target,
+            portable,
+            provider,
+            intent,
+            apply,
+        )?;
+        transaction.commit()?;
+        Ok(value)
+    }
+
+    /// Apply the settings half of a configuration whose session half already committed.
+    ///
+    /// The host commits the session and its intent row before the settings transaction, so a
+    /// process that stops between the two leaves the intent for recovery. Another session may
+    /// have advanced the settings revision in the meantime; the intent holds explicit fields
+    /// rather than a whole document, so they are merged at the current revision instead of
+    /// failing the captured-revision check on every reopen. A replay of an intent the settings
+    /// store already recorded is a no-op, checked inside the same write transaction.
+    pub(crate) fn recover_configuration(
+        &mut self,
+        intent: &crate::storage::configuration::ConfigurationIntent,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let recorded: Option<String> = transaction
+            .query_row(
+                "SELECT session_id FROM setting_operation WHERE id=?1",
+                [&intent.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = recorded {
+            ensure!(
+                owner == intent.session,
+                "settings operation belongs to another session"
+            );
+            return Ok(());
+        }
+        let revision = u64::try_from(transaction.query_row(
+            "SELECT revision FROM setting_revision WHERE id=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?)?;
+        Self::write_configuration(
+            &transaction,
+            revision,
+            SettingTarget {
+                scope: intent.scope,
+                workspace: &intent.workspace,
+                session: &intent.session,
+            },
+            intent.portable.as_ref(),
+            intent
+                .provider_setting
+                .as_ref()
+                .map(|value| (intent.provider.as_str(), value)),
+            Some(intent),
+            || Ok(()),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Merge one configuration's explicit fields at `revision` inside an open write transaction.
+    fn write_configuration<T>(
+        transaction: &rusqlite::Transaction<'_>,
+        revision: u64,
+        target: SettingTarget<'_>,
+        portable: Option<&PortableSettings>,
+        provider: Option<(&str, &Value)>,
+        intent: Option<&crate::storage::configuration::ConfigurationIntent>,
+        apply: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let mut next = revision;
         if let Some(patch) = portable {
             let (scope, identity) = match target.scope {
@@ -663,17 +740,7 @@ impl SettingsStore {
                 params![intent.id, intent.session, SettingsRecord::encode(&receipt)?],
             )?;
         }
-        transaction.commit()?;
         Ok(value)
-    }
-
-    pub(crate) fn configuration_applied(
-        &self,
-        intent: &crate::storage::configuration::ConfigurationIntent,
-    ) -> Result<bool> {
-        Ok(self
-            .operation(&intent.session, &intent.id, &serde_json::to_value(intent)?)?
-            .is_some())
     }
 
     /// Merge explicit directory grants into global settings without replacing concurrent preferences.
@@ -1203,6 +1270,52 @@ mod test {
         let after = store.get("workspace", "session", "mock")?;
         assert_eq!(after.revision, expected);
         assert_ne!(after.desired.status_thoughts, Some(true));
+        Ok(())
+    }
+
+    /// A configuration whose host commit outlived its settings commit is recovered even after
+    /// another session advanced the settings revision, and replaying it changes nothing.
+    #[test]
+    fn configuration_recovery_applies_at_the_current_revision_once() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut store = SettingsStore::open(fixture.path())?;
+        let captured = store.get("workspace", "session", "mock")?.revision;
+        let intent = crate::storage::configuration::ConfigurationIntent {
+            id: "configuration:recovered".into(),
+            session: "session".into(),
+            workspace: "workspace".into(),
+            provider: "mock".into(),
+            revision: captured,
+            scope: SettingScope::Session,
+            portable: Some(PortableSettings {
+                status_thoughts: Some(true),
+                ..Default::default()
+            }),
+            provider_setting: None,
+        };
+        store.patch(
+            SettingTarget {
+                scope: SettingScope::Global,
+                workspace: "workspace",
+                session: "other-session",
+            },
+            &PortableSettings {
+                plan_compact: Some(true),
+                ..Default::default()
+            },
+        )?;
+        let advanced = store.get("workspace", "session", "mock")?.revision;
+        assert_ne!(advanced, captured);
+        store.recover_configuration(&intent)?;
+        let recovered = store.get("workspace", "session", "mock")?;
+        assert_eq!(recovered.desired.status_thoughts, Some(true));
+        assert_eq!(recovered.desired.plan_compact, Some(true));
+        store.recover_configuration(&intent)?;
+        assert_eq!(
+            store.get("workspace", "session", "mock")?.revision,
+            recovered.revision,
+            "a replayed recovery must not apply the intent twice"
+        );
         Ok(())
     }
 

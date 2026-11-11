@@ -1028,6 +1028,129 @@ T["timeline_position"] = function()
   take("close").callback({})
 end
 
+-- Opens a presentation whose `session.document` requests wait in `pending` until the case answers
+-- them through `take`. Returns the fixture's handles.
+local function pending_presentation(fixture_options)
+  fixture_options = fixture_options or {}
+  local client = require("forge.client")
+  local pending, notices, opened = {}, {}, {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    if params.operation == "background_terminals" then callback({ supported = false }) return end
+    pending[#pending + 1] = { params = params, callback = callback }
+  end
+  local function take(operation)
+    wait_until(function() return #pending > 0 end, "missing " .. operation)
+    local request = table.remove(pending, 1)
+    assert(request.params.operation == operation, "expected " .. operation .. ", got " .. vim.inspect(request.params))
+    return request
+  end
+  local function snapshot(document, revision)
+    return { document = document, revision = revision, block = {
+      { id = "body", text = { "transcript row" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
+    } }
+  end
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch({ "unsent draft" })
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local owner = require("forge.views.harness.presentation").open({
+    session_id = "pending-fixture", transcript_buffer = transcript, composer_buffer = composer,
+    transcript_window = window, is_alive = function() return true end,
+    notice = function(message) notices[#notices + 1] = message end,
+  }, function(value, failure) opened[#opened + 1] = { owner = value, failure = failure } end)
+  MiniTest.finally(function() pcall(owner.close) end)
+  local fixture = { owner = owner, pending = pending, notices = notices, opened = opened, take = take,
+    snapshot = snapshot, transcript = transcript, composer = composer, window = window }
+  if fixture_options.ready ~= false then
+    local opening = take("open")
+    opening.callback({ transcript = snapshot(opening.params.document, 0) })
+    wait_until(function() return owner.ready end, "fixture presentation did not become ready")
+    fixture.document = opening.params.document
+  end
+  return fixture
+end
+
+T["open_failure_keeps_composer"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  -- A failure inside the open callback reaches `fail` before the presentation is ready.
+  stub(require("forge.views.harness.status_view"), "apply", function() error("status fixture failure") end)
+  local fixture = pending_presentation({ ready = false })
+  local opening = fixture.take("open")
+  opening.callback({ transcript = fixture.snapshot(opening.params.document, 0) })
+  wait_until(function() return #fixture.opened == 1 end, "failed open did not report to its caller")
+  assert(fixture.opened[1].failure:find("status fixture failure", 1, true), vim.inspect(fixture.opened))
+  wait_until(function() return fixture.owner.closed end, "failed open did not close the presentation")
+  assert(vim.api.nvim_buf_is_valid(fixture.composer), "failed open deleted the caller's composer")
+  eq(buffer.line(fixture.composer, 1), "unsent draft")
+end
+
+T["open_survives_buffer_swap"] = function()
+  local fixture = pending_presentation({ ready = false })
+  local opening = fixture.take("open")
+  -- The session picker previews another session in the transcript window while `open` is in flight.
+  local preview = buffer.scratch({ "preview" })
+  vim.api.nvim_win_set_buf(fixture.window, preview)
+  opening.callback({ transcript = fixture.snapshot(opening.params.document, 0) })
+  wait_until(function() return #fixture.opened == 1 end, "open callback did not run while the window showed another buffer")
+  assert(fixture.opened[1].owner == fixture.owner and not fixture.opened[1].failure, vim.inspect(fixture.opened[1].failure))
+  assert(fixture.owner.ready, "presentation did not become ready")
+end
+
+T["resize_failure_continues"] = function()
+  local fixture = pending_presentation()
+  vim.cmd("vsplit")
+  fixture.owner.refresh_views()
+  local opened_view = fixture.take("open_view")
+  opened_view.callback({})
+  -- Answer the refresh that the new view requests before measuring widths.
+  fixture.take("sync").callback({ patch = {} })
+  wait_until(function() return not fixture.owner.syncing end, "view refresh did not settle")
+  fixture.owner.resize()
+  local first = fixture.take("resize")
+  first.callback(nil, "resize fixture failure", { code = "invalid_request" })
+  local second = fixture.take("resize")
+  assert(second.params.view ~= first.params.view, "the remaining view's width was not sent")
+  second.callback({})
+  eq(fixture.notices, { "resize fixture failure" })
+end
+
+T["select_agent_reports_failure"] = function()
+  local fixture = pending_presentation()
+  local settled = {}
+  local function record(label)
+    return function(failure, superseded) settled[#settled + 1] = { label = label, failure = failure, superseded = superseded } end
+  end
+  -- The call without a callback keeps its existing behavior.
+  fixture.owner.select_agent("child")
+  fixture.take("select_agent").callback(nil, "selection fixture failure", { code = "invalid_request" })
+  eq(fixture.owner.timeline_key, "main")
+
+  fixture.owner.select_agent("child", record("failed"))
+  fixture.take("select_agent").callback(nil, "selection fixture failure", { code = "invalid_request" })
+  eq(settled, { { label = "failed", failure = "selection fixture failure" } })
+  eq(fixture.owner.timeline_key, "main")
+
+  -- A selection deferred behind an in-flight refresh is superseded by a later one.
+  settled = {}
+  fixture.owner.sync()
+  local refresh = fixture.take("sync")
+  fixture.owner.select_agent("child", record("superseded"))
+  fixture.owner.select_agent("other", record("selected"))
+  eq(settled, { { label = "superseded", superseded = true } })
+  refresh.callback({ patch = {} })
+  local selection = fixture.take("select_agent")
+  eq(selection.params.run_id, "other")
+  selection.callback({})
+  eq(settled[2], { label = "selected" })
+  eq(fixture.owner.timeline_key, "other")
+
+  fixture.owner.select_agent("other", record("unchanged"))
+  eq(settled[3], { label = "unchanged" })
+end
+
 T["transcript_follow"] = function()
   local client = require("forge.client")
   local request_list = {}

@@ -42,15 +42,52 @@ pub(super) enum StoppedCommand {
     Uncommitted,
 }
 
+/// Mark a domain step that could not run because owner storage already failed.
+#[derive(Debug, thiserror::Error)]
+#[error("owner storage is unavailable")]
+pub(super) struct OwnerStorageUnavailable;
+
+/// Report whether a domain error came from owner storage rather than from domain validation.
+///
+/// Storage failure fences the session for its lifetime, because no later command can certify its
+/// outcome. A domain rule that refused the command, such as continuing a task that is not
+/// running, leaves storage healthy, so classifying it as storage failure made one rejected
+/// command disable the whole session. Only SQLite, file I/O, and the owner's storage error types
+/// count as storage; everything else is a rejection of this command.
+pub(super) fn storage_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<rusqlite::Error>()
+            || cause.is::<std::io::Error>()
+            || cause.is::<crate::storage::database::DatabaseError>()
+            || cause.is::<super::journal::CommandJournalError>()
+            || cause.is::<super::input_receipts::InputReceiptError>()
+            || cause.is::<OwnerStorageUnavailable>()
+            || cause
+                .downcast_ref::<super::command::TaskCommandFailure>()
+                .is_some_and(|failure| {
+                    matches!(
+                        failure,
+                        super::command::TaskCommandFailure::StateUnavailable
+                    )
+                })
+    })
+}
+
 impl OperationFailure {
     /// Classify the outcome of a command that failed while its work was stopped.
     ///
     /// A lost deadline reports a timeout, storage failures leave the outcome uncommitted, an
-    /// explicit rejection keeps its own failure, and every other cause means the stop could not
-    /// prove the provider idle.
+    /// explicit rejection keeps its own failure, a domain rule that refused the command reports
+    /// a failed prerequisite, and every other cause means the stop could not prove the provider
+    /// idle.
     pub(super) fn into_stopped_command(self) -> StoppedCommand {
         use super::command::CommandFailure;
         match self {
+            Self::Domain(error) | Self::Transition(TransitionFailure::Domain(error))
+                if !storage_failure(&error) =>
+            {
+                StoppedCommand::Failed(CommandFailure::PrerequisiteFailed)
+            }
             Self::Domain(_)
             | Self::StorageUncommitted
             | Self::Transition(TransitionFailure::Domain(_)) => StoppedCommand::Uncommitted,

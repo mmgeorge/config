@@ -601,7 +601,6 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) attempted_results: std::collections::HashSet<String>,
     pub(crate) pending_agent_launch: std::collections::VecDeque<PendingAgentLaunch>,
     pub(crate) pending_agent_reply: Option<(tokio::sync::oneshot::Sender<Result<Value>>, Value)>,
-    pub(crate) pending_agent_interrupt: Option<(Vec<String>, OwnedAgentRequest, Value)>,
     pub(crate) user_delivery: tokio::task::JoinSet<(crate::provider::SteerCommand, Result<()>)>,
     pub(crate) session_events: Arc<crate::provider::session_execution::SessionObservationInbox>,
     pub(crate) delivery_sink: Option<publication::SessionUpdateSink>,
@@ -666,13 +665,9 @@ pub(crate) enum ForegroundSignal {
     },
     AgentApprovalsCancelled {
         completion: Box<AgentCompletion>,
-        result: Result<()>,
+        result: Result<Vec<ApprovalRequestView>>,
     },
-    AgentInterrupted {
-        operation: AgentInterrupt,
-        completed: usize,
-        result: Result<()>,
-    },
+    AgentInterrupted(AgentInterrupt),
     AgentSpawnSelected {
         request: OwnedAgentRequest,
         selection: Box<Result<crate::agent::AgentSelection>>,
@@ -811,7 +806,7 @@ impl ForegroundSignal {
             Self::AgentDelivery(..) => "AgentDelivery",
             Self::AgentResultDelivered { .. } => "AgentResultDelivered",
             Self::AgentApprovalsCancelled { .. } => "AgentApprovalsCancelled",
-            Self::AgentInterrupted { .. } => "AgentInterrupted",
+            Self::AgentInterrupted(..) => "AgentInterrupted",
             Self::AgentSpawnSelected { .. } => "AgentSpawnSelected",
             Self::AgentMessageSteered { .. } => "AgentMessageSteered",
             Self::ExecutionControl(..) => "ExecutionControl",
@@ -916,20 +911,22 @@ pub(crate) struct PendingAgentLaunch {
     reply: Option<(tokio::sync::oneshot::Sender<Result<Value>>, Value)>,
 }
 
-/// Child completion and the approvals observed before unlocked cancellation.
+/// Child completion retained while its approvals are cancelled unlocked.
 pub(crate) struct AgentCompletion {
     owner: crate::provider::ThreadOwner,
     task_id: String,
     output: Result<crate::provider::ProviderCompletion>,
     host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
     cleanup_error: Option<String>,
-    approvals: Vec<ApprovalRequestView>,
 }
 
 /// Retain interruption ownership and its reply while child cleanup runs unlocked.
+///
+/// Every target is flagged when the interruption is captured, before any cleanup runs, and the
+/// reply reports every target's failure together.
 pub(crate) struct AgentInterrupt {
     items: Vec<AgentInterruptItem>,
-    remaining: Vec<String>,
+    failures: Vec<anyhow::Error>,
     request: OwnedAgentRequest,
     result: Value,
 }
@@ -950,7 +947,10 @@ struct AgentInterruptItem {
     cancelled: Vec<crate::agent::AgentTask>,
     cleanup: Option<crate::agent::AgentTask>,
     provider: Option<Arc<Provider>>,
-    approvals: Vec<ApprovalRequestView>,
+    /// The approvals the unlocked job removed, or `None` when their cancellation failed.
+    approvals: Option<Vec<ApprovalRequestView>>,
+    /// Whether the unlocked cleanup retry for `cleanup` completed.
+    cleanup_succeeded: bool,
 }
 
 /// Own provider work that can run without retaining a broker guard.
@@ -1149,6 +1149,7 @@ impl ForegroundJob {
             | Self::GoalProgress(_)
             | Self::ExecutionProgress(_)
             | Self::PlanSubmission(_)
+            | Self::PlanQuestion(_)
             | Self::PlanMutation(_) => true,
             Self::AdmissionWorkspace(_)
             | Self::ProviderPrepare(_)
@@ -1167,7 +1168,6 @@ impl ForegroundJob {
             | Self::ObservationPublication(_)
             | Self::LivePlanMutation(_)
             | Self::LivePlanSubmission(_)
-            | Self::PlanQuestion(_)
             | Self::TaskCompaction(_)
             | Self::Compaction(_)
             | Self::PlanTerminalPublication { .. }
@@ -1441,44 +1441,56 @@ impl ForegroundJob {
                 coordinator,
                 completion,
             } => {
-                let result = coordinator.cancel_owner(&completion.owner, None).await;
+                let result = coordinator
+                    .cancel_owner_approvals(&completion.owner, None)
+                    .await;
                 Ok(ForegroundSignal::AgentApprovalsCancelled { completion, result })
             }
             Self::AgentInterrupt {
                 coordinator,
-                operation,
+                mut operation,
             } => {
-                let mut completed = 0;
                 let authority = operation
                     .request
                     .authority
                     .as_ref()
                     .and_then(|authority| authority.task.clone());
-                let result = async {
-                    for item in &operation.items {
-                        match &authority {
-                            Some(authority) => authority
-                                .commit(|| coordinator.cancel_owner_immediate(&item.owner))?,
-                            None => coordinator.cancel_owner_immediate(&item.owner)?,
+                // One failing child never stops the others: each target's approvals and cleanup
+                // run independently and their failures are reported together.
+                for item in &mut operation.items {
+                    let cancelled = match &authority {
+                        Some(authority) => {
+                            authority.commit(|| coordinator.cancel_owner_immediate(&item.owner))
                         }
-                        completed += 1;
-                        if let Some(provider) = &item.provider {
+                        None => coordinator.cancel_owner_immediate(&item.owner),
+                    };
+                    match cancelled {
+                        Ok(approvals) => item.approvals = Some(approvals),
+                        Err(error) => {
+                            operation
+                                .failures
+                                .push(error.context(format!("interrupt child {}", item.agent.id)));
+                            continue;
+                        }
+                    }
+                    if let Some(provider) = &item.provider {
+                        let cleanup =
                             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                                 provider.session_close_owner(&item.owner).await?;
                                 provider.shutdown().await
                             })
                             .await
-                            .context("child cleanup retry exceeded 30 seconds")??;
+                            .context("child cleanup retry exceeded 30 seconds")
+                            .and_then(|result| result.map_err(anyhow::Error::from));
+                        match cleanup {
+                            Ok(()) => item.cleanup_succeeded = true,
+                            Err(error) => operation
+                                .failures
+                                .push(error.context(format!("collect child {}", item.agent.id))),
                         }
                     }
-                    Ok(())
                 }
-                .await;
-                Ok(ForegroundSignal::AgentInterrupted {
-                    operation,
-                    completed,
-                    result,
-                })
+                Ok(ForegroundSignal::AgentInterrupted(operation))
             }
             Self::AgentSpawnSelect {
                 factory,
@@ -4112,9 +4124,13 @@ impl HarnessBroker {
                 return Ok(json!({"status":"interrupting","target":target}));
             }
             AgentOperation::InterruptAll => {
-                for (agent, _) in self.agent_coordinator.snapshot(None) {
-                    self.interrupt_managed_agent(&agent.id, event).await?;
-                }
+                let targets = self
+                    .agent_coordinator
+                    .snapshot(None)
+                    .into_iter()
+                    .map(|(agent, _)| agent.id)
+                    .collect::<Vec<_>>();
+                self.interrupt_managed_agents(&targets, event).await?;
                 return Ok(json!({"status":"interrupting"}));
             }
             AgentOperation::Spawn(spawn) => ChildWork::Spawn(spawn),
@@ -4252,16 +4268,11 @@ impl HarnessBroker {
         owner: &crate::provider::ThreadOwner,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        let pending = self
+        let cancelled = self
             .permission_coordinator
-            .pending_list()?
-            .into_iter()
-            .filter(|approval| approval.execution_owner.as_ref() == Some(owner))
-            .collect::<Vec<_>>();
-        self.permission_coordinator
-            .cancel_owner(owner, None)
+            .cancel_owner_approvals(owner, None)
             .await?;
-        for approval in pending {
+        for approval in cancelled {
             if let Some(runtime) = self
                 .child_exchange_runtime_by_agent
                 .get_mut(owner.agent_id().as_str())
@@ -4294,6 +4305,45 @@ impl HarnessBroker {
         target: &str,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        self.interrupt_managed_agents(&[target.to_owned()], event)
+            .await
+    }
+
+    /// Interrupt every target before retrying any retained process cleanup.
+    ///
+    /// Each target is flagged first, so one child whose cleanup retry fails cannot leave a later
+    /// child running under a cancel that already reported failure. Every failure is reported
+    /// together after all targets were attempted, and the agent snapshot is published either way.
+    async fn interrupt_managed_agents(
+        &mut self,
+        targets: &[String],
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        let mut flagged = Vec::new();
+        for target in targets {
+            match self.flag_managed_agent_interrupt(target, event).await {
+                Ok(agent) => flagged.push(agent),
+                Err(error) => failures.push(error.context(format!("interrupt child {target}"))),
+            }
+        }
+        for agent in flagged {
+            let agent_id = agent.id.clone();
+            if let Err(error) = self.retry_managed_agent_cleanup(agent).await {
+                failures.push(error.context(format!("collect child {agent_id}")));
+            }
+        }
+        let published = self.publish_agent_state(event).await;
+        aggregate_failures(failures)?;
+        published
+    }
+
+    /// Cancel one child's queued work and approvals, then persist each cancelled task.
+    async fn flag_managed_agent_interrupt(
+        &mut self,
+        target: &str,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<Agent> {
         let agent = self.agent_coordinator.resolve(target)?;
         let owner = crate::provider::ThreadOwner::new(
             (self.session.id.clone()).into(),
@@ -4314,6 +4364,16 @@ impl HarnessBroker {
             }
             self.agent_coordinator.retain(agent.clone(), task)?;
         }
+        Ok(agent)
+    }
+
+    /// Retry a flagged child's retained process cleanup and release its execution on success.
+    async fn retry_managed_agent_cleanup(&mut self, agent: Agent) -> Result<()> {
+        let owner = crate::provider::ThreadOwner::new(
+            (self.session.id.clone()).into(),
+            crate::provider::AgentId::new(agent.id.clone())?,
+        )
+        .expect("registered session and agent identities are nonempty");
         if let Some(mut task) = self.agent_coordinator.cleanup_task(&agent.id) {
             let provider = self
                 .child_provider_by_agent
@@ -4326,7 +4386,7 @@ impl HarnessBroker {
             })
             .await
             .context("child cleanup retry exceeded 30 seconds")??;
-            let mut agent = agent.clone();
+            let mut agent = agent;
             agent.state = AgentState::Ready;
             agent.updated_at_ms = self.clock.now_ms();
             task.error = None;
@@ -4348,7 +4408,6 @@ impl HarnessBroker {
             self.child_execution_by_agent
                 .remove(owner.agent_id().as_str());
         }
-        self.publish_agent_state(event).await?;
         Ok(())
     }
 
@@ -4492,105 +4551,150 @@ impl HarnessBroker {
         Ok(None)
     }
 
-    /// Drain owned mutations for the idle controller or a caller-supplied parent exchange.
+    /// Settle one queued child command, returning `false` once the idle lane is empty.
     ///
-    /// Without a parent, live model requests go to the active root turn, which authenticates them.
-    pub(crate) async fn drain_agent_commands(
+    /// The broker lock can be released between calls, so a caller that drains command by command
+    /// never holds it across more than one command's provider work. When the lane is empty and no
+    /// root turn is active, this call launches the queued children that capacity admits before
+    /// returning `false`.
+    pub(crate) async fn drain_next_agent_command(
         &mut self,
-        mut parent: Option<&mut Exchange>,
-    ) -> Result<Vec<SessionEvent>> {
-        let mut event = Vec::new();
-        while let Some(command) = self.agent_coordinator.try_receive_idle() {
-            match command {
-                crate::agent::AgentCommand::Request {
-                    request,
-                    authority,
-                    target,
-                    response,
-                    task_admission,
-                } => {
-                    if response.is_closed() {
-                        continue;
-                    }
-                    // The active root turn authenticates a live model request against its own
-                    // exchange, so a drain without that parent hands the request to the turn.
-                    if parent.is_none()
-                        && request.source == crate::agent::AgentSource::Model
-                        && authority
-                            .as_ref()
-                            .is_some_and(|authority| !*authority.expired.borrow())
-                        && self.agent_coordinator.foreground_claimed()
-                    {
-                        self.agent_coordinator.defer_to_foreground(
-                            crate::agent::AgentCommand::Request {
-                                request,
-                                authority,
-                                target,
-                                response,
-                                task_admission,
-                            },
-                        );
-                        continue;
-                    }
-                    let authenticated = if request.source == crate::agent::AgentSource::Model {
-                        authority.as_ref().is_some_and(|authority| {
-                            !*authority.expired.borrow()
-                                && authority.owner
-                                    == crate::provider::ThreadOwner::root(&self.session.id)
-                                && parent
-                                    .as_deref()
-                                    .is_some_and(|parent| parent.id == authority.parent_exchange_id)
-                        })
-                    } else {
-                        authority.is_none()
-                    };
-                    let scoped = target
+        parent: Option<&mut Exchange>,
+        event: &mut Vec<SessionEvent>,
+    ) -> bool {
+        let Some(command) = self.agent_coordinator.try_receive_idle() else {
+            if parent.is_none() && !self.agent_coordinator.foreground_claimed() {
+                let launched = self.launch_ready_agents(event).await;
+                self.report_agent_command_failure(launched, event);
+            }
+            return false;
+        };
+        let settled = self.apply_agent_command(command, parent, event).await;
+        self.report_agent_command_failure(settled, event);
+        true
+    }
+
+    /// Launch every queued child the coordinator admits now, in queue order.
+    async fn launch_ready_agents(&mut self, event: &mut Vec<SessionEvent>) -> Result<()> {
+        while let Some(work) = self.agent_coordinator.ready_launch()? {
+            Box::pin(self.launch_managed_agent(work, event)).await?;
+        }
+        Ok(())
+    }
+
+    /// Publish one child command failure in band so the batch's other events still reach the
+    /// editor.
+    fn report_agent_command_failure(&self, result: Result<()>, event: &mut Vec<SessionEvent>) {
+        let Err(error) = result else {
+            return;
+        };
+        self.trace.record(
+            &self.session.id,
+            "agent.command_failed",
+            json!({"error": format!("{error:#}")}),
+        );
+        event.push(SessionEvent {
+            session_id: self.session.id.clone(),
+            event: "provider_event".into(),
+            payload: json!({"kind":"error","text":format!("Agent coordinator failed: {error:#}")}),
+        });
+    }
+
+    /// Apply one dequeued child command; its failure never discards an earlier command's events.
+    async fn apply_agent_command(
+        &mut self,
+        command: crate::agent::AgentCommand,
+        parent: Option<&mut Exchange>,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        match command {
+            crate::agent::AgentCommand::Request {
+                request,
+                authority,
+                target,
+                response,
+                task_admission,
+            } => {
+                if response.is_closed() {
+                    return Ok(());
+                }
+                // The active root turn authenticates a live model request against its own
+                // exchange, so a drain without that parent hands the request to the turn.
+                if parent.is_none()
+                    && request.source == crate::agent::AgentSource::Model
+                    && authority
                         .as_ref()
-                        .map(|target| self.agent_coordinator.validate_target(target))
-                        .transpose();
-                    let operation = request.operation_id.clone();
-                    let result = if let Err(error) = scoped {
-                        Err(error)
-                    } else if authenticated {
-                        self.handle_agent_request(*request, parent.as_deref_mut(), &mut event)
-                            .await
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "agent request has no active authenticated root authority"
-                        ))
-                    };
-                    self.agent_coordinator
-                        .retain_task_admission(&operation, task_admission);
-                    let _ = response.send(result);
+                        .is_some_and(|authority| !*authority.expired.borrow())
+                    && self.agent_coordinator.foreground_claimed()
+                {
+                    self.agent_coordinator.defer_to_foreground(
+                        crate::agent::AgentCommand::Request {
+                            request,
+                            authority,
+                            target,
+                            response,
+                            task_admission,
+                        },
+                    );
+                    return Ok(());
                 }
-                crate::agent::AgentCommand::Event {
+                let authenticated = if request.source == crate::agent::AgentSource::Model {
+                    authority.as_ref().is_some_and(|authority| {
+                        !*authority.expired.borrow()
+                            && authority.owner
+                                == crate::provider::ThreadOwner::root(&self.session.id)
+                            && parent
+                                .as_deref()
+                                .is_some_and(|parent| parent.id == authority.parent_exchange_id)
+                    })
+                } else {
+                    authority.is_none()
+                };
+                let scoped = target
+                    .as_ref()
+                    .map(|target| self.agent_coordinator.validate_target(target))
+                    .transpose();
+                let operation = request.operation_id.clone();
+                let result = if let Err(error) = scoped {
+                    Err(error)
+                } else if authenticated {
+                    self.handle_agent_request(*request, parent, event).await
+                } else {
+                    Err(anyhow::anyhow!(
+                        "agent request has no active authenticated root authority"
+                    ))
+                };
+                self.agent_coordinator
+                    .retain_task_admission(&operation, task_admission);
+                let _ = response.send(result);
+            }
+            crate::agent::AgentCommand::Event {
+                owner,
+                task_id,
+                event: provider_event,
+            } => {
+                self.observe_managed_agent(owner, &task_id, *provider_event, event)
+                    .await?;
+            }
+            crate::agent::AgentCommand::Completed {
+                owner,
+                task_id,
+                output,
+                host_file_changes,
+                cleanup_error,
+            } => {
+                Box::pin(self.complete_managed_agent(
                     owner,
                     task_id,
-                    event: provider_event,
-                } => {
-                    self.observe_managed_agent(owner, &task_id, *provider_event, &mut event)
-                        .await?;
-                }
-                crate::agent::AgentCommand::Completed {
-                    owner,
-                    task_id,
-                    output,
+                    *output,
                     host_file_changes,
                     cleanup_error,
-                } => {
-                    Box::pin(self.complete_managed_agent(
-                        owner,
-                        task_id,
-                        *output,
-                        host_file_changes,
-                        cleanup_error,
-                        &mut event,
-                    ))
-                    .await?;
-                }
+                    event,
+                ))
+                .await?;
             }
         }
-        Ok(event)
+        Ok(())
     }
 
     async fn observe_managed_agent(
@@ -4882,7 +4986,10 @@ impl HarnessBroker {
         if task.completed_at_ms.is_some() {
             return Ok(());
         }
-        self.cancel_agent_approvals(&owner, event).await?;
+        // Cancellation removes the child's approvals before any fallible publication, so a
+        // failure publishing their terminal events must not also lose the child's completion:
+        // an unapplied completion leaves an execution with no runtime that blocks fork and delete.
+        let approvals = self.cancel_agent_approvals(&owner, event).await;
         let (effects, next) = self.apply_managed_agent_completion(
             owner,
             task_id,
@@ -4894,7 +5001,7 @@ impl HarnessBroker {
         if let Some(next) = next {
             Box::pin(self.launch_managed_agent(next, event)).await?;
         }
-        Ok(())
+        approvals
     }
 
     /// Apply a settled child after its pending approvals have been collected.
@@ -6781,12 +6888,6 @@ impl HarnessBroker {
         if task.completed_at_ms.is_some() {
             return Ok(ForegroundAction::Wait);
         }
-        let approvals = self
-            .permission_coordinator
-            .pending_list()?
-            .into_iter()
-            .filter(|approval| approval.execution_owner.as_ref() == Some(&owner))
-            .collect();
         Ok(ForegroundAction::Effect(
             ForegroundJob::AgentCancelApprovals {
                 coordinator: self.permission_coordinator.clone(),
@@ -6796,33 +6897,37 @@ impl HarnessBroker {
                     output,
                     host_file_changes,
                     cleanup_error,
-                    approvals,
                 }),
             },
         ))
     }
 
     /// Commit child completion only after its approval cancellation has settled.
+    ///
+    /// `result` carries exactly the approvals the cancellation removed, so each receives one
+    /// terminal event and none resolved meanwhile is reported as cancelled.
     pub(crate) fn apply_foreground_agent_completion(
         &mut self,
         transaction: &mut ForegroundTransaction,
         completion: AgentCompletion,
-        result: Result<()>,
+        result: Result<Vec<ApprovalRequestView>>,
     ) -> Result<ForegroundAction> {
         transaction.agent_command_active = false;
-        if let Err(error) = result {
-            if let Some((response, _)) = transaction.pending_agent_reply.take() {
-                let _ = response.send(Err(anyhow::anyhow!("{error:#}")));
+        let approvals = match result {
+            Ok(approvals) => approvals,
+            Err(error) => {
+                if let Some((response, _)) = transaction.pending_agent_reply.take() {
+                    let _ = response.send(Err(anyhow::anyhow!("{error:#}")));
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         let AgentCompletion {
             owner,
             task_id,
             output,
             host_file_changes,
             cleanup_error,
-            approvals,
         } = completion;
         let task = self
             .agent_coordinator
@@ -6977,10 +7082,14 @@ impl HarnessBroker {
         Ok(ForegroundAction::Wait)
     }
 
-    /// Capture child interruptions and run approval/provider cleanup outside the broker.
+    /// Flag every target child, then run approval/provider cleanup outside the broker.
+    ///
+    /// All targets are interrupted here, before any cleanup is attempted, so a failure for one
+    /// child cannot leave a later child running. Capture failures travel with the operation and
+    /// are reported after every other target was handled.
     pub(crate) fn prepare_foreground_agent_interrupt(
         &mut self,
-        mut targets: Vec<String>,
+        targets: Vec<String>,
         request: OwnedAgentRequest,
         result: Value,
     ) -> Result<ForegroundAction> {
@@ -6988,55 +7097,48 @@ impl HarnessBroker {
             let _ = request.response.send(Ok(result));
             return Ok(ForegroundAction::Wait);
         }
-        let target = targets.remove(0);
-        let captured = (|| -> Result<Vec<AgentInterruptItem>> {
-            let mut items = Vec::new();
-            let agent = self.agent_coordinator.resolve(&target)?;
-            let owner = crate::provider::ThreadOwner::new(
-                self.session.id.clone().into(),
-                crate::provider::AgentId::new(agent.id.clone())?,
-            )
-            .expect("registered session and agent identities are nonempty");
-            let cancelled = self.agent_coordinator.interrupt(&target)?;
-            let cleanup = self.agent_coordinator.cleanup_task(&agent.id);
-            let provider = if cleanup.is_some() {
-                Some(
-                    self.child_provider_by_agent
-                        .get(&agent.id)
-                        .cloned()
-                        .context("child cleanup obligation has no retained provider adapter")?,
+        let mut items = Vec::new();
+        let mut failures = Vec::new();
+        for target in targets {
+            let captured = (|| -> Result<AgentInterruptItem> {
+                let agent = self.agent_coordinator.resolve(&target)?;
+                let owner = crate::provider::ThreadOwner::new(
+                    self.session.id.clone().into(),
+                    crate::provider::AgentId::new(agent.id.clone())?,
                 )
-            } else {
-                None
-            };
-            let approvals = self
-                .permission_coordinator
-                .pending_list()?
-                .into_iter()
-                .filter(|approval| approval.execution_owner.as_ref() == Some(&owner))
-                .collect();
-            items.push(AgentInterruptItem {
-                agent,
-                owner,
-                cancelled,
-                cleanup,
-                provider,
-                approvals,
-            });
-            Ok(items)
-        })();
-        let items = match captured {
-            Ok(items) => items,
-            Err(error) => {
-                let _ = request.response.send(Err(error));
-                return Ok(ForegroundAction::Wait);
+                .expect("registered session and agent identities are nonempty");
+                let cancelled = self.agent_coordinator.interrupt(&target)?;
+                let cleanup = self.agent_coordinator.cleanup_task(&agent.id);
+                let provider = if cleanup.is_some() {
+                    Some(
+                        self.child_provider_by_agent
+                            .get(&agent.id)
+                            .cloned()
+                            .context("child cleanup obligation has no retained provider adapter")?,
+                    )
+                } else {
+                    None
+                };
+                Ok(AgentInterruptItem {
+                    agent,
+                    owner,
+                    cancelled,
+                    cleanup,
+                    provider,
+                    approvals: None,
+                    cleanup_succeeded: false,
+                })
+            })();
+            match captured {
+                Ok(item) => items.push(item),
+                Err(error) => failures.push(error.context(format!("interrupt child {target}"))),
             }
-        };
+        }
         Ok(ForegroundAction::Effect(ForegroundJob::AgentInterrupt {
             coordinator: self.permission_coordinator.clone(),
             operation: AgentInterrupt {
                 items,
-                remaining: targets,
+                failures,
                 request,
                 result,
             },
@@ -7658,156 +7760,144 @@ impl HarnessBroker {
         &mut self,
         transaction: &mut ForegroundTransaction,
         operation: AgentInterrupt,
-        completed: usize,
-        result: Result<()>,
     ) -> Result<ForegroundAction> {
         transaction.agent_command_active = false;
         let AgentInterrupt {
             items,
-            remaining,
+            mut failures,
             request,
             result: reply,
         } = operation;
-        let cleanup_succeeded = result.is_ok();
-        let applied = (|| {
-            let mut effects = Vec::new();
-            for item in items.into_iter().take(completed) {
-                let AgentInterruptItem {
-                    mut agent,
-                    owner,
-                    cancelled,
-                    cleanup,
-                    provider,
-                    approvals,
-                } = item;
-                anyhow::ensure!(
-                    *owner.session_id()
-                        == crate::provider::SessionId::from(self.session.id.as_str())
-                        && self.agent_coordinator.resolve(&agent.id)?.id == agent.id,
-                    "interrupted child authority changed during cleanup"
-                );
-                if let Some(expected) = &provider {
-                    anyhow::ensure!(
-                        self.child_provider_by_agent
-                            .get(&agent.id)
-                            .is_some_and(|current| Arc::ptr_eq(current, expected)),
-                        "interrupted child provider was replaced during cleanup"
-                    );
+        let mut effects = Vec::new();
+        for item in items {
+            let agent_id = item.agent.id.clone();
+            match self.apply_foreground_agent_interrupt_item(item) {
+                Ok(item_effects) => effects.extend(item_effects),
+                Err(error) => {
+                    failures.push(error.context(format!("record interrupted child {agent_id}")))
                 }
-                for approval in approvals {
-                    if let Some(runtime) = self
-                        .child_exchange_runtime_by_agent
-                        .get_mut(owner.agent_id().as_str())
-                    {
-                        runtime.exchange.observe_blocker(
-                            format!("approval:{}", approval.id),
-                            false,
-                            self.clock.now_ms(),
-                        );
-                        self.store.save_exchange(&runtime.exchange)?;
-                    }
-                    effects.push(AppliedProviderEvent::Update(SessionUpdate::Approval {
-                        execution_kind: crate::provider::ApprovalExecutionKind::Managed,
-                        execution_owner: approval
-                            .execution_owner
-                            .clone()
-                            .context("approval lost original owner")?,
-                        update: Box::new(approval_cancelled(&approval, self.clock.now_ms())?),
-                    }));
-                }
-                for mut task in cancelled {
-                    let current = self
-                        .agent_coordinator
-                        .task(&task.id)
-                        .context("interrupted queued task disappeared")?;
-                    anyhow::ensure!(
-                        serde_json::to_value(&current)? == serde_json::to_value(&task)?,
-                        "interrupted queued task changed during cleanup"
-                    );
-                    task.state = ExchangeState::Cancelled;
-                    task.completed_at_ms = Some(self.clock.now_ms());
-                    if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
-                        exchange.finish(
-                            crate::exchange::ExchangeOutcome::Cancelled,
-                            self.clock.now_ms(),
-                        )?;
-                        self.store.complete_agent_task(&agent, &task, &exchange)?;
-                    }
-                    self.agent_coordinator.retain(agent.clone(), task)?;
-                }
-                if let Some(mut task) = cleanup.filter(|_| cleanup_succeeded) {
-                    let current = self
-                        .agent_coordinator
-                        .cleanup_task(&agent.id)
-                        .context("child cleanup obligation disappeared")?;
-                    anyhow::ensure!(
-                        serde_json::to_value(&current)? == serde_json::to_value(&task)?,
-                        "child cleanup obligation changed during cleanup"
-                    );
-                    agent.state = AgentState::Ready;
-                    agent.updated_at_ms = self.clock.now_ms();
-                    task.error = None;
-                    let mut exchange = self
-                        .store
-                        .load_exchange(&task.id)?
-                        .context("child cleanup exchange missing")?;
-                    exchange.finalization_error = None;
-                    self.store.complete_agent_task(&agent, &task, &exchange)?;
-                    self.agent_registry.insert(agent.clone());
-                    self.agent_coordinator.retain(agent, task.clone())?;
-                    self.agent_coordinator.settled(
-                        owner.agent_id().as_str(),
-                        &task.id,
-                        crate::agent::AgentSettlementDisposition::Ready,
-                    )?;
-                    self.child_provider_by_agent
-                        .remove(owner.agent_id().as_str());
-                    self.child_execution_by_agent
-                        .remove(owner.agent_id().as_str());
-                }
-                effects.push(self.prepare_agent_state()?);
-            }
-            Ok(AppliedProviderEvent::Effects(effects))
-        })();
-        match applied {
-            Ok(effects) => {
-                let delivery = self.prepare_provider_delivery(effects)?;
-                match result {
-                    Ok(()) if !remaining.is_empty() => {
-                        transaction.pending_agent_interrupt = Some((remaining, request, reply));
-                        transaction.agent_command_active = true;
-                    }
-                    result => {
-                        let _ = request.response.send(result.map(|()| reply));
-                    }
-                }
-                Ok(ForegroundAction::Effect(ForegroundJob::Publication(
-                    delivery,
-                )))
-            }
-            Err(error) => {
-                let _ = request.response.send(Err(error));
-                Ok(ForegroundAction::Wait)
             }
         }
+        let delivery = self.prepare_agent_state().and_then(|state| {
+            effects.push(state);
+            self.prepare_provider_delivery(AppliedProviderEvent::Effects(effects))
+        });
+        let _ = request
+            .response
+            .send(aggregate_failures(failures).map(|()| reply));
+        Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+            delivery?,
+        )))
     }
 
-    /// Continue a multi-child interruption after the previous result is published.
-    pub(crate) fn continue_foreground_agent_interrupt(
+    /// Record one interrupted child whose approvals were cancelled under live authority.
+    ///
+    /// The approval events name exactly the requests the unlocked cancellation removed, and the
+    /// cleanup obligation is released only when that child's own retry succeeded.
+    fn apply_foreground_agent_interrupt_item(
         &mut self,
-        transaction: &mut ForegroundTransaction,
-    ) -> Result<ForegroundAction> {
-        let Some((targets, request, reply)) = transaction.pending_agent_interrupt.take() else {
-            return Ok(ForegroundAction::Wait);
+        item: AgentInterruptItem,
+    ) -> Result<Vec<AppliedProviderEvent>> {
+        let AgentInterruptItem {
+            mut agent,
+            owner,
+            cancelled,
+            cleanup,
+            provider,
+            approvals,
+            cleanup_succeeded,
+        } = item;
+        let Some(approvals) = approvals else {
+            // The unlocked job already reported this child's approval cancellation failure.
+            return Ok(Vec::new());
         };
-        let action = self.prepare_foreground_agent_interrupt(targets, request, reply)?;
-        transaction.agent_command_active = matches!(
-            &action,
-            ForegroundAction::Effect(ForegroundJob::AgentInterrupt { .. })
+        anyhow::ensure!(
+            *owner.session_id() == crate::provider::SessionId::from(self.session.id.as_str())
+                && self.agent_coordinator.resolve(&agent.id)?.id == agent.id,
+            "interrupted child authority changed during cleanup"
         );
-        Ok(action)
+        if let Some(expected) = &provider {
+            anyhow::ensure!(
+                self.child_provider_by_agent
+                    .get(&agent.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, expected)),
+                "interrupted child provider was replaced during cleanup"
+            );
+        }
+        let mut effects = Vec::new();
+        for approval in approvals {
+            if let Some(runtime) = self
+                .child_exchange_runtime_by_agent
+                .get_mut(owner.agent_id().as_str())
+            {
+                runtime.exchange.observe_blocker(
+                    format!("approval:{}", approval.id),
+                    false,
+                    self.clock.now_ms(),
+                );
+                self.store.save_exchange(&runtime.exchange)?;
+            }
+            effects.push(AppliedProviderEvent::Update(SessionUpdate::Approval {
+                execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                execution_owner: approval
+                    .execution_owner
+                    .clone()
+                    .context("approval lost original owner")?,
+                update: Box::new(approval_cancelled(&approval, self.clock.now_ms())?),
+            }));
+        }
+        for mut task in cancelled {
+            let current = self
+                .agent_coordinator
+                .task(&task.id)
+                .context("interrupted queued task disappeared")?;
+            anyhow::ensure!(
+                serde_json::to_value(&current)? == serde_json::to_value(&task)?,
+                "interrupted queued task changed during cleanup"
+            );
+            task.state = ExchangeState::Cancelled;
+            task.completed_at_ms = Some(self.clock.now_ms());
+            if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
+                exchange.finish(
+                    crate::exchange::ExchangeOutcome::Cancelled,
+                    self.clock.now_ms(),
+                )?;
+                self.store.complete_agent_task(&agent, &task, &exchange)?;
+            }
+            self.agent_coordinator.retain(agent.clone(), task)?;
+        }
+        if let Some(mut task) = cleanup.filter(|_| cleanup_succeeded) {
+            let current = self
+                .agent_coordinator
+                .cleanup_task(&agent.id)
+                .context("child cleanup obligation disappeared")?;
+            anyhow::ensure!(
+                serde_json::to_value(&current)? == serde_json::to_value(&task)?,
+                "child cleanup obligation changed during cleanup"
+            );
+            agent.state = AgentState::Ready;
+            agent.updated_at_ms = self.clock.now_ms();
+            task.error = None;
+            let mut exchange = self
+                .store
+                .load_exchange(&task.id)?
+                .context("child cleanup exchange missing")?;
+            exchange.finalization_error = None;
+            self.store.complete_agent_task(&agent, &task, &exchange)?;
+            self.agent_registry.insert(agent.clone());
+            self.agent_coordinator.retain(agent, task.clone())?;
+            self.agent_coordinator.settled(
+                owner.agent_id().as_str(),
+                &task.id,
+                crate::agent::AgentSettlementDisposition::Ready,
+            )?;
+            self.child_provider_by_agent
+                .remove(owner.agent_id().as_str());
+            self.child_execution_by_agent
+                .remove(owner.agent_id().as_str());
+        }
+        Ok(effects)
     }
-
     /// Acknowledge only the exact child result sent to this invocation.
     pub(crate) fn apply_foreground_agent_result(
         &mut self,
@@ -10760,6 +10850,22 @@ fn attribute_provider_tool(
         exchange.checklist = Some(checklist.snapshot().clone());
     }
     Ok(())
+}
+
+/// Report every failure of a multi-target operation, keeping a lone failure's original error.
+fn aggregate_failures(mut failures: Vec<anyhow::Error>) -> Result<()> {
+    match failures.len() {
+        0 => Ok(()),
+        1 => Err(failures.remove(0)),
+        count => {
+            let detail = failures
+                .iter()
+                .map(|failure| format!("{failure:#}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(anyhow::anyhow!("{count} child operations failed: {detail}"))
+        }
+    }
 }
 
 /// Preserve cancellation ownership when clearing an approval from a child workflow.

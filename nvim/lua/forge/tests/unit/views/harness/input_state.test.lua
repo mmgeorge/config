@@ -174,7 +174,57 @@ T["retracted_input"] = function()
     end
     assert(buffer.line(state.composer_buf, 1)
       == (newer_draft and "Newer unsent draft" or "Cancel this prompt"), "cancellation overwrote or lost the draft")
+    -- A retraction the composer could not take stays recoverable as an editor-only draft.
+    local recovered = vim.tbl_filter(function(entry)
+      return entry.local_only and entry.text == "Cancel this prompt"
+    end, state.queue)
+    eq(#recovered, newer_draft and 1 or 0)
+    if newer_draft then
+      assert(recovered[1].draft_state == "rejected" and recovered[1].id ~= message.id,
+        "recovered retraction reused the retired host identity")
+      eq(#requests, count)
+      input.discard_rejected(state, recovered[1].id)
+    end
   end
+end
+
+T["retraction_into_queue_edit"] = function()
+  local input = require("forge.views.harness.input_state")
+  local submission = require("forge.views.harness.prompt_submission")
+  local requests = mock_client.record()
+  local state = { session = { id = "queue-edit-retraction" }, queue = {} }
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 0, suspended = false, messages = {} })
+  state.composer_buf = buffer.scratch()
+  local context = { document = "draft", buffer = state.composer_buf, is_current = function() return true end }
+  buffer.set(state.composer_buf, { "Retract me" })
+  submission.start(state, { context = context }, function() end)
+  local request = requests[#requests]
+  local message = vim.deepcopy(request.spec.params.action.message)
+  message.revision = 1
+  request.callback({ operation_id = request.spec.params.id, revision = 1, suspended = false, upsert = { message }, removed = {} })
+  -- An empty queue edit owns the composer; the retraction must not write into it.
+  state.queue_edit = { drafts = {}, entry = {} }
+  input.receive(state, { revision = 2, suspended = true, upsert = {}, removed = { message.id }, retracted = message.id })
+  eq(buffer.line(state.composer_buf, 1), "")
+  local recovered = vim.tbl_filter(function(entry) return entry.local_only and entry.text == "Retract me" end, state.queue)
+  eq(#recovered, 1)
+end
+
+T["perform_settles_after_ownership_change"] = function()
+  local input = require("forge.views.harness.input_state")
+  local requests = mock_client.record()
+  notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local state = { session = { id = "settled-owner" }, queue = {} }
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 0, suspended = false, messages = {} })
+  local settled
+  input.submit(state, "explain", {}, "auto", nil, function(failure) settled = failure end)
+  local request = requests[#requests]
+  state.session = { id = "another-session" }
+  request.callback({ operation_id = request.spec.params.id, revision = 1, suspended = false, upsert = {}, removed = {} })
+  assert(type(settled) == "string", "a command settled after the view changed owner never answered its caller")
 end
 
 return T

@@ -297,10 +297,15 @@ impl ObservationRecovery {
     }
 
     /// Reject a not-yet-started recovery when shutdown closes admission.
-    pub(super) fn close_pending(&mut self) {
+    ///
+    /// Return whether a requested restart was cancelled, because the owner that requested it
+    /// still holds execution for that restart and must settle its own state.
+    pub(super) fn close_pending(&mut self) -> bool {
         if matches!(self.stage, Stage::Requested) {
             self.finish(Err(ProviderLifecycleFailure::ControllerClosed));
+            return true;
         }
+        false
     }
 
     /// Await the current job while event intake and cleanup continue in the owner loop.

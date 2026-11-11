@@ -174,4 +174,26 @@ T["session_geometry"] = function()
   assert(second.presentation.close())
 end
 
+T["resume_targets_the_requesting_tab"] = function()
+  local session = require("forge.session")
+  local navigation = require("forge.views.harness.session_navigation")
+  local mock_client = dofile("nvim/lua/forge/tests/support/mock_client.lua")
+  local requests = mock_client.record()
+  local activations = {}
+  navigation.activate = function(result, options) activations[#activations + 1] = { result = result, options = options } end
+  local requesting, other = session.new_harness_state(), session.new_harness_state()
+  session.select_harness(requesting)
+  navigation.resume("chosen", { open_mode = "current" })
+  -- The user selects another tab before the host answers.
+  session.select_harness(other)
+  requests[#requests].callback({ session = { id = "chosen" } })
+  local options = activations[1].options
+  assert(options.source_state == requesting and options.focus == false and options.open_mode == "current",
+    "a late resume acted on the selected tab or took its focus")
+  navigation.resume("chosen-again", { open_mode = "tab" })
+  requests[#requests].callback({ session = { id = "chosen-again" } })
+  options = activations[2].options
+  assert(options.source_state == other and options.focus == nil, "a resume for the selected tab lost its focus")
+end
+
 return T

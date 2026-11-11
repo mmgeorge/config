@@ -141,7 +141,10 @@ local function build_spec(elicitation, host)
             picker.update(build_spec(active_elicitation, host))
             return false
           end
+          -- The silent close skips `on_close`, so the host hears the close here; otherwise it
+          -- would keep treating the question picker as open while the answers settle.
           picker.close(false)
+          if host.closed then host.closed() end
           submission.continue_requested = true
           if submission.replica.pending() == 0 then continue_if_ready(submission, host)
           elseif host.pending then host.pending() end
@@ -197,7 +200,10 @@ local function build_spec(elicitation, host)
         end
         submission.replica.remove(identity)
         if not next_elicitation then
-          picker.close(false)
+          if picker.is_open("plan_question") then
+            picker.close(false)
+            if host.closed then host.closed() end
+          end
           return
         end
         submission.revision = math.max(submission.revision + 1, next_elicitation.answer_revision or 0)
@@ -205,7 +211,7 @@ local function build_spec(elicitation, host)
         active_elicitation = submission.replica.view()
         if submission.continue_requested then
           continue_if_ready(submission, host)
-        elseif picker.is_open() then picker.update(build_spec(active_elicitation, host)) end
+        elseif picker.is_open("plan_question") then picker.update(build_spec(active_elicitation, host)) end
       end)
       return false
     end,

@@ -236,19 +236,23 @@ impl HarnessBroker {
         Ok(PriorFinalizationAction::Ready)
     }
 
-    /// Persist an uncompleted prior exchange and release its settlement fence on failure.
+    /// Release an uncompleted prior exchange's settlement fence, then persist its failure.
+    ///
+    /// The fence is released before the save, so a failed save cannot leave later admissions
+    /// waiting on a settlement nobody advances; the exchange stays finalizing either way. A
+    /// repeated call releases nothing, because the fence may belong to a later finalizer by then.
     pub(crate) fn abort_prior_finalization(
         &mut self,
         state: &mut PriorFinalization,
         error: &anyhow::Error,
     ) -> Result<()> {
-        state.exchange.finalization_error = Some(format!("{error:#}"));
-        self.store.save_exchange(&state.exchange)?;
         if state.owns_settlement
             && let Some(scope) = &state.scope
         {
             self.host_settlement.end_settlement(scope);
         }
-        Ok(())
+        state.owns_settlement = false;
+        state.exchange.finalization_error = Some(format!("{error:#}"));
+        self.store.save_exchange(&state.exchange)
     }
 }

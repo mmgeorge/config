@@ -518,6 +518,15 @@ pub struct AgentCoordinator {
     profiles: Mutex<Option<Arc<super::AgentProfileStore>>>,
 }
 
+/// Split live child executions by whether a collection can still wait for them to settle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentCollectionCount {
+    /// Executions whose turn has not settled.
+    pub running: usize,
+    /// Executions whose turn ended but whose process cleanup failed and stays retained.
+    pub cleanup_failed: usize,
+}
+
 #[must_use]
 /// Rejects new child work until its owning cancellation or policy transition finishes.
 pub struct AgentQuiescence {
@@ -1244,31 +1253,30 @@ impl AgentCoordinator {
         result
     }
 
-    /// Reports unfinished model-delegated work owned by this exchange.
+    /// Reports unfinished model-delegated work owned by this exchange that can still run.
+    ///
+    /// A queued task whose child requires user authorization cannot launch until the user acts,
+    /// so a parent waiting on it would show Working indefinitely; it is left out.
     pub fn has_active_task(&self, parent_exchange_id: &str) -> bool {
-        self.state
-            .lock()
-            .expect("agent state poisoned")
-            .task_by_id
-            .values()
-            .any(|task| {
-                task.source == AgentSource::Model
-                    && task.parent_exchange_id == parent_exchange_id
-                    && task.completed_at_ms.is_none()
-            })
+        let state = self.state.lock().expect("agent state poisoned");
+        state.task_by_id.values().any(|task| {
+            task.source == AgentSource::Model
+                && task.parent_exchange_id == parent_exchange_id
+                && task.completed_at_ms.is_none()
+                && !awaits_authorization(&state, task)
+        })
     }
 
+    /// Reports model-delegated work of this exchange whose result the parent has yet to receive,
+    /// excluding queued work that cannot launch without user authorization.
     pub fn has_unresolved_task(&self, parent_exchange_id: &str) -> bool {
-        self.state
-            .lock()
-            .expect("agent state poisoned")
-            .task_by_id
-            .values()
-            .any(|task| {
-                task.source == AgentSource::Model
-                    && task.parent_exchange_id == parent_exchange_id
-                    && !task.parent_reported
-            })
+        let state = self.state.lock().expect("agent state poisoned");
+        state.task_by_id.values().any(|task| {
+            task.source == AgentSource::Model
+                && task.parent_exchange_id == parent_exchange_id
+                && !task.parent_reported
+                && !awaits_authorization(&state, task)
+        })
     }
 
     pub fn settled(
@@ -1368,6 +1376,24 @@ impl AgentCoordinator {
             .expect("agent state poisoned")
             .execution_by_agent
             .len()
+    }
+
+    /// Count child executions still running, and those whose turn ended with failed cleanup.
+    ///
+    /// A cleanup-failed execution keeps its slot in `active_count` for its retained cleanup
+    /// obligation, but no further event settles it, so a collection waiting for children treats
+    /// it as settled with an error rather than waiting for the count to reach zero.
+    pub fn collection_count(&self) -> AgentCollectionCount {
+        let state = self.state.lock().expect("agent state poisoned");
+        let cleanup_failed = state
+            .execution_by_agent
+            .values()
+            .filter(|execution| execution.cleanup_failed)
+            .count();
+        AgentCollectionCount {
+            running: state.execution_by_agent.len() - cleanup_failed,
+            cleanup_failed,
+        }
     }
 
     /// Claim the next queued child for the exchange owner's launch path after a capacity wake.
@@ -1485,6 +1511,22 @@ impl AgentCoordinator {
 }
 
 /// Count queued tasks and uncommitted reservations without charging live executions twice.
+/// Report a task queued for launch whose child must be authorized by the user before it runs.
+///
+/// `ready_launch` skips such a task, so nothing launches it until an explicit user admission
+/// acknowledges the child's stopped task.
+fn awaits_authorization(state: &AgentStateStore, task: &AgentTask) -> bool {
+    task.completed_at_ms.is_none()
+        && state
+            .pending_launches
+            .iter()
+            .any(|queued| *queued == task.id)
+        && state
+            .agent_by_id
+            .get(&task.agent_id)
+            .is_some_and(|agent| !matches!(agent.continuation, AgentContinuationPolicy::Ready))
+}
+
 fn pending_task_count(state: &AgentStateStore) -> usize {
     state.pending_launches.len()
         + state

@@ -394,8 +394,15 @@ impl ProviderObservation {
 #[derive(Default)]
 struct ObservationState {
     consumed: forge_provider_api::EventSequence,
+    /// Highest native position handed to the owner channel; it advances only together with the
+    /// send, so a relay failure between validation and forwarding cannot publish a position
+    /// that no consumer will ever see.
     published: forge_provider_api::EventSequence,
     forwarded: forge_provider_api::EventSequence,
+    /// Highest native position the owner refused without consuming, such as an event that
+    /// arrived after its execution was fenced. A refused position applies no metadata and ends
+    /// every watermark wait through it as abandoned rather than leaving it unsatisfiable.
+    rejected: forge_provider_api::EventSequence,
     closed: bool,
     capabilities: Option<forge_provider_api::CapabilityManifest>,
     identity: Option<forge_provider_api::ProviderSessionId>,
@@ -2456,13 +2463,14 @@ impl ProviderBridge {
         // Failed native collection still owns its producer and reader for the next close attempt.
         combined(errors)?;
         // Closing the native reader may leave a valid published prefix queued for the owner.
-        // Keep the binding routable until that exact prefix has been consumed.
+        // Keep the binding routable until that exact prefix has been consumed, or until the
+        // owner refuses it or exits, since neither can consume it and close holds admission.
         let watermark = session
             .observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .published;
-        self.wait_watermark(owner, watermark).await?;
+        wait_for_consumption(&session, watermark).await?;
         session.invocations.lock().await.clear();
         let mut sessions = self.sessions.lock().await;
         sessions.remove(owner);
@@ -2655,33 +2663,7 @@ impl ProviderBridge {
         binding: &BindingId,
         sequence: forge_provider_api::EventSequence,
     ) -> Result<(), ProviderError> {
-        let original = self
-            .ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(binding)
-            .cloned()
-            .ok_or(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
-            ))?;
-        let sessions = self.sessions.lock().await;
-        let host = sessions
-            .values()
-            .find(|host| {
-                host.initialized
-                    .get()
-                    .is_some_and(|bound| &bound.binding.id == binding)
-                    && host
-                        .observation
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .ownership
-                        .as_ref()
-                        .is_some_and(|ownership| Arc::ptr_eq(ownership, &original))
-            })
-            .ok_or(ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
-            ))?;
+        let host = self.consuming_host(binding).await?;
         let mut state = host
             .observation
             .lock()
@@ -2718,6 +2700,68 @@ impl ProviderBridge {
         drop(state);
         host.changed.notify_waiters();
         Ok(())
+    }
+
+    /// Record that the owner refused a published position and will never consume it.
+    ///
+    /// The refused event's binding metadata is discarded rather than applied, so identity and
+    /// capabilities still advance only through consumed events. Waits through the position end
+    /// as abandoned instead of waiting for a consumption that cannot happen.
+    pub(crate) async fn event_rejected(
+        &self,
+        binding: &BindingId,
+        sequence: forge_provider_api::EventSequence,
+    ) -> Result<(), ProviderError> {
+        let host = self.consuming_host(binding).await?;
+        let mut state = host
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sequence > state.published {
+            return Err(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Protocol,
+            ));
+        }
+        if sequence <= state.consumed || sequence <= state.rejected {
+            return Ok(());
+        }
+        state.pending.remove(&sequence);
+        state.rejected = sequence;
+        drop(state);
+        host.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Find the live host whose current ownership registry still matches `binding`'s original.
+    async fn consuming_host(&self, binding: &BindingId) -> Result<Arc<HostSession>, ProviderError> {
+        let original = self
+            .ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(binding)
+            .cloned()
+            .ok_or(ProviderError::Observation(
+                forge_provider_api::ObservationFailure::OwnershipConflict,
+            ))?;
+        let sessions = self.sessions.lock().await;
+        sessions
+            .values()
+            .find(|host| {
+                host.initialized
+                    .get()
+                    .is_some_and(|bound| &bound.binding.id == binding)
+                    && host
+                        .observation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .ownership
+                        .as_ref()
+                        .is_some_and(|ownership| Arc::ptr_eq(ownership, &original))
+            })
+            .cloned()
+            .ok_or(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+            ))
     }
 
     /// Wait for authoritative event consumption through an operation's publication boundary.
@@ -3216,10 +3260,6 @@ async fn relay_events(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .resolve(&observation.binding_id, &observation.event)?;
-                    state.published = observation.sequence;
-                    if let Some(metadata) = binding_metadata(&observation.event, &owner) {
-                        state.pending.insert(observation.sequence, metadata);
-                    }
                     Ok::<_, EventDeliveryError>(scope)
                 })();
                 let scope = match resolved {
@@ -3400,6 +3440,20 @@ async fn relay_events(
                         }
                     }
                 }
+                // Publish the position and its metadata only now, after every fallible step, so
+                // the close watermark never names a position that was not handed to the owner.
+                // Metadata is retained before the send, because the owner may consume at once.
+                {
+                    let metadata = binding_metadata(&observation.event, &owner);
+                    let mut state = host
+                        .observation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.published = observation.sequence;
+                    if let Some(metadata) = metadata {
+                        state.pending.insert(observation.sequence, metadata);
+                    }
+                }
                 if sender
                     .send(Ok(ProviderObservation {
                         event: super::session_execution::OwnerObservation::Event(
@@ -3565,10 +3619,30 @@ async fn collect_selected_invocations(
 
 /// Preserve the primary failure and every independent cleanup failure.
 /// Consume evidence from the captured reader, never a replacement selected by owner name.
+///
+/// Configuration, settlement, and compaction need proof of consumption, so an owner that
+/// refused the position or exited fails the wait.
 async fn wait_for_watermark(
     host: &HostSession,
     watermark: forge_provider_api::EventSequence,
 ) -> Result<(), ProviderError> {
+    match wait_for_consumption(host, watermark).await? {
+        WatermarkProgress::Consumed => Ok(()),
+        WatermarkProgress::Abandoned => Err(ProviderError::Observation(
+            forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+        )),
+    }
+}
+
+/// Wait until the owner consumes through `watermark` or can no longer do so.
+///
+/// The wait ends as [`WatermarkProgress::Abandoned`] when the owner refused a position at or
+/// past the watermark, or its receiver is gone. Without that, a close holding provider
+/// admission would wait forever on a fenced or exited owner.
+async fn wait_for_consumption(
+    host: &HostSession,
+    watermark: forge_provider_api::EventSequence,
+) -> Result<WatermarkProgress, ProviderError> {
     loop {
         let notified = host.changed.notified();
         tokio::pin!(notified);
@@ -3579,16 +3653,28 @@ async fn wait_for_watermark(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.consumed >= watermark {
-                return Ok(());
+                return Ok(WatermarkProgress::Consumed);
             }
             if state.closed && state.published < watermark {
                 return Err(ProviderError::Observation(
                     forge_provider_api::lifecycle::ObservationFailure::Disconnected,
                 ));
             }
+            if state.rejected >= watermark || host.sender.is_closed() {
+                return Ok(WatermarkProgress::Abandoned);
+            }
         }
-        notified.await;
+        tokio::select! {
+            () = &mut notified => {}
+            () = host.sender.closed() => {}
+        }
     }
+}
+
+/// Distinguish owner consumption through a watermark from an owner that will never reach it.
+enum WatermarkProgress {
+    Consumed,
+    Abandoned,
 }
 
 fn combined(errors: Vec<ProviderError>) -> Result<(), ProviderError> {

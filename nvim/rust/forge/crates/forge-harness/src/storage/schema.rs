@@ -6,13 +6,24 @@ const APPLICATION: i64 = 0x464f5247;
 
 /// Serializes bootstrap pragmas across processes before SQLite can acquire its own write lock.
 pub(crate) fn bootstrap_lock(root: &std::path::Path, name: &str) -> Result<std::fs::File> {
-    let path = root.join(format!("{name}-schema.lock"));
+    exclusive_file_lock(
+        &root.join(format!("{name}-schema.lock")),
+        "database schema initialization",
+    )
+}
+
+/// Hold an exclusive advisory lock on `path` across processes, waiting at most five seconds.
+///
+/// The returned file releases the lock when dropped. `purpose` names the protected operation in
+/// errors so a busy lock reports what another process was doing.
+pub(crate) fn exclusive_file_lock(path: &std::path::Path, purpose: &str) -> Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)?;
+        .open(path)
+        .with_context(|| format!("open {purpose} lock {}", path.display()))?;
     let started = std::time::Instant::now();
     loop {
         match lock.try_lock() {
@@ -23,10 +34,12 @@ pub(crate) fn bootstrap_lock(root: &std::path::Path, name: &str) -> Result<std::
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-                "database schema initialization lock {} remained busy after 5 seconds",
+                "{purpose} lock {} remained busy after 5 seconds",
                 path.display()
             ),
-            Err(error) => return Err(error).context("acquire database schema initialization lock"),
+            Err(error) => {
+                return Err(error).with_context(|| format!("acquire {purpose} lock"));
+            }
         }
     }
 }

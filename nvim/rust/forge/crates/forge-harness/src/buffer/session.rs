@@ -41,6 +41,8 @@ struct OpenPresentation {
     history_input_id: HashSet<String>,
     unsettled_exchange: Vec<String>,
     syntax_done: HashSet<TargetId>,
+    /// Targets captured for analysis whose highlight has not been applied yet.
+    syntax_in_flight: HashSet<TargetId>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     agent_scope: Option<String>,
     last_width: WidthProfile,
@@ -757,6 +759,7 @@ impl SessionPresentation {
             history_input_id: history_input_ids(self.timeline.entry_list()),
             unsettled_exchange: unsettled,
             syntax_done: HashSet::new(),
+            syntax_in_flight: HashSet::new(),
             syntax,
             agent_scope: None,
             last_width: width,
@@ -880,33 +883,42 @@ impl SessionPresentation {
         document: &DocumentId,
     ) -> Result<Option<super::syntax::TranscriptSyntax>> {
         let open = OpenPresentation::document_mut(&mut self.open, document)?;
-        let selected = open
-            .action
-            .iter()
-            .find_map(|(target, action)| match action {
-                TranscriptAction::Diff {
-                    text, syntax: true, ..
-                } if !open.syntax_done.contains(target)
-                    && !open.diff.root.contains_key(target)
-                    && open.sections.expansion(&target.0) == Some(true) =>
-                {
-                    Some(super::syntax::TranscriptSyntax::Diff(
-                        super::syntax::SavedDiffSyntax {
-                            target: target.clone(),
-                            text: text.clone(),
-                        },
-                    ))
-                }
-                _ => None,
-            })
-            .or_else(|| {
-                open.syntax.iter().find_map(|(target, job)| {
-                    (!open.syntax_done.contains(target))
-                        .then(|| super::syntax::TranscriptSyntax::Markdown(job.clone()))
+        // Prefer targets no earlier capture has taken. A captured target stays unfinished until
+        // `apply_syntax` settles it, so a failed analysis is retried by a later request once no
+        // untaken work remains, without starving the targets behind it.
+        let select = |include_in_flight: bool| {
+            let eligible = |target: &TargetId| {
+                !open.syntax_done.contains(target)
+                    && (include_in_flight || !open.syntax_in_flight.contains(target))
+            };
+            open.action
+                .iter()
+                .find_map(|(target, action)| match action {
+                    TranscriptAction::Diff {
+                        text, syntax: true, ..
+                    } if eligible(target)
+                        && !open.diff.root.contains_key(target)
+                        && open.sections.expansion(&target.0) == Some(true) =>
+                    {
+                        Some(super::syntax::TranscriptSyntax::Diff(
+                            super::syntax::SavedDiffSyntax {
+                                target: target.clone(),
+                                text: text.clone(),
+                            },
+                        ))
+                    }
+                    _ => None,
                 })
-            });
+                .or_else(|| {
+                    open.syntax.iter().find_map(|(target, job)| {
+                        eligible(target)
+                            .then(|| super::syntax::TranscriptSyntax::Markdown(job.clone()))
+                    })
+                })
+        };
+        let selected = select(false).or_else(|| select(true));
         if let Some(job) = &selected {
-            open.syntax_done.insert(job.target().clone());
+            open.syntax_in_flight.insert(job.target().clone());
         }
         Ok(selected)
     }
@@ -936,43 +948,48 @@ impl SessionPresentation {
         if !current_source {
             return Ok(());
         }
-        let mut edits = Vec::new();
-        for syntax in highlighted {
-            let Some(index) = open.transcript.document.block_index(&syntax.id) else {
-                return Ok(());
-            };
-            let current = open
-                .transcript
-                .document
-                .blocks(open.transcript.document.revision(), index..index + 1)?
-                .next()
-                .context("highlighted block is unavailable")?;
-            if current.text.row_count() != syntax.text.row_count() {
-                return Ok(());
-            }
-            let mut replacement = current.clone();
-            for mut span in syntax.metadata.visible_decoration {
-                let row = span.range.start.row;
-                let Some((source, displayed)) = syntax.text.row(row).zip(current.text.row(row))
-                else {
-                    return Ok(());
+        // A highlight that no longer lines up with the displayed blocks is settled as done, as an
+        // applied one is; only a failure before this point leaves the target retryable.
+        'apply: {
+            let mut edits = Vec::new();
+            for syntax in highlighted {
+                let Some(index) = open.transcript.document.block_index(&syntax.id) else {
+                    break 'apply;
                 };
-                let Some(prefix) = displayed.strip_suffix(source) else {
-                    return Ok(());
-                };
-                span.range.start.column += prefix.len();
-                span.range.end.column += prefix.len();
-                replacement.metadata.visible_decoration.push(span);
+                let current = open
+                    .transcript
+                    .document
+                    .blocks(open.transcript.document.revision(), index..index + 1)?
+                    .next()
+                    .context("highlighted block is unavailable")?;
+                if current.text.row_count() != syntax.text.row_count() {
+                    break 'apply;
+                }
+                let mut replacement = current.clone();
+                for mut span in syntax.metadata.visible_decoration {
+                    let row = span.range.start.row;
+                    let Some((source, displayed)) = syntax.text.row(row).zip(current.text.row(row))
+                    else {
+                        break 'apply;
+                    };
+                    let Some(prefix) = displayed.strip_suffix(source) else {
+                        break 'apply;
+                    };
+                    span.range.start.column += prefix.len();
+                    span.range.end.column += prefix.len();
+                    replacement.metadata.visible_decoration.push(span);
+                }
+                open.transcript.mark_block_dirty(&syntax.id);
+                edits.push(forge_buffer::sequence::SequenceEdit {
+                    range: index..index + 1,
+                    block: vec![replacement],
+                });
             }
-            open.transcript.mark_block_dirty(&syntax.id);
-            edits.push(forge_buffer::sequence::SequenceEdit {
-                range: index..index + 1,
-                block: vec![replacement],
-            });
+            if let Some(patch) = open.transcript.document.edit_many(edits)? {
+                retain_patches(open, vec![patch])?;
+            }
         }
-        if let Some(patch) = open.transcript.document.edit_many(edits)? {
-            retain_patches(open, vec![patch])?;
-        }
+        open.syntax_in_flight.remove(job.target());
         open.syntax_done.insert(job.target().clone());
         Ok(())
     }
@@ -1756,6 +1773,7 @@ fn reflow(
         }
     }
     open.syntax_done.clear();
+    open.syntax_in_flight.clear();
     open.entry = entry;
     open.action = action;
     open.syntax = syntax;
@@ -1839,10 +1857,12 @@ fn apply_projection<'operation>(
                 for target in &previous_targets {
                     open.action.remove(target);
                     open.syntax_done.remove(target);
+                    open.syntax_in_flight.remove(target);
                 }
                 let syntax_target = TargetId(format!("{}:markdown-syntax", block_id.0));
                 open.syntax.remove(&syntax_target);
                 open.syntax_done.remove(&syntax_target);
+                open.syntax_in_flight.remove(&syntax_target);
                 if let Some(entry) = open.entry.get_mut(owner) {
                     entry
                         .target
@@ -2094,6 +2114,7 @@ fn apply_projection<'operation>(
         if let Some(previous) = open.entry.remove(&id) {
             for target in previous.target {
                 open.syntax_done.remove(&target);
+                open.syntax_in_flight.remove(&target);
                 open.action.remove(&target);
             }
             for call in previous.tool {
@@ -2103,6 +2124,7 @@ fn apply_projection<'operation>(
             }
             for target in previous.syntax {
                 open.syntax_done.remove(&target);
+                open.syntax_in_flight.remove(&target);
                 open.syntax.remove(&target);
             }
         }
@@ -2747,6 +2769,50 @@ mod tests {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    /// A captured highlight whose analysis never applies stays retryable, behind untaken work,
+    /// instead of being marked done before analysis ran.
+    #[test]
+    fn failed_syntax_analysis_is_retried_after_untaken_targets() -> Result<()> {
+        let document = DocumentId("timeline:syntax".into());
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![interaction_entry("syntax-retry")])?;
+        owner.open(
+            document.clone(),
+            ViewId("timeline:syntax:view".into()),
+            WidthProfile::default(),
+        )?;
+        let open = owner.open.as_mut().context("presentation is open")?;
+        open.syntax.clear();
+        let job = |name: &str| super::super::syntax::MarkdownSyntax {
+            target: TargetId(format!("{name}:markdown-syntax")),
+            block: forge_buffer::identity::BlockId(name.into()),
+            text: Default::default(),
+            code: Default::default(),
+        };
+        for name in ["first", "second"] {
+            open.syntax.insert(job(name).target.clone(), job(name));
+        }
+        let captured = |owner: &mut SessionPresentation| -> Result<Option<String>> {
+            Ok(owner
+                .capture_syntax(&document)?
+                .map(|job| job.target().0.clone()))
+        };
+
+        let failed = captured(&mut owner)?.context("first capture")?;
+        let untaken = captured(&mut owner)?.context("second capture")?;
+        assert_ne!(
+            failed, untaken,
+            "a taken target was preferred over untaken work"
+        );
+        let retried = owner
+            .capture_syntax(&document)?
+            .context("failed analysis was never retried")?;
+        assert_eq!(retried.target().0, failed);
+        owner.apply_syntax(&document, &retried, Vec::new())?;
+        assert_eq!(captured(&mut owner)?, Some(untaken));
         Ok(())
     }
 

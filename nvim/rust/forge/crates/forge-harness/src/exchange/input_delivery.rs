@@ -863,16 +863,23 @@ impl InputDeliveryRun {
                     return Err(OperationFailure::StorageUncommitted);
                 }
                 self.release_steering_order(services);
-                let prepared = submission
+                let delivery = submission
                     .record()
                     .map_err(OperationFailure::Domain)?
-                    .delivery
-                    == SubmissionState::Prepared;
+                    .delivery;
                 let retired_parent = !flight.target.parent.is_open();
-                if outcome.is_err()
-                    && prepared
-                    && (retired_parent || *services.cancellation.subscribe().borrow())
-                {
+                let user_cancelled = *services.cancellation.subscribe().borrow();
+                // A turn that ends on a question, plan submission, or collection retires its
+                // lane and settlement cancels the steering it never dispatched. Without a user
+                // cancel that retirement is not a retraction: the message returns to the queue.
+                let undispatched = match delivery {
+                    SubmissionState::Prepared => retired_parent || user_cancelled,
+                    SubmissionState::Cancelled => retired_parent && !user_cancelled,
+                    SubmissionState::Sending { .. }
+                    | SubmissionState::Accepted { .. }
+                    | SubmissionState::Discarded => false,
+                };
+                if outcome.is_err() && undispatched {
                     let input = receipts
                         .apply(
                             InputReceiptFact::Abandoned {

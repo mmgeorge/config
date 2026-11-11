@@ -60,11 +60,22 @@ function M.open(options, callback)
     if owner.transcript then owner.transcript.fold_loading = {} end
     if previous ~= owner.failure then notice(owner.failure) end
     if options.on_update then pcall(options.on_update) end
+    owner.settle_selection(owner.failure)
     if not owner.ready and not owner.open_failed then
       owner.open_failed = true
       pcall(callback, nil, owner.failure)
-      vim.schedule(function() if owner.close then owner.close() end end)
+      -- The caller still owns the composer and any draft in it after a failed open, as it does
+      -- after `reject_open`, so closing releases only the presentation's own state.
+      vim.schedule(function() if owner.close then owner.close({ preserve_buffer = true }) end end)
     end
+  end
+  ---Settles the caller waiting on a deferred agent selection, if any.
+  ---@param failure string?
+  ---@param superseded boolean?
+  function owner.settle_selection(failure, superseded)
+    local waiter = owner.selection_waiter
+    owner.selection_waiter = nil
+    if waiter then pcall(waiter.settled, failure, superseded) end
   end
   local function guard(callback)
     local epoch = owner.epoch
@@ -85,7 +96,11 @@ function M.open(options, callback)
     if not alive() or owner.failure then return false end
     if current.epoch ~= owner.epoch and not lifetime_request(current.params) then return false end
     if current.valid and not current.valid() then return false end
-    local view_id = current.params.view or (current.params.input and current.params.input.view)
+    -- `open` adopts the document for the whole presentation, not for the view it names. A window
+    -- that shows another buffer while it is in flight, such as the session picker's preview, must
+    -- not discard it, or the open callback never runs and the presentation never becomes ready.
+    local view_id = current.params.operation ~= "open"
+      and (current.params.view or (current.params.input and current.params.input.view))
     if view_id then
       for _, view in pairs(owner.views) do
         if view.id == view_id and view.active and vim.api.nvim_win_is_valid(view.window)
@@ -852,6 +867,8 @@ function M.open(options, callback)
       owner.pending_width[view.id] = { view = view.id, width = require("forge.width").capture(window) }
     end
     if owner.resizing then return end
+    -- Each view's width is independent, so a failed or discarded update for one view reports its
+    -- failure and still sends the widths that remain.
     local function send_width()
       local view, pending = next(owner.pending_width)
       if not view or not pending then owner.sync() return end
@@ -859,9 +876,14 @@ function M.open(options, callback)
       request({ operation = "resize", document = identity, view = pending.view, width = pending.width }, function(_, failure)
         owner.resizing = false
         if not alive() then return end
-        if failure then notice(failure) return end
+        if failure then notice(failure) end
         send_width()
-      end, nil, function() owner.resizing = false end)
+      end, nil, function()
+        owner.resizing = false
+        -- Discarding runs inside the request queue's dispatch loop, so the next width is queued
+        -- after that loop returns.
+        vim.schedule(function() if alive() and not owner.resizing then send_width() end end)
+      end)
     end
     send_width()
   end
@@ -929,14 +951,34 @@ function M.open(options, callback)
     end)
   end
 
+  ---Select the timeline the transcript presents: a child run, or Main when `run_id` is nil.
+  ---A selection made while another update is in flight is deferred and coalesced with later ones.
+  ---`on_settled` runs once: with no failure when the transcript shows `run_id`; with the failure
+  ---text when the selection did not take effect, so the caller can revert its own selection; or
+  ---with `superseded = true` when a later selection replaced this one before it was sent.
   ---@param run_id string?
-  function owner.select_agent(run_id)
-    if not alive() or not owner.ready or owner.failure then return end
+  ---@param on_settled? fun(failure?: string, superseded?: boolean)
+  function owner.select_agent(run_id, on_settled)
+    if not alive() or not owner.ready or owner.failure then
+      if on_settled then pcall(on_settled, owner.failure or "Harness documents are not ready") end
+      return
+    end
     local target = run_id or "main"
+    local waiter = owner.selection_waiter
+    if waiter and (on_settled or waiter.target ~= target) then owner.settle_selection(nil, true) end
+    if on_settled then owner.selection_waiter = { target = target, settled = on_settled } end
     owner.next_timeline, owner.pending = target, true
     if owner.syncing or owner.selecting or owner.applying then return end
     owner.next_timeline = nil
-    if target == owner.timeline_key then owner.sync() return end
+    waiter = owner.selection_waiter
+    owner.selection_waiter = nil
+    local function settle(failure)
+      if not waiter then return end
+      local settled = waiter.settled
+      waiter = nil
+      pcall(settled, failure)
+    end
+    if target == owner.timeline_key then owner.sync() settle(nil) return end
     owner.epoch = owner.epoch + 1
     owner.section_inflight, owner.section_request, owner.section_intent = {}, {}, {}
     owner.section_failure, owner.section_page = {}, {}
@@ -948,12 +990,16 @@ function M.open(options, callback)
     request({ operation = "select_agent", document = identity, sequence = owner.selection_sequence,
       run_id = target ~= "main" and target or vim.NIL }, function(_, failure)
       owner.selecting = false
-      if not alive() then return end
-      if failure then notice(failure) flush_staging() return end
+      if not alive() then settle("Harness presentation closed") return end
+      if failure then notice(failure) flush_staging() settle(failure) return end
       owner.save_timeline = owner.timeline_key
       owner.timeline_key, owner.restore_timeline = target, target
       flush_staging()
       owner.sync()
+      settle(nil)
+    end, nil, function()
+      owner.selecting = false
+      settle("Agent selection was discarded")
     end)
   end
 
@@ -985,6 +1031,7 @@ function M.open(options, callback)
     local collected = owner.host_generation ~= client.host_get_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
     owner.closed = true
+    owner.settle_selection("Harness presentation closed")
     owner.selection.close()
     owner.epoch = owner.epoch + 1
     owner.applying = false

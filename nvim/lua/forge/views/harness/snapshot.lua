@@ -105,7 +105,11 @@ function HarnessSnapshot.apply(state, result)
     local selected_exists = vim.iter(state.agent.run or {}):any(function(run)
       return run.id == state.selected_agent_run_id
     end)
-    if not selected_exists then state.selected_agent_run_id = nil end
+    if not selected_exists then
+      -- The composer now addresses Main, so the transcript must stop showing the vanished child.
+      state.selected_agent_run_id = nil
+      if state.presentation and state.presentation.select_agent then state.presentation.select_agent(nil) end
+    end
   end
   if result.prompt_history then prompt_history.replace(result.prompt_history) end
   if result.input and state.input and state.input.session_id == state.session.id

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use forge_diff::engine::DiffEngine;
 use forge_diff::syntax::{SyntaxEngine, SyntaxLanguage, SyntaxRequest};
 use forge_git::store::RepositoryStore;
-use forge_protocol::message::{Message, Request, Response, SessionEvent};
+use forge_protocol::message::{Request, Response, SessionEvent};
 use forge_protocol::outbound::MessageSender;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard};
@@ -943,11 +943,31 @@ impl HarnessService {
 
     /// Close each session owner and retain all effect handles until collection and dispatch finish.
     /// A deadline leaves the registry and unfinished joins available for a later shutdown attempt.
+    ///
+    /// Background generation owns separate runtimes, so it shuts down concurrently with the
+    /// sessions under the same deadline. A slow or failed Background task must not skip closing
+    /// session owners, provider runtimes, and leases.
     pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
         self.accepting.store(false, Ordering::Release);
-        tokio::time::timeout(deadline, self.background.shutdown())
-            .await
-            .context("Background shutdown timed out")??;
+        let (background, sessions) = tokio::join!(
+            async {
+                tokio::time::timeout(deadline, self.background.shutdown())
+                    .await
+                    .context("Background shutdown timed out")?
+            },
+            self.shutdown_sessions(deadline),
+        );
+        match (background, sessions) {
+            (Ok(()), sessions) => sessions,
+            (Err(background), Ok(())) => Err(background),
+            (Err(background), Err(sessions)) => {
+                Err(sessions.context(format!("Background shutdown also failed: {background:#}")))
+            }
+        }
+    }
+
+    /// Quiesce every session owner, then release provider runtimes, presentations, and leases.
+    async fn shutdown_sessions(&self, deadline: Duration) -> Result<()> {
         tokio::time::timeout(deadline, async {
             let registry = self.registry.lock().await.clone();
             if let Some(registry) = &registry {
@@ -1144,7 +1164,7 @@ impl HarnessService {
                 return Ok(json!({"initialized":true}));
             }
             ensure!(
-                registry.initial_session_id.is_none(),
+                registry.initial_session_id.get().is_none(),
                 "Harness is already initialized"
             );
         }
@@ -1190,30 +1210,84 @@ impl HarnessService {
             *harness = Some(SessionControllerRegistry::new(None, runtime, initialize));
             return Ok(json!({"initialized":true,"startup_timing":{"phases":startup_timing}}));
         }
-        let startup_request = initialize.clone();
-        let startup_runtime = runtime.clone();
-        let mut broker = tokio::task::spawn_blocking(move || {
-            HarnessBroker::initialize_with_runtime(startup_request, startup_runtime)
-        })
-        .await
-        .context("Harness session startup worker failed")??;
+        // Services-only initialization may already have resolved sessions in this registry, each
+        // holding its session lock. Selecting one of them adopts its live controller, because a
+        // second broker would collide with this process's own lock.
+        let existing = harness.clone();
+        let force_new_session = initialize.new_session_name.is_some()
+            || initialize.lease_conflict_action.as_deref() == Some("new");
+        let mut adopted = match (&existing, &initialize.session_id) {
+            (Some(registry), Some(session_id)) if !force_new_session => registry
+                .controller_by_id
+                .read()
+                .await
+                .get(session_id)
+                .cloned(),
+            _ => None,
+        };
+        let mut broker_timing = Value::Null;
+        if adopted.is_none() {
+            let startup_request = initialize.clone();
+            let startup_runtime = runtime.clone();
+            let broker = tokio::task::spawn_blocking(move || {
+                HarnessBroker::initialize_with_runtime(startup_request, startup_runtime)
+            })
+            .await
+            .context("Harness session startup worker failed")?;
+            match broker {
+                Ok(mut broker) => {
+                    broker_timing =
+                        serde_json::to_value(std::mem::take(&mut broker.startup_timing))?;
+                    adopted = Some(SessionController::new(broker).await?);
+                }
+                Err(error) => {
+                    // The default selection can pick a session this registry already owns.
+                    let owned = match (&existing, error.downcast_ref::<SessionLeaseConflict>()) {
+                        (Some(registry), Some(conflict)) => registry
+                            .controller_by_id
+                            .read()
+                            .await
+                            .get(&conflict.session_id)
+                            .cloned(),
+                        _ => None,
+                    };
+                    adopted = Some(owned.ok_or(error)?);
+                }
+            }
+        }
+        let controller = adopted.expect("session selection produced a controller");
         startup_timing.insert(
             "broker_ready_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
         );
-        let broker_timing = std::mem::take(&mut broker.startup_timing);
-        let controller = SessionController::new(broker).await?;
         let snapshot = controller.observer.snapshot()?;
         let mut result = serde_json::to_value(&snapshot)?;
         startup_timing.insert(
             "snapshot_serialized_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
         );
-        *harness = Some(SessionControllerRegistry::new(
-            Some((snapshot.session.id.clone(), controller)),
-            runtime,
-            initialize,
-        ));
+        match &existing {
+            // Keep every live controller; replacing the registry would drop their owners.
+            Some(registry) => {
+                registry
+                    .controller_by_id
+                    .write()
+                    .await
+                    .entry(snapshot.session.id.clone())
+                    .or_insert(controller);
+                registry
+                    .initial_session_id
+                    .set(snapshot.session.id.clone())
+                    .map_err(|_| anyhow::anyhow!("Harness is already initialized"))?;
+            }
+            None => {
+                *harness = Some(SessionControllerRegistry::new(
+                    Some((snapshot.session.id.clone(), controller)),
+                    runtime,
+                    initialize,
+                ));
+            }
+        }
         startup_timing.insert(
             "controller_ready_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
@@ -1518,31 +1592,23 @@ impl SessionController {
                 let Some(controller) = controller.upgrade() else {
                     return;
                 };
-                let session_id = controller
-                    .catalog_request
-                    .read()
-                    .await
-                    .harness_session_id
-                    .clone();
-                let outcome = controller
+                // Take the broker for one command at a time, so session requests and root event
+                // intake can run between commands instead of waiting for the whole queue.
+                let mut event = Vec::new();
+                let drained = controller
                     .broker
                     .lock()
                     .await
-                    .drain_agent_commands(None)
+                    .drain_next_agent_command(None, &mut event)
                     .await;
                 drop(controller);
-                match outcome {
-                    Ok(event) => {
-                        for event in event {
-                            if message_sink.send_event(event).await.is_err() {
-                                return;
-                            }
-                        }
+                for event in event {
+                    if message_sink.send_event(event).await.is_err() {
+                        return;
                     }
-                    Err(error) => {
-                        let _ = message_sink.send_event(SessionEvent {session_id,event:"provider_event".into(),
-                            payload:json!({"kind":"error","text":format!("Agent coordinator failed: {error:#}")})}).await;
-                    }
+                }
+                if drained {
+                    continue;
                 }
                 if revision.changed().await.is_err() {
                     return;
@@ -1579,7 +1645,8 @@ struct SessionControllerRegistry {
     fork_task: Mutex<JoinSet<()>>,
     runtime: Arc<BrokerRuntime>,
     initialize: InitializeRequest,
-    initial_session_id: Option<String>,
+    /// Set once by the first full initialization, which may follow services-only initialization.
+    initial_session_id: std::sync::OnceLock<String>,
 }
 
 /// Coordinates queued child work with one asynchronous provider fork.
@@ -1622,7 +1689,10 @@ impl SessionControllerRegistry {
         runtime: Arc<BrokerRuntime>,
         initialize: InitializeRequest,
     ) -> Arc<Self> {
-        let initial_session_id = initial.as_ref().map(|(id, _)| id.clone());
+        let initial_session_id = std::sync::OnceLock::new();
+        if let Some((session_id, _)) = &initial {
+            initial_session_id.get_or_init(|| session_id.clone());
+        }
         Arc::new(Self {
             controller_by_id: RwLock::new(initial.into_iter().collect()),
             provider_fork_by_id: RwLock::new(HashMap::new()),
@@ -1636,7 +1706,7 @@ impl SessionControllerRegistry {
     #[cfg(test)]
     fn initial_session_id(&self) -> &str {
         self.initial_session_id
-            .as_deref()
+            .get()
             .expect("test requires an opened session")
     }
 
@@ -1664,8 +1734,40 @@ impl SessionControllerRegistry {
             "resolved Harness controller does not own requested session {session_id}"
         );
         let controller = SessionController::new(broker).await?;
+        self.fail_interrupted_provider_fork(session_id, &controller)
+            .await?;
         controller_by_id.insert(session_id.to_owned(), Arc::clone(&controller));
         Ok(controller)
+    }
+
+    /// Record a `Preparing` fork that has no live gate as failed.
+    ///
+    /// Only `start_session_fork` creates a gate, before it resolves the child, and the gate lives
+    /// until the fork task records its outcome. A gateless `Preparing` child therefore belongs to a
+    /// fork that a previous host quit or that failed before its task started, and nothing else
+    /// will ever complete it.
+    async fn fail_interrupted_provider_fork(
+        &self,
+        session_id: &str,
+        controller: &SessionController,
+    ) -> Result<()> {
+        let mut broker = controller.broker.lock().await;
+        if !matches!(
+            broker.provider_fork_state(),
+            ProviderForkState::Preparing { .. }
+        ) || self
+            .provider_fork_by_id
+            .read()
+            .await
+            .contains_key(session_id)
+        {
+            return Ok(());
+        }
+        broker
+            .complete_provider_fork(Err(
+                "provider fork preparation was interrupted before this broker resumed".into(),
+            ))
+            .map(drop)
     }
 
     /// Queue provider-bound child work until its native fork reaches durable readiness.
@@ -1684,11 +1786,25 @@ impl SessionControllerRegistry {
                     .read()
                     .await
                     .get(session_id)
-                    .cloned()
-                    .context(
-                        "provider fork preparation was interrupted before this broker resumed",
-                    )?;
-                gate.wait().await
+                    .cloned();
+                match gate {
+                    Some(gate) => gate.wait().await,
+                    // The initial session is opened without `resolve`, so its interrupted fork
+                    // is recorded here instead.
+                    // A fork that finished since the state read has already removed its gate,
+                    // so the state is read again under the broker lock that recorded it.
+                    None => {
+                        self.fail_interrupted_provider_fork(session_id, controller)
+                            .await?;
+                        match controller.broker.lock().await.provider_fork_state() {
+                            ProviderForkState::Ready => Ok(()),
+                            ProviderForkState::Failed { message, .. } => anyhow::bail!(message),
+                            ProviderForkState::Preparing { .. } => anyhow::bail!(
+                                "provider fork preparation was interrupted before this broker resumed"
+                            ),
+                        }
+                    }
+                }
             }
         }
     }
@@ -2352,11 +2468,13 @@ async fn route_new_session(
     message_sink
         .send_response(Response::success(request.id, snapshot)?)
         .await?;
-    message_sink.send(Message::Event(SessionEvent {
-        session_id: child.id.clone(),
-        event: "session_created".into(),
-        payload: serde_json::to_value(child)?,
-    }))?;
+    message_sink
+        .send_event(SessionEvent {
+            session_id: child.id.clone(),
+            event: "session_created".into(),
+            payload: serde_json::to_value(child)?,
+        })
+        .await?;
     child_controller.start_provider(message_sink).await;
     Ok(())
 }
@@ -2393,39 +2511,44 @@ async fn start_session_fork(
         purpose,
     )?;
     let child_session_id = preparation.child.id.clone();
-    let child_controller = registry.resolve(&child_session_id).await?;
+    // The gate exists before the child controller, so resolution never mistakes this live fork for
+    // one interrupted by a previous host and fails it.
     let gate = ProviderForkGate::new();
     registry
         .provider_fork_by_id
         .write()
         .await
         .insert(child_session_id.clone(), Arc::clone(&gate));
+    let child_controller = match registry.resolve(&child_session_id).await {
+        Ok(controller) => controller,
+        Err(error) => {
+            // The persisted child stays `Preparing` without a gate, and its next resolution
+            // records the interrupted fork as failed.
+            gate.complete(Err(format!("open forked session: {error:#}")))
+                .await;
+            registry
+                .provider_fork_by_id
+                .write()
+                .await
+                .remove(&child_session_id);
+            return Err(error);
+        }
+    };
 
-    if let Some(response_id) = response_id {
-        let mut snapshot = serde_json::to_value(child_controller.broker.lock().await.snapshot()?)?;
-        snapshot["fork_performance"] = json!({
-            "total_ms": preparation.total_duration_ms,
-            "timing": preparation.timing,
-            "provider_pending": true,
-        });
-        message_sink
-            .send_response(Response::success(response_id, snapshot)?)
-            .await?;
-    }
-    message_sink.send(Message::Event(SessionEvent {
-        session_id: child_session_id.clone(),
-        event: "session_created".into(),
-        payload: serde_json::to_value(&preparation.child)?,
-    }))?;
-
-    let message_sink = message_sink.clone();
+    // Spawn the fork before any fallible delivery, so a failed response or event cannot leave the
+    // gate pending forever. The task holds its outcome until the child is announced, keeping
+    // the response and `session_created` ahead of the fork's ready or failed event.
+    let (announced, announcement) = tokio::sync::oneshot::channel::<()>();
+    let completion_sink = message_sink.clone();
     let registry_for_completion = Arc::clone(&registry);
     let child_result = Arc::clone(&child_controller);
     let gate_result = Arc::clone(&gate);
+    let provider_request = preparation.provider_request;
     task.spawn(async move {
+        let message_sink = completion_sink;
         let provider_started = Instant::now();
         let mut result = provider
-            .thread_fork(preparation.provider_request)
+            .thread_fork(provider_request)
             .await
             .map_err(|error| format!("{error:#}"));
         if let Ok(result) = &mut result {
@@ -2434,6 +2557,8 @@ async fn start_session_fork(
                 duration_ms: provider_started.elapsed().as_secs_f64() * 1000.0,
             });
         }
+        // A dropped sender means announcement failed; the outcome is still recorded.
+        let _ = announcement.await;
         let mut readiness = result.as_ref().map(|_| ()).map_err(ToOwned::to_owned);
         let completion = child_controller
             .broker
@@ -2457,6 +2582,27 @@ async fn start_session_fork(
             .await
             .remove(&child_session_id);
     });
+    drop(task);
+
+    if let Some(response_id) = response_id {
+        let mut snapshot = serde_json::to_value(child_result.broker.lock().await.snapshot()?)?;
+        snapshot["fork_performance"] = json!({
+            "total_ms": preparation.total_duration_ms,
+            "timing": preparation.timing,
+            "provider_pending": true,
+        });
+        message_sink
+            .send_response(Response::success(response_id, snapshot)?)
+            .await?;
+    }
+    message_sink
+        .send_event(SessionEvent {
+            session_id: child_result.observer.session_id().to_owned(),
+            event: "session_created".into(),
+            payload: serde_json::to_value(&preparation.child)?,
+        })
+        .await?;
+    let _ = announced.send(());
     Ok((child_result, gate_result))
 }
 
@@ -2492,6 +2638,39 @@ async fn delete_session(
         }
         controller.input_stopping.store(true, Ordering::Release);
         controller.coordinator.submissions.changed.notify_one();
+    }
+    let deleted = delete_stopping_session(&registry, &target, selected.as_ref()).await;
+    if let Err(error) = deleted {
+        // A stopping controller has closed its exchange owner and refuses every request, and
+        // nothing clears that state. Evict it so the next request or retried deletion resolves a
+        // fresh owner from storage; that owner can take the lease once the old one drops.
+        if let Some(controller) = &selected {
+            let mut controllers = registry.controller_by_id.write().await;
+            if controllers
+                .get(&target)
+                .is_some_and(|current| Arc::ptr_eq(current, controller))
+            {
+                controllers.remove(&target);
+            }
+        }
+        return Err(error);
+    }
+    message_sink
+        .send_response(Response::success(
+            request.id,
+            json!({"deleted":target,"provider_session_preserved":true}),
+        )?)
+        .await?;
+    Ok(())
+}
+
+/// Quiesce a controller already marked stopping, then delete the session's durable records.
+async fn delete_stopping_session(
+    registry: &SessionControllerRegistry,
+    target: &str,
+    selected: Option<&Arc<SessionController>>,
+) -> Result<()> {
+    if let Some(controller) = selected {
         // The owner retains every admitted command and collection effect when this wait is cancelled.
         tokio::time::timeout(Duration::from_secs(60), controller.finish_exchange_owner())
             .await
@@ -2532,43 +2711,35 @@ async fn delete_session(
     }
     let mut controllers = registry.controller_by_id.write().await;
     ensure!(
-        match (&selected, controllers.get(&target)) {
+        match (selected, controllers.get(target)) {
             (Some(selected), Some(current)) => Arc::ptr_eq(selected, current),
             (None, None) => true,
             _ => false,
         },
         "session controller changed while deletion waited for its owner"
     );
-    if let Some(controller) = &selected {
+    if let Some(controller) = selected {
         require_idle_deletion(controller)?;
         controller.broker.lock().await.release_lease()?;
     }
     let mut store = SqliteStore::open(std::path::Path::new(&registry.initialize.data_root))?;
-    let session = crate::broker::SessionNotFound::require(store.load_session(&target)?, &target)?;
+    let session = crate::broker::SessionNotFound::require(store.load_session(target)?, target)?;
     let plans = crate::plan::PlanFileStore::new(
         std::path::Path::new(&registry.initialize.data_root),
         &session.workspace,
-    )
-    .unwrap();
-    store.delete_session_with(&target, || {
-        plans.delete_session(&target)?;
+    )?;
+    store.delete_session_with(target, || {
+        plans.delete_session(target)?;
         crate::input::SessionInputQueue::delete_persisted(
             std::path::Path::new(&registry.initialize.data_root),
-            &target,
+            target,
         )
     })?;
     if let Some(controller) = selected {
         controller.coordinator.execution.close();
         controller.coordinator.control.close();
-        controllers.remove(&target);
+        controllers.remove(target);
     }
-    drop(controllers);
-    message_sink
-        .send_response(Response::success(
-            request.id,
-            json!({"deleted":target,"provider_session_preserved":true}),
-        )?)
-        .await?;
     Ok(())
 }
 

@@ -2176,7 +2176,8 @@ impl Driver {
             crate::provider::submission::SubmissionState::Prepared
             | crate::provider::submission::SubmissionState::Cancelled => {}
             crate::provider::submission::SubmissionState::Sending { .. }
-            | crate::provider::submission::SubmissionState::Accepted { .. } => {
+            | crate::provider::submission::SubmissionState::Accepted { .. }
+            | crate::provider::submission::SubmissionState::Discarded => {
                 return Err(invalid());
             }
         }
@@ -2283,7 +2284,12 @@ impl Driver {
             if scope.owner().session_id() != self.owner.session_id()
                 || native.is_none() && !registered_host
             {
-                self.fail_observation(ObservationFailure::OwnershipConflict);
+                self.refuse_native_event(
+                    native.as_ref(),
+                    ObservationFailure::OwnershipConflict,
+                    FailureOrigin::Observation,
+                )
+                .await;
                 return;
             }
         }
@@ -2303,13 +2309,19 @@ impl Driver {
                 .invocation()
                 .is_some_and(|scope| scope.owner() == self.owner && !self.state.contains(scope))
         {
-            self.fail_observation(ObservationFailure::OwnershipConflict);
+            self.refuse_native_event(
+                native.as_ref(),
+                ObservationFailure::OwnershipConflict,
+                FailureOrigin::Observation,
+            )
+            .await;
             return;
         }
         if native.is_some()
             && let Err(failure) = self.validate_native_event(&event)
         {
-            self.fail_observation(failure);
+            self.refuse_native_event(native.as_ref(), failure, FailureOrigin::Observation)
+                .await;
             return;
         }
         if let Some((binding, sequence)) = &native {
@@ -2319,11 +2331,21 @@ impl Driver {
                 ..
             } = &event
             else {
-                self.fail_observation(ObservationFailure::Protocol);
+                self.refuse_native_event(
+                    native.as_ref(),
+                    ObservationFailure::Protocol,
+                    FailureOrigin::Observation,
+                )
+                .await;
                 return;
             };
             if &source.binding_id != binding || source.sequence != *sequence {
-                self.fail_observation(ObservationFailure::OwnershipConflict);
+                self.refuse_native_event(
+                    native.as_ref(),
+                    ObservationFailure::OwnershipConflict,
+                    FailureOrigin::Observation,
+                )
+                .await;
                 return;
             }
             let core = crate::exchange::core_log::CoreRecord::provider_event_metadata(
@@ -2333,10 +2355,12 @@ impl Driver {
                 provider_event,
             );
             if let Err(error) = self.provider.record_core_event(&self.owner, &core) {
-                self.fail_observation_with_origin(
+                self.refuse_native_event(
+                    native.as_ref(),
                     ObservationFailure::LifecycleUnavailable,
                     FailureOrigin::Error(error),
-                );
+                )
+                .await;
                 return;
             }
         }
@@ -4160,6 +4184,35 @@ impl Driver {
 
     fn fail_all(&mut self, _message: &str) {
         self.fail_observation(ObservationFailure::Protocol);
+    }
+
+    /// Fence this owner for an event it cannot accept, and release that event's native stream
+    /// position as refused.
+    ///
+    /// A refused native position is never consumed, so without the refusal a later close would
+    /// wait for it forever while holding provider admission. The refusal applies none of the
+    /// event's binding metadata. A refusal the bridge cannot record leaves the fence in place.
+    async fn refuse_native_event(
+        &mut self,
+        native: Option<&(
+            forge_provider_api::BindingId,
+            forge_provider_api::EventSequence,
+        )>,
+        failure: ObservationFailure,
+        origin: FailureOrigin,
+    ) {
+        self.fail_observation_with_origin(failure, origin);
+        if let Some((binding, sequence)) = native
+            && let Err(error) = self.provider.event_rejected(binding, *sequence).await
+        {
+            self.trace.record(
+                self.owner.session_id().as_str(),
+                "provider.event.refusal_unrecorded",
+                serde_json::json!({
+                    "binding_id": binding, "sequence": sequence, "error": error.to_string(),
+                }),
+            );
+        }
     }
 
     fn fail_observation(&mut self, failure: ObservationFailure) {

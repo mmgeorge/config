@@ -730,6 +730,9 @@ function M.apply_async(session, update, alive, done)
   local readonly = vim.bo[session.buffer].readonly
   local observed_tick = vim.api.nvim_buf_get_changedtick(session.buffer)
   session.update_pending = token
+  -- Set when the caller's `alive` ends the work between slices. The owner withdrew the update, so
+  -- the replica keeps its last applied state instead of being marked desynchronized.
+  local withdrawn = false
   cooperative.run(function()
     if update.patch then
       array(update.patch)
@@ -746,9 +749,12 @@ function M.apply_async(session, update, alive, done)
     if update.block then return M.apply_snapshot(session, update) end
     return M.apply_patch(session, update)
   end, function()
-    return session.update_pending == token and session.status ~= "Closed"
-      and vim.api.nvim_buf_is_valid(session.buffer)
-      and vim.api.nvim_buf_get_changedtick(session.buffer) == observed_tick and alive()
+    if session.update_pending ~= token or session.status == "Closed"
+      or not vim.api.nvim_buf_is_valid(session.buffer)
+      or vim.api.nvim_buf_get_changedtick(session.buffer) ~= observed_tick then return false end
+    if alive() then return true end
+    withdrawn = true
+    return false
   end, function(result, failure, timing)
     if session.update_pending ~= token then return end
     session.update_pending = nil
@@ -760,7 +766,7 @@ function M.apply_async(session, update, alive, done)
       if session.status ~= "Closed" and vim.api.nvim_buf_is_valid(session.buffer) then
         vim.bo[session.buffer].modifiable = false
         vim.bo[session.buffer].readonly = readonly
-        result = M.fail_apply(session, failure)
+        result = withdrawn and { kind = "Cancelled" } or M.fail_apply(session, failure)
       else result = { kind = "Closed" } end
     end
     require("forge.infra.perf").event("harness", "ui.document.slices", {

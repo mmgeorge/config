@@ -95,6 +95,10 @@ pub(super) fn capture(
         .map_err(ReconnectError::Snapshot)?;
     let page = services.publications.snapshot(cursor, limit)?;
     let high_water = page.high_water();
+    // A cursorless page starts after the admitted prefix, so completeness compares against that
+    // start. The response still echoes the caller's own cursor as `after`, which the editor
+    // matches against the cursor it holds before promoting it to `through`.
+    let page_start = page.page_start();
     let (records, receipt) = page.into_parts();
     let through = records.last().map(|record| record.sequence());
     let events: Vec<_> = records
@@ -114,7 +118,7 @@ pub(super) fn capture(
     response["owner_publication"] = serde_json::json!({
         "receipt_id": uuid::Uuid::new_v4().to_string(),
         "after": cursor, "through": through, "high_water": high_water,
-        "more": through.or(cursor) != high_water, "events": events,
+        "more": through.or(page_start) != high_water, "events": events,
         "update_step": step, "execution_available": execution_available,
     });
     Ok(ReconnectSnapshot {

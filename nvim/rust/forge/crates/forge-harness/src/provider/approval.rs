@@ -1243,13 +1243,33 @@ impl PermissionCoordinator {
         owner: &crate::provider::ThreadOwner,
         event_sink: Option<&HarnessEventSink>,
     ) -> Result<()> {
+        self.cancel_owner_approvals(owner, event_sink)
+            .await
+            .map(|_| ())
+    }
+
+    /// Cancel one owner's approvals and return exactly the requests this call removed.
+    ///
+    /// A caller that publishes its own terminal events must use this list rather than an
+    /// earlier `pending_list` snapshot: a request registered after the snapshot would otherwise
+    /// receive no terminal event, and one resolved after it would receive a false cancellation.
+    pub async fn cancel_owner_approvals(
+        &self,
+        owner: &crate::provider::ThreadOwner,
+        event_sink: Option<&HarnessEventSink>,
+    ) -> Result<Vec<ApprovalRequestView>> {
         let pending_list = self.take_owner_approvals(owner)?;
+        let cancelled = pending_list
+            .iter()
+            .map(|pending| pending.view.clone())
+            .collect();
         Self::cancel_pending(
             pending_list,
             event_sink,
             ApprovalCancellationReason::TurnInterrupted,
         )
-        .await
+        .await?;
+        Ok(cancelled)
     }
 
     /// Publish cancellation on each request's own stream and release every waiter on failure.
@@ -1273,15 +1293,19 @@ impl PermissionCoordinator {
         }
     }
 
-    /// Begin cancellation synchronously after callback authority is checked.
+    /// Begin cancellation synchronously after callback authority is checked, returning exactly the
+    /// requests this call removed so the caller publishes terminal events for those alone.
     pub(crate) fn cancel_owner_immediate(
         &self,
         owner: &crate::provider::ThreadOwner,
-    ) -> Result<()> {
-        for pending in self.take_owner_approvals(owner)? {
+    ) -> Result<Vec<ApprovalRequestView>> {
+        let pending_list = self.take_owner_approvals(owner)?;
+        let mut cancelled = Vec::with_capacity(pending_list.len());
+        for pending in pending_list {
+            cancelled.push(pending.view.clone());
             let _ = pending.response.send(ApprovalResolution::Cancel);
         }
-        Ok(())
+        Ok(cancelled)
     }
 
     fn take_owner_approvals(

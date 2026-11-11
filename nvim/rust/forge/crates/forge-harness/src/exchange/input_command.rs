@@ -235,9 +235,9 @@ pub(super) fn apply_input(
                     .input
                     .acknowledge_retry(operation)
                     .map_err(InputCommandFailure::Domain),
-                SubmissionState::Sending { .. } => Err(InputCommandFailure::Rejected(
-                    CommandFailure::DeliveryUncertain,
-                )),
+                SubmissionState::Sending { .. } | SubmissionState::Discarded => Err(
+                    InputCommandFailure::Rejected(CommandFailure::DeliveryUncertain),
+                ),
                 SubmissionState::Prepared | SubmissionState::Cancelled => {
                     submission.cancel().map_err(InputCommandFailure::Domain)?;
                     services

@@ -789,20 +789,30 @@ impl QuestionController {
     }
 
     /// Commit observation/fallback evidence before retiring one registered answer destination.
+    ///
+    /// A closing owner cannot wait for storage to recover, so when its commit fails it releases
+    /// the destination without moving the answers; they stay in the canonical discussion.
     pub(crate) fn retire_wait(
         &self,
         ids: &[QuestionId],
         end: &QuestionWaitEnd,
         policy: QuestionWaitPolicy,
     ) -> std::result::Result<Option<Vec<QuestionRecord>>, QuestionWaitError> {
-        if matches!(end, QuestionWaitEnd::OwnerClosed)
-            || matches!(policy, QuestionWaitPolicy::Closing)
-                && !matches!(end, QuestionWaitEnd::Observed(_))
-        {
-            release_waiting(self, ids)?;
-            return Ok(None);
+        match (self.retire_wait_durably(ids, end), policy) {
+            (Err(_), QuestionWaitPolicy::Closing) => {
+                release_waiting(self, ids)?;
+                Ok(None)
+            }
+            (result, _) => result,
         }
+    }
 
+    /// Record observed answers and move unobserved ones to the outbox in one transaction.
+    fn retire_wait_durably(
+        &self,
+        ids: &[QuestionId],
+        end: &QuestionWaitEnd,
+    ) -> std::result::Result<Option<Vec<QuestionRecord>>, QuestionWaitError> {
         // Keep question-store-before-wait-registry order, matching answer admission.
         let mut connection = self
             .connection
@@ -866,14 +876,16 @@ impl QuestionController {
         }
 
         // Recover only messages with no remaining destination and no prior tool-observation receipt.
+        // A closing owner recovers them too: answers given while the wait was registered went to
+        // that wait rather than the outbox, and the outbox is the only record that survives into
+        // the next owner, which admits it at startup. The closing owner itself admits nothing.
         let mut recovered = Vec::new();
         for id in ids.iter().filter(|id| {
-            matches!(policy, QuestionWaitPolicy::Live)
-                && waiting
-                    .iter()
-                    .filter(|registered| *registered == *id)
-                    .count()
-                    == 1
+            waiting
+                .iter()
+                .filter(|registered| *registered == *id)
+                .count()
+                == 1
         }) {
             let question = state
                 .snapshot
@@ -1612,7 +1624,8 @@ pub(crate) enum QuestionWaitEnd {
     OwnerClosed,
 }
 
-/// Limit fallback admission to a live owner; shutdown still retains observed-answer evidence.
+/// Select how a failed retirement commit ends: a live owner retries it, a closing owner releases
+/// the destination so shutdown cannot wait on storage recovery.
 #[derive(Clone, Copy)]
 pub(crate) enum QuestionWaitPolicy {
     Live,
@@ -1978,6 +1991,49 @@ mod tests {
             },
         ))?;
         assert_eq!(controller.outbox()?.len(), 1);
+        Ok(())
+    }
+
+    /// A partial answer given to a live wait survives the owner closing before the wait ends.
+    #[test]
+    fn closing_owner_moves_partial_wait_answers_to_the_outbox() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = std::sync::Arc::new(QuestionController::open(root.path(), "session")?);
+        let wait = controller.prepare_tool_wait(
+            "closing",
+            "exchange",
+            None,
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Required),
+            ],
+            None,
+        )?;
+        let ids = wait.question_ids().to_vec();
+        controller.apply(command(
+            &ids[0],
+            "partial-answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        ))?;
+        assert!(
+            controller.outbox()?.is_empty(),
+            "a live wait owns the answer"
+        );
+        controller.retire_wait(
+            &ids,
+            &QuestionWaitEnd::OwnerClosed,
+            QuestionWaitPolicy::Closing,
+        )?;
+        let outbox = controller.outbox()?;
+        assert_eq!(outbox.len(), 1, "the partial answer was dropped on close");
+        assert_eq!(outbox[0].id, "partial-answer");
+        drop(wait);
+        let restored = QuestionController::open(root.path(), "session")?;
+        assert_eq!(restored.outbox()?.len(), 1);
         Ok(())
     }
 

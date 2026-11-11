@@ -1071,6 +1071,76 @@ T["transport_failure"] = function()
   assert(#diagnostics == 1 and diagnostics[1].message:find("exited 1", 1, true))
 end
 
+-- A host that exits while a frame is half written must still finish its exit path: pending callbacks
+-- fail, subscribers learn of the stop, and the next start launches a fresh host. The receiver used to
+-- route the truncated frame through `host_stop`, which drained a process that had already exited and
+-- waited on a forced collection that cannot succeed. The forced-collection collaborators fail the way
+-- they do for a dead process on each platform, so the case fails if recovery depends on them.
+local function exit_inside_frame_recovers(windows)
+  local client = require("forge.client")
+  local builder = require("forge.builder")
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local original_has = stub(vim.fn, "has", function(feature)
+    if feature == "win32" then return windows and 1 or 0 end
+    return original_has(feature)
+  end)
+  local original_system = stub(vim, "system", function(command, options, on_exit)
+    if command[1] ~= "taskkill" then return original_system(command, options, on_exit) end
+    vim.schedule(function() on_exit({ code = 128, stdout = "", stderr = "ERROR: process not found" }) end)
+    return { kill = function() end }
+  end)
+  local emitted, exited
+  local launch_count = 0
+  builder.ensure = function(callback) callback({ ok = true, path = "truncated-frame-fixture" }) end
+  local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  client._host_reset_for_test()
+  client._host_set_launcher_for_test(function(_, options, on_exit)
+    launch_count = launch_count + 1
+    emitted, exited = options.stdout, on_exit
+    return {
+      pid = 4242,
+      write = function(_, encoded)
+        local request = vim.json.decode(encoded)
+        if request.method == "host.initialize" then
+          emitted(nil, vim.json.encode({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) .. "\n")
+        end
+      end,
+      kill = function() error("process already exited") end,
+      wait = function() error("process already exited") end,
+    }
+  end)
+  local function start()
+    local ready = false
+    client.host_start(function(_, failure) assert(not failure, failure) ready = true end)
+    wait_until(function() return ready end, "fixture host did not start")
+    client._client.runtime_ready = true
+    client._provider_registry_adopt_for_test(true)
+  end
+  start()
+  local stopped = false
+  client.session_events_subscribe(function(event) if event == "host_stopped" then stopped = true end end)
+  local unresolved
+  client.request({ method = "repository.status.document", params = {} }, function(_, failure, detail)
+    unresolved = { failure = failure, detail = detail }
+  end)
+  wait_until(function() return client._client.pending[next(client._client.pending)].dispatched end,
+    "request was not written to the fixture host")
+  emitted(nil, '{"id":')
+  exited({ code = 0 })
+  wait_until(function() return unresolved ~= nil end, "pending callback did not run after the host exited mid-frame")
+  assert(unresolved.failure:find("unresolved request", 1, true), unresolved.failure)
+  eq(unresolved.detail.code, "outcome_unknown")
+  assert(stopped, "subscribers did not receive host_stopped")
+  assert(not client._client.draining and not client._client.process, "client stayed draining after the host exited")
+  assert(diagnostics[1] and diagnostics[1].message:find("ended inside a frame", 1, true), vim.inspect(diagnostics))
+  start()
+  eq(launch_count, 2)
+end
+
+T["exit_inside_frame_windows"] = function() exit_inside_frame_recovers(true) end
+
+T["exit_inside_frame_unix"] = function() exit_inside_frame_recovers(false) end
+
 T["history_clear"] = function()
   local client = require("forge.client")
   local builder = require("forge.builder")

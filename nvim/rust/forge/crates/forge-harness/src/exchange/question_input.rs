@@ -72,7 +72,11 @@ impl QuestionInputs {
     }
 
     /// Observe changes and bounded retry readiness without retaining any domain lock while waiting.
-    pub(super) async fn next(&self, changes: &mut tokio::sync::watch::Receiver<u64>) {
+    ///
+    /// A committed question change requests reconciliation in the same poll that observes it.
+    /// Answers can enter the outbox without passing through owner intake, such as when a waiting
+    /// `question_ask` ends without returning them, and only this request admits them.
+    pub(super) async fn next(&mut self, changes: &mut tokio::sync::watch::Receiver<u64>) {
         if self.requested {
             match self.retry_at {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -80,7 +84,11 @@ impl QuestionInputs {
             }
             return;
         }
-        let _ = changes.changed().await;
+        match changes.changed().await {
+            Ok(()) => self.requested = true,
+            // A closed question controller produces no further changes to reconcile.
+            Err(_) => std::future::pending().await,
+        }
     }
 
     /// Commit durable input before acknowledging its question source; recover retries through that receipt.
@@ -398,4 +406,29 @@ fn publish_input(
         messages,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QuestionInputs;
+
+    /// A question change committed outside owner intake must still request outbox admission.
+    #[tokio::test]
+    async fn observed_question_change_requests_reconciliation() {
+        let mut inputs = QuestionInputs {
+            requested: false,
+            ..QuestionInputs::default()
+        };
+        let (revision, mut changes) = tokio::sync::watch::channel(0_u64);
+        let mut waiting = Box::pin(async {
+            inputs.next(&mut changes).await;
+            inputs.requested
+        });
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        revision.send_replace(1);
+        assert!(
+            waiting.await,
+            "the observed change left reconciliation unrequested"
+        );
+    }
 }

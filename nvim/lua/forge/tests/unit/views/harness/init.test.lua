@@ -72,4 +72,31 @@ T["provider_switch"] = function()
   assert(activation_options.state == state and activation_options.open_mode == 'current')
 end
 
+T["provider_switch_checks_every_tab"] = function()
+  local session = require("forge.session")
+  local activity = dofile("nvim/lua/forge/tests/support/activity.lua")
+  local harness = require("forge.views.harness")
+  local state = session.harness
+  state.session = { id = "switching", provider = "fixture_alpha" }
+  activity.set_busy(state, false)
+  local other = session.new_harness_state()
+  other.session = { id = "other-tab", provider = "fixture_alpha" }
+  session.register_harness("switching", state)
+  session.register_harness("other-tab", other)
+  activity.set_busy(other, true)
+  -- The host serves every tab, so a turn running in another tab blocks the switch.
+  eq(harness.provider_switch_available(), false)
+  activity.set_busy(other, false)
+  other.queue = { { text = "queued elsewhere" } }
+  eq(harness.provider_switch_available(), false)
+  other.queue, other.status = {}, { kind = "finalizing" }
+  eq(harness.provider_switch_available(), false)
+  other.status = { kind = "idle" }
+  eq(harness.provider_switch_available(), true)
+  -- A tab whose host already stopped has nothing left to interrupt.
+  activity.set_busy(other, true)
+  other.host_error = "Forge host stopped"
+  eq(harness.provider_switch_available(), true)
+end
+
 return T

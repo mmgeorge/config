@@ -12,17 +12,38 @@ pub(super) struct CheckPublication {
 
 impl CheckPublication {
     /// Starts persistence with the admitted run's first snapshot.
+    ///
+    /// Every write replaces the whole record, so a failed progress write is superseded by the
+    /// next successful one. The worker therefore keeps writing after a failure, and only a
+    /// failure of the last snapshot, which `finish` always supplies, reaches the caller. A
+    /// transient error, such as a Windows sharing violation on one rename, cannot turn a run
+    /// whose terminal record was saved into an execution error.
     pub(super) fn new(path: PathBuf, run: &CheckRun) -> Self {
         let (update, mut pending) = watch::channel(Arc::new(run.clone()));
         let worker = tokio::spawn(async move {
             loop {
                 let run = Arc::clone(&pending.borrow_and_update());
                 let path = path.clone();
-                tokio::task::spawn_blocking(move || super::supervisor::write_record(&path, &run))
-                    .await
-                    .context("check persistence worker failed")??;
+                let written = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || super::supervisor::write_record(&path, &run)
+                })
+                .await
+                .context("check persistence worker failed")
+                .and_then(|written| written);
+                // `changed` reports an unseen snapshot before it reports the closed channel, so
+                // the terminal snapshot sent by `finish` is always written last.
                 if pending.changed().await.is_err() {
-                    return Ok(());
+                    return written;
+                }
+                if let Err(error) = written {
+                    tracing::warn!(
+                        target: "forge::checks",
+                        event_name = "checks.progress_write_failed",
+                        path = %path.display(),
+                        error = %format!("{error:#}"),
+                        "check progress record write failed; retrying with the next snapshot"
+                    );
                 }
             }
         });

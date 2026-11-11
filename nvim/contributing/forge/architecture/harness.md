@@ -31,6 +31,14 @@ The exchange owner (`ExchangeDriver`) uses the following terms, each with one me
 
 `exchange/owner.rs` holds only the handle that callers use: `ExchangeOwner`, `QuestionEvents`, and the `OwnerEvent` messages they send. `exchange/driver.rs` holds `ExchangeDriver`, whose `run` loop is a fixed sequence of named phases in `exchange/driver/`: intake (`intake.rs`), publication, storage, and delivery bookkeeping (`step.rs`), the effect phase that starts admitted work (`step.rs`, `check_admission.rs`), and wake selection and application (`wake.rs`, with one handler file per wake family under `handlers/`). Every phase reads its decisions from `Admission::evaluate` and changes the execution state only through `ExecutionState`'s transition methods (`execution_state.rs`), so no phase keeps its own copy of a rule or pairs the execution fence by hand. `RunningTasks::is_idle` is the only definition of "no background job is running", which restarts, shutdown, and approval timeouts all wait on, and `ExchangeDriver::turn_status` is the only computation of the turn status that stops and steering read.
 
+### Publication outbox
+
+`SessionPublications` (`exchange/publication.rs`) commits every owner notification to `owner_publication` before any output, and offers rows strictly in sequence order, so a stale row offered out of turn would corrupt the editor's view of the epoch. Three rules keep the outbox from stalling or leaking:
+
+- **Owner start.** `recover_interrupted_offers` reclassifies every unadmitted row from the earlier epoch, `pending` as well as `offering`, to `uncertain`. Live delivery never sends an uncertain row, so the previous epoch's timeline revisions cannot raise the editor's floor; the first reconnect page carries those rows and admits them.
+- **Stranded offers.** A direct offer whose final state write fails records its known transport outcome, and the delivery phase writes that outcome once no worker offer is active, before it checks the transport. A row therefore never stays `offering` with no owner, which would block every later offer and every reconnect.
+- **Pruning.** Owner start and each confirmed reconnect page delete admitted history that no reader still needs. They keep every unadmitted row and everything after the first one, the highest sequence (sequence allocation and cursor validation read the maximum), rows after the confirmed page, and rows whose origin is a durable producer identity, which a retried producer finds instead of publishing again. A cursorless reconnect page starts after the admitted prefix, because a newly attached view adopts current state without replaying history; the response still echoes the caller's absent cursor as `after`.
+
 ## Process and session ownership
 
 The broker runs once per Neovim process, inside the shared Forge host. `client.lua` owns the JSONL connection to that host. Every Harness request and event carries a session ID, so sessions run concurrently and there is no globally active session. On the Lua side, `session.lua` keeps each session's transcript buffer, composer, windows, and subscriptions in `harness_by_id`.
@@ -39,7 +47,7 @@ Each session has a `SessionCoordinator`. Provider work needs its `ExecutionPermi
 
 Controller construction resolves inherited model tuning against the provider's workspace catalog before publishing the controller or its initial snapshot. An unavailable model fails construction. Unavailable saved reasoning, context-window, and service-tier choices fall back to advertised defaults; absence of a context-window override stays absent. This applies equally to initial opening, new conversations, and resumed controllers, so an early prompt cannot race native initialization with unchecked preferences. Explicit configuration commands continue to reject unsupported choices before committing them.
 
-`/new`, `/fork`, and `:ForgeHarnessNew` open their tab before provider work finishes. A fork first persists a child with `provider_fork_state = preparing`, the source's last completed provider turn, and a snapshot of the source's visible history. Provider preparation then runs outside the parent's lock, so a slow fork cannot stall the parent. A prompt sent early waits only on that child. The child inherits history for display only, without tasks, questions, or live agents.
+`/new`, `/fork`, and `:ForgeHarnessNew` open their tab before provider work finishes. A fork first persists a child with `provider_fork_state = preparing`, the source's last completed provider turn, and a snapshot of the source's visible history. Provider preparation then runs outside the parent's lock, so a slow fork cannot stall the parent. A prompt sent early waits only on that child's fork gate. The host registers the gate before it opens the child and starts the fork task before it sends the response or `session_created`, so a failed delivery cannot leave the gate pending; the task holds its outcome event until that announcement finishes, which keeps the outcome after it. A `preparing` child with no gate belongs to a fork that a previous host quit or that failed before its task started, so resolving it records the fork as failed. The child inherits history for display only, without tasks, questions, or live agents.
 
 ## Commands and operations
 
@@ -51,7 +59,7 @@ Settings, permission, model, resource, compaction, and cancellation commands ent
 
 `Admission::evaluate` (`exchange/driver/admission.rs`) holds every rule for what the driver may start: commands, turns, turn effects, question and check tools, automatic and task checks, task delivery, deferred configuration retries, restarts, and shutdown. It is a pure function of an `AdmissionFacts` snapshot that each phase gathers fresh, so no phase applies its own copy of a rule, and a table test pins the dispatch race cases. Its `start_command` rule decides when the owner starts its next queued command, and the effect phase and the step-restart gate both read it. No command starts while a provider restart or a stop runs, while the session's observation stream is closed, or while the current turn's send was lost (`DispatchStage::Lost`). A failed observation stream reports its failure to every later reader until a restart replaces it, so a command started then would fail on evidence that belongs to the failed turn. Commands other than cancellation also wait while the turn's send is unsettled, from host admission until the adapter confirms the send (`TurnTransaction::dispatch_stage`). Stopping a turn whose send is in flight leaves its delivery unknown. Stopping it before the journal records `Sending` prevents the send, after which both the restarted exchange and the input queue would deliver the prompt again. A model change made at the start of a turn therefore applies once the provider holds the prompt, then restarts the turn on the new model. Cancellation stays exempt from that wait, because it prevents an unsent prompt and restores the draft, or waits inside the provider runtime for an in-flight send before stopping the turn, and it never restarts the exchange. Cancellation that arrives after a failing turn has closed its engine pins no invocation.
 
-`forge.replica` keeps confirmed state, optimistic intents, and editor drafts apart. A reply removes only its matching intent and rebuilds the view over the newest confirmed state. Snapshots are scoped to their conversation, host generation, runtime epoch, and revision, so an older snapshot cannot replace newer state. A revision gap keeps the previous view until replacement state arrives. Failed state reads stay visible and retry after one, two, and four seconds.
+`forge.replica` keeps confirmed state, optimistic intents, and editor drafts apart. A reply removes only its matching intent and rebuilds the view over the newest confirmed state. Snapshots are scoped to their conversation, host generation, runtime epoch, and revision, so an older snapshot cannot replace newer state. A revision gap keeps the previous view until replacement state arrives. Failed state reads stay visible and retry after one, two, and four seconds (`controller.state_sync_retry_delays_ms`); a later successful read clears the failure and resets the sequence. A view keeps one `session.state.get` in flight per session and host generation, so an in-place session switch issues its own read, and a reply for a session the view no longer shows triggers a read of the current one. A `document_changed` patch does not discard an in-flight read, because the read's `timeline_revision` already orders it against the patch; a patch stamped with another runtime epoch or host generation is ignored.
 
 ## Tool execution deadlines
 
@@ -73,6 +81,18 @@ execution owner, failure settlement commits that invocation's settlement ticket 
 failure checkpoint and publication drains; an uncommitted ticket would reject the next prompt
 with "execution owner is unavailable or already active". A cleanly collected timeout then finishes as a
 settled `tool_timeout` response, as collected cancellation finishes as `turn_cancelled`.
+A deadline found elapsed only after a cancel or restart already began collecting the turn
+does not convert it into a timeout: the collected outcome settles the exchange, so a cancelled
+prompt is still restored, and the foreground claims the timeout report so the inbox monitor
+cannot later publish it against the settled invocation.
+
+`SessionObservationInbox` routes tool observations to watchdogs by owner and exchange, not by
+invocation. A steering message, child result, or check repair continues the exchange under a
+successor invocation, and its events reach the inbox before the foreground adopts that scope;
+a registry keyed by invocation never delivered them, so a hung tool in any continuation had no
+deadline. Registering a new foreground's watchdog retires the previous one, which keeps its
+admitted background deadlines and then lets its monitor end instead of parking for the
+session's lifetime.
 
 A failure that leaves provider state unknown restarts the provider instead of stranding the
 session. A turn that fails, a stop that cannot prove the provider idle, a collection task that
@@ -84,7 +104,22 @@ session's lifetime and publishes a `provider_restart_failed` error, after which 
 fails immediately rather than waiting. A failed owner with no remaining work reports its turn
 status as idle, so session shutdown still finishes; its observation listener then reports the
 stream failure that no restart replaced. Owner storage failures stay terminal without a restart,
-because a new provider generation cannot repair the database.
+because a new provider generation cannot repair the database. Only failures sourced from SQLite,
+file I/O, or the owner's journal count as storage failures (`exchange::failure::storage_failure`);
+a domain rule that refuses a command, such as `/goal continue` on a paused task, answers that
+command with a typed failure and leaves the session usable. A cancellation whose target pinning
+fails for any other reason is answered as a failed stop and collected like one. Shutdown that
+cancels a requested but unstarted restart fails execution instead of leaving the owner
+`Restarting`, so its turn status reaches idle and shutdown finishes.
+
+A stop's retained transition outlives the stop as evidence, so once its host jobs join, the driver
+releases both its control permit and its child quiescence; a held quiescence parked every later
+root turn at completion. Child collection treats a child whose cleanup failed as settled with an
+error, which makes the stop uncertain and restarts the provider, because that child keeps its
+execution slot and the active count never reaches zero. A cancellation settlement that fails, or
+whose command fails or runs overdue, releases the host-settlement fence of the exchange it was
+finalizing (`abort_prior_finalization`); the exchange stays finalizing with the recorded error for
+the next admission to retry.
 
 The `tool_timeout` setting defaults to ten minutes and applies to shell commands as
 well as tool calls. `SessionEventInbox` retains watchdogs for confirmed background
@@ -146,7 +181,7 @@ their presentation work is coalesced into one scheduled render per event-loop bu
 
 The queue commits accepted state and idempotency receipts to its SQLite journal before acknowledging a mutation. Recovery releases abandoned edit reservations and restores retained input suspended. It reconciles linked submission evidence: accepted input leaves the queue, uncertain sends stay blocked, and proven unsent work requires explicit resumption or retry. An empty recovered queue preserves readiness instead of creating a pause. Lua reserves a queued message for editing at the revision its last committed edit published: a reservation requested while that commit awaits its host result waits for the result, because the displayed revision is stale until then and the host rejects it as `RevisionChanged`.
 
-Provider acceptance and queue acknowledgement are separate facts. `SubmissionStore` persists a `Prepared → Sending → Accepted` journal, and restart recovery never treats `Sending` as permission to replay. A turn that ends before dispatch keeps the message for the next eligible interaction. A failed message stays visible and blocks later follow-ups until the user retries or removes it. `SessionAdmission` keeps a compact task, operation, question, and exchange projection in memory, republished after every committed mutation, so submission never reopens SQLite.
+Provider acceptance and queue acknowledgement are separate facts. `SubmissionStore` persists a `Prepared → Sending → Accepted` journal, and restart recovery never treats `Sending` as permission to replay. A turn that ends before dispatch keeps the message for the next eligible interaction: settlement retires undispatched steering to `Cancelled`, and unless the user cancelled the turn the input worker returns that message to the queue rather than retracting it. A failed message stays visible and blocks later follow-ups until the user retries or removes it, including across a host restart, because recovery reads a `Failed` queue entry whose record settlement retired as a failure rather than a retraction. Uncertain (`Unknown`) delivery blocks the queue until reconciliation proves an outcome or the user removes the message; `session.input` removal then retires its record to the terminal `Discarded` state, which is never replayed and no longer blocks later dispatch. `SessionAdmission` keeps a compact task, operation, question, and exchange projection in memory, republished after every committed mutation, so submission never reopens SQLite.
 
 Lua owns the unsent draft, and typing sends nothing to Rust. Ctrl-S captures the draft and sends one `session.prompt.submit` with its text, typed attachments, and a monotonically increasing token. `composer_draft.take` clears the captured draft at submission, for prompts and for task commands such as `/plan` and `/goal`, because `session.command.apply` replies only after the task starts its provider turn. A rejection restores the draft only into an untouched or empty composer, so newer typing always survives. Rust publishes a durable running exchange before provider preparation. Editing a queued prompt reserves its entry, so the queue drains only up to that entry.
 
@@ -170,7 +205,7 @@ The winbar displays `Session.resolved_model` when the provider has reported one 
 
 `session.turn.cancel` enters the same exchange command FIFO as configuration and other mutations. The owner signals the exact invocation while retaining asynchronous settlement and host finalization; it does not wait for the original result request to finish before processing cancellation. A newly submitted prompt stays retractable until the provider produces a message, reasoning, tool activity, task update, or workspace change. Reasoning counts as visible model work because the user can read it. The provider's echo of the submitted prompt does not count: Codex reports the prompt as a native user-message item before any assistant output, so `RetractionEligibility` records each user-message item identity at its start and ignores that item's later deltas and completion. Owner-collected cancellation and foreground failure settlement both decide restoration through `cancellation_restores_prompt`, which requires output-free history and the `RestoreIfUnconsumed` input policy; a clean cancellation that restores its prompt enters failure settlement rather than ordinary finalization, and settlement waits until the owner's collection completes before deleting the exchange. Retraction is available both before the checkpoint baseline and after a committed baseline; after the baseline, a retained retraction result continues to the ordinary failure checkpoint. After settlement, the owner authorizes `input_retract` for the exact cancelled submission, delivery attempt, and checked history boundary. Only proven nonconsumption or confirmed history retraction permits removing the provisional interaction and restoring the exact draft. An unknown retraction result retains the draft boundary for reconciliation and never authorizes blind rollback; tool effects are never undone by history retraction. A confirmed retraction answers the cancel command with `CancellationOutcome::Retracted`, answers the prompt request with `turn_retracted`, and publishes the input update with `retracted` set, including for a submission the provider had already accepted. After visible activity, cancellation persists the partial exchange as cancelled.
 
-Collection also stops plan-execution progress scans. A scan is ordinary foreground work, and a collecting command keeps the effect gate closed until it ends, so a scan requested after collection began stayed staged while finalization waited for its result; Ctrl-C with a pending approval then waited for the 30-second collection deadline. `ForegroundTransaction::next` therefore yields no `PlanScan` while `collection` is set, and the step ignores a tick that was already selected.
+Collection also stops plan-execution progress scans. A scan is ordinary foreground work, and a collecting command keeps the effect gate closed until it ends, so a scan requested after collection began stayed staged while finalization waited for its result; Ctrl-C with a pending approval then waited for the 30-second collection deadline. `ForegroundTransaction::next` therefore yields no `PlanScan` while `collection` is set, and the step ignores a tick that was already selected. A plan question staged by a finalizing planning turn is settlement work, like a plan submission, so `ForegroundJob::is_collection` lets it run behind a closed effect gate instead of waiting out the command's deadline. When the reducer settles a turn while an observation or scan read during the settlement commit has started work, the driver drops effects that never started and joins the running ones, publishing any output they forward, before it reports the turn finished.
 
 Failure finalization settles every turn still `Running` as the exchange outcome after native cleanup joins (`Exchange::settle_running_turns`), because a terminal event that cleanup dropped will not arrive later; without that step the failure checkpoint rejected the exchange and left it finalizing. A Codex interrupt registered before `turn/start` is acknowledged waits for the acknowledgment, then interrupts the acknowledged turn.
 
@@ -249,6 +284,11 @@ These questions appear as required, but do not trigger provider cleanup or a sec
 chat continuation. The tool returns their resolved records, without also sending
 the answers through the input journal. Its live registration ends on completion or
 cancellation; a later answer without a waiting tool uses ordinary message delivery.
+When a wait ends without returning its answers, because the tool was cancelled, including
+after it reported them, or because the owner closed, the owner moves every unreturned
+answer to the outbox. A committed question change requests outbox admission, so a live
+owner admits those answers at once; a closing owner leaves them for the next owner, which
+admits the outbox at startup.
 The model supplies neither question IDs nor mutation operation IDs. Existing IDs
 and revisions select questions for replies, revisions, and withdrawals.
 
@@ -273,6 +313,6 @@ completion; late answers enter discussion without resuming the original work.
 
 Terminal inventories arrive through normalized provider events. Check catalog views subscribe to `checks_changed`, emitted after committed check updates, so ordinary streamed text does not reload the catalog. Resource toggles subscribe before command admission, match completion by operation identity, and perform one durable read after the receipt to cover attachment races. They do not repeatedly query settings. Host exits and failed requests provide connection diagnostics; the UI does not send health heartbeat queries. Local animation clocks, operation deadlines, and delayed retries after an actual failed request remain separate from state observation.
 
-Picker `on_dispose` releases owned subscriptions on every close, including confirmation and silent replacement. `on_close` remains the optional user-workflow callback.
+Picker `on_dispose` releases owned subscriptions on every close, including confirmation and silent replacement. `on_close(resume, reason)` remains the optional user-workflow callback; `reason` is `"user"` only for the user's own close key and `"programmatic"` for every other close, including replacement by `Picker.open`, so an owner can tell a dismissal from a displacement. `Picker.when_idle` runs a callback once no picker is open.
 
 LSP requests observe cancellation, scope lease release, and tool-selection revisions through watch notifications. Structural analysis also observes the pending request lifetime, so dropping an editor request cancels its analysis without a periodic map lookup. Check workers consume the owner's cancellation stream and publish output only after new bytes arrive; the existing output coalescing delay does not wake or rewrite idle progress.

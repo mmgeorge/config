@@ -1294,26 +1294,31 @@ impl HarnessBroker {
             update_model_preference,
             ..
         } = *candidate;
-        let previous = std::mem::replace(&mut self.session, *configured);
-        self.permission_coordinator
-            .configure_timeout(&self.session.id, self.session.approval_timeout)?;
-        self.session.approval_timeout = self.permission_coordinator.approval_timeout(&self.session.id)?;
-        self.session.acquire_lease(&self.client_id)?;
-        self.session.updated_at_ms = self.clock.now_ms();
-        let prior_preference = self.store.load_preference(&self.session.workspace, &self.session.provider)?;
-        let preference = if self.session.background.is_some() { None } else {
-            let mut preference = preference_for_session(&self.session, prior_preference.clone());
-            if !update_model_preference && let Some(previous) = prior_preference {
-                preference.model = previous.model; preference.effort = previous.effort; preference.model_setting = previous.model_setting;
-            }
-            Some(preference)
-        };
-        if let Err(error) = self.store.commit_configuration_intent(&self.session, &self.client_id, preference.as_ref(), &intent) {
+        // Prepare and persist the configured session before it replaces the owned one, so a
+        // failure in any step leaves memory equal to the last durable session.
+        let mut session = *configured;
+        let persisted = (|| -> Result<()> {
             self.permission_coordinator
-                .configure_timeout(&previous.id, previous.approval_timeout)?;
-            self.session = previous;
+                .configure_timeout(&session.id, session.approval_timeout)?;
+            session.approval_timeout = self.permission_coordinator.approval_timeout(&session.id)?;
+            session.acquire_lease(&self.client_id)?;
+            session.updated_at_ms = self.clock.now_ms();
+            let prior_preference = self.store.load_preference(&session.workspace, &session.provider)?;
+            let preference = if session.background.is_some() { None } else {
+                let mut preference = preference_for_session(&session, prior_preference.clone());
+                if !update_model_preference && let Some(previous) = prior_preference {
+                    preference.model = previous.model; preference.effort = previous.effort; preference.model_setting = previous.model_setting;
+                }
+                Some(preference)
+            };
+            self.store.commit_configuration_intent(&session, &self.client_id, preference.as_ref(), &intent)
+        })();
+        if let Err(error) = persisted {
+            self.permission_coordinator
+                .configure_timeout(&self.session.id, self.session.approval_timeout)?;
             return Err(error);
         }
+        self.session = session;
         self.session.name = self.store.load_session(&self.session.id)?.context("owned session is missing")?.name;
         if let Some(enabled) = subagent_tools {
             self.agent_coordinator.set_enabled(enabled);

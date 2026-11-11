@@ -57,24 +57,33 @@ T["harness_child_steering"] = function()
   assert(#calls == 1 and calls[1].method == "session.agent.message.send")
   assert(calls[1].session_id == "child-steering" and calls[1].params.target == "child")
   eq(calls[1].params.message, "review the boundary")
-  assert(buffer.line(state.composer_buf, 1) == "review the boundary", "draft cleared before steering acknowledgement")
+  -- The composer empties at submission, so a second submit before the reply sends nothing.
+  eq(buffer.line(state.composer_buf, 1), "")
+  controller.steer_submit()
+  controller.submit()
+  eq(#calls, 1)
   reply(nil, "turn already completed")
   assert(buffer.line(state.composer_buf, 1) == "review the boundary" and #state.queue == 0, "failed child steering became a new request")
   assert(not main_agent_requested(), "failed child steering fell back to the main agent")
   controller.submit()
   assert(#calls == 2 and calls[2].method == "session.agent.followup" and calls[2].params.target == "child")
-  assert(buffer.line(state.composer_buf, 1) == "review the boundary", "draft cleared before follow-up acknowledgement")
+  eq(buffer.line(state.composer_buf, 1), "")
   reply({ status = "admitted" })
   assert(buffer.line(state.composer_buf, 1) == "" and #state.queue == 0)
+  buffer.set(state.composer_buf, { "rejected while typing" })
+  controller.steer_submit()
+  buffer.set(state.composer_buf, { "newer text" })
+  reply(nil, "turn already completed")
+  eq(buffer.line(state.composer_buf, 1), "newer text")
   buffer.set(state.composer_buf, { "another steer" })
   controller.steer_submit()
-  assert(#calls == 3 and calls[3].params.message == "another steer")
+  assert(#calls == 4 and calls[4].params.message == "another steer")
   buffer.set(state.composer_buf, { "new draft while awaiting acknowledgement" })
   reply({ delivery = "steered" })
   assert(buffer.line(state.composer_buf, 1) == "new draft while awaiting acknowledgement", "acknowledgement erased newer input")
   state.selected_agent_run_id = "missing"
   controller.submit()
-  assert(#calls == 4 and calls[4].params.target == "missing", "missing child input was not addressed to that child")
+  assert(#calls == 5 and calls[5].params.target == "missing", "missing child input was not addressed to that child")
   assert(not main_agent_requested(), "missing child input fell back to the main agent")
 end
 
@@ -981,6 +990,284 @@ T["undo_requires_native_conversation_rewind"] = function()
   controller.open_undo_picker()
   eq(methods, { "session.exchange.recovery", "session.exchange.list" })
   eq(warnings, {})
+end
+
+---Stub the collaborators a state read reaches after it applies a snapshot.
+local function quiet_state_read(controller)
+  controller.render, controller.refresh_winbar, controller.attach_transcript =
+    function() end, function() end, function() end
+  require("forge.views.harness.agent_picker").refresh = function() end
+end
+
+T["state_sync_retry"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  quiet_state_read(controller)
+  notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local requests = mock_client.record()
+  local timers = {}
+  stub(vim, "defer_fn", function(callback, delay) timers[#timers + 1] = { callback = callback, delay = delay } end)
+  state.session = { id = "retried" }
+  local function reads()
+    return vim.tbl_filter(function(request) return request.spec.method == "session.state.get" end, requests)
+  end
+  controller.synchronize_state()
+  for attempt, delay in ipairs({ 1000, 2000, 4000 }) do
+    reads()[attempt].callback(nil, "storage busy", { code = "storage" })
+    assert(state.sync_error, "a failed read was not shown")
+    eq(#timers, attempt)
+    eq(timers[attempt].delay, delay)
+    timers[attempt].callback()
+    eq(#reads(), attempt + 1)
+  end
+  reads()[4].callback(nil, "storage busy", { code = "storage" })
+  eq(#timers, 3)
+  -- A later read that succeeds clears the failure and starts a fresh sequence for the next one.
+  controller.synchronize_state()
+  reads()[5].callback({ session = { id = "retried" } })
+  assert(not state.sync_error and state.state_sync_retry == nil)
+  controller.synchronize_state()
+  reads()[6].callback(nil, "storage busy", { code = "storage" })
+  eq(timers[4].delay, 1000)
+  -- A retry superseded by a successful read issues nothing.
+  controller.synchronize_state()
+  reads()[7].callback({ session = { id = "retried" } })
+  timers[4].callback()
+  eq(#reads(), 7)
+end
+
+T["state_sync_keyed_by_session"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  quiet_state_read(controller)
+  local requests = mock_client.record()
+  state.session = { id = "first" }
+  local settled = {}
+  controller.synchronize_state(function(result, failure) settled[#settled + 1] = { result = result, failure = failure } end)
+  local first = requests[#requests]
+  -- An in-place switch issues a read for the new session instead of waiting on the old one.
+  state.session = { id = "second" }
+  controller.synchronize_state()
+  local second = requests[#requests]
+  assert(second ~= first and second.spec.session_id == "second", "the new session's read was suppressed")
+  first.callback({ session = { id = "first" } })
+  eq(state.session.id, "second")
+  second.callback({ session = { id = "second" }, timeline_revision = 4 })
+  eq(state.timeline_revision, 4)
+  eq(#settled, 1)
+  assert(settled[1].result and not settled[1].failure)
+  -- A switch with no later read still reconciles the session the view now shows.
+  controller.synchronize_state()
+  local stale = requests[#requests]
+  state.session = { id = "third" }
+  stale.callback({ session = { id = "second" } })
+  wait_until(function() return requests[#requests].spec.session_id == "third" end,
+    "the shown session was never read after an in-place switch")
+end
+
+T["document_change_does_not_invalidate_reads"] = function()
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local requests = mock_client.record()
+  local receive
+  client.session_events_subscribe = function(callback) receive = callback return function() end end
+  quiet_state_read(controller)
+  require("forge.views.harness.workspace").attach = function() end
+  require("forge.views.harness.prompt_history").attach = function() end
+  state.session = { id = "streaming", provider = "mock" }
+  state.runtime_epoch, state.status = "current-epoch", { kind = "working" }
+  state.composer_buf, state.transcript_buf = buffer.scratch(), buffer.scratch()
+  controller.attach()
+  controller.synchronize_state()
+  local read = requests[#requests]
+  eq(read.spec.method, "session.state.get")
+  receive("document_changed", { session_id = "streaming", revision = 3 }, "streaming")
+  eq(state.timeline_revision, 3)
+  local count = #requests
+  read.callback({ session = state.session, runtime_epoch = "current-epoch", timeline_revision = 3 })
+  vim.wait(20, function() return #requests > count end, 5)
+  eq(#requests, count)
+  -- A patch from an earlier epoch cannot raise the floor for the current one.
+  receive("document_changed", { session_id = "streaming", revision = 900, runtime_epoch = "previous-epoch" }, "streaming")
+  eq(state.timeline_revision, 3)
+end
+
+T["approval_waits_for_a_window"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local approval = require("forge.views.harness.approval")
+  controller.refresh_winbar = function() end
+  local opened = 0
+  approval.open = function() opened = opened + 1 end
+  state.session = { id = "closed-view" }
+  state.approval = { { request_id = "late", execution_kind = "managed", targets = {} } }
+  state.transcript_win, state.composer_win = nil, nil
+  controller.present_approval()
+  assert(opened == 0 and not state.approval_open and not state.presented_approval_id,
+    "an approval without a window blocked its later presentation")
+  state.transcript_win = vim.api.nvim_get_current_win()
+  approval.open = function() error("picker host failed") end
+  local failures = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  controller.present_approval()
+  assert(#failures == 1 and not state.approval_open, "a failed presentation kept the approval marked open")
+  approval.open = function() opened = opened + 1 end
+  controller.present_approval()
+  assert(opened == 1 and state.approval_open and state.presented_approval_id == "late")
+end
+
+T["approval_returns_after_replacement"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local approval = require("forge.views.harness.approval")
+  local picker = require("forge.views.picker")
+  controller.refresh_winbar = function() end
+  local window = vim.api.nvim_get_current_win()
+  state.session = { id = "displaced" }
+  state.transcript_win = window
+  state.approval = { { request_id = "displaced", execution_kind = "managed", targets = { {
+    target_id = "command", title = "Run command", detail = "whoami", commands = {},
+    choices = { { choice_id = "allow_once", label = "Allow once" }, { choice_id = "deny_once", label = "Deny once" } },
+  } } } }
+  local requests = mock_client.record()
+  controller.present_approval()
+  assert(approval.is_open())
+  -- No decision starts selected, so an Enter already in flight confirms nothing.
+  local instance = picker._state_for_test()
+  eq(require("forge.views.picker.state").selected_option(instance.state, instance.spec), nil)
+  keymap.invoke("<CR>")
+  assert(approval.is_open() and #requests == 0, "an unchosen approval was submitted")
+  picker.open({ owner = "late-list", host = { window_list = { window }, control_win = window },
+    page_list = { { option_list = { { label = "Late option" } } } } })
+  assert(not state.approval_open and state.dismissed_approval_id == nil,
+    "replacement by another picker was recorded as a user dismissal")
+  picker.close(false)
+  wait_until(approval.is_open, "the displaced approval was not presented again")
+  keymap.invoke("q")
+  assert(not approval.is_open() and state.dismissed_approval_id == "displaced", "q did not dismiss the approval")
+end
+
+T["rollback_respects_newer_composer_text"] = function()
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local picker = require("forge.views.picker")
+  controller.render, controller.refresh_winbar = function() end, function() end
+  local warnings = {}
+  require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
+  local interaction = { id = "exchange", ordinal = 1, state = "complete", disposition = "current", prompt = "Original prompt" }
+  client.request = function(request_specification, callback)
+    if request_specification.method == "session.exchange.recovery" then callback(vim.NIL)
+    elseif request_specification.method == "session.exchange.list" then callback({ interaction }) end
+  end
+  local specs = {}
+  picker.open = function(spec) specs[#specs + 1] = spec end
+  local completions = {}
+  controller.task_transition = function(_, _, completed) completions[#completions + 1] = completed end
+  state.session = { id = "rollback" }
+  state.capability = { native_conversation_rewind = true }
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
+  vim.cmd("split")
+  state.composer_win = vim.api.nvim_get_current_win()
+  state.composer_buf = buffer.scratch()
+  vim.api.nvim_win_set_buf(state.composer_win, state.composer_buf)
+  vim.cmd("wincmd p")
+  local other_window = vim.api.nvim_get_current_win()
+  local function roll_back()
+    controller.open_undo_picker()
+    specs[#specs].on_confirm({ option = { value = interaction } })
+    specs[#specs].on_confirm({ option = { value = "conversation" } })
+    return completions[#completions]
+  end
+  local completed = roll_back()
+  buffer.set(state.composer_buf, { "newer typing" })
+  completed(true)
+  vim.wait(20, function() return false end, 5)
+  eq(buffer.line(state.composer_buf, 1), "newer typing")
+  eq(#warnings, 1)
+  eq(vim.api.nvim_get_current_win(), other_window)
+  buffer.set(state.composer_buf, { "" })
+  completed = roll_back()
+  completed(true)
+  vim.wait(20, function() return false end, 5)
+  eq(buffer.line(state.composer_buf, 1), "Original prompt")
+  eq(vim.api.nvim_get_current_win(), other_window)
+end
+
+T["select_agent_reverts_on_failure"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  controller.render = function() end
+  state.agent = { run = { { id = "child", definition = "explorer" } }, exchange = {} }
+  local settle
+  state.presentation = { select_agent = function(_, callback) settle = callback end }
+  controller.select_agent("child")
+  eq(state.selected_agent_run_id, "child")
+  settle("timeline unavailable")
+  eq(state.selected_agent_run_id, nil)
+  controller.select_agent("child")
+  settle(nil)
+  eq(state.selected_agent_run_id, "child")
+end
+
+T["preview_close_renders_its_view"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local preview = require("forge.views.harness.session_preview")
+  local rendered = 0
+  controller.render = function() rendered = rendered + 1 end
+  state.transcript_buf = buffer.scratch()
+  state.transcript_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(state.transcript_win, state.transcript_buf)
+  preview.open(state.transcript_win)
+  preview.close()
+  eq(rendered, 1)
+  eq(vim.api.nvim_win_get_buf(state.transcript_win), state.transcript_buf)
+end
+
+T["with_state_restores_after_failure"] = function()
+  local session = require("forge.session")
+  local controller = require("forge.views.harness.controller")
+  local selected, background = session.harness, session.new_harness_state()
+  MiniTest.expect.error(function()
+    controller.with_state(background, function()
+      assert(session.harness == background)
+      error("render failed")
+    end)
+  end, "render failed")
+  assert(session.harness == selected, "a failed background render left its state active")
+end
+
+T["clarification_settles_on_failed_read"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local input = require("forge.views.harness.input_state")
+  local question = require("forge.views.harness.plan_question")
+  quiet_state_read(controller)
+  require("forge.views.harness.prompt_history").record = function() end
+  dofile("nvim/lua/forge/tests/support/stub.lua")(vim, "defer_fn", function() end)
+  notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local requests = mock_client.record()
+  local host
+  question.open = function(_, value) host = value end
+  state.session = { id = "clarification" }
+  state.transcript_win = vim.api.nvim_get_current_win()
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
+  input.attach(state, function() end)
+  requests[#requests].callback({ revision = 0, suspended = false, messages = {} })
+  state.active_elicitation = { owner = "plan", plan_id = "plan", elicitation = { revision = 1, current_index = 0, answer = {},
+    question_set = { id = "set", questions = { { id = "scope", question = "Scope?", options = {} } } } } }
+  controller.present_plan_question(true)
+  host.ask({ question_id = "scope", text = "What does scope cover?" })
+  assert(state.question_clarification, "the clarification did not suppress the question")
+  local submit = requests[#requests]
+  eq(submit.spec.method, "session.input.apply")
+  submit.callback({ operation_id = submit.spec.params.id, revision = 1, suspended = false, upsert = {}, removed = {} })
+  local read = requests[#requests]
+  eq(read.spec.method, "session.state.get")
+  read.callback(nil, "host stopped")
+  eq(state.question_clarification, nil)
 end
 
 return T

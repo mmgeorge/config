@@ -487,6 +487,133 @@ async fn task_creation_completes_at_dispatch_and_replay_preserves_replacement_ca
     Ok(())
 }
 
+/// Reject `/goal continue` for a task that cannot continue without fencing the session.
+///
+/// Preparation refuses a paused goal. That refusal is a rejection of
+/// the one command; reporting it as uncommitted storage closed every later command, Ctrl-C
+/// included, for the session's lifetime.
+#[tokio::test]
+async fn goal_continue_on_paused_task_is_rejected_without_fencing_the_session() -> Result<()> {
+    use crate::exchange::command::{
+        CancelExchangeRequest, Command, CommandFailure, ExchangeContinuationSelection,
+        ExecuteCommandError, TaskCommandFailure, WorkflowContinuationRequest,
+        WorkflowContinuationTarget,
+    };
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![TestPromptStep::Message {
+                        content: TestMessageContent::Response,
+                        text: "Answered".into(),
+                    }],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"before-continue","text":"Answer once"}),
+            },
+            &sink,
+        )
+        .await?;
+    let store = SqliteStore::open(&controller.data_root)?;
+    let exchange = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(exchange) = store.latest_exchange(&session_id)?
+                && exchange.is_finished()
+                && controller.coordinator.execution.available_permits() == 1
+            {
+                break Ok::<_, anyhow::Error>(exchange);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the first prompt never settled")??;
+    let installed = controller
+        .task_controller
+        .change(
+            &mut SqliteStore::open(&controller.data_root)?,
+            None,
+            crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+                "A paused goal".into(),
+                Default::default(),
+                1,
+            ))),
+            1,
+        )?
+        .context("installed task is missing")?;
+    let task = controller
+        .task_controller
+        .change(
+            &mut SqliteStore::open(&controller.data_root)?,
+            Some(&installed.revision),
+            crate::task::TaskChange::Pause,
+            2,
+        )?
+        .context("paused task is missing")?;
+    assert_eq!(task.status(), crate::task::TaskStatus::Paused);
+    let continued = controller
+        .exchange_owner
+        .execute_command(Command::ContinueWorkflow(WorkflowContinuationRequest {
+            target: WorkflowContinuationTarget::Exchange(ExchangeContinuationSelection::capture(
+                &exchange,
+                Some(&task),
+            )?),
+            message: None,
+        }))
+        .await;
+    assert!(
+        matches!(
+            continued,
+            Err(ExecuteCommandError::Failed(CommandFailure::Task(
+                TaskCommandFailure::Changed
+            )))
+        ),
+        "{continued:?}"
+    );
+    let cancelled = controller
+        .exchange_owner
+        .execute_command(Command::CancelExchange(CancelExchangeRequest::default()))
+        .await;
+    assert!(cancelled.is_ok(), "{cancelled:?}");
+    controller.finish_exchange_owner().await?;
+    reader.abort();
+    let result = reader.await;
+    assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
+    Ok(())
+}
+
 /// A durable pause releases the command FIFO and replay never schedules goal work.
 #[tokio::test]
 async fn task_pause_completes_at_local_commit_and_replay_preserves_fifo() -> Result<()> {

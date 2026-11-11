@@ -165,6 +165,8 @@ end
 ---@field open_mode? "current"|"tab"
 ---@field interaction_mode? "reconcile"
 ---@field focus? boolean Preserve the selected session when completing a background request.
+---@field source_state? ForgeHarnessPresentationState The view that issued the request, captured when it
+---  was issued; defaults to `state`, then to the selected view at completion.
 
 ---@param result table
 ---@param options? ForgeHarnessSessionActivation
@@ -176,7 +178,11 @@ function M.activate(result, options)
     return
   end
   local existing = state_by_session_id[next_session.id]
-  local source_state = session.harness
+  -- A reply can arrive after the user selected another tab. The view that issued the request is
+  -- the source whose panes and tab the activation may reuse or close; the selected view is only
+  -- restored when this activation does not take focus.
+  local selected_state = session.harness
+  local source_state = options.source_state or options.state or selected_state
   -- Opening a session that no tab displays in the current tab targets the current view's windows.
   -- A retained session would otherwise reopen through `layout.open` in a new last tab while the
   -- source tab closes. A session displayed elsewhere keeps its tab, and the source tab closes.
@@ -199,7 +205,7 @@ function M.activate(result, options)
       state.transcript_win, state.composer_win, state.timeline_tab = nil, nil, nil
       layout.attach_auto_height(existing.composer_buf, existing.composer_win)
       layout.attach_scroll_boundary(existing.transcript_buf, existing.transcript_win)
-      vim.api.nvim_set_current_tabpage(existing.timeline_tab)
+      if options.focus ~= false then vim.api.nvim_set_current_tabpage(existing.timeline_tab) end
       if previous_tab and previous_tab ~= existing.timeline_tab and vim.api.nvim_tabpage_is_valid(previous_tab) then
         vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(previous_tab))
       end
@@ -225,7 +231,7 @@ function M.activate(result, options)
   controller().attach()
   controller().attach_transcript(state.transcript_buf)
   controller().refresh_winbar()
-  if options.focus == false then session.activate_harness(source_state) else focus_state(state) end
+  if options.focus == false then session.activate_harness(selected_state) else focus_state(state) end
 
   if options.open_mode == "current"
     and source_state ~= state
@@ -333,12 +339,17 @@ end
 function M.resume(session_id, options)
   local existing = state_by_session_id[session_id] or session.harness_by_id[session_id]
   if existing and focus_state(existing) then return end
+  local source_state = session.harness
   client.request({ session_id = session_id, method = "session.resume", params = { session_id = session_id } }, function(result, request_error)
     if request_error then
       notifications.error(request_error, "Harness session")
       return
     end
-    M.activate(result, options)
+    -- The activation targets the tab where the user chose the session, and takes focus only
+    -- when that tab is still the selected one.
+    local activation = vim.tbl_extend("force", {}, options or {}, { source_state = source_state })
+    if session.harness ~= source_state then activation.focus = false end
+    M.activate(result, activation)
   end)
 end
 

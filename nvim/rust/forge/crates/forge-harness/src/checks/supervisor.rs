@@ -291,6 +291,10 @@ impl CheckSupervisor {
     }
 
     /// Reads saved history for session previews without mutating another live runner's state.
+    ///
+    /// A record that cannot be read or decoded, such as one torn by a crash, is skipped and
+    /// reported in the log. One damaged run must not block resume, preview, or fork of the whole
+    /// session, and the skipped file is left in place for inspection.
     pub(crate) fn saved_history(root: &Path) -> Result<Vec<CheckRun>> {
         if !root.exists() {
             return Ok(Vec::new());
@@ -305,23 +309,17 @@ impl CheckSupervisor {
             if !path.exists() {
                 continue;
             }
-            let value: serde_json::Value = crate::codec::from_slice(&std::fs::read(&path)?)
-                .with_context(|| format!("decode check history {}", path.display()))?;
-            if value["version"] != CHECK_HISTORY_VERSION {
-                continue;
+            match saved_record(&path, &directory.file_name().to_string_lossy()) {
+                Ok(Some(run)) => records.push(run),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    target: "forge::checks",
+                    event_name = "checks.history_skipped",
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "skipping undecodable check history record"
+                ),
             }
-            let mut run: CheckRun = crate::codec::from_value(value["run"].clone())
-                .with_context(|| format!("decode current check history {}", path.display()))?;
-            ensure!(
-                directory.file_name().to_string_lossy() == run.id,
-                "check history identity differs from its directory"
-            );
-            for command in &mut run.commands {
-                if command.report.is_none() {
-                    command.report = super::report::collect(command);
-                }
-            }
-            records.push(run);
         }
         records.sort_by_key(|run| run.started_at_ms);
         Ok(records)
@@ -971,17 +969,19 @@ impl CheckSupervisor {
             run.cancelled_inputs = None;
         }
         run.completed_at_ms = Some(now_ms());
-        self.update(&run.clone().into_record(), sink.as_ref())?;
-        if let Err(error) = publication.finish(&run.clone().into_record()).await {
+        // Save before publishing the terminal state, so the editor sees one terminal outcome
+        // instead of a result that a failed save later replaces.
+        let saved = publication.finish(&run.clone().into_record()).await;
+        if let Err(error) = &saved {
             run.state = CheckState::ExecutionError;
             run.record(
                 CheckEventKind::ExecutionError,
                 None,
                 format!("Check history could not be saved: {error:#}"),
             );
-            self.update(&run.clone().into_record(), sink.as_ref())?;
-            return Err(error);
         }
+        self.update(&run.clone().into_record(), sink.as_ref())?;
+        saved?;
         result?;
         Ok(run.into_record())
     }
@@ -1735,7 +1735,31 @@ pub(super) fn operation<'definition>(
     }
 }
 
+/// Decode one current-format run record, or `None` for a record from another history version.
+fn saved_record(path: &Path, directory_name: &str) -> Result<Option<CheckRun>> {
+    let value: serde_json::Value = crate::codec::from_slice(&std::fs::read(path)?)
+        .with_context(|| format!("decode check history {}", path.display()))?;
+    if value["version"] != CHECK_HISTORY_VERSION {
+        return Ok(None);
+    }
+    let mut run: CheckRun = crate::codec::from_value(value["run"].clone())
+        .with_context(|| format!("decode current check history {}", path.display()))?;
+    ensure!(
+        directory_name == run.id,
+        "check history identity differs from its directory"
+    );
+    for command in &mut run.commands {
+        if command.report.is_none() {
+            command.report = super::report::collect(command);
+        }
+    }
+    Ok(Some(run))
+}
+
 /// Atomically replaces one run record on a blocking persistence worker.
+///
+/// The replacement is synced before the rename, so a crash leaves either the previous record or
+/// the complete new one, never a renamed file whose contents had not reached the disk.
 pub(super) fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
     if path.exists() {
         let existing: serde_json::Value = crate::codec::from_slice(&std::fs::read(path)?)?;
@@ -1746,12 +1770,13 @@ pub(super) fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
     }
     std::fs::create_dir_all(path.parent().context("check history path has no parent")?)?;
     let temporary = path.with_extension("tmp");
-    std::fs::write(
-        &temporary,
-        crate::codec::to_vec(
-            &serde_json::json!({"version":CHECK_HISTORY_VERSION,"run":crate::codec::to_value(run)?}),
-        )?,
+    let encoded = crate::codec::to_vec(
+        &serde_json::json!({"version":CHECK_HISTORY_VERSION,"run":crate::codec::to_value(run)?}),
     )?;
+    let mut file = std::fs::File::create(&temporary)?;
+    std::io::Write::write_all(&mut file, &encoded)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(temporary, path)?;
     Ok(())
 }
