@@ -1725,4 +1725,59 @@ T["update_scheduling"] = function()
   owner.close()
 end
 
+T["markdown_pass_skips_unchanged_messages"] = function()
+  local client = require("forge.client")
+  local requests = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    requests[#requests + 1] = { params = params, callback = callback }
+  end
+  -- The fake reports one visible message whose identity, version and rows never change, so only
+  -- `current` decides whether a buffer change elsewhere needs another pass.
+  local passes, regions_current = 0, true
+  package.loaded["forge.render.harness.markdown"] = {
+    viewport = function() return { { id = "message", version = 1, first0 = 0, after0 = 1 } } end,
+    render = function() passes = passes + 1 end,
+    current = function() return regions_current end,
+    after_render = function(_, done) done(true) end,
+    clear = function() end,
+  }
+  MiniTest.finally(function() package.loaded["forge.render.harness.markdown"] = nil end)
+  local transcript, composer = buffer.scratch(), buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local owner = require("forge.views.harness.presentation").open({ session_id = "markdown-pass",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function() end,
+  }, function(value, failure) assert(value and not failure, failure) end)
+  requests[#requests].callback({ transcript = { document = owner.document, revision = 0,
+    block = { { id = "body", text = { "initial" },
+      metadata = { target = {}, decoration = {}, editable_region = {} } } } } })
+  local function patch_once()
+    local count, base = #requests, owner.transcript.revision
+    owner.sync()
+    wait_until(function()
+      return #requests > count and requests[#requests].params.operation == "sync"
+    end, "sync did not dispatch")
+    requests[#requests].callback({ patch = { { document = owner.document, base = base, next = base + 1,
+      base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1,
+      text_edit = { { start_row = 0, removed_rows = 1, text = { "update " .. (base + 1) } } },
+      block_edit = {}, removed_block = {}, metadata_edit = {} } } })
+    wait_until(function() return owner.transcript.revision == base + 1 and not owner.syncing end,
+      "patch did not apply")
+  end
+  patch_once()
+  local settled = passes
+  assert(settled >= 1, "the first publication did not render Markdown")
+  patch_once()
+  MiniTest.expect.equality(passes, settled)
+  -- Rows inserted at a message's end stretch the parser's region, which requires a pass.
+  regions_current = false
+  patch_once()
+  MiniTest.expect.equality(passes, settled + 1)
+  owner.close()
+end
+
 return T

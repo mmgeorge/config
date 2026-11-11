@@ -110,6 +110,38 @@ local function parser_region_list(range_list)
   return region_list
 end
 
+--- Whether the last render of `buf` still describes it, given that `range_list` is the range list
+--- that render used and the buffer has changed since.
+---
+--- An edit outside every message leaves the rendered marks correct, with one exception: rows
+--- inserted exactly at a message's end stretch Tree-sitter's included region over them, and the
+--- highlighter would then style those rows as Markdown. The parser reports its regions as edits
+--- have moved them, so comparing them with the message ranges detects that case exactly. A render
+--- that is still in flight, or that finished against an older buffer, is never current.
+---@param buf integer
+---@param range_list { first0: integer, after0: integer, source_indent?: integer }[]
+---@return boolean
+function M.current(buf, range_list)
+  local pending = render_pending[buf]
+  if not pending or pending.rendered ~= true then return false end
+  local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
+  if not parser_ok or not parser then return false end
+  local expected, actual = parser_region_list(range_list), parser:included_regions()
+  if #expected ~= #actual then return false end
+  for index, region in ipairs(expected) do
+    local live = actual[index]
+    if not live or #live ~= #region then return false end
+    for part, range in ipairs(region) do
+      -- Tree-sitter reports six fields per range, with the byte offsets third and sixth.
+      local moved = live[part]
+      if moved[1] ~= range[1] or moved[2] ~= range[2] or moved[4] ~= range[3] or moved[5] ~= range[4] then
+        return false
+      end
+    end
+  end
+  return true
+end
+
 --- Anchors render-markdown replacement lines that would otherwise follow the final buffer line.
 --- render-markdown conceals each wrapped table row and attaches its replacement lines above the next
 --- visible row. When the concealed rows end the buffer, no such row exists: the anchor lands past the
@@ -328,17 +360,23 @@ function M.render(buf, win, range_list)
             for _, range in ipairs(ranges) do
               -- Incremental trees can retain deleted list items at a shortened region's boundary.
               if source_mark.start_row >= range.first0 and source_mark.start_row < range.after0 then
-                local mark = vim.deepcopy(source_mark)
-                if mark.opts.end_row and mark.opts.end_row >= range.after0 then
-                  mark.opts.end_row, mark.opts.end_col = range.after0, 0
-                end
+                local shift = math.max(0, (range.indent or 2) - 2)
                 local padding = math.max(0, (range.indent or 2) - 2 - (range.source_indent or 0))
-                if mark.opts.virt_text_win_col then
-                  mark.opts.virt_text_win_col = mark.opts.virt_text_win_col + math.max(0, (range.indent or 2) - 2)
-                end
-                if padding > 0 then
-                  for _, line in ipairs(mark.opts.virt_lines or {}) do
-                    table.insert(line, 1, { string.rep(" ", padding), "Normal" })
+                local options = source_mark.opts
+                local clipped = options.end_row and options.end_row >= range.after0
+                local shifted = shift > 0 and options.virt_text_win_col ~= nil
+                local padded = padding > 0 and options.virt_lines ~= nil
+                -- Most marks pass through unchanged, and only a mark that is rewritten needs its
+                -- own copy; copying every mark of every parse dominated this handler.
+                local mark = source_mark
+                if clipped or shifted or padded then
+                  mark = vim.deepcopy(source_mark)
+                  if clipped then mark.opts.end_row, mark.opts.end_col = range.after0, 0 end
+                  if shifted then mark.opts.virt_text_win_col = mark.opts.virt_text_win_col + shift end
+                  if padded then
+                    for _, line in ipairs(mark.opts.virt_lines) do
+                      table.insert(line, 1, { string.rep(" ", padding), "Normal" })
+                    end
                   end
                 end
                 visible[#visible + 1] = mark
@@ -396,7 +434,8 @@ function M.render(buf, win, range_list)
           enabled = true,
           render_modes = true,
           debounce = 0,
-          anti_conceal = { enabled = true, above = 0, below = 0 },
+          -- The transcript is read, not edited, so the cursor row stays rendered like every other row.
+          anti_conceal = { enabled = false },
           completions = { lsp = { enabled = false } },
           sign = { enabled = false },
           win_options = {

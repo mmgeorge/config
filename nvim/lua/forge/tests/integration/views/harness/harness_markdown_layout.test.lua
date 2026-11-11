@@ -199,8 +199,10 @@ T["harness_markdown_layout"] = function()
         return opening == source and body == source and closing == source and rendered ~= source
       end, "equation reveal was partial at source row " .. row, { timeout_ms = 3000 })
     end
+    -- The transcript is read, not edited, so the cursor row stays rendered: no source row of the
+    -- equation reveals its delimiters or body when the cursor enters it.
     for _, row in ipairs({6, 7, 8, 9, 10, 9, 8, 7, 6}) do
-      expect_equation(row, row >= 7 and row <= 9)
+      expect_equation(row, false)
     end
     expect_equation(10, false)
     local after_equation = child.lua([[
@@ -210,16 +212,9 @@ T["harness_markdown_layout"] = function()
   ]])
     local after_screen = capture()
     assert(after_screen[after_equation.row]:match("^%s*$"), "line after equation was concealed into its rendering")
-    child.api.nvim_input("gk")
-    wait_until(function()
-      return table.concat(capture(), "\n"):find("\\int", 1, true)
-    end, "upward display-line motion did not reveal equation", { timeout_ms = 3000 })
-    child.lua("vim.api.nvim_win_set_cursor(0, {7, 0})")
-    wait_until(function()
-      local screen = table.concat(capture(), "\n")
-      return screen:find("\\int", 1, true) and not screen:find("⌠", 1, true)
-    end, "equation did not reveal its complete source on entry", { timeout_ms = 3000 })
-    local previous = 7
+    -- Display-line motion still crosses the rendered equation without stalling or moving backward.
+    child.lua("vim.api.nvim_win_set_cursor(0, {6, 0})")
+    local previous = 6
     for _ = 1, 12 do
       local before = child.api.nvim_win_get_cursor(0)
       child.api.nvim_input("gj")
@@ -227,14 +222,13 @@ T["harness_markdown_layout"] = function()
         return not vim.deep_equal(child.api.nvim_win_get_cursor(0), before)
       end, "down motion did not advance", { timeout_ms = 3000 })
       local current = child.api.nvim_win_get_cursor(0)[1]
-      assert(current >= previous and current <= previous + 1, "down motion skipped or revisited equation source")
+      assert(current > previous, "down motion revisited equation source")
       previous = current
-      if current == 11 then break end
+      if current >= 11 then break end
     end
-    assert(previous == 11, "down motion did not leave the equation")
-    wait_until(function()
-      return table.concat(capture(), "\n"):find("⌠", 1, true)
-    end, "equation did not render again after leaving", { timeout_ms = 3000 })
+    assert(previous >= 11, "down motion did not leave the equation")
+    local crossed = table.concat(capture(), "\n")
+    assert(crossed:find("⌠", 1, true) and not crossed:find("\\int", 1, true), "crossing the equation revealed its source")
   end
 end
 

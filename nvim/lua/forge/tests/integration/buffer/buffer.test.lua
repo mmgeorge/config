@@ -167,8 +167,7 @@ T["markdown_viewport"] = function()
     assert(owner.transcript.revision == revision)
     assert(markdown_visits < 300, "Markdown traversed off-screen history")
   end
-  -- Every buffer change re-renders the visible Markdown, because an edit outside a message can
-  -- extend Tree-sitter's included region at its boundary; only the newly visible range is checked.
+  -- Scrolling brings another message into view, which always needs a pass.
   local rendered_before_scroll = rendered
   vim.api.nvim_win_set_cursor(window, { 29991, 0 })
   vim.cmd("normal! zt")
@@ -193,6 +192,17 @@ T["markdown_viewport"] = function()
   edit_parses = 0
   vim.api.nvim_buf_set_text(transcript, 1, 0, 1, 0, { "changed " })
   assert(edit_parses == 0, "a transcript edit ran " .. edit_parses .. " synchronous Tree-sitter parses")
+  -- A pass is skipped while the parser's regions still equal the message ranges. An edit in
+  -- another block keeps them equal; rows inserted exactly at a message's end stretch its region.
+  local markdown = require("forge.render.harness.markdown")
+  owner.resize()
+  wait_until(function() return markdown.current(transcript, owner.markdown_ranges) end,
+    "a settled render was not reported current")
+  local message_end = owner.markdown_ranges[1].after0
+  vim.api.nvim_buf_set_lines(transcript, message_end + 3, message_end + 4, true, { "elsewhere" })
+  assert(markdown.current(transcript, owner.markdown_ranges), "an edit outside every message required a pass")
+  vim.api.nvim_buf_set_lines(transcript, message_end, message_end, true, { "appended at the boundary" })
+  assert(not markdown.current(transcript, owner.markdown_ranges), "a stretched parser region went undetected")
   owner.close()
 end
 

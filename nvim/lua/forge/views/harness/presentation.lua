@@ -132,9 +132,15 @@ function M.open(options, callback)
     table.sort(range_list, function(left, right) return left.first0 < right.first0 end)
     table.sort(window_list)
     local changedtick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
-    -- Appending outside a message can extend Tree-sitter's included region at its boundary.
-    if not force and owner.markdown_tick == changedtick and vim.deep_equal(owner.markdown_ranges, range_list)
-      and vim.deep_equal(owner.markdown_windows, window_list) then return end
+    -- The pass is skipped while the visible messages, their versions and their rows are those of
+    -- the last pass. A buffer change elsewhere, such as streamed tool output or a status tick,
+    -- needs a pass only when it moved the parser's regions, which `markdown.current` detects.
+    if not force and vim.deep_equal(owner.markdown_ranges, range_list)
+      and vim.deep_equal(owner.markdown_windows, window_list)
+      and (owner.markdown_tick == changedtick or markdown.current(options.transcript_buffer, range_list)) then
+      owner.markdown_tick = changedtick
+      return
+    end
     owner.markdown_ranges, owner.markdown_windows = range_list, window_list
     owner.markdown_tick = changedtick
     if #window_list == 0 then markdown.render(options.transcript_buffer, nil, {}) return end

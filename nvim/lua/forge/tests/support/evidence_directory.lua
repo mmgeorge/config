@@ -10,6 +10,9 @@
 ---@field path string Absolute evidence directory owned by this fixture run.
 ---@field release fun(passed: boolean): string|nil Removes passing evidence; returns a removal failure.
 
+-- Bounds the wait for the host's child processes to release the evidence directory.
+local removal_timeout_ms = 2000
+
 ---@param name string Fixture label used as the directory prefix.
 ---@return ForgeFixtureEvidence
 return function(name)
@@ -20,7 +23,13 @@ return function(name)
     path = path,
     release = function(passed)
       if not passed then return nil end
-      if vim.fn.delete(path, "rf") ~= 0 then return "could not remove fixture evidence " .. path end
+      -- The host's own exit does not end the processes it launched in the workspace, such as a
+      -- Git command behind a checkpoint. Windows refuses to remove a directory that a process
+      -- still holds as its working directory, so removal is repeated until those processes exit.
+      local removed = vim.wait(removal_timeout_ms, function()
+        return vim.fn.delete(path, "rf") == 0 or vim.uv.fs_stat(path) == nil
+      end, 20)
+      if not removed then return "could not remove fixture evidence " .. path end
       return nil
     end,
   }
