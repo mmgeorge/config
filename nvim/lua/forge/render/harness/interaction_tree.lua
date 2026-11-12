@@ -269,71 +269,6 @@ local function append_tool(result, tool, thought_key, tool_index, content_width,
   end
 end
 
---- Formats and truncates output preview lines for an active running tool.
----@param output string? Raw tool output text.
----@param content_width integer? Maximum column width.
----@return string[] lines Array of formatted preview line strings.
-local function active_tool_output_lines(output, content_width)
-  local output_line_list = tool_render.output_lines(output)
-  local preview_line_list = {}
-  local maximum_line_count = 4
-
-  for _, output_line in ipairs(output_line_list) do
-    local remainder = output_line
-    repeat
-      local prefix = #preview_line_list == 0 and "      └ " or "        "
-      local available_width = math.max(1, (content_width or math.huge) - vim.fn.strdisplaywidth(prefix))
-      local split = display_text.take_prefix(remainder, available_width)
-      preview_line_list[#preview_line_list + 1] = prefix .. split.prefix
-      remainder = split.remainder
-    until remainder == "" or #preview_line_list == maximum_line_count
-
-    if #preview_line_list == maximum_line_count then break end
-  end
-
-  return preview_line_list
-end
-
---- Appends active tool execution headings and output preview lines.
----@param result table Target render collection table.
----@param tool table Active tool descriptor table.
----@param content_width integer? Maximum column width.
----@param now_ms? number Current render timestamp in milliseconds.
-local function append_active_tool_preview(result, tool, content_width, now_ms)
-  local first = #result.lines + 1
-  local heading_line_list = tool_render.heading_lines(tool, content_width, "    ", now_ms)
-  for heading_index, heading_line in ipairs(heading_line_list) do
-    result.lines[#result.lines + 1] = heading_line.text
-    heading_line.line = #result.lines
-    result.rows[#result.lines] = {
-      kind = heading_index == 1 and "active_tool" or "active_tool_continuation",
-      tool = tool,
-    }
-  end
-  result.highlights[#result.highlights + 1] = {
-    line = first,
-    first = 4,
-    last = 4 + #"•",
-    group = tool_render.failed(tool) and "ForgeHarnessToolFailure" or "ForgeHarnessToolSuccess",
-  }
-  if tool.kind == "command" then
-    tool_render.highlight_command_lines(result, heading_line_list)
-  elseif tool.kind == "tool_call" then
-    tool_render.highlight_tool_call_lines(result, tool, heading_line_list)
-  end
-
-  for _, output_line in ipairs(active_tool_output_lines(tool.output, content_width)) do
-    result.lines[#result.lines + 1] = output_line
-    result.rows[#result.lines] = { kind = "active_tool_output", tool = tool }
-    result.highlights[#result.highlights + 1] = {
-      line = #result.lines,
-      first = 0,
-      last = -1,
-      group = "ForgeHarnessOutput",
-    }
-  end
-end
-
 --- Appends a file change count and addition/deletion summary line with an expandable diff tree.
 ---@param result table Target render collection table.
 ---@param tree table Prebuilt diff tree structure.
@@ -504,7 +439,8 @@ local function append_active_thought(result, interaction, active, options)
     result.rows[#result.lines] = { kind = "active_tool_count", interaction = interaction }
   end
   if type(active.latest_tool) == "table" then
-    append_active_tool_preview(result, active.latest_tool, options.content_width, options.now_ms)
+    local thought_key = ("interaction:%s:active"):format(interaction.id or interaction.ordinal)
+    append_tool(result, active.latest_tool, thought_key, active.tool_count or 1, options.content_width, options.now_ms)
   end
 end
 

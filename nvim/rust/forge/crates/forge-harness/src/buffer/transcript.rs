@@ -57,7 +57,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         Ok(block)
     }
 
-    /// Projects one stable output chunk and an independent collapsed hidden-count block.
+    /// Project one stable output chunk only while its individual tool is expanded.
     pub(super) fn tool_body(
         &self,
         call_id: &super::identity::DisplayId,
@@ -89,40 +89,19 @@ impl<'profile> TranscriptRenderer<'profile> {
             }
             rows
         } else {
-            let mut rows = preview_rows(self.profile, &output.preview(false)?)?.0;
-            if output.live_preview && output.preview(false)?.total_rows == 0 {
-                rows.clear();
-            }
-            rows
+            Vec::new()
         };
         self.output_block(BlockId(id), rows)
     }
 
-    /// Changes hidden output counts without replacing the heading or its preview.
+    /// Retain the empty end anchor used to replace an individual tool's output chunks.
     pub(super) fn tool_hidden(
         &self,
         call_id: &super::identity::DisplayId,
-        output: &ToolOutputView,
-        expanded: bool,
+        _output: &ToolOutputView,
+        _expanded: bool,
     ) -> Result<BufferBlock> {
-        let hidden = if expanded || output.live_preview {
-            0
-        } else {
-            preview_rows(self.profile, &output.preview(false)?)?.1
-        };
-        let rows = if hidden == 0 {
-            Vec::new()
-        } else {
-            tool_body_rows(
-                self.profile,
-                &format!(
-                    "…({hidden} earlier {})",
-                    if hidden == 1 { "line" } else { "lines" }
-                ),
-                false,
-            )?
-        };
-        self.output_block(BlockId(format!("{call_id}:hidden")), rows)
+        self.output_block(BlockId(format!("{call_id}:hidden")), Vec::new())
     }
 
     fn output_block(&self, id: BlockId, rows: Vec<String>) -> Result<BufferBlock> {
@@ -473,47 +452,6 @@ impl<'profile> TranscriptRenderer<'profile> {
     }
 }
 
-fn preview_rows(
-    profile: &WidthProfile,
-    output: &ToolOutputPreview<'_>,
-) -> Result<(Vec<String>, usize)> {
-    let mut content_profile = profile.clone();
-    let margin = 3.min(content_profile.columns - 1);
-    content_profile.columns -= margin;
-    let mut row = Vec::new();
-    let mut hidden_rows = output.hidden_rows;
-    for (index, text) in output.row.iter().enumerate().rev() {
-        let byte_limit = (profile.columns * 64).min(65536);
-        let truncated = text.len() > byte_limit;
-        let text = if truncated {
-            let mut start = text.len() - byte_limit;
-            while !text.is_char_boundary(start) {
-                start += 1;
-            }
-            &text[start..]
-        } else {
-            text
-        };
-        let wrapped = content_profile.wrap_plain(text, 0)?;
-        let remaining = 4_usize.saturating_sub(row.len());
-        let clipped = wrapped.len() > remaining || truncated;
-        row.extend(wrapped.into_iter().rev().take(remaining));
-        if clipped || row.len() == 4 {
-            hidden_rows += index + usize::from(clipped);
-            break;
-        }
-    }
-    row.reverse();
-    if row.is_empty() {
-        row.push("no output".into());
-    }
-    let mut formatted = Vec::new();
-    for (index, text) in row.into_iter().enumerate() {
-        formatted.extend(tool_body_rows(profile, &text, index == 0)?);
-    }
-    Ok((formatted, hidden_rows))
-}
-
 fn tool_output_rows(
     profile: &WidthProfile,
     output: &ToolOutputPreview<'_>,
@@ -529,18 +467,7 @@ fn tool_output_rows(
         }
         return Ok(row);
     }
-    let (mut row, hidden) = preview_rows(profile, output)?;
-    if hidden > 0 {
-        row.extend(tool_body_rows(
-            profile,
-            &format!(
-                "…({hidden} earlier {})",
-                if hidden == 1 { "line" } else { "lines" }
-            ),
-            false,
-        )?);
-    }
-    Ok(row)
+    Ok(Vec::new())
 }
 
 /// Wraps body content before adding its marker so long tokens cannot strand the marker.

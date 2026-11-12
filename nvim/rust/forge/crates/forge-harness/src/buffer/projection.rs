@@ -1287,7 +1287,7 @@ impl TimelineRenderer<'_> {
                         turn,
                         tool,
                     };
-                    self.tool(&call, None, "", false, exchange)?;
+                    self.tool(&call, None, "", exchange)?;
                 }
             }
         }
@@ -1956,7 +1956,7 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    /// Keep active commentary open so its existing latest-tool preview remains visible.
+    /// Keep active commentary open so the latest tool heading remains visible.
     fn commentary<'exchange>(
         &mut self,
         interaction: &'exchange Exchange,
@@ -2020,31 +2020,17 @@ impl TimelineRenderer<'_> {
             exchange.tool_instant(self.now_ms),
         );
         self.literal(&group_id, &label, None)?;
-        for (index, call) in group.call.iter().enumerate() {
+        for call in &group.call {
             let tool_start = self.block.len();
-            let (call_id, more) = self.tool(
-                call,
-                None,
-                &group_id,
-                !settled && index + 1 == group.call.len(),
-                exchange,
-            )?;
+            let (call_id, more) = self.tool(call, None, &group_id, exchange)?;
             let node_id = format!("{call_id}:tool");
             let expansion = self.expansion.get(&node_id).copied();
-            let node = self.fold(
-                tool_start,
-                &node_id,
-                settled || index + 1 < group.call.len(),
-                NodeKind::Tool,
-            );
+            let node = self.fold(tool_start, &node_id, true, NodeKind::Tool);
             node.lifecycle = if call.tool.state() == crate::turn::ToolState::Running {
                 NodeLifecycle::Live
             } else {
                 NodeLifecycle::Settled
             };
-            if !settled && index + 1 == group.call.len() {
-                node.default_display = NodeDisplay::Preview;
-            }
             if expansion == Some(true) {
                 node.more = more;
             }
@@ -2056,7 +2042,7 @@ impl TimelineRenderer<'_> {
         node.default_display = if settled {
             NodeDisplay::Heading
         } else {
-            NodeDisplay::Preview
+            NodeDisplay::Full
         };
         node.resolve(expansion);
         Ok(())
@@ -2886,7 +2872,7 @@ impl TimelineRenderer<'_> {
                     || call.tool.change.file.is_empty())
             {
                 let tool_start = self.block.len();
-                let (call_id, _) = self.tool(call, Some(&identity), &identity, false, exchange)?;
+                let (call_id, _) = self.tool(call, Some(&identity), &identity, exchange)?;
                 self.fold(tool_start, &format!("{call_id}:tool"), true, NodeKind::Tool);
             } else {
                 self.file_change(&format!("{}:operation", call.id), call.tool)?;
@@ -2982,7 +2968,6 @@ impl TimelineRenderer<'_> {
         call: &crate::exchange::ThoughtCall<'_>,
         scope: Option<&str>,
         group: &str,
-        preview: bool,
         exchange: &Exchange,
     ) -> Result<(super::identity::DisplayId, bool)> {
         let interaction = call.turn.id();
@@ -3012,7 +2997,6 @@ impl TimelineRenderer<'_> {
         };
         output.heading(tool, exchange.tool_instant(self.now_ms));
         output.group = group.to_owned();
-        output.live_preview = preview;
         let id = format!("{call_id}:tool");
         let target = TargetId(id.clone());
         let label = tool.title.clone();
@@ -3020,7 +3004,6 @@ impl TimelineRenderer<'_> {
         let renderer = TranscriptRenderer::new(&width)?;
         let choice = self.expansion.get(&format!("{call_id}:tool")).copied();
         let expanded = !group.is_empty() && choice == Some(true);
-        let preview = preview && choice != Some(false);
         let block = renderer.tool_header(
             BlockId(id),
             target.clone(),
@@ -3036,18 +3019,14 @@ impl TimelineRenderer<'_> {
         self.action
             .insert(target, TranscriptAction::Tool { call_id });
         self.push(block)?;
-        if expanded || preview {
+        if expanded {
             let limit = self
                 .tool_limit
                 .get(&format!("{call_id}:tool"))
                 .copied()
                 .unwrap_or(super::tool::INITIAL_INLINE_BYTES);
             output.load_prefix(limit)?;
-            for chunk in 0..if expanded {
-                output.inline_prefix_chunks(limit)?
-            } else {
-                1
-            } {
+            for chunk in 0..output.inline_prefix_chunks(limit)? {
                 let block = renderer.tool_body(&call_id, &output, expanded, chunk)?;
                 for target in &block.metadata.target {
                     self.action
@@ -3585,6 +3564,181 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{exchange::Exchange, timeline::TimelineEntry};
+
+    /// Keep live output behind each tool's expansion across updates and reflow.
+    #[test]
+    fn live_tool_output_requires_individual_expansion() -> anyhow::Result<()> {
+        use forge_buffer::node::{NodeDisplay, NodeKind};
+        use forge_provider_api::{ItemEvent, ItemStart, TextUpdate, ToolItemEvent};
+
+        for agent in ["primary", "child"] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"live-output", "session_id":"session", "agent_id":agent, "ordinal":1,
+                "prompt":"Inspect", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            exchange.resume(0)?;
+            let address = crate::turn::test_support::address(&exchange, "turn");
+            exchange.start_turn(address.clone(), 0)?;
+            for id in ["first", "latest"] {
+                crate::turn::test_support::tool(
+                    &mut exchange,
+                    &address,
+                    id,
+                    ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+                        semantics: Default::default(),
+                        name: "command".into(),
+                        title: format!("Run {id}"),
+                        arguments: forge_provider_api::InspectableArguments::new(json!({})),
+                    }),
+                    [
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::ExecutionStarted,
+                        },
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::Output(TextUpdate::Replace(format!(
+                                "{id}-one\n{id}-two\n{id}-three\n{id}-four\n{id}-five"
+                            ))),
+                        },
+                    ],
+                    1,
+                )?;
+            }
+            let mut display = crate::buffer::identity::DisplayRegistry::default();
+            let mut expansion = HashMap::new();
+            for columns in [80, 24] {
+                let width = WidthProfile {
+                    columns,
+                    ..WidthProfile::default()
+                };
+                let collapsed = super::project(
+                    super::ProjectionSource::Exchange(&exchange),
+                    &width,
+                    2,
+                    false,
+                    &expansion,
+                    &HashMap::new(),
+                    &mut display,
+                )?;
+                let tools = collapsed
+                    .entry
+                    .block
+                    .iter()
+                    .filter_map(|block| {
+                        block
+                            .metadata
+                            .node
+                            .as_ref()
+                            .filter(|node| node.kind == NodeKind::Tool)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(tools.len(), 2);
+                assert!(
+                    tools
+                        .iter()
+                        .all(|node| node.display == NodeDisplay::Heading)
+                );
+                assert!(collapsed.entry.block.iter().all(|block| {
+                    !block
+                        .text
+                        .wire_rows()
+                        .iter()
+                        .any(|row| row.contains("-one") || row.contains("-five"))
+                }));
+                let latest = tools.last().unwrap().id.0.clone();
+                let visible = crate::buffer::sections::preview(collapsed.entry)?;
+                let headings = visible
+                    .block
+                    .iter()
+                    .filter_map(|block| {
+                        block
+                            .metadata
+                            .node
+                            .as_ref()
+                            .filter(|node| node.kind == NodeKind::Tool)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    headings.len(),
+                    2,
+                    "the live group must show every tool heading"
+                );
+                assert!(
+                    headings
+                        .iter()
+                        .all(|node| node.display == NodeDisplay::Heading)
+                );
+                expansion.insert(latest.clone(), true);
+                let expanded = super::project(
+                    super::ProjectionSource::Exchange(&exchange),
+                    &width,
+                    2,
+                    false,
+                    &expansion,
+                    &HashMap::new(),
+                    &mut display,
+                )?;
+                let text = expanded
+                    .entry
+                    .block
+                    .iter()
+                    .flat_map(|block| block.text.wire_rows())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains("latest-one") && text.contains("latest-five"),
+                    "{text}"
+                );
+                assert!(
+                    !text.contains("first-one"),
+                    "expanding one tool exposed another: {text}"
+                );
+                let renderer = super::TranscriptRenderer::new(&width)?;
+                for (call_id, output) in &expanded.tool {
+                    assert_eq!(
+                        renderer
+                            .tool_body(call_id, output, false, 0)?
+                            .text
+                            .row_count(),
+                        0
+                    );
+                    assert_eq!(
+                        renderer
+                            .tool_hidden(call_id, output, false)?
+                            .text
+                            .row_count(),
+                        0
+                    );
+                }
+                expansion.insert(latest, false);
+            }
+            let update = crate::turn::test_support::item_event(
+                &address,
+                "latest",
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Output(TextUpdate::Append("\nnew-output".into())),
+                },
+            );
+            exchange.observe_event(&update, 3)?;
+            let collapsed = super::project(
+                super::ProjectionSource::Exchange(&exchange),
+                &WidthProfile::default(),
+                3,
+                false,
+                &expansion,
+                &HashMap::new(),
+                &mut display,
+            )?;
+            assert!(collapsed.entry.block.iter().all(|block| {
+                !block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .any(|row| row.contains("new-output") || row.contains("latest-five"))
+            }));
+        }
+        Ok(())
+    }
 
     /// Count concurrent and sequential tool intervals without charging overlaps or idle gaps.
     #[test]

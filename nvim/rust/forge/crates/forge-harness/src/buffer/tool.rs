@@ -37,8 +37,6 @@ pub struct ToolOutputView {
     heading: Option<(crate::turn::ToolCall, crate::turn::ToolInstant)>,
     owner: String,
     pub(super) group: String,
-    /// Show the current tool's output without an empty placeholder or overflow row.
-    pub(super) live_preview: bool,
 }
 
 /// Locates retained output without keeping its bytes in the timeline.
@@ -330,7 +328,6 @@ impl ToolOutputView {
         self.heading = replacement.heading.clone();
         self.owner.clone_from(&replacement.owner);
         self.group.clone_from(&replacement.group);
-        self.live_preview = replacement.live_preview;
         true
     }
 
@@ -382,7 +379,6 @@ impl ToolOutputView {
             heading: None,
             owner: String::new(),
             group: String::new(),
-            live_preview: false,
         }
     }
 

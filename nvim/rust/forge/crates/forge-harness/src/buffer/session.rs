@@ -1943,7 +1943,7 @@ fn apply_projection<'operation>(
                 };
                 let first_chunk = if expanded { source.inline_tail()? } else { 0 };
                 source.append(delta)?;
-                if source.group.is_empty() {
+                if source.group.is_empty() || !expanded {
                     continue;
                 }
                 let block_id = forge_buffer::identity::BlockId(format!("{call_id}:tool"));

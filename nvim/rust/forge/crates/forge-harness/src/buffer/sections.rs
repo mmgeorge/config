@@ -987,27 +987,10 @@ fn render(
                     budget
                 })
             };
-            let compact_tools = source_block.metadata.node.as_ref().is_some_and(|node| {
-                node.kind == forge_buffer::node::NodeKind::ToolGroup
-                    && node.default_display == forge_buffer::node::NodeDisplay::Preview
-            });
-            let child_start = if compact_tools {
-                (cursor + 1..after)
-                    .rev()
-                    .find(|index| {
-                        source[*index].metadata.node.as_ref().is_some_and(|node| {
-                            node.kind == forge_buffer::node::NodeKind::Tool
-                                && node.parent.as_ref().is_some_and(|parent| parent.0 == *id)
-                        })
-                    })
-                    .unwrap_or(cursor + 1)
-            } else {
-                cursor + 1
-            };
             let more = expanded
                 && (render(
                     context,
-                    child_start,
+                    cursor + 1,
                     after,
                     output,
                     child_budget,
@@ -1078,9 +1061,7 @@ fn render(
                 .sum();
             if let Some(node) = &mut output[heading].metadata.node {
                 node.resolve(intent.get(id).copied());
-                if expanded && compact_tools {
-                    node.display = forge_buffer::node::NodeDisplay::Preview;
-                } else if expanded && node.display == forge_buffer::node::NodeDisplay::Heading {
+                if expanded && node.display == forge_buffer::node::NodeDisplay::Heading {
                     node.display = forge_buffer::node::NodeDisplay::Full;
                 }
                 node.loaded_rows = loaded_rows;
