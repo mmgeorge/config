@@ -585,6 +585,8 @@ impl CodexProvider {
             "input":native_input.clone(),
             "clientUserMessageId":native_input_id(&request.submission_id, &request.attempt_id),
             "serviceTier":model.service_tier,
+            // The status preview needs summaries even when the model catalog defaults omit them.
+            "summary":"concise",
             "config":{}
         });
         let rpc = session.rpc.lock().await;
@@ -6506,6 +6508,7 @@ mod continuation_tests {
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":models["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"low"}],"defaultReasoningEffort":"low"}]}}).to_string().into())).await.unwrap();
                 let start: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(start["method"], "turn/start");
+                assert_eq!(start["params"]["summary"], "concise");
                 assert_eq!(start["params"]["approvalPolicy"], "never");
                 assert_eq!(start["params"]["sandboxPolicy"]["type"], "readOnly");
                 assert!(!start["params"]["input"].to_string().contains("<forge>"));
