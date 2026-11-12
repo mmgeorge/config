@@ -1,11 +1,13 @@
 local M = {}
 
 M.frame_list = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+--- Target duration of one animation frame in milliseconds (60 frames per second).
+M.frame_interval_ms = 1000 / 60
 
 ---@param now_ms integer
 ---@return string
 function M.frame_at(now_ms)
-  return M.frame_list[math.floor(now_ms / 120) % #M.frame_list + 1]
+  return M.frame_list[math.floor(now_ms / M.frame_interval_ms) % #M.frame_list + 1]
 end
 
 ---@param current fun(): boolean
@@ -25,7 +27,8 @@ function M.watch(current, update)
     if not current() then stop() return end
     update(M.frame_at(vim.uv.now()))
   end
-  timer:start(120, 120, vim.schedule_wrap(tick))
+  local interval = math.ceil(M.frame_interval_ms)
+  timer:start(interval, interval, vim.schedule_wrap(tick))
   tick()
   return stop
 end

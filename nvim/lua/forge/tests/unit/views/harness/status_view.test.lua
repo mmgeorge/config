@@ -176,10 +176,15 @@ T["timeline_status"] = function()
   local function mark()
     return vim.api.nvim_buf_get_extmark_by_id(status.buffer, status.animation_namespace, 1, { details = true })
   end
-  assert(spinner.frame_at(0) == "⠋" and spinner.frame_at(120) == "⠙")
+  eq(spinner.frame_at(0), "⠋")
+  eq(spinner.frame_at(16), "⠋")
+  eq(spinner.frame_at(17), "⠙")
+  eq(spinner.frame_at(150), "⠏")
+  eq(spinner.frame_at(167), "⠋")
   for _, phase in ipairs({ "Working", "Planning", "Revising plan", "Implementing", "Verifying", "Resolving", "Saving exchange", "Waiting for 2 agents" }) do
     publish(phase, true)
     assert(status.timer and mark()[3].virt_text[1][1] ~= "◷")
+    eq(status.timer:get_repeat(), 17)
   end
   for _, phase in ipairs({ "Paused", "Waiting for your answer", "Waiting for plan review", "Planning stopped", "Saving exchange failed" }) do
     publish(phase, false)

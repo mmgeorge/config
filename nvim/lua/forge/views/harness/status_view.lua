@@ -23,7 +23,7 @@ local StatusView = {}
 StatusView.__index = StatusView
 local replica = require("forge.buffer")
 local position = require("forge.buffer_view")
-local spinner = require("forge.render.harness.timeline_status")
+local spinner = require("forge.render.spinner")
 local hint = require("forge.views.harness.status_hint")
 
 ---@param options {transcript: table, transcript_window: integer, composer_window?: integer, alive: fun(): boolean, notice: fun(message: string), recover: fun(document: table), refresh?: fun()}
@@ -156,7 +156,8 @@ function StatusView:update_animation()
     end
     self.timer = timer
     draw()
-    timer:start(120, 120, vim.schedule_wrap(draw))
+    local interval = math.ceil(spinner.frame_interval_ms)
+    timer:start(interval, interval, vim.schedule_wrap(draw))
   elseif content and content.waiting and visible then
     vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.waiting, 0,
       { id = 1, virt_text = { { "◷", "ForgeStatusHint" } }, virt_text_win_col = 0 })
