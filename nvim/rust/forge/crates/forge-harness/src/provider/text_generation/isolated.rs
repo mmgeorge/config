@@ -14,6 +14,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use tracing::{Instrument, instrument::WithSubscriber};
+
 type Collection = Shared<BoxFuture<'static, Result<(), ProviderError>>>;
 
 enum ReceiptObservation {
@@ -61,10 +63,14 @@ impl TextGenerationJobs {
                 .jobs
                 .retain(|job| !matches!(job.collection.clone().now_or_never(), Some(Ok(()))));
             let (cancellation, observer) = api::OperationCancellation::channel();
-            let worker = tokio::spawn(async move {
-                let result = generate(provider, trace, request, observer).await;
-                let _ = send.send(result);
-            });
+            let worker = tokio::spawn(
+                async move {
+                    let result = generate(provider, trace, request, observer).await;
+                    let _ = send.send(result);
+                }
+                .in_current_span()
+                .with_current_subscriber(),
+            );
             let collection = async move {
                 worker
                     .await
@@ -283,6 +289,11 @@ async fn generate(
     });
     let selected = selected
         .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected))?;
+    request.service_tier.validate_model(selected).map_err(|_| {
+        forge_provider_api::capability::UnsupportedCapability(
+            forge_provider_api::capability::ProviderFeature::ServiceTier,
+        )
+    })?;
     let reasoning = match request.reasoning {
         api::ReasoningSelection::Default => api::ReasoningSelection::Default,
         api::ReasoningSelection::Lowest => api::generation::lowest_effort(selected)?.map_or(
@@ -303,9 +314,11 @@ async fn generate(
         model: Some(selected.id.clone()),
         reasoning,
         context_window: None,
-        service_tier: Default::default(),
+        service_tier: request.service_tier,
     };
     let access = api::access::AccessPolicy {
+        // Isolated adapters disable every native and host tool; no OS sandbox is needed.
+        sandbox: false,
         write_access: api::access::WriteScope::Off,
         ..Default::default()
     };
@@ -438,6 +451,8 @@ async fn observe_operation<T>(
     work: impl std::future::Future<Output = Result<T, ProviderError>>,
 ) -> Result<T, ProviderError> {
     let context = control.context();
+    let span = tracing::info_span!("provider.operation", operation_id = context.id().as_str(), operation = ?control.operation());
+    let work = work.instrument(span);
     tokio::select! {
         result = work => result,
         _ = cancellation.cancelled() => {
@@ -771,6 +786,7 @@ mod tests {
             workspace: "utility-workspace".into(),
             model: "utility-model".into(),
             reasoning: api::ReasoningSelection::Lowest,
+            service_tier: Default::default(),
             instructions: "Return the requested text only".into(),
             input: "evidence".into(),
             validator: Arc::new(Validator { calls, reject }),
@@ -860,6 +876,9 @@ mod tests {
                 let entered = entered_worker.clone();
                 let release = release_worker.clone();
                 async move {
+                    assert!(!request.configuration.access.sandbox);
+                    assert!(request.tools.is_empty());
+                    assert!(request.tool_endpoint.is_none());
                     entered.notify_one();
                     release
                         .acquire()

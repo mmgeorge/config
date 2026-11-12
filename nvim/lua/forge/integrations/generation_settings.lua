@@ -1,0 +1,88 @@
+local function create(purpose)
+  local M = {}
+  local client = require("forge.client")
+  local config = require("forge.infra.config")
+
+  ---@class ForgeBackgroundModel
+  ---@field model string
+  ---@field thinking? string
+  ---@field service_tier? 'default'|'fast'|'ultrafast'
+
+  ---@class ForgeBackgroundPreferences
+  ---@field provider? string Background provider; the host fills in the registry default.
+  ---@field models table<string, ForgeBackgroundModel>
+  ---@field auto_compaction {enabled: boolean, threshold_tokens: integer}
+
+  ---@class ForgeBackgroundSettings
+  ---@field revision integer
+  ---@field settings ForgeBackgroundPreferences
+
+  ---@return ForgeBackgroundPreferences
+  local function defaults()
+    local models = {}
+    local choices = vim.deepcopy(config.options.background_generation or {})
+    if purpose == "commit" then
+      for provider, choice in pairs(config.options.commit_generation or {}) do choices[provider] = choice end
+    end
+    for provider, choice in pairs(choices) do
+      models[provider] = { model = choice.model, thinking = choice.reasoning_effort, service_tier = choice.service_tier or "default" }
+    end
+    return { provider = (purpose == "commit" and config.options.commit_provider or config.options.background_provider), models = models,
+      auto_compaction = { enabled = true, threshold_tokens = 128000 } }
+  end
+
+  --- Read or save one revision of globally shared Background preferences.
+  ---@param snapshot ForgeBackgroundSettings?
+  ---@param preferences ForgeBackgroundPreferences?
+  ---@param callback fun(snapshot: ForgeBackgroundSettings?, failure: string?)
+  function M.request(snapshot, preferences, callback)
+    client.generation_config(function(generation, failure)
+      if not generation then callback(nil, failure) return end
+      local baseline = defaults()
+      client.request({ method = "background.settings", params = {
+        data_root = generation.data_root, defaults = baseline, purpose = purpose,
+        expected_revision = snapshot and snapshot.revision, settings = preferences,
+      } }, function(result, request_failure)
+        if request_failure then callback(nil, request_failure)
+        elseif type(result) ~= "table" or type(result.settings) ~= "table" or type(result.settings.provider) ~= "string" then
+          callback(nil, "Invalid Background settings response")
+        else
+          for _, choice in pairs(result.settings.models) do
+            if choice.thinking == vim.NIL then choice.thinking = nil end
+          end
+          callback(result)
+        end
+      end)
+    end)
+  end
+
+  ---@param snapshot ForgeBackgroundSettings
+  ---@return string provider The saved Background provider, independent of the active chat.
+  function M.provider(snapshot)
+    return snapshot.settings.provider
+  end
+
+  ---@param snapshot ForgeBackgroundSettings
+  ---@param provider string
+  ---@return ForgeBackgroundModel
+  function M.model(snapshot, provider)
+    return assert(snapshot.settings.models[provider],
+      "Background settings have no model for provider " .. provider .. ". Choose one in /config.")
+  end
+
+  --- Build the generation selection every Background consumer sends, from one settings snapshot.
+  ---@param snapshot ForgeBackgroundSettings
+  ---@return ForgeBackgroundSelection selection
+  ---@return ForgeBackgroundModel choice The provider's saved model choice, for progress labels.
+  function M.selection(snapshot)
+    local provider = M.provider(snapshot)
+    local choice = M.model(snapshot, provider)
+    return { provider = provider, model = choice.model, reasoning_effort = choice.thinking,
+      service_tier = choice.service_tier,
+      auto_compaction = purpose == "background" and snapshot.settings.auto_compaction or nil }, vim.deepcopy(choice)
+  end
+
+  return M
+end
+
+return { new = create }

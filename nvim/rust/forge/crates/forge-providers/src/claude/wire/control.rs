@@ -200,6 +200,9 @@ pub(crate) struct Initialize {
     /// Names of in-process MCP servers the client serves over `mcp_message`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sdk_mcp_servers: Vec<String>,
+    /// Replace the CLI prompt for isolated text generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// System prompt text appended to the CLI's own prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub append_system_prompt: Option<String>,

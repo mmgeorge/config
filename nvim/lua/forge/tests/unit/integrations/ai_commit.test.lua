@@ -20,7 +20,7 @@ T["ai_commit"] = function()
   local ai_commit = require("forge.integrations.ai_commit")
   local function generation_get_config() return { provider = { kind = "fixture_alpha" } } end
   package.loaded["forge.client"] = { generation_get_config = generation_get_config }
-  package.loaded["forge.integrations.background_settings"] = {
+  package.loaded["forge.integrations.commit_settings"] = {
     request = function(_, _, callback)
       callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
     end,
@@ -246,7 +246,7 @@ T["ai_commit"] = function()
       vim.api.nvim_buf_delete(buffer, { force = true })
     end
 
-    local settings = package.loaded["forge.integrations.background_settings"]
+    local settings = package.loaded["forge.integrations.commit_settings"]
     local original_request, resolution = settings.request, {}
     settings.request = function(_, _, callback) resolution[#resolution + 1] = callback end
     ai_commit.ensure("D:/delayed-settings", { ref = "HEAD" })

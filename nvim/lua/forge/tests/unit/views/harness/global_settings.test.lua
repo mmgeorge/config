@@ -26,6 +26,7 @@ T["standalone_defaults_do_not_touch_live_session"] = function()
     callback({ revision = 0, settings = { provider = "mock", models = { mock = { model = "mock-model" } },
       auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
   end
+  require("forge.integrations.commit_settings").request = require("forge.integrations.background_settings").request
   client.request = function(request, callback)
     assert(request.session_id == nil, "global configuration sent a session-bound request")
     if request.method == "settings.get" then
@@ -58,8 +59,16 @@ T["standalone_defaults_do_not_touch_live_session"] = function()
   local tabs = #vim.api.nvim_list_tabpages()
   require("forge.views.harness.controller").open_config()
   eq(picker._state_for_test().spec.title, "Global defaults")
+  eq(field("main-speed").value, "default")
+  eq(field("main-speed").disabled_reason, "This model only supports default speed")
+  eq(field("commit-speed").value, "default")
+  eq(field("commit-speed").disabled_reason, "This model only supports default speed")
+  -- A Commit or Background save advances the shared revision while this form stays open.
+  revision = revision + 1
+  saved.lsp_tools = true
   change("status-thoughts")
   eq(saved.status_thoughts, false)
+  eq(saved.lsp_tools, true)
   change("approval-mode")
   eq(saved.approval_mode, "deny")
   change("check-editing")

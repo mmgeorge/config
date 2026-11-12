@@ -16,7 +16,6 @@ use super::excerpt::ChangedFile;
 use super::{Comparison, GenerationRequest, excerpt};
 
 pub struct CommitContext {
-    pub background: Option<forge_harness::background::BackgroundContext>,
     pub prompt: Option<String>,
     pub source_requests: usize,
     pub diff_pairs: usize,
@@ -307,8 +306,7 @@ pub async fn collect(
         });
         let limit = request.max_bytes.unwrap_or_else(|| {
             excerpt::MAX_INPUT_BYTES.saturating_sub(
-                forge_harness::provider::BACKGROUND_SYSTEM_MESSAGE.len()
-                    + TextGeneration::CommitMessage.background_input("").len()
+                TextGeneration::CommitMessage.instructions().len()
                     + header.len()
                     + background_wrapper_bytes,
             )
@@ -325,7 +323,6 @@ pub async fn collect(
         prompt
     };
     Ok(CommitContext {
-        background,
         prompt,
         source_requests,
         diff_pairs,

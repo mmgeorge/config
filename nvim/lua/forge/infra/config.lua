@@ -20,6 +20,8 @@
 ---@field status_diff_viewport_threshold integer
 ---@field status_diff_viewport_overscan integer
 ---@field about_auto_generate boolean
+---@field commit_generation table<string, ForgeBackgroundSelection> Initial per-provider one-shot settings.
+---@field commit_provider? string Initial provider for one-shot commit generation.
 ---@field background_generation table<string, ForgeBackgroundSelection> Per-provider settings for Background generation.
 ---@field background_provider? string Provider for Background generation until `/config` saves another; nil uses the registry default.
 ---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
@@ -242,6 +244,7 @@ M.defaults = {
   status_diff_viewport_overscan = 80,
   about_auto_generate = true,
   background_generation = {},
+  commit_generation = {},
   walkthrough_inventory = "sem",
   branch_prefix = "matt9222/",
   harness = {

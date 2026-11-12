@@ -731,14 +731,20 @@ impl ClaudeProvider {
                 ProviderFailureKind::BindingClosed,
             ));
         }
-        if matches!(
+        let isolated = matches!(
             request.history,
             forge_provider_api::SessionHistory::IsolatedText(_)
-        ) {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::TextGeneration,
-            )
-            .into());
+        );
+        if isolated
+            && (!request.tools.is_empty()
+                || request.tool_endpoint.is_some()
+                || !request.configuration.resources.skills.is_empty()
+                || !request.configuration.resources.mcp.is_empty())
+        {
+            return Err(failure(
+                ProviderOperation::ThreadOpen,
+                ProviderFailureKind::Policy,
+            ));
         }
         validate_configuration(&request.configuration.model, &request.configuration.access)?;
         let mcp_servers = mcp_servers(
@@ -807,6 +813,7 @@ impl ClaudeProvider {
                     drops_turn: None,
                 },
             ),
+            None if isolated => (uuid::Uuid::new_v4().to_string(), SessionStart::Ephemeral),
             None => {
                 let session_id = uuid::Uuid::new_v4().to_string();
                 self.unstarted_sessions.mint(&session_id);
@@ -881,7 +888,7 @@ impl ClaudeProvider {
         let binding = SessionBinding {
             thread_id: request.thread_id.clone(),
             id: binding_id.clone(),
-            provider_session_id: Some(provider_session_id),
+            provider_session_id: (!isolated).then_some(provider_session_id),
         };
         let retained = Arc::new(ClaudeBinding {
             binding: binding.clone(),

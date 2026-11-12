@@ -44,11 +44,21 @@ T["settings"] = function()
       fixture_beta = { model = "mock-model", thinking = "low" },
       fixture_gamma = { model = "mock-model" }, fixture_delta = { model = "mock-model" }, mock = { model = "mock-model" } } }
   local background_revision = 0
-  commit_settings.request = function(_, preferences, callback)
+  commit_settings.request = function(snapshot, preferences, callback)
     if preferences then
+      eq(snapshot.revision, background_revision)
       background_preferences, background_revision = vim.deepcopy(preferences), background_revision + 1
     end
     callback({ revision = background_revision, settings = vim.deepcopy(background_preferences) })
+  end
+  local commit_preferences = vim.deepcopy(background_preferences)
+  require("forge.integrations.commit_settings").request = function(snapshot, preferences, callback)
+    if preferences then
+      eq(snapshot.revision, background_revision)
+      commit_preferences = vim.deepcopy(preferences)
+      background_revision = background_revision + 1
+    end
+    callback({ revision = background_revision, settings = vim.deepcopy(commit_preferences) })
   end
   client.request = function(request_specification, callback)
     local session_id = request_specification.session_id
@@ -79,6 +89,7 @@ T["settings"] = function()
       return
     end
     if method == "session.configure" then
+      background_revision = background_revision + 1
       if params.ask_model then
         state.ask_model = vim.deepcopy(params.ask_model)
         callback({ ask_model = state.ask_model })
@@ -451,6 +462,25 @@ T["settings"] = function()
   local system_rows = vim.tbl_map(function(row) return row.id end, picker._state_for_test().spec.page_list[5].option_list)
   eq(system_rows, { "status-thoughts", "logging" })
   -- The Background provider is a saved preference of its own; changing it leaves the chat alone.
+  eq(find("commit-provider").section, "Commit model")
+  commit_preferences.models.fixture_alpha.thinking = "high"
+  background_revision = background_revision + 1
+  key("commit-speed", "<Right>")
+  eq(commit_preferences.models.fixture_alpha.service_tier, "fast")
+  eq(commit_preferences.models.fixture_alpha.thinking, "high")
+  eq(background_preferences.models.fixture_alpha.service_tier, nil)
+  local _, commit_field = find("commit-model")
+  eq(commit_field.id, "commit-model")
+  assert(not pcall(find, "commit-compact"), "one-shot generation must not offer compaction")
+  key("commit-provider", "<Right>")
+  eq(commit_preferences.provider, "fixture_beta")
+  eq(background_preferences.provider, "fixture_alpha")
+  require("forge.infra.config").options.harness.providers.fixture_gamma.capability.integration.isolated_generation = false
+  key("commit-provider", "<Right>")
+  eq(commit_preferences.provider, "fixture_delta")
+  key("commit-provider", "<Right>")
+  eq(commit_preferences.provider, "fixture_gamma")
+  eq(configured_session.provider, "fixture_alpha")
   eq(find("background-provider").section, "Background model")
   key("background-provider", "<Right>")
   eq(background_preferences.provider, "fixture_beta")

@@ -121,16 +121,11 @@ impl HarnessService {
         workspace: &str,
         purpose: crate::provider::TextGeneration,
         input: &str,
+        cancellation: crate::background::CancellationToken,
+        request_id: Option<u64>,
     ) -> Result<String> {
         let _activity = self.admit().await?;
-        let mut model = config.model;
-        if model == "default"
-            && let Some(preference) =
-                crate::storage::writer::HistoryWriter::lease_for(&config.data_root)?
-                    .load_preference(workspace, config.provider.kind.as_str())?
-        {
-            model = preference.model;
-        }
+        let model = config.model;
         ensure!(
             !model.is_empty() && model.len() <= 256,
             "invalid generation model identity"
@@ -144,11 +139,25 @@ impl HarnessService {
             Arc::new(std::sync::RwLock::new(permission_store)),
         ));
         let trace = Arc::new(crate::trace::TraceStore::open(&config.data_root)?);
+        use tracing::{Instrument, instrument::WithSubscriber};
+        let dispatch = trace.dispatch();
+        let generation_id = format!("generation-{}", uuid::Uuid::new_v4());
+        let span = tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info_span!(
+                "isolated.generation",
+                request_id,
+                process_id = std::process::id(),
+                session_id = generation_id.as_str(),
+                method = "repository.generation",
+                provider = config.provider.kind.as_str()
+            )
+        });
+        let generation = async {
         let provider =
             crate::provider::build(config.provider, permission, trace.clone(), config.data_root)?;
         let request = crate::provider::ProviderCatalogRequest {
             execution_owner: None,
-            harness_session_id: format!("generation-{}", uuid::Uuid::new_v4()),
+            harness_session_id: generation_id.clone(),
             workspace: workspace.to_owned(),
             access: provider
                 .descriptor()
@@ -164,12 +173,25 @@ impl HarnessService {
             provider.as_ref(),
             request,
             purpose,
-            &model,
-            config.reasoning_effort.as_deref(),
+            forge_provider_api::ModelSelection {
+                model: Some(model),
+                reasoning: config.reasoning_effort.map_or(
+                    forge_provider_api::ReasoningSelection::Default,
+                    forge_provider_api::ReasoningSelection::Level,
+                ),
+                service_tier: config.service_tier,
+                ..Default::default()
+            },
             input,
+            cancellation,
         )
         .await;
         drop(provider);
+        if let Err(error) = &generation {
+            tracing::error!(target: "forge::provider", event_name = "isolated.generation.failed", error = %format_args!("{error:#}"));
+        }
+        generation
+        }.instrument(span).with_subscriber(dispatch).await;
         let collected = tokio::task::spawn_blocking(move || trace.close()).await;
         // Diagnostic collection cannot change an already established model result.
         match collected {
@@ -258,7 +280,15 @@ impl HarnessService {
                 let request = controller.catalog_request.read().await.clone();
                 let text = controller
                     .provider_handle()
-                    .generate_text(request, purpose, model, None, &history)
+                    .generate_text(
+                        request,
+                        purpose,
+                        forge_provider_api::ModelSelection {
+                            model: Some(model.clone()),
+                            ..Default::default()
+                        },
+                        &history,
+                    )
                     .await?;
                 return Ok(json!({"text": purpose.validate(&text)?}));
             }
@@ -2095,14 +2125,21 @@ async fn generate_isolated_text(
     provider: &crate::provider::Provider,
     request: crate::provider::ProviderCatalogRequest,
     purpose: crate::provider::TextGeneration,
-    model: &str,
-    reasoning_effort: Option<&str>,
+    selection: forge_provider_api::ModelSelection,
     input: &str,
+    cancellation: crate::background::CancellationToken,
 ) -> Result<String> {
     let provider_label = provider.descriptor().label;
-    let result = provider
-        .generate_text(request, purpose, model, reasoning_effort, input)
-        .await;
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(crate::provider::ProviderError::Failure(
+            forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::TurnStart,
+                forge_provider_api::ProviderFailureKind::Cancelled).at_phase(
+                    forge_provider_api::ProviderPhase::Interruption,
+                    forge_provider_api::FailureDisposition::Uncertain))),
+        result = provider.generate_text(request, purpose, selection, input) => result,
+    };
     let cleanup = match tokio::time::timeout(Duration::from_secs(8), provider.shutdown()).await {
         Ok(result) => result,
         Err(source) => Err(crate::provider::lifecycle_error::classify_source(

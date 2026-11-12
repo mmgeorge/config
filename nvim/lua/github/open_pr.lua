@@ -518,9 +518,9 @@ end
 local function generate_description(cwd, head_commit, context, callback)
   show_progress("Resolving Harness model for PR description...")
   local client = require("forge.client")
-  local settings = require("forge.integrations.background_settings")
+  local settings = require("forge.integrations.commit_settings")
   local function resolved(snapshot, failure)
-    if not snapshot then callback(nil, failure or "Missing Background settings") return end
+    if not snapshot then callback(nil, failure or "Missing commit settings") return end
     local selection = settings.selection(snapshot)
     client.generation_request({
       operation = "pull_request", workspace = cwd, comparison = "pull_request", head = head_commit,

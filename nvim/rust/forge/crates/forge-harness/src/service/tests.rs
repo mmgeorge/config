@@ -167,9 +167,9 @@ async fn isolated_generation_uses_configured_model_without_a_conversation() -> R
         provider_fixture.as_provider(),
         request.clone(),
         TextGeneration::CommitMessage,
-        "selected-model",
-        Some("low"),
+        generation_selection(),
         "Staged diff:\n+change",
+        crate::background::CancellationToken::new(),
     )
     .await?;
     assert_eq!(text, "fix: preserve drafts\n\nKeep existing text.");
@@ -180,12 +180,55 @@ async fn isolated_generation_uses_configured_model_without_a_conversation() -> R
         let request = &requests[0];
         assert_eq!(request.workspace, "commit-workspace");
         assert_eq!(request.model, "selected-model");
+        assert_eq!(request.service_tier, forge_provider_api::ServiceTier::Fast);
         assert!(
             matches!(request.reasoning, forge_provider_api::generation::ReasoningSelection::Level(ref level) if level == "low")
         );
         assert!(request.instructions.contains("Conventional Commit"));
         assert_eq!(request.input, "Staged diff:\n+change");
     }
+    let rejected_calls = Arc::new(Mutex::new(Vec::new()));
+    let rejected_shutdown = Arc::new(AtomicBool::new(false));
+    let rejected_native =
+        generation_provider(rejected_calls.clone(), rejected_shutdown.clone(), false);
+    let rejected_provider =
+        crate::provider::test_support::ProviderTestSession::from_native(rejected_native)?;
+    let mut unsupported_speed = generation_selection();
+    unsupported_speed.service_tier = forge_provider_api::ServiceTier::Ultrafast;
+    let error = generate_isolated_text(
+        rejected_provider.as_provider(),
+        request.clone(),
+        TextGeneration::CommitMessage,
+        unsupported_speed,
+        "diff",
+        crate::background::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("ServiceTier"));
+    assert!(rejected_calls.lock().await.is_empty());
+    assert!(rejected_shutdown.load(Ordering::Acquire));
+    let cancelled_calls = Arc::new(Mutex::new(Vec::new()));
+    let cancelled_shutdown = Arc::new(AtomicBool::new(false));
+    let cancelled_native =
+        generation_provider(cancelled_calls.clone(), cancelled_shutdown.clone(), false);
+    let cancelled_provider =
+        crate::provider::test_support::ProviderTestSession::from_native(cancelled_native)?;
+    let cancellation = crate::background::CancellationToken::new();
+    cancellation.cancel();
+    let error = generate_isolated_text(
+        cancelled_provider.as_provider(),
+        request.clone(),
+        TextGeneration::CommitMessage,
+        generation_selection(),
+        "diff",
+        cancellation,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("Cancelled"));
+    assert!(cancelled_calls.lock().await.is_empty());
+    assert!(cancelled_shutdown.load(Ordering::Acquire));
     let descriptor = forge_providers::registry::descriptor(
         &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
     )
@@ -208,9 +251,9 @@ async fn isolated_generation_uses_configured_model_without_a_conversation() -> R
         unsupported.as_provider(),
         request,
         TextGeneration::CommitMessage,
-        "selected-model",
-        Some("low"),
+        generation_selection(),
         "Staged diff:\n+change",
+        crate::background::CancellationToken::new(),
     )
     .await
     .unwrap_err();
@@ -236,9 +279,9 @@ async fn isolated_generation_uses_configured_model_without_a_conversation() -> R
         failing.as_provider(),
         request,
         TextGeneration::CommitMessage,
-        "selected-model",
-        Some("low"),
+        generation_selection(),
         "Staged diff:\n+change",
+        crate::background::CancellationToken::new(),
     )
     .await
     .unwrap_err();
@@ -253,8 +296,19 @@ struct GenerationCall {
     workspace: String,
     model: String,
     reasoning: forge_provider_api::generation::ReasoningSelection,
+    service_tier: forge_provider_api::ServiceTier,
     instructions: String,
     input: String,
+}
+
+/// Select accelerated generation independently of reasoning effort.
+fn generation_selection() -> forge_provider_api::ModelSelection {
+    forge_provider_api::ModelSelection {
+        model: Some("selected-model".into()),
+        reasoning: forge_provider_api::ReasoningSelection::Level("low".into()),
+        service_tier: forge_provider_api::ServiceTier::Fast,
+        ..Default::default()
+    }
 }
 
 fn generation_provider(
@@ -295,7 +349,7 @@ fn generation_provider(
             }
             Ok(crate::provider::test_support::native_result(&request, forge_provider_api::turn::TurnOutcome::Completed { stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal }))
         }
-    }).with_models(vec![serde_json::from_value(json!({"id":"selected-model","reasoning":["low","high"],"context_window":[],"vision":false,"is_default":true})).expect("normalized fixture model")]);
+    }).with_models(vec![serde_json::from_value(json!({"id":"selected-model","reasoning":["low","high"],"service_tiers":["default","fast"],"context_window":[],"vision":false,"is_default":true})).expect("normalized fixture model")]);
     provider.with_session_open(move |request| {
         let requests = requests.clone();
         async move {
@@ -319,6 +373,7 @@ fn generation_provider(
                     .model
                     .expect("catalog resolved explicit model"),
                 reasoning: request.configuration.model.reasoning,
+                service_tier: request.configuration.model.service_tier,
                 instructions: request.system_instructions,
                 input: String::new(),
             });

@@ -85,3 +85,5 @@ An untouched store reads as follows; [the settings source](../../../rust/forge/s
 ```
 
 An editor must discard an obsolete response when its settings owner has closed. The revision guards writes, not delivery to a replacement view.
+
+The optional `purpose` parameter is `background` (the default) or `commit`. Commit choices are saved separately, accept any registered provider, and seed from existing Background choices before the first Commit save. Generation checks the selected adapter's isolated-generation support when invoked. They select one-shot commit and PR generation, not persisted background conversations.

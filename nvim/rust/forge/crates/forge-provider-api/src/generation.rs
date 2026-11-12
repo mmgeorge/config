@@ -21,6 +21,8 @@ pub struct TextGenerationRequest {
     pub model: String,
     /// Reasoning policy selected by the caller.
     pub reasoning: ReasoningSelection,
+    /// Service tier selected independently of reasoning effort.
+    pub service_tier: crate::ServiceTier,
     /// Complete instructions for the isolated conversation.
     pub instructions: String,
     /// Prepared evidence and user input for generation.

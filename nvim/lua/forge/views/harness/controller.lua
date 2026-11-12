@@ -1930,7 +1930,7 @@ function M.submit()
     M.open_spawn_picker()
     return
   end
-  if text == "/sessions" then
+  if text == "/sessions" or text == "/s" then
     set_composer_text(state.composer_buf, "")
     M.open_session_picker()
     return

@@ -431,7 +431,10 @@ async fn launch(
     });
     let transport = Arc::new(ClaudeTransport::start(io, frames.clone(), cleanup));
     let initialized = transport
-        .request(OutboundControl::Initialize(initialize(options)))
+        .request(OutboundControl::Initialize(initialize(
+            options,
+            &spec.start,
+        )))
         .await;
     let initialized = match initialized {
         Ok(initialized) => initialized,
@@ -523,10 +526,12 @@ fn launch_spec(
     start: SessionStart,
 ) -> Result<LaunchSpec, ProviderError> {
     let mut servers = options.mcp_servers.clone();
-    servers.insert(
-        super::tool_targets::HOST_TOOL_SERVER.to_owned(),
-        json!({"type": "sdk", "name": super::tool_targets::HOST_TOOL_SERVER}),
-    );
+    if !matches!(start, SessionStart::Ephemeral) {
+        servers.insert(
+            super::tool_targets::HOST_TOOL_SERVER.to_owned(),
+            json!({"type": "sdk", "name": super::tool_targets::HOST_TOOL_SERVER}),
+        );
+    }
     let config = json!({"mcpServers": servers});
     // Selected servers can carry credentials; only the built-in host server may stay inline.
     let mcp_config = match &options.plugin_dir {
@@ -556,11 +561,17 @@ fn launch_spec(
     })
 }
 
-fn initialize(options: &ConversationOptions) -> Initialize {
+fn initialize(options: &ConversationOptions, start: &SessionStart) -> Initialize {
+    let isolated = matches!(start, SessionStart::Ephemeral);
     Initialize {
         hooks: None,
-        sdk_mcp_servers: vec![super::tool_targets::HOST_TOOL_SERVER.to_owned()],
-        append_system_prompt: (!options.system_instructions.is_empty())
+        sdk_mcp_servers: if isolated {
+            Vec::new()
+        } else {
+            vec![super::tool_targets::HOST_TOOL_SERVER.to_owned()]
+        },
+        system_prompt: isolated.then(|| options.system_instructions.clone()),
+        append_system_prompt: (!isolated && !options.system_instructions.is_empty())
             .then(|| options.system_instructions.clone()),
         // Render current host instructions on every request, including after resume.
         system_prompt_snapshot: Some(false),

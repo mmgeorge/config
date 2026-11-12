@@ -64,28 +64,39 @@ function M.open(host)
           end)
       end
       target.configure = function(params, completed)
-        local patch = { scope = "global", provider = provider, workspace = workspace, expected_revision = snapshot.revision }
-        local provider_patch, portable = {}, {}
-        for key, value in pairs(params) do
-          if provider_fields[key] then provider_patch[key] = value else portable[key] = value end
-        end
-        if next(provider_patch) then
-          assert(not next(portable), "configuration update mixed provider and portable defaults")
-          patch.provider_settings = provider_patch
-        else patch.desired = vim.tbl_deep_extend("force", global, portable) end
-        client.request({ method = "settings.update", params = patch }, function(result, save_failure)
+        client.request({ method = "settings.get", params = { provider = provider, workspace = workspace } },
+          function(latest, read_failure)
           if not current() then return end
-          if save_failure then notifications.error(save_failure, "ForgeConfig")
-          else
-            snapshot.revision = result.revision
-            if patch.desired then global = patch.desired end
-            selected = vim.tbl_deep_extend("force", selected, params)
-            if params.ask_model then selected.ask_model = vim.deepcopy(params.ask_model) end
-            state.session = selected
-            sync()
+          if read_failure then
+            notifications.error(read_failure, "ForgeConfig")
+            completed(false)
+            return
           end
-          completed(save_failure == nil)
-        end)
+          snapshot = present(latest)
+          global = snapshot.layers.global or {}
+          local patch = { scope = "global", provider = provider, workspace = workspace, expected_revision = snapshot.revision }
+          local provider_patch, portable = {}, {}
+          for key, value in pairs(params) do
+            if provider_fields[key] then provider_patch[key] = value else portable[key] = value end
+          end
+          if next(provider_patch) then
+            assert(not next(portable), "configuration update mixed provider and portable defaults")
+            patch.provider_settings = provider_patch
+          else patch.desired = vim.tbl_deep_extend("force", global, portable) end
+          client.request({ method = "settings.update", params = patch }, function(result, save_failure)
+            if not current() then return end
+            if save_failure then notifications.error(save_failure, "ForgeConfig")
+            else
+              snapshot.revision = result.revision
+              if patch.desired then global = patch.desired end
+              selected = vim.tbl_deep_extend("force", selected, global, snapshot.provider or {}, params)
+              if params.ask_model then selected.ask_model = vim.deepcopy(params.ask_model) end
+              state.session = selected
+              sync()
+            end
+            completed(save_failure == nil)
+          end)
+          end)
       end
       target.select_provider = function(provider_host)
         local entries = {}

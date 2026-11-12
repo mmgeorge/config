@@ -173,7 +173,7 @@ impl GenerationService {
         &self,
         params: Value,
         harness: &HarnessService,
-        delivery: Option<(forge_protocol::outbound::MessageSender, u64)>,
+        _delivery: Option<(forge_protocol::outbound::MessageSender, u64)>,
         lease: Option<GenerationLease>,
     ) -> Result<GenerationResponse> {
         if params.get("operation").and_then(Value::as_str) == Some("cancel") {
@@ -270,22 +270,21 @@ impl GenerationService {
                 "repository HEAD changed before PR generation; run the command again"
             );
             let generated = harness
-                .background
-                .generate(forge_harness::background::BackgroundRequest {
-                    cancellation,
-                    purpose: TextGeneration::PullRequestDescription,
-                    config: request
+                .generate_text(
+                    request
                         .generation
-                        .context("Missing Background provider configuration")?,
-                    context,
-                    input,
-                    delivery,
-                })
+                        .context("Missing commit provider configuration")?,
+                    &request.workspace,
+                    TextGeneration::PullRequestDescription,
+                    &input,
+                    cancellation,
+                    lease.as_ref().map(|lease| lease.request_id),
+                )
                 .await?;
             return Ok(GenerationResponse {
-                session_id: Some(generated.session_id),
+                session_id: None,
                 state: "ready".into(),
-                message: Some(generated.text),
+                message: Some(generated),
                 source_requests: 0,
                 diff_pairs: 0,
                 prompt: None,
@@ -340,13 +339,9 @@ impl GenerationService {
             let system = if context_only {
                 ""
             } else {
-                forge_harness::provider::BACKGROUND_SYSTEM_MESSAGE
+                TextGeneration::CommitMessage.instructions()
             };
-            let user = if context_only {
-                prompt.to_owned()
-            } else {
-                TextGeneration::CommitMessage.background_input(prompt)
-            };
+            let user = prompt.to_owned();
             response.prompt = Some(PromptPreview {
                 system,
                 input_bytes: system.len() + user.len(),
@@ -355,24 +350,20 @@ impl GenerationService {
             });
             return Ok(response);
         }
-        let generated = harness
-            .background
-            .generate(forge_harness::background::BackgroundRequest {
-                cancellation,
-                purpose: TextGeneration::CommitMessage,
-                config: request
-                    .generation
-                    .context("Missing Background provider configuration")?,
-                context: context
-                    .background
-                    .context("Missing Background Git context")?,
-                input: prompt.to_owned(),
-                delivery,
-            })
-            .await?;
-        response.session_id = Some(generated.session_id);
-        let message = generated.text;
-        response.message = Some(message);
+        response.message = Some(
+            harness
+                .generate_text(
+                    request
+                        .generation
+                        .context("Missing commit provider configuration")?,
+                    &request.workspace,
+                    TextGeneration::CommitMessage,
+                    prompt,
+                    cancellation,
+                    lease.as_ref().map(|lease| lease.request_id),
+                )
+                .await?,
+        );
         Ok(response)
     }
 
@@ -394,5 +385,48 @@ impl GenerationService {
                 .await
                 .context("detached generation drain deadline exceeded")?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_diff::cache::CacheLimits;
+    use forge_harness::session::SessionStore;
+    use serde_json::json;
+
+    /// Repeated commit requests complete without creating persistent sessions.
+    #[tokio::test]
+    async fn commit_generation_is_isolated() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        forge_git::test_support::init_repository(&workspace);
+        std::fs::write(workspace.join("change.txt"), "new content")?;
+        let data = directory.path().join("data");
+        let repositories = Arc::new(RepositoryStore::default());
+        let diff = DiffEngine::new(CacheLimits::default(), 1);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
+        let harness = HarnessService::new(repositories.clone(), diff.clone(), syntax.clone());
+        let service = GenerationService::new(repositories, diff, syntax)?;
+        for id in 1..=2 {
+            let params = json!({"operation":"generate","workspace":workspace,"comparison":"status",
+                "generation":{"provider":{"kind":"mock","command":[]},"model":"mock-model","data_root":data}});
+            let lease = service.admit(&forge_protocol::message::Request {
+                id,
+                method: "repository.generation".into(),
+                params: params.clone(),
+            })?;
+            let response = service.dispatch(params, &harness, None, lease).await?;
+            assert_eq!(response.state, "ready");
+            assert!(response.message.is_some());
+            assert!(response.session_id.is_none());
+        }
+        assert!(
+            forge_harness::storage::SqliteStore::open(&data)?
+                .list_session(None)?
+                .is_empty()
+        );
+        Ok(())
     }
 }

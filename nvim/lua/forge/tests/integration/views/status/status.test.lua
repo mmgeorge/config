@@ -21,7 +21,7 @@ T["commit"] = function()
     if event:match("^commit%.") then event_list[#event_list + 1] = { event = event, payload = vim.deepcopy(payload) } end
   end
 
-  local background_settings = require("forge.integrations.background_settings")
+  local background_settings = require("forge.integrations.commit_settings")
   background_settings.request = function(_, _, callback)
     callback({ settings = { provider = "fixture_alpha", models = {
       fixture_alpha = { model = "fixture-model", thinking = "low" },
@@ -153,7 +153,7 @@ T["commit_large_output"] = function()
   local git_write = require("forge.git.write")
 
   local original_execute = git_write.execute
-  local background_settings = require("forge.integrations.background_settings")
+  local background_settings = require("forge.integrations.commit_settings")
   background_settings.request = function(_, _, callback)
     callback({ settings = { provider = "fixture_alpha", models = {
       fixture_alpha = { model = "fixture-model", thinking = "low" },

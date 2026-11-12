@@ -27,7 +27,11 @@ local configuration_field_description = {
   ["ask-model"] = "Model used for Ask requests when Override is enabled.",
   ["ask-thinking"] = "How much reasoning the Ask model uses.",
   ["ask-speed"] = "Service tier for Ask requests.",
-  ["background-provider"] = "Provider for background requests such as commit messages, independent of this chat.",
+  ["commit-provider"] = "Provider for one-shot commit messages and PR descriptions, independent of this chat.",
+  ["commit-model"] = "Model for one-shot commit messages and PR descriptions.",
+  ["commit-thinking"] = "Reasoning effort for one-shot generation.",
+  ["commit-speed"] = "Service tier for one-shot commit messages and PR descriptions.",
+  ["background-provider"] = "Provider reserved for persistent background requests, independent of this chat.",
   ["background-model"] = "Used for background requests.",
   ["background-thinking"] = "How much reasoning the background model uses.",
   ["background-speed"] = "Service tier for background-model requests.",
@@ -418,7 +422,8 @@ function M.open(state, host, resume_state, defaults)
     local configuration_revision = 0
     local cli = active.provider_label or active.provider
     local build_spec
-    local commit
+    local commit_config
+    local background_config
     local current
     --- Main and Ask model choices come from the configured session's provider catalog, never from
     --- the Background controller, whose failures concern only the Background rows.
@@ -553,7 +558,8 @@ function M.open(state, host, resume_state, defaults)
         configure_ask(selection)
         return
       end
-      if commit and commit:change(id, direction or 1) then return end
+      if id:match("^commit%-") and commit_config and commit_config:change(id, direction or 1) then return end
+      if id:match("^background%-") and background_config and background_config:change(id, direction or 1) then return end
       if id == "auto-compact" then
         local policy = vim.deepcopy(active.auto_compaction or { enabled = false, threshold_tokens = 128000 })
         if not (state.capability and state.capability.native_compact) then notifications.error("This provider does not support compaction", "Harness") return end
@@ -675,7 +681,8 @@ function M.open(state, host, resume_state, defaults)
           end })
         return
       end
-      if commit and id:match("^background%-") and commit:open(id) then return end
+      if commit_config and id:match("^commit%-") and commit_config:open(id) then return end
+      if background_config and id:match("^background%-") and background_config:open(id) then return end
       if id == "ask-model" then
         local models = vim.deepcopy(main_catalog.model_list or {})
         for _, model in ipairs(models) do
@@ -721,7 +728,10 @@ function M.open(state, host, resume_state, defaults)
     build_spec = function()
       local policy = access.policy(active)
       local supported = access.supports_sandbox(active, state.capability)
-      local background = commit and commit:fields() or {}
+      local commit = commit_config and commit_config:fields() or {}
+      local background = background_config and background_config:fields() or {}
+      local commit_fields = { commit.provider, commit.model, commit.thinking }
+      if commit.speed then commit_fields[#commit_fields + 1] = commit.speed end
       local background_fields = { background.provider, background.model, background.thinking }
       if background.speed then background_fields[#background_fields + 1] = background.speed end
       local capability = state.capability or {}
@@ -748,10 +758,10 @@ function M.open(state, host, resume_state, defaults)
         field("main-thinking", "choice", active.effort or "Default", "Thinking",
           not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or catalog_disabled),
       }
-      if #require("forge.views.harness.model_options").speeds(model_descriptor(), capability) > 1
-        or active.service_tier and active.service_tier ~= "default" then
-        main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed")
-      end
+      local speeds = require("forge.views.harness.model_options").speeds(model_descriptor(), capability)
+      main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed",
+        catalog_disabled or (#speeds == 1 and (active.service_tier or "default") == "default"
+          and "This model only supports default speed" or nil))
       local compaction = active.auto_compaction or { enabled = false, threshold_tokens = 128000 }
       main[#main + 1] = field("auto-compact", "toggle", compaction.enabled, "Compact",
         not capability.native_compact and "Compaction is unavailable for this provider" or nil)
@@ -801,6 +811,7 @@ function M.open(state, host, resume_state, defaults)
               field("ask-speed", "choice", ask.model and (ask.service_tier or "default") or (active.service_tier or "default"), "Speed",
                 ask_disabled),
             }),
+            row("models", "commit-model", "Commit model", "Model", commit_fields),
             row("models", "background-model", "Background model", "Model", background_fields),
             row("workflow", "automatic-checks", "Checks", "Automatic", {
               field("automatic-checks", "toggle", active.automatic_checks == true, "Enabled"),
@@ -885,10 +896,15 @@ function M.open(state, host, resume_state, defaults)
         session.activate_harness(previous)
       end
     end
-    commit = require("forge.views.harness.background_configuration").new({
+    background_config = require("forge.views.harness.background_configuration").new({
       session_id = session_id, host = host,
       current = current,
-      changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,
+      changed = function() if background_config and picker.is_open("harness-config") then picker.update(build_spec()) end end,
+      reopen = reopen,
+    })
+    commit_config = require("forge.views.harness.background_configuration").new({
+      purpose = "commit", session_id = session_id, host = host, current = current,
+      changed = function() if commit_config and picker.is_open("harness-config") then picker.update(build_spec()) end end,
       reopen = reopen,
     })
     picker.open(build_spec())

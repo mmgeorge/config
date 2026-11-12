@@ -420,6 +420,66 @@ async fn prompt_streams_text_and_completes_with_a_response() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// Isolated prompts stream normally without a durable identity or inherited tool surface.
+#[tokio::test]
+async fn isolated_text_uses_an_unpersisted_tool_free_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| answering_peer(&["generated", " subject"]));
+    let provider =
+        ClaudeProvider::with_launcher(launcher.clone(), directory.path().join("runtime"));
+    let mut request = session_request(directory.path());
+    request.history = forge_provider_api::SessionHistory::IsolatedText(
+        forge_provider_api::session::IsolatedTextPolicy::new(),
+    );
+    let mut opened = provider
+        .thread_open(operation_context(), request)
+        .await
+        .unwrap();
+    assert!(opened.binding.provider_session_id.is_none());
+    provider
+        .turn_start(
+            operation_context(),
+            &opened.binding.id,
+            prompt_request(
+                &opened.binding.id,
+                "isolated-turn",
+                receipt("isolated"),
+                forge_provider_api::permissions::PermissionResponse::Deny {
+                    reason: Some("Tools disabled".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let (events, _) = until_completed(&mut opened.events).await;
+    assert_eq!(streamed_text(&events), "generated subject");
+    let record = launcher.record.lock().unwrap();
+    let arguments = &record.launches[0];
+    for flag in [
+        "--no-session-persistence",
+        "--safe-mode",
+        "--tools=",
+        "--permission-prompts=none",
+    ] {
+        assert!(arguments.iter().any(|argument| argument == flag));
+    }
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.starts_with("--session-id=")
+                || argument.starts_with("--resume="))
+    );
+    let initialize = record
+        .frames
+        .iter()
+        .find(|frame| frame["request"]["subtype"] == "initialize")
+        .unwrap();
+    assert!(initialize["request"]["sdkMcpServers"].is_null());
+    assert_eq!(initialize["request"]["systemPrompt"], "fixture system");
+    drop(record);
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// A steer still queued at the CLI's result starts another CLI turn, and the Forge turn spans both.
 #[tokio::test]
 async fn late_steer_extends_the_turn_through_the_follow_up_result() {

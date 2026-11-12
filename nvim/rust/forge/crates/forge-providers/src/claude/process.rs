@@ -145,7 +145,13 @@ impl LaunchSpec {
                     arguments.push(format!("--resume-session-at={entry}"));
                 }
             }
-            SessionStart::Ephemeral => arguments.push("--no-session-persistence".to_owned()),
+            SessionStart::Ephemeral => {
+                arguments.push("--no-session-persistence".to_owned());
+                arguments.push("--tools=".to_owned());
+                arguments.push("--safe-mode".to_owned());
+                arguments.push("--permission-prompts=none".to_owned());
+                arguments.push("--settings={\"disableAllHooks\":true}".to_owned());
+            }
         }
         arguments
     }

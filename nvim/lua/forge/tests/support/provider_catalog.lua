@@ -6,7 +6,7 @@ function M.registry()
   for index, id in ipairs({ "fixture_alpha", "fixture_beta", "fixture_gamma", "fixture_delta", "mock" }) do
     providers[#providers + 1] = {
       id = id, label = "Fixture " .. index, detail = "Test provider", selectable = id ~= "mock",
-      command = { "fixture-provider", id }, capability = { os_sandbox = index == 1 },
+      command = { "fixture-provider", id }, capability = { os_sandbox = index == 1, integration = { isolated_generation = true } },
       background_generation = { model = "fixture-model", reasoning_effort = "low" },
     }
   end

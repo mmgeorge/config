@@ -1746,8 +1746,7 @@ impl ProviderBridge {
         &self,
         request: super::ProviderCatalogRequest,
         purpose: super::TextGeneration,
-        model: &str,
-        reasoning: Option<&str>,
+        selection: forge_provider_api::ModelSelection,
         history: &str,
     ) -> Result<String, ProviderError> {
         self.ensure_admission(ProviderOperation::ThreadOpen)?;
@@ -1760,17 +1759,30 @@ impl ProviderBridge {
             )
             .into());
         }
+        let tier_supported = match selection.service_tier {
+            forge_provider_api::ServiceTier::Standard => true,
+            forge_provider_api::ServiceTier::Fast => {
+                manifest.supports(forge_provider_api::capability::CapabilityId::FastMode)
+            }
+            forge_provider_api::ServiceTier::Ultrafast => {
+                manifest.supports(forge_provider_api::capability::CapabilityId::UltrafastMode)
+            }
+        };
+        if !tier_supported {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ServiceTier,
+            )
+            .into());
+        }
         self.utility
             .generate(
                 self.native.clone(),
                 self.trace.clone(),
                 forge_provider_api::TextGenerationRequest {
                     workspace: request.workspace,
-                    model: model.to_owned(),
-                    reasoning: reasoning
-                        .map_or(forge_provider_api::ReasoningSelection::Default, |value| {
-                            forge_provider_api::ReasoningSelection::Level(value.to_owned())
-                        }),
+                    model: selection.model.unwrap_or_else(|| "default".to_owned()),
+                    reasoning: selection.reasoning,
+                    service_tier: selection.service_tier,
                     instructions: purpose.instructions().to_owned(),
                     input: purpose.input(history),
                     validator: Arc::new(purpose),

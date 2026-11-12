@@ -6,6 +6,24 @@ use forge_harness::{provider::ServiceTier, session::AutoCompaction, settings::Se
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Select independently saved model settings for persistent or isolated generation.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Purpose {
+    #[default]
+    Background,
+    Commit,
+}
+
+impl Purpose {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Commit => "commit",
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ModelChoice {
@@ -28,31 +46,38 @@ struct Preferences {
     models: BTreeMap<String, ModelChoice>,
 }
 
-/// Reject a provider whose registry entry cannot run tool-free Background sessions.
-fn validate_provider(provider: &str) -> Result<()> {
+/// Keep Commit preferences editable for every registered provider; Background needs a durable runner.
+fn validate_provider(provider: &str, purpose: Purpose) -> Result<()> {
     let kind = forge_providers::registry::select(provider)?;
+    let integration = forge_providers::registry::resolve(&kind)?
+        .capability
+        .integration;
     ensure!(
-        forge_providers::registry::resolve(&kind)?
-            .capability
-            .integration
-            .background_generation,
-        "{provider} does not support Background sessions"
+        match purpose {
+            Purpose::Background => integration.background_generation,
+            Purpose::Commit => true,
+        },
+        "{provider} does not support {}",
+        match purpose {
+            Purpose::Background => "Background sessions",
+            Purpose::Commit => "isolated generation",
+        }
     );
     Ok(())
 }
 
 impl Preferences {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, purpose: Purpose) -> Result<()> {
         self.auto_compaction.validate(None)?;
         if let Some(provider) = &self.provider {
-            validate_provider(provider)?;
+            validate_provider(provider, purpose)?;
         }
         for (provider, choice) in &self.models {
             ensure!(
                 !provider.trim().is_empty() && !choice.model.trim().is_empty(),
                 "Background model cannot be empty"
             );
-            validate_provider(provider)?;
+            validate_provider(provider, purpose)?;
             if let Some(thinking) = &choice.thinking {
                 ensure!(
                     !thinking.trim().is_empty(),
@@ -67,6 +92,8 @@ impl Preferences {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsRequest {
+    #[serde(default)]
+    purpose: Purpose,
     data_root: PathBuf,
     defaults: Preferences,
     expected_revision: Option<u64>,
@@ -74,24 +101,27 @@ struct SettingsRequest {
 }
 
 fn apply(request: SettingsRequest) -> Result<Value> {
-    request.defaults.validate()?;
+    request.defaults.validate(request.purpose)?;
     let mut store = SettingsStore::open(&request.data_root)?;
-    let mut snapshot = store.get("", "", "background")?;
+    let mut snapshot = store.get("", "", request.purpose.key())?;
     if let Some(settings) = request.settings {
-        settings.validate()?;
+        settings.validate(request.purpose)?;
         store.save_provider(
             request
                 .expected_revision
                 .context("Background settings require an expected revision")?,
-            "background",
+            request.purpose.key(),
             &serde_json::to_value(settings)?,
         )?;
-        snapshot = store.get("", "", "background")?;
+        snapshot = store.get("", "", request.purpose.key())?;
+    }
+    if snapshot.provider.is_null() && matches!(request.purpose, Purpose::Commit) {
+        snapshot.provider = store.get("", "", "background")?.provider;
     }
     let mut settings = request.defaults;
     if !snapshot.provider.is_null() {
         let saved: Preferences = serde_json::from_value(snapshot.provider)?;
-        saved.validate()?;
+        saved.validate(request.purpose)?;
         settings.auto_compaction = saved.auto_compaction;
         settings.provider = saved.provider.or(settings.provider);
         settings.models.extend(saved.models);
@@ -129,6 +159,72 @@ mod tests {
     fn defaults() -> Value {
         json!({"auto_compaction": {"enabled": true, "threshold_tokens": 128000},
             "models": {"codex": {"model": "gpt-6-luna", "thinking": "low"}}})
+    }
+
+    /// Commit selections seed from earlier preferences and then save independently.
+    #[test]
+    fn commit_preferences_are_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = apply(request(
+            directory.path(),
+            defaults(),
+            Some(defaults()),
+            Some(0),
+        ))
+        .unwrap();
+        let mut commit = request(directory.path(), defaults(), None, None);
+        commit.purpose = Purpose::Commit;
+        let seeded = apply(commit).unwrap();
+        assert_eq!(seeded["settings"]["models"], original["settings"]["models"]);
+        let mut selected = seeded["settings"].clone();
+        selected["models"]["codex"]["model"] = json!("another-model");
+        let mut commit = request(
+            directory.path(),
+            defaults(),
+            Some(selected),
+            seeded["revision"].as_u64(),
+        );
+        commit.purpose = Purpose::Commit;
+        apply(commit).unwrap();
+        let background = apply(request(directory.path(), defaults(), None, None)).unwrap();
+        assert_eq!(
+            background["settings"]["models"],
+            original["settings"]["models"]
+        );
+        let mut commit = request(directory.path(), defaults(), None, None);
+        commit.purpose = Purpose::Commit;
+        assert_eq!(
+            apply(commit).unwrap()["settings"]["models"]["codex"]["model"],
+            "another-model"
+        );
+    }
+
+    /// Mixed-provider defaults cannot disable the picker, and every registered choice persists.
+    #[test]
+    fn commit_preferences_accept_every_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut baseline = defaults();
+        baseline["models"]["claude"] = json!({"model": "haiku"});
+        baseline["models"]["antigravity"] = json!({"model": "default"});
+        let mut read = request(directory.path(), baseline.clone(), None, None);
+        read.purpose = Purpose::Commit;
+        let mut snapshot = apply(read).unwrap();
+        for provider in ["claude", "antigravity", "codex", "copilot"] {
+            let mut selected = snapshot["settings"].clone();
+            selected["provider"] = json!(provider);
+            let mut save = request(
+                directory.path(),
+                baseline.clone(),
+                Some(selected),
+                snapshot["revision"].as_u64(),
+            );
+            save.purpose = Purpose::Commit;
+            apply(save).unwrap();
+            let mut read = request(directory.path(), baseline.clone(), None, None);
+            read.purpose = Purpose::Commit;
+            snapshot = apply(read).unwrap();
+            assert_eq!(snapshot["settings"]["provider"], provider);
+        }
     }
 
     /// Settings saved before the provider field existed still load and take the registry default.

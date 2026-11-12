@@ -148,31 +148,19 @@ Forge reads their content. This applies to automatic drafts, staged regeneration
 generation, and pull-request descriptions, including untracked files and renamed LFS
 paths. LFS-only changes produce no generation request.
 
-Commit generation uses a persistent, tool-free **Background session** whose provider is
-chosen separately from the active chat, so a Claude Code chat can generate commits with
-Codex and the reverse. The Background provider defaults to Codex. Codex and Copilot default
-to `gpt-6-luna` with low thinking, and Claude Code defaults to `haiku` with low thinking.
-`/config` provides a **Background model** section in **Models** for provider, model,
-thinking, supported speed, automatic compaction, and token threshold choices. The model
-list follows the selected provider. Choices persist across restarts. Gemini is not part
-of this workflow. Other AI features retain their existing adapters.
+Commit generation uses a one-shot, tool-free request through the selected provider's
+isolated-text adapter. It creates no saved Harness conversation and never resumes a
+background thread. Each request includes the current diff and the last ten complete
+Git commit messages as style examples.
 
-Background **Speed** is independent of Main and applies to subsequent Background
-requests. It offers `default` and the accelerated tiers advertised for the selected
-model. Codex's model catalog determines whether `fast` or `ultrafast` is available.
-Changing models resets an incompatible speed to `default`. The control is hidden
-for providers without accelerated tiers. Invalid combinations are rejected before
-provider submission, including settings supplied outside `/config`.
+`/config` and `:ForgeConfig` provide a **Commit model** section in **Models** with provider,
+model, thinking, and speed choices, independent of Main, Ask, and Background. These settings
+also supply one-shot PR descriptions. Existing Background preferences seed the initial
+commit selection; saving a Commit choice stores it independently. Closing the last
+consumer cancels unfinished commit generation.
 
-The first actual generation creates the session. Normal commits reuse it. Switching
-branches or rewriting history starts another conversation, with the old timeline retained.
-Each request includes the last ten complete Git commit messages for terminology and style.
-
-Background auto-compaction defaults to **128,000 tokens** using the model's default context
-window. Ordinary Harness sessions default to off. Their **Main model** section in
-**Models** includes the Compact toggle and token threshold in `/config`. Compaction runs after completed turns, with no
-idle timer. Missing provider usage cannot trigger compaction. Failed compaction is visible
-and does not discard generated text.
+The **Background model** settings and service remain available for future persistent
+workflows. Commit messages and PR descriptions do not use them.
 
 `:ForgeDebugBackgroundTimeline [session_id]` opens the recorded Background conversation
 without changing the active chat or sending model input. Use **Tab** to expand rows, **H**
@@ -435,8 +423,8 @@ source.
 cleanup diagnostics follow the same `/log` setting instead of printing to process
 streams. Operation failures remain visible when logging is off.
 
-Inside Harness, `/sessions`
-opens durable session search and `/undo` opens the interaction list directly.
+Inside Harness, `/sessions` (or `/s`) opens durable session search in a picker
+with a fixed height of 35% of the Harness area. `/undo` opens the interaction list directly.
 Session search starts on **Workspace**; switch to **All** with `Tab`, the left/right
 arrow keys, or `Ctrl-O`. Each tab retains its own search query, and **All** includes
 the workspace path for each session.
@@ -619,8 +607,12 @@ Enter activates a setting, Space also toggles booleans, and Left/Right cycle cho
 Press `?` for the full key help. A fixed two-line area describes the selected setting.
 Category and field selection survive resizing, updates, and returns from child editors.
 
-**Models** contains Main, Ask, and Background model sections. Main and Background each
-start with a **Provider** field that decides which models the section lists. Activating
+**Models** contains Main, Ask, Commit, and Background model sections. Commit selects a
+provider from the full provider list and offers Model, Thinking, and Speed controls. Its
+choices are global and do not reconfigure the current chat. Speed choices follow the
+selected provider and model; Main and Commit keep Speed visible when only the default
+tier is available. Main and Background each start with a **Provider** field that decides
+which models the section lists. Activating
 Main's Provider switches the chat's provider by starting a new chat or resuming one, the
 same flow as `/provider`. Background's Provider cycles with Left/Right among providers that
 support Background sessions and leaves the chat unchanged. Main and Background
@@ -895,8 +887,7 @@ the diff or requesting a description. Conflicts stop the workflow with "Merge
 conflicts. Resolve them before creating the PR." The check leaves your branch,
 index, and working files unchanged.
 
-PR descriptions use Harness with the same Background provider, model, thinking, and
-speed settings in `/config` as commits. PR descriptions and commits share one persistent, branch-aware Background
-session and its compaction policy. Each request supplies its own output instructions.
-Both appear in `:ForgeDebugBackgroundTimeline`. Provider failures stop PR creation and
-appear in a notification.
+PR descriptions use the same Commit provider, model, and thinking settings in `/config`
+as commits. Each request runs once through the isolated-text adapter with its own output
+instructions and no saved conversation. Provider failures stop PR creation and appear
+in a notification.

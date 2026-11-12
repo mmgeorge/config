@@ -390,6 +390,7 @@ fn capability(id: &str) -> ProviderCapability {
         "claude" => ProviderCapability {
             integration: ProviderIntegration {
                 background_generation: true,
+                isolated_generation: true,
                 tracked_submission: true,
                 native_agent_suppression: true,
                 mcp_runtime_status: true,

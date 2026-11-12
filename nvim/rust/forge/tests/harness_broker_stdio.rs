@@ -340,7 +340,7 @@ fn verify_background_failure_logs(
         assert!(
             records
                 .iter()
-                .any(|record| record["event"] == "background.preparation.failed"
+                .any(|record| record["event"] == "isolated.generation.failed"
                     && record["payload"]["request_id"] == request_id),
             "{contents}"
         );
@@ -354,8 +354,10 @@ fn verify_background_failure_logs(
     } else {
         for request_id in [41, 43] {
             assert!(
-                records.iter().any(|record| record["event"] == "ipc.failed"
-                    && record["payload"]["request_id"] == request_id),
+                records
+                    .iter()
+                    .any(|record| record["event"] == "isolated.generation.failed"
+                        && record["payload"]["request_id"] == request_id),
                 "{contents}"
             );
         }

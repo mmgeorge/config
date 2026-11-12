@@ -106,6 +106,26 @@ T["new_session_commands_choose_tab_mode"] = function()
   eq(calls, { "current", "tab" })
 end
 
+T["session_picker_command_alias"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local commands = require("forge.views.harness.completion.command_source")
+  state.session = { id = "source", model = "test" }
+  state.ready = true
+  state.composer_buf = buffer.scratch()
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
+  local opened = 0
+  controller.open_session_picker = function() opened = opened + 1 end
+  for _, command in ipairs({ "/sessions", "/s" }) do
+    eq(commands.accepts_prompt(command), true)
+    eq(commands.queues_execution(command), false)
+    buffer.set(state.composer_buf, { command })
+    controller.submit()
+    eq(buffer.line(state.composer_buf, 1), "")
+  end
+  eq(opened, 2)
+end
+
 T["config_opens_without_harness_windows"] = function()
   local session = require("forge.session")
   local state = session.harness

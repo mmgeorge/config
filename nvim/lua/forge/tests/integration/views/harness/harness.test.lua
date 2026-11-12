@@ -307,7 +307,7 @@ do
   end
   controller.drain, history.record = function() end, function() end
   local controls = { "/config", "/effort", "/effort high", "/model", "/read", "/write", "/yolo", "/ask", "/deny", "/allow",
-    "/fast", "/ultrafast", "/skills", "/mcp", "/checks", "/rename", "/sessions",
+    "/fast", "/ultrafast", "/skills", "/mcp", "/checks", "/rename", "/sessions", "/s",
     "/task refresh", "/agents on", "/agents edit", "/provider", "/questions" }
   for _, command in ipairs(controls) do
     buffer.set(composer, { command })
