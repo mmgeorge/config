@@ -62,7 +62,8 @@ replaying an uncertain prompt.
 | `:ForgeDiffCompactPreview!` | Bang | Preview the compacted staged diff |
 
 Invoking `:ForgeStatus` from a floating picker or a window pinned to another buffer
-reuses an existing non-floating Status window, or opens a new tab if none exists.
+reuses an existing non-floating Status window in the current tab, or opens a split
+in that tab if none exists.
 Forge leaves the picker or pinned buffer untouched.
 
 ForgeStatus file rows, file-specific comparison labels, and single-file discard
@@ -86,10 +87,10 @@ For example, `:ForgeFileRevision README.md HEAD` opens the committed README.
 Revision arguments use the shared revision completion source. File-specific
 commands complete the file argument before the revision argument.
 
-Opening a file from ForgeStatus uses a new tab by default, including historical
-source for deleted files. Set `status_open_target = "buffer"` in
-`require("forge").setup({ ... })` to open files in the Status window instead.
-The default is `status_open_target = "tab"`.
+Opening a file from ForgeStatus with `.`, `o`, or `<CR>` uses the Status window by
+default, including historical source for deleted files. Set
+`status_open_target = "tab"` in `require("forge").setup({ ... })` to open files in
+a new tab. The default is `status_open_target = "buffer"`.
 
 ## Diff controls
 
