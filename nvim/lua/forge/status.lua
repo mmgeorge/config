@@ -828,17 +828,25 @@ function M.show(state, window)
   local focused = origin == window
   local created
   local target = window
+  local tab = vim.api.nvim_win_get_tabpage(window)
   local ok, failure = xpcall(function()
     if vim.api.nvim_win_get_config(window).relative ~= ""
       or (vim.wo[window].winfixbuf and vim.api.nvim_win_get_buf(window) ~= state.replica.buffer) then
       local displayed = vim.tbl_filter(function(candidate)
-        return vim.api.nvim_win_get_config(candidate).relative == ""
+        return vim.api.nvim_win_get_tabpage(candidate) == tab
+          and vim.api.nvim_win_get_config(candidate).relative == ""
       end, vim.fn.win_findbuf(state.replica.buffer))
       if #displayed > 0 then
         target = displayed[1]
       else
-        vim.api.nvim_win_call(window, function()
-          vim.cmd("tabnew")
+        local anchor = window
+        if vim.api.nvim_win_get_config(anchor).relative ~= "" then
+          for _, candidate in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+            if vim.api.nvim_win_get_config(candidate).relative == "" then anchor = candidate break end
+          end
+        end
+        vim.api.nvim_win_call(anchor, function()
+          vim.cmd("botright vsplit")
           target = vim.api.nvim_get_current_win()
           created = target
           vim.wo[target].winfixbuf = false

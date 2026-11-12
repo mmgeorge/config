@@ -222,7 +222,7 @@ M.defaults = {
   text_correction = { enabled = true, language = "en-US", terminology = {}, project_terms = {},
     wordlist = require("forge.text.wordlist").default_path },
   status_buffer_name = "ForgeStatus",
-  status_open_target = "tab",
+  status_open_target = "buffer",
   pr_buffer_name = "ForgePR",
   debug_notifications = false,
   -- Gate non-Harness tracing (ForgeStatus, diffs, PRs, and shared UI work).

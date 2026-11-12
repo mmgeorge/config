@@ -301,8 +301,8 @@ T["native"] = function()
   assert(selected_input.revision == captured_revision, "confirmation replaced its captured revision")
   local status_window = vim.api.nvim_get_current_win()
   local status_tab = vim.api.nvim_get_current_tabpage()
-  assert(config.options.status_open_target == "tab", "file opening no longer defaults to a tab")
-  for _, target in ipairs({ "tab", "buffer" }) do
+  assert(config.options.status_open_target == "buffer", "file opening must default to the current window")
+  for _, target in ipairs({ "buffer", "tab" }) do
     config.options.status_open_target = target
     vim.api.nvim_set_current_win(status_window)
     vim.api.nvim_win_set_buf(status_window, state.replica.buffer)
@@ -484,6 +484,8 @@ T["open_lifecycle"] = function()
   vim.api.nvim_win_set_cursor(unrelated_window, { 1, 5 })
   vim.wo[unrelated_window].winfixbuf = true
   local pinned_cursor = vim.api.nvim_win_get_cursor(unrelated_window)
+  local opening_tab = vim.api.nvim_get_current_tabpage()
+  local opening_tabs = #vim.api.nvim_list_tabpages()
   local public = forge.open()
   assert(vim.api.nvim_get_current_win() == unrelated_window and vim.api.nvim_get_current_buf() == pinned,
     "pending public Status entry changed the pinned window")
@@ -492,6 +494,8 @@ T["open_lifecycle"] = function()
     "public Status entry did not mount beside the pinned feature")
   local status_window = vim.fn.win_findbuf(public.replica.buffer)[1]
   assert(status_window ~= unrelated_window and vim.api.nvim_get_current_win() == status_window)
+  eq(vim.api.nvim_get_current_tabpage(), opening_tab)
+  eq(#vim.api.nvim_list_tabpages(), opening_tabs)
   assert(vim.api.nvim_win_get_buf(unrelated_window) == pinned and vim.wo[unrelated_window].winfixbuf,
     "Status stole the pinned Harness input buffer or removed its pin")
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(unrelated_window), pinned_cursor)
@@ -511,6 +515,8 @@ T["open_lifecycle"] = function()
   local picker_notices = notify.capture()
   assert(forge.open() == public, "cached Status failed from a one-row picker: " .. table.concat(picker_notices:messages(), "\n"))
   local mounted_window = vim.api.nvim_get_current_win()
+  eq(vim.api.nvim_get_current_tabpage(), opening_tab)
+  eq(#vim.api.nvim_list_tabpages(), opening_tabs)
   assert(mounted_window ~= picker_window and vim.api.nvim_win_get_config(mounted_window).relative == "",
     "cached Status mounted inside a transient picker")
   assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer and vim.wo[picker_window].winbar == "",
@@ -541,6 +547,8 @@ T["open_lifecycle"] = function()
   pending_open[fresh.document]()
   wait_until(function() return fresh.ready end, "fresh Status did not open from a one-row picker")
   mounted_window = vim.api.nvim_get_current_win()
+  eq(vim.api.nvim_get_current_tabpage(), opening_tab)
+  eq(#vim.api.nvim_list_tabpages(), opening_tabs)
   assert(mounted_window ~= picker_window and vim.api.nvim_win_get_config(mounted_window).relative == "",
     "fresh Status mounted inside a transient picker")
   assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer and vim.wo[picker_window].winbar == "")
@@ -564,12 +572,14 @@ T["open_lifecycle"] = function()
     return original_set_buffer(window, buf)
   end
   local before_failure_tabs = #vim.api.nvim_list_tabpages()
+  local before_failure_windows = #vim.api.nvim_tabpage_list_wins(opening_tab)
   pending_open[failed.document]()
   wait_until(function() return not failed.active and closed_document[failed.document] end,
     "failed Status binding retained a partial active document")
   vim.api.nvim_win_set_buf = original_set_buffer
   assert(not vim.api.nvim_buf_is_valid(failed.replica.buffer) and not failed.ready)
-  assert(#vim.api.nvim_list_tabpages() == before_failure_tabs, "failed binding leaked its new Status tab")
+  assert(#vim.api.nvim_list_tabpages() == before_failure_tabs, "failed binding created a Status tab")
+  eq(#vim.api.nvim_tabpage_list_wins(opening_tab), before_failure_windows)
   assert(#notices == 1 and notices[1].message:find("fixture Status bind failure", 1, true))
   assert(vim.api.nvim_win_get_buf(unrelated_window) == pinned and vim.wo[unrelated_window].winfixbuf)
   local recovered = forge.open()
