@@ -343,6 +343,8 @@ An explicitly empty final answer does not produce a replacement response.
 `Running` tool groups show only the latest call and its four-row output preview.
 When a group changes to `Ran`, it folds automatically. Expanding that completed group
 shows every call in the group, with individual output available on expansion.
+The group duration counts overlapping calls once and excludes gaps between calls.
+Individual rows show each call's duration, so their sum can exceed the group duration.
 
 Thoughts with activity start collapsed and preserve the assistant's text in their heading.
 Expanding a thought shows its events first, then its tool summary, then its file changes,

@@ -273,21 +273,15 @@ fn part_turn_id<'source>(
     }
 }
 
+/// Render a group's tool count and occupied execution time without counting overlaps twice.
 fn tool_group_label<'tool>(
     calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
     lifecycle: NodeLifecycle,
     now: crate::turn::ToolInstant,
 ) -> String {
-    let mut count = 0;
-    let mut failed = 0;
-    let mut elapsed = Some(0_u64);
-    for tool in calls {
-        count += 1;
-        failed += usize::from(tool.failed);
-        elapsed = elapsed
-            .zip(tool.elapsed_ms(now))
-            .map(|(total, duration)| total.saturating_add(duration));
-    }
+    let calls: Vec<_> = calls.into_iter().collect();
+    let count = calls.len();
+    let failed = calls.iter().filter(|tool| tool.failed).count();
     let mut label = format!(
         "▸ {} {count} {}",
         if lifecycle == NodeLifecycle::Live {
@@ -300,13 +294,53 @@ fn tool_group_label<'tool>(
     if failed > 0 {
         label.push_str(&format!(" ({failed} failed)"));
     }
-    if let Some(elapsed) = elapsed {
+    if let Some(elapsed) = tool_group_elapsed(&calls, now) {
         label.push_str(&format!(
             " · {}",
             super::duration::tool_duration(Some(elapsed)).trim()
         ));
     }
     label
+}
+
+/// Get occupied group time on a shared active clock, falling back to a shared wall clock.
+fn tool_group_elapsed(
+    calls: &[&crate::turn::ToolCall],
+    now: crate::turn::ToolInstant,
+) -> Option<u64> {
+    let active_intervals = calls
+        .iter()
+        .map(|tool| {
+            let start = tool.started_active_ms?;
+            let end = tool.completed_active_ms.or_else(|| {
+                (tool.state() == crate::turn::ToolState::Running)
+                    .then_some(now.active_ms)
+                    .flatten()
+            })?;
+            Some((i128::from(start), i128::from(end)))
+        })
+        .collect::<Option<Vec<_>>>();
+    let mut intervals = active_intervals.or_else(|| {
+        calls
+            .iter()
+            .map(|tool| {
+                let start = tool.started_at_ms?;
+                let end = tool.completed_at_ms.or_else(|| {
+                    (tool.state() == crate::turn::ToolState::Running).then_some(now.wall_ms)
+                })?;
+                Some((i128::from(start), i128::from(end)))
+            })
+            .collect::<Option<Vec<_>>>()
+    })?;
+    intervals.sort_unstable();
+    let mut elapsed = 0_u64;
+    let mut previous_end = None;
+    for (start, end) in intervals {
+        let uncovered_start = previous_end.map_or(start, |previous: i128| previous.max(start));
+        elapsed = elapsed.saturating_add(u64::try_from((end - uncovered_start).max(0)).ok()?);
+        previous_end = Some(previous_end.map_or(end, |previous| previous.max(end)));
+    }
+    Some(elapsed)
 }
 
 pub(super) fn timing_blocks(
@@ -3551,6 +3585,119 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{exchange::Exchange, timeline::TimelineEntry};
+
+    /// Count concurrent and sequential tool intervals without charging overlaps or idle gaps.
+    #[test]
+    fn tool_group_duration_counts_occupied_time_once() {
+        use crate::turn::{ToolCall, ToolInstant, ToolState};
+
+        for (intervals, expected) in [
+            (vec![(0, 1_000), (0, 2_000), (0, 3_000)], "3s"),
+            (vec![(0, 1_000), (1_000, 2_000), (2_000, 3_000)], "3s"),
+            (vec![(0, 1_000), (3_000, 4_000)], "2s"),
+            (vec![(2_000, 4_000), (0, 3_000), (1_000, 2_000)], "4s"),
+        ] {
+            let calls: Vec<_> = intervals
+                .into_iter()
+                .enumerate()
+                .map(|(id, (start, end))| {
+                    ToolCall::projection(
+                        id.to_string(),
+                        "command".into(),
+                        "Inspect".into(),
+                        ToolState::Completed,
+                        Some(start),
+                        Some(end),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                super::tool_group_label(
+                    &calls,
+                    super::NodeLifecycle::Settled,
+                    ToolInstant::wall(10_000),
+                ),
+                format!("▸ Ran {} tools · {expected}", calls.len()),
+            );
+        }
+    }
+
+    /// Freeze completed intervals and measure live overlap on the approval-paused clock.
+    #[test]
+    fn tool_group_duration_uses_active_clock_for_live_and_completed_calls() {
+        use crate::turn::{ToolCall, ToolInstant, ToolState};
+
+        let mut completed = ToolCall::projection(
+            "completed".into(),
+            "command".into(),
+            "Inspect".into(),
+            ToolState::Completed,
+            Some(1_000),
+            Some(10_000),
+        );
+        completed.started_active_ms = Some(0);
+        completed.completed_active_ms = Some(1_000);
+        let mut running = ToolCall::projection(
+            "running".into(),
+            "command".into(),
+            "Inspect".into(),
+            ToolState::Running,
+            Some(1_500),
+            None,
+        );
+        running.started_active_ms = Some(500);
+        let calls = [completed, running];
+        assert_eq!(
+            super::tool_group_label(
+                &calls,
+                super::NodeLifecycle::Live,
+                ToolInstant {
+                    wall_ms: 20_000,
+                    active_ms: Some(2_000),
+                },
+            ),
+            "▸ Running 2 tools · 2s",
+        );
+    }
+
+    /// Use one wall clock for mixed records and retain failure counts and unknown timing.
+    #[test]
+    fn tool_group_duration_handles_wall_fallback_and_missing_endpoints() {
+        use crate::turn::{ToolCall, ToolInstant, ToolState};
+
+        let mut active = ToolCall::projection(
+            "active".into(),
+            "command".into(),
+            "Inspect".into(),
+            ToolState::Completed,
+            Some(1_000),
+            Some(3_000),
+        );
+        active.started_active_ms = Some(0);
+        active.completed_active_ms = Some(100);
+        let wall = ToolCall::projection(
+            "wall".into(),
+            "command".into(),
+            "Inspect".into(),
+            ToolState::Failed,
+            Some(2_000),
+            Some(4_000),
+        );
+        let mut calls = [active, wall];
+        let now = ToolInstant {
+            wall_ms: 10_000,
+            active_ms: Some(5_000),
+        };
+        assert_eq!(
+            super::tool_group_label(&calls, super::NodeLifecycle::Settled, now),
+            "▸ Ran 2 tools (1 failed) · 3s",
+        );
+        calls[1].started_at_ms = None;
+        assert_eq!(
+            super::tool_group_label(&calls, super::NodeLifecycle::Settled, now),
+            "▸ Ran 2 tools (1 failed)",
+        );
+    }
 
     #[test]
     fn outer_responses_keep_order_across_answered_questions_and_continued_turns() {
