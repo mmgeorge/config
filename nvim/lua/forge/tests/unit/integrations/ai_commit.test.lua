@@ -54,6 +54,15 @@ T["ai_commit"] = function()
       eq(request.params.comparison, comparison)
       return request.callback, request
     end
+    local release_first = ai_commit.ensure("D:/consumer-fixture", {}, function() end)
+    local release_second = ai_commit.ensure("D:/consumer-fixture", {}, function() end)
+    local shared = table.remove(requests, 1)
+    release_first()
+    eq(shared.cancelled, false)
+    release_second()
+    eq(shared.cancelled, true)
+    eq(ai_commit.state("D:/consumer-fixture", "HEAD"), nil)
+    generated = 0
     local cwd = "D:/ai-commit-fixture"
     ai_commit.ensure(cwd, { ref = "HEAD", ignored_paths = { "excluded.txt" } })
     eq(requests[1].params.ignored_paths[1], "excluded.txt")

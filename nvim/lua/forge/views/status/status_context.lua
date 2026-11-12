@@ -217,7 +217,9 @@ function M.attach(options)
           function() return alive() and revision == owner.about_revision end, present_about)
       else present_about() end
     end
-    ai_commit.ensure(options.workspace, { ref = "HEAD", force = force == true, ignored_paths = options.ignored_paths and options.ignored_paths() or {}, on_start = accept_about }, accept_about)
+    local previous_request = owner.stop_about_request
+    owner.stop_about_request = ai_commit.ensure(options.workspace, { ref = "HEAD", force = force == true, ignored_paths = options.ignored_paths and options.ignored_paths() or {}, on_start = accept_about }, accept_about)
+    if previous_request then previous_request() end
   end
 
   function owner.clear_about()
@@ -424,6 +426,8 @@ function M.attach(options)
   end
 
   function owner.close()
+    owner.closed = true
+    if owner.stop_about_request then owner.stop_about_request() owner.stop_about_request = nil end
     if owner.stop_about_progress then owner.stop_about_progress() owner.stop_about_progress = nil end
     stop_lookup_timers()
     owner.pending_pr = nil

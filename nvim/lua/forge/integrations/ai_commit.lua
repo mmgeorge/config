@@ -140,6 +140,7 @@ end
 ---@param cwd string
 ---@param opts? { force?: boolean, ref?: string, ignored_paths?: string[], on_start?: fun(state: ForgeAICommitState) }
 ---@param cb? fun(state: ForgeAICommitState)
+---@return fun()? release Unsubscribe and cancel when the last consumer leaves.
 function M.ensure(cwd, opts, cb)
   opts = opts or {}
   local ref = opts.ref or "HEAD"
@@ -149,6 +150,18 @@ function M.ensure(cwd, opts, cb)
     return
   end
 
+  local active, callback = true, cb
+  cb = function(result) if active and callback then callback(result) end end
+  local function release()
+    if not active then return end
+    active = false
+    local state = get_state(cwd, ref)
+    if not state or state.state ~= "generating" then return end
+    for index = #state.waiters, 1, -1 do
+      if state.waiters[index] == cb then table.remove(state.waiters, index) end
+    end
+    if #state.waiters == 0 then M.clear(cwd, ref) end
+  end
   local current = get_state(cwd, ref)
   if not opts.force and current then
     if opts.on_start and current.state == "generating" then opts.on_start(current) end
@@ -161,7 +174,7 @@ function M.ensure(cwd, opts, cb)
       end
       current.waiters[#current.waiters + 1] = cb
     elseif cb then cb(current) end
-    return
+    return release
   end
   local waiters = current and current.state == "generating" and current.waiters or {}
   if cb then waiters[#waiters + 1] = cb end
@@ -199,6 +212,7 @@ function M.ensure(cwd, opts, cb)
     function() return M._request_ids[key] == request_id and get_state(cwd, ref) == state and state.state == "generating" end,
     function(model) state.model = model end)
   if ok then state.cancel = cancel_or_failure else complete(nil, tostring(cancel_or_failure)) end
+  return release
 end
 
 ---@param cwd? string
@@ -273,6 +287,7 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
     end
   end
   local abandoned, displayed, autocmd, replaced = false, nil, nil, false
+  local release_request
   local stop_progress = function() end
   local view = { buffer = buf, preserve_view = true, sequence = { node = {}, locate = function() end } }
   local function replace(first, last, replacement)
@@ -304,6 +319,7 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
   local function cancel(supersede)
     if abandoned then return end
     abandoned = true
+    if release_request then release_request() release_request = nil end
     cleanup()
     restore_subject()
     if supersede then M.clear(cwd, comparison or (regenerate and "staged" or "HEAD")) end
@@ -329,7 +345,7 @@ function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
     buffer = buf, once = true,
     callback = function(event) cancel(event.event == "InsertEnter") end,
   })
-  M.ensure(cwd, { ref = ref, force = regenerate == true, on_start = function(state)
+  release_request = M.ensure(cwd, { ref = ref, force = regenerate == true, on_start = function(state)
     stop_progress = require("forge.render.generation_progress").watch(state, function()
       if current() then return true end
       cancel()

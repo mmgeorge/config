@@ -1,6 +1,6 @@
 # Background methods
 
-The background service owns persisted generation conversations independently of the selected interactive session. These calls never accept an envelope `session_id` or start a provider.
+Each Forge host owns its own background generation conversation per repository, independently of the selected interactive session. It reuses that conversation within the host, but a new host starts fresh. Persisted conversations remain available for inspection and are never automatically resumed by another host. Session ownership locks remain held until provider collection completes. Closing the last generation consumer cancels its unfinished request. These calls never accept an envelope `session_id` or start a provider.
 
 All calls inherit the [request lifecycle and failure contract](lua-client.md#requestspec-callback-progress). Method failures do not select another session or close an otherwise valid connection.
 
