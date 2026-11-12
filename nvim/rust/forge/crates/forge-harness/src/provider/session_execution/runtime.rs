@@ -2275,6 +2275,15 @@ impl Driver {
             }
         };
         let category = event_category(&event);
+        // Measured before `event` moves into its reducer; the consumption record carries the
+        // length, never the text, so a trace shows how many bytes each delta batch held.
+        let output_bytes = match &event {
+            HarnessEvent::Native {
+                event: provider_event,
+                ..
+            } => provider_event.output_delta_bytes(),
+            HarnessEvent::Host { .. } => None,
+        };
         let scope = event.scope().clone();
         if scope.owner() != self.owner {
             let registered_host = matches!(&event, HarnessEvent::Host { .. })
@@ -2384,9 +2393,17 @@ impl Driver {
                 );
                 return;
             } else {
-                self.trace.record(self.owner.session_id().as_str(), "provider.event.consumed", serde_json::json!({
+                let mut consumed = serde_json::json!({
                     "binding_id":binding, "sequence":sequence, "scope":scope, "category":category,
-                }));
+                });
+                if let Some(bytes) = output_bytes {
+                    consumed["bytes"] = bytes.into();
+                }
+                self.trace.record(
+                    self.owner.session_id().as_str(),
+                    "provider.event.consumed",
+                    consumed,
+                );
             }
         }
         if let Some(event) = after_consumption

@@ -88,6 +88,36 @@ begin/end boundary and can produce substantial traffic; use Info for routine wor
 and enable Trace for a bounded reproduction. Timing records identify the slow
 boundary but do not identify native buffer callbacks, CPU stacks, or lock owners.
 
+## Streaming cadence
+
+Choppy streamed text has three possible sources: the provider delivering in bursts, the host's 16 ms delta window, or slow editor work per update. Telling them apart needs one Trace capture. Run `/log trace`, stream a long response, then restore the previous level.
+
+The host's `provider.event.consumed` record carries `bytes`, the UTF-8 length of an output delta batch, and never its text. The `sequence` gap between consecutive delta records counts the native positions that one batch absorbed, including any interleaved non-delta events. `timestamp_ms` is wall-clock time with millisecond resolution. The following Nushell pipeline prints each batch's gap, position count, and size from the session file that `/log open` shows:
+
+```nu
+open --raw $log
+| lines
+| each { from json }
+| where {|record| $record.event? == "provider.event.consumed" and $record.payload?.bytes? != null }
+| each {|record| { time: $record.timestamp_ms, sequence: $record.payload.sequence, bytes: $record.payload.bytes } }
+| window 2
+| each {|pair| { gap_ms: ($pair.1.time - $pair.0.time), positions: ($pair.1.sequence - $pair.0.sequence), bytes: $pair.1.bytes } }
+```
+
+Batches that absorb many positions and arrive well over 16 ms apart point upstream. A median gap near 31 ms between dense batches means the host window rounds up to the Windows tick. Editor cost appears in `harness-perf.log` as `ui.request` gaps for the `sync` operation, `ui.buffer.patch` phase timings, and `ui.render`. A `ui.buffer.patch` time that rises over the course of one long response means that per-update cost grows with message length.
+
+## Streaming investigation, 2026-11-12
+
+One Trace capture of a Codex response measured the path after the editor stopped delaying displayed transcripts. The response streamed 18,467 bytes in 363 host batches over 27.4 seconds and filled 262 transcript rows. No Claude response was captured.
+
+Codex delivers in bursts. The median gap between host batches was 77 ms (p10 21 ms, p90 126 ms), and 196 of 362 gaps were 60 ms or longer. A median batch absorbed 9 native positions and 47 bytes. A host window that merges nine positions and then waits 77 ms for the next delta is idle, not limiting, so the gaps originate before Forge: in the Codex CLI or its service.
+
+The host window does not consistently round to the Windows tick. No gap fell below 15 ms, 28 fell between 15 and 19 ms, and 46 between 30 and 35 ms, so the 16 ms timeout often fires on time.
+
+The editor adds little. Each `sync` round trip took a median 0.80 ms (p90 1.14 ms), a patch 0.48 ms, and `ui.render` 0.34 ms. Patch time did not grow over the response: its median was 0.54 ms in the first quarter and 0.46 ms in the last. Neither a transcript-only render path nor narrower message patches would change what a reader sees at this size.
+
+Smoother display therefore needs an editor-side reveal that spreads each burst over the following gap, which trades some latency for continuity. These figures come from one response from one provider and do not establish how other providers or longer messages behave.
+
 ## Queue-edit investigation, 2026-11-10
 
 The retained foreground session `8dcba1ee-f6df-49cd-b6e4-48990555e14b`

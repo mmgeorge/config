@@ -600,9 +600,12 @@ do
   assert(state.goal == nil and state.active_elicitation == nil, "startup retained nullable state")
   local original_state_request = client.request
   local synchronized = false
+  -- These stubs own state reads only. A displayed transcript synchronizes on the same wake, so its
+  -- document requests still reach the native fixture.
   client.request = function(request_specification, callback)
   local method = request_specification.method
 
+    if method == "session.document" then return original_state_request(request_specification, callback) end
     if method == "session.input.get" then
       callback({ revision = 0, messages = {}, suspended = false })
       return
@@ -623,6 +626,7 @@ do
   client.request = function(request_specification, callback)
   local method = request_specification.method
 
+    if method == "session.document" then return original_state_request(request_specification, callback) end
     if method == "session.input.get" then
       callback({ revision = 0, messages = {}, suspended = false })
       return
@@ -2539,9 +2543,13 @@ local function drafts_pending()
   end
   return false
 end
+-- Settled also means no queue reservation or edit commit awaits the host. A displayed transcript
+-- synchronizes without delay, so presentation idleness alone no longer spans those round trips.
 local function settled()
   wait_until(function()
+    local reserving = state.queue_edit and state.queue_edit.reserving
     return state.input and not drafts_pending() and not state.input.refreshing
+      and not (reserving and next(reserving)) and not next(state.input.committing)
       and state.presentation and not state.presentation.syncing and not state.presentation.pending
       and not state.presentation.staging_inflight and not state.presentation.applying
       and vim.deep_equal(state.presentation.staging, state.presentation.applied_staging)

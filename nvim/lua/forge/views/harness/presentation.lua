@@ -4,10 +4,12 @@ local replica = require("forge.buffer")
 local input = require("forge.input")
 local perf = require("forge.infra.perf")
 local diagnostic = require("forge.views.harness.diagnostic")
-local refresh_interval_ns = 1e9 / 60
+-- A displayed transcript synchronizes on every wake: the host's output window already paces
+-- streamed text, and one request in flight absorbs the wakes that arrive during it. A timer here
+-- only added latency, and on Windows a sub-tick delay rounds up to a whole 15.6 ms tick.
 -- A transcript that no window of the current tab page shows still has to stay within the host's
 -- retained patch history, but nobody watches it, so it synchronizes once a second and leaves the
--- frame budget to the session on screen. Entering its tab page synchronizes it at once.
+-- main loop to the session on screen. Entering its tab page synchronizes it at once.
 local hidden_refresh_interval_ns = 1e9
 local transcript_options = {
   margin = 0,
@@ -572,16 +574,18 @@ function M.open(options, callback)
     return false
   end
 
-  --- End the hidden pace once the transcript is on screen, so its tab page shows current text.
-  function owner.hasten_displayed_refresh()
-    if not owner.refresh_timer or not owner.displayed() then return end
-    local displayed_deadline = vim.uv.hrtime() + refresh_interval_ns
-    if owner.refresh_deadline <= displayed_deadline then return end
-    owner.refresh_deadline = displayed_deadline
+  --- Retire the hidden transcript's pending interval without synchronizing.
+  local function cancel_refresh_timer()
+    if not owner.refresh_timer then return end
     owner.refresh_timer:stop()
     owner.refresh_timer:close()
     owner.refresh_timer = nil
-    owner.refresh_ready = true
+  end
+
+  --- End the hidden pace once the transcript is on screen, so its tab page shows current text.
+  function owner.hasten_displayed_refresh()
+    if not owner.refresh_timer or not owner.displayed() then return end
+    cancel_refresh_timer()
     owner.sync()
   end
 
@@ -593,10 +597,11 @@ function M.open(options, callback)
       owner.select_agent(owner.next_timeline)
       return
     end
-    if not owner.refresh_ready then
+    if owner.displayed() then
+      cancel_refresh_timer()
+    elseif not owner.refresh_ready then
       if not owner.refresh_timer then
-        local interval_ns = owner.displayed() and refresh_interval_ns or hidden_refresh_interval_ns
-        owner.refresh_deadline = vim.uv.hrtime() + interval_ns
+        owner.refresh_deadline = vim.uv.hrtime() + hidden_refresh_interval_ns
         local function publish()
           owner.refresh_timer = nil
           if not alive() then return end
@@ -610,7 +615,7 @@ function M.open(options, callback)
           owner.sync()
         end
         vim.uv.update_time()
-        owner.refresh_timer = vim.defer_fn(publish, math.ceil(interval_ns / 1e6))
+        owner.refresh_timer = vim.defer_fn(publish, math.ceil(hidden_refresh_interval_ns / 1e6))
       end
       return
     end
@@ -1089,11 +1094,7 @@ function M.open(options, callback)
     owner.section_inflight = {}
     clear_loading()
     owner.transcript.fold_loading = {}
-    if owner.refresh_timer then
-      owner.refresh_timer:stop()
-      owner.refresh_timer:close()
-      owner.refresh_timer = nil
-    end
+    cancel_refresh_timer()
     if owner.terminals then owner.terminals.close() end
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, output in ipairs(owner.output) do output.close() end

@@ -242,9 +242,7 @@ T["presentation"] = function()
   assert(not owner.toggle_heading(window), "a thought without activity offered a fold")
   assert(#requests == 1, "a thought without activity dispatched an expansion")
   owner.sync()
-  owner.sync()
-  assert(#requests == 1, "refresh bypassed the publication interval")
-  wait_until(function() return #requests == 2 end, "refresh after the publication interval did not dispatch")
+  assert(#requests == 2, "a displayed refresh waited for a timer")
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   requests[2].callback({ snapshot = vim.NIL, patch = {} })
   assert(owner.transcript.status == "Applied", "null snapshot desynchronized incremental transcript updates")
@@ -356,13 +354,20 @@ T["presentation"] = function()
     stream.block[1].text[#stream.block[1].text + 1] = "history row " .. row
   end
   initial.callback({ transcript = stream })
+  -- Return the transcript read in flight, requesting one when none is. A displayed transcript
+  -- synchronizes at once, so a read that an earlier step started may already be waiting.
   local function refresh()
-    local count = #requests
-    owner.sync()
+    if not owner.syncing then owner.sync() end
+    local read
     wait_until(function()
-      return #requests > count and requests[#requests].params.operation == "sync"
+      if not owner.syncing or owner.applying then return false end
+      for index = #requests, 1, -1 do
+        local params = requests[index].params
+        if params.operation == "sync" and params.document == owner.document then read = requests[index] return true end
+      end
+      return false
     end, "sync did not dispatch a transcript read")
-    return requests[#requests]
+    return read
   end
   owner.follow_tail()
   local before_stream = vim.api.nvim_win_get_cursor(window)
@@ -390,8 +395,17 @@ T["presentation"] = function()
   retry.callback(nil, "temporary admission contention", { code = "not_admitted" })
   assert(not owner.failure and owner.transcript.revision == revision)
   local previous = #requests
-  wait_until(function() return #requests > previous end, "transcript read did not retry", { timeout_ms = 2000 })
-  requests[#requests].callback({ patch = {}, status = { document = owner.document .. ":status", revision = 0, block = {} } })
+  -- The discarded startup presentation's scheduled cleanup can interleave with the retry, so the
+  -- retried read is found by its document rather than taken as the newest request.
+  local retried
+  wait_until(function()
+    for index = previous + 1, #requests do
+      local params = requests[index].params
+      if params.operation == "sync" and params.document == owner.document then retried = requests[index] return true end
+    end
+    return false
+  end, "transcript read did not retry", { timeout_ms = 2000 })
+  retried.callback({ patch = {}, status = { document = owner.document .. ":status", revision = 0, block = {} } })
   assert(not owner.failure and not owner.sync_failure, "successful retry retained its diagnostic")
   owner.set_staging({ "queued draft" }, {})
   local staging = requests[#requests]
@@ -683,7 +697,7 @@ T["publication"] = function()
     if host.request(request_specification.method, params, callback) then return end
     callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
     if params.operation == "background_terminals" then callback({ supported = false }) return end
-    requests[#requests + 1] = { params = params, callback = callback, time = vim.uv.hrtime() }
+    requests[#requests + 1] = { params = params, callback = callback }
   end
   local transcript = buffer.scratch()
   local composer = buffer.scratch()
@@ -697,20 +711,15 @@ T["publication"] = function()
   requests[1].callback({ transcript = { document = owner.document, revision = 0, block = {
     { id = "body", text = { "frame 0" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
   } } })
+  -- The host's output window paces a displayed transcript, so the first wake of a burst
+  -- synchronizes at once and the in-flight request absorbs the rest.
   local function burst(expected)
-    local started = vim.uv.hrtime()
-    local defer = vim.defer_fn
-    local scheduled_delay
-    vim.defer_fn = function(callback, delay)
-      scheduled_delay = delay
-      return defer(callback, delay)
-    end
-    for _ = 1, 100 do owner.sync() end
-    vim.defer_fn = defer
-    assert(scheduled_delay == 17, "refresh did not schedule the 60 Hz target")
-    assert(#requests == expected - 1, "burst published immediately")
-    wait_until(function() return #requests == expected end, "burst did not publish")
-    assert((requests[expected].time - started) / 1e6 >= 1000 / 60, "refresh exceeded the 60 Hz target")
+    owner.sync()
+    local dispatched = #requests
+    for _ = 2, 100 do owner.sync() end
+    assert(owner.refresh_timer == nil, "a displayed refresh waited on a publication timer")
+    assert(dispatched == expected, "a displayed refresh did not dispatch at once")
+    assert(#requests == expected, "one burst dispatched more than one refresh")
   end
   burst(2)
   for _ = 1, 100 do owner.sync() end
@@ -730,14 +739,14 @@ T["publication"] = function()
     -- A backlog may yield between patches, but only at a complete revision.
     assert(#text == 1 and text[1] == "frame " .. (owner.transcript.revision or 0), "a partial patch reached the main loop")
   end))
-  local completed = vim.uv.hrtime()
   local initial_publications = publications
   requests[2].callback({ patch = patch })
   wait_until(function() return owner.transcript.revision == 64 end, "patch backlog did not reach its final revision")
   assert(publications == initial_publications + 1, "batch notified before its final revision")
   wait_until(function() return #requests == 3 end, "in-flight burst lost its trailing update")
-  assert((requests[3].time - completed) / 1e6 >= 1000 / 60, "trailing publication exceeded the 60 Hz target")
+  assert(requests[3].params.revision == 64, "trailing refresh did not request the applied revision")
   requests[3].callback({ patch = {} })
+  assert(#requests == 3, "an in-flight burst dispatched more than one trailing refresh")
   timer:stop()
   timer:close()
   assert(observations > 0)
@@ -1148,7 +1157,10 @@ T["select_agent_reports_failure"] = function()
   eq(settled[2], { label = "selected" })
   eq(fixture.owner.timeline_key, "other")
 
+  -- The selection's own refresh is still in flight, so an unchanged selection settles once it lands.
   fixture.owner.select_agent("other", record("unchanged"))
+  eq(settled[3], nil)
+  fixture.take("sync").callback({ patch = {} })
   eq(settled[3], { label = "unchanged" })
 end
 
@@ -1634,19 +1646,38 @@ T["update_scheduling"] = function()
   open()
   refresh().callback({ patch = {} })
   wait_until(function() return not owner.syncing end, "the settling refresh did not complete")
-  local defer, delays = vim.defer_fn, {}
+  local defer, delays, timers = vim.defer_fn, {}, {}
   vim.defer_fn = function(callback, delay)
     delays[#delays + 1] = delay
-    return { stop = function() end, close = function() end, callback = callback }
+    local timer = { callback = callback }
+    function timer.stop() timer.stopped = true end
+    function timer.close() timer.closed = true end
+    if delay == 1000 then timers[#timers + 1] = timer end
+    return timer
   end
   local transcript_tabpage = vim.api.nvim_get_current_tabpage()
   vim.cmd.tabnew()
   local hidden_count = #requests
   owner.sync()
   assert(delays[#delays] == 1000 and #requests == hidden_count, "a hidden transcript kept the displayed pace")
+  local entered_timer = timers[#timers]
   vim.api.nvim_set_current_tabpage(transcript_tabpage)
   wait_until(function() return #requests > hidden_count and requests[#requests].params.operation == "sync" end,
     "entering the transcript's tab page did not synchronize it")
+  assert(entered_timer.stopped and entered_timer.closed, "entering the tab page left the hidden timer armed")
+  requests[#requests].callback({ patch = {} })
+  -- A wake that reaches a displayed transcript before the tab-entry callback runs synchronizes at
+  -- once and retires the hidden timer itself.
+  vim.cmd.tabnext()
+  hidden_count = #requests
+  owner.sync()
+  assert(#requests == hidden_count, "a hidden transcript synchronized before its interval")
+  local displayed_timer = timers[#timers]
+  vim.api.nvim_set_current_tabpage(transcript_tabpage)
+  owner.sync()
+  assert(#requests == hidden_count + 1 and requests[#requests].params.operation == "sync",
+    "a displayed transcript waited on the hidden interval")
+  assert(displayed_timer.stopped and displayed_timer.closed, "a displayed refresh left the hidden timer armed")
   vim.defer_fn = defer
   requests[#requests].callback({ patch = {} })
   vim.cmd.tabonly()

@@ -1196,6 +1196,13 @@ impl ProviderEvent {
         batchable(self)
     }
 
+    /// Report the UTF-8 length of this output delta's text, or `None` for any other event.
+    ///
+    /// Diagnostics record this length to measure delta batching without recording the text.
+    pub fn output_delta_bytes(&self) -> Option<usize> {
+        output_text(self).map(str::len)
+    }
+
     /// Append `following` to this output delta when both extend the same item.
     ///
     /// Returns `false` and leaves both events unchanged when they are not adjacent output for one
@@ -1822,10 +1829,12 @@ mod tests {
         // Deltas that follow inside the window wait for its end and leave as one event.
         writer.send_wait(item(delta("second "))).await.unwrap();
         writer.send_wait(item(delta("third"))).await.unwrap();
+        let merged = stream.recv().await.unwrap().unwrap();
         assert_eq!(
-            delta_text(stream.recv().await.unwrap().unwrap()),
-            "second third"
+            merged.event.output_delta_bytes(),
+            Some("second third".len())
         );
+        assert_eq!(delta_text(merged), "second third");
         assert_eq!(started.elapsed(), OUTPUT_WINDOW);
 
         // After an idle window the next delta is a new leading edge.
