@@ -85,12 +85,12 @@ T["session_picker"] = function()
   local now = 1700000000
   datetime.now_override = function() return now end
   local entry_list = {
-    { id = "active", name = "Architecture review", workspace = workspace, provider = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 86400) * 1000 },
     { id = "beta", name = "Beta cleanup", workspace = workspace, provider = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 3600) * 1000 },
-    { id = "gamma", name = "Gamma migration", workspace = workspace, provider = "mock", approval_mode = "ask" },
+    { id = "active", name = "Architecture review", workspace = workspace, provider = "mock", approval_mode = "ask", created_at_ms = (now - 2 * 86400) * 1000, active = true },
+    { id = "gamma", name = "Gamma migration", workspace = workspace, provider = "mock", approval_mode = "ask", active = true },
     { id = "remote", name = "Remote review", workspace = workspace .. "-other", provider = "mock", approval_mode = "ask" },
   }
-  state.session = entry_list[1]
+  state.session = entry_list[2]
   state.interaction = {}
   state.timeline = {}
   state.agent = { definition = {}, run = {}, turn = {} }
@@ -170,7 +170,16 @@ T["session_picker"] = function()
   assert(buffer.line(active_picker.buf, 1):find("[Workspace]  All", 1, true))
   eq(active_picker.spec.page_list[1].header_right, nil)
   assert(active_picker.spec.page_list[1].option_list[1].label:find("2 days ago", 1, true) == 1)
-  assert(active_picker.spec.page_list[1].option_list[2].label:find("2 hours ago", 1, true) == 1)
+  assert(active_picker.spec.page_list[1].option_list[3].label:find("2 hours ago", 1, true) == 1)
+  eq(vim.tbl_map(function(entry) return { entry.id, entry.section } end, active_picker.spec.page_list[1].option_list), {
+    { "active", "Active" }, { "gamma", "Active" }, { "beta", "Inactive" },
+  }, { fail_reason = "loaded sessions, including hidden ones, precede saved-only history" })
+  local picker_state = require("forge.views.picker.state")
+  picker_state.set_query(active_picker.state, active_picker.spec, "a")
+  local matched = picker_state.page(active_picker.state, active_picker.spec).option_list
+  eq(vim.tbl_map(function(entry) return entry.section end, matched), { "Active", "Active", "Inactive" },
+    { fail_reason = "fuzzy scores must not move inactive matches above active matches" })
+  picker_state.set_query(active_picker.state, active_picker.spec, "")
   eq(vim.api.nvim_get_current_win(), active_picker.win, { fail_reason = "session picker should start on options" })
   eq(vim.api.nvim_get_mode().mode, "n", { fail_reason = "session picker should start in normal mode" })
   eq(active_picker.frame.search_start, nil, { fail_reason = "normal-mode session picker should hide the search row" })

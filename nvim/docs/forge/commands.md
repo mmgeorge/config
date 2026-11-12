@@ -428,6 +428,9 @@ with a fixed height of 35% of the Harness area. `/undo` opens the interaction li
 Session search starts on **Workspace**; switch to **All** with `Tab`, the left/right
 arrow keys, or `Ctrl-O`. Each tab retains its own search query, and **All** includes
 the workspace path for each session.
+Within each scope, **Active** sessions loaded in this Forge host appear first,
+including sessions whose editor views are closed. Saved sessions that are not loaded
+appear under **Inactive**. Searching keeps this section order.
 In session search, Enter always shows the chosen session in the current tab. `Ctrl-J`
 deletes the selected saved session and closes every tab that shows it.
 After selecting an interaction, choose **Conversation only** to keep current files,

@@ -28,6 +28,7 @@ local function option(entry, scope)
   if scope == "all" then columns[#columns + 1] = entry.workspace or "" end
   return {
     id = entry.id,
+    section = entry.active and "Active" or "Inactive",
     label = ("%-24s  %s"):format(datetime.relative_ms(entry.created_at_ms), label),
     columns = columns,
     search_text = name,
@@ -113,8 +114,13 @@ end
 build_spec = function(instance)
   local page_list = {}
   for _, scope in ipairs(instance.provider and { "repo" } or { "repo", "all" }) do
-    local option_list = vim.tbl_map(function(entry) return option(entry, scope) end,
-      instance.entry_list_by_scope[scope] or {})
+    local option_list = {}
+    local entry_list = instance.entry_list_by_scope[scope] or {}
+    for _, is_active in ipairs({ true, false }) do
+      for _, entry in ipairs(entry_list) do
+        if (entry.active == true) == is_active then option_list[#option_list + 1] = option(entry, scope) end
+      end
+    end
     local column_headers = { "Created", "Session", "Harness", "Mode" }
     if scope == "all" then column_headers[#column_headers + 1] = "Workspace" end
     page_list[#page_list + 1] = {
@@ -125,7 +131,7 @@ build_spec = function(instance)
       option_list = option_list,
       wrap_selection = false,
       empty_text = instance.entry_list_by_scope[scope] and "No matching Harness sessions." or "Loading sessions...",
-      search = { start_in_normal = true },
+      search = { start_in_normal = true, preserve_sections = true },
       footer = instance.provider and "↑↓ select  / search  Enter resume  q back"
         or "Tab scope  ↑↓ select  / search  Enter open  C-j delete  q close",
     }

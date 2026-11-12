@@ -100,7 +100,7 @@ end
 --- Get the current searchable rows without changing selection or page ownership.
 local function page_options(state, page)
   if not page.search then return page.option_list end
-  return picker_filter.apply(page.option_list, state.query_by_page[page.id] or "")
+  return picker_filter.apply(page.option_list, state.query_by_page[page.id] or "", page.search.preserve_sections)
 end
 
 --- Get a stable row identity when the caller supplies one.

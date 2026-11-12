@@ -14,6 +14,92 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Distinguish loaded sessions from saved history without treating a preview as activation.
+#[tokio::test]
+async fn session_list_reports_live_ownership() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let host = service();
+    host.open_session(1, initialize(&fixture, "mock")).await?;
+    let registry = host.registry().await?;
+    let source = registry.initial_session_id().to_owned();
+    let saved = prepare_new_session(
+        std::path::Path::new(&registry.initialize.data_root),
+        &registry.initialize.client_id,
+        "mock",
+        false,
+        &source,
+        &json!({"name":"saved history"}),
+        0,
+    )?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    for (request_id, method, params, saved_active) in [
+        (2, "session.list", json!({"scope":"all"}), false),
+        (3, "session.preview", json!({"session_id":saved.id}), false),
+        (4, "session.list", json!({"scope":"all"}), false),
+        (5, "session.resume", json!({"session_id":saved.id}), true),
+        (6, "session.list", json!({"scope":"all"}), true),
+    ] {
+        host.dispatch(
+            Some(source.clone()),
+            Request {
+                id: request_id,
+                method: method.into(),
+                params,
+            },
+            &sink,
+        )
+        .await?;
+        let response = response_for(&mut output, request_id).await?;
+        assert!(response.get("error").is_none(), "{response}");
+        if method == "session.list" {
+            let entries = response["result"]
+                .as_array()
+                .context("session list missing")?;
+            let source_entry = entries
+                .iter()
+                .find(|entry| entry["id"] == source)
+                .context("source missing")?;
+            let saved_entry = entries
+                .iter()
+                .find(|entry| entry["id"] == saved.id)
+                .context("saved session missing")?;
+            assert_eq!(source_entry["active"], true);
+            assert_eq!(saved_entry["active"], saved_active);
+        }
+    }
+    host.shutdown(Duration::from_secs(5)).await?;
+
+    let restarted = service();
+    let mut options = initialize(&fixture, "mock");
+    options.session_id = Some(source.clone());
+    restarted.open_session(7, options).await?;
+    restarted
+        .dispatch(
+            Some(source),
+            Request {
+                id: 8,
+                method: "session.list".into(),
+                params: json!({"scope":"all"}),
+            },
+            &sink,
+        )
+        .await?;
+    let response = response_for(&mut output, 8).await?;
+    let entries = response["result"]
+        .as_array()
+        .context("session list missing after restart")?;
+    let saved_entry = entries
+        .iter()
+        .find(|entry| entry["id"] == saved.id)
+        .context("saved history missing after restart")?;
+    assert_eq!(
+        saved_entry["active"], false,
+        "live ownership must not be persisted"
+    );
+    restarted.shutdown(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
 /// A deletion that fails after it stopped the target's input evicts that controller, so the
 /// session answers requests again and a retried deletion succeeds.
 #[tokio::test]

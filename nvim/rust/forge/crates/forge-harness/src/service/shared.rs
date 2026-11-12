@@ -1,5 +1,13 @@
 use super::*;
 
+/// Describe saved history together with its live ownership in this host.
+#[derive(serde::Serialize)]
+struct SessionListEntry {
+    #[serde(flatten)]
+    session: crate::session::HarnessSession,
+    active: bool,
+}
+
 pub(super) fn handles(method: RuntimeMethod) -> bool {
     matches!(
         method,
@@ -520,10 +528,21 @@ async fn list_sessions(
     let store = crate::storage::HistoryReader::current(
         PathBuf::from(&registry.initialize.data_root).as_path(),
     )?;
+    let active_session_ids: std::collections::HashSet<_> = registry
+        .controller_by_id
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect();
     let sessions = store
         .list_session((scope != "all").then_some(workspace.as_str()))?
         .into_iter()
         .filter(|session| session.background.is_none())
+        .map(|session| SessionListEntry {
+            active: active_session_ids.contains(&session.id),
+            session,
+        })
         .collect::<Vec<_>>();
     message_sink
         .send_response(Response::success(request.id, sessions)?)

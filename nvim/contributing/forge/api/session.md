@@ -697,7 +697,7 @@ List persisted sessions according to the requested selection.
 
 ### Contract
 
-Accepts optional `scope` (`"repo"` by default or `"all"`) and optional `workspace` (path string, defaulting to the initialized workspace). Unknown scopes fail. The service canonicalizes the workspace and returns an array of [HarnessSession](runtime-schemas.md#harnesssession), excluding background conversations. An empty array is valid. Shared initialization suffices and no existing session, provider invocation, or lease acquisition is required. The result describes saved metadata, not exclusive ownership of the listed sessions.
+Accepts optional `scope` (`"repo"` by default or `"all"`) and optional `workspace` (path string, defaulting to the initialized workspace). Unknown scopes fail. The service canonicalizes the workspace and returns an array of [HarnessSession](runtime-schemas.md#harnesssession) records with an additional boolean `active`, excluding background conversations. `active` indicates a loaded controller in the current Forge host, including sessions whose editor views are hidden; it does not indicate ongoing execution or ownership in another host. This flag is computed for each list request and is not persisted. An empty array is valid. Shared initialization suffices and no existing session, provider invocation, or lease acquisition is required. Listing and previewing saved history do not activate its controller.
 
 ## `session.lsp.analyze`
 
