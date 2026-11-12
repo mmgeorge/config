@@ -1,8 +1,8 @@
 local M = {}
 
 M.frame_list = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
---- Target duration of one animation frame in milliseconds (60 frames per second).
-M.frame_interval_ms = 1000 / 60
+--- Target duration of one animation frame in milliseconds (15 frames per second).
+M.frame_interval_ms = 1000 / 15
 
 ---@param now_ms integer
 ---@return string
