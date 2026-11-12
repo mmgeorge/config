@@ -932,4 +932,123 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Preserve the validation cause alongside a separately attributed cleanup failure.
+    #[tokio::test]
+    async fn validator_rejection_preserves_cleanup_failure() -> anyhow::Result<()> {
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
+        )?;
+        let native = EventFixtureProvider::new(descriptor, |request, sink, start, _| async move {
+            finish(&request, &sink, &start, false).await
+        })
+        .with_models(models());
+        let closed = Arc::new(AtomicUsize::new(0));
+        let observed_close = closed.clone();
+        native.with_session_close(move |_| {
+            let closed = observed_close.clone();
+            async move {
+                closed.fetch_add(1, Ordering::AcqRel);
+                Err(failure(
+                    ProviderOperation::ThreadClose,
+                    ProviderFailureKind::Runtime,
+                ))
+            }
+        });
+        let jobs = TextGenerationJobs::default();
+        let validated = Arc::new(AtomicUsize::new(0));
+        let error = jobs
+            .generate(
+                native,
+                Arc::new(Trace),
+                api::access::AccessPolicy {
+                    write_access: api::access::WriteScope::Off,
+                    ..Default::default()
+                },
+                request(validated.clone(), true),
+            )
+            .await
+            .expect_err("validation and cleanup both fail");
+        let ProviderError::Combined { primary, secondary } = error else {
+            panic!("both independently attributed causes must survive: {error:?}");
+        };
+        assert!(matches!(*primary, ProviderError::Failure(error)
+            if error.operation() == ProviderOperation::TurnStart
+                && error.kind() == ProviderFailureKind::Rejected));
+        assert!(
+            matches!(secondary.as_slice(), [ProviderError::Failure(error)]
+            if error.operation() == ProviderOperation::ThreadClose
+                && error.kind() == ProviderFailureKind::Runtime)
+        );
+        jobs.shutdown().await?;
+        jobs.shutdown().await?;
+        assert_eq!(validated.load(Ordering::Acquire), 1);
+        assert_eq!(closed.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    /// Cancel active generation and collect its session once across repeated shutdown calls.
+    #[tokio::test]
+    async fn shutdown_cancels_and_collects_temporary_session_once() -> anyhow::Result<()> {
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
+        )?;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_worker = entered.clone();
+        let native =
+            EventFixtureProvider::new(descriptor, move |request, _, start, mut cancelled| {
+                let entered = entered_worker.clone();
+                async move {
+                    start.observed(0).await?;
+                    entered.notify_one();
+                    cancelled
+                        .wait_for(|cancelled| *cancelled)
+                        .await
+                        .expect("the fixture retains its cancellation sender");
+                    Ok(crate::provider::test_support::native_result(
+                        &request,
+                        api::turn::TurnOutcome::Interrupted,
+                    ))
+                }
+            })
+            .with_models(models());
+        let closed = Arc::new(AtomicUsize::new(0));
+        let observed_close = closed.clone();
+        native.with_session_close(move |_| {
+            let closed = observed_close.clone();
+            async move {
+                closed.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+        });
+        let jobs = Arc::new(TextGenerationJobs::default());
+        let running = jobs.clone();
+        let validated = Arc::new(AtomicUsize::new(0));
+        let input = request(validated.clone(), false);
+        let waiter = tokio::spawn(async move {
+            running
+                .generate(
+                    native,
+                    Arc::new(Trace),
+                    api::access::AccessPolicy {
+                        write_access: api::access::WriteScope::Off,
+                        ..Default::default()
+                    },
+                    input,
+                )
+                .await
+        });
+        entered.notified().await;
+        jobs.shutdown().await?;
+        let error = waiter
+            .await?
+            .expect_err("shutdown cancels active generation");
+        assert!(matches!(error, ProviderError::Failure(failure)
+            if failure.operation() == ProviderOperation::TurnStart
+                && failure.kind() == ProviderFailureKind::Cancelled));
+        jobs.shutdown().await?;
+        assert_eq!(validated.load(Ordering::Acquire), 0);
+        assert_eq!(closed.load(Ordering::Acquire), 1);
+        Ok(())
+    }
 }

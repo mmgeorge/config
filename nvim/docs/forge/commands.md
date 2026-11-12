@@ -148,9 +148,10 @@ Forge reads their content. This applies to automatic drafts, staged regeneration
 generation, and pull-request descriptions, including untracked files and renamed LFS
 paths. LFS-only changes produce no generation request.
 
-Commit generation uses a one-shot, tool-free request through the selected provider's
-isolated-text adapter. It creates no saved Harness conversation and never resumes a
-background thread. Each request includes the current diff and the last ten complete
+Commit generation uses a fresh temporary conversation through the selected provider.
+It supplies no Harness tools and denies permission requests; native tools and hooks
+are disabled where supported. It creates no saved Harness conversation and never
+resumes a background thread. Each request includes the current diff and the last ten complete
 Git commit messages as style examples.
 
 `/config` and `:ForgeConfig` provide a **Commit model** section in **Models** with provider,
@@ -891,6 +892,6 @@ conflicts. Resolve them before creating the PR." The check leaves your branch,
 index, and working files unchanged.
 
 PR descriptions use the same Commit provider, model, and thinking settings in `/config`
-as commits. Each request runs once through the isolated-text adapter with its own output
-instructions and no saved conversation. Provider failures stop PR creation and appear
+as commits. Each request uses a fresh temporary conversation with its own output
+instructions and no saved Harness conversation. Provider failures stop PR creation and appear
 in a notification.

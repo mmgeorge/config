@@ -4351,14 +4351,10 @@ impl CopilotProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
-        if !isolated_text {
-            self.descriptor()
-                .capability
-                .validate_access(&request.configuration.access)
-                .map_err(|_| {
-                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
-                })?;
-        }
+        self.descriptor()
+            .capability
+            .validate_access(&request.configuration.access)
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected))?;
         if state.stream.lock().await.is_some() {
             return Err(ProviderError::Failure(
                 ProviderFailure::new(

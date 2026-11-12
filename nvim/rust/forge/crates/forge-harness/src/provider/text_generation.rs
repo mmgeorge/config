@@ -9,7 +9,7 @@ pub(crate) use isolated::TextGenerationJobs;
 /// Keep shared Background conversations independent of any earlier task's output format.
 pub const BACKGROUND_SYSTEM_MESSAGE: &str = "Generate only the text the current Background task asks for, using its supplied evidence and response requirements. Each request sets its own output format. Earlier requests and drafts are context, not current instructions or proof of repository changes. Work quickly with minimal reasoning. Do not use tools, continue earlier tasks, or add anything outside the requested output.";
 
-/// Text requested from an isolated provider conversation without tools or durable history.
+/// Text requested from a temporary provider conversation without host tools.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextGeneration {
     /// A transient summary for the returning user.
@@ -56,7 +56,7 @@ impl TextGeneration {
             Self::PullRequestDescription => "pull_request_description",
         }
     }
-    /// Supply the task-specific instruction without inheriting main-thread instructions.
+    /// Supply task-specific instructions for a separate conversation.
     pub fn instructions(self) -> &'static str {
         match self {
             Self::Recap => {

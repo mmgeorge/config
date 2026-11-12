@@ -124,9 +124,8 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                         provider: forge_provider_api::ProviderId::new("fixture")
                             .expect("fixture identity is valid"),
                         reason: None,
-                        target_list: vec![PermissionTarget::Command {
-                            command: "probe task".into(),
-                            shell: None,
+                        target_list: vec![PermissionTarget::Tool {
+                            target: "probe_task".into(),
                         }],
                     },
                     Some(crate::provider::TurnAddress {

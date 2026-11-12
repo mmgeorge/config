@@ -38,7 +38,7 @@ Overloads are never paired by position, and ambiguous matches keep body excerpts
 
 `HarnessService.generate_text` runs commit and PR text generation through the shared temporary-generation lifecycle. Each request captures worktree identity, branch, HEAD, and recent reachable commit messages, then supplies the prepared evidence to a fresh provider conversation. It never resumes or appends to the interactive conversation.
 
-`background.settings` continues to store the independently selected provider and per-provider model, reasoning, and service-tier preferences. Those user settings are preserved. Commit generation no longer depends on a persistent `BackgroundManager` conversation or its compaction policy; the existing Background timeline describes retained Background work, not these temporary requests.
+The Commit model settings store the independently selected provider, model, reasoning, and service tier. Existing Background preferences seed an initial Commit selection; saving that selection stores it independently. Temporary generation does not use a persistent `BackgroundManager` conversation or its compaction policy. The Background timeline describes retained Background work, not these temporary requests.
 
 The shared helper resolves the selected model, supplies no host tools or selected resources, denies permission callbacks, disables writes, and requests native read-only sandboxing where supported. Adapters disable native tools, inherited resources, and hooks only through supported controls. Native defaults may remain; the workflow does not promise complete suppression. See [Providers](providers.md) for the adapter contract and minimum CLI versions.
 

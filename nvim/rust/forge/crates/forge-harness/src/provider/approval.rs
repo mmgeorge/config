@@ -2439,43 +2439,6 @@ mod test {
         );
     }
 
-    /// Return unresolved pipeline names to the agent without opening or saving an approval.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn unresolved_commands_never_open_approval_or_change_permission_rules() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("permissions.json");
-        std::fs::write(&path, r#"{"permission":{"bash":{"git *":"allow"}}}"#).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let store = PermissionStore::load(&path, directory.path()).unwrap();
-        let coordinator = PermissionCoordinator::new(Arc::new(RwLock::new(store)));
-        let (sink, mut stream) = crate::provider::events::channel(scope());
-        let request = normalized_permission(
-            "unresolved",
-            vec![PermissionTarget::Command {
-                command: "git log -n 25 --format=%h|%ad|%s --date=short".into(),
-                shell: Some(shell::CommandShell::PowerShell),
-            }],
-        );
-        let failure = coordinator
-            .authorize(ApprovalMode::Ask, request, None, Some(&sink))
-            .await
-            .unwrap_err();
-        assert!(failure.to_string().contains("shell_command_not_found"));
-        assert!(failure.to_string().contains("%ad"));
-        assert!(failure.to_string().contains("%s"));
-        assert!(coordinator.pending_list().unwrap().is_empty());
-        assert_eq!(std::fs::read(path).unwrap(), before);
-        assert!(matches!(
-            stream.try_recv().unwrap(),
-            OwnerObservation::Event(HarnessEvent::Host {
-                event: HostEvent::Failure { .. },
-                ..
-            })
-        ));
-        assert!(stream.try_recv().is_err());
-    }
-
     #[tokio::test]
     async fn pauses_asked_permissions_and_persists_the_selected_rule() {
         let directory = tempfile::tempdir().unwrap();

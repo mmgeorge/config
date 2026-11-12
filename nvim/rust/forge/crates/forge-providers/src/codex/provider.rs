@@ -490,7 +490,9 @@ impl CodexProvider {
                 || request.tool_endpoint.is_some()
                 || !matches!(
                     request.input.kind(),
-                    forge_provider_api::forge::TurnKind::UserMessage {
+                    forge_provider_api::forge::TurnKind::Background {
+                        input: PromptInput::Text(_)
+                    } | forge_provider_api::forge::TurnKind::UserMessage {
                         input: PromptInput::Text(_)
                     }
                 )
@@ -6263,7 +6265,9 @@ mod continuation_tests {
     }
 
     /// Build a real adapter and RPC dispatcher against an isolated native wire fixture.
-    async fn compaction_fixture() -> (
+    async fn compaction_fixture(
+        history: forge_provider_api::SessionHistory,
+    ) -> (
         CodexProvider,
         Arc<CodexBinding>,
         ProviderEventStream,
@@ -6341,7 +6345,7 @@ mod continuation_tests {
             invalidated: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             provider_closed: provider.closed.clone(),
-            isolated: false,
+            isolated: history == forge_provider_api::SessionHistory::Temporary,
             background: false,
             configuration: Mutex::new(forge_provider_api::SessionConfiguration {
                 model: ModelSelection::default(),
@@ -6365,22 +6369,6 @@ mod continuation_tests {
             .insert(binding.id.clone(), session.clone());
         provider.owners.lock().await.insert(owner, binding.id);
         (provider, session, stream, socket)
-    }
-
-    /// Acknowledge the per-turn context injection that precedes a binding's first native turn.
-    async fn acknowledge_context_injection(
-        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) {
-        use futures_util::{SinkExt, StreamExt};
-        let inject: Value =
-            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(inject["method"], "thread/inject_items");
-        socket
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                json!({"id":inject["id"],"result":{}}).to_string().into(),
-            ))
-            .await
-            .unwrap();
     }
 
     /// Create canonical native evidence for retained-runner lifecycle fixtures.
@@ -6450,7 +6438,8 @@ mod continuation_tests {
     /// Concurrent resumes under different owners cannot acquire the same retained durable history.
     #[tokio::test]
     async fn duplicate_resume_is_excluded_until_invalidated_history_owner_is_collected() {
-        let (provider, session, _events, _socket) = compaction_fixture().await;
+        let (provider, session, _events, _socket) =
+            compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
         session.fenced.store(true, Ordering::Release);
         let request = |owner| SessionRequest {
             thread_id: (forge_provider_api::testing::root_thread(owner)).clone(),
@@ -6501,8 +6490,11 @@ mod continuation_tests {
     async fn cancellation_before_start_acknowledgment_interrupts_after_admission() {
         use futures_util::{SinkExt, StreamExt};
         async {
-            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let (provider, session, _events, mut socket) = compaction_fixture(forge_provider_api::SessionHistory::Temporary).await;
             let mut input = request();
+            input.input = forge_provider_api::forge::TurnInput::new(
+                forge_provider_api::forge::TurnKind::Background { input: PromptInput::Text("Generate a title".into()) },
+            );
             let (dispatch, mut observed) = forge_provider_api::submission::DispatchReporter::channel(session.binding.id.clone(), input.scope.clone(), input.submission_id.clone(), input.attempt_id.clone());
             input.dispatch = dispatch;
             let scope = input.scope.clone();
@@ -6512,9 +6504,11 @@ mod continuation_tests {
                 let models: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(models["method"], "model/list");
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":models["id"],"result":{"data":[{"model":"native-model","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"low"}],"defaultReasoningEffort":"low"}]}}).to_string().into())).await.unwrap();
-                acknowledge_context_injection(&mut socket).await;
                 let start: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(start["method"], "turn/start");
+                assert_eq!(start["params"]["approvalPolicy"], "never");
+                assert_eq!(start["params"]["sandboxPolicy"]["type"], "readOnly");
+                assert!(!start["params"]["input"].to_string().contains("<forge>"));
                 released_ack.await.unwrap();
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":start["id"],"result":{"turn":{"id":"late-ack-turn"}}}).to_string().into())).await.unwrap();
                 let early: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
@@ -6565,7 +6559,7 @@ mod continuation_tests {
     async fn completed_invocation_settles_once_and_late_cancel_preserves_successor() {
         use futures_util::SinkExt;
         async {
-            let (provider, session, mut events, mut socket) = compaction_fixture().await;
+            let (provider, session, mut events, mut socket) = compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
             let request = request();
             let scope = request.scope.clone();
             session.normalization.lock().await.bind(Some(scope.clone()));
@@ -6659,7 +6653,9 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
                 ProviderFailureKind::Authentication,
             ),
         ] {
-            let (_provider, session, mut events, _socket) = compaction_fixture().await;
+            let (_provider, session, mut events, _socket) =
+                compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None })
+                    .await;
             let request = request();
             {
                 let mut normalization = session.normalization.lock().await;
@@ -6753,7 +6749,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
     async fn uncertain_retraction_never_repeats_native_rollback() {
         use futures_util::{SinkExt, StreamExt};
         async {
-            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let (provider, session, _events, mut socket) = compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
             let input = request();
             let operation = context();
             let request = forge_provider_api::InputRetractRequest { scope: input.scope.clone(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone(), boundary: forge_provider_api::CheckpointId::new("cancelled-turn").unwrap(), authorization: forge_provider_api::RetractionAuthorization::OutputFreeCancellation };
@@ -6883,7 +6879,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
     async fn native_child_host_callback_never_borrows_root_or_successor_authority() {
         use futures_util::StreamExt;
         async {
-            let (_, session, _events, mut socket) = compaction_fixture().await;
+            let (_, session, _events, mut socket) = compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
             let mut request = request();
             let child = {
                 let mut normalization = session.normalization.lock().await;

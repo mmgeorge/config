@@ -418,7 +418,17 @@ async fn failed_send_keeps_cancel_available_and_never_resends() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    fixture.finish().await?;
+    // Shutdown may collect the failed generation before recovery installs a replacement.
+    // Its expected uncertain-delivery cause must survive, but no unrelated failure may pass.
+    if let Err(error) = fixture.finish_reporting_observation().await? {
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<forge_provider_api::ProviderError>(),
+                Some(forge_provider_api::ProviderError::DeliveryUncertain)
+            )),
+            "unexpected observation collector failure: {error:#}"
+        );
+    }
     scenario
 }
 

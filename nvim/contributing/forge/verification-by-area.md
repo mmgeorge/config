@@ -29,6 +29,12 @@ See [Extending project checks](extending-project-checks.md) when changing input 
 
 Compile the affected package first, with a 300-second compile deadline. Select the exact regression for the changed boundary; source files and broad module filters are not substitutes for a named regression. These selectors name current test functions and describe their coverage, not recorded passing results.
 
+- `forge-providers`: `codex::provider::continuation_tests::initialization_accepts_newer_versions_and_reports_invalid_versions` checks minimum-only version validation, newer CLI support, and repeated connection cleanup.
+- `forge-providers`: `codex::provider::continuation_tests::cancellation_before_start_acknowledgment_interrupts_after_admission` checks that temporary Background input reaches native dispatch with read-only access and denied approvals, then cancels the exact invocation.
+- `forge-harness`: `provider::text_generation::isolated::tests::dropped_waiter_and_validator_rejection_collect_temporary_sessions` checks retained cleanup and final-answer selection when native activity accompanies the response.
+- `forge-harness`: `provider::text_generation::isolated::tests::validator_rejection_preserves_cleanup_failure` retains both causes when validation and cleanup fail; `shutdown_cancels_and_collects_temporary_session_once` checks cancellation and repeated shutdown.
+- `forge-harness`: `service::tests::isolated_generation_uses_configured_model_without_a_conversation` checks the caller's model, reasoning, and speed selection through the shared generation lifecycle.
+
 - `forge-providers`: `turn_runner::tests::cleanup_failure_retains_native_result_and_fences_without_completion` checks unavailable publication after failed collection without ordinary completion.
 - `forge-provider-api`: `turn::tests::only_normal_completion_permits_automatic_continuation` checks normal completion versus token limit, request limit, refusal, failure, and interruption.
 

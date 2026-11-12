@@ -1,4 +1,4 @@
--- Saved Background controls survive fresh hosts and preserve chat settings. The case runs each
+-- Saved Commit controls survive fresh hosts and preserve chat settings. The case runs each
 -- phase in a fresh child Neovim: `save` changes the controls, and `reopen` reads them back.
 if vim.g.forge_commit_settings_phase then
   vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
@@ -30,38 +30,40 @@ if vim.g.forge_commit_settings_phase then
   local function option(id)
     local instance = picker._state_for_test()
     if not instance then return end
-    for _, row in ipairs(instance.spec.page_list[1].option_list) do
-      for _, field in ipairs(row.fields or {}) do if field.id == id then return field end end
+    for index, row in ipairs(instance.spec.page_list[1].option_list) do
+      for _, field in ipairs(row.fields or {}) do if field.id == id then return field, index end end
     end
   end
-  -- The settings picker renders only the rows its window fits; the default 24-line
-  -- headless screen hides the Background section below Main and Ask.
-  vim.o.lines = 60
   require("forge").open_harness()
   wait_until(function() return state.ready and state.session end, "Harness did not start", { timeout_ms = 4000, errors = errors })
   local before = { model = state.session.model, effort = state.session.effort, service_tier = state.session.service_tier }
   settings.open(state, { window_list = { state.transcript_win, state.composer_win }, control_win = state.composer_win })
-  wait_until(function() local model = option("background-model") return model and not model.disabled_reason end, "Background controls did not load", { timeout_ms = 4000, errors = errors })
+  wait_until(function() local model = option("commit-model") return model and not model.disabled_reason end, "Commit controls did not load", { timeout_ms = 4000, errors = errors })
   local expected = stage == "save" and "low" or "medium"
-  assert(option("background-provider").value == "Mock", vim.inspect(option("background-provider")))
-  assert(option("background-model").value:find("mock-model", 1, true))
-  assert(option("background-thinking").value:find(expected, 1, true), vim.inspect(option("background-thinking")))
-  assert(option("background-speed").value == (stage == "save" and "default" or "fast"))
-  assert(buffer.text(picker._state_for_test().buf):find("Background", 1, true), "Background controls did not render")
+  assert(option("commit-provider").value == "Mock", vim.inspect((option("commit-provider"))))
+  assert(option("commit-model").value:find("mock-model", 1, true))
+  assert(option("commit-thinking").value:find(expected, 1, true), vim.inspect((option("commit-thinking"))))
+  assert(option("commit-speed").value == (stage == "save" and "default" or "fast"))
+  -- Select the section so the viewport includes it on the headless screen.
+  local instance = picker._state_for_test()
+  local _, index = option("commit-provider")
+  instance.state.selected_index_by_page[instance.spec.page_list[1].id] = index
+  picker.update(instance.spec)
+  assert(buffer.text(picker._state_for_test().buf):find("Commit", 1, true), "Commit controls did not render")
   if stage == "save" then
-    picker._state_for_test().spec.on_field_action({ field = option("background-thinking") }, "change", 1)
-    wait_until(function() return option("background-thinking").value:find("medium", 1, true) ~= nil end, "Thinking did not save", { timeout_ms = 4000, errors = errors })
-    picker._state_for_test().spec.on_field_action({ field = option("background-speed") }, "change", 1)
-    wait_until(function() return option("background-speed").value == "fast" end, "Speed did not save", { timeout_ms = 4000, errors = errors })
+    picker._state_for_test().spec.on_field_action({ field = option("commit-thinking") }, "change", 1)
+    wait_until(function() return option("commit-thinking").value:find("medium", 1, true) ~= nil end, "Thinking did not save", { timeout_ms = 4000, errors = errors })
+    picker._state_for_test().spec.on_field_action({ field = option("commit-speed") }, "change", 1)
+    wait_until(function() return option("commit-speed").value == "fast" end, "Speed did not save", { timeout_ms = 4000, errors = errors })
   end
   assert(state.session.model == before.model and state.session.effort == before.effort, "Commit settings changed the chat")
-  assert(state.session.service_tier == before.service_tier, "Background speed changed the chat")
+  assert(state.session.service_tier == before.service_tier, "Commit speed changed the chat")
   local generator = require("forge.integrations.ai_commit")
   local original_generation_request = client.generation_request
   client.generation_request = function(_, callback, _, selection)
     local generation = assert(client.generation_get_config(selection))
-    assert(generation.service_tier == "fast", "saved Background speed did not reach generation")
-    assert(generation.provider.kind == "mock", "saved Background provider did not reach generation")
+    assert(generation.service_tier == "fast", "saved Commit speed did not reach generation")
+    assert(generation.provider.kind == "mock", "saved Commit provider did not reach generation")
     callback({ state = "ready", message = "test: use saved preferences" })
   end
   local generated
