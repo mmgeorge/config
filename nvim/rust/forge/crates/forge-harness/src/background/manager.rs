@@ -49,6 +49,7 @@ pub struct BackgroundResult {
 /// Retain the native owner and its observer between tool-free generation requests.
 struct RetainedBackground {
     runtime: Arc<BrokerRuntime>,
+    ownership: Arc<fs::File>,
     trace: Arc<crate::trace::TraceStore>,
     session_id: String,
     observer: Arc<crate::provider::session_execution::SessionObservationInbox>,
@@ -215,7 +216,7 @@ impl BackgroundManager {
             admitted = admitted => admitted,
         };
         let prepared = self.prepare(&request, &key, trace).await;
-        let (mut broker, runtime, _ownership, model) = match prepared {
+        let (mut broker, runtime, model) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::error!(target: "forge::provider", event_name = "background.preparation.failed",
@@ -540,7 +541,6 @@ impl BackgroundManager {
     ) -> Result<(
         HarnessBroker,
         BackgroundLease,
-        fs::File,
         crate::settings::ValidatedModelSelection,
     )> {
         // Serialize cache selection, collection, and allocation so concurrent workspaces
@@ -587,20 +587,36 @@ impl BackgroundManager {
             reason = "a Background run owns a store for its whole asynchronous preparation, and a writer lease cannot cross an await"
         )]
         let store = SqliteStore::open(&request.config.data_root)?;
-        let directory =
-            crate::storage::state::directory(&request.config.data_root).join("background-owner");
-        fs::create_dir_all(&directory)?;
-        let ownership = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(directory.join(format!("{}.lock", crate::plan::digest(key.as_bytes()))))?;
-        ownership.try_lock().map_err(|error| {
-            anyhow::anyhow!(
-                "Background session is busy in another editor. Retry after it finishes: {error}"
-            )
-        })?;
+        let ownership = self
+            .retained
+            .lock()
+            .await
+            .get(key)
+            .map(|retained| retained.ownership.clone());
+        // An idle retained runtime still owns its native writer. Keep the file lock
+        // through reuse, replacement, and failed cleanup, not just one generation.
+        let ownership = match ownership {
+            Some(ownership) => ownership,
+            None => {
+                let directory = crate::storage::state::directory(&request.config.data_root)
+                    .join("background-owner");
+                fs::create_dir_all(&directory)?;
+                let ownership = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(
+                        directory.join(format!("{}.lock", crate::plan::digest(key.as_bytes()))),
+                    )?;
+                ownership.try_lock().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Background session is owned by another editor. Close that editor before retrying: {error}"
+                    )
+                })?;
+                Arc::new(ownership)
+            }
+        };
         let previous = store
             .list_session(Some(&request.context.workspace))?
             .into_iter()
@@ -699,6 +715,7 @@ impl BackgroundManager {
                     broker.observer().replace_session_events(observer.clone());
                     let replacement = Arc::new(RetainedBackground {
                         runtime: retained.retained.runtime.clone(),
+                        ownership: retained.retained.ownership.clone(),
                         trace: retained.retained.trace.clone(),
                         session_id: retained.retained.session_id.clone(),
                         observer,
@@ -728,7 +745,7 @@ impl BackgroundManager {
                 }
             };
             let model = broker.configure_background_model(&request.config).await?;
-            return Ok((broker, retained, ownership, model));
+            return Ok((broker, retained, model));
         }
         let evicted = {
             let mut cache = self.retained.lock().await;
@@ -790,6 +807,7 @@ impl BackgroundManager {
         let observer = registry.observer(owner)?;
         let retained = Arc::new(RetainedBackground {
             runtime,
+            ownership,
             trace,
             session_id,
             observer,
@@ -808,7 +826,7 @@ impl BackgroundManager {
         }
         .await;
         match prepared {
-            Ok(model) => Ok((broker, lease, ownership, model)),
+            Ok(model) => Ok((broker, lease, model)),
             Err(error) => {
                 drop(lease);
                 self.retained.lock().await.remove(key);
@@ -1091,5 +1109,69 @@ async fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: S
                 payload: json!({"error":error}),
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_diff::cache::CacheLimits;
+
+    /// Keep idle native ownership exclusive until shutdown, while allowing reuse by its owner.
+    #[tokio::test]
+    async fn retained_background_keeps_writer_lock_until_shutdown() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir_all(&workspace)?;
+        forge_git::test_support::init_repository(&workspace);
+        let repositories = Arc::new(RepositoryStore::default());
+        let diff = DiffEngine::new(CacheLimits::default(), 1);
+        let syntax = forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool());
+        let first = BackgroundManager::new(repositories.clone(), diff.clone(), syntax.clone());
+        let second = BackgroundManager::new(repositories.clone(), diff, syntax);
+        let request = BackgroundRequest {
+            cancellation: super::super::CancellationToken::new(),
+            purpose: crate::provider::TextGeneration::CommitMessage,
+            config: serde_json::from_value(json!({
+                "data_root":fixture.path().join("data"),
+                "provider":{"kind":"mock","command":[]},
+                "model":"mock-model",
+                "auto_compaction":{"enabled":false,"threshold_tokens":100000}
+            }))?,
+            context: BackgroundContext::read(&repositories, &workspace.to_string_lossy()).await?,
+            input: "A test diff".into(),
+            delivery: None,
+        };
+        let key = format!(
+            "{}:{}",
+            request.config.data_root.display(),
+            request.context.workspace
+        );
+        let trace = Arc::new(crate::trace::TraceStore::open(&request.config.data_root)?);
+        let (mut broker, lease, _) = first.prepare(&request, &key, trace.clone()).await?;
+        let session_id = lease.retained.session_id.clone();
+        broker.release_lease()?;
+        drop(broker);
+        drop(lease);
+
+        let (mut broker, lease, _) = first.prepare(&request, &key, trace.clone()).await?;
+        assert_eq!(lease.retained.session_id, session_id);
+        broker.release_lease()?;
+        drop(broker);
+        drop(lease);
+        let conflict = match second.prepare(&request, &key, trace.clone()).await {
+            Err(error) => error,
+            Ok(_) => panic!("an idle native writer must exclude another manager"),
+        };
+        assert!(conflict.to_string().contains("owned by another editor"));
+
+        first.shutdown().await?;
+        let (mut broker, lease, _) = second.prepare(&request, &key, trace).await?;
+        assert_eq!(lease.retained.session_id, session_id);
+        broker.release_lease()?;
+        drop(broker);
+        drop(lease);
+        second.shutdown().await?;
+        Ok(())
     }
 }

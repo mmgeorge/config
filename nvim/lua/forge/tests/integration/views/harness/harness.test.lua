@@ -1911,9 +1911,16 @@ do
   client._host_set_launcher_for_test(mock_launcher)
 
   local baseline_tab_count = vim.fn.tabpagenr("$")
-  require("forge.views.harness").new_session()
-  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 1,
-    { fail_reason = "cold ForgeHarnessNew should create exactly one timeline tab" })
+  local original_tab = vim.api.nvim_get_current_tabpage()
+  local function close_panes()
+    local state = session.harness
+    vim.cmd("aboveleft new")
+    vim.api.nvim_win_close(state.composer_win, true)
+    vim.api.nvim_win_close(state.transcript_win, true)
+  end
+  forge.new_harness_session()
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count,
+    { fail_reason = "cold ForgeHarnessNew should use the current tab" })
   wait_until(function()
     return session.harness.session and session.harness.session.id == "session-2"
   end, "cold ForgeHarnessNew should open the session that session.new created")
@@ -1923,37 +1930,52 @@ do
     { fail_reason = "cold startup should restore the broker without naming a session; session.new owns creation" })
 
   local cold_tab = session.harness.timeline_tab
-  require("forge.views.harness").new_session("warm start")
-  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 2,
-    { fail_reason = "warm ForgeHarnessNew should create one additional timeline tab" })
+  eq(cold_tab, original_tab)
+  forge.new_harness_session()
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count,
+    { fail_reason = "warm ForgeHarnessNew should reuse the current timeline tab" })
   wait_until(function()
-    return session.harness.session and session.harness.session.name == "warm start"
+    return session.harness.session and session.harness.session.id == "session-3"
   end, "warm ForgeHarnessNew should complete through session.new")
   eq(initialize_count, 1, { fail_reason = "warm ForgeHarnessNew should reuse the running broker" })
   eq(session_new_count, 2, { fail_reason = "warm ForgeHarnessNew should create one broker session" })
-  assert(vim.api.nvim_tabpage_is_valid(cold_tab), "warm ForgeHarnessNew should preserve the prior timeline tab")
+  eq(session.harness.timeline_tab, cold_tab, { fail_reason = "warm ForgeHarnessNew should retain the same tab" })
 
-  vim.cmd("tabclose!")
-  vim.cmd("tabclose!")
+  close_panes()
   eq(vim.fn.tabpagenr("$"), baseline_tab_count, { fail_reason = "closing Harness timelines should restore the baseline" })
-  require("forge.views.harness").new_session("after close")
-  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 1,
-    { fail_reason = "ForgeHarnessNew after closing every timeline should create exactly one tab" })
+  forge.new_harness_session()
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count,
+    { fail_reason = "ForgeHarnessNew after closing every timeline should use the current tab" })
   wait_until(function()
-    return session.harness.session and session.harness.session.name == "after close"
+    return session.harness.session and session.harness.session.id == "session-4"
   end, "ForgeHarnessNew should remain usable after every timeline closes")
   eq(session_new_count, 3, { fail_reason = "ForgeHarnessNew after tab closure should reuse the running broker" })
 
   local successful_tab = session.harness.timeline_tab
-  require("forge.views.harness").new_session("fail")
-  eq(vim.fn.tabpagenr("$"), baseline_tab_count + 2,
-    { fail_reason = "a failed ForgeHarnessNew should retain exactly one provisional tab" })
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  require("forge.views.harness").new_session("fail", { open_mode = "current" })
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count,
+    { fail_reason = "a failed ForgeHarnessNew should not add a tab" })
   wait_until(function()
-    local line_list = buffer.lines(session.harness.transcript_buf)
-    return vim.tbl_contains(line_list, "  New session failed: mock new-session failure")
-  end, "a failed ForgeHarnessNew should explain the failure in its provisional timeline")
+    return vim.tbl_contains(errors:messages(), "mock new-session failure")
+  end, "a failed ForgeHarnessNew should report its failure")
+  eq(session.harness.session.id, "session-4",
+    { fail_reason = "a failed ForgeHarnessNew should preserve the current session" })
+  eq(session.harness.timeline_tab, successful_tab)
   assert(vim.api.nvim_tabpage_is_valid(successful_tab),
     "a failed ForgeHarnessNew should preserve the previously active timeline")
+
+  close_panes()
+  forge.open_harness()
+  wait_until(function()
+    return session.harness.session and session.harness.initial_snapshot_pending == nil
+  end, "ForgeHarness should reopen the retained session")
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count,
+    { fail_reason = "ForgeHarness should use the current tab" })
+  eq(session.harness.timeline_tab, original_tab)
+  forge.open_harness()
+  eq(vim.fn.tabpagenr("$"), baseline_tab_count,
+    { fail_reason = "repeated ForgeHarness should keep the current tab" })
 end
 end
 T["prompt_lifecycle"] = function()

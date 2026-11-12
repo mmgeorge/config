@@ -5,6 +5,28 @@ local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["open_uses_current_tab_on_first_launch"] = function()
+  local session = require("forge.session")
+  local client = require("forge.client")
+  local controller = require("forge.views.harness.controller")
+  local state = session.harness
+  local tab = vim.api.nvim_get_current_tabpage()
+  local tab_count = #vim.api.nvim_list_tabpages()
+  controller.attach = function() end
+  controller.render = function() end
+  client.session_initialize = function() end
+  require("forge").open_harness()
+  eq(#vim.api.nvim_list_tabpages(), tab_count)
+  eq(state.timeline_tab, tab)
+  assert(vim.api.nvim_win_is_valid(state.transcript_win))
+  assert(vim.api.nvim_win_is_valid(state.composer_win))
+  local composer = state.composer_win
+  require("forge").open_harness()
+  eq(#vim.api.nvim_list_tabpages(), tab_count)
+  eq(state.composer_win, composer)
+  state.startup_trace.finish("test")
+end
+
 T["provider_switch"] = function()
   local client = require('forge.client')
   dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
@@ -107,6 +129,8 @@ T["replace_session_preserves_requesting_tab_and_handles_failure"] = function()
   local source = session.harness
   source.session = { id = "source" }
   source.timeline_tab = vim.api.nvim_get_current_tabpage()
+  source.transcript_win = vim.api.nvim_get_current_win()
+  source.composer_win = vim.api.nvim_get_current_win()
   local reply, activation, failure
   client.session_create = function(options, callback)
     eq(options.source_session_id, "source")

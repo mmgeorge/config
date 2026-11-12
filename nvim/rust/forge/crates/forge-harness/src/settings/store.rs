@@ -72,6 +72,8 @@ pub(crate) struct SettingTarget<'scope> {
 #[serde(deny_unknown_fields)]
 /// Retains portable choices without copying provider authentication or native files.
 pub struct PortableSettings {
+    /// Default approval policy for newly created sessions.
+    pub approval_mode: Option<crate::session::ApprovalMode>,
     /// Requests native compaction after completed turns reach this token threshold.
     pub auto_compaction: Option<crate::session::AutoCompaction>,
     /// Controls reported file authorization and requested OS isolation independently of approval mode.
@@ -113,6 +115,9 @@ impl PortableSettings {
     }
 
     fn inherit(&mut self, overriding: Self) {
+        if overriding.approval_mode.is_some() {
+            self.approval_mode = overriding.approval_mode;
+        }
         if overriding.auto_compaction.is_some() {
             self.auto_compaction = overriding.auto_compaction;
         }
@@ -162,6 +167,9 @@ impl PortableSettings {
         session: &mut crate::session::HarnessSession,
         native_compact: bool,
     ) -> Result<()> {
+        if let Some(mode) = self.approval_mode {
+            session.approval_mode = mode;
+        }
         if let Some(policy) = &self.auto_compaction {
             policy.validate(session.context_usage.as_ref())?;
             session.auto_compaction = policy.clone();

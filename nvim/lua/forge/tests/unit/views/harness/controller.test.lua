@@ -106,6 +106,37 @@ T["new_session_commands_choose_tab_mode"] = function()
   eq(calls, { "current", "tab" })
 end
 
+T["config_opens_without_harness_windows"] = function()
+  local session = require("forge.session")
+  local state = session.harness
+  local controller = require("forge.views.harness.controller")
+  local defaults, openings = {}, {}
+  local window = vim.api.nvim_get_current_win()
+  local tab_count, window_count = #vim.api.nvim_list_tabpages(), #vim.api.nvim_list_wins()
+  require("forge.client").session_initialize = function() error("configuration created a session") end
+  require("forge.views.harness.global_settings").open = function(host)
+    defaults[#defaults + 1] = host
+  end
+  require("forge.views.harness.settings").open = function(owner, host)
+    openings[#openings + 1] = { owner = owner, host = host }
+  end
+  controller.open_config()
+  eq(defaults[1].control_win, window)
+  eq(#openings, 0)
+  state.session = { id = "active-elsewhere" }
+  controller.open_config()
+  eq(#defaults, 2)
+  state.composer_buf = vim.api.nvim_get_current_buf()
+  state.composer_win = window
+  controller.open_config()
+  eq(#openings, 1)
+  eq(openings[1].owner, state)
+  eq(openings[1].host.window_list, { window })
+  eq(openings[1].host.control_win, window)
+  eq(#vim.api.nvim_list_tabpages(), tab_count)
+  eq(#vim.api.nvim_list_wins(), window_count)
+end
+
 T["composer_admission"] = function()
   local client = require("forge.client")
   local state = require("forge.session").harness

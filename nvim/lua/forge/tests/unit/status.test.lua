@@ -475,7 +475,7 @@ T["open_lifecycle"] = function()
   pending_open[pending_command.document]()
   wait_until(function() return closed_document[pending_command.document] end, "pending command close did not settle")
 
-  -- Exercise the public entry from a real pinned window, preserving its draft and ownership.
+  -- The public entry replaces even a pinned buffer without creating windows or tabs.
   local forge = require("forge")
   vim.api.nvim_set_current_win(unrelated_window)
   local pinned = buffer_support.scratch({ "Retain this Harness draft café 東京" },
@@ -483,27 +483,26 @@ T["open_lifecycle"] = function()
   vim.api.nvim_win_set_buf(unrelated_window, pinned)
   vim.api.nvim_win_set_cursor(unrelated_window, { 1, 5 })
   vim.wo[unrelated_window].winfixbuf = true
-  local pinned_cursor = vim.api.nvim_win_get_cursor(unrelated_window)
   local opening_tab = vim.api.nvim_get_current_tabpage()
   local opening_tabs = #vim.api.nvim_list_tabpages()
+  local opening_windows = #vim.api.nvim_list_wins()
   local public = forge.open()
   assert(vim.api.nvim_get_current_win() == unrelated_window and vim.api.nvim_get_current_buf() == pinned,
     "pending public Status entry changed the pinned window")
   pending_open[public.document]()
   wait_until(function() return public.ready and #vim.fn.win_findbuf(public.replica.buffer) == 1 end,
-    "public Status entry did not mount beside the pinned feature")
+    "public Status entry did not replace the pinned buffer")
   local status_window = vim.fn.win_findbuf(public.replica.buffer)[1]
-  assert(status_window ~= unrelated_window and vim.api.nvim_get_current_win() == status_window)
+  assert(status_window == unrelated_window and vim.api.nvim_get_current_win() == status_window)
   eq(vim.api.nvim_get_current_tabpage(), opening_tab)
   eq(#vim.api.nvim_list_tabpages(), opening_tabs)
-  assert(vim.api.nvim_win_get_buf(unrelated_window) == pinned and vim.wo[unrelated_window].winfixbuf,
-    "Status stole the pinned Harness input buffer or removed its pin")
-  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(unrelated_window), pinned_cursor)
-    and buffer_support.line(pinned, 1) == "Retain this Harness draft café 東京")
+  eq(#vim.api.nvim_list_wins(), opening_windows)
+  assert(vim.api.nvim_win_get_buf(unrelated_window) == public.replica.buffer and not vim.wo[unrelated_window].winfixbuf)
+  eq(buffer_support.line(pinned, 1), "Retain this Harness draft café 東京")
   vim.api.nvim_set_current_win(unrelated_window)
   local tabs = #vim.api.nvim_list_tabpages()
   assert(forge.open() == public and vim.api.nvim_get_current_win() == status_window,
-    "cached Status entry could not focus its existing mount from a pinned input")
+    "cached Status entry moved away from the current window")
   assert(#vim.api.nvim_list_tabpages() == tabs, "cached Status entry created another tab")
 
   vim.api.nvim_win_set_buf(status_window, source)
@@ -512,36 +511,35 @@ T["open_lifecycle"] = function()
   local picker_window = vim.api.nvim_open_win(picker_buffer, true, {
     relative = "editor", row = 1, col = 1, width = 40, height = 1, style = "minimal",
   })
+  local picker_windows = #vim.api.nvim_list_wins()
   local picker_notices = notify.capture()
   assert(forge.open() == public, "cached Status failed from a one-row picker: " .. table.concat(picker_notices:messages(), "\n"))
   local mounted_window = vim.api.nvim_get_current_win()
   eq(vim.api.nvim_get_current_tabpage(), opening_tab)
   eq(#vim.api.nvim_list_tabpages(), opening_tabs)
-  assert(mounted_window ~= picker_window and vim.api.nvim_win_get_config(mounted_window).relative == "",
-    "cached Status mounted inside a transient picker")
-  assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer and vim.wo[picker_window].winbar == "",
-    "cached Status changed the picker buffer or presentation")
+  assert(mounted_window == picker_window, "cached Status did not use the current floating window")
+  eq(#vim.api.nvim_list_wins(), picker_windows)
+  eq(vim.api.nvim_win_get_buf(picker_window), public.replica.buffer)
   assert(buffer_support.line(picker_buffer, 1) == "Retain the picker query")
   local mounted_tabs = #vim.api.nvim_list_tabpages()
   vim.api.nvim_set_current_win(picker_window)
   assert(forge.open() == public and vim.api.nvim_get_current_win() == mounted_window,
-    "picker entry did not reuse the existing normal Status window")
+    "picker entry did not reuse the current window")
   assert(#vim.api.nvim_list_tabpages() == mounted_tabs, "picker entry duplicated the Status tab")
   picker_notices:assert_none()
   vim.api.nvim_win_close(picker_window, true)
   vim.api.nvim_buf_delete(picker_buffer, { force = true })
-  assert(vim.api.nvim_win_get_buf(mounted_window) == public.replica.buffer,
-    "picker cleanup removed the Status mount")
+  assert(not vim.api.nvim_win_is_valid(mounted_window))
   status.close(public)
   wait_until(function() return closed_document[public.document] end, "public pinned Status close did not settle")
   if vim.api.nvim_win_is_valid(mounted_window) then vim.api.nvim_win_close(mounted_window, true) end
-  if vim.api.nvim_win_is_valid(status_window) then vim.api.nvim_win_close(status_window, true) end
   vim.api.nvim_set_current_win(unrelated_window)
 
   picker_buffer = buffer_support.scratch()
   picker_window = vim.api.nvim_open_win(picker_buffer, true, {
     relative = "editor", row = 1, col = 1, width = 40, height = 1, style = "minimal",
   })
+  picker_windows = #vim.api.nvim_list_wins()
   local fresh = forge.open()
   assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer, "pending Status replaced the picker")
   pending_open[fresh.document]()
@@ -549,22 +547,23 @@ T["open_lifecycle"] = function()
   mounted_window = vim.api.nvim_get_current_win()
   eq(vim.api.nvim_get_current_tabpage(), opening_tab)
   eq(#vim.api.nvim_list_tabpages(), opening_tabs)
-  assert(mounted_window ~= picker_window and vim.api.nvim_win_get_config(mounted_window).relative == "",
-    "fresh Status mounted inside a transient picker")
-  assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer and vim.wo[picker_window].winbar == "")
+  assert(mounted_window == picker_window, "fresh Status did not use the current floating window")
+  eq(#vim.api.nvim_list_wins(), picker_windows)
+  eq(vim.api.nvim_win_get_buf(picker_window), fresh.replica.buffer)
   vim.schedule(function()
     vim.api.nvim_win_close(picker_window, true)
     vim.api.nvim_buf_delete(picker_buffer, { force = true })
   end)
   wait_until(function() return not vim.api.nvim_win_is_valid(picker_window) end, "picker teardown did not settle")
-  assert(fresh.active and vim.api.nvim_win_get_buf(mounted_window) == fresh.replica.buffer,
-    "deferred picker cleanup removed fresh Status")
+  assert(fresh.active and not vim.api.nvim_win_is_valid(mounted_window))
   status.close(fresh)
   wait_until(function() return closed_document[fresh.document] end, "fresh picker Status close did not settle")
   if vim.api.nvim_win_is_valid(mounted_window) then vim.api.nvim_win_close(mounted_window, true) end
   vim.api.nvim_set_current_win(unrelated_window)
 
-  -- A failed asynchronous bind must release the cached owner and its newly created window.
+  -- A failed asynchronous bind preserves the current window, its buffer, and its pin.
+  vim.api.nvim_win_set_buf(unrelated_window, pinned)
+  vim.wo[unrelated_window].winfixbuf = true
   local failed = forge.open()
   local notices = notify.capture()
   vim.api.nvim_win_set_buf = function(window, buf)

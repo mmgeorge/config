@@ -1083,6 +1083,8 @@ Decoder source: [nvim/rust/forge/crates/forge-harness/src/settings/store.rs](../
 #[serde(deny_unknown_fields)]
 /// Retains portable choices without copying provider authentication or native files.
 pub struct PortableSettings {
+    /// Default approval policy for newly created sessions.
+    pub approval_mode: Option<crate::session::ApprovalMode>,
     /// Requests native compaction after completed turns reach this token threshold.
     pub auto_compaction: Option<crate::session::AutoCompaction>,
     /// Controls reported file authorization and requested OS isolation independently of approval mode.

@@ -57,11 +57,12 @@ local function attach_activation(state)
 end
 
 ---@param timeline_key string
+---@param open_mode? "current"|"tab"
 ---@return ForgeHarnessPresentationState
-local function create_view(timeline_key)
+local function create_view(timeline_key, open_mode)
   local state = session.new_harness_state()
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
-    layout.open(timeline_key)
+    layout.open(timeline_key, open_mode)
   layout.attach_auto_height(state.composer_buf, state.composer_win)
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
   attach_activation(state)
@@ -276,11 +277,12 @@ function M.begin_fork(source_session, child_name)
 end
 
 ---@param name? string
+---@param open_mode? "current"|"tab"
 ---@return ForgeHarnessPendingSession
-function M.begin_new(name)
+function M.begin_new(name, open_mode)
   pending_sequence = pending_sequence + 1
   local source_session_id = session.harness.session and session.harness.session.id or ""
-  local state = create_view("new-pending-" .. pending_sequence)
+  local state = create_view("new-pending-" .. pending_sequence, open_mode)
   local pending = {
     state = state,
     source_session_id = source_session_id,
@@ -337,9 +339,10 @@ end
 ---@param session_id string
 ---@param options? ForgeHarnessSessionActivation
 function M.resume(session_id, options)
-  local existing = state_by_session_id[session_id] or session.harness_by_id[session_id]
-  if existing and focus_state(existing) then return end
   local source_state = session.harness
+  local existing = state_by_session_id[session_id] or session.harness_by_id[session_id]
+  if existing and (existing == source_state or not options or options.open_mode ~= "current")
+    and focus_state(existing) then return end
   client.request({ session_id = session_id, method = "session.resume", params = { session_id = session_id } }, function(result, request_error)
     if request_error then
       notifications.error(request_error, "Harness session")
@@ -348,6 +351,7 @@ function M.resume(session_id, options)
     -- The activation targets the tab where the user chose the session, and takes focus only
     -- when that tab is still the selected one.
     local activation = vim.tbl_extend("force", {}, options or {}, { source_state = source_state })
+    if activation.open_mode == "current" and valid_view(source_state) then activation.state = source_state end
     if session.harness ~= source_state then activation.focus = false end
     M.activate(result, activation)
   end)

@@ -963,6 +963,35 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     Ok(())
 }
 
+/// A rejected resume must not be replayed as native cleanup during shutdown.
+#[tokio::test]
+async fn shutdown_does_not_reopen_a_rejected_writer() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    *native.open_failure.lock().unwrap() = Some(
+        ProviderFailure::new(
+            ProviderOperation::ThreadOpen,
+            ProviderFailureKind::ResourceConflict,
+        )
+        .at_phase(
+            forge_provider_api::ProviderPhase::Preparation,
+            forge_provider_api::FailureDisposition::Unchanged,
+        )
+        .into(),
+    );
+    let bridge = bridge(root.path(), native.clone()).await?;
+    let error = bridge
+        .thread_open(provider_request(root.path()))
+        .await
+        .expect_err("the writer conflict must reach the caller");
+    assert!(matches!(error, ProviderError::Failure(failure)
+        if failure.kind() == ProviderFailureKind::ResourceConflict));
+    bridge.shutdown().await?;
+    assert_eq!(native.open_attempts.lock().unwrap().len(), 1);
+    assert_eq!(native.shutdown_calls.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
 /// Shutdown interrupts a pending open before awaiting its shared admission guard.
 #[tokio::test]
 async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow::Result<()> {

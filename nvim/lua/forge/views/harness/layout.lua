@@ -99,10 +99,17 @@ function M.configure_transcript_window(win)
 end
 
 ---@param timeline_key? string
+---@param open_mode? "current"|"tab"
 ---@return integer, integer, integer, integer, integer
-function M.open(timeline_key)
+function M.open(timeline_key, open_mode)
   local options = config.options.harness
-  vim.cmd("tabnew")
+  if open_mode ~= "current" then
+    vim.cmd("tabnew")
+  elseif vim.wo[vim.api.nvim_get_current_win()].winfixbuf then
+    -- Keep buffer-locked views intact while opening Harness in the same tab.
+    vim.cmd("aboveleft split")
+    vim.wo[vim.api.nvim_get_current_win()].winfixbuf = false
+  end
   local tabpage = vim.api.nvim_get_current_tabpage()
   local transcript_win = vim.api.nvim_get_current_win()
   local transcript_buf = M.create_transcript_buffer(timeline_key)

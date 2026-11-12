@@ -400,7 +400,8 @@ end
 ---@param state ForgeHarnessPresentationState
 ---@param host table
 ---@param resume_state? ForgePickerResumeState State captured before a child editor opened.
-function M.open(state, host, resume_state)
+---@param defaults? {current: fun(): boolean, configure: fun(params: table, completed: fun(applied: boolean)), models: fun(callback: fun(models: table[])), select_provider: fun(host: table)} Saved-defaults operations without a session.
+function M.open(state, host, resume_state, defaults)
   if not state.session then return end
   local session_id = state.session.id
   M._revision = (M._revision or 0) + 1
@@ -426,13 +427,24 @@ function M.open(state, host, resume_state)
     local return_state = resume_state
     --- Re-enter only after the owned child closes and the original session remains current.
     local function reopen()
-      if current() and not picker.is_open() then M.open(state, host, return_state) end
+      if current() and not picker.is_open() then M.open(state, host, return_state, defaults) end
     end
     ---@type ForgeAskModel
     local ask = vim.deepcopy(state.ask_model or {})
     local access = require("forge.views.harness.access")
     local function configure(params, completed)
       if not current() then if completed then completed(false) end return end
+      if defaults then
+        pending = true
+        defaults.configure(params, function(applied)
+          if not current() then return end
+          pending = false
+          active = vim.deepcopy(state.session)
+          if completed then completed(applied) end
+          if picker.is_open("harness-config") then picker.update(build_spec()) end
+        end)
+        return
+      end
       configuration_revision = configuration_revision + 1
       local revision = configuration_revision
       active = vim.tbl_extend("force", active, params)
@@ -468,6 +480,7 @@ function M.open(state, host, resume_state)
       configure({ access = policy }, completed)
     end
     local function set_approval_mode(mode)
+      if defaults then configure({ approval_mode = mode }) return end
       local previous_mode = active.approval_mode or "ask"
       active.approval_mode, pending = mode, true
       local session = require("forge.session")
@@ -485,6 +498,13 @@ function M.open(state, host, resume_state)
       if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
     end
     local function configure_ask(selection, completed)
+      if defaults then
+        configure({ ask_model = selection }, function(applied)
+          ask = vim.deepcopy(state.ask_model)
+          if completed then completed(applied) end
+        end)
+        return
+      end
       pending = true
       client.request({ session_id = session_id, method = "session.configure", params = { ask_model = selection } }, function(result, failure)
         if not current() then return end
@@ -580,6 +600,7 @@ function M.open(state, host, resume_state)
         local position = active.shell == "nushell" and #values or 1
         configure({ shell = values[(position - 1 + (direction or 1)) % #values + 1] })
       elseif id == "check-editing" then
+        if defaults then configure({ check_editing = not state.check_editing }) return end
         pending = true
         client.request({ session_id = session_id, method = "session.check.editing.set",
           params = { enabled = not state.check_editing } }, function(result, failure)
@@ -614,6 +635,7 @@ function M.open(state, host, resume_state)
     current = function()
       return M._revision == owner_revision and not state.switching_provider
         and state.session ~= nil and state.session.id == session_id
+        and (not defaults or defaults.current())
     end
     local function model_descriptor()
       return require("forge.views.harness.model_options").find(main_catalog.model_list, active.model)
@@ -688,7 +710,8 @@ function M.open(state, host, resume_state)
               reopen)
           end })
       elseif id == "main-provider" then
-        require("forge.views.harness.controller").select_provider()
+        if defaults then defaults.select_provider(host)
+        else require("forge.views.harness.controller").select_provider() end
       elseif id:match("^main%-") then
         change_main(id, 1)
       else
@@ -711,6 +734,7 @@ function M.open(state, host, resume_state)
       ---@return ForgePickerField
       local function field(id, kind, value, label, disabled, muted)
         return { id = id, kind = kind, value = value, label = label,
+          description = defaults and id == "main-provider" and "Default provider for new chats. Existing chats keep their provider." or nil,
           disabled_reason = disabled, muted = muted,
           input = kind == "input" and { kind = "choice", values = duration.choices(), initial = duration.selection(active[id]) } or nil }
       end
@@ -755,7 +779,7 @@ function M.open(state, host, resume_state)
         return { category = category, id = id, section = section, label = label, fields = fields }
       end
       return {
-        owner = "harness-config", title = "Configuration", host = host, size_ratio = 0.8, width_ratio = 1, placement = "bottom",
+        owner = "harness-config", title = defaults and "Global defaults" or "Session configuration", host = host, size_ratio = 0.8, width_ratio = 1, placement = "bottom",
         page_navigation = "tabs", wrap_pages = true, hint_mode = "help", resume_state = resume_state,
         keymaps = {
           page_previous = { "<S-Tab>", "[" }, page_next = { "<Tab>", "]" },
@@ -846,16 +870,20 @@ function M.open(state, host, resume_state)
       }
     end
     do
-      local session = require("forge.session")
-      local previous = session.harness
-      session.activate_harness(state)
-      require("forge.views.harness.provider_catalog").models(false, function(model_list, failure)
+      local function receive_models(model_list, failure)
         if not current() then return end
         main_catalog.model_list, main_catalog.failure = model_list, failure
         if failure then notifications.error(failure, "Harness models") end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
-      end)
-      session.activate_harness(previous)
+      end
+      if defaults then defaults.models(receive_models)
+      else
+        local session = require("forge.session")
+        local previous = session.harness
+        session.activate_harness(state)
+        require("forge.views.harness.provider_catalog").models(false, receive_models)
+        session.activate_harness(previous)
+      end
     end
     commit = require("forge.views.harness.background_configuration").new({
       session_id = session_id, host = host,

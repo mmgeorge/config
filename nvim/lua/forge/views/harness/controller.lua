@@ -1612,6 +1612,17 @@ function M.open_session_picker()
   require("forge.views.harness.session_picker").open(picker_host(harness_state()))
 end
 
+function M.open_config()
+  local state = harness_state()
+  local window = vim.api.nvim_get_current_win()
+  local current_buffer = vim.api.nvim_win_get_buf(window)
+  if not state.session or (current_buffer ~= state.transcript_buf and current_buffer ~= state.composer_buf) then
+    require("forge.views.harness.global_settings").open({ window_list = { window }, control_win = window })
+    return
+  end
+  require("forge.views.harness.settings").open(state, picker_host(state))
+end
+
 ---List provider-owned background shells and terminate only the selected shell.
 function M.open_background_picker()
   local state = harness_state()
@@ -2027,7 +2038,7 @@ function M.submit()
   if text == "/config" or text == "/log" or text:match("^/log%s") then
     set_composer_text(state.composer_buf, "")
     local settings = require("forge.views.harness.settings")
-    if text == "/config" then settings.open(state, picker_host(state))
+    if text == "/config" then M.open_config()
     else settings.log(state.session.id, text:match("^/log%s+(.+)$")) end
     return
   end

@@ -118,6 +118,7 @@ Read resolved settings and the available catalogs/layers.
 - **Context:** Shared service with explicit evaluation context.
 - **Input:** `workspace`: optional path string, used only without explicit session context and defaulting to the initialized workspace. With a session, its workspace and session layer are used. Returns the settings snapshot plus `catalog`, `layers` (`global`, `workspace`, `session`), and `application` status.
 - **Result and effects:** Returns effective settings, catalogs, layer settings, and application status.
+- **Defaults queries:** Optional `provider` selects provider-local defaults and is returned as `selected_provider`. Without a session, `include_models: true` also returns `model_catalog: { models, capability }`, queried with workspace context only. This does not create or resume a session. Use `layers.global` to edit global defaults without copying workspace overrides into them.
 - **Boundary:** Global, workspace, and session layers are distinct.
 - **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service.rs`](../../../rust/forge/crates/forge-harness/src/service/shared.rs).
 
@@ -178,6 +179,7 @@ Apply an explicit settings mutation.
 - **Context:** Shared service with explicit evaluation context.
 - **Input:** `expected_revision`: required unsigned integer. `desired`: required [PortableSettings](native-schemas.md#portablesettings) object. `scope`: `global`, `workspace`, or `session`, default `global`. `workspace`: optional evaluation path without a session. `operation_id`: optional string, generated when omitted. Callers that need mutation recovery must retain their own ID. Session scope requires an explicit envelope session ID.
 - **Result and effects:** Returns mutation/application information.
+- **Provider defaults:** Without a session, `provider` plus `provider_settings` replaces the `desired` input with a partial provider-local patch. Accepted fields are `model`, `effort`, `context_window`, `service_tier`, and `ask_model`. `expected_revision` remains required. The response is `{ state: "saved", revision }`; reread settings after an uncertain response. This path does not apply changes to live sessions.
 - **Boundary:** Persisted intent and runtime application can have separate outcomes.
 - **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service.rs`](../../../rust/forge/crates/forge-harness/src/service/shared.rs).
 

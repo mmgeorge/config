@@ -257,7 +257,7 @@ M.open_file_revision = commands.open_file_revision
 M.open_compact_preview = commands.open_compact_preview
 M.open_harness = function() require("forge.views.harness").open() end
 M.open_background_timeline = function(session_id) require("forge.views.background").open(session_id) end
-M.new_harness_session = function() require("forge.views.harness").new_session() end
+M.new_harness_session = function() require("forge.views.harness").new_session(nil, { open_mode = "current" }) end
 M.set_git_provider = git_provider.set_provider
 M.reset_git_provider = git_provider.reset_provider
 

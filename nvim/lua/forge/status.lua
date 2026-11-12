@@ -814,7 +814,7 @@ function M.apply_update(state, update)
   M.demand(state)
 end
 
----Mount Status without replacing floating UI or a buffer pinned by another feature.
+---Mount Status in the requested window, releasing any previous buffer pin.
 ---@param state ForgeNativeStatus
 ---@param window integer
 ---@return integer? window
@@ -824,44 +824,24 @@ function M.show(state, window)
     return nil, "Status document is closed"
   end
   if not vim.api.nvim_win_is_valid(window) then return nil, "Status opening window is closed" end
-  local origin = vim.api.nvim_get_current_win()
-  local focused = origin == window
-  local created
-  local target = window
-  local tab = vim.api.nvim_win_get_tabpage(window)
+  local previous_buffer = vim.api.nvim_win_get_buf(window)
+  local pinned = vim.wo[window].winfixbuf
+  local previous_height = vim.api.nvim_win_get_height(window)
   local ok, failure = xpcall(function()
-    if vim.api.nvim_win_get_config(window).relative ~= ""
-      or (vim.wo[window].winfixbuf and vim.api.nvim_win_get_buf(window) ~= state.replica.buffer) then
-      local displayed = vim.tbl_filter(function(candidate)
-        return vim.api.nvim_win_get_tabpage(candidate) == tab
-          and vim.api.nvim_win_get_config(candidate).relative == ""
-      end, vim.fn.win_findbuf(state.replica.buffer))
-      if #displayed > 0 then
-        target = displayed[1]
-      else
-        local anchor = window
-        if vim.api.nvim_win_get_config(anchor).relative ~= "" then
-          for _, candidate in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
-            if vim.api.nvim_win_get_config(candidate).relative == "" then anchor = candidate break end
-          end
-        end
-        vim.api.nvim_win_call(anchor, function()
-          vim.cmd("botright vsplit")
-          target = vim.api.nvim_get_current_win()
-          created = target
-          vim.wo[target].winfixbuf = false
-        end)
-      end
-    end
-    vim.api.nvim_win_set_buf(target, state.replica.buffer)
-    if focused then vim.api.nvim_set_current_win(target) end
+    -- Status uses a winbar, which needs room above at least one content row.
+    if previous_height < 2 then vim.api.nvim_win_set_height(window, 2) end
+    vim.wo[window].winfixbuf = false
+    vim.api.nvim_win_set_buf(window, state.replica.buffer)
   end, debug.traceback)
   if not ok then
-    if created and vim.api.nvim_win_is_valid(created) then pcall(vim.api.nvim_win_close, created, true) end
-    if vim.api.nvim_win_is_valid(origin) then pcall(vim.api.nvim_set_current_win, origin) end
+    if vim.api.nvim_win_is_valid(window) then
+      if vim.api.nvim_buf_is_valid(previous_buffer) then pcall(vim.api.nvim_win_set_buf, window, previous_buffer) end
+      vim.wo[window].winfixbuf = pinned
+      if previous_height < 2 then pcall(vim.api.nvim_win_set_height, window, previous_height) end
+    end
     return nil, tostring(failure)
   end
-  return target
+  return window
 end
 
 ---@param options? ForgeNativeStatusOptions

@@ -78,7 +78,7 @@ local function resume_session(instance, entry)
   session_preview.close()
   active = nil
   if instance.on_select then instance.on_select(entry)
-  else session_navigation.resume(entry.id, { open_mode = instance.open_mode }) end
+  else session_navigation.resume(entry.id, { open_mode = "current" }) end
 end
 
 local build_spec
@@ -111,38 +111,44 @@ end
 ---@param instance table
 ---@return table
 build_spec = function(instance)
-  local scope_label = instance.scope == "repo" and "Repository" or "All"
-  local open_label = instance.open_mode == "tab" and "New Tab" or "Current Tab"
-  local option_list = vim.tbl_map(function(entry) return option(entry, instance.scope) end, instance.entry_list)
-  local column_headers = { "Created", "Session", "Harness", "Mode" }
-  if instance.scope == "all" then column_headers[#column_headers + 1] = "Workspace" end
+  local page_list = {}
+  for _, scope in ipairs(instance.provider and { "repo" } or { "repo", "all" }) do
+    local option_list = vim.tbl_map(function(entry) return option(entry, scope) end,
+      instance.entry_list_by_scope[scope] or {})
+    local column_headers = { "Created", "Session", "Harness", "Mode" }
+    if scope == "all" then column_headers[#column_headers + 1] = "Workspace" end
+    page_list[#page_list + 1] = {
+      id = scope,
+      title = instance.provider and "Resume Session" or (scope == "repo" and "Workspace" or "All"),
+      column_headers = column_headers,
+      header_right = instance.provider,
+      option_list = option_list,
+      wrap_selection = false,
+      empty_text = instance.entry_list_by_scope[scope] and "No matching Harness sessions." or "Loading sessions...",
+      search = { start_in_normal = true },
+      footer = instance.provider and "↑↓ select  / search  Enter resume  q back"
+        or "Tab scope  ↑↓ select  / search  Enter open  C-j delete  q close",
+    }
+  end
+  local function switch_scope()
+    local spec = build_spec(instance)
+    spec.initial_page = instance.scope == "repo" and 2 or 1
+    picker.update(spec)
+  end
   return {
     owner = "sessions",
     host = instance.host,
-    page_list = {
-      {
-        id = "sessions",
-        title = instance.provider and "Resume Session" or "Select Session",
-        column_headers = column_headers,
-        header_right = instance.provider or ("Search: " .. scope_label .. " | Open: " .. open_label),
-        option_list = option_list,
-        wrap_selection = false,
-        empty_text = "No matching Harness sessions.",
-        search = { start_in_normal = true },
-        footer = instance.provider and "↑↓ select  / search  Enter resume  q back"
-          or "↑↓ select  / search  Enter open  Tab toggle tab  C-j delete  C-o scope  q close",
-      },
-    },
+    title = instance.provider and "Resume Session" or "Select Session",
+    page_navigation = not instance.provider and "tabs" or nil,
+    wrap_pages = true,
+    page_list = page_list,
     action_list = instance.provider and {} or {
       {
-        id = "open-mode",
+        id = "scope",
         key = "<Tab>",
         modes = { "n", "i" },
-        desc = "Toggle current-tab and new-tab opening",
-        callback = function()
-          instance.open_mode = instance.open_mode == "current" and "tab" or "current"
-          picker.update(build_spec(instance))
-        end,
+        desc = "Switch Workspace and All sessions",
+        callback = switch_scope,
       },
       {
         id = "delete",
@@ -152,17 +158,22 @@ build_spec = function(instance)
         callback = function(context) delete_session(instance, context.option and context.option.value) end,
       },
       {
-        id = "scope",
+        id = "scope-alternate",
         key = "<C-o>",
         modes = { "n", "i" },
-        desc = "Toggle repository session scope",
-        callback = function()
-          instance.scope = instance.scope == "repo" and "all" or "repo"
-          load_session_list(instance)
-        end,
+        desc = "Switch Workspace and All sessions",
+        callback = switch_scope,
       },
     },
-    on_change = function(context) request_preview(instance, context.option and context.option.value) end,
+    on_change = function(context)
+      if instance.scope ~= context.page.id then
+        instance.scope = context.page.id
+        request_preview(instance, nil)
+        load_session_list(instance)
+        return
+      end
+      request_preview(instance, context.option and context.option.value)
+    end,
     on_confirm = function(result)
       resume_session(instance, result.option.value)
       return false
@@ -190,7 +201,7 @@ load_session_list = function(instance)
       end
       return
     end
-    instance.entry_list = vim.tbl_filter(function(entry)
+    instance.entry_list_by_scope[instance.scope] = vim.tbl_filter(function(entry)
       return not instance.provider or (entry.provider == instance.provider and same_workspace(entry.workspace, instance.workspace))
     end, result or {})
     if picker.is_open("sessions") then
@@ -214,8 +225,7 @@ function SessionPicker.open(host, options)
     host = host,
     owner_session_id = session.harness.session and session.harness.session.id,
     scope = "repo",
-    open_mode = "current",
-    entry_list = {},
+    entry_list_by_scope = {},
     list_generation = 0,
     preview_generation = 0,
     provider = options.provider,

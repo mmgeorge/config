@@ -37,7 +37,7 @@ T["session_geometry"] = function()
     local result
     if method == "session.input.get" then
       result = { revision = 0, messages = queue_by_session[request.session_id] or {}, suspended = true, execution_busy = false }
-    elseif method == "session.state.get" then
+    elseif method == "session.state.get" or method == "session.resume" then
       result = { session = { id = request.session_id, provider = "mock", model = "mock", approval_mode = "ask" },
         runtime_epoch = host_runtime_epoch, snapshot_revision = host_revision_by_session[request.session_id] or 0 }
     elseif method == "session.health.get" then result = { responsive = true }
@@ -76,11 +76,19 @@ T["session_geometry"] = function()
   end
 
   ---Transfer the current panes and verify both previous geometry owners were collected.
-  local function transfer(target, source)
+  local function transfer(target, source, resume)
     local previous_target, previous_source = target.presentation, source.presentation
     local window, tab = source.composer_win, source.timeline_tab
     generation = generation + 1
-    navigation.activate({ session = target.session }, { state = source, open_mode = "current" })
+    if resume then
+      session.select_harness(source)
+      vim.api.nvim_set_current_win(source.composer_win)
+      navigation.resume(target.session.id, { open_mode = "current" })
+      wait_until(function() return target.timeline_tab == tab end,
+        "resuming an already open session should use the requesting tab")
+    else
+      navigation.activate({ session = target.session }, { state = source, open_mode = "current" })
+    end
     settled(target)
     assert(session.harness == target and target.composer_win == window and target.timeline_tab == tab)
     assert(source.composer_win == nil and source.timeline_tab == nil)
@@ -117,7 +125,7 @@ T["session_geometry"] = function()
     "background presentation completion stole focus")
   require("forge.views.harness.workspace").release(pending.state)
   assert(pending.state.presentation.close())
-  transfer(first, second)
+  transfer(first, second, true)
   transfer(second, first)
   transfer(first, second)
   failures:assert_none()

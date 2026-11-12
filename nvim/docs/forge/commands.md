@@ -61,10 +61,8 @@ replaying an uncertain prompt.
 | `:ForgeDiffCompactPreview` | None | Preview the compacted working-tree diff |
 | `:ForgeDiffCompactPreview!` | Bang | Preview the compacted staged diff |
 
-Invoking `:ForgeStatus` from a floating picker or a window pinned to another buffer
-reuses an existing non-floating Status window in the current tab, or opens a split
-in that tab if none exists.
-Forge leaves the picker or pinned buffer untouched.
+`:ForgeStatus` displays its buffer in the current window without creating a split
+or tab. It replaces the displayed buffer even when the window was pinned to it.
 
 ForgeStatus file rows, file-specific comparison labels, and single-file discard
 confirmations show paths relative to the editor cwd in the window that opened the view.
@@ -427,8 +425,9 @@ source.
 
 | Command | Arguments | Behavior |
 | --- | --- | --- |
-| `:ForgeHarness` | None | Open the Harness |
-| `:ForgeHarnessNew` | None | Create a fresh Harness session |
+| `:ForgeHarness` | None | Focus the open Harness, or open it in the current tab |
+| `:ForgeHarnessNew` | None | Create a fresh Harness session in the current Harness panes, or open it in the current tab |
+| `:ForgeConfig` | None | Edit the current session from its panes, or global defaults elsewhere without opening a session |
 | `:ForgeHarnessLog` | Optional logging level, `open`, or `clear` | Open the active session's log, select its recording threshold, or clear its files |
 | `:ForgePermissions` | None | Edit the Harness permissions document |
 
@@ -438,8 +437,10 @@ streams. Operation failures remain visible when logging is off.
 
 Inside Harness, `/sessions`
 opens durable session search and `/undo` opens the interaction list directly.
-In session search, Enter with **Open: Current Tab** shows the chosen session in the current
-tab, or focuses the tab that already shows it; `Tab` switches to **Open: New Tab**. `Ctrl-J`
+Session search starts on **Workspace**; switch to **All** with `Tab`, the left/right
+arrow keys, or `Ctrl-O`. Each tab retains its own search query, and **All** includes
+the workspace path for each session.
+In session search, Enter always shows the chosen session in the current tab. `Ctrl-J`
 deletes the selected saved session and closes every tab that shows it.
 After selecting an interaction, choose **Conversation only** to keep current files,
 or **Conversation and files** to restore its checkpoint too. Conversation-only
@@ -607,7 +608,11 @@ file, and directory renames. It also adds LSP guidance after the
 Harness system prompt. Enabling the setting does not start language servers or
 change interactive plan navigation.
 
-`/config` opens five tabs: **Models**, **Workflow**, **Permissions**, **Tools**, and
+`/config` opens the current session's configuration. `:ForgeConfig` uses that same
+session when invoked from its transcript or composer; elsewhere it edits global
+defaults without creating or changing a session. New sessions inherit those defaults.
+
+The picker opens five tabs: **Models**, **Workflow**, **Permissions**, **Tools**, and
 **System**. The window occupies the bottom 80% of the host at full width.
 Tab/Shift-Tab cycle through tabs; Up/Down select settings without wrapping.
 Enter activates a setting, Space also toggles booleans, and Left/Right cycle choices.

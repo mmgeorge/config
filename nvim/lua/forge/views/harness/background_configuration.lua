@@ -8,7 +8,7 @@ local model_options = require("forge.views.harness.model_options")
 local threshold = require("forge.views.harness.compaction_threshold")
 
 ---@class ForgeBackgroundConfigurationOptions
----@field session_id string Root session that owns catalog requests for any Background provider.
+---@field session_id? string Root session that owns catalog requests; absent when editing global defaults.
 ---@field host table
 ---@field current fun(): boolean
 ---@field changed fun()
@@ -66,8 +66,12 @@ function BackgroundConfiguration:load_models(on_loaded)
   self.catalog_key, self.catalog = provider, nil
   self.revision = self.revision + 1
   local revision = self.revision
-  client.request({ session_id = self.options.session_id, method = "session.agent.model.list", params = { provider = provider } },
+  local request = self.options.session_id
+    and { session_id = self.options.session_id, method = "session.agent.model.list", params = { provider = provider } }
+    or { method = "settings.get", params = { provider = provider, include_models = true } }
+  client.request(request,
     function(catalog, failure)
+      if not self.options.session_id and catalog then catalog = catalog.model_catalog end
       if not self.options.current() or revision ~= self.revision then return end
       if not failure and (type(catalog) ~= "table" or type(catalog.models) ~= "table") then
         failure = "Invalid model catalog for " .. provider

@@ -114,7 +114,7 @@ function M.open()
     and vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf)
   local timeline_key = retained_session and state.session.id or ("initial-pending-" .. tostring(vim.uv.hrtime()))
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
-    layout.open(timeline_key)
+    layout.open(timeline_key, "current")
   layout.attach_auto_height(state.composer_buf, state.composer_win)
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
   controller.attach()
@@ -225,7 +225,9 @@ function M.new_session(name, options)
   local source_state = session.harness
   local source_session_id = source_state.session and source_state.session.id or nil
   local replace_current = options and options.open_mode == "current"
-  local pending = not replace_current and session_navigation.begin_new(name) or nil
+    and source_state.timeline_tab and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab)
+    and valid_window(source_state.transcript_win) and valid_window(source_state.composer_win)
+  local pending = not replace_current and session_navigation.begin_new(name, options and options.open_mode) or nil
   client.session_create({ source_session_id = source_session_id, name = name }, function(result, request_error)
     if request_error then
       if pending then

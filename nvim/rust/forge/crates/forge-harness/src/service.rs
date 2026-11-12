@@ -50,6 +50,7 @@ mod reconnect;
 mod review_questions;
 #[cfg(test)]
 mod session_observation_test;
+mod settings_defaults;
 mod shared;
 mod task_state;
 

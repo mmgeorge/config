@@ -7,6 +7,7 @@ mod owner_storage_failure;
 mod owner_transition;
 mod reconnect_overlap;
 mod session_lifecycle;
+mod settings_defaults;
 mod task_state;
 
 use super::*;

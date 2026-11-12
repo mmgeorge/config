@@ -99,16 +99,19 @@ async fn settings(
     };
     // The empty storage key selects no session layer and never resolves a session.
     let session_key = session_id.as_deref().unwrap_or_default();
+    let provider = request
+        .params
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or(registry.initialize.provider.kind.as_str());
+    forge_providers::registry::select(provider)?;
     let mut settings = crate::settings::SettingsStore::open(
         PathBuf::from(&registry.initialize.data_root).as_path(),
     )?;
     if method == RuntimeMethod::SettingsGet {
-        let snapshot = settings.catalog(
-            &workspace,
-            session_key,
-            registry.initialize.provider.kind.as_str(),
-        )?;
+        let snapshot = settings.catalog(&workspace, session_key, provider)?;
         let mut value = serde_json::to_value(snapshot.settings)?;
+        value["selected_provider"] = json!(provider);
         value["catalog"] = json!({"mcp":snapshot.server,"skill":snapshot.skill});
         value["layers"] = json!({
             "global":settings.layer_settings(crate::settings::SettingScope::Global,&workspace,session_key)?,
@@ -116,8 +119,51 @@ async fn settings(
             "session":settings.layer_settings(crate::settings::SettingScope::Session,&workspace,session_key)?,
         });
         value["application"] = serde_json::to_value(settings.application(session_key)?)?;
+        if request.params["include_models"] == true {
+            ensure!(
+                session_id.is_none(),
+                "defaults catalog does not accept a session"
+            );
+            value["model_catalog"] =
+                settings_defaults::catalog(&registry, provider, &workspace).await?;
+        }
         message_sink
             .send_response(Response::success(request.id, value)?)
+            .await?;
+        return Ok(());
+    }
+    if method == RuntimeMethod::SettingsUpdate && request.params.get("provider_settings").is_some()
+    {
+        ensure!(
+            session_id.is_none(),
+            "provider defaults do not accept a session"
+        );
+        ensure!(
+            request.params.get("desired").is_none(),
+            "provider and portable defaults require separate updates"
+        );
+        ensure!(
+            request
+                .params
+                .get("scope")
+                .is_none_or(|scope| scope == "global"),
+            "provider defaults require global scope"
+        );
+        let revision = request.params["expected_revision"]
+            .as_u64()
+            .context("settings require expected_revision")?;
+        settings_defaults::save(
+            &mut settings,
+            revision,
+            provider,
+            &request.params["provider_settings"],
+        )?;
+        let snapshot = settings.get(&workspace, session_key, provider)?;
+        message_sink
+            .send_response(Response::success(
+                request.id,
+                json!({"state":"saved","revision":snapshot.revision}),
+            )?)
             .await?;
         return Ok(());
     }

@@ -500,7 +500,14 @@ fn decode_result(
                         && message.ends_with(" already has an active writer")
                 })
         {
-            return Err(failure(operation, ProviderFailureKind::ResourceConflict));
+            return Err(
+                ProviderFailure::new(operation, ProviderFailureKind::ResourceConflict)
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Preparation,
+                        forge_provider_api::FailureDisposition::Unchanged,
+                    )
+                    .into(),
+            );
         }
         if method == "thread/resume"
             && error.get("code").and_then(Value::as_i64) == Some(-32600)
@@ -554,6 +561,35 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    /// Prove a native writer rejection settles preparation without leaving cleanup work.
+    #[test]
+    fn active_writer_conflict_has_unchanged_preparation_evidence() {
+        for (method, operation) in [
+            ("thread/resume", ProviderOperation::ThreadOpen),
+            ("thread/fork", ProviderOperation::ThreadFork),
+        ] {
+            let error = decode_result(
+                &json!({"id":17,"error":{"code":-32600,
+                    "message":"thread private-native-id already has an active writer"}}),
+                operation,
+                method,
+            )
+            .unwrap_err();
+            let ProviderError::Failure(failure) = error else {
+                panic!("writer rejection must retain its typed cause");
+            };
+            assert_eq!(failure.kind(), ProviderFailureKind::ResourceConflict);
+            assert_eq!(
+                failure.phase(),
+                forge_provider_api::ProviderPhase::Preparation
+            );
+            assert_eq!(
+                failure.disposition(),
+                forge_provider_api::FailureDisposition::Unchanged
+            );
+        }
+    }
 
     /// Keep method-specific missing-session recognition inside the native response decoder.
     #[test]
