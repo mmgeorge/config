@@ -1314,28 +1314,66 @@ impl MockProvider {
         operation: MockOperation,
         request: SessionForkRequest,
     ) -> Result<ProviderForkResult, ProviderError> {
-        let source_id = match &request.source {
-            session::ForkSource::Binding(binding) => binding.clone(),
-            session::ForkSource::Checkpoint { .. } => {
-                return Err(capability::UnsupportedCapability(
-                    capability::ProviderFeature::CheckpointFork,
-                )
-                .into());
+        let inherited_history = match &request.source {
+            session::ForkSource::Binding(binding) => {
+                let source = self.binding(binding, ProviderOperation::ThreadFork).await?;
+                let _admission = source.admission.lock().await;
+                ensure_open(&source, ProviderOperation::ThreadFork)?;
+                if source.active.lock().await.is_some() {
+                    return Err(failure(
+                        ProviderOperation::ThreadFork,
+                        ProviderFailureKind::ExecutionActive,
+                    ));
+                }
+                self.control
+                    .histories
+                    .lock()
+                    .unwrap()
+                    .get(&source.owner)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            // A checkpoint is immutable, so this fork reads it while the source executes.
+            session::ForkSource::Checkpoint {
+                provider_session_id,
+                checkpoint,
+            } => {
+                let source_owner = self
+                    .bindings
+                    .lock()
+                    .await
+                    .values()
+                    .find(|session| {
+                        session.binding.provider_session_id.as_ref() == Some(provider_session_id)
+                    })
+                    .map(|session| session.owner.clone())
+                    .ok_or_else(|| {
+                        failure(
+                            ProviderOperation::ThreadFork,
+                            ProviderFailureKind::SessionMissing,
+                        )
+                    })?;
+                let histories = self.control.histories.lock().unwrap();
+                let source_history = histories
+                    .get(&source_owner)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let checkpoint_index = source_history
+                    .iter()
+                    .position(|retained| retained == checkpoint)
+                    .ok_or_else(|| {
+                        failure(ProviderOperation::ThreadFork, ProviderFailureKind::Rejected)
+                    })?;
+                source_history[..=checkpoint_index].to_vec()
             }
         };
-        let source = self
-            .binding(&source_id, ProviderOperation::ThreadFork)
-            .await?;
-        let _admission = source.admission.lock().await;
-        ensure_open(&source, ProviderOperation::ThreadFork)?;
-        if source.active.lock().await.is_some() {
-            return Err(failure(
-                ProviderOperation::ThreadFork,
-                ProviderFailureKind::ExecutionActive,
-            ));
-        }
         validate_model_selection(&request.target.configuration.model)?;
         operation.dispatch(ProviderOperation::ThreadFork)?;
+        self.control
+            .histories
+            .lock()
+            .unwrap()
+            .insert(request.target.thread_id.clone(), inherited_history);
         let result = ProviderForkResult::unprofiled(
             uuid::Uuid::new_v4()
                 .to_string()

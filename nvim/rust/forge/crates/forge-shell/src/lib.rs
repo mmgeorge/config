@@ -2,4 +2,5 @@
 
 pub mod command;
 pub mod process;
+pub mod resolution;
 pub mod shell;

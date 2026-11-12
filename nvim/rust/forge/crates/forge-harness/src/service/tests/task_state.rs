@@ -663,6 +663,7 @@ async fn task_pause_completes_at_local_commit_and_replay_preserves_fifo() -> Res
                 attachments: Vec::new(),
                 config: None,
                 intent: crate::input::InputIntent::Queue,
+                turn: None,
             })));
     let (paused, accepted) = async { tokio::join!(replay, following) }.await;
     assert!(matches!(

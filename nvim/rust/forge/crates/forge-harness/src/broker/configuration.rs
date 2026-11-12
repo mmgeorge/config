@@ -1106,7 +1106,7 @@ impl HarnessBroker {
             execution_owner: None,
             harness_session_id: configured.id.clone(),
             workspace: configured.workspace.clone(),
-            input: ProviderInput::from_text(""),
+            input: ProviderInput::from_user_text(""),
             mode: if configured.background.is_some() {
                 PromptMode::Background
             } else {
@@ -1127,6 +1127,7 @@ impl HarnessBroker {
             acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
+            child_agent: None,
         };
         let mut job = self.prepare_configuration_reconcile(request, selection)?;
         job.completed = Some(Arc::clone(&candidate.reconciled));
@@ -1898,7 +1899,7 @@ impl HarnessBroker {
             &text,
             mode,
             None,
-            ProviderInput::from_text(text.clone()),
+            ProviderInput::from_user_text(text.clone()),
             Some(selected),
         )?;
         Ok(SelectedContinuation::Staged {
@@ -2129,7 +2130,7 @@ mod owned_tests {
             broker
                 .provider
                 .thread_open(
-                    broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+                    broker.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?,
                 )
                 .await?;
             let original = serde_json::to_value(&broker.session)?;
@@ -2180,7 +2181,7 @@ mod owned_tests {
                 engine
                     .run_once(
                         broker.provider_request(
-                            ProviderInput::from_text("Prompt after rejected configuration"),
+                            ProviderInput::from_user_text("Prompt after rejected configuration"),
                             PromptMode::Chat,
                         )?,
                         sink,
@@ -2193,8 +2194,10 @@ mod owned_tests {
                 assert!(
                     broker
                         .prepare_configuration_reconcile(
-                            broker
-                                .provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+                            broker.provider_request(
+                                ProviderInput::from_user_text(""),
+                                PromptMode::Chat
+                            )?,
                             Default::default(),
                         )
                         .is_err(),
@@ -2270,7 +2273,7 @@ mod owned_tests {
             broker
                 .provider
                 .thread_open(
-                    broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+                    broker.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?,
                 )
                 .await?;
             let preparation = broker.prepare_configuration(json!({"session_tools":false}))?;

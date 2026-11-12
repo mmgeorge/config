@@ -470,7 +470,7 @@ impl HarnessBroker {
                 // A deferred user message carries the reports beside its text; otherwise the
                 // reports continue the parent's request on their own.
                 let (input, submission) = if let Some(command) = &command {
-                    let mut input = ProviderInput::from_text(command.text.clone())
+                    let mut input = ProviderInput::from_user_text(command.text.clone())
                         .with_attachments(command.attachments.clone());
                     input.push_child_results(reports);
                     (input, command.submission.clone())

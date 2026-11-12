@@ -1,4 +1,5 @@
 mod bootstrap;
+mod fork;
 mod owner_cancel;
 mod owner_dispatch;
 mod owner_fixture;
@@ -1231,7 +1232,7 @@ async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result
     let journal = SubmissionStore::open(&controller.data_root, controller.trace.clone())?;
     let submission = journal.prepare_input(
         &controller.catalog_request.read().await.clone(),
-        crate::provider::ProviderInput::from_text("uncertain"),
+        crate::provider::ProviderInput::from_user_text("uncertain"),
         forge_providers::registry::nonselectable_id()
             .expect("registry supplies a nonselectable fixture identity"),
         Some("uncertain-message".into()),

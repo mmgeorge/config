@@ -302,14 +302,41 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
         Some("durable-child-conversation")
     );
     let request = broker.agent_provider_factory.request(
-        &broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+        &broker.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?,
         &admitted_request_fixture(&broker, retained.clone())?,
-        "Follow-up".into(),
+        forge_provider_api::forge::AgentTask {
+            task_id: "follow-up".into(),
+            from: forge_provider_api::forge::ROOT_AGENT_PATH.into(),
+            text: "Follow-up".into(),
+            messages: Vec::new(),
+        },
     )?;
     assert_eq!(
-        request.provider_session_id.map(String::from),
+        request.provider_session_id.clone().map(String::from),
         retained.provider_thread_id
     );
+    // The parent's task reaches the child as a `new_task` message rather than user text, and the
+    // child learns its own path and profile from the standing `<agent>` section.
+    assert!(matches!(
+        request.input.turn().kind(),
+        forge_provider_api::forge::TurnKind::AgentTask { task } if task.text == "Follow-up"
+    ));
+    assert_eq!(request.input.turn().user_input(), None);
+    let section = request
+        .child_agent
+        .as_ref()
+        .context("child request names its agent")?;
+    assert_eq!(section.path, retained.task_path);
+    assert_eq!(section.parent, forge_provider_api::forge::ROOT_AGENT_PATH);
+    assert_eq!(
+        section.profile_instructions,
+        retained
+            .selection
+            .as_ref()
+            .context("fixture child has a selection")?
+            .instructions
+    );
+    assert_eq!(request.standing_sections().agent.as_ref(), Some(section));
     broker
         .store
         .interrupt_detached_execution(&broker.session.id)?;
@@ -983,11 +1010,11 @@ async fn child_results_reach_active_parent_once_without_wait() -> Result<()> {
                     .any(|message| message.contains(&format!("CHILD_REPORT_{result}")))
             );
         }
-        // Each report is a typed `<agent_result>` carrying only the child's identity, status, and
+        // Each report is a typed `final_answer` `<agent_message>` carrying only the child's identity, status, and
         // outcome, never Harness bookkeeping such as `parent_reported`.
         for message in message.iter() {
             assert!(
-                message.contains("<agent_result agent=\"")
+                message.contains("<agent_message type=\"final_answer\" from=\"/root/")
                     && message.contains(" task=\"")
                     && message.contains(" status=\""),
                 "{message}"

@@ -120,6 +120,15 @@ impl HarnessBroker {
                     self.fail_foreground_dispatch(dispatch, TurnCancelled.into())?;
                     return Ok(ForegroundAction::WaitForPublicationDrain);
                 }
+                // The owner restarts the provider after a failed collection, so this admission
+                // ends as the stop asked. Its cleanup collects the native owner itself, because
+                // the owner's collection proved nothing.
+                ForegroundSignal::CollectionFailed if admission.owner_collection_requested() => {
+                    admission.fail_owner_collection();
+                    self.fail_foreground_dispatch(dispatch, TurnCancelled.into())?;
+                    return Ok(ForegroundAction::WaitForPublicationDrain);
+                }
+                ForegroundSignal::CollectionFailed => return Ok(ForegroundAction::Wait),
                 _ => {}
             }
         }
@@ -401,6 +410,16 @@ impl HarnessBroker {
                 self.collect_foreground_observations(transaction)?;
                 // A collected cancellation may already be settling an output-free prompt,
                 // which waits for this positive collection before deleting its exchange.
+                if transaction.failure.is_some() {
+                    return self.advance_foreground_failure(dispatch);
+                }
+                Ok(ForegroundAction::Wait)
+            }
+            ForegroundSignal::CollectionFailed => {
+                admission.fail_owner_collection();
+                // A failed turn that waited for this collection before restoring its prompt
+                // settles now, without restoring: nothing proved the provider left the prompt
+                // unconsumed. The owner's provider restart waits for that settlement.
                 if transaction.failure.is_some() {
                     return self.advance_foreground_failure(dispatch);
                 }

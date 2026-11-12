@@ -55,6 +55,7 @@ mod interaction;
 mod live_goal_effect;
 mod live_host_effect;
 mod prior_finalization;
+pub(crate) mod session_message;
 pub(crate) use prior_finalization::PriorFinalizationAction;
 mod foreground_dispatch;
 mod foreground_start;
@@ -84,7 +85,7 @@ mod host_settlement;
 mod review_question;
 pub(crate) use observation::BrokerObserver;
 
-pub use fork::{ForkPreparation, prepare_provider_fork};
+pub use fork::{ForkOptions, ForkPreparation, prepare_provider_fork};
 pub use new_session::prepare_new_session;
 
 use crate::agent::{Agent, AgentRegistry, AgentState};
@@ -642,6 +643,9 @@ pub(crate) enum ForegroundSignal {
     LiveHost(Box<crate::provider::LiveHostEffect>),
     CollectionStarted(ForegroundCollection),
     CollectionCompleted(ForegroundCollection),
+    /// The owner's native collection ended without proving the provider idle, so no
+    /// `CollectionCompleted` follows and the owner restarts the provider.
+    CollectionFailed,
     AdmissionWorkspaceCompleted(Box<foreground_workspace::AdmissionWorkspaceResult>),
     AdmissionRequested,
     AdmissionPrepared,
@@ -786,6 +790,7 @@ impl ForegroundSignal {
             Self::LiveHost(..) => "LiveHost",
             Self::CollectionStarted(..) => "CollectionStarted",
             Self::CollectionCompleted(..) => "CollectionCompleted",
+            Self::CollectionFailed => "CollectionFailed",
             Self::AdmissionWorkspaceCompleted(..) => "AdmissionWorkspaceCompleted",
             Self::AdmissionRequested => "AdmissionRequested",
             Self::AdmissionPrepared => "AdmissionPrepared",
@@ -1893,6 +1898,8 @@ pub struct DispatchResult {
 /// Owns provider, permission, and analysis infrastructure shared by every session controller.
 pub struct BrokerRuntime {
     pub(crate) lsp: Arc<crate::tools::lsp::LspService>,
+    /// Routes messages between this host's sessions once the owning service binds it.
+    pub(crate) session_messages: Arc<session_message::SessionMessageRouter>,
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     workspace_kind: WorkspaceKind,
@@ -1986,6 +1993,7 @@ impl BrokerRuntime {
         )?;
         Ok(Arc::new(Self {
             lsp: Arc::new(Default::default()),
+            session_messages: Arc::default(),
             repositories,
             diff,
             workspace_kind,
@@ -2252,6 +2260,8 @@ pub struct HarnessBroker {
     pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::tools::lsp::LspService>,
+    /// Routes messages between this host's sessions once the owning service binds it.
+    pub(crate) session_messages: Arc<session_message::SessionMessageRouter>,
     checkpoint: Option<GitCheckpoint>,
     active_operation_id: Option<String>,
     observer: Arc<observation::BrokerObserver>,
@@ -2469,6 +2479,7 @@ impl HarnessBroker {
                         };
                         let session_id = Uuid::new_v4().to_string();
                         let mut session = HarnessSession {
+                            aside: None,
                             purpose: crate::session::SessionPurpose::Conversation,
                             primary_agent_id: HarnessSession::primary_agent_id(&session_id),
                             id: session_id,
@@ -2728,6 +2739,7 @@ impl HarnessBroker {
             submission_store,
             context_usage_fresh: false,
             lsp: runtime.lsp.clone(),
+            session_messages: Arc::clone(&runtime.session_messages),
             active_operation_id: None,
             observer,
             repositories: Arc::clone(&runtime.repositories),
@@ -2977,6 +2989,7 @@ impl HarnessBroker {
             repository: None,
             harness: None,
             lsp: None,
+            aside: crate::tools::AsideToolScope::open(&self.session, &self.session_messages),
             execution: None,
         })
     }
@@ -3546,7 +3559,7 @@ impl HarnessBroker {
                     .catalog(
                         provider,
                         self.provider_request(
-                            ProviderInput::from_text(String::new()),
+                            ProviderInput::from_user_text(String::new()),
                             PromptMode::Chat,
                         )?,
                     )
@@ -3887,10 +3900,10 @@ impl HarnessBroker {
         );
         let mode = self.task_prompt_mode()?;
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
-            self.run_planning_interaction(ProviderInput::from_text(text), None)
+            self.run_planning_interaction(ProviderInput::from_user_text(text), None)
                 .await
         } else {
-            self.run_interaction(ProviderInput::from_text(text), mode, None)
+            self.run_interaction(ProviderInput::from_user_text(text), mode, None)
                 .await
         }
     }
@@ -4152,8 +4165,10 @@ impl HarnessBroker {
         };
         let admission = match work {
             ChildWork::Spawn(spawn) => {
-                let mut root = self
-                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat)?;
+                let mut root = self.provider_request(
+                    ProviderInput::from_user_text(String::new()),
+                    PromptMode::Chat,
+                )?;
                 if root.model == "default"
                     && let Some(model) = &self.session.resolved_model
                 {
@@ -4438,25 +4453,31 @@ impl HarnessBroker {
             "child execution belongs to another session"
         );
         let prepared = (|| -> Result<_> {
-            let mut message = admission.task.message.clone();
+            // Messages the parent queued before this task started travel with it, each as its
+            // own `<agent_message type="message">` after the task.
+            let mut task = forge_provider_api::forge::AgentTask {
+                task_id: admission.task.id.clone(),
+                from: forge_provider_api::forge::ROOT_AGENT_PATH.into(),
+                text: admission.task.message.clone(),
+                messages: Vec::new(),
+            };
             for incoming in admission
                 .agent
                 .inbox
                 .iter_mut()
                 .filter(|message| message.delivery == crate::agent::MessageDelivery::Queued)
             {
-                message.push_str(&format!(
-                    "\n\nAdditional information:\n{}",
-                    incoming.message
-                ));
+                task.messages.push(parent_message(incoming.message.clone()));
                 incoming.delivery = crate::agent::MessageDelivery::Attached;
                 incoming.task_id = Some(admission.task.id.clone());
             }
             let mut request = self.agent_provider_factory.request(
-                &self
-                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat)?,
+                &self.provider_request(
+                    ProviderInput::from_user_text(String::new()),
+                    PromptMode::Chat,
+                )?,
                 &admission,
-                message,
+                task,
             )?;
             let provider = self.agent_provider_factory.build(
                 admission
@@ -6391,7 +6412,7 @@ impl HarnessBroker {
         Ok(())
     }
 
-    /// Describe a settled child task as the `<agent_result>` the parent receives.
+    /// Describe a settled child task as the `final_answer` `<agent_message>` the parent receives.
     fn agent_result(
         &self,
         task: &crate::agent::AgentTask,
@@ -7345,9 +7366,10 @@ impl HarnessBroker {
                 )
             }
             AgentOperation::Spawn(spawn) => {
-                let mut root = match self
-                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat)
-                {
+                let mut root = match self.provider_request(
+                    ProviderInput::from_user_text(String::new()),
+                    PromptMode::Chat,
+                ) {
                     Ok(root) => root,
                     Err(error) => {
                         let _ = owned.response.send(Err(error));
@@ -11050,6 +11072,17 @@ fn default_effort() -> String {
 }
 fn default_goal_max_turns() -> u32 {
     20
+}
+
+/// Address information from the root session to one of its children.
+///
+/// Every message to a child comes from the root session's agent commands, whether the root's
+/// model or its user sent it, so the root's path names the sender.
+fn parent_message(text: String) -> forge_provider_api::forge::AgentMessage {
+    forge_provider_api::forge::AgentMessage {
+        from: forge_provider_api::forge::ROOT_AGENT_PATH.into(),
+        text,
+    }
 }
 
 pub use forge_provider_api::error::TurnCancelled;

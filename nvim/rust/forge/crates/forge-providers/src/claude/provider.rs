@@ -408,6 +408,7 @@ pub struct ClaudeProvider {
     operations: Arc<Operations>,
     pending_inputs: Arc<PendingInputs>,
     validated_version: Arc<Mutex<Option<String>>>,
+    unstarted_sessions: super::conversation::UnstartedSessions,
 }
 
 impl ClaudeProvider {
@@ -441,6 +442,7 @@ impl ClaudeProvider {
             operations: Arc::new(Operations::new()),
             pending_inputs: Arc::new(PendingInputs::new()),
             validated_version: Arc::new(Mutex::new(None)),
+            unstarted_sessions: Default::default(),
         }
     }
 
@@ -807,6 +809,7 @@ impl ClaudeProvider {
             ),
             None => {
                 let session_id = uuid::Uuid::new_v4().to_string();
+                self.unstarted_sessions.mint(&session_id);
                 (session_id.clone(), SessionStart::Fresh { session_id })
             }
         };
@@ -858,6 +861,7 @@ impl ClaudeProvider {
             session_id,
             start,
             options,
+            self.unstarted_sessions.clone(),
             &cleanup,
         )
         .await
@@ -2412,17 +2416,38 @@ async fn close_binding(session: Arc<ClaudeBinding>) -> Result<(), ProviderError>
     Err(error)
 }
 
+/// Describe a CLI that stayed silent through the interrupt grace period.
+///
+/// The binding cannot prove what the CLI consumed, so the failure invalidates it.
+fn unanswered_interrupt() -> ProviderError {
+    ProviderFailure::new(
+        ProviderOperation::TurnInterrupt,
+        ProviderFailureKind::Transport,
+    )
+    .at_phase(ProviderPhase::Observation, FailureDisposition::Invalidated)
+    .into()
+}
+
+/// Carry what only a prompt's delivery owns; a steer joins a turn that already owns both.
+struct PromptDelivery<'a> {
+    /// Reports that the prompt was written to the CLI.
+    dispatch: &'a forge_provider_api::submission::DispatchReporter,
+    /// Fires when the prompt's turn is interrupted.
+    cancellation: &'a tokio_util::sync::CancellationToken,
+}
+
 /// Write one user input and commit its delivery evidence through the host receipt.
 ///
 /// The CLI reports `command_lifecycle queued` once it owns the input, which is the acceptance
-/// evidence; the write alone proves nothing.
+/// evidence; the write alone proves nothing. A prompt's cancellation that fires while the CLI has
+/// not acknowledged the written prompt bounds that wait by `INTERRUPT_GRACE`.
 async fn deliver_input(
     session: &ClaudeBinding,
     operation: ProviderOperation,
     input: UserInput,
     session_id: &str,
     receipt: Option<&Arc<dyn forge_provider_api::submission::InputReceipt>>,
-    dispatch: Option<&forge_provider_api::submission::DispatchReporter>,
+    prompt: Option<PromptDelivery<'_>>,
     observer: &mut tokio::sync::watch::Receiver<CommandState>,
 ) -> Result<(), ProviderError> {
     let sending = receipt
@@ -2442,10 +2467,28 @@ async fn deliver_input(
     }
     let result = async {
         session.conversation.write(&input).await?;
-        if let Some(dispatch) = dispatch {
-            dispatch.confirm();
+        if let Some(prompt) = &prompt {
+            prompt.dispatch.confirm();
         }
-        wait_command(observer, |state| state != CommandState::Other, operation).await?;
+        let acknowledged = wait_command(observer, |state| state != CommandState::Other, operation);
+        match prompt.map(|prompt| prompt.cancellation) {
+            None => acknowledged.await?,
+            Some(cancellation) => {
+                tokio::pin!(acknowledged);
+                tokio::select! {
+                    biased;
+                    state = &mut acknowledged => state?,
+                    // The input is written, so only the CLI's silence keeps this wait open. A CLI
+                    // that stays silent for the interrupt grace period is wedged; the caller
+                    // invalidates the binding on this failure so Harness can restart it.
+                    _ = cancellation.cancelled() => {
+                        tokio::time::timeout(INTERRUPT_GRACE, acknowledged)
+                            .await
+                            .map_err(|_| unanswered_interrupt())??
+                    }
+                }
+            }
+        };
         if let Some(receipt) = receipt {
             receipt
                 .clone()
@@ -2598,7 +2641,10 @@ async fn run_prompt(
             input,
             &session_id,
             Some(&receipt),
-            Some(&request.dispatch),
+            Some(PromptDelivery {
+                dispatch: &request.dispatch,
+                cancellation: &cancellation,
+            }),
             &mut observer,
         )
         .await
@@ -2635,16 +2681,7 @@ async fn run_prompt(
                     Err(_) => {
                         // A CLI that neither answers the interrupt nor ends its turn is wedged;
                         // invalidating the binding ends the turn so Harness can restart it.
-                        session
-                            .invalidate(
-                                ProviderFailure::new(
-                                    ProviderOperation::TurnInterrupt,
-                                    ProviderFailureKind::Transport,
-                                )
-                                .at_phase(ProviderPhase::Observation, FailureDisposition::Invalidated)
-                                .into(),
-                            )
-                            .await;
+                        session.invalidate(unanswered_interrupt()).await;
                         turn_end.await
                     }
                 }
@@ -2667,6 +2704,7 @@ async fn run_prompt(
             session.state.finish(end.outcome).await?;
             return Err(ProviderError::Cancelled);
         }
+        session.conversation.observe_turn();
         session.state.observe_native_start(end.completed_at_ms).await?;
         if !session.conversation.is_closed().await
             && let Some(usage) = session.conversation.context_usage().await

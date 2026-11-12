@@ -87,6 +87,25 @@ T["harness_child_steering"] = function()
   assert(not main_agent_requested(), "missing child input fell back to the main agent")
 end
 
+T["new_session_commands_choose_tab_mode"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local calls = {}
+  state.session = { id = "source", model = "test" }
+  state.ready = true
+  state.composer_buf = buffer.scratch()
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
+  require("forge.views.harness").new_session = function(_, options)
+    calls[#calls + 1] = options.open_mode
+  end
+  for _, command in ipairs({ "/clear", "/new" }) do
+    buffer.set(state.composer_buf, { command })
+    controller.submit()
+    eq(buffer.line(state.composer_buf, 1), "")
+  end
+  eq(calls, { "current", "tab" })
+end
+
 T["composer_admission"] = function()
   local client = require("forge.client")
   local state = require("forge.session").harness
@@ -1268,6 +1287,73 @@ T["clarification_settles_on_failed_read"] = function()
   eq(read.spec.method, "session.state.get")
   read.callback(nil, "host stopped")
   eq(state.question_clarification, nil)
+end
+
+-- `/btw <question>` forks the current session as an aside and sends the question to the fork, not
+-- to the session the user typed it in.
+T["btw_forks_an_aside_and_sends_its_question"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local navigation = require("forge.views.harness.session_navigation")
+  stub(require("forge.views.harness.prompt_history"), "record", function() end)
+  local warnings = notify.capture({ min_level = vim.log.levels.WARN, notifications = true })
+  state.session = { id = "origin", name = "main" }
+  state.capability = { native_fork = true }
+  state.composer_buf = buffer.scratch()
+  state.composer_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(state.composer_win, state.composer_buf)
+  -- A view binds its input to a session when the fork result activates it; a closed tab never does.
+  local aside_state, tab_open = nil, true
+  stub(navigation, "begin_fork", function()
+    aside_state = { input = {} }
+    return { state = aside_state }
+  end)
+  stub(navigation, "complete_fork", function(pending, result)
+    if tab_open then pending.state.input.session_id = result.session.id end
+  end)
+  local submitted = {}
+  stub(require("forge.views.harness.input_state"), "submit", function(target_state, text, attachments, intent)
+    submitted[#submitted + 1] = { state = target_state, text = text, attachments = attachments, intent = intent }
+  end)
+  local requests = mock_client.record()
+
+  buffer.set(state.composer_buf, { "/btw why did the build fail?" })
+  controller.submit()
+  eq(#requests, 1)
+  eq(requests[1].spec.method, "session.fork")
+  eq(requests[1].spec.session_id, "origin")
+  eq(requests[1].spec.params, { session_id = "origin", aside = true })
+  eq(buffer.line(state.composer_buf, 1), "")
+  eq(submitted, {})
+  local opened_state = aside_state
+  requests[1].callback({ session = { id = "aside" } })
+  eq(submitted, { { state = opened_state, text = "why did the build fail?", attachments = {}, intent = "auto" } })
+  eq(warnings, {})
+
+  -- The fork answers after its tab closed: no view can queue the question, so the user is told.
+  tab_open = false
+  buffer.set(state.composer_buf, { "/btw and the tests?" })
+  controller.submit()
+  requests[2].callback({ session = { id = "aside-closed" } })
+  eq(#submitted, 1)
+  eq(#warnings, 1)
+  assert(warnings[1].message:find("and the tests?", 1, true), warnings[1].message)
+
+  -- A bare command asks nothing, so it forks nothing and returns to the composer for the question.
+  buffer.set(state.composer_buf, { "/btw" })
+  controller.submit()
+  eq(#requests, 2)
+  eq(buffer.line(state.composer_buf, 1), "/btw ")
+  eq(#warnings, 2)
+
+  -- An ordinary fork is not an aside and sends nothing on the user's behalf.
+  tab_open = true
+  buffer.set(state.composer_buf, { "/fork" })
+  controller.submit()
+  eq(requests[3].spec.params, { session_id = "origin" })
+  requests[3].callback({ session = { id = "plain-fork" } })
+  eq(#submitted, 1)
 end
 
 return T

@@ -20,7 +20,6 @@ use super::{
 use crate::trace::TraceStore;
 
 const RETRY_DELAY_SECONDS: [u64; 5] = [1, 5, 30, 60, 300];
-const CONTINUATION_PROMPT: &str = "Continue the previously accepted work from its current state. The preceding execution ended with a transient failure. Preserve completed work and tool effects; do not repeat the original user input or redo completed actions.";
 
 /// Rejects replay after tools, control results, or model output have been observed.
 pub(crate) fn replay_safe(output: &super::ProviderCompletion) -> bool {
@@ -435,7 +434,9 @@ fn retry_delay(attempt: usize, required: Option<Duration>) -> Option<Duration> {
 
 /// Author a new logical input while preserving effective configuration and existing task authority.
 fn author_continuation(request: &mut ProviderRequest) {
-    request.input = super::ProviderInput::from_text(CONTINUATION_PROMPT);
+    request.input = super::ProviderInput::kind(forge_provider_api::forge::TurnKind::TaskStep {
+        step: forge_provider_api::forge::TaskStep::RetryContinue,
+    });
     request.submission = None;
     request.dispatch = super::DispatchTracker::default();
     request.recovered_input.clear();
@@ -600,7 +601,11 @@ mod tests {
                         log.continuation_count.fetch_add(1, Ordering::SeqCst);
                         assert_eq!(
                             request.input,
-                            forge_provider_api::forge::TurnInput::from(CONTINUATION_PROMPT)
+                            forge_provider_api::forge::TurnInput::new(
+                                forge_provider_api::forge::TurnKind::TaskStep {
+                                    step: forge_provider_api::forge::TaskStep::RetryContinue,
+                                }
+                            )
                         );
                     }
                     *log.selected_model.lock().unwrap() = request.configuration.model.model.clone();
@@ -629,7 +634,7 @@ mod tests {
             execution_owner: None,
             harness_session_id: "retry-fixture".into(),
             workspace: "workspace".into(),
-            input: ProviderInput::from_text("original request"),
+            input: ProviderInput::from_user_text("original request"),
             mode: PromptMode::Chat,
             model: "selected-model".into(),
             effort: "high".into(),
@@ -642,6 +647,7 @@ mod tests {
             acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
+            child_agent: None,
         }
     }
 

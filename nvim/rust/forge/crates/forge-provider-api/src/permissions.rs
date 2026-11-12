@@ -145,6 +145,11 @@ impl std::fmt::Display for CommandAnalysisError {
                 "shell_command_unsupported: Harness does not support {construct} in {:?} command analysis. Rewrite the unsupported construct while keeping pipelines intact. No command was executed.",
                 self.shell
             ),
+            forge_shell::shell::CommandAnalysisFailure::UnresolvedCommands(names) => write!(
+                formatter,
+                "shell_command_not_found: PowerShell could not resolve command(s): {}. Check command names and quote literal pipe characters in arguments (for example, --format='%h|%ad|%s'). Profile-only definitions are not loaded during validation. No command was executed.",
+                names.join(", ")
+            ),
             forge_shell::shell::CommandAnalysisFailure::Incomplete(reason) => write!(
                 formatter,
                 "shell_command_analysis_failed: Harness could not finish {:?} command analysis: {reason}. No command was executed.",

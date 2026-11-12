@@ -45,7 +45,7 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
         Some(&ExchangeAdmission::chat(
             "Prepared before cancellation".into(),
         )),
-        ProviderInput::from_text("Prepared before cancellation"),
+        ProviderInput::from_user_text("Prepared before cancellation"),
     )?;
     broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
     let engine = broker
@@ -77,5 +77,44 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
     dispatch.authorize_submission();
     tokio::task::yield_now().await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+/// An admission the owner started collecting must settle when that collection fails.
+///
+/// The admission's failure cleanup waits for the owner's collection. A failed collection has to
+/// release that wait, or the turn never ends and the provider restart behind it never starts.
+#[tokio::test]
+async fn failed_owner_collection_releases_a_collected_admission() -> Result<()> {
+    let workspace = super::test::repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = super::test::planning_question_broker(workspace.path(), data.path(), false);
+    let (publication, _updates) = publication::channel();
+    let mut dispatch = broker.begin_foreground_dispatch(
+        Request {
+            id: 1,
+            method: "session.prompt.submit".into(),
+            params: json!({"text":"Admitted before the failed stop"}),
+        },
+        publication,
+    )?;
+    assert!(matches!(dispatch, TurnTransaction::Admitting(_)));
+    let started = broker.step_foreground(
+        &mut dispatch,
+        ForegroundSignal::CollectionStarted(ForegroundCollection::Cancel(
+            crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed,
+        )),
+    )?;
+    assert!(matches!(started, ForegroundAction::Wait));
+    let failed = broker.step_foreground(&mut dispatch, ForegroundSignal::CollectionFailed)?;
+    assert!(
+        matches!(failed, ForegroundAction::WaitForPublicationDrain),
+        "a failed collection did not end the admission it was collecting"
+    );
+    let drained = broker.step_foreground(&mut dispatch, ForegroundSignal::PublicationDrained)?;
+    assert!(
+        !matches!(drained, ForegroundAction::Wait),
+        "the admission still waits for a collection that already failed"
+    );
     Ok(())
 }

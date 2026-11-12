@@ -493,7 +493,7 @@ fn provider_request(root: &std::path::Path) -> ProviderRequest {
         execution_owner: None,
         harness_session_id: "bridge-test-session".into(),
         workspace: root.to_string_lossy().into_owned(),
-        input: super::super::ProviderInput::from_text(""),
+        input: super::super::ProviderInput::from_user_text(""),
         mode: super::super::PromptMode::Chat,
         model: "default".into(),
         effort: "default".into(),
@@ -506,6 +506,7 @@ fn provider_request(root: &std::path::Path) -> ProviderRequest {
         acknowledged_child_reports: Vec::new(),
         recovered_input: Vec::new(),
         control_context: None,
+        child_agent: None,
     }
 }
 
@@ -677,71 +678,127 @@ async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
 }
 
 /// Collect positively rejected native admission while retaining every uncertain or invalidated cause.
-#[tokio::test]
-async fn native_input_rejection_preserves_delivery_proof_and_exact_collection() -> anyhow::Result<()>
-{
-    use forge_provider_api::{FailureDisposition as Disposition, ProviderPhase as Phase};
-    for (phase, disposition, unconsumed) in [
-        (Phase::Admission, Disposition::Unchanged, true),
-        (Phase::Preparation, Disposition::Unchanged, true),
-        (Phase::Observation, Disposition::Uncertain, false),
-        (Phase::Collection, Disposition::Invalidated, false),
-        (Phase::Admission, Disposition::Closed, false),
-        (Phase::Observation, Disposition::Unchanged, false),
-    ] {
-        let root = tempfile::tempdir()?;
-        let native = BridgeFixtureProvider::new(false);
-        *native.input_failure.lock().unwrap() = Some(
-            ProviderFailure::new(
-                ProviderOperation::TurnStart,
-                ProviderFailureKind::WrongInvocation,
-            )
-            .at_phase(phase, disposition)
-            .into(),
-        );
-        let bridge = bridge(root.path(), native.clone()).await?;
-        let store = super::super::submission::SubmissionStore::open(
-            root.path(),
-            Arc::new(crate::trace::TraceStore::open(root.path())?),
-        )?;
-        let mut request = provider_request(root.path());
-        let owner = request.owner()?;
-        request.submission = Some(store.prepare(
-            &request,
-            forge_providers::registry::nonselectable_id().unwrap(),
-        )?);
-        let scope = forge_provider_api::InvocationScope::new(owner.clone(), "native-rejection");
-        let error = bridge.turn_start(request, scope.clone()).await.unwrap_err();
-        let cause = match error {
-            ProviderError::PreparationFailed(cause) if unconsumed => *cause,
-            error if !unconsumed => error,
-            error => panic!("positive native admission proof was lost: {error:?}"),
-        };
-        assert!(matches!(cause, ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::TurnStart
-                && failure.kind() == ProviderFailureKind::WrongInvocation
-                && failure.phase() == phase && failure.disposition() == disposition));
-        assert_eq!(
-            native.cancel_calls.load(Ordering::Acquire),
-            usize::from(unconsumed)
-        );
-        let host = bridge.session(owner).await;
-        let effects = host
-            .invocations
-            .lock()
-            .await
-            .get(&scope.invocation_id)
-            .cloned()
-            .unwrap();
-        assert_eq!(effects.foreground_pending(), !unconsumed);
-        assert_eq!(
-            native.sinks.lock().unwrap().len(),
-            1,
-            "rejection retired the stable binding"
-        );
-        bridge.shutdown().await?;
-    }
+///
+/// `unconsumed` states whether the failure proves the provider never took the input. Each case is
+/// its own test because every case builds a bridge and two SQLite stores, and six of them in one
+/// test left that test a sixth of the time limit's headroom under a loaded run.
+async fn native_input_rejection_preserves_delivery_proof_and_exact_collection(
+    phase: forge_provider_api::ProviderPhase,
+    disposition: forge_provider_api::FailureDisposition,
+    unconsumed: bool,
+) -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    *native.input_failure.lock().unwrap() = Some(
+        ProviderFailure::new(
+            ProviderOperation::TurnStart,
+            ProviderFailureKind::WrongInvocation,
+        )
+        .at_phase(phase, disposition)
+        .into(),
+    );
+    let bridge = bridge(root.path(), native.clone()).await?;
+    let store = super::super::submission::SubmissionStore::open(
+        root.path(),
+        Arc::new(crate::trace::TraceStore::open(root.path())?),
+    )?;
+    let mut request = provider_request(root.path());
+    let owner = request.owner()?;
+    request.submission = Some(store.prepare(
+        &request,
+        forge_providers::registry::nonselectable_id().unwrap(),
+    )?);
+    let scope = forge_provider_api::InvocationScope::new(owner.clone(), "native-rejection");
+    let error = bridge.turn_start(request, scope.clone()).await.unwrap_err();
+    let cause = match error {
+        ProviderError::PreparationFailed(cause) if unconsumed => *cause,
+        error if !unconsumed => error,
+        error => panic!("positive native admission proof was lost: {error:?}"),
+    };
+    assert!(matches!(cause, ProviderError::Failure(failure)
+        if failure.operation() == ProviderOperation::TurnStart
+            && failure.kind() == ProviderFailureKind::WrongInvocation
+            && failure.phase() == phase && failure.disposition() == disposition));
+    assert_eq!(
+        native.cancel_calls.load(Ordering::Acquire),
+        usize::from(unconsumed)
+    );
+    let host = bridge.session(owner).await;
+    let effects = host
+        .invocations
+        .lock()
+        .await
+        .get(&scope.invocation_id)
+        .cloned()
+        .unwrap();
+    assert_eq!(effects.foreground_pending(), !unconsumed);
+    assert_eq!(
+        native.sinks.lock().unwrap().len(),
+        1,
+        "rejection retired the stable binding"
+    );
+    bridge.shutdown().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn native_input_rejection_at_unchanged_admission() -> anyhow::Result<()> {
+    native_input_rejection_preserves_delivery_proof_and_exact_collection(
+        forge_provider_api::ProviderPhase::Admission,
+        forge_provider_api::FailureDisposition::Unchanged,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_input_rejection_at_unchanged_preparation() -> anyhow::Result<()> {
+    native_input_rejection_preserves_delivery_proof_and_exact_collection(
+        forge_provider_api::ProviderPhase::Preparation,
+        forge_provider_api::FailureDisposition::Unchanged,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_input_rejection_at_uncertain_observation() -> anyhow::Result<()> {
+    native_input_rejection_preserves_delivery_proof_and_exact_collection(
+        forge_provider_api::ProviderPhase::Observation,
+        forge_provider_api::FailureDisposition::Uncertain,
+        false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_input_rejection_at_invalidated_collection() -> anyhow::Result<()> {
+    native_input_rejection_preserves_delivery_proof_and_exact_collection(
+        forge_provider_api::ProviderPhase::Collection,
+        forge_provider_api::FailureDisposition::Invalidated,
+        false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_input_rejection_at_closed_admission() -> anyhow::Result<()> {
+    native_input_rejection_preserves_delivery_proof_and_exact_collection(
+        forge_provider_api::ProviderPhase::Admission,
+        forge_provider_api::FailureDisposition::Closed,
+        false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_input_rejection_at_unchanged_observation() -> anyhow::Result<()> {
+    native_input_rejection_preserves_delivery_proof_and_exact_collection(
+        forge_provider_api::ProviderPhase::Observation,
+        forge_provider_api::FailureDisposition::Unchanged,
+        false,
+    )
+    .await
 }
 
 /// Deliver each context section once per change, keep rejected sections pending, and deliver

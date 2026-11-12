@@ -579,7 +579,7 @@ mod test {
         };
         let submission = store.prepare_steering(
             &catalog,
-            crate::provider::ProviderInput::from_text("once"),
+            crate::provider::ProviderInput::from_user_text("once"),
             forge_providers::registry::default_id(),
         )?;
         let lane = SteeringLane::default();

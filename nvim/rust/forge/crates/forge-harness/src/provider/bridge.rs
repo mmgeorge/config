@@ -1719,7 +1719,7 @@ impl ProviderBridge {
         })?
     }
 
-    /// Fork native history using the first complete request retained for this target.
+    /// Fork native history using the first complete request retained for this attempt.
     pub async fn thread_fork(
         &self,
         request: super::ProviderForkRequest,
@@ -1727,8 +1727,8 @@ impl ProviderBridge {
         let _admission = self.admission.read().await;
         self.ensure_admission(ProviderOperation::ThreadFork)?;
         let id = forge_provider_api::OperationId::new(format!(
-            "fork/{}",
-            request.target_harness_session_id
+            "fork/{}/{}",
+            request.target_harness_session_id, request.attempt_id
         ))?;
         self.history_operations
             .fork(
@@ -2462,6 +2462,11 @@ impl ProviderBridge {
         }
         // Failed native collection still owns its producer and reader for the next close attempt.
         combined(errors)?;
+        // An owner takes the host stream under shared admission, which every caller of this close
+        // holds exclusively. A stream still parked here, as when the binding was opened only as a
+        // fork source, can therefore never be consumed. Dropping it ends the wait below as
+        // abandoned instead of blocking this close and every close queued behind it.
+        session.receiver.lock().await.take();
         // Closing the native reader may leave a valid published prefix queued for the owner.
         // Keep the binding routable until that exact prefix has been consumed, or until the
         // owner refuses it or exits, since neither can consume it and close holds admission.

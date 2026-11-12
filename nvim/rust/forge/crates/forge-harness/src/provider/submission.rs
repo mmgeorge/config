@@ -662,6 +662,7 @@ impl SubmissionStore {
             acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
+            child_agent: None,
         }
     }
 
@@ -866,8 +867,10 @@ impl Submission {
                 recovered_input: _,
                 acknowledged_child_reports,
                 control_context: _,
+                child_agent,
             } = request;
             record.request.execution_owner = execution_owner;
+            record.request.child_agent = child_agent;
             record.request.mode = mode;
             record.request.model = model;
             record.request.effort = effort;
@@ -1880,7 +1883,7 @@ mod tests {
             execution_owner: None,
             harness_session_id: "submission-test".into(),
             workspace: "workspace".into(),
-            input: ProviderInput::from_text(text),
+            input: ProviderInput::from_user_text(text),
             mode: PromptMode::Chat,
             model: "model".into(),
             effort: "high".into(),
@@ -1893,6 +1896,7 @@ mod tests {
             acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
+            child_agent: None,
         }
     }
 
@@ -2130,8 +2134,8 @@ mod tests {
                 .map(|input| input.input.clone())
                 .collect::<Vec<_>>(),
             vec![
-                ProviderInput::from_text("second").normalized(),
-                ProviderInput::from_text("third").normalized()
+                ProviderInput::from_user_text("second").normalized(),
+                ProviderInput::from_user_text("third").normalized()
             ]
         );
         Ok(())

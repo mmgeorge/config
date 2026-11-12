@@ -70,7 +70,7 @@ impl AgentProviderFactory {
             request.owner()?.is_root(),
             "child model catalogs require root session ownership"
         );
-        request.input = ProviderInput::from_text(String::new());
+        request.input = ProviderInput::from_user_text(String::new());
         request.model = "default".into();
         request.effort = "default".into();
         request.provider_session_id = None;
@@ -206,11 +206,16 @@ impl AgentProviderFactory {
         Ok(selection)
     }
 
+    /// Build the child's request for one task.
+    ///
+    /// The parent's task travels as an `<agent_message type="new_task">`, never as user text, and
+    /// the profile instructions travel in the standing `<agent>` section, so compaction cannot
+    /// summarize them away.
     pub fn request(
         &self,
         root: &ProviderRequest,
         work: &super::AgentWork,
-        message: String,
+        task: forge_provider_api::forge::AgentTask,
     ) -> Result<ProviderRequest> {
         let agent = &work.agent;
         let selection = agent
@@ -223,20 +228,12 @@ impl AgentProviderFactory {
                 && !work.owner().is_root(),
             "child request crosses root ownership"
         );
-        let message = if selection.instructions.trim().is_empty() {
-            message
-        } else {
-            format!(
-                "Subagent profile instructions:\n{}\n\nAssigned task:\n{message}",
-                selection.instructions
-            )
-        };
         Ok(ProviderRequest {
             dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(work.owner().clone()),
             harness_session_id: root.harness_session_id.clone(),
             workspace: root.workspace.clone(),
-            input: ProviderInput::from_text(message),
+            input: ProviderInput::kind(forge_provider_api::forge::TurnKind::AgentTask { task }),
             mode: PromptMode::Chat,
             model: selection.model.clone(),
             effort: selection.reasoning_effort.clone(),
@@ -255,6 +252,11 @@ impl AgentProviderFactory {
             acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
+            child_agent: Some(forge_provider_api::forge::ChildAgent {
+                path: agent.task_path.clone(),
+                parent: forge_provider_api::forge::ROOT_AGENT_PATH.into(),
+                profile_instructions: selection.instructions.clone(),
+            }),
         })
     }
 }

@@ -112,6 +112,61 @@ impl Permissions {
     }
 }
 
+/// The origin of an aside session: a fork the user opened to ask about a session that keeps
+/// running.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Aside {
+    /// Harness session the aside was forked from.
+    pub origin_session_id: String,
+    /// The origin's display name when the aside was opened; empty when it had none.
+    pub origin_session_name: String,
+}
+
+/// Role of an aside session and the tools that reach its origin.
+const ASIDE_RULE: &str = "This session is an aside: a fork of the origin session named above, which the user opened with /btw to ask about that session without interrupting it. The origin continues its own work in another tab. This conversation holds a copy of the origin's history up to the fork, without any exchange that was still running then.\n\nThe user will ask questions about the origin session. Answer from the copied history when it is enough. To see what the origin did after the fork or is doing now, inspect it with the harness_session_* tools, passing the origin session ID as session_id: harness_session_exchange_list lists its exchanges, harness_session_exchange shows one exchange's messages, tool calls, and progress so far, harness_session_tool reads one tool's output, and harness_session_status reports its task and access. The origin keeps changing, so read it again instead of relying on an earlier read.\n\nDo not continue the origin's task here unless the user asks. This is a full session: when the user gives you other work, do it here.\n\norigin_message sends the origin session a message. It arrives there in a <session_message> element that names this session, and starts a turn or waits in the queue behind running work. Send one only when the user asks, or to report a result the user asked you to send back.";
+
+impl Aside {
+    pub(crate) fn write(&self, writer: &mut Writer) {
+        let mut attributes = vec![("origin_session_id", self.origin_session_id.clone())];
+        if !self.origin_session_name.is_empty() {
+            attributes.push(("origin_session_name", self.origin_session_name.clone()));
+        }
+        writer.element("aside", &attributes, ASIDE_RULE);
+    }
+}
+
+/// The child agent a conversation belongs to: its path, its parent, and the user's profile
+/// instructions for it.
+///
+/// The section stands rather than travelling with each task so that compaction, which clears the
+/// delivery record, cannot summarize the profile instructions away.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildAgent {
+    /// The agent's own path, such as `/root/explore-1`.
+    pub path: String,
+    /// Path of the agent that assigns its tasks and receives its answers.
+    pub parent: String,
+    /// Instructions from the agent's profile; empty when the profile has none.
+    pub profile_instructions: String,
+}
+
+/// Role of a child agent, written after the section names its path and parent.
+const CHILD_AGENT_RULE: &str = "You are a child agent. Your parent assigns each task in an <agent_message type=\"new_task\"> and may send more information about it in an <agent_message type=\"message\">. Harness delivers your final response to each task to your parent as your answer, so make that response a complete report of what you did and found.";
+
+impl ChildAgent {
+    pub(crate) fn write(&self, writer: &mut Writer) {
+        writer.open(
+            "agent",
+            &[("path", self.path.clone()), ("parent", self.parent.clone())],
+        );
+        writer.text(CHILD_AGENT_RULE);
+        if !self.profile_instructions.trim().is_empty() {
+            writer.element("profile_instructions", &[], &self.profile_instructions);
+        }
+        writer.close();
+    }
+}
+
 /// The active Harness task and its standing workflow.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

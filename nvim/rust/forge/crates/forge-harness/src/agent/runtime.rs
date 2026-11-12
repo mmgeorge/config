@@ -160,7 +160,11 @@ impl AgentRuntime {
                     request.provider_session_id = output.provider_session_id.clone();
                 }
                 events.native_outcome = None;
-                request.input = crate::provider::ProviderInput::from_text(feedback);
+                // The same typed kind a root session uses, so the child receives the fixed
+                // timeout preface rather than bare feedback that reads as user text.
+                request.input = crate::provider::ProviderInput::kind(
+                    forge_provider_api::forge::TurnKind::PermissionTimeout { feedback },
+                );
                 request.submission = None;
                 request.recovered_input.clear();
             }

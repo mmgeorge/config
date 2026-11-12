@@ -225,7 +225,7 @@ impl HarnessBroker {
         };
         let request = crate::provider::ProviderCompactionRequest {
             id: compaction.id.clone(),
-            request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+            request: self.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?,
         };
         self.trace.record(
             &self.session.id,

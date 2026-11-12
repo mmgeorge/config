@@ -17,6 +17,10 @@ enum CollectionBoundary {
     ActiveAfterUserEcho,
     /// Hold native execution inside a started shell tool until its deadline stops the turn.
     ActiveInTool,
+    /// Accept the input without starting its turn, hold it until it is interrupted, then lose the
+    /// provider's lifecycle observation and fail the interrupt's collection, as a binding does
+    /// when it is invalidated because its interrupt was never answered.
+    ActiveLosesObservation,
 }
 
 /// Hold one real owner at a selected boundary while native collection remains delayed.
@@ -63,12 +67,18 @@ async fn slow_collection_fixture(
                 CollectionBoundary::Active
                     | CollectionBoundary::ActiveAfterUserEcho
                     | CollectionBoundary::ActiveInTool
+                    | CollectionBoundary::ActiveLosesObservation
             ) && executions.fetch_add(1, Ordering::AcqRel) == 0;
+            let lose_observation =
+                held_active && boundary == CollectionBoundary::ActiveLosesObservation;
             let echo_user_message =
                 held_active && boundary == CollectionBoundary::ActiveAfterUserEcho;
             let run_tool = held_active && boundary == CollectionBoundary::ActiveInTool;
             async move {
-                start.observed(1).await?;
+                // A binding that is still starting accepts the input without starting its turn.
+                if !lose_observation {
+                    start.observed(1).await?;
+                }
                 if echo_user_message {
                     let item_id = forge_provider_api::ItemId::new("echoed-user-message")
                         .expect("fixture item ID is valid");
@@ -138,6 +148,11 @@ async fn slow_collection_fixture(
                             .changed()
                             .await
                             .map_err(|_| crate::provider::ProviderError::Cancelled)?;
+                    }
+                    if lose_observation {
+                        return Err(crate::provider::ProviderError::Observation(
+                            forge_provider_api::ObservationFailure::LifecycleUnavailable,
+                        ));
                     }
                     if run_tool {
                         let completion = forge_provider_api::ToolCompletion {
@@ -227,6 +242,27 @@ async fn slow_collection_fixture(
             Ok(())
         }
     });
+    if boundary == CollectionBoundary::ActiveLosesObservation {
+        // The interrupt itself fails too: its collection cannot prove the native turn ended.
+        let failed_collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native.with_cleanup(move |_| {
+            let first = failed_collections.fetch_add(1, Ordering::AcqRel) == 0;
+            async move {
+                if first {
+                    return Err(forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TurnInterrupt,
+                        forge_provider_api::ProviderFailureKind::Transport,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Observation,
+                        forge_provider_api::FailureDisposition::Invalidated,
+                    )
+                    .into());
+                }
+                Ok(())
+            }
+        });
+    }
     let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider.provider_handle());
@@ -523,5 +559,104 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
             if text == "Prompt after late settlement"));
         Ok::<(), anyhow::Error>(())
     }.await;
+    fixture.finish(scenario).await
+}
+
+/// Answer every cancellation queued behind a stop that lost the provider.
+///
+/// A user who sees no response presses cancel again, so several cancellations queue behind the
+/// first. When that first stop cannot prove the provider idle, the owner restarts the provider;
+/// the queued cancellations must still be answered, and the session must run a later prompt.
+///
+/// The cancellations ask to restore an unconsumed prompt, as the editor's cancel key does. That
+/// policy makes the failed turn wait for the owner's collection before it settles, so the turn
+/// must also learn that the collection failed.
+#[tokio::test(start_paused = true)]
+async fn cancels_queued_behind_a_failed_stop_are_answered() -> Result<()> {
+    use crate::exchange::command::{
+        CancelExchangeRequest, CancelledInputPolicy, Command, CommandFailure, CommandId,
+        CommandRequest, ExecuteCommandError, InputControl,
+    };
+    let mut fixture = slow_collection_fixture(
+        Duration::from_secs(10),
+        CollectionBoundary::ActiveLosesObservation,
+    )
+    .await?;
+    let scenario = async {
+        // The paused clock runs this bound out at once if the turn never starts, so a missed
+        // start fails with this message instead of spinning until the runner kills the test.
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while fixture.engine.active_invocation_scope()?.is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("the held turn never started")??;
+        let cancel = |operation_id: &str| -> Result<_> {
+            let command_id = CommandId::new(operation_id)?;
+            let controller = Arc::clone(&fixture.controller);
+            let sink = fixture.sink.clone();
+            Ok(tokio::spawn(async move {
+                controller
+                    .exchange_owner
+                    .execute_identified(
+                        CommandRequest {
+                            id: command_id,
+                            command: Command::CancelExchange(CancelExchangeRequest {
+                                input: CancelledInputPolicy::RestoreIfUnconsumed,
+                            }),
+                            input_control: InputControl::AtExecution,
+                        },
+                        sink,
+                    )
+                    .await
+            }))
+        };
+        let first = cancel("first-cancel")?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let second = cancel("second-cancel")?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let third = cancel("third-cancel")?;
+        ensure!(
+            !first.is_finished(),
+            "the first stop finished before the later cancellations queued behind it"
+        );
+        let first = first.await?;
+        ensure!(
+            matches!(
+                first,
+                Err(ExecuteCommandError::Failed(CommandFailure::StopFailed))
+            ),
+            "a stop that lost the provider did not report the failed stop"
+        );
+        // The paused clock runs this bound out at once when nothing answers the queue.
+        let queued = tokio::time::timeout(Duration::from_secs(120), async {
+            Ok::<_, anyhow::Error>((second.await?, third.await?))
+        })
+        .await
+        .context("the cancellations queued behind the failed stop were never answered")??;
+        ensure!(
+            queued.0.is_ok() && queued.1.is_ok(),
+            "a cancellation that found the restarted provider idle was refused"
+        );
+        prompt::apply(
+            &fixture.controller,
+            Request {
+                id: 803,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"after-failed-stop","text":"Prompt after the restart"}),
+            },
+            &fixture.sink,
+        )
+        .await?;
+        let input = tokio::time::timeout(Duration::from_secs(120), fixture.dispatches.recv())
+            .await
+            .context("the session ran no prompt after the failed stop")?;
+        ensure!(matches!(input, Some(forge_provider_api::input::PromptInput::Text(text))
+            if text == "Prompt after the restart"));
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     fixture.finish(scenario).await
 }

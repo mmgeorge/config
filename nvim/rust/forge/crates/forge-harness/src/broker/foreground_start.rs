@@ -42,8 +42,8 @@ impl HarnessBroker {
         }
         let attached_results = self.agent_coordinator.unreported_result();
         if !attached_results.is_empty() {
-            // Child results travel as `<agent_result>` elements beside the input, never inside
-            // the user's text.
+            // Child results travel as `final_answer` `<agent_message>` elements beside the input,
+            // never inside the user's text.
             let results = attached_results
                 .iter()
                 .map(|task| self.agent_result(task))

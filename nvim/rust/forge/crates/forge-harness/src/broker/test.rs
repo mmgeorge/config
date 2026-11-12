@@ -108,7 +108,8 @@ async fn prebaseline_failure_settles_while_shared_git_admission_remains_held() -
                 .as_deref()
                 .is_some_and(|error| error.contains(expected))
         );
-        let query = broker.provider_request(ProviderInput::from_text(prompt), PromptMode::Chat)?;
+        let query =
+            broker.provider_request(ProviderInput::from_user_text(prompt), PromptMode::Chat)?;
         let pending = broker.submission_store.pending(
             &query,
             forge_providers::registry::nonselectable_id()
@@ -470,7 +471,8 @@ fn delegating_root_fixture() -> Result<(
                 } else {
                     assert!(ordinal == 1, "parent continuation duplicated");
                     assert!(
-                        text.contains("CHILD_RESULT") && text.contains("<agent_result "),
+                        text.contains("CHILD_RESULT")
+                            && text.contains("<agent_message type=\"final_answer\" "),
                         "parent continuation omitted child result: {text}"
                     );
                 }
@@ -2004,7 +2006,7 @@ fn question_discussion_is_read_only_without_changing_session_access() {
     broker.question_discussion = true;
     let request = broker
         .provider_request(
-            ProviderInput::from_text("Explain this choice"),
+            ProviderInput::from_user_text("Explain this choice"),
             PromptMode::Chat,
         )
         .unwrap();
@@ -2466,14 +2468,20 @@ async fn forks_a_live_session_without_taking_its_lease() {
         &fork_controller.capability,
         &fork_controller.session.id,
         &json!({ "session_id": source_session_id, "name": "fork investigation" }),
-        crate::session::SessionPurpose::Conversation,
+        crate::broker::ForkOptions {
+            purpose: crate::session::SessionPurpose::Conversation,
+            source_is_executing: &|| false,
+        },
     )
     .unwrap();
     assert!(matches!(
         preparation.child.provider_fork_state,
         ProviderForkState::Preparing { .. }
     ));
-    assert_eq!(preparation.provider_request.checkpoint_id.as_deref(), None);
+    let provider_request = preparation
+        .provider_request
+        .expect("an idle source forks its native conversation");
+    assert_eq!(provider_request.checkpoint_id.as_deref(), None);
     let child_session_id = preparation.child.id.clone();
     let inherited_source = source
         .snapshot()
@@ -2485,7 +2493,7 @@ async fn forks_a_live_session_without_taking_its_lease() {
         .collect::<Vec<_>>();
     let provider_fork = fork_controller
         .provider
-        .thread_fork(preparation.provider_request)
+        .thread_fork(provider_request)
         .await
         .unwrap();
     let mut child_initialize = initialize("fork-client", None);
@@ -2558,7 +2566,10 @@ async fn forks_a_live_session_without_taking_its_lease() {
         &fork_controller.capability,
         &fork_controller.session.id,
         &json!({ "session_id": source_session_id }),
-        crate::session::SessionPurpose::Conversation,
+        crate::broker::ForkOptions {
+            purpose: crate::session::SessionPurpose::Conversation,
+            source_is_executing: &|| false,
+        },
     )
     .unwrap();
     let mut failed_initialize = initialize("fork-client", None);
@@ -2632,7 +2643,10 @@ async fn forks_a_live_session_without_taking_its_lease() {
         &child_controller.capability,
         &child_session_id,
         &json!({ "session_id": child_session_id }),
-        crate::session::SessionPurpose::Conversation,
+        crate::broker::ForkOptions {
+            purpose: crate::session::SessionPurpose::Conversation,
+            source_is_executing: &|| false,
+        },
     )
     .unwrap();
     let grandchild_history = child_controller

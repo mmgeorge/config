@@ -80,6 +80,9 @@ pub(crate) fn requirement(name: &str) -> Option<&'static str> {
         );
     }
     Some(match name {
+        "origin_message" => {
+            "Available only in an aside session, which a standing <aside> section identifies."
+        }
         "plan_capture_file" => "Available while <task kind=\"plan\"> is active.",
         "plan_submit" => {
             "Available while <task kind=\"plan\"> is active, and during <task kind=\"execute\" phase=\"resolve\">."
@@ -172,6 +175,7 @@ mod tests {
             "goal_status",
             "goal_complete",
             "goal_blocked",
+            "origin_message",
         ] {
             assert!(
                 catalog.iter().any(|tool| tool.name == name),

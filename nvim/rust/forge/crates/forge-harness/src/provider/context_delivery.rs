@@ -6,7 +6,7 @@
 //! from the model's view, such as compaction, rewind, or retraction, clears the record so the next
 //! turn delivers every section again.
 
-use forge_provider_api::forge::{Permissions, Task, TurnContext};
+use forge_provider_api::forge::{Aside, ChildAgent, Permissions, Task, TurnContext};
 
 /// Delivery state for one native binding's standing sections.
 #[derive(Debug)]
@@ -15,6 +15,10 @@ pub(super) struct ContextDelivery {
     record: String,
     /// Permissions the conversation last accepted.
     permissions: Option<Permissions>,
+    /// Aside origin the conversation last accepted.
+    aside: Option<Aside>,
+    /// Child agent identity the conversation last accepted.
+    agent: Option<ChildAgent>,
     /// Task the conversation last accepted.
     task: Option<Task>,
 }
@@ -23,6 +27,10 @@ pub(super) struct ContextDelivery {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StandingSections {
     pub(crate) permissions: Option<Permissions>,
+    /// Present only in an aside session.
+    pub(crate) aside: Option<Aside>,
+    /// Present only in a child agent's conversation.
+    pub(crate) agent: Option<ChildAgent>,
     pub(crate) task: Option<Task>,
 }
 
@@ -34,6 +42,8 @@ impl ContextDelivery {
         Self {
             record,
             permissions: None,
+            aside: None,
+            agent: None,
             task: None,
         }
     }
@@ -45,6 +55,12 @@ impl ContextDelivery {
             permissions: sections
                 .permissions
                 .filter(|permissions| self.permissions.as_ref() != Some(permissions)),
+            aside: sections
+                .aside
+                .filter(|aside| self.aside.as_ref() != Some(aside)),
+            agent: sections
+                .agent
+                .filter(|agent| self.agent.as_ref() != Some(agent)),
             task: sections
                 .task
                 .filter(|task| self.task.as_ref() != Some(task)),
@@ -61,6 +77,12 @@ impl ContextDelivery {
         if let Some(permissions) = &context.permissions {
             self.permissions = Some(permissions.clone());
         }
+        if let Some(aside) = &context.aside {
+            self.aside = Some(aside.clone());
+        }
+        if let Some(agent) = &context.agent {
+            self.agent = Some(agent.clone());
+        }
         if let Some(task) = &context.task {
             self.task = Some(task.clone());
         }
@@ -69,6 +91,8 @@ impl ContextDelivery {
     /// Forget every delivered section after an event that may have removed it from history.
     pub(super) fn clear(&mut self) {
         self.permissions = None;
+        self.aside = None;
+        self.agent = None;
         self.task = None;
     }
 }
@@ -87,6 +111,8 @@ mod tests {
                 write: WriteAccess::Off,
                 toolsets: Vec::new(),
             }),
+            aside: None,
+            agent: None,
             task: Some(Task::Goal(GoalTask {
                 objective: objective.into(),
             })),
@@ -141,6 +167,56 @@ mod tests {
         assert_eq!(
             names(&delivery.pending(sections("ship", ApprovalMode::Ask))),
             (true, true)
+        );
+    }
+
+    /// Deliver an aside's origin once, and again after history may have lost it.
+    #[test]
+    fn aside_origin_is_delivered_once_until_cleared() {
+        let aside_sections = || StandingSections {
+            aside: Some(Aside {
+                origin_session_id: "origin".into(),
+                origin_session_name: "main".into(),
+            }),
+            ..sections("ship", ApprovalMode::Ask)
+        };
+        let mut delivery = ContextDelivery::new();
+        let first = delivery.pending(aside_sections());
+        assert!(first.aside.is_some());
+        delivery.commit(&first);
+        assert!(delivery.pending(aside_sections()).is_empty());
+        delivery.clear();
+        assert!(delivery.pending(aside_sections()).aside.is_some());
+    }
+
+    /// Deliver a child's identity and profile once, and again after compaction may have lost them.
+    #[test]
+    fn child_agent_is_delivered_once_until_cleared() {
+        let agent_sections = |profile: &str| StandingSections {
+            agent: Some(ChildAgent {
+                path: "/root/explore-1".into(),
+                parent: "/root".into(),
+                profile_instructions: profile.into(),
+            }),
+            ..sections("ship", ApprovalMode::Ask)
+        };
+        let mut delivery = ContextDelivery::new();
+        let first = delivery.pending(agent_sections("Read only."));
+        assert!(first.agent.is_some());
+        delivery.commit(&first);
+        assert!(delivery.pending(agent_sections("Read only.")).is_empty());
+        assert!(
+            delivery
+                .pending(agent_sections("Edit freely."))
+                .agent
+                .is_some()
+        );
+        delivery.clear();
+        assert!(
+            delivery
+                .pending(agent_sections("Read only."))
+                .agent
+                .is_some()
         );
     }
 

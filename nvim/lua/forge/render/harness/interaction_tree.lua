@@ -22,7 +22,9 @@ local function append_session_event(result, entry)
   if event.kind == "forked" then
     target_session_id = event.source_session_id
     local source_name = event.source_session_name or ""
-    text = "Forked from " .. tostring(target_session_id or "")
+    -- The omission leads the line so a narrow window cannot hide it behind the session identity.
+    text = (event.unfinished_exchange_omitted and "Forked before the unfinished exchange of " or "Forked from ")
+      .. tostring(target_session_id or "")
     if source_name ~= "" then text = text .. " (" .. source_name .. ")" end
   else
     text = event.message or (name == "" and "Session name cleared" or ("Session renamed to " .. name))

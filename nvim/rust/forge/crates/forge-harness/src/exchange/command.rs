@@ -362,6 +362,11 @@ pub(crate) struct InputSubmission {
     pub(crate) config: Option<QueuedModelSettings>,
     /// Automatic steering/delivery or explicit queued delivery.
     pub(crate) intent: InputIntent,
+    /// Typed Harness input that `text` labels, for input Harness delivers on another session's
+    /// behalf. Only the host sets it: [`CommandRequest::from_input`] never decodes one, so editor
+    /// input cannot claim to be Harness-authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) turn: Option<Box<forge_provider_api::forge::TurnInput>>,
 }
 
 /// Select an existing input at the exact revision observed by its caller.
@@ -472,6 +477,7 @@ impl CommandRequest {
                 attachments,
                 config: None,
                 intent: InputIntent::Auto,
+                turn: None,
             })),
             input_control: InputControl::AtExecution,
         })
@@ -487,6 +493,22 @@ impl CommandRequest {
             return Err(CommandDecodeError::HostOnlyInput);
         };
         input.target = target;
+        Ok(request)
+    }
+
+    /// Admit input that Harness delivers on another session's behalf, carrying its typed turn.
+    ///
+    /// The operation decodes exactly as editor input does, so every guard on its content still
+    /// applies; only the typed turn, which no editor request can supply, is added.
+    pub(crate) fn from_host_input(
+        operation: InputOperation,
+        turn: forge_provider_api::forge::TurnInput,
+    ) -> Result<Self, CommandDecodeError> {
+        let mut request = Self::from_input(operation)?;
+        let Command::Input(InputCommand::Submit(input)) = &mut request.command else {
+            return Err(CommandDecodeError::HostOnlyInput);
+        };
+        input.turn = Some(Box::new(turn));
         Ok(request)
     }
 
@@ -521,6 +543,7 @@ impl CommandRequest {
                         .collect::<Result<_, _>>()?,
                     config: config.map(QueuedModelSettings::decode).transpose()?,
                     intent,
+                    turn: None,
                 })
             }
             InputAction::Retry { id, revision } => InputCommand::Retry(InputRevision {
@@ -604,8 +627,8 @@ impl CommandRequest {
             }
         };
         let action = match command {
-            InputCommand::Submit(input) => InputAction::Submit {
-                message: Box::new(InputMessage::queued(crate::input::InputDraft {
+            InputCommand::Submit(input) => {
+                let message = InputMessage::queued(crate::input::InputDraft {
                     id: input.id.as_str().into(),
                     text: input.text.clone(),
                     purpose: InputPurpose::User,
@@ -616,8 +639,14 @@ impl CommandRequest {
                         .collect::<Result<_, _>>()?,
                     config: input.config.as_ref().map(QueuedModelSettings::encode),
                     intent: input.intent.clone(),
-                })),
-            },
+                });
+                InputAction::Submit {
+                    message: Box::new(match &input.turn {
+                        Some(turn) => message.with_turn((**turn).clone()),
+                        None => message,
+                    }),
+                }
+            }
             InputCommand::Retry(input) => InputAction::Retry {
                 id: input.id.as_str().into(),
                 revision: input.revision,

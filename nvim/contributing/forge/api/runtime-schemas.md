@@ -215,9 +215,25 @@ pub struct ActiveTask {
 Source: [session/mod.rs](../../../rust/forge/crates/forge-harness/src/session/mod.rs).
 
 ```rust
+/// Names the session an aside was forked from.
+///
+/// An aside is a full session the user opens with `/btw` to ask about a session that keeps
+/// running. The marker selects its standing instructions, keeps the session-history tools on, and
+/// addresses the messages it sends back.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AsideOrigin {
+    pub session_id: String,
+    /// The origin's display name when the aside was opened.
+    #[serde(default)]
+    pub session_name: String,
+}
+
 /// Represents one durable conversation and its provider identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessSession {
+    /// Marks an aside and names its origin. A fork of an aside stays an aside of that origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aside: Option<AsideOrigin>,
     /// Controls automatic resumption while retaining explicit access to every session.
     #[serde(default)]
     pub purpose: SessionPurpose,

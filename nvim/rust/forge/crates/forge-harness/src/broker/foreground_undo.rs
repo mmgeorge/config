@@ -83,7 +83,7 @@ impl HarnessBroker {
             );
         }
         Ok(Some(NativeRewind {
-            request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+            request: self.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?,
             after,
         }))
     }

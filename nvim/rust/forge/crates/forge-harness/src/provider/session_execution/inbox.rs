@@ -805,7 +805,7 @@ mod tests {
                 execution_owner: Some(scope.owner().clone()),
                 harness_session_id: scope.owner().session_id().to_string(),
                 workspace: directory.path().to_string_lossy().into_owned(),
-                input: crate::provider::ProviderInput::from_text("timeout fixture"),
+                input: crate::provider::ProviderInput::from_user_text("timeout fixture"),
                 mode: crate::provider::PromptMode::Chat,
                 model: "default".into(),
                 effort: "default".into(),
@@ -818,6 +818,7 @@ mod tests {
                 acknowledged_child_reports: Vec::new(),
                 recovered_input: Vec::new(),
                 control_context: None,
+                child_agent: None,
             };
             let turn = crate::provider::TurnAddress {
                 scope: scope.clone(),

@@ -4,6 +4,7 @@
 
 use super::super::{prepare_new_session, prepare_provider_fork, start_session_fork};
 use super::bootstrap::{initialize, service};
+use super::owner_transition::finish_first_exchange;
 use super::response_for;
 use crate::session::{ProviderForkState, SessionPurpose, SessionStore};
 use crate::storage::SqliteStore;
@@ -82,6 +83,9 @@ async fn undelivered_fork_response_still_settles_the_child() -> Result<()> {
         .await?;
     let registry = service.registry().await?;
     let source = registry.initial_session_id().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move { while let Ok(Some(_)) = output.recv().await {} });
+    finish_first_exchange(&service, &registry.resolve(&source).await?, &source, &sink).await?;
     let (closed_sink, output) = forge_protocol::outbound::channel();
     drop(output);
 
@@ -124,6 +128,7 @@ async fn undelivered_fork_response_still_settles_the_child() -> Result<()> {
     // No service shutdown: after a successful mock native fork, the source and child exchange
     // owners do not finish within the shutdown deadline, independently of this scenario.
     drop(store);
+    reader.abort();
     Ok(())
 }
 
@@ -138,6 +143,9 @@ async fn resolving_an_interrupted_fork_records_its_failure() -> Result<()> {
         .await?;
     let registry = service.registry().await?;
     let source = registry.initial_session_id().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move { while let Ok(Some(_)) = output.recv().await {} });
+    finish_first_exchange(&service, &registry.resolve(&source).await?, &source, &sink).await?;
     let capability = registry.runtime.provider_handle().descriptor().capability;
     let preparation = prepare_provider_fork(
         std::path::Path::new(&registry.initialize.data_root),
@@ -146,7 +154,10 @@ async fn resolving_an_interrupted_fork_records_its_failure() -> Result<()> {
         &capability,
         &source,
         &json!({}),
-        SessionPurpose::Conversation,
+        crate::broker::ForkOptions {
+            purpose: SessionPurpose::Conversation,
+            source_is_executing: &|| false,
+        },
     )?;
 
     let child = registry.resolve(&preparation.child.id).await?;
@@ -157,6 +168,7 @@ async fn resolving_an_interrupted_fork_records_its_failure() -> Result<()> {
     assert!(message.contains("interrupted"), "{message}");
     drop(child);
     service.shutdown(Duration::from_secs(5)).await?;
+    reader.abort();
     Ok(())
 }
 

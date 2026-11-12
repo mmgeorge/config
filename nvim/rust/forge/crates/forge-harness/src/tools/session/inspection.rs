@@ -88,11 +88,7 @@ impl HarnessInspectionScope {
         cancelled: Arc<AtomicBool>,
         trace: Arc<crate::trace::TraceStore>,
     ) -> Result<(Arc<Self>, InspectionLease)> {
-        let enabled = SettingsStore::read_only(&data_root)?
-            .get(&session.workspace, &session.id, &session.provider)?
-            .desired
-            .session_tools
-            .unwrap_or(true);
+        let enabled = Self::session_tools_enabled(&session, &data_root)?;
         let scope = Arc::new(Self {
             session,
             data_root,
@@ -110,6 +106,21 @@ impl HarnessInspectionScope {
 
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Read whether the session-history tools are on for `session`.
+    ///
+    /// An aside exists to inspect its origin session, so its tools stay on whatever `/config`
+    /// says. Every other session follows the setting.
+    fn session_tools_enabled(session: &HarnessSession, data_root: &Path) -> Result<bool> {
+        if session.aside.is_some() {
+            return Ok(true);
+        }
+        Ok(SettingsStore::read_only(data_root)?
+            .get(&session.workspace, &session.id, &session.provider)?
+            .desired
+            .session_tools
+            .unwrap_or(true))
     }
 
     /// Reject work after cancellation or release of the owning interaction.
@@ -134,15 +145,7 @@ impl HarnessInspectionScope {
         self.check_active()?;
         if name != "harness_config" {
             ensure!(
-                SettingsStore::read_only(&self.data_root)?
-                    .get(
-                        &self.session.workspace,
-                        &self.session.id,
-                        &self.session.provider
-                    )?
-                    .desired
-                    .session_tools
-                    .unwrap_or(true),
+                Self::session_tools_enabled(&self.session, &self.data_root)?,
                 "Harness session tools are disabled in /config"
             );
         }
@@ -310,6 +313,21 @@ impl HarnessInspectionScope {
                             .context("exchange_id is required")?,
                     )?;
                     page.push(exchange_summary(&exchange))?;
+                    // A finished exchange is summarized by its final answer. An unfinished one
+                    // has none yet, so its commentary is the only account of what it is doing.
+                    if !exchange.is_finished() {
+                        for turn in &exchange.turn {
+                            for message in turn.messages() {
+                                if message.kind() == MessageKind::Assistant
+                                    && message.delivery() != MessageDelivery::Final
+                                    && !message.text().trim().is_empty()
+                                {
+                                    page.push(json!({"kind":"commentary","turn_id":turn.id(),
+                                        "text":message.text()}))?;
+                                }
+                            }
+                        }
+                    }
                     for turn in &exchange.turn {
                         for tool in exchange.tools_for_turn(turn.id()) {
                             page.push(

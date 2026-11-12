@@ -196,7 +196,7 @@ async fn owner_close_preserves_shared_runtime_sibling() -> Result<()> {
 }
 
 /// Wait until every submitted input settled into a finished exchange and the owner is idle.
-async fn settle_exchanges(
+pub(super) async fn settle_exchanges(
     controller: &SessionController,
     session_id: &str,
     count: usize,
@@ -222,7 +222,7 @@ async fn settle_exchanges(
 
 /// Submit one user input at the queue's current control revision, as the editor does, so input
 /// submitted after a control operation such as undo resumes the suspended queue.
-async fn submit_input(
+pub(super) async fn submit_input(
     service: &super::super::HarnessService,
     controller: &SessionController,
     session_id: &str,
@@ -249,6 +249,29 @@ async fn submit_input(
             sink,
         )
         .await
+}
+
+/// Start a session's provider and finish its first exchange, so the session holds provider
+/// history that a fork copies. A session that ran no turn has none, and its fork copies nothing.
+pub(super) async fn finish_first_exchange(
+    service: &super::super::HarnessService,
+    controller: &std::sync::Arc<SessionController>,
+    session_id: &str,
+    sink: &forge_protocol::outbound::MessageSender,
+) -> Result<()> {
+    controller.start_provider(sink).await;
+    controller.attach_input(sink).await?;
+    submit_input(
+        service,
+        controller,
+        session_id,
+        10,
+        "settled-input",
+        "Remember the word harbor",
+        sink,
+    )
+    .await?;
+    settle_exchanges(controller, session_id, 1).await
 }
 
 /// Conversation undo rewinds the provider's own history and keeps the provider session, so the
@@ -381,48 +404,6 @@ async fn conversation_undo_rewinds_native_history_and_keeps_provider_session() -
     service.shutdown(Duration::from_secs(5)).await?;
     reader.abort();
     scenario
-}
-
-/// Input to a forked child waits for its native fork. A failed fork refuses the input rather than
-/// opening fresh provider history that lacks the forked conversation.
-#[tokio::test]
-async fn forked_child_input_waits_for_native_fork() -> Result<()> {
-    let fixture = owner_transition_fixture().await?;
-    let registry = fixture.service.registry().await?;
-    // The held source invocation makes the native fork fail as executing.
-    let (child, gate) = super::super::start_session_fork(
-        registry.clone(),
-        fixture.session.clone(),
-        json!({"session_id": fixture.session}),
-        None,
-        crate::session::SessionPurpose::Conversation,
-        &fixture.sink,
-    )
-    .await?;
-    let child_id = child.broker.lock().await.snapshot()?.session.id;
-    let submitted = fixture
-        .service
-        .dispatch(
-            Some(child_id),
-            Request {
-                id: 30,
-                method: "session.input.apply".into(),
-                params: json!({"id":"forked-input","action":{"kind":"submit","message":{"id":"forked-input","text":"What word did I ask you to remember?","intent":"auto","attachments":[]}}}),
-            },
-            &fixture.sink,
-        )
-        .await;
-
-    assert!(
-        gate.wait().await.is_err(),
-        "the held source fails the native fork"
-    );
-    let error = submitted.expect_err("input must not run before the fork is ready");
-    assert!(
-        format!("{error:#}").contains("ExecutionActive"),
-        "{error:#}"
-    );
-    Ok(())
 }
 
 /// A reconnect captured while a turn is still running carries a transcript revision no lower

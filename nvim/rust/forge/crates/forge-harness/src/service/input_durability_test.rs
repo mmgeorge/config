@@ -533,7 +533,7 @@ async fn registered_receipt(
         .unwrap();
     let catalog = controller.catalog_request.read().await.clone();
     let provider = controller.provider_handle().descriptor().kind;
-    let input = crate::provider::ProviderInput::from_text(message.text);
+    let input = crate::provider::ProviderInput::from_user_text(message.text);
     let submission = match purpose {
         crate::input::InputPurpose::TaskEntry { id, .. }
         | crate::input::InputPurpose::TaskContinuation { id, .. } => controller
@@ -652,7 +652,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     let journal = controller.submission_store.clone();
     let prepared = journal.prepare_input(
         &catalog,
-        crate::provider::ProviderInput::from_text("once"),
+        crate::provider::ProviderInput::from_user_text("once"),
         forge_providers::registry::nonselectable_id()
             .expect("registry supplies a nonselectable fixture identity"),
         Some("gap".into()),
@@ -665,7 +665,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     assert!(controller.coordinator.submissions.snapshot()?.suspended);
     let again = journal.prepare_input(
         &catalog,
-        crate::provider::ProviderInput::from_text("once"),
+        crate::provider::ProviderInput::from_user_text("once"),
         forge_providers::registry::nonselectable_id()
             .expect("registry supplies a nonselectable fixture identity"),
         Some("gap".into()),
@@ -673,7 +673,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     assert_eq!(prepared.id(), again.id());
     let edited = journal.prepare_input(
         &catalog,
-        crate::provider::ProviderInput::from_text("edited"),
+        crate::provider::ProviderInput::from_user_text("edited"),
         forge_providers::registry::nonselectable_id()
             .expect("registry supplies a nonselectable fixture identity"),
         Some("gap".into()),

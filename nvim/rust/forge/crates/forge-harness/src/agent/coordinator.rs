@@ -850,7 +850,7 @@ impl AgentCoordinator {
             ordinal += 1;
         };
         let mut agent = Agent::pending(&self.session_id, &selection.profile, &spawn.text, now_ms);
-        agent.task_path = format!("/root/{task_name}");
+        agent.task_path = format!("{}/{task_name}", forge_provider_api::forge::ROOT_AGENT_PATH);
         agent.task_name = task_name;
         agent.source = request.source;
         agent.selection = Some(selection);

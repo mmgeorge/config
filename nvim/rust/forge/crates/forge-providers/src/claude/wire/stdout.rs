@@ -340,6 +340,9 @@ pub(crate) enum CommandState {
     Started,
     /// The turn that consumed the command finished.
     Completed,
+    /// An interrupt discarded the command, either while it was still queued or with the turn that
+    /// consumed it. The CLI prints a `result` only in the second case.
+    Cancelled,
     #[serde(other)]
     Other,
 }

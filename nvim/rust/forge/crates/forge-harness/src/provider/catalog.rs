@@ -80,7 +80,7 @@ impl ProviderInput {
     }
 
     /// Build ordinary provider input from admitted user text.
-    pub fn from_text(text: impl Into<String>) -> Self {
+    pub fn from_user_text(text: impl Into<String>) -> Self {
         Self::new(forge_provider_api::forge::TurnInput::user(
             forge_provider_api::PromptInput::Text(text.into()),
         ))
@@ -90,7 +90,7 @@ impl ProviderInput {
     pub(crate) fn from_message(message: &crate::input::InputMessage) -> Self {
         match message.turn() {
             Some(turn) => Self::new(turn.clone()),
-            None => Self::from_text(message.text.clone()),
+            None => Self::from_user_text(message.text.clone()),
         }
     }
 
@@ -173,14 +173,14 @@ impl ProviderInput {
 impl From<String> for ProviderInput {
     /// Build ordinary user text input.
     fn from(text: String) -> Self {
-        Self::from_text(text)
+        Self::from_user_text(text)
     }
 }
 
 impl From<&str> for ProviderInput {
     /// Build ordinary user text input.
     fn from(text: &str) -> Self {
-        Self::from_text(text)
+        Self::from_user_text(text)
     }
 }
 

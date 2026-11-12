@@ -46,6 +46,9 @@ pub enum SessionEventKind {
     Forked {
         source_session_id: String,
         source_session_name: String,
+        /// The source was executing, so its unfinished exchange is absent from this session.
+        #[serde(default)]
+        unfinished_exchange_omitted: bool,
     },
 }
 

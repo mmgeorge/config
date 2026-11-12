@@ -38,6 +38,7 @@ pub fn prepare_new_session(
         .or_else(|| same_model.then(|| source.model_label.clone()).flatten());
     let session_id = Uuid::new_v4().to_string();
     let mut child = HarnessSession {
+        aside: None,
         purpose: crate::session::SessionPurpose::Conversation,
         primary_agent_id: HarnessSession::primary_agent_id(&session_id),
         id: session_id,

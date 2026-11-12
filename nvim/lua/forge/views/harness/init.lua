@@ -220,17 +220,28 @@ function M.switch_provider(provider, destination)
 end
 
 ---@param name? string
-function M.new_session(name)
-  local source_session_id = session.harness.session and session.harness.session.id or nil
-  local pending = session_navigation.begin_new(name)
+---@param options? {open_mode?: "current"|"tab"}
+function M.new_session(name, options)
+  local source_state = session.harness
+  local source_session_id = source_state.session and source_state.session.id or nil
+  local replace_current = options and options.open_mode == "current"
+  local pending = not replace_current and session_navigation.begin_new(name) or nil
   client.session_create({ source_session_id = source_session_id, name = name }, function(result, request_error)
     if request_error then
-      pending.error = request_error
-      session_navigation.render_pending(pending)
+      if pending then
+        pending.error = request_error
+        session_navigation.render_pending(pending)
+      end
       notifications.error(request_error, "ForgeHarness")
       return
     end
-    session_navigation.complete_pending(pending, result)
+    if pending then
+      session_navigation.complete_pending(pending, result)
+    elseif source_state.timeline_tab and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab) then
+      session_navigation.activate(result, {
+        state = source_state, open_mode = "current", focus = session.harness == source_state,
+      })
+    end
   end)
 end
 

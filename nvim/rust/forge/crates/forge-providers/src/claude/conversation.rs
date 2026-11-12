@@ -2,20 +2,102 @@
 //!
 //! A conversation keeps its session id across process restarts: rewind and launch-time
 //! configuration changes close the idle process and resume the same session in a new one.
+//!
+//! The CLI writes a conversation to disk when its first turn runs, so a session id that has only
+//! ever launched names nothing to resume. `UnstartedSessions` records those ids, and
+//! `launch_conversation` starts such a conversation again when its resume finds nothing.
 
 use super::process::{ClaudeLauncher, LaunchSpec, McpConfig, SessionStart};
 use super::session::ClaudeSessionState;
-use super::transport::{ClaudeTransport, TransportFailure};
+use super::transport::{ClaudeTransport, FrameHandler, TransportFailure};
 use super::wire::content::InputBlock;
-use super::wire::control::{Initialize, InitializeResponse, OutboundControl};
+use super::wire::control::{
+    InboundControlRequest, Initialize, InitializeResponse, OutboundControl,
+};
 use super::wire::stdin::UserInput;
+use super::wire::stdout::StdoutFrame;
+use async_trait::async_trait;
 use forge_provider_api::{
     FailureDisposition, ProviderError, ProviderFailure, ProviderFailureKind, ProviderModel,
     ProviderOperation, ProviderPhase,
 };
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
+/// Record the session ids this provider minted under which the CLI has run no turn.
+///
+/// Harness learns a session id when the session opens and resumes it after every provider
+/// restart, but the CLI answers `--resume` of an id it never ran a turn under with "No
+/// conversation found" and exits. An id held here may therefore be started again under
+/// `--session-id` when its resume fails. An id leaves when a turn the CLI started ends, because
+/// starting that conversation again would replace history Harness still shows. An id whose
+/// session never ran a turn stays for the provider's lifetime.
+#[derive(Clone, Default)]
+pub(crate) struct UnstartedSessions {
+    session_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl UnstartedSessions {
+    /// Record a session id minted for a conversation the CLI has not run.
+    pub(crate) fn mint(&self, session_id: &str) {
+        self.session_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_owned());
+    }
+
+    /// Report whether the CLI has run no turn under a session id this provider minted.
+    fn holds(&self, session_id: &str) -> bool {
+        self.session_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
+    }
+
+    /// Forget a session id whose conversation the CLI has written.
+    fn started(&self, session_id: &str) {
+        self.session_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+}
+
+/// Deliver one process's frames to its conversation, and its exit only once it serves the
+/// conversation.
+///
+/// A process that exits before its initialize handshake never served the conversation. `launch`
+/// returns that failure to its caller, which may launch another process for the same
+/// conversation, so the exit must not invalidate the session state both processes share.
+struct ProcessFrames {
+    state: Arc<ClaudeSessionState>,
+    serving: AtomicBool,
+}
+
+#[async_trait]
+impl FrameHandler for ProcessFrames {
+    async fn frame(&self, frame: StdoutFrame) {
+        FrameHandler::frame(&*self.state, frame).await;
+    }
+
+    async fn control(
+        &self,
+        request: InboundControlRequest,
+        cancelled: CancellationToken,
+    ) -> Result<Value, String> {
+        FrameHandler::control(&*self.state, request, cancelled).await
+    }
+
+    async fn closed(&self, failure: Option<TransportFailure>) {
+        if self.serving.load(Ordering::Acquire) {
+            FrameHandler::closed(&*self.state, failure).await;
+        }
+    }
+}
 
 /// Native configuration a conversation applies at every launch.
 #[derive(Clone)]
@@ -40,6 +122,7 @@ pub(crate) struct ClaudeConversation {
     session_id: String,
     launcher: Arc<dyn ClaudeLauncher>,
     state: Arc<ClaudeSessionState>,
+    unstarted: UnstartedSessions,
     options: RwLock<ConversationOptions>,
     live: RwLock<LiveProcess>,
 }
@@ -52,9 +135,11 @@ impl ClaudeConversation {
         session_id: String,
         start: SessionStart,
         options: ConversationOptions,
+        unstarted: UnstartedSessions,
         cleanup: &crate::resource_cleanup::ResourceCleanup,
     ) -> Result<Self, ProviderError> {
-        let live = launch(&*launcher, &state, &options, start, cleanup).await?;
+        let live =
+            launch_conversation(&*launcher, &state, &options, start, &unstarted, cleanup).await?;
         state
             .update_catalog(|catalog| {
                 catalog.models = live.initialized.models.clone();
@@ -68,6 +153,7 @@ impl ClaudeConversation {
             session_id,
             launcher,
             state,
+            unstarted,
             options: RwLock::new(options),
             live: RwLock::new(live),
         })
@@ -76,6 +162,11 @@ impl ClaudeConversation {
     /// Get the durable native session id.
     pub(crate) fn id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Record that a turn the CLI started has ended, so the conversation is on disk.
+    pub(crate) fn observe_turn(&self) {
+        self.unstarted.started(&self.session_id);
     }
 
     /// Report the CLI version from the initialize handshake.
@@ -236,7 +327,15 @@ impl ClaudeConversation {
         let mut live = self.live.write().await;
         live.transport.retire().await?;
         let options = self.options.read().await.clone();
-        *live = launch(&*self.launcher, &self.state, &options, start, cleanup).await?;
+        *live = launch_conversation(
+            &*self.launcher,
+            &self.state,
+            &options,
+            start,
+            &self.unstarted,
+            cleanup,
+        )
+        .await?;
         Ok(())
     }
 
@@ -274,6 +373,42 @@ impl ClaudeConversation {
     }
 }
 
+/// Launch a process for a retained conversation, starting the conversation again when the CLI
+/// never ran it.
+///
+/// The resume is attempted first because only the CLI knows whether it wrote the conversation: a
+/// prompt it received before it froze or was replaced may or may not have reached disk.
+async fn launch_conversation(
+    launcher: &dyn ClaudeLauncher,
+    state: &Arc<ClaudeSessionState>,
+    options: &ConversationOptions,
+    start: SessionStart,
+    unstarted: &UnstartedSessions,
+    cleanup: &crate::resource_cleanup::ResourceCleanup,
+) -> Result<LiveProcess, ProviderError> {
+    let restart = match &start {
+        SessionStart::Resume {
+            session_id,
+            resume_at: None,
+            ..
+        } if unstarted.holds(session_id) => Some(SessionStart::Fresh {
+            session_id: session_id.clone(),
+        }),
+        _ => None,
+    };
+    match (
+        launch(launcher, state, options, start, cleanup).await,
+        restart,
+    ) {
+        (Err(ProviderError::Failure(failure)), Some(restart))
+            if failure.kind() == ProviderFailureKind::Initialization =>
+        {
+            launch(launcher, state, options, restart, cleanup).await
+        }
+        (launched, _) => launched,
+    }
+}
+
 /// Launch a process and complete its initialize handshake.
 async fn launch(
     launcher: &dyn ClaudeLauncher,
@@ -290,7 +425,11 @@ async fn launch(
     }
     let spec = launch_spec(options, start)?;
     let io = launcher.launch(&spec)?;
-    let transport = Arc::new(ClaudeTransport::start(io, state.clone(), cleanup));
+    let frames = Arc::new(ProcessFrames {
+        state: state.clone(),
+        serving: AtomicBool::new(false),
+    });
+    let transport = Arc::new(ClaudeTransport::start(io, frames.clone(), cleanup));
     let initialized = transport
         .request(OutboundControl::Initialize(initialize(options)))
         .await;
@@ -307,6 +446,13 @@ async fn launch(
             ProviderFailureKind::Initialization,
         )
     })?;
+    frames.serving.store(true, Ordering::Release);
+    // The reader marks the transport closed before it reports the exit, so an exit that raced the
+    // line above and went unreported is still visible here.
+    if transport.is_closed() {
+        let _ = transport.shutdown().await;
+        return Err(initialization_failure(TransportFailure::Closed));
+    }
     Ok(LiveProcess {
         transport,
         initialized,

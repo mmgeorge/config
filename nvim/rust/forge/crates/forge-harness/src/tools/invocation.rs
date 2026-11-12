@@ -114,6 +114,7 @@ pub fn apply_invocation(
         name if super::checks::is_tool(name) => super::checks::record(invocation, output)?,
         name if super::lsp::is_tool(name) => super::lsp::record(invocation, output)?,
         name if super::session::is_tool(name) => super::session::record(invocation, output)?,
+        name if super::origin::is_tool(name) => {}
         super::config::NAME => {}
         name => crate::tools::error::bail!("unknown Harness control tool: {name}"),
     }

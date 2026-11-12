@@ -22,7 +22,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
         "finish",
         PromptMode::Chat,
         Some(&ExchangeAdmission::chat("finish".into())),
-        ProviderInput::from_text("finish"),
+        ProviderInput::from_user_text("finish"),
     )?;
     broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
     let engine = broker
@@ -294,7 +294,7 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     broker.turn_cancellation().arm();
     let submission = broker.submission_store.prepare_input(
         &catalog,
-        ProviderInput::from_text("Retain café 東京"),
+        ProviderInput::from_user_text("Retain café 東京"),
         broker.provider.descriptor().kind,
         Some("cancelled-followup".into()),
     )?;
@@ -361,7 +361,7 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
             }
         }
         let submission = journal.prepare_input(&catalog,
-            ProviderInput::from_text("boundary correction"), provider_id, Some("boundary-message".into()))?;
+            ProviderInput::from_user_text("boundary correction"), provider_id, Some("boundary-message".into()))?;
         let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
             text: "boundary correction".into(), attachments: Vec::new(), submission: Some(submission.clone()),
         }));

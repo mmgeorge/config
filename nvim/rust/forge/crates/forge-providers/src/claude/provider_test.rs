@@ -1,5 +1,6 @@
 //! Provider contract tests against an in-memory Claude Code peer.
 
+use super::process::{ClaudeLauncher, LaunchSpec, SessionStart};
 use super::provider::ClaudeProvider;
 use super::test_peer::{
     PeerHandler, PeerLauncher, lifecycle, result_interrupted, result_success, success, text_message,
@@ -249,6 +250,8 @@ fn prompt_texts_place_the_forge_block_before_the_input() {
     request.context = TurnContext {
         record: "k3f9".into(),
         permissions: None,
+        aside: None,
+        agent: None,
         task: Some(Task::Goal(GoalTask {
             objective: "Ship.".into(),
         })),
@@ -830,6 +833,409 @@ async fn unanswered_interrupt_ends_the_turn() {
             .turn_start(operation_context(), &binding, request)
             .await
             .is_err()
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Interrupting an input the CLI has queued but not started ends the turn without a `result`.
+///
+/// A CLI that is still starting, as after a resume or a fork, queues the first input. An interrupt
+/// then cancels that input: the CLI reports `command_lifecycle cancelled`, lists the input in the
+/// interrupt response, and prints no `result`, because no turn ever ran. The paused clock runs the
+/// interrupt grace period out at once, so a binding that waited for a `result` is invalidated here
+/// and refuses the second turn.
+#[tokio::test(start_paused = true)]
+async fn interrupting_a_queued_input_ends_the_turn_and_keeps_the_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        let mut queued_input: Option<Value> = None;
+        let mut cancelled = false;
+        Box::new(move |frame| {
+            if let Some(uuid) = user_uuid(frame) {
+                if !cancelled {
+                    queued_input = Some(uuid.clone());
+                    return Some(vec![lifecycle(&uuid, "queued")]);
+                }
+                let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+                frames.extend(text_message("msg-1", &["answer"]));
+                frames.push(result_success());
+                frames.push(lifecycle(&uuid, "completed"));
+                return Some(frames);
+            }
+            if frame["request"]["subtype"] == "interrupt" {
+                cancelled = true;
+                let uuid = queued_input
+                    .clone()
+                    .expect("the interrupt follows an input");
+                return Some(vec![
+                    lifecycle(&uuid, "cancelled"),
+                    success(
+                        frame["request_id"].clone(),
+                        json!({"still_queued": [], "cancelled": [uuid]}),
+                    ),
+                ]);
+            }
+            None
+        })
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let queued_receipt = receipt("first");
+    let request = prompt_request(
+        &binding,
+        "turn-1",
+        queued_receipt.clone(),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    // `turn_start` returns once the turn starts natively, which this input never does.
+    let start = tokio::spawn({
+        let provider = provider.clone();
+        let binding = binding.clone();
+        async move {
+            provider
+                .turn_start(operation_context(), &binding, request)
+                .await
+        }
+    });
+    while !queued_receipt.state.lock().unwrap().accepted {
+        tokio::task::yield_now().await;
+    }
+
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(start.await.unwrap(), Err(ProviderError::Cancelled)),
+        "the cancelled input started no turn"
+    );
+
+    let mut request = prompt_request(
+        &binding,
+        "turn-2",
+        receipt("second"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    request.input = forge_provider_api::forge::TurnInput::user(
+        forge_provider_api::input::PromptInput::Text("again".into()),
+    );
+    provider
+        .turn_start(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    let (events, completed) = until_completed(&mut opened.events).await;
+    assert_eq!(streamed_text(&events), "answer");
+    assert!(matches!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
+    ));
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A CLI that never acknowledges an input cannot keep that input's interrupt waiting forever.
+///
+/// A frozen CLI receives the prompt and reports nothing, so the prompt worker is still waiting for
+/// the CLI to acknowledge the prompt when the interrupt arrives. The interrupt bounds that wait by
+/// the interrupt grace period and then invalidates the binding, as it does for a CLI that ignores
+/// an interrupt during a turn. The paused clock runs both that period and this test's outer bound
+/// out at once.
+#[tokio::test(start_paused = true)]
+async fn unacknowledged_input_cannot_outlive_its_interrupt() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        Box::new(move |frame| {
+            // The frozen CLI reads the prompt and the interrupt and answers neither.
+            (user_uuid(frame).is_some() || frame["request"]["subtype"] == "interrupt")
+                .then(Vec::new)
+        })
+    });
+    let (provider, _opened) = open(launcher.clone(), directory.path()).await;
+    let binding = _opened.binding.id.clone();
+    let request = prompt_request(
+        &binding,
+        "turn-1",
+        receipt("first"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    // Harness gives a turn start no deadline, so only the interrupt can end this wait.
+    let (_, start_cancellation) = forge_provider_api::OperationCancellation::channel();
+    let start_context = forge_provider_api::OperationContext::unbounded(
+        forge_provider_api::OperationId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+        start_cancellation,
+    );
+    let start = tokio::spawn({
+        let provider = provider.clone();
+        let binding = binding.clone();
+        async move { provider.turn_start(start_context, &binding, request).await }
+    });
+    while launcher.frames("user").is_empty() {
+        tokio::task::yield_now().await;
+    }
+
+    let interrupt = provider.turn_interrupt(
+        operation_context(),
+        &binding,
+        forge_provider_api::CancelRequest { scope },
+    );
+    let started = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let _ = interrupt.await;
+        start.await.unwrap()
+    })
+    .await
+    .expect("the unacknowledged prompt outlived its interrupt");
+    assert!(
+        started.is_err(),
+        "a prompt the CLI never acknowledged started"
+    );
+
+    let mut request = prompt_request(
+        &binding,
+        "turn-2",
+        receipt("second"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    request.input = forge_provider_api::forge::TurnInput::user(
+        forge_provider_api::input::PromptInput::Text("again".into()),
+    );
+    assert!(
+        provider
+            .turn_start(operation_context(), &binding, request)
+            .await
+            .is_err(),
+        "the binding of a frozen CLI accepted another turn"
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Launch peers as a CLI that holds no transcript, so every resume exits before its handshake.
+///
+/// The real CLI writes a conversation when its first turn runs. Resuming a session id that has
+/// only ever launched prints "No conversation found" and exits.
+struct TranscriptlessLauncher {
+    peers: Arc<PeerLauncher>,
+}
+
+#[async_trait]
+impl ClaudeLauncher for TranscriptlessLauncher {
+    fn available(&self) -> bool {
+        self.peers.available()
+    }
+
+    fn executable(&self) -> std::path::PathBuf {
+        self.peers.executable()
+    }
+
+    async fn version(
+        &self,
+        context: &forge_provider_api::OperationContext,
+    ) -> Result<String, ProviderError> {
+        self.peers.version(context).await
+    }
+
+    fn launch(&self, spec: &LaunchSpec) -> Result<super::transport::ProcessIo, ProviderError> {
+        if !matches!(spec.start, SessionStart::Resume { .. }) {
+            return self.peers.launch(spec);
+        }
+        self.peers
+            .record
+            .lock()
+            .unwrap()
+            .launches
+            .push(spec.arguments());
+        Ok(super::transport::ProcessIo {
+            stdout: Box::new(tokio::io::empty()),
+            stdin: Box::new(tokio::io::sink()),
+            process: None,
+        })
+    }
+}
+
+/// Name how each recorded launch opened its conversation.
+fn session_starts(launcher: &PeerLauncher) -> Vec<String> {
+    launcher
+        .record
+        .lock()
+        .unwrap()
+        .launches
+        .iter()
+        .flat_map(|launch| {
+            launch
+                .iter()
+                .filter(|argument| {
+                    argument.starts_with("--session-id=") || argument.starts_with("--resume=")
+                })
+                .cloned()
+        })
+        .collect()
+}
+
+/// Harness restarts a provider by reopening the session under the id the first open reported. A
+/// CLI replaced before its first turn ran holds no conversation under that id, so the reopen
+/// starts the conversation again instead of failing every later prompt.
+#[tokio::test]
+async fn reopening_a_conversation_the_cli_never_ran_starts_it_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let peers = PeerLauncher::new(|| answering_peer(&["hel", "lo"]));
+    let provider = ClaudeProvider::with_launcher(
+        Arc::new(TranscriptlessLauncher {
+            peers: peers.clone(),
+        }),
+        directory.path().join("runtime"),
+    );
+    let first = provider
+        .thread_open(operation_context(), session_request(directory.path()))
+        .await
+        .unwrap();
+    let session_id = first.binding.provider_session_id.clone().unwrap();
+
+    let mut request = session_request(directory.path());
+    request.history = forge_provider_api::SessionHistory::Durable {
+        resume: Some(session_id.clone()),
+    };
+    let mut reopened = provider
+        .thread_open(operation_context(), request)
+        .await
+        .expect("the conversation the CLI never ran reopens");
+
+    assert_eq!(
+        reopened.binding.provider_session_id.as_ref(),
+        Some(&session_id)
+    );
+    assert_eq!(
+        session_starts(&peers),
+        [
+            format!("--session-id={}", session_id.as_str()),
+            format!("--resume={}", session_id.as_str()),
+            format!("--session-id={}", session_id.as_str()),
+        ]
+    );
+    provider
+        .turn_start(
+            operation_context(),
+            &reopened.binding.id,
+            prompt_request(
+                &reopened.binding.id,
+                "turn-1",
+                receipt("first"),
+                forge_provider_api::permissions::PermissionResponse::Allow,
+            ),
+        )
+        .await
+        .unwrap();
+    let (events, _) = until_completed(&mut reopened.events).await;
+    assert_eq!(streamed_text(&events), "hello");
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A resource change restarts the process on the same session. Before the first turn the CLI
+/// holds no conversation to resume, and the restart must still keep the binding.
+#[tokio::test]
+async fn a_resource_change_before_the_first_turn_keeps_the_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let peers = PeerLauncher::new(|| answering_peer(&["hel", "lo"]));
+    let provider = ClaudeProvider::with_launcher(
+        Arc::new(TranscriptlessLauncher {
+            peers: peers.clone(),
+        }),
+        directory.path().join("runtime"),
+    );
+    let mut opened = provider
+        .thread_open(operation_context(), session_request(directory.path()))
+        .await
+        .unwrap();
+    let mut configuration = session_request(directory.path()).configuration;
+    configuration
+        .resources
+        .mcp
+        .push(forge_provider_api::McpLaunch {
+            name: "remote".into(),
+            transport: forge_provider_api::McpTransport::Http {
+                url: "https://mcp.example.invalid".into(),
+                headers: Default::default(),
+            },
+            timeout: None,
+            working_directory: None,
+            tools: None,
+        });
+
+    provider
+        .thread_configure(operation_context(), &opened.binding.id, configuration)
+        .await
+        .expect("the resource change restarts a conversation the CLI never ran");
+
+    provider
+        .turn_start(
+            operation_context(),
+            &opened.binding.id,
+            prompt_request(
+                &opened.binding.id,
+                "turn-1",
+                receipt("first"),
+                forge_provider_api::permissions::PermissionResponse::Allow,
+            ),
+        )
+        .await
+        .unwrap();
+    let (events, _) = until_completed(&mut opened.events).await;
+    assert_eq!(streamed_text(&events), "hello");
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A conversation whose turn ran is on disk, so a failed resume of it is a real failure: starting
+/// it again under the same id would replace the history Harness still shows.
+#[tokio::test]
+async fn a_conversation_that_ran_a_turn_is_never_started_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let peers = PeerLauncher::new(|| answering_peer(&["hel", "lo"]));
+    let provider = ClaudeProvider::with_launcher(
+        Arc::new(TranscriptlessLauncher {
+            peers: peers.clone(),
+        }),
+        directory.path().join("runtime"),
+    );
+    let mut opened = provider
+        .thread_open(operation_context(), session_request(directory.path()))
+        .await
+        .unwrap();
+    let session_id = opened.binding.provider_session_id.clone().unwrap();
+    provider
+        .turn_start(
+            operation_context(),
+            &opened.binding.id,
+            prompt_request(
+                &opened.binding.id,
+                "turn-1",
+                receipt("first"),
+                forge_provider_api::permissions::PermissionResponse::Allow,
+            ),
+        )
+        .await
+        .unwrap();
+    until_completed(&mut opened.events).await;
+
+    let mut request = session_request(directory.path());
+    request.history = forge_provider_api::SessionHistory::Durable {
+        resume: Some(session_id.clone()),
+    };
+    let reopened = provider.thread_open(operation_context(), request).await;
+
+    assert!(matches!(
+        reopened,
+        Err(ProviderError::Failure(failure))
+            if failure.kind() == forge_provider_api::ProviderFailureKind::Initialization
+    ));
+    assert_eq!(
+        session_starts(&peers),
+        [
+            format!("--session-id={}", session_id.as_str()),
+            format!("--resume={}", session_id.as_str()),
+        ]
     );
     provider.shutdown(operation_context()).await.unwrap();
 }

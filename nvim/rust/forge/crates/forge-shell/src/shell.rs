@@ -60,6 +60,8 @@ pub enum CommandAnalysisFailure {
     Syntax,
     /// Valid syntax whose execution cannot be resolved by the analyzer.
     Unsupported(String),
+    /// Literal command names unavailable to side-effect-free host discovery.
+    UnresolvedCommands(Vec<String>),
     /// Analysis could not finish or preserve executable source coordinates.
     Incomplete(String),
 }

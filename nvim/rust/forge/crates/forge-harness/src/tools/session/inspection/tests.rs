@@ -128,3 +128,45 @@ fn search_respects_workspace_read_boundary_and_explicit_denials() -> Result<()> 
     assert!(!scope.allowed(&fixture.scope.session.workspace)?);
     Ok(())
 }
+
+/// Report an unfinished exchange's commentary, the only account of a turn that is still running.
+#[test]
+fn unfinished_exchange_reports_its_commentary() -> Result<()> {
+    use crate::turn::test_support::{TestTurn, address, message};
+    let fixture = Fixture::new()?;
+    let address = address(
+        &exchange(&fixture.scope.session, "running", "Fix the build"),
+        "turn",
+    );
+    let mut running = TestTurn::new("turn".into(), address.clone(), 2).into_exchange();
+    running.ordinal = 2;
+    running.observe_event(
+        &message(
+            &address,
+            "note",
+            Some(forge_provider_api::AgentMessageRole::Commentary),
+            "Reading the build log",
+        ),
+        3,
+    )?;
+    SqliteStore::open(fixture.root.path())?.save_exchange(&running)?;
+    let commentary = |exchange_id: &str| -> Result<Vec<Value>> {
+        Ok(fixture.invoke(
+            "harness_session_exchange",
+            json!({"exchange_id": exchange_id}),
+        )?["items"]
+            .as_array()
+            .context("exchange items missing")?
+            .iter()
+            .filter(|item| item["kind"] == "commentary")
+            .cloned()
+            .collect())
+    };
+    assert_eq!(
+        commentary("running")?,
+        [json!({"kind":"commentary","turn_id":"turn","text":"Reading the build log"})]
+    );
+    // A finished exchange is summarized by its final answer instead.
+    assert!(commentary("exchange")?.is_empty());
+    Ok(())
+}

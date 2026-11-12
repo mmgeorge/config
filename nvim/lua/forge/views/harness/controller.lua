@@ -1051,8 +1051,31 @@ function M.rename_session(name)
   end)
 end
 
+---Send the question that opened an aside as the aside's first input.
+---
+---The host holds the input until the aside's provider fork is ready, so the question is
+---submitted as soon as the aside's view is bound to its session.
+---@param aside_state table
+---@param aside_session_id string?
+---@param prompt string
+local function submit_aside_prompt(aside_state, aside_session_id, prompt)
+  local input = aside_state.input
+  if not (aside_session_id and input and input.session_id == aside_session_id) then
+    -- The fork answered after its tab closed, so no view exists to queue the question in.
+    notifications.warn("The aside opened after its tab closed, so its question was not sent. "
+      .. "Resume the aside from /sessions and ask again: " .. prompt, "Harness aside")
+    return
+  end
+  input_state.submit(aside_state, prompt, {}, "auto")
+end
+
+---@class ForgeHarnessForkOptions
+---@field aside_prompt string? Opens the fork as an aside of the current session and sends this question to it.
+
 ---@param name? string
-function M.fork_session(name)
+---@param options? ForgeHarnessForkOptions
+function M.fork_session(name, options)
+  local aside_prompt = options and options.aside_prompt
   local state = harness_state()
   local active_session = state.session
   if not (active_session and active_session.id) then
@@ -1065,6 +1088,7 @@ function M.fork_session(name)
   end
   local params = { session_id = active_session.id }
   if name and name ~= "" then params.name = name end
+  if aside_prompt then params.aside = true end
   local fork_started = perf.now()
   local pending = session_navigation.begin_fork(active_session, name)
   perf.event("harness", "harness.fork.ui_opened", {
@@ -1096,6 +1120,9 @@ function M.fork_session(name)
       })
     end
     session_navigation.complete_fork(pending, result)
+    if aside_prompt then
+      submit_aside_prompt(pending.state, result.session and result.session.id, aside_prompt)
+    end
   end)
 end
 
@@ -1724,6 +1751,11 @@ function M.submit()
     notifications.warn("Describe the goal after /goal", "ForgeHarness")
     return
   end
+  if text == "/btw" then
+    restore_composer_prompt("/btw ")
+    notifications.warn("Ask a question after /btw", "ForgeHarness")
+    return
+  end
   if text == "/plan accept on" or text == "/plan accept off" then
     M.task_transition({ action = "plan_accept", enabled = text == "/plan accept on" }, text)
     return
@@ -1853,7 +1885,7 @@ function M.submit()
   end
   if text == "/new" or text == "/clear" then
     set_composer_text(state.composer_buf, "")
-    require("forge.views.harness").new_session()
+    require("forge.views.harness").new_session(nil, { open_mode = text == "/clear" and "current" or "tab" })
     return
   end
   if text == "/questions" then
@@ -1938,6 +1970,12 @@ function M.submit()
   if fork_name then
     set_composer_text(state.composer_buf, "")
     M.fork_session(vim.trim(fork_name))
+    return
+  end
+  local aside_prompt = text:match("^/btw%s+(.+)$")
+  if aside_prompt then
+    set_composer_text(state.composer_buf, "")
+    M.fork_session(nil, { aside_prompt = vim.trim(aside_prompt) })
     return
   end
   local new_name = text:match("^/new%s+(.+)$")

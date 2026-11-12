@@ -1,4 +1,5 @@
 pub mod command;
+mod command_adapter;
 pub mod directory;
 pub mod document;
 pub mod matcher;

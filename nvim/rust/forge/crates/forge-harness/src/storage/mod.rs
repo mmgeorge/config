@@ -1406,6 +1406,7 @@ pub(crate) mod test {
 
     pub(crate) fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {
+            aside: None,
             purpose: crate::session::SessionPurpose::Conversation,
             id: id.into(),
             primary_agent_id: HarnessSession::primary_agent_id(id),

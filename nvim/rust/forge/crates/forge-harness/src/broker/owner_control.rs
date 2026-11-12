@@ -76,6 +76,7 @@ impl HarnessBroker {
             acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
+            child_agent: None,
         })
     }
 

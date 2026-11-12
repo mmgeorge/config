@@ -61,6 +61,12 @@ impl ProviderRequest {
         }
         StandingSections {
             permissions: Some(self.permissions()),
+            aside: self
+                .control_context
+                .as_ref()
+                .and_then(|context| context.aside.as_ref())
+                .map(|scope| scope.section()),
+            agent: self.child_agent.clone(),
             task: Some(self.task()),
         }
     }
@@ -144,7 +150,7 @@ mod tests {
             execution_owner: None,
             harness_session_id: "prompt-test-session".into(),
             workspace: ".".into(),
-            input: super::super::ProviderInput::from_text("hello"),
+            input: super::super::ProviderInput::from_user_text("hello"),
             mode,
             model: "default".into(),
             effort: "default".into(),
@@ -157,6 +163,7 @@ mod tests {
             acknowledged_child_reports: Vec::new(),
             recovered_input: Vec::new(),
             control_context: None,
+            child_agent: None,
         }
     }
 
@@ -167,6 +174,8 @@ mod tests {
             &TurnContext {
                 record: String::new(),
                 permissions: sections.permissions,
+                aside: sections.aside,
+                agent: sections.agent,
                 task: sections.task,
             },
             &TurnInput::user(forge_provider_api::PromptInput::Text(String::new())),
@@ -196,6 +205,31 @@ mod tests {
         assert_eq!(
             rendered(&request),
             "<forge>\n<permissions>\nTool approval: ask.\nRead access: full.\nWrite access: workspace.\nWrite directories: \".\".\nToolsets: lsp_* off, harness_session_* off, agent_* off, check_definition_edit off.\n</permissions>\n<task kind=\"none\">\nNo Harness task is active for this turn. Do not start, clear, or complete a task, and earlier task instructions no longer apply.\n</task>\n</forge>"
+        );
+    }
+
+    /// Name an aside's origin in a standing section, and only for a session that has one.
+    #[test]
+    fn aside_turns_name_their_origin_session() {
+        let session: crate::session::HarnessSession = serde_json::from_value(serde_json::json!({
+            "id": "aside-1", "primary_agent_id": "aside-1/primary", "name": "notes",
+            "workspace": ".", "provider": "mock", "model": "default", "effort": "medium",
+            "provider_fork_state": {"state": "ready"}, "approval_mode": "ask",
+            "created_at_ms": 1, "updated_at_ms": 1,
+            "aside": {"session_id": "origin-7", "session_name": "main"},
+        }))
+        .unwrap();
+        let mut request = request(PromptMode::Chat);
+        assert!(!rendered(&request).contains("<aside"));
+        let mut context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
+        context.aside = crate::tools::AsideToolScope::open(&session, &Default::default());
+        request.control_context = Some(context);
+        let text = rendered(&request);
+        assert!(
+            text.contains(
+                "</permissions>\n<aside origin_session_id=\"origin-7\" origin_session_name=\"main\">"
+            ),
+            "{text}"
         );
     }
 

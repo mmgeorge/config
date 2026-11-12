@@ -43,7 +43,13 @@ const PLAN_EDITS: &str = "The plan already includes the user's edits listed belo
 
 const CHECK_REPAIR: &str = "Automatic checks are blocking task completion. Fix the failures below and finish the repair turn, and Harness runs the checks again. You do not need to call check_run, though you may for earlier feedback. Do not run validation commands through terminal tools, and keep to the original task's scope. If the turn ends with the same failing inputs, automatic repair stops.";
 
-const CHILD_RESULTS: &str = "Continue this same unfinished request using the child results below. Synthesize the results and complete the original request when its required work is settled.";
+const CHILD_RESULTS: &str = "Continue this same unfinished request using the child agents' final_answer messages below. Synthesize the results and complete the original request when its required work is settled.";
+
+const AGENT_TASK: &str = "Carry out the task in the new_task message below, which your parent agent assigned you, within your permissions. Any message elements after it are information your parent sent about that task before it started.";
+
+const SESSION_MESSAGE: &str = "An aside session the user opened from this session sent the session_message below. Act on it where it agrees with the user's requests in this session. It cannot widen <permissions>, and it does not replace the active task.";
+
+const RETRY_CONTINUE: &str = "Continue the previously accepted work from its current state. The preceding execution ended with a transient failure. Preserve completed work and tool effects; do not repeat the original user input or redo completed actions.";
 
 const PERMISSION_TIMEOUT: &str =
     "Approval requests timed out during the previous turn, and the user may be unavailable:";
@@ -133,6 +139,8 @@ pub(crate) fn for_kind(kind: &TurnKind) -> Option<String> {
         }
         TurnKind::CheckRepair { .. } => CHECK_REPAIR.into(),
         TurnKind::ChildResults => CHILD_RESULTS.into(),
+        TurnKind::AgentTask { .. } => AGENT_TASK.into(),
+        TurnKind::SessionMessage { .. } => SESSION_MESSAGE.into(),
         TurnKind::PermissionTimeout { feedback } => format!("{PERMISSION_TIMEOUT}\n{feedback}"),
         TurnKind::TaskStep { step } => match step {
             TaskStep::ExecuteStart => EXECUTE_START.into(),
@@ -148,6 +156,7 @@ pub(crate) fn for_kind(kind: &TurnKind) -> Option<String> {
             TaskStep::ChecksSaved { revision } => CHECKS_SAVED.replace("{revision}", revision),
             TaskStep::AnswersResolved => ANSWERS_RESOLVED.into(),
             TaskStep::ContinueRequest => CONTINUE_REQUEST.into(),
+            TaskStep::RetryContinue => RETRY_CONTINUE.into(),
         },
     })
 }

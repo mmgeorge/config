@@ -77,6 +77,8 @@ pub(crate) struct ForegroundAdmission {
 enum AdmissionCollection {
     Collecting(ForegroundCollection),
     Collected(ForegroundCollection),
+    /// The owner's collection ended without proving the provider idle.
+    Failed(ForegroundCollection),
 }
 
 enum AdmissionPhase {
@@ -414,16 +416,41 @@ impl ForegroundAdmission {
     fn record_owner_collection(&mut self, next: AdmissionCollection) -> Result<()> {
         let disposition = match &next {
             AdmissionCollection::Collecting(disposition)
-            | AdmissionCollection::Collected(disposition) => disposition,
+            | AdmissionCollection::Collected(disposition)
+            | AdmissionCollection::Failed(disposition) => disposition,
         };
         if let Some(
-            AdmissionCollection::Collecting(prior) | AdmissionCollection::Collected(prior),
+            AdmissionCollection::Collecting(prior)
+            | AdmissionCollection::Collected(prior)
+            | AdmissionCollection::Failed(prior),
         ) = &self.collection
         {
             anyhow::ensure!(prior == disposition, "admission collection owner changed");
         }
         self.collection = Some(next);
         Ok(())
+    }
+
+    /// Record that the owner's collection ended without proving the provider idle.
+    ///
+    /// Only a collection still in progress fails: positive evidence already recorded stands, and
+    /// a turn the owner never collected has nothing to release.
+    pub(super) fn fail_owner_collection(&mut self) {
+        if let Some(AdmissionCollection::Collecting(disposition)) = self.collection {
+            self.collection = Some(AdmissionCollection::Failed(disposition));
+        }
+    }
+
+    /// Report whether the owner started collecting this admission, whatever the result.
+    pub(super) fn owner_collection_requested(&self) -> bool {
+        self.collection.is_some()
+    }
+
+    /// Report whether the owner's collection ended without proving the provider idle.
+    ///
+    /// Settlement must then treat the native turn's input as possibly consumed.
+    pub(super) fn owner_collection_failed(&self) -> bool {
+        matches!(self.collection, Some(AdmissionCollection::Failed(_)))
     }
 
     /// Report whether the owner still retains native collection work.
@@ -438,6 +465,7 @@ impl ForegroundAdmission {
             Some(
                 AdmissionCollection::Collecting(ForegroundCollection::Restart)
                     | AdmissionCollection::Collected(ForegroundCollection::Restart)
+                    | AdmissionCollection::Failed(ForegroundCollection::Restart)
             )
         )
     }
@@ -1431,7 +1459,7 @@ impl HarnessBroker {
             crate::input::InputPurpose::Question { reply, .. } => {
                 ProviderInput::question_reply(reply.clone())
             }
-            _ => ProviderInput::from_text(text.clone()),
+            _ => ProviderInput::from_user_text(text.clone()),
         };
         self.stage_foreground_interaction(&text, mode, None, input)
             .map(Some)
@@ -1456,7 +1484,7 @@ impl HarnessBroker {
                 crate::input::InputPurpose::Question { reply, .. } => {
                     ProviderInput::question_reply(reply.clone())
                 }
-                _ => ProviderInput::from_text(text),
+                _ => ProviderInput::from_user_text(text),
             };
             return self.stage_foreground_interaction(
                 &visible,
@@ -1475,7 +1503,7 @@ impl HarnessBroker {
                 "question continuation cannot replace an active task"
             );
             let input = admission.turn.clone().map_or_else(
-                || ProviderInput::from_text(text.clone()),
+                || ProviderInput::from_user_text(text.clone()),
                 ProviderInput::new,
             );
             return self.stage_foreground_interaction(
@@ -1571,7 +1599,7 @@ impl HarnessBroker {
                     .and_then(|continuation| continuation.work.instruction().cloned()),
             });
             let input = typed.map_or_else(
-                || ProviderInput::from_text(text.clone()),
+                || ProviderInput::from_user_text(text.clone()),
                 ProviderInput::new,
             );
             return self.stage_foreground_interaction(
@@ -1991,7 +2019,7 @@ impl HarnessBroker {
         };
         let request = crate::provider::ProviderCompactionRequest {
             id: compaction.id.clone(),
-            request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+            request: self.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?,
         };
         self.store.save_session_event(&record)?;
         let patch = self.reconcile_timeline()?;
@@ -2356,14 +2384,18 @@ mod tests {
             &catalog,
         )?;
         let configuration = TaskInvocationConfiguration { model: Some(model) };
-        let mut task =
-            broker.provider_request(ProviderInput::from_text("task input"), PromptMode::Chat)?;
+        let mut task = broker.provider_request(
+            ProviderInput::from_user_text("task input"),
+            PromptMode::Chat,
+        )?;
         configuration.apply(&broker.session, &mut task);
         assert_eq!(task.model, "task-executor");
         assert_eq!(task.effort, "high");
         assert_eq!(task.approval_mode, before.approval_mode);
-        let ordinary = broker
-            .provider_request(ProviderInput::from_text("ordinary input"), PromptMode::Chat)?;
+        let ordinary = broker.provider_request(
+            ProviderInput::from_user_text("ordinary input"),
+            PromptMode::Chat,
+        )?;
         assert_eq!(ordinary.model, before.model);
         assert_eq!(ordinary.effort, before.effort);
         assert_eq!(ordinary.approval_mode, before.approval_mode);

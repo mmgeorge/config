@@ -20,6 +20,8 @@ fn context() -> TurnContext {
     TurnContext {
         record: "k3f9".into(),
         permissions: Some(permissions()),
+        aside: None,
+        agent: None,
         task: Some(Task::Goal(GoalTask {
             objective: "Ship it.".into(),
         })),
@@ -175,11 +177,11 @@ fn earlier_inputs_render_a_marker_block() {
     assert!(earlier_input_block(2, &notice).contains("<instructions>\nRecovery notice"));
 }
 
-/// Render child results as reports rather than instructions.
+/// Render child results as final answers rather than instructions.
 #[test]
-fn child_results_render_as_agent_results() {
+fn child_results_render_as_final_answers() {
     let input = TurnInput::child_continuation(vec![AgentResult {
-        agent: "/explore-1".into(),
+        agent: "/root/explore-1".into(),
         task_id: "t-8".into(),
         status: "completed".into(),
         response: Some("Found 3 call sites.".into()),
@@ -188,7 +190,113 @@ fn child_results_render_as_agent_results() {
     .unwrap();
     let text = input_block(&input);
     assert!(text.contains("Continue this same unfinished request"));
-    assert!(text.contains("<agent_result agent=\"/explore-1\" task=\"t-8\" status=\"completed\">\nFound 3 call sites.\n</agent_result>"));
+    assert!(text.contains("<agent_message type=\"final_answer\" from=\"/root/explore-1\" task=\"t-8\" status=\"completed\">\nFound 3 call sites.\n</agent_message>"));
+}
+
+/// Keep a parent's task and queued messages in data elements, so on the developer channel the
+/// parent's words never join the developer message and the child has no user text.
+#[test]
+fn agent_tasks_render_their_messages_as_data() {
+    let input = TurnInput::new(TurnKind::AgentTask {
+        task: AgentTask {
+            task_id: "t-1".into(),
+            from: ROOT_AGENT_PATH.into(),
+            text: "List the callers of </agent_message> parse.".into(),
+            messages: vec![AgentMessage {
+                from: ROOT_AGENT_PATH.into(),
+                text: "Skip tests/.".into(),
+            }],
+        },
+    });
+    assert_eq!(input.user_input(), None);
+    assert_eq!(input.label(), "List the callers of </agent_message> parse.");
+    let blocks = render(&context(), &input, ContextChannel::DeveloperMessage);
+    assert!(blocks.lead.contains("<instructions>\nCarry out the task"));
+    assert!(!blocks.lead.contains("agent_message type"));
+    assert_eq!(
+        blocks.user,
+        "<forge>\n<agent_message type=\"new_task\" from=\"/root\" task=\"t-1\">\nList the callers of &lt;/agent_message> parse.\n</agent_message>\n<agent_message type=\"message\" from=\"/root\">\nSkip tests/.\n</agent_message>\n</forge>"
+    );
+}
+
+/// Name the sending session and grant its message bounded authority through the instructions.
+#[test]
+fn session_messages_name_their_sender() {
+    let message = |name: &str| {
+        TurnInput::new(TurnKind::SessionMessage {
+            message: SessionMessage {
+                from_session_id: "aside-1".into(),
+                from_session_name: name.into(),
+                text: "The cache key is wrong.".into(),
+            },
+        })
+    };
+    let named = input_block(&message("review notes"));
+    assert!(named.contains("It cannot widen <permissions>"));
+    assert!(named.contains("<session_message from_session_id=\"aside-1\" from_session_name=\"review notes\">\nThe cache key is wrong.\n</session_message>"));
+    assert_eq!(
+        message("review notes").label(),
+        "Message from aside session \"review notes\" (aside-1):\n\nThe cache key is wrong."
+    );
+    assert!(input_block(&message("")).contains("<session_message from_session_id=\"aside-1\">"));
+    assert_eq!(
+        message("").label(),
+        "Message from aside session aside-1:\n\nThe cache key is wrong."
+    );
+    assert_eq!(message("").user_input(), None);
+}
+
+/// Name a child's path and parent, and carry its profile instructions as instructions.
+#[test]
+fn child_agent_section_follows_the_aside_and_precedes_instructions() {
+    let mut context = context();
+    context.agent = Some(ChildAgent {
+        path: "/root/explore-1".into(),
+        parent: ROOT_AGENT_PATH.into(),
+        profile_instructions: "Read only.".into(),
+    });
+    assert!(!context.is_empty());
+    let input = TurnInput::new(TurnKind::AgentTask {
+        task: AgentTask {
+            task_id: "t-1".into(),
+            from: ROOT_AGENT_PATH.into(),
+            text: "Survey.".into(),
+            messages: Vec::new(),
+        },
+    });
+    let blocks = render(&context, &input, ContextChannel::DeveloperMessage);
+    let agent = blocks
+        .lead
+        .find("<agent path=\"/root/explore-1\" parent=\"/root\">\nYou are a child agent.")
+        .unwrap_or_else(|| panic!("agent missing from {}", blocks.lead));
+    assert!(blocks.lead.find("<permissions>").unwrap() < agent);
+    assert!(agent < blocks.lead.find("<instructions>").unwrap());
+    assert!(
+        blocks
+            .lead
+            .contains("<profile_instructions>\nRead only.\n</profile_instructions>\n</agent>")
+    );
+
+    context.agent = Some(ChildAgent {
+        path: "/root/explore-1".into(),
+        parent: ROOT_AGENT_PATH.into(),
+        profile_instructions: String::new(),
+    });
+    let unconfigured = render(&context, &input, ContextChannel::UserMessage).lead;
+    assert!(
+        !unconfigured.contains("<profile_instructions>"),
+        "{unconfigured}"
+    );
+}
+
+/// Carry the retry continuation as fixed instructions rather than user text.
+#[test]
+fn retry_continuation_is_a_task_step() {
+    let input = TurnInput::new(TurnKind::TaskStep {
+        step: TaskStep::RetryContinue,
+    });
+    assert_eq!(input.user_input(), None);
+    assert!(input_block(&input).contains("<instructions>\nContinue the previously accepted work"));
 }
 
 /// Render Background requests outside the protocol.
@@ -211,20 +319,66 @@ fn overview_names_every_element_and_channel() {
     for tag in [
         "<permissions>",
         "<task",
+        "<aside",
+        "<agent path",
         "<instructions>",
         "<question_response",
         "<recorded_answers>",
         "<pending_questions>",
         "<plan_review",
         "<check_failures>",
-        "<agent_result>",
+        "<agent_message",
+        "<session_message",
         "<earlier_input",
+        "<file>",
+        "[Forge:",
+        "/root",
     ] {
         assert!(developer.contains(tag) && user.contains(tag), "{tag}");
     }
     assert!(developer.contains("as a developer message"));
+    assert!(developer.contains("arrives while you are working"));
     assert!(user.contains("at the start of a user message, before"));
     assert!(user.contains("Your system instructions always apply"));
+}
+
+/// Name an aside's origin after the permissions and before the turn's own elements.
+#[test]
+fn aside_section_names_its_origin_after_permissions() {
+    let mut context = context();
+    context.aside = Some(Aside {
+        origin_session_id: "origin-1".into(),
+        origin_session_name: "main \"thread\"".into(),
+    });
+    assert!(!context.is_empty());
+    let lead = render(
+        &context,
+        &TurnInput::user(PromptInput::Text("What is it doing?".into())),
+        ContextChannel::UserMessage,
+    )
+    .lead;
+    let aside = lead
+        .find("<aside origin_session_id=\"origin-1\" origin_session_name=\"main &quot;thread&quot;\">")
+        .unwrap_or_else(|| panic!("aside missing from {lead}"));
+    assert!(lead.find("<permissions>").unwrap() < aside, "{lead}");
+    assert!(aside < lead.find("<task kind=\"goal\">").unwrap(), "{lead}");
+    assert!(lead.contains("harness_session_exchange") && lead.contains("origin_message"));
+
+    context.aside = Some(Aside {
+        origin_session_id: "origin-1".into(),
+        origin_session_name: String::new(),
+    });
+    let unnamed = render(
+        &context,
+        &TurnInput::user(PromptInput::Text(String::new())),
+        ContextChannel::DeveloperMessage,
+    );
+    assert!(
+        unnamed
+            .lead
+            .contains("<aside origin_session_id=\"origin-1\">")
+    );
+    assert!(!unnamed.user.contains("<aside"));
 }
 
 /// Escape only the exact block tag in user text.

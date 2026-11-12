@@ -400,6 +400,30 @@ above its fork marker. New child messages append below that marker. Source updat
 not change the copied history, and pending questions, tasks, and agents do not resume
 in the child. Inherited question and plan controls are inactive.
 
+`/fork` works while the source is running a turn. The child then stops at the source's
+last finished exchange, and its fork marker reads "Forked before the unfinished
+exchange of" the source. A source still running its first turn has nothing finished to copy, so its
+child starts empty. Two cases are refused with a message and create no session: the
+source has child agents running, or the source is itself a fork that has not finished
+its first turn. If the provider fork fails, the child keeps its tab, and sending or
+retrying a message in it attempts the fork again.
+
+`/btw <question>` opens an aside: a fork in a new tab whose agent is told that you are
+asking about the session you came from. The question is sent to the aside at once, and
+the origin session keeps running undisturbed. The aside's agent reads the origin's
+history, including its running exchange, through the session history tools, which stay
+on in an aside regardless of `/config`. It can also send the origin a message with its
+`origin_message` tool, for example to pass on a finding. The message appears in the
+origin's queue labeled with the aside's name and ID, and runs after the origin's current
+turn; the agent can instead steer it into the running turn. The origin's agent receives
+it as a message from the aside rather than as your own words, so it acts on the message
+only where it agrees with what you asked in the origin, and the message cannot widen the
+origin's permissions. An
+aside is an ordinary session in every other respect: continue the conversation, give
+it unrelated work, or resume it later from `/sessions`. A fork of an aside remains an
+aside of the same origin. `/btw` follows the same rules as `/fork` for a running
+source.
+
 | Command | Arguments | Behavior |
 | --- | --- | --- |
 | `:ForgeHarness` | None | Open the Harness |

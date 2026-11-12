@@ -84,27 +84,7 @@ pub(crate) fn path_starts_with(path: &Path, root: &Path) -> bool {
 
 fn command_pattern_score(pattern: &str, invocation: &CommandInvocation) -> Option<usize> {
     let pattern_token_list = command_token_list(pattern).ok()?;
-    let wildcard = pattern_token_list.last().is_some_and(|token| token == "*");
-    let literal_count = pattern_token_list
-        .len()
-        .saturating_sub(usize::from(wildcard));
-    if literal_count == 0 {
-        return (pattern_token_list.len() == 1 && wildcard).then_some(0);
-    }
-    if invocation.token_list.len() < literal_count {
-        return None;
-    }
-    let matches = pattern_token_list[..literal_count]
-        .iter()
-        .zip(&invocation.token_list)
-        .all(|(expected, actual)| {
-            if invocation.shell == CommandShell::PowerShell {
-                expected.eq_ignore_ascii_case(actual)
-            } else {
-                expected == actual
-            }
-        });
-    matches.then_some(literal_count * 2 + usize::from(!wildcard))
+    super::command_adapter::pattern_score(&pattern_token_list, invocation)
 }
 
 fn qualified_pattern_score(pattern: &str, target: &str) -> Option<usize> {
@@ -328,6 +308,163 @@ mod test {
 
     fn compiled(source: &str) -> CompiledPermissionDocument {
         CompiledPermissionDocument::compile(parse_permission_document(source).unwrap(), "D:/repo")
+    }
+
+    /// Match Git operations through supported prefixes in every shell without changing source.
+    #[test]
+    fn git_adapter_matches_supported_prefixes_and_preserves_source() {
+        let policy =
+            compiled(r#"{"permission":{"bash":{"git ls-files":"allow","git commit":"deny"}}}"#);
+        for shell in [
+            CommandShell::PowerShell,
+            CommandShell::Bash,
+            CommandShell::Zsh,
+            CommandShell::Nushell,
+        ] {
+            for command in [
+                "git -C repo ls-files",
+                "git --no-pager ls-files",
+                "git -C 'repo space' --no-pager ls-files --cached",
+                "git --no-pager -C root -C child ls-files",
+                "git -C '' ls-files",
+            ] {
+                let result = policy
+                    .evaluate(&PermissionRequest {
+                        id: "git-adapter".into(),
+                        provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                        reason: None,
+                        target_list: vec![PermissionTarget::Command {
+                            command: command.into(),
+                            shell: Some(shell),
+                        }],
+                    })
+                    .unwrap();
+                assert_eq!(
+                    result.decision,
+                    PermissionDecision::Allow,
+                    "{shell:?}: {command}"
+                );
+            }
+        }
+        for (command, decision) in [
+            (r"git -C D:\config ls-files", PermissionDecision::Allow),
+            (
+                "git -C repo ls-files; git --no-pager -C repo commit -m test",
+                PermissionDecision::Deny,
+            ),
+            ("git --no-pager -C repo clean -fd", PermissionDecision::Ask),
+        ] {
+            let result = policy
+                .evaluate(&PermissionRequest {
+                    id: "git-source".into(),
+                    provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                    reason: None,
+                    target_list: vec![PermissionTarget::Command {
+                        command: command.into(),
+                        shell: Some(CommandShell::PowerShell),
+                    }],
+                })
+                .unwrap();
+            assert_eq!(result.decision, decision, "{command}");
+            if decision == PermissionDecision::Ask {
+                assert_eq!(result.pending_command_list[0].source, command);
+                assert_eq!(
+                    result.pending_command_list[0].source_range,
+                    0..command.len()
+                );
+                assert_eq!(
+                    result.pending_target_list[0],
+                    PermissionTarget::Command {
+                        command: command.into(),
+                        shell: Some(CommandShell::PowerShell),
+                    }
+                );
+            }
+        }
+    }
+
+    /// Keep unknown global options and all subcommand arguments visible to ordinary rules.
+    #[test]
+    fn git_adapter_does_not_strip_unrecognized_or_subcommand_options() {
+        let policy = compiled(
+            r#"{"permission":{"bash":{"git ls-files":"allow","git branch --list":"allow","git -c color.ui=false ls-files":"allow"}}}"#,
+        );
+        for (command, expected) in [
+            ("git -c color.ui=false ls-files", PermissionDecision::Allow),
+            (
+                "git -c core.sshCommand=custom ls-files",
+                PermissionDecision::Ask,
+            ),
+            (
+                "git -C repo -c color.ui=false ls-files",
+                PermissionDecision::Ask,
+            ),
+            (
+                "git --config-env=name=ENV ls-files",
+                PermissionDecision::Ask,
+            ),
+            ("git --exec-path=custom ls-files", PermissionDecision::Ask),
+            ("git --git-dir=custom ls-files", PermissionDecision::Ask),
+            ("git --work-tree=custom ls-files", PermissionDecision::Ask),
+            ("git --paginate ls-files", PermissionDecision::Ask),
+            ("git -Crepo ls-files", PermissionDecision::Ask),
+            ("git -C", PermissionDecision::Ask),
+            ("git --no-pager", PermissionDecision::Ask),
+            ("git -C repo branch --list", PermissionDecision::Allow),
+            ("git -C repo branch --delete topic", PermissionDecision::Ask),
+            (
+                "git -C repo branch --no-pager --list",
+                PermissionDecision::Ask,
+            ),
+        ] {
+            let result = policy
+                .evaluate(&PermissionRequest {
+                    id: "git-options".into(),
+                    provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                    reason: None,
+                    target_list: vec![PermissionTarget::Command {
+                        command: command.into(),
+                        shell: Some(CommandShell::PowerShell),
+                    }],
+                })
+                .unwrap();
+            assert_eq!(result.decision, expected, "{command}");
+        }
+    }
+
+    /// Retain context constraints and priority when options are reordered or repeated.
+    #[test]
+    fn git_adapter_preserves_explicit_context_rules() {
+        let policy = compiled(
+            r#"{"permission":{"bash":{"git ls-files":"allow","git -C secret ls-files":"deny","git --no-pager diff":"deny","git diff":"allow","git -C root -C child ls-files":"deny"}}}"#,
+        );
+        for (command, expected) in [
+            (
+                "git --no-pager -C secret ls-files",
+                PermissionDecision::Deny,
+            ),
+            ("git -C public ls-files", PermissionDecision::Allow),
+            (
+                "git -C root --no-pager -C child ls-files",
+                PermissionDecision::Deny,
+            ),
+            ("git -C root -C other ls-files", PermissionDecision::Allow),
+            ("git -C repo --no-pager diff", PermissionDecision::Deny),
+            ("git -C repo diff", PermissionDecision::Allow),
+        ] {
+            let result = policy
+                .evaluate(&PermissionRequest {
+                    id: "git-context".into(),
+                    provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                    reason: None,
+                    target_list: vec![PermissionTarget::Command {
+                        command: command.into(),
+                        shell: Some(CommandShell::PowerShell),
+                    }],
+                })
+                .unwrap();
+            assert_eq!(result.decision, expected, "{command}");
+        }
     }
 
     /// Allow built-in tools by default while retaining explicit policy and resource checks.

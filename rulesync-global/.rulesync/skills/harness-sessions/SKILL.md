@@ -41,6 +41,10 @@ Start with `harness_config` and `harness_session_status`. Compare the relevant e
 
 The Tools section of `/config` controls Session history. When disabled, all `harness_session_*` tools disappear and calls are rejected. `harness_config` and this skill remain available. Background requests have neither inspection tools nor selected skills.
 
+## Inspect an origin session from an aside
+
+An aside session, opened with `/btw`, carries a standing `<aside>` section that names its origin session. The `harness_session_*` tools stay available in an aside regardless of `/config`. Pass the origin's ID as `session_id`: `harness_session_exchange_list` lists its exchanges and marks any that is not complete with its `state`, so a `running` newest exchange means the origin is still working, and `harness_session_exchange` on that exchange returns the activity recorded so far, including `commentary` items for assistant text of a turn that has not finished. `harness_session_status` reports the origin's task and access, not whether it is executing. Re-read rather than assume, because the origin keeps working. `origin_message` sends the origin a labeled user message; use it when the user asks, or to deliver a result the origin needs, not to narrate.
+
 ## Retrieval contract
 
 All session-specific tools default to the current session when `session_id` is omitted. Unfiltered listing/search instead considers all accessible sessions. Tools never switch the active conversation or adopt another session's permissions.

@@ -11,8 +11,8 @@ use super::transport::{FrameHandler, TransportFailure};
 use super::wire::content::{ContentBlock, ToolResultBlock, ToolUseBlock, UserContent};
 use super::wire::control::{CanUseTool, InboundControl, InboundControlRequest, PermissionDecision};
 use super::wire::stdout::{
-    AssistantFrame, CommandState, ResultFrame, StdoutFrame, StreamDelta, StreamEvent, SystemFrame,
-    UserFrame,
+    AssistantFrame, CommandLifecycleFrame, CommandState, ResultFrame, StdoutFrame, StreamDelta,
+    StreamEvent, SystemFrame, UserFrame,
 };
 use async_trait::async_trait;
 use forge_provider_api::permissions::{PermissionRequest, PermissionResponse};
@@ -55,6 +55,8 @@ struct ActiveTurn {
     native_start: Option<NativeTurnStart>,
     /// Inputs written for this turn: the prompt first, then steering in write order.
     commands: Vec<String>,
+    /// Whether the CLI is running a turn for one of these inputs, and so owes a `result`.
+    native_turn_running: bool,
     interrupting: bool,
 }
 
@@ -305,6 +307,7 @@ impl ClaudeSessionState {
             execution_started: false,
             native_start: Some(start),
             commands: Vec::new(),
+            native_turn_running: false,
             interrupting: false,
         });
         Ok(receiver)
@@ -505,6 +508,73 @@ impl ClaudeSessionState {
             event: ThreadEvent::ContextUsage(usage),
         })
         .await
+    }
+
+    /// Record one input's delivery progress.
+    ///
+    /// The CLI ends a running turn with a `result`. An interrupt that reaches an input still in the
+    /// CLI's queue, as when the CLI is starting after a resume or a fork, cancels that input and
+    /// prints no `result`, because no CLI turn ran for it. Once the active turn has neither a CLI
+    /// turn running nor an input left to start one, the cancellation is the last frame the CLI
+    /// sends for it, so the cancellation ends the turn as interrupted. Waiting for a `result`
+    /// instead runs out the interrupt grace period and invalidates a healthy binding.
+    async fn command_lifecycle(&self, lifecycle: CommandLifecycleFrame) {
+        {
+            let mut commands = self
+                .commands
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(record) = commands.get(&lifecycle.command_uuid) {
+                record.send_replace(lifecycle.state);
+            }
+            if matches!(
+                lifecycle.state,
+                CommandState::Completed | CommandState::Cancelled
+            ) {
+                commands.remove(&lifecycle.command_uuid);
+            }
+        }
+        if !matches!(
+            lifecycle.state,
+            CommandState::Started | CommandState::Cancelled
+        ) {
+            return;
+        }
+        let checkpoint = self.decoder.lock().await.checkpoint.clone();
+        let mut active = self.active.write().await;
+        let Some(active) = active
+            .as_mut()
+            .filter(|active| active.commands.contains(&lifecycle.command_uuid))
+        else {
+            return;
+        };
+        if lifecycle.state == CommandState::Started {
+            active.native_turn_running = true;
+            return;
+        }
+        if active.native_turn_running || self.awaits_native_start(active) {
+            return;
+        }
+        self.end_turn(Ok(TurnEnd {
+            outcome: turn::TurnOutcome::Interrupted,
+            completed_at_ms: timestamp(),
+            duration_ms: None,
+            checkpoint,
+            commands: active.commands.clone(),
+        }));
+    }
+
+    /// Report whether the CLI still holds an input of this turn that it has not started.
+    fn awaits_native_start(&self, active: &ActiveTurn) -> bool {
+        let commands = self
+            .commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.commands.iter().any(|command| {
+            commands.get(command).is_some_and(|record| {
+                matches!(*record.borrow(), CommandState::Queued | CommandState::Other)
+            })
+        })
     }
 
     /// Deliver the turn's native end to its waiting runner.
@@ -738,16 +808,7 @@ impl ClaudeSessionState {
             StdoutFrame::Result(result) => self.result(result).await,
             StdoutFrame::System(system) => self.system(system).await,
             StdoutFrame::CommandLifecycle(lifecycle) => {
-                let mut commands = self
-                    .commands
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(record) = commands.get(&lifecycle.command_uuid) {
-                    record.send_replace(lifecycle.state);
-                }
-                if lifecycle.state == CommandState::Completed {
-                    commands.remove(&lifecycle.command_uuid);
-                }
+                self.command_lifecycle(lifecycle).await;
                 Ok(())
             }
             StdoutFrame::Recognized { .. } => Ok(()),
@@ -1103,22 +1164,12 @@ impl ClaudeSessionState {
         // Decide under the turn lock so concurrently written steering either joins this decision
         // or is rejected. Steering the CLI has not started yet starts the next CLI turn, which
         // continues this Forge turn. An interrupt discards queued input, so it always ends the turn.
-        let active = self.active.write().await;
-        let Some(active) = active.as_ref() else {
+        let mut active = self.active.write().await;
+        let Some(active) = active.as_mut() else {
             return Ok(());
         };
-        let pending = !active.interrupting && {
-            let commands = self
-                .commands
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            active.commands.iter().any(|command| {
-                commands.get(command).is_some_and(|record| {
-                    matches!(*record.borrow(), CommandState::Queued | CommandState::Other)
-                })
-            })
-        };
-        if pending {
+        active.native_turn_running = false;
+        if !active.interrupting && self.awaits_native_start(active) {
             return Ok(());
         }
         let outcome = if active.interrupting || result.interrupted() {

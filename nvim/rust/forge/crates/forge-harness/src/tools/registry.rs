@@ -66,6 +66,7 @@ impl ControlToolRegistry {
             super::checks::definitions(),
             super::lsp::definitions(),
             super::session::definitions(),
+            super::origin::definitions(),
             vec![super::config::definition()],
         ]
         .into_iter()
@@ -126,6 +127,9 @@ impl ControlToolRegistry {
                             .is_some_and(|scope| {
                                 definition.name == "harness_config" || scope.enabled()
                             });
+                }
+                if super::origin::is_tool(definition.name) {
+                    return root && context.is_some_and(|context| context.aside.is_some());
                 }
                 if is_check_tool(definition.name) {
                     return root && context.is_some_and(|context| context.checks.is_some());

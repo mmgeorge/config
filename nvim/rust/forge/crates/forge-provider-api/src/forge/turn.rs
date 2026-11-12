@@ -53,6 +53,10 @@ pub enum TurnKind {
     CheckRepair { repair: CheckRepair },
     /// Settled child results continue the parent's unfinished request.
     ChildResults,
+    /// A parent assigned a child agent one task.
+    AgentTask { task: AgentTask },
+    /// Another session, such as an aside, sent this session a message.
+    SessionMessage { message: SessionMessage },
     /// An approval request timed out while no task could continue.
     PermissionTimeout { feedback: String },
     /// Harness starts or resumes a task step on its own.
@@ -72,10 +76,17 @@ pub enum TaskStep {
     GoalContinue,
     GoalResume,
     PlanResume,
-    PlanContinue { turn: u32, max_turns: u32 },
-    ChecksSaved { revision: String },
+    PlanContinue {
+        turn: u32,
+        max_turns: u32,
+    },
+    ChecksSaved {
+        revision: String,
+    },
     AnswersResolved,
     ContinueRequest,
+    /// Continue accepted work after a transient provider failure ended its execution.
+    RetryContinue,
 }
 
 /// Which workflow a pending-question discussion belongs to.
@@ -247,14 +258,56 @@ pub struct CheckFailure {
     pub log: String,
 }
 
-/// A finished child agent's report.
+/// A finished child agent's report, rendered as `<agent_message type="final_answer">`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentResult {
+    /// Path of the child that answered.
     pub agent: String,
     pub task_id: String,
     pub status: String,
     pub response: Option<String>,
     pub error: Option<String>,
+}
+
+/// One task a parent assigned a child agent, with information the parent queued for it before
+/// the task started.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTask {
+    pub task_id: String,
+    /// Path of the parent that assigned the task.
+    pub from: String,
+    pub text: String,
+    /// Messages the parent sent before the task started, in arrival order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<AgentMessage>,
+}
+
+/// Information one agent sent another about a task.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentMessage {
+    /// Path of the sending agent.
+    pub from: String,
+    pub text: String,
+}
+
+/// A message another session sent this one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionMessage {
+    pub from_session_id: String,
+    /// The sender's display name; empty when it has none.
+    pub from_session_name: String,
+    pub text: String,
+}
+
+impl SessionMessage {
+    /// Name the sender for transcripts: its display name with its ID, or its ID alone.
+    fn sender(&self) -> String {
+        if self.from_session_name.is_empty() {
+            self.from_session_id.clone()
+        } else {
+            format!("\"{}\" ({})", self.from_session_name, self.from_session_id)
+        }
+    }
 }
 
 /// A side condition any turn can carry.
@@ -342,6 +395,8 @@ impl TurnInput {
             | TurnKind::PlanReview { .. }
             | TurnKind::CheckRepair { .. }
             | TurnKind::ChildResults
+            | TurnKind::AgentTask { .. }
+            | TurnKind::SessionMessage { .. }
             | TurnKind::PermissionTimeout { .. }
             | TurnKind::TaskStep { .. } => None,
         }
@@ -398,6 +453,12 @@ impl TurnInput {
             } => "Revision requested".into(),
             TurnKind::CheckRepair { .. } => "Automatic check repair".into(),
             TurnKind::ChildResults => "Child results".into(),
+            TurnKind::AgentTask { task } => task.text.clone(),
+            TurnKind::SessionMessage { message } => format!(
+                "Message from aside session {}:\n\n{}",
+                message.sender(),
+                message.text
+            ),
             TurnKind::PermissionTimeout { .. } => "An approval timed out".into(),
             TurnKind::TaskStep { step } => match step {
                 TaskStep::ExecuteStart => "Execute started",
@@ -411,6 +472,7 @@ impl TurnInput {
                 TaskStep::ChecksSaved { .. } => "Project checks saved",
                 TaskStep::AnswersResolved => "Questions resolved",
                 TaskStep::ContinueRequest => "Request continued",
+                TaskStep::RetryContinue => "Request retried",
             }
             .into(),
         }
@@ -442,6 +504,8 @@ impl TurnInput {
             TurnKind::WorkflowAnswers { answers } => answers.write(writer),
             TurnKind::PlanReview { review } => review.write(writer),
             TurnKind::CheckRepair { repair } => repair.write(writer),
+            TurnKind::AgentTask { task } => task.write(writer),
+            TurnKind::SessionMessage { message } => message.write(writer),
             TurnKind::UserMessage { .. }
             | TurnKind::PlanDiscussion { .. }
             | TurnKind::ChecksSetup { .. }
@@ -607,12 +671,16 @@ impl CheckRepair {
     }
 }
 
+/// Element that carries text one agent wrote to another.
+const AGENT_MESSAGE: &str = "agent_message";
+
 impl AgentResult {
     fn write(&self, writer: &mut Writer) {
         writer.open(
-            "agent_result",
+            AGENT_MESSAGE,
             &[
-                ("agent", self.agent.clone()),
+                ("type", "final_answer".into()),
+                ("from", self.agent.clone()),
                 ("task", self.task_id.clone()),
                 ("status", self.status.clone()),
             ],
@@ -624,6 +692,43 @@ impl AgentResult {
             writer.element("error", &[], error);
         }
         writer.close();
+    }
+}
+
+impl AgentTask {
+    fn write(&self, writer: &mut Writer) {
+        writer.element(
+            AGENT_MESSAGE,
+            &[
+                ("type", "new_task".into()),
+                ("from", self.from.clone()),
+                ("task", self.task_id.clone()),
+            ],
+            &self.text,
+        );
+        for message in &self.messages {
+            message.write(writer);
+        }
+    }
+}
+
+impl AgentMessage {
+    fn write(&self, writer: &mut Writer) {
+        writer.element(
+            AGENT_MESSAGE,
+            &[("type", "message".into()), ("from", self.from.clone())],
+            &self.text,
+        );
+    }
+}
+
+impl SessionMessage {
+    fn write(&self, writer: &mut Writer) {
+        let mut attributes = vec![("from_session_id", self.from_session_id.clone())];
+        if !self.from_session_name.is_empty() {
+            attributes.push(("from_session_name", self.from_session_name.clone()));
+        }
+        writer.element("session_message", &attributes, &self.text);
     }
 }
 

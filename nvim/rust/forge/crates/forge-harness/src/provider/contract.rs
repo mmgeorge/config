@@ -40,6 +40,10 @@ pub struct ProviderRequest {
     pub acknowledged_child_reports: Vec<ExchangeId>,
     #[serde(skip, default)]
     pub control_context: Option<crate::tools::ControlTurnContext>,
+    /// The child agent this request runs as, delivered as the standing `<agent>` section; root
+    /// requests carry none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_agent: Option<forge_provider_api::forge::ChildAgent>,
 }
 
 impl ProviderRequest {
@@ -63,6 +67,7 @@ impl ProviderRequest {
             recovered_input,
             acknowledged_child_reports,
             control_context: _,
+            child_agent,
         } = self;
         Self {
             dispatch: Default::default(),
@@ -82,6 +87,7 @@ impl ProviderRequest {
             recovered_input: recovered_input.clone(),
             acknowledged_child_reports: acknowledged_child_reports.clone(),
             control_context: None,
+            child_agent: child_agent.clone(),
         }
     }
 
@@ -227,6 +233,9 @@ pub struct ProviderForkRequest {
     pub source: ProviderRequest,
     pub target_harness_session_id: String,
     pub checkpoint_id: Option<String>,
+    /// Distinguishes native attempts for one target. The bridge retains the first request and
+    /// outcome under each operation identity, so a later attempt needs an identity of its own.
+    pub attempt_id: String,
 }
 
 pub type Provider = super::bridge::ProviderBridge;

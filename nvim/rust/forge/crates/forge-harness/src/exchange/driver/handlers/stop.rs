@@ -83,12 +83,15 @@ impl ExchangeDriver {
                                 }));
                             }
                         }
-                        if outcome.is_ok()
-                            && let Some(runtime) = foreground.as_mut()
-                        {
-                            runtime
-                                .collection_signals
-                                .push_back(retained.collection_completed_signal());
+                        // The turn hears both results: a turn that waits for this collection
+                        // before it settles would otherwise wait forever on a failed one, and
+                        // the provider restart below waits in turn for that turn to settle.
+                        if let Some(runtime) = foreground.as_mut() {
+                            runtime.collection_signals.push_back(if outcome.is_ok() {
+                                retained.collection_completed_signal()
+                            } else {
+                                crate::broker::ForegroundSignal::CollectionFailed
+                            });
                         }
                         let outcome = match outcome {
                             Ok(()) => retained.apply_collected(&mut *broker.lock().await),
@@ -145,6 +148,11 @@ impl ExchangeDriver {
             }
             // The stop task ended without its result, so the provider state is unknown.
             Some(Err(_)) => {
+                if let Some(runtime) = state.foreground.as_mut() {
+                    runtime
+                        .collection_signals
+                        .push_back(crate::broker::ForegroundSignal::CollectionFailed);
+                }
                 self.restart_after_failure(env, state, step, FailedWork::Unknown, "stop_lost");
             }
             None => {}
@@ -282,12 +290,12 @@ impl ExchangeDriver {
                                 false
                             }
                         };
-                        if outcome.is_ok()
-                            && let Some(runtime) = foreground.as_mut()
-                        {
-                            runtime
-                                .collection_signals
-                                .push_back(collected.work.retained.collection_completed_signal());
+                        if let Some(runtime) = foreground.as_mut() {
+                            runtime.collection_signals.push_back(if outcome.is_ok() {
+                                collected.work.retained.collection_completed_signal()
+                            } else {
+                                crate::broker::ForegroundSignal::CollectionFailed
+                            });
                         }
                         let committed = if outcome.is_ok() && facts_committed {
                             collected
@@ -334,6 +342,11 @@ impl ExchangeDriver {
             }
             // The input stop task ended without its result, so the provider state is unknown.
             Some(Err(_)) => {
+                if let Some(runtime) = state.foreground.as_mut() {
+                    runtime
+                        .collection_signals
+                        .push_back(crate::broker::ForegroundSignal::CollectionFailed);
+                }
                 self.restart_after_failure(
                     env,
                     state,

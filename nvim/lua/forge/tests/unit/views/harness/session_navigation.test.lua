@@ -170,6 +170,25 @@ T["session_geometry"] = function()
   eq(buffer.line(draft_buffer, 1), "Retain draft across public close")
   require("forge.views.harness.workspace").release(fourth)
   assert(fourth.presentation.close())
+  local current_tab, current_window = second.timeline_tab, second.composer_win
+  local tab_count = #vim.api.nvim_list_tabpages()
+  local create_reply
+  client.session_create = function(options, callback)
+    eq(options.source_session_id, second.session.id)
+    create_reply = callback
+  end
+  require("forge.views.harness").new_session(nil, { open_mode = "current" })
+  eq(#vim.api.nvim_list_tabpages(), tab_count)
+  create_reply({ session = { id = "geometry-fresh", provider = "mock", model = "mock", approval_mode = "ask" } })
+  settled(second)
+  eq(second.session.id, "geometry-fresh")
+  eq(second.timeline_tab, current_tab)
+  eq(second.composer_win, current_window)
+  eq(#vim.api.nvim_list_tabpages(), tab_count)
+  eq(second.queue, {})
+  assert(table.concat(buffer.lines(second.transcript_buf), "\n"):find("geometry-fresh transcript", 1, true),
+    "new session did not replace the current transcript")
+  eq(#failures, 2)
   require("forge.views.harness.workspace").release(second)
   assert(second.presentation.close())
 end

@@ -67,6 +67,7 @@ local command_list = {
   { label = "/new", detail = "Start a new session in another tab" },
   { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
   { label = "/fork", detail = "Fork the current session with provider-owned context", capability = "native_fork" },
+  { label = "/btw", detail = "Ask about this session in an aside fork that can inspect and message it", capability = "native_fork" },
   { label = "/rename", detail = "Generate a short session name, or set an explicit name" },
   { label = "/effort", detail = "Select reasoning effort", capability = "effort_selection" },
   { label = "/model", detail = "Select the provider model", capability = "model_selection" },

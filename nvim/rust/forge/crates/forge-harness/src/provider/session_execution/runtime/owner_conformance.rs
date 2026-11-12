@@ -209,7 +209,7 @@ fn request(owner: &ThreadOwner, directory: &std::path::Path) -> ProviderRequest 
         execution_owner: Some(owner.clone()),
         harness_session_id: owner.session_id().to_string(),
         workspace: directory.to_string_lossy().into_owned(),
-        input: ProviderInput::from_text("inspect"),
+        input: ProviderInput::from_user_text("inspect"),
         mode: if owner.session_id().as_str() == "background-session" {
             PromptMode::Background
         } else {
@@ -226,6 +226,7 @@ fn request(owner: &ThreadOwner, directory: &std::path::Path) -> ProviderRequest 
         acknowledged_child_reports: Vec::new(),
         recovered_input: vec![],
         control_context: None,
+        child_agent: None,
     }
 }
 /// Prepare steering with real journal authority rather than a fabricated input identity.
@@ -243,7 +244,7 @@ fn steering(fixture: &Fixture, owner: &ThreadOwner) -> Result<SteeringInput> {
         attachments: vec![],
         submission: Some(fixture.store.prepare_steering(
             &catalog,
-            ProviderInput::from_text("continue"),
+            ProviderInput::from_user_text("continue"),
             forge_providers::registry::nonselectable_id().unwrap(),
         )?),
     })

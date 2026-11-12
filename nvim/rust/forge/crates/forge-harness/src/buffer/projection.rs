@@ -3395,8 +3395,15 @@ fn session_event_text(event: &SessionEventKind) -> String {
         SessionEventKind::Forked {
             source_session_id,
             source_session_name,
+            unfinished_exchange_omitted,
         } => {
-            let mut text = format!("Forked from {source_session_id}");
+            // The omission leads the line: a session ID and name fill most of a transcript row,
+            // and a wrapped event folds every row after its first.
+            let mut text = if *unfinished_exchange_omitted {
+                format!("Forked before the unfinished exchange of {source_session_id}")
+            } else {
+                format!("Forked from {source_session_id}")
+            };
             if !source_session_name.is_empty() {
                 text.push_str(&format!(" ({source_session_name})"));
             }

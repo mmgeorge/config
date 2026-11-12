@@ -71,6 +71,7 @@ fn main() -> Result<()> {
 /// Create disconnected fixture ownership without importing source session settings.
 fn fixture_session(id: &str, workspace: &std::path::Path) -> HarnessSession {
     HarnessSession {
+        aside: None,
         purpose: Default::default(),
         background: None,
         auto_compaction: Default::default(),

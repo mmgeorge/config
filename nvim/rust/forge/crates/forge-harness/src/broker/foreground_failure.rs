@@ -571,8 +571,7 @@ impl HarnessBroker {
         dispatch.fail_live_host_observer(&self.trace, &self.session.id);
         match dispatch {
             TurnTransaction::Admitting(admission) => {
-                let error = if (admission.owner_collection_pending()
-                    || admission.owner_collection_complete())
+                let error = if admission.owner_collection_requested()
                     && error
                         .downcast_ref::<ProviderError>()
                         .is_some_and(ProviderError::is_clean_cancellation)
@@ -1075,7 +1074,10 @@ impl HarnessBroker {
         {
             return Ok(ForegroundAction::Wait);
         }
-        let restores_prompt = Self::cancellation_restores_prompt(transaction);
+        // Restoration deletes the exchange as if the provider never saw its prompt. A collection
+        // that failed proves nothing about what the provider consumed, so the exchange stays.
+        let restores_prompt =
+            Self::cancellation_restores_prompt(transaction) && !admission.owner_collection_failed();
         let native_retraction = if restores_prompt && self.capability.native_turn_rollback {
             Self::output_free_retraction(transaction)?
         } else {
@@ -1098,7 +1100,8 @@ impl HarnessBroker {
             return Ok(ForegroundAction::Wait);
         }
         // Restoration deletes the provisional exchange, and the exchange owner validates that
-        // exchange when its collection completes. `CollectionCompleted` resumes this decision.
+        // exchange when its collection completes. `CollectionCompleted` resumes this decision,
+        // and `CollectionFailed` resumes it with restoration withdrawn.
         if restores_prompt && admission.owner_collection_pending() {
             return Ok(ForegroundAction::Wait);
         }
@@ -2096,7 +2099,7 @@ mod tests {
                 prompt,
                 PromptMode::Chat,
                 Some(&ExchangeAdmission::chat(prompt.into())),
-                ProviderInput::from_text(prompt),
+                ProviderInput::from_user_text(prompt),
             )?;
             broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
             let exchange_id = staged.exchange.id.clone();

@@ -16,8 +16,8 @@ use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard};
 use tokio::task::JoinSet;
 
 use crate::broker::{
-    BrokerRuntime, HarnessBroker, InitializeRequest, TurnCancellation, prepare_new_session,
-    prepare_provider_fork,
+    BrokerRuntime, ForkOptions, HarnessBroker, InitializeRequest, TurnCancellation,
+    prepare_new_session, prepare_provider_fork,
 };
 use crate::command::{CommandAdmission, CommandIdentity, ExecutionPermit, SessionCoordinator};
 use crate::protocol::{RuntimeMethod, validate_root_control};
@@ -1067,6 +1067,8 @@ impl HarnessService {
             }
             let mut owner = self.registry.lock().await;
             if let Some(registry) = owner.as_ref() {
+                // Every admitted request has finished, so none can retain the connection again.
+                registry.release_client_sink();
                 let mut forks = registry.fork_task.lock().await;
                 while let Some(result) = forks.join_next().await {
                     result.context("Harness provider fork task failed")?;
@@ -1647,10 +1649,30 @@ struct SessionControllerRegistry {
     controller_by_id: RwLock<HashMap<String, Arc<SessionController>>>,
     provider_fork_by_id: RwLock<HashMap<String, Arc<ProviderForkGate>>>,
     fork_task: Mutex<JoinSet<()>>,
+    /// The editor connection, retained from requests so work no request started, such as a
+    /// message one session sends another, can publish the events it causes.
+    client_sink: std::sync::Mutex<Option<MessageSender>>,
     runtime: Arc<BrokerRuntime>,
     initialize: InitializeRequest,
     /// Set once by the first full initialization, which may follow services-only initialization.
     initial_session_id: std::sync::OnceLock<String>,
+}
+
+/// Delivers messages between the sessions one registry owns.
+struct RegistryMessageRoute {
+    /// Weak, because the registry owns the runtime that holds this route.
+    registry: std::sync::Weak<SessionControllerRegistry>,
+}
+
+#[async_trait::async_trait]
+impl crate::broker::session_message::SessionMessageRoute for RegistryMessageRoute {
+    async fn deliver(&self, message: crate::broker::session_message::SessionMessage) -> Result<()> {
+        self.registry
+            .upgrade()
+            .context("Harness is shutting down")?
+            .deliver_session_message(message)
+            .await
+    }
 }
 
 /// Coordinates queued child work with one asynchronous provider fork.
@@ -1697,14 +1719,125 @@ impl SessionControllerRegistry {
         if let Some((session_id, _)) = &initial {
             initial_session_id.get_or_init(|| session_id.clone());
         }
-        Arc::new(Self {
+        let registry = Arc::new(Self {
             controller_by_id: RwLock::new(initial.into_iter().collect()),
             provider_fork_by_id: RwLock::new(HashMap::new()),
             fork_task: Mutex::new(JoinSet::new()),
+            client_sink: std::sync::Mutex::new(None),
             runtime,
             initialize,
             initial_session_id,
-        })
+        });
+        registry
+            .runtime
+            .session_messages
+            .bind(Arc::new(RegistryMessageRoute {
+                registry: Arc::downgrade(&registry),
+            }));
+        registry
+    }
+
+    /// Keep an open editor connection for work that no request carries a sink for.
+    fn retain_client_sink(&self, message_sink: &MessageSender) {
+        let mut client_sink = self
+            .client_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if client_sink.as_ref().is_none_or(MessageSender::is_closed) {
+            *client_sink = Some(message_sink.clone());
+        }
+    }
+
+    /// Release the retained editor connection at shutdown, so its channel closes once the
+    /// editor's own senders drop instead of staying open for as long as the registry lives.
+    fn release_client_sink(&self) {
+        self.client_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    /// Queue one message in its target session, as that session's editor queues user input.
+    ///
+    /// The target is resolved, waits for its own fork, and attaches its publishers first, so a
+    /// target that no tab has opened in this process still runs the message and reports it.
+    async fn deliver_session_message(
+        self: &Arc<Self>,
+        message: crate::broker::session_message::SessionMessage,
+    ) -> Result<()> {
+        use crate::broker::session_message::SessionMessageDelivery;
+        let client_sink = self
+            .client_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .context("no editor connection can show the message")?;
+        let target_session_id = message.target_session_id;
+        let controller = self
+            .resolve(&target_session_id)
+            .await
+            .with_context(|| format!("open target session {target_session_id}"))?;
+        ensure!(
+            !controller.input_stopping.load(Ordering::Acquire),
+            "target session {target_session_id} is closing"
+        );
+        self.await_provider_fork(&target_session_id, &controller, &client_sink)
+            .await?;
+        controller.recover_session_events(&client_sink).await?;
+        controller.attach_session_events(&client_sink).await?;
+        controller.attach_input(&client_sink).await?;
+        // Steering carries the queue's current control revision, as the editor's own input does,
+        // so it resumes a queue the user suspended. Queued delivery never resumes one.
+        let (intent, control_revision) = match message.delivery {
+            SessionMessageDelivery::Queue => ("queue", 0),
+            SessionMessageDelivery::Steer => (
+                "auto",
+                controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .control_revision,
+            ),
+        };
+        // The queue shows the turn's label, which names the sender; the model receives the
+        // typed `<session_message>` turn.
+        let turn = forge_provider_api::forge::TurnInput::new(
+            forge_provider_api::forge::TurnKind::SessionMessage {
+                message: message.content,
+            },
+        );
+        let operation: crate::input::InputOperation = crate::codec::from_value(json!({
+            "id": message.input_id,
+            "control_revision": control_revision,
+            "action": {"kind": "submit", "message": {
+                "id": message.input_id, "text": turn.label(), "intent": intent, "attachments": [],
+            }},
+        }))?;
+        let command = crate::exchange::command::CommandRequest::from_host_input(operation, turn)?;
+        let operation_id = command.id.clone();
+        let admitted = controller.execute_command(command, &client_sink).await;
+        let receipt = controller
+            .coordinator
+            .submissions
+            .operation(operation_id.as_str())?;
+        match (admitted, receipt) {
+            (_, Some(receipt)) => match receipt.error {
+                Some(rejection) => {
+                    anyhow::bail!(
+                        "target session {target_session_id} rejected the message: {rejection}"
+                    )
+                }
+                None => Ok(()),
+            },
+            (Err(error), None) => Err(anyhow::Error::new(error).context(format!(
+                "target session {target_session_id} did not accept the message"
+            ))),
+            (Ok(_), None) => {
+                anyhow::bail!(
+                    "target session {target_session_id} recorded no receipt for the message"
+                )
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1775,15 +1908,20 @@ impl SessionControllerRegistry {
     }
 
     /// Queue provider-bound child work until its native fork reaches durable readiness.
+    ///
+    /// A request that finds the fork failed starts a new native attempt instead of reporting the
+    /// stored failure, so a child whose fork failed recovers on its next input. A request that
+    /// waited on an attempt reports that attempt's failure and leaves the retry to the next one.
     async fn await_provider_fork(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
-        controller: &SessionController,
+        controller: &Arc<SessionController>,
+        message_sink: &MessageSender,
     ) -> Result<()> {
         let provider_fork_state = controller.broker.lock().await.provider_fork_state();
         match provider_fork_state {
-            ProviderForkState::Ready => Ok(()),
-            ProviderForkState::Failed { message, .. } => anyhow::bail!(message),
+            ProviderForkState::Ready => return Ok(()),
+            ProviderForkState::Failed { .. } => {}
             ProviderForkState::Preparing { .. } => {
                 let gate = self
                     .provider_fork_by_id
@@ -1791,27 +1929,165 @@ impl SessionControllerRegistry {
                     .await
                     .get(session_id)
                     .cloned();
-                match gate {
-                    Some(gate) => gate.wait().await,
-                    // The initial session is opened without `resolve`, so its interrupted fork
-                    // is recorded here instead.
-                    // A fork that finished since the state read has already removed its gate,
-                    // so the state is read again under the broker lock that recorded it.
-                    None => {
-                        self.fail_interrupted_provider_fork(session_id, controller)
-                            .await?;
-                        match controller.broker.lock().await.provider_fork_state() {
-                            ProviderForkState::Ready => Ok(()),
-                            ProviderForkState::Failed { message, .. } => anyhow::bail!(message),
-                            ProviderForkState::Preparing { .. } => anyhow::bail!(
-                                "provider fork preparation was interrupted before this broker resumed"
-                            ),
-                        }
-                    }
+                if let Some(gate) = gate {
+                    return gate.wait().await;
                 }
+                // The initial session is opened without `resolve`, so its interrupted fork is
+                // recorded here instead. A fork that finished since the state read has already
+                // removed its gate, so the retry below reads the state again.
+                self.fail_interrupted_provider_fork(session_id, controller)
+                    .await?;
             }
         }
+        self.retry_provider_fork(session_id, controller, message_sink)
+            .await
     }
+
+    /// Start a new native attempt for a child whose fork failed, or join the one already running.
+    async fn retry_provider_fork(
+        self: &Arc<Self>,
+        session_id: &str,
+        controller: &Arc<SessionController>,
+        message_sink: &MessageSender,
+    ) -> Result<()> {
+        let gate = {
+            // The fork task lock serializes retries, so concurrent requests share one attempt.
+            let mut fork_task = self.fork_task.lock().await;
+            let running = self
+                .provider_fork_by_id
+                .read()
+                .await
+                .get(session_id)
+                .cloned();
+            match running {
+                Some(gate) => gate,
+                None => {
+                    // The gate exists before the state leaves `Failed`, so no other request
+                    // mistakes this attempt for one interrupted by a previous host.
+                    let gate = ProviderForkGate::new();
+                    self.provider_fork_by_id
+                        .write()
+                        .await
+                        .insert(session_id.to_owned(), Arc::clone(&gate));
+                    let provider_request = controller.broker.lock().await.retry_provider_fork();
+                    match provider_request {
+                        Ok(Some(provider_request)) => spawn_provider_fork(
+                            self,
+                            &mut fork_task,
+                            Arc::clone(controller),
+                            Arc::clone(&gate),
+                            provider_request,
+                            None,
+                            message_sink.clone(),
+                        ),
+                        Ok(None) => {
+                            self.provider_fork_by_id.write().await.remove(session_id);
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            self.provider_fork_by_id.write().await.remove(session_id);
+                            return Err(error);
+                        }
+                    }
+                    gate
+                }
+            }
+        };
+        gate.wait().await
+    }
+}
+
+/// Report whether a native fork failed only because its source conversation is executing.
+fn fork_source_is_executing(error: &crate::provider::ProviderError) -> bool {
+    match error {
+        crate::provider::ProviderError::Failure(failure) => {
+            failure.operation() == forge_provider_api::ProviderOperation::ThreadFork
+                && failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive
+                && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged
+        }
+        crate::provider::ProviderError::PreparationFailed(source) => {
+            fork_source_is_executing(source)
+        }
+        _ => false,
+    }
+}
+
+/// Run one native fork attempt for a durable child and publish its outcome through the gate.
+///
+/// `announcement` holds the outcome until the client has learned of the child, keeping the fork
+/// response and `session_created` ahead of the ready or failed event. A dropped sender releases
+/// the outcome, so a failed announcement still records it.
+fn spawn_provider_fork(
+    registry: &Arc<SessionControllerRegistry>,
+    fork_task: &mut JoinSet<()>,
+    child_controller: Arc<SessionController>,
+    gate: Arc<ProviderForkGate>,
+    provider_request: crate::provider::ProviderForkRequest,
+    announcement: Option<tokio::sync::oneshot::Receiver<()>>,
+    message_sink: MessageSender,
+) {
+    let registry = Arc::clone(registry);
+    let provider = registry.runtime.provider_handle();
+    fork_task.spawn(async move {
+        let child_session_id = child_controller.observer.session_id().to_owned();
+        let provider_started = Instant::now();
+        let copies_live_conversation = provider_request.checkpoint_id.is_none();
+        let mut result = provider.thread_fork(provider_request).await;
+        // The source started a turn after the fork selected its live conversation. The recorded
+        // checkpoint names the same history the child inherited, and stays readable meanwhile.
+        if copies_live_conversation && result.as_ref().is_err_and(fork_source_is_executing) {
+            let checkpoint_request = child_controller
+                .broker
+                .lock()
+                .await
+                .provider_fork_checkpoint_request();
+            if let Ok(Some(checkpoint_request)) = checkpoint_request {
+                result = provider.thread_fork(checkpoint_request).await;
+            }
+        }
+        let mut result = result.map_err(|error| {
+            if fork_source_is_executing(&error) {
+                format!(
+                    "the source session is running and recorded no checkpoint to fork from; send again when its turn finishes ({error:#})"
+                )
+            } else {
+                format!("{error:#}")
+            }
+        });
+        if let Ok(result) = &mut result {
+            result.timing.push(crate::provider::ProviderTimingRecord {
+                phase: "broker.provider_total".into(),
+                duration_ms: provider_started.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+        if let Some(announcement) = announcement {
+            let _ = announcement.await;
+        }
+        let mut readiness = result.as_ref().map(|_| ()).map_err(ToOwned::to_owned);
+        let completion = child_controller
+            .broker
+            .lock()
+            .await
+            .complete_provider_fork(result);
+        match completion {
+            Ok(event) => {
+                if let Err(error) = message_sink.send_event(event).await {
+                    readiness = Err(format!("deliver provider fork outcome: {error:#}"));
+                }
+            }
+            Err(error) => {
+                readiness = Err(format!("persist provider fork outcome: {error:#}"));
+            }
+        }
+        gate.complete(readiness).await;
+        let mut provider_fork_by_id = registry.provider_fork_by_id.write().await;
+        if provider_fork_by_id
+            .get(&child_session_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &gate))
+        {
+            provider_fork_by_id.remove(&child_session_id);
+        }
+    });
 }
 
 async fn generate_isolated_text(
@@ -1972,6 +2248,7 @@ async fn route_request(
     let RequestAdmission {
         execution: admission,
     } = permits;
+    registry.retain_client_sink(message_sink);
     if matches!(
         method,
         RuntimeMethod::SessionLspAuthorize
@@ -2081,7 +2358,7 @@ async fn route_request(
     // Provider-bound child work waits for its native fork, or it would open fresh history.
     if method.requires_provider_fork() || new_queued_submission {
         registry
-            .await_provider_fork(&session_id, &controller)
+            .await_provider_fork(&session_id, &controller, message_sink)
             .await?;
     }
     if method == RuntimeMethod::SessionPromptSubmit
@@ -2266,7 +2543,7 @@ async fn route_request(
                     execution_owner: catalog.execution_owner,
                     harness_session_id: catalog.harness_session_id,
                     workspace: catalog.workspace,
-                    input: crate::provider::ProviderInput::from_text(String::new()),
+                    input: crate::provider::ProviderInput::from_user_text(String::new()),
                     mode: crate::provider::PromptMode::Chat,
                     model: "default".into(),
                     effort: "default".into(),
@@ -2279,6 +2556,7 @@ async fn route_request(
                     acknowledged_child_reports: Vec::new(),
                     recovered_input: Vec::new(),
                     control_context: None,
+                    child_agent: None,
                 },
             ),
         )
@@ -2499,16 +2777,35 @@ async fn start_session_fork(
     while let Some(result) = task.try_join_next() {
         result.context("Harness provider fork task failed")?;
     }
-    // Native fork rejects a thread whose children still execute, and the optimistic child
-    // session would otherwise inherit their live rows with no runtime left to settle them.
-    if let Some(source) = registry.controller_by_id.read().await.get(&session_id) {
+    let source_session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&session_id);
+    let source = registry
+        .controller_by_id
+        .read()
+        .await
+        .get(source_session_id)
+        .cloned();
+    // A held execution permit means the source owns a running turn, which a native fork of its
+    // live conversation rejects and whose unfinished exchange the child must not copy.
+    let source_holds_turn = || {
+        source
+            .as_ref()
+            .is_some_and(|source| source.coordinator.execution.available_permits() == 0)
+    };
+    if let Some(source) = &source {
+        // Native fork rejects a thread whose children still execute, and the optimistic child
+        // session would otherwise inherit their live rows with no runtime left to settle them.
         anyhow::ensure!(
             source.agent_coordinator.active_count() == 0,
             "cannot fork while child agents are running; wait for them to finish or interrupt them"
         );
     }
-    let provider = registry.runtime.provider_handle();
-    let descriptor = provider.descriptor();
+    // A turn that ends while the fork waits for the history writer may not have saved its
+    // finished exchange yet, so a source seen executing here stays executing for this fork.
+    let held_turn_before_preparation = source_holds_turn();
+    let descriptor = registry.runtime.provider_handle().descriptor();
     let preparation = prepare_provider_fork(
         PathBuf::from(&registry.initialize.data_root).as_path(),
         &registry.initialize.client_id,
@@ -2516,7 +2813,10 @@ async fn start_session_fork(
         &descriptor.capability,
         &session_id,
         &params,
-        purpose,
+        ForkOptions {
+            purpose,
+            source_is_executing: &|| held_turn_before_preparation || source_holds_turn(),
+        },
     )?;
     let child_session_id = preparation.child.id.clone();
     // The gate exists before the child controller, so resolution never mistakes this live fork for
@@ -2544,52 +2844,31 @@ async fn start_session_fork(
     };
 
     // Spawn the fork before any fallible delivery, so a failed response or event cannot leave the
-    // gate pending forever. The task holds its outcome until the child is announced, keeping
-    // the response and `session_created` ahead of the fork's ready or failed event.
+    // gate pending forever. The task holds its outcome until the child is announced.
     let (announced, announcement) = tokio::sync::oneshot::channel::<()>();
-    let completion_sink = message_sink.clone();
-    let registry_for_completion = Arc::clone(&registry);
     let child_result = Arc::clone(&child_controller);
     let gate_result = Arc::clone(&gate);
-    let provider_request = preparation.provider_request;
-    task.spawn(async move {
-        let message_sink = completion_sink;
-        let provider_started = Instant::now();
-        let mut result = provider
-            .thread_fork(provider_request)
-            .await
-            .map_err(|error| format!("{error:#}"));
-        if let Ok(result) = &mut result {
-            result.timing.push(crate::provider::ProviderTimingRecord {
-                phase: "broker.provider_total".into(),
-                duration_ms: provider_started.elapsed().as_secs_f64() * 1000.0,
-            });
+    let provider_pending = preparation.provider_request.is_some();
+    match preparation.provider_request {
+        Some(provider_request) => spawn_provider_fork(
+            &registry,
+            &mut task,
+            child_controller,
+            gate,
+            provider_request,
+            Some(announcement),
+            message_sink.clone(),
+        ),
+        // The source held no native history, so the child is ready without provider work.
+        None => {
+            gate.complete(Ok(())).await;
+            registry
+                .provider_fork_by_id
+                .write()
+                .await
+                .remove(&child_session_id);
         }
-        // A dropped sender means announcement failed; the outcome is still recorded.
-        let _ = announcement.await;
-        let mut readiness = result.as_ref().map(|_| ()).map_err(ToOwned::to_owned);
-        let completion = child_controller
-            .broker
-            .lock()
-            .await
-            .complete_provider_fork(result);
-        match completion {
-            Ok(event) => {
-                if let Err(error) = message_sink.send_event(event).await {
-                    readiness = Err(format!("deliver provider fork outcome: {error:#}"));
-                }
-            }
-            Err(error) => {
-                readiness = Err(format!("persist provider fork outcome: {error:#}"));
-            }
-        }
-        gate.complete(readiness).await;
-        registry_for_completion
-            .provider_fork_by_id
-            .write()
-            .await
-            .remove(&child_session_id);
-    });
+    }
     drop(task);
 
     if let Some(response_id) = response_id {
@@ -2597,7 +2876,7 @@ async fn start_session_fork(
         snapshot["fork_performance"] = json!({
             "total_ms": preparation.total_duration_ms,
             "timing": preparation.timing,
-            "provider_pending": true,
+            "provider_pending": provider_pending,
         });
         message_sink
             .send_response(Response::success(response_id, snapshot)?)

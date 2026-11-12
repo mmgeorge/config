@@ -86,7 +86,7 @@ fn fixture_request() -> crate::provider::ProviderRequest {
         execution_owner: None,
         harness_session_id: "session".into(),
         workspace: "workspace".into(),
-        input: crate::provider::ProviderInput::from_text("draft message"),
+        input: crate::provider::ProviderInput::from_user_text("draft message"),
         mode: crate::provider::PromptMode::Chat,
         model: "fixture".into(),
         effort: "low".into(),
@@ -99,6 +99,7 @@ fn fixture_request() -> crate::provider::ProviderRequest {
         acknowledged_child_reports: Vec::new(),
         recovered_input: Vec::new(),
         control_context: None,
+        child_agent: None,
     }
 }
 
@@ -259,7 +260,7 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
                 execution_owner: None,
                 harness_session_id: "session".into(),
                 workspace: "workspace".into(),
-                input: crate::provider::ProviderInput::from_text("draft message"),
+                input: crate::provider::ProviderInput::from_user_text("draft message"),
                 mode: crate::provider::PromptMode::Chat,
                 model: "fixture".into(),
                 effort: "low".into(),
@@ -272,6 +273,7 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
                 acknowledged_child_reports: Vec::new(),
                 recovered_input: Vec::new(),
                 control_context: None,
+                child_agent: None,
             };
             let submission =
                 submissions.prepare(&request, forge_providers::registry::default_id())?;

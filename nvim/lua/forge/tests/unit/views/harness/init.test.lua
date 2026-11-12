@@ -99,4 +99,35 @@ T["provider_switch_checks_every_tab"] = function()
   eq(harness.provider_switch_available(), true)
 end
 
+T["replace_session_preserves_requesting_tab_and_handles_failure"] = function()
+  local session = require("forge.session")
+  local client = require("forge.client")
+  local navigation = require("forge.views.harness.session_navigation")
+  local harness = require("forge.views.harness")
+  local source = session.harness
+  source.session = { id = "source" }
+  source.timeline_tab = vim.api.nvim_get_current_tabpage()
+  local reply, activation, failure
+  client.session_create = function(options, callback)
+    eq(options.source_session_id, "source")
+    reply = callback
+  end
+  navigation.begin_new = function() error("replacement opened a pending tab") end
+  navigation.activate = function(result, options) activation = { result = result, options = options } end
+  require("forge.infra.notifications").error = function(message) failure = message end
+  harness.new_session(nil, { open_mode = "current" })
+  reply(nil, "creation failed")
+  eq(failure, "creation failed")
+  eq(source.session.id, "source")
+  eq(activation, nil)
+  harness.new_session(nil, { open_mode = "current" })
+  local other = session.new_harness_state()
+  session.select_harness(other)
+  reply({ session = { id = "fresh" } })
+  eq(activation.result.session.id, "fresh")
+  eq(activation.options.state, source)
+  eq(activation.options.open_mode, "current")
+  eq(activation.options.focus, false)
+end
+
 return T

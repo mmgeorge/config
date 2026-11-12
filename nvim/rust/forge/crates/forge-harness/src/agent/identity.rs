@@ -83,7 +83,7 @@ impl Agent {
             definition: "primary".into(),
             nickname: None,
             task_name: "Main".into(),
-            task_path: "/root".into(),
+            task_path: forge_provider_api::forge::ROOT_AGENT_PATH.into(),
             source: super::AgentSource::Root,
             selection: None,
             inbox: Vec::new(),
@@ -103,7 +103,10 @@ impl Agent {
             definition: definition.into(),
             nickname: None,
             task_name: definition.into(),
-            task_path: format!("/root/{definition}"),
+            task_path: format!(
+                "{}/{definition}",
+                forge_provider_api::forge::ROOT_AGENT_PATH
+            ),
             source: super::AgentSource::Model,
             selection: None,
             inbox: Vec::new(),

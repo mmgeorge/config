@@ -2255,6 +2255,117 @@ local release_failure = fixture_evidence.release(success and collected)
 assert(success and collected, failure or "host was not collected")
 assert(not release_failure, release_failure)
 end
+T["aside_fork"] = function()
+-- `/btw` through a real host and mock provider: the aside forks a running origin at its last
+-- finished exchange, receives the question in its own tab, and leaves the origin's turn running.
+local original_directory = vim.fn.getcwd()
+local fixture_evidence = dofile("nvim/lua/forge/tests/support/evidence_directory.lua")("harness-aside-fork")
+local evidence = fixture_evidence.path
+local workspace, data = evidence .. "/workspace", evidence .. "/data"
+vim.fn.mkdir(workspace, "p")
+vim.fn.mkdir(data, "p")
+vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+local client = host.start({ data = data, config = data }).client
+local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
+local session = require("forge.session")
+local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+local wait_options = { timeout_ms = 4000 }
+---@type ForgeHarnessPresentationState?, ForgeHarnessPresentationState?
+local origin_state, aside_state
+
+---@param state ForgeHarnessPresentationState?
+---@return string?
+local function transcript_text(state)
+  local transcript_buffer = state and state.transcript_buf
+  return transcript_buffer and vim.api.nvim_buf_is_valid(transcript_buffer) and buffer.text(transcript_buffer) or nil
+end
+
+local success, failure = xpcall(function()
+  vim.api.nvim_set_current_dir(workspace)
+  require("forge").setup({ diff_logging = false, harness = { provider = "mock" } })
+  require("forge.views.harness").open()
+  wait_until(function()
+    local state = session.harness
+    return state.ready and state.session ~= nil and state.presentation and state.presentation.ready
+  end, "startup timeout", wait_options)
+  origin_state = session.harness
+  local origin_id = origin_state.session.id
+  local controller = require("forge.views.harness.controller")
+  local activity = require("forge.views.harness.activity")
+
+  ---@param text string
+  local function submit_from_origin(text)
+    buffer.set(origin_state.composer_buf, { text })
+    controller.submit()
+  end
+
+  -- One finished exchange gives the fork a boundary; the held second turn keeps the origin running.
+  submit_from_origin("Describe the fixture")
+  wait_until(function()
+    return transcript_text(origin_state):find("Mock response", 1, true) ~= nil and not activity.busy(origin_state)
+  end, "the origin's first exchange did not settle", wait_options)
+  local origin_hold = mock_provider.hold(origin_id, "chat")
+  submit_from_origin("Keep working on the task")
+  eq(origin_hold:wait().prompt, "Keep working on the task")
+
+  -- The aside's ID does not exist yet, so its hold matches the next prompt of any session.
+  local aside_hold = mock_provider.hold(origin_id, "chat", true)
+  local tab_count_before_aside = #vim.api.nvim_list_tabpages()
+  submit_from_origin("/btw What is the origin doing?")
+  wait_until(function()
+    aside_state = session.harness
+    return aside_state ~= origin_state and aside_state.session ~= nil and aside_state.session.aside ~= nil
+  end, "the aside did not open", wait_options)
+  local aside_id = aside_state.session.id
+  assert(aside_id ~= origin_id, "the aside reused its origin's session")
+  eq(aside_state.session.aside.session_id, origin_id)
+  eq(origin_state.session.id, origin_id)
+  eq(#vim.api.nvim_list_tabpages(), tab_count_before_aside + 1)
+  eq(vim.api.nvim_get_current_tabpage(), aside_state.timeline_tab)
+  assert(origin_state.timeline_tab ~= aside_state.timeline_tab, "the aside replaced its origin's tab")
+
+  -- The question runs in the aside's own provider conversation.
+  local aside_pending = aside_hold:wait()
+  eq(aside_pending.prompt, "What is the origin doing?")
+  -- The hold reports its owner's runtime key, which embeds the session ID.
+  assert(aside_pending.session_id:find(aside_id, 1, true) and not aside_pending.session_id:find(origin_id, 1, true),
+    "the question ran outside the aside: " .. aside_pending.session_id)
+
+  wait_until(function()
+    return transcript_text(aside_state):find("Forked before the unfinished exchange", 1, true) ~= nil
+  end, "the aside's fork marker did not report the omitted exchange", wait_options)
+  local aside_transcript = transcript_text(aside_state)
+  assert(aside_transcript:find("Describe the fixture", 1, true), "the aside lost its origin's finished exchange")
+  assert(not aside_transcript:find("Keep working on the task", 1, true),
+    "the aside copied its origin's unfinished exchange")
+
+  -- Releasing a cancelled hold fails, so the origin's release proves the fork left its turn alive.
+  origin_hold:release()
+  aside_hold:release()
+  wait_until(function() return not activity.busy(origin_state) and not activity.busy(aside_state) end,
+    "the origin and its aside did not settle", wait_options)
+  assert(not transcript_text(origin_state):find("What is the origin doing?", 1, true),
+    "the aside's question entered its origin")
+  diagnostics:assert_none()
+end, debug.traceback)
+if not success then
+  local diagnostic = { workspace = workspace, data = data, errors = diagnostics, host_stderr = client._client.stderr,
+    failure = failure, origin_transcript = transcript_text(origin_state), aside_transcript = transcript_text(aside_state) }
+  vim.fn.writefile(vim.split(vim.inspect(diagnostic), "\n", { plain = true }), evidence .. "/failure.txt")
+  failure = tostring(failure) .. "\nRetained diagnostics: " .. evidence .. "/failure.txt"
+end
+-- The origin comes first because a failure before the fork leaves no aside to release.
+for _, state in ipairs({ origin_state, aside_state }) do
+  require("forge.views.harness.workspace").release(state)
+  if state.presentation then state.presentation.close() end
+end
+local collected = host.stop()
+vim.api.nvim_set_current_dir(original_directory)
+-- Remove passing evidence only after the host exits and releases its files.
+local release_failure = fixture_evidence.release(success and collected)
+assert(success and collected, failure or "host was not collected")
+assert(not release_failure, release_failure)
+end
 T["provider_destination"] = function()
 local session = require('forge.session')
 local client = require('forge.client')

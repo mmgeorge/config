@@ -51,6 +51,8 @@ pub struct ControlTurnContext {
     pub repository: Option<Arc<super::repository::RepositoryToolScope>>,
     pub(crate) harness: Option<Arc<super::session::HarnessInspectionScope>>,
     pub(crate) lsp: Option<Arc<super::lsp::LspScope>>,
+    /// Present only in an aside session: names its origin and carries messages there.
+    pub(crate) aside: Option<Arc<super::origin::AsideToolScope>>,
     pub execution: Option<crate::plan::execution::ExecutionControlSender>,
 }
 
@@ -288,6 +290,7 @@ impl ControlTurnContext {
             repository: None,
             harness: None,
             lsp: None,
+            aside: None,
             execution: None,
         }
     }
@@ -470,6 +473,9 @@ impl ControlToolRuntime {
             }
             name if super::session::is_tool(name) => {
                 super::session::execute(self, invocation, output).await
+            }
+            name if super::origin::is_tool(name) => {
+                super::origin::execute(self, invocation, output).await
             }
             super::config::NAME => super::config::execute(self, invocation, output).await,
             name => crate::tools::error::bail!("unknown Harness control tool: {name}"),
@@ -1395,6 +1401,7 @@ mod test {
             repository: None,
             harness: None,
             lsp: None,
+            aside: None,
             execution: None,
         }
     }

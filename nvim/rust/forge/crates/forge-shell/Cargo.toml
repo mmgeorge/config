@@ -10,7 +10,7 @@ process-wrap = { workspace = true, features = ["tokio1", "job-object", "kill-on-
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["io-util", "process", "time"] }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
 tree-sitter-nu = { workspace = true }
