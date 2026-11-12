@@ -716,15 +716,6 @@ impl AcpProvider {
                 ProviderFailureKind::BindingClosed,
             ));
         }
-        if matches!(
-            request.history,
-            forge_provider_api::SessionHistory::IsolatedText(_)
-        ) {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::TextGeneration,
-            )
-            .into());
-        }
         validate_configuration(&request.configuration.model, &request.configuration.access)?;
         let mcp_servers = super::resources::mcp_launches(
             ProviderOperation::ThreadOpen,

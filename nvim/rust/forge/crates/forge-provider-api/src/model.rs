@@ -184,6 +184,7 @@ pub struct ProviderModel {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderIntegration {
     pub background_generation: bool,
+    /// Generate text in fresh history separate from the main conversation.
     pub isolated_generation: bool,
     pub terminal_termination: bool,
     pub native_agent_suppression: bool,

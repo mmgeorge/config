@@ -45,6 +45,7 @@ impl TextGenerationJobs {
         &self,
         provider: Arc<dyn api::provider::Provider>,
         trace: Arc<dyn api::trace::ProviderTrace>,
+        access: api::access::AccessPolicy,
         request: api::TextGenerationRequest,
     ) -> Result<String, ProviderError> {
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -65,7 +66,7 @@ impl TextGenerationJobs {
             let (cancellation, observer) = api::OperationCancellation::channel();
             let worker = tokio::spawn(
                 async move {
-                    let result = generate(provider, trace, request, observer).await;
+                    let result = generate(provider, trace, access, request, observer).await;
                     let _ = send.send(result);
                 }
                 .in_current_span()
@@ -194,7 +195,7 @@ impl api::permissions::ProviderPermissions for IsolatedCallbacks {
     ) -> api::permissions::PermissionResponse {
         api::permissions::PermissionResponse::Deny { reason: None }
     }
-    /// Reject native tools even if an adapter violates its isolated policy.
+    /// Reject native permission requests independently of supported tool suppression.
     async fn before_tool(&self, _: &api::InvocationScope) -> Result<(), ProviderError> {
         Err(failure(
             ProviderOperation::TurnStart,
@@ -266,6 +267,7 @@ impl api::ProviderHostEffects for IsolatedCallbacks {
 async fn generate(
     provider: Arc<dyn api::provider::Provider>,
     trace: Arc<dyn api::trace::ProviderTrace>,
+    access: api::access::AccessPolicy,
     request: api::TextGenerationRequest,
     cancellation: api::OperationCancellation,
 ) -> Result<String, ProviderError> {
@@ -316,12 +318,6 @@ async fn generate(
         context_window: None,
         service_tier: request.service_tier,
     };
-    let access = api::access::AccessPolicy {
-        // Isolated adapters disable every native and host tool; no OS sandbox is needed.
-        sandbox: false,
-        write_access: api::access::WriteScope::Off,
-        ..Default::default()
-    };
     let owner = crate::provider::ThreadOwner::root(format!("utility-{}", uuid::Uuid::new_v4()));
     let scope = api::InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string());
     let open_operation = OperationControl::fresh(ProviderOperation::ThreadOpen)?;
@@ -336,7 +332,7 @@ async fn generate(
                 thread_id: owner.thread_id(),
                 mode: api::SessionMode::Background,
                 workspace: request.workspace,
-                history: api::SessionHistory::IsolatedText(api::IsolatedTextPolicy::new()),
+                history: api::SessionHistory::Temporary,
                 configuration: api::SessionConfiguration {
                     model: model.clone(),
                     access: access.clone(),
@@ -650,17 +646,11 @@ async fn collect(
                                 classification: start.classification,
                                 text: start.text,
                             },
-                            api::ItemStart::UserMessage(_) | api::ItemStart::Reasoning(_) => {
-                                IsolatedMessage::Other
-                            }
-                            api::ItemStart::CommandExecution(_)
+                            api::ItemStart::UserMessage(_)
+                            | api::ItemStart::Reasoning(_)
+                            | api::ItemStart::CommandExecution(_)
                             | api::ItemStart::FileChange(_)
-                            | api::ItemStart::ToolCall(_) => {
-                                return Err(failure(
-                                    ProviderOperation::TurnStart,
-                                    ProviderFailureKind::Policy,
-                                ));
-                            }
+                            | api::ItemStart::ToolCall(_) => IsolatedMessage::Other,
                         };
                         order.push(item_id.clone());
                         messages.insert(item_id, message);
@@ -700,7 +690,10 @@ async fn collect(
                                 }
                             }
                             api::ItemCompletion::UserMessage(_)
-                            | api::ItemCompletion::Reasoning(_) => {
+                            | api::ItemCompletion::Reasoning(_)
+                            | api::ItemCompletion::CommandExecution(_)
+                            | api::ItemCompletion::FileChange(_)
+                            | api::ItemCompletion::ToolCall(_) => {
                                 if matches!(message, IsolatedMessage::Agent { .. }) {
                                     return Err(failure(
                                         ProviderOperation::TurnStart,
@@ -708,30 +701,12 @@ async fn collect(
                                     ));
                                 }
                             }
-                            api::ItemCompletion::CommandExecution(_)
-                            | api::ItemCompletion::FileChange(_)
-                            | api::ItemCompletion::ToolCall(_) => {
-                                return Err(failure(
-                                    ProviderOperation::TurnStart,
-                                    ProviderFailureKind::Policy,
-                                ));
-                            }
                         }
                     }
-                    api::ItemEvent::Tool { .. } => {
-                        return Err(failure(
-                            ProviderOperation::TurnStart,
-                            ProviderFailureKind::Policy,
-                        ));
-                    }
+                    api::ItemEvent::Tool { .. } => {}
                 }
             }
-            api::ProviderEvent::Agent { .. } => {
-                return Err(failure(
-                    ProviderOperation::TurnStart,
-                    ProviderFailureKind::Policy,
-                ));
-            }
+            api::ProviderEvent::Agent { .. } => {}
         }
     }
     let primary = failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
@@ -813,6 +788,28 @@ mod tests {
             thread_id: request.thread_id.clone(),
             turn_id: request.turn_id.clone(),
         };
+        for event in [
+            api::ItemEvent::Started(api::ItemStart::ToolCall(api::ToolDescriptor {
+                name: "native_read".into(),
+                title: "Read context".into(),
+                semantics: api::tool::ToolSemantics::Other,
+                arguments: api::InspectableArguments::new(serde_json::Value::Null),
+            })),
+            api::ItemEvent::Completed(api::ItemCompletion::ToolCall(api::ToolCompletion {
+                outcome: api::ToolOutcome::Succeeded,
+                descriptor: None,
+                output: Some("native output is not the answer".into()),
+                changes: Default::default(),
+            })),
+        ] {
+            sink.send_wait(api::AdapterActivity::Item {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                item_id: api::ItemId::new("native-read").unwrap(),
+                event,
+            })
+            .await?;
+        }
         for (id, role, text) in [
             (
                 "reasoning",
@@ -876,7 +873,7 @@ mod tests {
                 let entered = entered_worker.clone();
                 let release = release_worker.clone();
                 async move {
-                    assert!(!request.configuration.access.sandbox);
+                    assert!(request.configuration.access.sandbox);
                     assert!(request.tools.is_empty());
                     assert!(request.tool_endpoint.is_none());
                     entered.notify_one();
@@ -902,8 +899,19 @@ mod tests {
             let jobs = Arc::new(TextGenerationJobs::default());
             let running = jobs.clone();
             let input = request(validated.clone(), reject);
-            let waiter =
-                tokio::spawn(async move { running.generate(native, Arc::new(Trace), input).await });
+            let waiter = tokio::spawn(async move {
+                running
+                    .generate(
+                        native,
+                        Arc::new(Trace),
+                        api::access::AccessPolicy {
+                            write_access: api::access::WriteScope::Off,
+                            ..Default::default()
+                        },
+                        input,
+                    )
+                    .await
+            });
             entered.notified().await;
             if drop_waiter {
                 waiter.abort();

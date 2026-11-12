@@ -355,7 +355,7 @@ fn generation_provider(
         async move {
             assert!(matches!(
                 request.history,
-                forge_provider_api::SessionHistory::IsolatedText(_)
+                forge_provider_api::SessionHistory::Temporary
             ));
             assert!(request.tools.is_empty());
             assert!(request.tool_endpoint.is_none());

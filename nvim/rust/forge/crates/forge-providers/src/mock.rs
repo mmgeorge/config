@@ -1180,7 +1180,7 @@ impl MockProvider {
             ));
         }
         validate_model_selection(&request.configuration.model)?;
-        let isolated = matches!(request.history, SessionHistory::IsolatedText(_));
+        let isolated = matches!(request.history, SessionHistory::Temporary);
         if isolated
             && (!request.tools.is_empty()
                 || request.tool_endpoint.is_some()

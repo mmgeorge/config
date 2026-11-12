@@ -449,6 +449,18 @@ async fn launch(
             ProviderFailureKind::Initialization,
         )
     })?;
+    if let Err(error) = super::process::runtime_requirement(launcher.executable())
+        .validate(initialized.claude_code_version.as_deref())
+    {
+        let cause = ProviderError::from(error);
+        return Err(match transport.shutdown().await {
+            Ok(()) => cause,
+            Err(cleanup) => ProviderError::Combined {
+                primary: Box::new(cause),
+                secondary: vec![cleanup],
+            },
+        });
+    }
     frames.serving.store(true, Ordering::Release);
     // The reader marks the transport closed before it reports the exit, so an exit that raced the
     // line above and went unreported is still visible here.

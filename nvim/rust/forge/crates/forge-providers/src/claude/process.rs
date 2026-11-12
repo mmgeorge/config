@@ -11,6 +11,17 @@ use std::path::PathBuf;
 /// Oldest CLI release whose stream-json behavior this adapter was verified against.
 pub(crate) const MINIMUM_VERSION: semver::Version = semver::Version::new(2, 1, 317);
 
+/// Bind the adapter's single CLI minimum to the selected executable.
+pub(crate) fn runtime_requirement(
+    executable: PathBuf,
+) -> forge_provider_api::version::RuntimeRequirement {
+    forge_provider_api::version::RuntimeRequirement::new(
+        crate::registry::select("claude").expect("Claude is registered"),
+        executable,
+        MINIMUM_VERSION,
+    )
+}
+
 /// Select how a process opens its conversation history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SessionStart {

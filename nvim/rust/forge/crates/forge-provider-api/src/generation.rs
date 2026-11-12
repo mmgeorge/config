@@ -12,7 +12,7 @@ pub enum ReasoningSelection {
     Level(String),
 }
 
-/// Prepare an isolated text request without retaining Harness task state.
+/// Prepare a temporary text request without retaining Harness task state.
 #[derive(Clone)]
 pub struct TextGenerationRequest {
     /// Select the admitted workspace for temporary native configuration and files.
@@ -23,7 +23,7 @@ pub struct TextGenerationRequest {
     pub reasoning: ReasoningSelection,
     /// Service tier selected independently of reasoning effort.
     pub service_tier: crate::ServiceTier,
-    /// Complete instructions for the isolated conversation.
+    /// Host instructions for the temporary conversation.
     pub instructions: String,
     /// Prepared evidence and user input for generation.
     pub input: String,

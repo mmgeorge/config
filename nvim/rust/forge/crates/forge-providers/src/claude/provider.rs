@@ -407,7 +407,6 @@ pub struct ClaudeProvider {
     shutdown_task: Arc<Mutex<Option<Arc<crate::retained_task::RetainedTask>>>>,
     operations: Arc<Operations>,
     pending_inputs: Arc<PendingInputs>,
-    validated_version: Arc<Mutex<Option<String>>>,
     unstarted_sessions: super::conversation::UnstartedSessions,
 }
 
@@ -441,7 +440,6 @@ impl ClaudeProvider {
             shutdown_task: Arc::new(Mutex::new(None)),
             operations: Arc::new(Operations::new()),
             pending_inputs: Arc::new(PendingInputs::new()),
-            validated_version: Arc::new(Mutex::new(None)),
             unstarted_sessions: Default::default(),
         }
     }
@@ -559,17 +557,9 @@ impl ClaudeProvider {
             .ok_or_else(|| failure(operation, ProviderFailureKind::SessionMissing))
     }
 
-    /// Validate the installed CLI against the verified version floor once per provider.
+    /// Validate the selected CLI before each catalog probe or replacement process.
     async fn validate_runtime(&self, context: &OperationContext) -> Result<(), ProviderError> {
-        let mut validated = self.validated_version.lock().await;
-        if validated.is_some() {
-            return Ok(());
-        }
-        let requirement = forge_provider_api::version::RuntimeRequirement::new(
-            claude_id(),
-            self.launcher.executable(),
-            super::process::MINIMUM_VERSION,
-        );
+        let requirement = super::process::runtime_requirement(self.launcher.executable());
         if !self.launcher.available() {
             return Err(requirement
                 .probe_failed(forge_provider_api::version::RuntimeProbeFailure::Unavailable)
@@ -582,7 +572,6 @@ impl ClaudeProvider {
             )
         })?;
         requirement.validate(Some(&version))?;
-        *validated = Some(version);
         Ok(())
     }
 
@@ -733,7 +722,7 @@ impl ClaudeProvider {
         }
         let isolated = matches!(
             request.history,
-            forge_provider_api::SessionHistory::IsolatedText(_)
+            forge_provider_api::SessionHistory::Temporary
         );
         if isolated
             && (!request.tools.is_empty()

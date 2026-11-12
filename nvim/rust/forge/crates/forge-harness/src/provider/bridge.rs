@@ -1750,8 +1750,7 @@ impl ProviderBridge {
         history: &str,
     ) -> Result<String, ProviderError> {
         self.ensure_admission(ProviderOperation::ThreadOpen)?;
-        // Negotiation can withdraw isolated generation (for example an unaudited runtime
-        // version); opening a temporary session would only fail later with cleanup noise.
+        // Check workflow support before allocating temporary history.
         let manifest = self.capabilities(request.clone()).await?;
         if !manifest.supports(forge_provider_api::capability::CapabilityId::IsolatedGeneration) {
             return Err(forge_provider_api::capability::UnsupportedCapability(
@@ -1778,6 +1777,12 @@ impl ProviderBridge {
             .generate(
                 self.native.clone(),
                 self.trace.clone(),
+                self.descriptor.capability.resolve_access(
+                    forge_provider_api::access::AccessPolicy {
+                        write_access: forge_provider_api::access::WriteScope::Off,
+                        ..Default::default()
+                    },
+                ),
                 forge_provider_api::TextGenerationRequest {
                     workspace: request.workspace,
                     model: selection.model.unwrap_or_else(|| "default".to_owned()),

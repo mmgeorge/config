@@ -2680,7 +2680,7 @@ impl CopilotProvider {
                 ProviderFailureKind::BindingClosed,
             ));
         }
-        if matches!(request.history, SessionHistory::IsolatedText(_))
+        if matches!(request.history, SessionHistory::Temporary)
             && (!request.tools.is_empty()
                 || request.tool_endpoint.is_some()
                 || !request.configuration.resources.skills.is_empty()
@@ -2697,16 +2697,10 @@ impl CopilotProvider {
                 ProviderFailureKind::Rejected,
             ));
         }
-        // Isolated text has no executable tools or permission authority; its mandatory native
-        // suppression policy enforces filesystem denial without requiring the ordinary tool sandbox.
-        if !matches!(request.history, SessionHistory::IsolatedText(_)) {
-            self.descriptor()
-                .capability
-                .validate_access(&request.configuration.access)
-                .map_err(|_| {
-                    failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Rejected)
-                })?;
-        }
+        self.descriptor()
+            .capability
+            .validate_access(&request.configuration.access)
+            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Rejected))?;
         self.collect_failed_runtime().await?;
         if self.owners.lock().await.contains_key(&request.thread_id) {
             return Err(failure(
@@ -2742,7 +2736,7 @@ impl CopilotProvider {
             .subscribe(runtime_key.clone(), sink.clone())
             .await;
         let callbacks = Arc::new(CallbackRouter::new(self.closed.clone()));
-        if !matches!(request.history, SessionHistory::IsolatedText(_)) {
+        if !matches!(request.history, SessionHistory::Temporary) {
             let router: Arc<dyn NativeCallbackRouter> = callbacks.clone();
             let shell = Arc::new(super::shell_session::ShellSession::new(
                 Arc::downgrade(&router),
@@ -2793,7 +2787,7 @@ impl CopilotProvider {
             .collect::<Vec<_>>();
         let tools = request.tools.clone();
         let options = super::session::SessionOptions {
-            isolated_text: matches!(request.history, SessionHistory::IsolatedText(_)),
+            isolated_text: matches!(request.history, SessionHistory::Temporary),
             session_id: request
                 .history
                 .resume_id()
@@ -2877,7 +2871,7 @@ impl CopilotProvider {
         let binding = SessionBinding {
             thread_id: request.thread_id.clone(),
             id: binding_id.clone(),
-            provider_session_id: (!matches!(request.history, SessionHistory::IsolatedText(_)))
+            provider_session_id: (!matches!(request.history, SessionHistory::Temporary))
                 .then_some(provider_session_id),
         };
         let state = Arc::new(BindingState {
@@ -3011,7 +3005,7 @@ impl CopilotProvider {
                 watermark: state.sink.watermark(),
             });
         }
-        if matches!(next_request.history, SessionHistory::IsolatedText(_)) {
+        if matches!(next_request.history, SessionHistory::Temporary) {
             return Err(failure(
                 ProviderOperation::ThreadConfigure,
                 ProviderFailureKind::Policy,
@@ -3191,7 +3185,7 @@ impl CopilotProvider {
             .collect::<Vec<_>>();
         let tools = next_request.tools.clone();
         let options = super::session::SessionOptions {
-            isolated_text: matches!(next_request.history, SessionHistory::IsolatedText(_)),
+            isolated_text: matches!(next_request.history, SessionHistory::Temporary),
             session_id: next_request
                 .history
                 .resume_id()
@@ -3642,7 +3636,7 @@ impl CopilotProvider {
             }
             let temporary = matches!(
                 state.request.lock().await.history,
-                SessionHistory::IsolatedText(_)
+                SessionHistory::Temporary
             );
             if temporary && !state.history_deleted.load(Ordering::Acquire) {
                 match super::operation::wait(
@@ -4324,7 +4318,7 @@ impl CopilotProvider {
         let attempt_id = request.attempt_id.clone();
         let isolated_text = matches!(
             state.request.lock().await.history,
-            SessionHistory::IsolatedText(_)
+            SessionHistory::Temporary
         );
         if isolated_text && (!request.tools.is_empty() || request.tool_endpoint.is_some()) {
             return Err(failure(

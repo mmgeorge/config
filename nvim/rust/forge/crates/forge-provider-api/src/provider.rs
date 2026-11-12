@@ -35,15 +35,16 @@ use crate::{
 ///
 /// Fresh open, submit, cancel, automatic settlement, close, and shutdown are core
 /// obligations. Optional operations or modes may reject as unsupported before mutation.
-/// Resume, isolated text, configuration changes, fork, compact, steering, and retraction
+/// Resume, temporary text, configuration changes, fork, compact, steering, and retraction
 /// require their full advertised contracts. Exact no-op configuration may succeed without
 /// claiming unsupported changes. Catalog reads never become configuration writes.
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
     /// Open fresh or resumed history together with a fresh binding, negotiated support, and its sole reader.
     /// Create the reader before returning and retain cleanup across dropped awaits. The caller
-    /// installs stream consumption before submission. Resume and isolated modes may be unsupported;
-    /// reject them before allocation or dispatch. Successful close deletes isolated temporary history.
+    /// installs stream consumption before submission. Resume and temporary modes may be unsupported;
+    /// reject them before allocation or dispatch. Close releases temporary bindings; native history
+    /// deletion is required only when the provider supports ephemeral history.
     async fn thread_open(
         &self,
         context: OperationContext,

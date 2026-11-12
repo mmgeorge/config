@@ -101,39 +101,35 @@ impl CodexProvider {
             let discovery = self.discovery.clone();
             let command = self.command.clone();
             let native = super::operations::current();
-            *catalog = Some(CatalogConnection::Starting(tokio::spawn(async move {
-                let connect = async move {
-                    let connection = runtime.connect().await.map_err(|error| {
-                        connection_failure(ProviderOperation::Inspect, error)
-                    })?;
-                    let rpc = Arc::new(NativeRpc::new(connection));
-                    discovery.lock().await.push(rpc.clone());
-                    let initialized = async {
-                    let initialized = rpc.request("initialize", json!({
-                        "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-                        "capabilities":{"experimentalApi":true}
-                    }), ProviderOperation::Inspect).await?;
-                    let reported = initialized.get("userAgent").and_then(Value::as_str).and_then(|agent| agent.split_whitespace().next()).and_then(|product| product.split_once('/').map(|(_, version)| version));
-                    let requirement = forge_provider_api::version::RuntimeRequirement::new(crate::registry::select("codex").expect("Codex is registered"), PathBuf::from(&command[0]), semver::Version::new(0, 164, 0));
-                    requirement.validate(reported).map_err(ProviderError::from)?;
-                    rpc.notify("initialized", Value::Null).await
-                }.await;
-                    if let Err(primary) = initialized {
-                        return Err(match rpc.close().await {
-                            Ok(()) => primary,
-                            Err(secondary) => ProviderError::Combined {
-                                primary: Box::new(primary),
-                                secondary: vec![secondary],
-                            },
-                        });
+            *catalog = Some(CatalogConnection::Starting(tokio::spawn(
+                async move {
+                    let connect = async move {
+                        let connection = runtime.connect().await.map_err(|error| {
+                            connection_failure(ProviderOperation::Inspect, error)
+                        })?;
+                        let rpc = Arc::new(NativeRpc::new(connection));
+                        discovery.lock().await.push(rpc.clone());
+                        let initialized =
+                            initialize_connection(&rpc, &command, ProviderOperation::Inspect).await;
+                        if let Err(primary) = initialized {
+                            return Err(match rpc.close().await {
+                                Ok(()) => primary,
+                                Err(secondary) => ProviderError::Combined {
+                                    primary: Box::new(primary),
+                                    secondary: vec![secondary],
+                                },
+                            });
+                        }
+                        Ok(rpc)
+                    };
+                    match native {
+                        Some(native) => super::operations::scope(native, connect).await,
+                        None => connect.await,
                     }
-                    Ok(rpc)
-                };
-                match native {
-                    Some(native) => super::operations::scope(native, connect).await,
-                    None => connect.await,
                 }
-            }.instrument(tracing::Span::current()).with_current_subscriber())));
+                .instrument(tracing::Span::current())
+                .with_current_subscriber(),
+            )));
         }
         let result = match catalog.as_mut().expect("catalog initialization installed") {
             CatalogConnection::Ready(rpc) => return Ok(rpc.clone()),
@@ -237,7 +233,7 @@ impl CodexProvider {
         }
         let isolated = matches!(
             &request.history,
-            forge_provider_api::session::SessionHistory::IsolatedText(_)
+            forge_provider_api::session::SessionHistory::Temporary
         );
         if isolated
             && (!request.tools.is_empty()
@@ -280,41 +276,9 @@ impl CodexProvider {
         profile
             .bind_skills(&request.configuration.resources.skills, "skills")
             .map_err(|error| error.into_provider_error(ProviderOperation::ThreadOpen))?;
-        let private_home = profile.path().to_path_buf();
-        let resources = CodexResources::new(
-            request.configuration.resources.clone(),
-            private_home.clone(),
-        );
-        let (runtime, isolation_auth) = if isolated {
-            let rpc = self.catalog_connection().await?;
-            let catalog = rpc
-                .request("model/list", json!({}), ProviderOperation::ThreadOpen)
-                .await?;
-            let models = super::catalog::parse_model_catalog(&catalog);
-            let selected = match request.configuration.model.model.as_deref() {
-                Some(id) => models.iter().find(|model| model.id == id),
-                None => models.iter().find(|model| model.is_default),
-            }
-            .ok_or_else(|| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Rejected))?;
-            let config = rpc
-                .request(
-                    "config/read",
-                    json!({"includeLayers":false,"cwd":request.workspace}),
-                    ProviderOperation::ThreadOpen,
-                )
-                .await?;
-            let config = config.get("config").ok_or_else(|| {
-                failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
-            })?;
-            let (command, home) =
-                super::isolation::runtime_command(&self.command, profile.path(), selected, config)?;
-            (
-                Arc::new(CodexRuntime::isolated(command, home)),
-                Some(Arc::new(super::isolation::IsolationAuth::new(rpc))),
-            )
-        } else {
-            (Arc::new(CodexRuntime::new(self.command.clone())), None)
-        };
+        let profile_root = profile.path().to_path_buf();
+        let resources = CodexResources::new(request.configuration.resources.clone(), profile_root);
+        let runtime = Arc::new(CodexRuntime::new(self.command.clone()));
         let pending = Arc::new(PendingOpen {
             operation_id: operation_id.clone(),
             runtime: runtime.clone(),
@@ -336,45 +300,8 @@ impl CodexProvider {
             .map_err(|error| connection_failure(ProviderOperation::ThreadOpen, error))?;
         let rpc = Arc::new(NativeRpc::new(connection));
         *pending.rpc.lock().await = Some(rpc.clone());
-        let initialized = rpc.request("initialize", json!({
-            "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"experimentalApi":true}
-        }), ProviderOperation::ThreadOpen).await?;
-        let requirement = forge_provider_api::version::RuntimeRequirement::new(
-            crate::registry::select("codex").expect("Codex is registered"),
-            self.command
-                .first()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "app-server".into()),
-            semver::Version::new(0, 164, 0),
-        );
-        let reported = initialized
-            .get("userAgent")
-            .and_then(Value::as_str)
-            .and_then(|agent| agent.split_whitespace().next())
-            .and_then(|product| product.split_once('/').map(|(_, version)| version));
-        requirement
-            .validate(reported)
-            .map_err(ProviderError::from)?;
-        rpc.notify("initialized", Value::Null).await?;
-        if isolated {
-            let version = reported
-                .and_then(|version| semver::Version::parse(version).ok())
-                .ok_or_else(|| {
-                    failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
-                })?;
-            if version != semver::Version::new(0, 164, 0) {
-                return Err(forge_provider_api::capability::UnsupportedCapability(
-                    forge_provider_api::capability::ProviderFeature::TextGeneration,
-                )
-                .into());
-            }
-            isolation_auth
-                .as_ref()
-                .expect("isolated runtime owns its credential bridge")
-                .bootstrap(&rpc)
-                .await?;
-        }
+        let validated =
+            initialize_connection(&rpc, &self.command, ProviderOperation::ThreadOpen).await?;
 
         let resource_config = resources.configure(&rpc, &request.workspace, &[]).await?;
         let mut parameters = match request.history.resume_id() {
@@ -448,15 +375,7 @@ impl CodexProvider {
         };
         let mut mcp_context = super::protocol::McpContext::default();
         mcp_context.set_bindings(resources.mcp_aliases());
-        let auth_status = rpc
-            .request(
-                "getAuthStatus",
-                json!({"includeToken":false,"refreshToken":false}),
-                ProviderOperation::ThreadOpen,
-            )
-            .await
-            .ok();
-        let capabilities = negotiated_capabilities(reported, auth_status.as_ref());
+        let capabilities = negotiated_capabilities(&validated);
         let mut normalization = CodexNormalization::default();
         normalization.admit_thread(session_id.as_str(), &request.thread_id)?;
         let retained = Arc::new(CodexBinding {
@@ -505,7 +424,6 @@ impl CodexProvider {
             provider_closed: self.closed.clone(),
             isolated,
             background: request.mode == forge_provider_api::session::SessionMode::Background,
-            isolation_auth,
             configuration: Mutex::new(request.configuration.clone()),
             capabilities,
             settlements: Mutex::new(HashMap::new()),
@@ -1038,25 +956,7 @@ impl CodexProvider {
         let next_rpc = Arc::new(NativeRpc::new(connection));
         session.retired_rpcs.lock().await.push(next_rpc.clone());
         let resumed = async {
-            let initialized = next_rpc.request("initialize", json!({
-                "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-                "capabilities":{"experimentalApi":true}
-            }), ProviderOperation::ThreadConfigure).await?;
-            let requirement = forge_provider_api::version::RuntimeRequirement::new(
-                crate::registry::select("codex").expect("Codex is registered"),
-                self.command
-                    .first()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| "app-server".into()),
-                semver::Version::new(0, 164, 0),
-            );
-            let version = initialized
-                .get("userAgent")
-                .and_then(Value::as_str)
-                .and_then(|agent| agent.split_whitespace().next())
-                .and_then(|product| product.split_once('/').map(|(_, version)| version));
-            requirement.validate(version).map_err(ProviderError::from)?;
-            next_rpc.notify("initialized", Value::Null).await?;
+            initialize_connection(&next_rpc, &self.command, ProviderOperation::ThreadConfigure).await?;
             let config = next_resources
                 .configure(&next_rpc, &session.workspace, &retired_aliases)
                 .await?;
@@ -1608,25 +1508,8 @@ impl CodexProvider {
         self.discovery.lock().await.push(rpc.clone());
         let operation_result: Result<forge_provider_api::SubmissionEvidence, ProviderError> =
             async {
-                let initialized = rpc.request("initialize", json!({
-                "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-                "capabilities":{"experimentalApi":true}
-            }), ProviderOperation::InputReconcile).await?;
-                let requirement = forge_provider_api::version::RuntimeRequirement::new(
-                    crate::registry::select("codex").expect("Codex is registered"),
-                    self.command
-                        .first()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| "app-server".into()),
-                    semver::Version::new(0, 164, 0),
-                );
-                let version = initialized
-                    .get("userAgent")
-                    .and_then(Value::as_str)
-                    .and_then(|agent| agent.split_whitespace().next())
-                    .and_then(|product| product.split_once('/').map(|(_, version)| version));
-                requirement.validate(version).map_err(ProviderError::from)?;
-                rpc.notify("initialized", Value::Null).await?;
+                initialize_connection(&rpc, &self.command, ProviderOperation::InputReconcile)
+                    .await?;
                 let mut cursor = None::<String>;
                 let mut seen_cursors = std::collections::HashSet::new();
                 loop {
@@ -3808,7 +3691,6 @@ struct CodexBinding {
     isolated: bool,
     /// Retained Background generation, which must run no native tool that changes anything.
     background: bool,
-    isolation_auth: Option<Arc<super::isolation::IsolationAuth>>,
     configuration: Mutex<forge_provider_api::SessionConfiguration>,
     capabilities: forge_provider_api::capability::CapabilityManifest,
     settlements: Mutex<
@@ -4348,43 +4230,56 @@ async fn stop_foreground_commands(
     Ok(())
 }
 
-/// Get effective Codex support after validating the minimum native protocol version.
+/// Initialize and validate every native connection before exposing it to callers.
+async fn initialize_connection(
+    rpc: &NativeRpc,
+    command: &[String],
+    operation: ProviderOperation,
+) -> Result<forge_provider_api::version::ValidatedRuntime, ProviderError> {
+    let initialized = rpc
+        .request(
+            "initialize",
+            json!({
+                "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
+                "capabilities":{"experimentalApi":true}
+            }),
+            operation,
+        )
+        .await?;
+    let reported = initialized
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .and_then(|agent| agent.split_whitespace().next())
+        .and_then(|product| product.split_once('/').map(|(_, version)| version));
+    let requirement = forge_provider_api::version::RuntimeRequirement::new(
+        crate::registry::select("codex").expect("Codex is registered"),
+        command
+            .first()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "app-server".into()),
+        semver::Version::new(0, 164, 0),
+    );
+    let validated = requirement.validate(reported)?;
+    rpc.notify("initialized", Value::Null).await?;
+    Ok(validated)
+}
+
+/// Get the adapter's capabilities independently of the installed CLI version.
 fn codex_capabilities() -> forge_provider_api::capability::CapabilityManifest {
-    let mut capabilities = forge_provider_api::capability::CapabilityManifest::from_descriptor(
+    forge_provider_api::capability::CapabilityManifest::from_descriptor(
         crate::registry::descriptor(
             &crate::registry::select("codex").expect("Codex is registered"),
         )
         .expect("registered Codex descriptor"),
-    );
-    // Isolated text requires an audited runtime and native-exportable credentials, which
-    // only negotiation can prove.
-    capabilities.set_support(
-        forge_provider_api::capability::CapabilityId::IsolatedGeneration,
-        forge_provider_api::capability::Support::Unsupported,
-    );
-    capabilities
+    )
 }
 
-/// Publish isolated support only for the audited runtime and a native-exportable authentication mode.
+/// Attach the validated runtime version without withdrawing adapter capabilities.
 fn negotiated_capabilities(
-    version: Option<&str>,
-    auth_status: Option<&Value>,
+    runtime: &forge_provider_api::version::ValidatedRuntime,
 ) -> forge_provider_api::capability::CapabilityManifest {
     let mut capabilities = codex_capabilities();
-    capabilities.provider_version = version.map(str::to_owned);
-    let exportable = auth_status.is_some_and(|status| {
-        status.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(false)
-            || matches!(
-                status.get("authMethod").and_then(Value::as_str),
-                Some("apikey" | "chatgpt" | "chatgptAuthTokens")
-            )
-    });
-    if version == Some("0.164.0") && exportable {
-        capabilities.set_support(
-            forge_provider_api::capability::CapabilityId::IsolatedGeneration,
-            forge_provider_api::capability::Support::Supported,
-        );
-    }
+    capabilities.provider_version = Some(runtime.version().to_string());
     capabilities
 }
 
@@ -5738,23 +5633,6 @@ async fn handle_native_request(
     request: &PromptRequest,
     message: &Value,
 ) -> Result<(), ProviderError> {
-    if session.isolated
-        && message.get("method").and_then(Value::as_str)
-            == Some("account/chatgptAuthTokens/refresh")
-        && !session.is_fenced()
-    {
-        let id = message
-            .get("id")
-            .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
-        let auth = session.isolation_auth.as_ref().ok_or_else(|| {
-            failure(
-                ProviderOperation::TurnStart,
-                ProviderFailureKind::Authentication,
-            )
-        })?;
-        let response = auth.refresh_response().await?;
-        return session.rpc.lock().await.respond(id, response).await;
-    }
     if session.is_fenced() || session.isolated {
         return session
             .rpc
@@ -6233,72 +6111,9 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Exclude inherited instructions and every native tool/automation surface in temporary history.
+/// Apply documented controls for a temporary text conversation.
 fn isolated_config() -> Value {
-    let mut config = json!({
-        "web_search":"disabled",
-        "project_doc_max_bytes":0,
-        "instructions":"",
-        "developer_instructions":"",
-        "include_permissions_instructions":false,
-        "include_apps_instructions":false,
-        "include_collaboration_mode_instructions":false,
-        "include_environment_context":false,
-        "include_environment_context_time":false,
-        "cloud.skills.enabled":false,
-        "orchestrator.mcp.enabled":false,
-        "agents.enabled":false,
-        "skills.include_instructions":false,
-        "orchestrator.skills.enabled":false,
-        "tools.update_plan.enabled":false,
-        "tools.experimental_request_user_input.enabled":false
-    });
-    for feature in [
-        "apps",
-        "enable_mcp_apps",
-        "codex_apps_mcp_2026_07_28",
-        "recommended_plugins",
-        "remote_plugin",
-        "external_agent_memory_import",
-        "skill_search",
-        "in_app_browser",
-        "in_app_local_automation",
-        "code_mode",
-        "code_mode_only",
-        "code_mode_tool_search",
-        "code_mode_host",
-        "code_mode_prewarm",
-        "default_mode_request_user_input",
-        "sleep_tool",
-        "send_message_to_user_async",
-        "runtime_agent_instances",
-        "use_agent_identity",
-        "artifact",
-        "async_compaction",
-        "step_model_switching",
-        "context_management",
-        "current_time_reminder",
-        "deferred_executor",
-        "enable_fanout",
-        "goals",
-        "hooks",
-        "image_generation",
-        "memories",
-        "multi_agent",
-        "multi_agent_v2",
-        "plugins",
-        "request_permissions_tool",
-        "shell_snapshot",
-        "shell_tool",
-        "standalone_web_search",
-        "token_budget",
-        "tool_suggest",
-        "unified_exec",
-        "view_image",
-    ] {
-        config[format!("features.{feature}")] = json!(false);
-    }
-    config
+    json!({"web_search":"disabled", "project_doc_max_bytes":0})
 }
 
 #[cfg(test)]
@@ -6316,6 +6131,78 @@ mod continuation_tests {
         turn_control::{HostTurnStatus, TurnControl},
     };
     use forge_provider_api::{ProviderEvent, turn::TurnOutcome};
+
+    /// Validate each new connection using only the minimum CLI version, including newer releases.
+    #[tokio::test]
+    async fn initialization_accepts_newer_versions_and_reports_invalid_versions() {
+        use futures_util::{SinkExt, StreamExt};
+        for (reported, accepted) in [
+            (Some("codex/0.163.0"), false),
+            (Some("codex/0.164.0"), true),
+            (Some("codex/0.167.0"), true),
+            (Some("codex/99.0.0"), true),
+            (None, false),
+            (Some("codex/invalid"), false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], "initialize");
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({
+                            "id":request["id"], "result":{"userAgent":reported}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if accepted {
+                    let notification: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(notification["method"], "initialized");
+                }
+                while let Some(Ok(message)) = socket.next().await {
+                    if message.is_close() {
+                        break;
+                    }
+                }
+            });
+            let connection = super::super::connection::CodexConnection::connect(&endpoint)
+                .await
+                .unwrap();
+            let rpc = NativeRpc::new(connection);
+            let result = initialize_connection(
+                &rpc,
+                &["fixture-codex".into()],
+                ProviderOperation::ThreadOpen,
+            )
+            .await;
+            if accepted {
+                let runtime = result.unwrap();
+                assert!(
+                    negotiated_capabilities(&runtime)
+                        .supports(forge_provider_api::capability::CapabilityId::IsolatedGeneration)
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ProviderError::RuntimeVersion(_))),
+                    "{result:?}"
+                );
+            }
+            rpc.close().await.unwrap();
+            rpc.close().await.unwrap();
+            peer.await.unwrap();
+        }
+    }
 
     /// Keep a non-launch I/O failure distinct from an executable lookup failure.
     #[test]
@@ -6456,7 +6343,6 @@ mod continuation_tests {
             provider_closed: provider.closed.clone(),
             isolated: false,
             background: false,
-            isolation_auth: None,
             configuration: Mutex::new(forge_provider_api::SessionConfiguration {
                 model: ModelSelection::default(),
                 access: AccessPolicy::default(),

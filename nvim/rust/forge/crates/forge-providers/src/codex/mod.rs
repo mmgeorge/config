@@ -1,7 +1,6 @@
 mod attachments;
 mod connection;
 mod descendants;
-mod isolation;
 mod operations;
 pub mod provider;
 mod resources;

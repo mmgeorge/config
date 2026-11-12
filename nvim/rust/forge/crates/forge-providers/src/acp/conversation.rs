@@ -76,13 +76,6 @@ impl AcpConversation {
             "clientInfo":{"name":"forge-harness","title":"Forge Harness","version":"0.1.0"},
             "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{}},"subagents":{}}})).await.map_err(|source| initialization_failure(&requirement, source))?;
         validate_initialization(&requirement, &initialized)?;
-        ensure!(
-            initialized
-                .pointer("/agentCapabilities/loadSession")
-                .and_then(Value::as_bool)
-                == Some(true),
-            "ACP agent cannot resume conversations, which Forge requires"
-        );
         let mut servers = Vec::new();
         if let Some(endpoint) = &options.control_endpoint {
             let headers = endpoint.headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>();
@@ -157,7 +150,10 @@ impl AcpConversation {
                     }) => forge_provider_api::ProviderFailureKind::Authentication,
                     _ => forge_provider_api::ProviderFailureKind::Initialization,
                 };
-                let cause = acp_failure(kind);
+                let cause = error
+                    .downcast_ref::<ProviderError>()
+                    .cloned()
+                    .unwrap_or_else(|| acp_failure(kind));
                 state.invalidate_binding(cause.clone()).await;
                 transport.retain_failure(cause.clone()).await;
                 match transport.shutdown().await {

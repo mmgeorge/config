@@ -689,7 +689,7 @@ impl EventFixtureProvider {
                 reason = context.interrupted() => return Err(reason.failure(ProviderOperation::ThreadOpen, ProviderPhase::Preparation, FailureDisposition::Unchanged)),
             }
         }
-        if matches!(request.history, SessionHistory::IsolatedText(_))
+        if matches!(request.history, SessionHistory::Temporary)
             && (!request.tools.is_empty()
                 || request.tool_endpoint.is_some()
                 || !request.configuration.resources.skills.is_empty()

@@ -428,9 +428,7 @@ async fn isolated_text_uses_an_unpersisted_tool_free_process() {
     let provider =
         ClaudeProvider::with_launcher(launcher.clone(), directory.path().join("runtime"));
     let mut request = session_request(directory.path());
-    request.history = forge_provider_api::SessionHistory::IsolatedText(
-        forge_provider_api::session::IsolatedTextPolicy::new(),
-    );
+    request.history = forge_provider_api::SessionHistory::Temporary;
     let mut opened = provider
         .thread_open(operation_context(), request)
         .await

@@ -416,6 +416,7 @@ fn capability(id: &str) -> ProviderCapability {
         },
         "antigravity" => ProviderCapability {
             integration: ProviderIntegration {
+                isolated_generation: true,
                 tracked_submission: true,
                 resource_target: Some("antigravity-cli".into()),
                 limitations: vec![

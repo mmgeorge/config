@@ -244,7 +244,7 @@ fn provider_row_text(id: CapabilityId) -> ProviderRowText {
             ),
             ..provider_row(
                 "Harness",
-                "Generate isolated recap and session name",
+                "Generate recap, session name, and commit text",
                 Provider,
                 "Generation must not append to the main provider conversation",
             )

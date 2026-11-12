@@ -145,8 +145,7 @@ pub struct ForkTarget {
 /// Own complete open inputs and binding-lifetime host resource authority.
 /// Transfer this request to the retained open operation. Its identity snapshot retains values
 /// and weak authority identity only, so cached replay metadata cannot prolong live leases.
-/// Isolated history excludes resume by construction; adapters also reject incompatible tools,
-/// inherited resources, or instructions before allocating native isolated work.
+/// Temporary history excludes resume by construction and keeps generated work separate.
 #[derive(Clone)]
 pub struct SessionRequest {
     /// Identify the host conversation before any native history is opened.
@@ -155,7 +154,7 @@ pub struct SessionRequest {
     pub mode: SessionMode,
     /// Select the workspace used to resolve admitted resources.
     pub workspace: String,
-    /// Choose durable history or enforce fresh isolated temporary history.
+    /// Choose durable history or a fresh temporary conversation.
     pub history: SessionHistory,
     /// Apply one complete initial configuration.
     pub configuration: SessionConfiguration,
@@ -231,7 +230,7 @@ impl std::fmt::Debug for HostToolEndpoint {
 pub enum SessionMode {
     /// The user's retained foreground conversation.
     Interactive,
-    /// A retained background conversation with its own host owner; not isolated temporary text work.
+    /// A retained background conversation with its own host owner; not temporary text work.
     Background,
     /// A delegated conversation with independent host ownership and callback authority.
     Child,
@@ -302,8 +301,10 @@ pub enum SessionHistory {
         /// Durable provider-issued history to resume, or None for new retained history.
         resume: Option<ProviderSessionId>,
     },
-    /// Create fresh temporary history with the complete isolation guarantee.
-    IsolatedText(IsolatedTextPolicy),
+    /// Create a fresh conversation separate from durable history.
+    /// Adapters use native ephemeral history when supported. Native instructions and
+    /// tools may remain available; access and approval policies still apply.
+    Temporary,
 }
 
 impl SessionHistory {
@@ -311,30 +312,13 @@ impl SessionHistory {
     pub fn resume_id(&self) -> Option<&ProviderSessionId> {
         match self {
             Self::Durable { resume } => resume.as_ref(),
-            Self::IsolatedText(_) => None,
+            Self::Temporary => None,
         }
     }
 }
 
-/// Request fresh temporary history with only explicitly supplied instructions.
-/// Exclude inherited instructions, hooks, skills, and MCP; disable native and host tools,
-/// permission prompts, and autonomous goal work. This policy cannot contain a resume ID and
-/// is independent of session role. Adapters must enforce every guarantee or reject before
-/// dispatch; an empty host tool list alone is insufficient. Successful close removes the history.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct IsolatedTextPolicy {
-    _private: (),
-}
-
-impl IsolatedTextPolicy {
-    /// Create the complete isolated-text policy; no partial isolation mode is available.
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
 /// Select the complete resource set for one retained provider session.
-/// Empty selections exclude inherited resources rather than restoring native defaults.
+/// Empty selections request no resources; adapters suppress inherited resources where supported.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResourceSelection {
     /// Select portable skills by normalized definitions.

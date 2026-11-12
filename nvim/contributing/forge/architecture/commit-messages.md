@@ -34,24 +34,14 @@ Overloads are never paired by position, and ambiguous matches keep body excerpts
 
 `ForgeDebugCommitPromptPreview [head|staged|latest_commit]` returns the exact system and user strings with their byte count, without calling a provider.
 
-## Background conversations
+## Temporary generation
 
-`HarnessService.background` owns persistent, tool-free conversations independently of interactive Harness. A Background conversation opens with only `BACKGROUND_SYSTEM_MESSAGE` as its instructions, which each request's `TextGeneration::background_input` follows with its task name, response requirements, and evidence. It advertises no Harness tools and selects no skills or MCP servers, writes are off, and `ProviderPermissionContext::deny_all_tools` rejects every native tool, command, and file request its turns make, whatever saved rules or approval mode would allow. Codex additionally runs Background turns in a read-only sandbox without network access, so commands it runs without asking cannot change anything. Each request captures worktree identity, branch, HEAD, and the full messages of the ten most recent reachable commits, which supply terminology rather than evidence. A conversation resumes while its branch and model stay unchanged and its previous HEAD remains an ancestor. Otherwise a new conversation starts, and the old timeline is kept. An operating-system lock serializes work across editors.
+`HarnessService.generate_text` runs commit and PR text generation through the shared temporary-generation lifecycle. Each request captures worktree identity, branch, HEAD, and recent reachable commit messages, then supplies the prepared evidence to a fresh provider conversation. It never resumes or appends to the interactive conversation.
 
-`background.settings` stores the Background provider, per-provider model and thinking defaults, and a compaction policy at 128,000 tokens. The Background provider is chosen independently of interactive Harness: Lua sends it in every generation selection, and `BackgroundManager` runs it in its own runtime, so the active chat's provider never decides which provider generates. Changing it starts a new Background conversation, like a model change. `:ForgeDebugBackgroundTimeline` inspects these conversations. Generation failures notify even after the buffer closes, and they never replace an existing draft.
+`background.settings` continues to store the independently selected provider and per-provider model, reasoning, and service-tier preferences. Those user settings are preserved. Commit generation no longer depends on a persistent `BackgroundManager` conversation or its compaction policy; the existing Background timeline describes retained Background work, not these temporary requests.
 
-When Codex cannot launch, generation reports its configured executable and the
-normalized launch cause, rather than a model-list transport failure. The remedy
-is to check that executable's installation or the independently selected
-Background provider settings; generation never changes those settings on failure.
+The shared helper resolves the selected model, supplies no host tools or selected resources, denies permission callbacks, disables writes, and requests native read-only sandboxing where supported. Adapters disable native tools, inherited resources, and hooks only through supported controls. Native defaults may remain; the workflow does not promise complete suppression. See [Providers](providers.md) for the adapter contract and minimum CLI versions.
 
-Background generation cancels when its request is cancelled, its two-minute deadline expires, or provider observation fails. Observation failure does not imply user cancellation. A failed generation or unreliable observer retires its runtime, and the next explicit request retries pending cleanup before acquiring a replacement. Cleanup failure keeps the old owner fenced; successful cleanup permits a fresh runtime to resume the retained conversation without replaying the failed request.
+The helper collects final answer text, applies the output validator, and closes the temporary binding. Cancellation, timeout, or provider failure still triggers independent cleanup. A primary generation failure and a cleanup failure are both retained. Generation failures notify even after the buffer closes and never replace an existing draft. A failed request does not change provider preferences, and the next request starts fresh.
 
-`BackgroundManager` retains a trace lease for each data root and gives its workers
-an explicit logging destination from preparation through cleanup. It closes those
-leases only after workers and retained runtimes finish, so a failed preparation
-cannot remove its destination and a reusable runtime cannot inherit a closed one.
-The worker's span carries the originating IPC request ID, host process ID, and
-Background session ID once assigned; catalog spans add the provider operation ID.
-These fields remain in JSONL diagnostics, not user notifications. Explicit routing
-also prevents another active data root from suppressing or receiving these records.
+When a CLI cannot launch or is below its adapter's minimum version, generation reports the selected executable and normalized cause. Versions above the minimum remain eligible without an exact-version certification gate.

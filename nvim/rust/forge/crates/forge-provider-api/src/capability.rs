@@ -91,7 +91,7 @@ pub enum CapabilityId {
     FileDiff,
     /// Independent binding-owned shell termination.
     BackgroundTermination,
-    /// Text generation in an isolated history that never appends to the main conversation.
+    /// Text generation in a separate conversation that never appends to main history.
     IsolatedGeneration,
     /// Enforcement of host-owned delegation authority.
     NativeAgentSuppression,
@@ -335,7 +335,7 @@ pub enum ProviderFeature {
     BackgroundTerminals,
     /// Independent terminal termination.
     BackgroundTermination,
-    /// The complete isolated-text session mode.
+    /// Text generation in a fresh temporary conversation.
     TextGeneration,
     /// Opaque normalized model selection.
     ModelSelection,
