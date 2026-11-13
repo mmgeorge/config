@@ -519,10 +519,11 @@ impl BrokerObserver {
             })
             .collect();
         Ok(BrokerSnapshot {
-            activity: *self
+            activity: self
                 .activity
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             questions: self.questions.snapshot()?,
             ask_model,
             access_preference: settings

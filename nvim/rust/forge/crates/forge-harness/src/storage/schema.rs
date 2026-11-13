@@ -4,6 +4,44 @@ use rusqlite::{Connection, TransactionBehavior};
 pub(super) const VERSION: i64 = super::state::VERSION as i64;
 const APPLICATION: i64 = 0x464f5247;
 
+/// Tables created atomically before a history database can be opened.
+const REQUIRED_TABLES: &[&str] = &[
+    "session_record",
+    "task_record",
+    "exchange_record",
+    "exchange_comment",
+    "plan_record",
+    "plan_lifecycle_record",
+    "plan_execution_record",
+    "plan_deviation_record",
+    "plan_audit_record",
+    "plan_resolution_record",
+    "goal_record",
+    "checkpoint_record",
+    "prompt_history_record",
+    "prompt_attachment_record",
+    "agent_run_record",
+    "observed_binding_unavailable",
+    "observed_agent_record",
+    "agent_task_record",
+    "session_event_record",
+    "fork_history_record",
+    "session_deletion",
+    "tool_output_owner",
+    "tool_output_chunk",
+    "tool_output_summary",
+    "tool_output_position",
+    "command_receipt",
+    "owner_command",
+    "terminal_request",
+    "owner_core_log",
+    "owner_publication",
+    "owner_publication_origin",
+    "input_session",
+    "input_operation",
+    "input_submitted",
+];
+
 /// Serializes bootstrap pragmas across processes before SQLite can acquire its own write lock.
 pub(crate) fn bootstrap_lock(root: &std::path::Path, name: &str) -> Result<std::fs::File> {
     exclusive_file_lock(
@@ -48,7 +86,7 @@ pub(crate) fn exclusive_file_lock(path: &std::path::Path, purpose: &str) -> Resu
     }
 }
 
-/// Rejects foreign and newer database formats before any data or schema is changed.
+/// Reject foreign, newer, and incomplete current schemas before any data or schema is changed.
 pub(super) fn validate(connection: &Connection) -> Result<i64> {
     let application: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
@@ -68,6 +106,23 @@ pub(super) fn validate(connection: &Connection) -> Result<i64> {
             |row| row.get(0),
         )?;
         ensure!(!foreign, "database belongs to another application");
+    }
+    if version == VERSION {
+        let mut statement =
+            connection.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+        let tables = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        let missing: Vec<_> = REQUIRED_TABLES
+            .iter()
+            .copied()
+            .filter(|table| !tables.contains(*table))
+            .collect();
+        ensure!(
+            missing.is_empty(),
+            "Harness database schema {VERSION} is incomplete: missing required tables: {}; clear this state version with ForgeHistoryClear",
+            missing.join(", ")
+        );
     }
     Ok(version)
 }
@@ -312,4 +367,31 @@ fn initialize_owner_commands(connection: &Connection) -> Result<()> {
         );",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every bootstrap table must participate in the early compatibility check.
+    #[test]
+    fn required_tables_match_initialized_schema() -> Result<()> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "isolated schema fixture has no history files"
+        )]
+        let mut connection = Connection::open_in_memory()?;
+        initialize(&mut connection)?;
+        let mut query = connection.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )?;
+        let actual = query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut required = REQUIRED_TABLES.to_vec();
+        required.sort_unstable();
+        assert_eq!(actual, required);
+        assert_eq!(validate(&connection)?, VERSION);
+        Ok(())
+    }
 }

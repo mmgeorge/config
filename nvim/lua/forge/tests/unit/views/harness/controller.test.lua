@@ -10,6 +10,38 @@ local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["unavailable_owner_shows_failure_and_preserves_prompt"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local activity = require("forge.views.harness.activity")
+  local failures, calls, header = {}, 0, ""
+  require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
+  require("forge.client").request = function() calls = calls + 1 end
+  require("forge.shared.keymaps").apply_view_winbar = function(_, _, _, _, segments)
+    header = table.concat(vim.tbl_map(function(segment) return segment.text end, segments))
+  end
+  state.session = { id = "unavailable", provider = "mock", model = "test" }
+  state.runtime_epoch = "new-owner"
+  state.composer_buf = buffer.scratch()
+  state.transcript_win = vim.api.nvim_get_current_win()
+  state.command_set = controller.command_set()
+  local reason = "Recover terminal requests: no such table: terminal_request"
+  assert(activity.receive(state, { revision = 1, phase = "unavailable", unavailable_reason = reason }, "new-owner"))
+  buffer.set(state.composer_buf, { "preserve this prompt" })
+  controller.refresh_winbar()
+  assert(header:find(reason, 1, true), header)
+  for _, submit in ipairs({ controller.submit, controller.queue_submit, controller.steer_submit }) do submit() end
+  eq(calls, 0)
+  eq(buffer.line(state.composer_buf, 1), "preserve this prompt")
+  eq(#failures, 3)
+  for _, failure in ipairs(failures) do assert(failure:find(reason, 1, true), failure) end
+  local opened = false
+  require("forge.views.harness").new_session = function() opened = true end
+  buffer.set(state.composer_buf, { "/new" })
+  controller.submit()
+  eq(opened, true)
+end
+
 T["harness_child_steering"] = function()
   local client = require("forge.client")
   local state = require("forge.session").harness

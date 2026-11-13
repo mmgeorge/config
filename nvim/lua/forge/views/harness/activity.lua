@@ -7,6 +7,14 @@ function M.busy(state)
   return not state.host_error and state.activity ~= nil and state.activity.phase == "working"
 end
 
+---Get the owner's fatal execution failure for status and prompt admission.
+---@param state table
+---@return string?
+function M.unavailable_reason(state)
+  if not state.activity or state.activity.phase ~= "unavailable" then return nil end
+  return state.activity.unavailable_reason or "Session execution is unavailable; reopen the session to retry"
+end
+
 ---Adopt one ordered owner projection within its runtime epoch.
 ---@param state table
 ---@param incoming table

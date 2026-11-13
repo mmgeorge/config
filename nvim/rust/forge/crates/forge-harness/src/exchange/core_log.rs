@@ -310,6 +310,7 @@ impl CoreOutcome {
                 | CommandFailure::LegacyInputRejected
                 | CommandFailure::PrerequisiteFailed
                 | CommandFailure::OwnershipUnavailable
+                | CommandFailure::OwnerUnavailable(_)
                 | CommandFailure::ExchangeChanged
                 | CommandFailure::ConfigurationRejected(_),
             ) => Self::Rejected,

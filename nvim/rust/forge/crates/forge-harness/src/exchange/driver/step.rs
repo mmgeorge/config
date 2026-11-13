@@ -449,17 +449,30 @@ impl ExchangeDriver {
                     .push((pending.run.command.record.request.id.clone(), queued));
                 return;
             }
-            // Execution never reopens after a lost stop or restart, so cancel cannot wait for it.
+            // Fatal owners cannot execute newly accepted prompts or resume queued delivery.
             if matches!(self.execution_state, ExecutionState::Failed)
-                && matches!(queued.record.request.command, Command::CancelExchange(_))
+                && matches!(
+                    queued.record.request.command,
+                    Command::CancelExchange(_)
+                        | Command::Input(
+                            super::super::command::InputCommand::Submit(_)
+                                | super::super::command::InputCommand::Retry(_)
+                                | super::super::command::InputCommand::ResumeDelivery
+                        )
+                )
             {
-                self.commands.finish(
-                    queued,
-                    Err(CommandFailure::ProviderFailed),
-                    trace,
-                    session_id,
-                    step,
-                );
+                let failure = if matches!(queued.record.request.command, Command::CancelExchange(_))
+                {
+                    CommandFailure::ProviderFailed
+                } else {
+                    CommandFailure::OwnerUnavailable(
+                        self.failure_reason
+                            .clone()
+                            .expect("failed execution retains its cause"),
+                    )
+                };
+                self.commands
+                    .finish(queued, Err(failure), trace, session_id, step);
             } else {
                 let record = crate::exchange::core_log::CoreRecord::OperationStarted {
                     operation: crate::exchange::core_log::CoreOperation::Command {
@@ -1012,6 +1025,7 @@ impl ExchangeDriver {
         };
         if let Err(error) = publish_activity(
             activity,
+            self.failure_reason.clone(),
             command_messages.as_ref(),
             services,
             trace,

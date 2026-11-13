@@ -93,7 +93,7 @@ M.empty_diff_rows = {}
 ---@field render_fold_signature? string
 ---@field queue (string|ForgeQueuedPrompt)[]
 ---@field input? ForgeInputViewState
----@field activity? {revision: integer, phase: 'idle'|'working'|'unavailable'}
+---@field activity? {revision: integer, phase: 'idle'|'working'|'unavailable', unavailable_reason?: string}
 ---@field status_thoughts? boolean
 ---@field ask_model? ForgeAskModel
 ---@field subagent_tools? boolean

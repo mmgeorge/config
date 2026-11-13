@@ -54,5 +54,22 @@ impl ExchangeDriver {
     pub(super) fn execution_fail(&mut self, services: &OwnerServices) {
         services.execution.close();
         self.execution_state = ExecutionState::Failed;
+        self.failure_reason
+            .get_or_insert_with(|| "Session execution failed; reopen the session to retry".into());
+    }
+
+    /// Preserve the first startup failure for UI status and rejected commands.
+    pub(super) fn startup_fail(
+        &mut self,
+        services: &OwnerServices,
+        stage: &str,
+        error: &anyhow::Error,
+    ) {
+        let reason = format!("{stage}: {}", crate::storage::error_message(error));
+        tracing::error!(session_id = services.observer.session_id(), %reason, "Harness session startup failed");
+        if self.failure_reason.is_none() {
+            self.failure_reason = Some(reason);
+        }
+        self.execution_fail(services);
     }
 }

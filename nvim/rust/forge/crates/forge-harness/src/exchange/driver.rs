@@ -83,6 +83,7 @@ pub(crate) struct ExchangeDriver {
     shutdown_retry: Arc<tokio::sync::Notify>,
     commands: CommandQueue,
     execution_state: ExecutionState,
+    failure_reason: Option<String>,
     configuration_attempt: Option<ConfigurationAttempt>,
     deferred_configuration: Option<DeferredConfiguration>,
     pending_plan_acceptance: Option<PendingPlanAcceptance>,
@@ -152,6 +153,7 @@ impl ExchangeDriver {
             shutdown_retry,
             commands,
             execution_state: ExecutionState::Ready,
+            failure_reason: None,
             configuration_attempt: None,
             deferred_configuration: None,
             pending_plan_acceptance: None,
@@ -313,7 +315,7 @@ impl ExchangeDriver {
             services.tasks.recover_terminal_requests(&mut store, now_ms)
         })();
         if let Err(error) = recovered {
-            self.execution_fail(services);
+            self.startup_fail(services, "Recover terminal requests", &error);
             trace.record(
                 session_id,
                 "task.terminal_recovery_failed",
@@ -321,7 +323,7 @@ impl ExchangeDriver {
             );
         }
         if let Err(error) = services.checks.install_owner(check_sender) {
-            self.execution_fail(services);
+            self.startup_fail(services, "Install check owner", &error);
             trace.record(
                 session_id,
                 "exchange.check.owner_unavailable",
@@ -329,7 +331,8 @@ impl ExchangeDriver {
             );
         }
         if let Err(error) = services.publications.recover_interrupted_offers() {
-            self.execution_fail(services);
+            let error = anyhow::Error::new(error);
+            self.startup_fail(services, "Recover publications", &error);
             trace.record(
                 session_id,
                 "exchange.publication.recovery_failed",
@@ -349,7 +352,8 @@ impl ExchangeDriver {
             }
             Ok(None) => {}
             Err(error) => {
-                self.execution_fail(services);
+                let error = anyhow::Error::new(error);
+                self.startup_fail(services, "Restore task input", &error);
                 trace.record(
                     session_id,
                     "exchange.task_input.recovery_failed",
@@ -366,7 +370,8 @@ impl ExchangeDriver {
                 }
             }
             Err(error) => {
-                self.execution_fail(services);
+                let error = anyhow::Error::new(error);
+                self.startup_fail(services, "Restore input receipts", &error);
                 trace.record(
                     session_id,
                     "exchange.input_receipt.recovery_failed",
@@ -1179,41 +1184,45 @@ fn publish_input_observation(
     }
 }
 
-/// Retain the owner's changed activity before making it visible to snapshot readers.
+/// Publish owner activity, keeping unavailable status visible even when its journal fails.
 fn publish_activity(
     phase: super::ActivityPhase,
+    reason: Option<String>,
     messages: Option<&MessageSender>,
     services: &OwnerServices,
     trace: &TraceStore,
     session: &str,
     step: u64,
 ) -> Result<()> {
-    let previous = *services
+    let previous = services
         .observer
         .activity
         .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(activity) = previous.changed(phase) else {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(activity) = previous.changed(phase, reason) else {
         return Ok(());
     };
-    retain_publication(
-        forge_protocol::message::SessionEvent {
-            session_id: session.into(),
-            event: "activity_changed".into(),
-            payload: serde_json::json!({"runtime_epoch":services.observer.runtime_epoch(),"activity":activity}),
-        },
-        messages,
-        services,
-        trace,
-        session,
-        step,
-    )?;
+    let event = forge_protocol::message::SessionEvent {
+        session_id: session.into(),
+        event: "activity_changed".into(),
+        payload: serde_json::json!({"runtime_epoch":services.observer.runtime_epoch(),"activity":activity}),
+    };
+    let publication = retain_publication(event.clone(), messages, services, trace, session, step);
+    // Unavailable is a runtime fact even when the journal itself cannot accept writes.
+    if phase != super::ActivityPhase::Unavailable && publication.is_err() {
+        return publication.map_err(Into::into);
+    } else if publication.is_err()
+        && let Some(messages) = messages
+    {
+        let _ = messages.try_send_event(&event);
+    }
     *services
         .observer
         .activity
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = activity;
-    Ok(())
+    publication.map_err(Into::into)
 }
 
 /// Retain late cleanup facts and resources independently of the completed caller wait.

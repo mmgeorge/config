@@ -769,6 +769,9 @@ pub(crate) enum CommandFailure {
     /// The host closed admission before queued work began.
     #[error("the session closed before the command started")]
     OwnerStopping,
+    /// The owner cannot execute work after a fatal startup or runtime failure.
+    #[error("session unavailable: {0}")]
+    OwnerUnavailable(String),
     /// Compatibility admission could not be acquired before any collection work began.
     #[error("the session could not take control of its provider, so the command did not run")]
     OwnershipUnavailable,
@@ -818,6 +821,7 @@ impl CommandFailure {
             Self::LegacyInputRejected => "legacy_input_rejected",
             Self::PrerequisiteFailed => "command_prerequisite_failed",
             Self::OwnerStopping => "command_owner_stopping",
+            Self::OwnerUnavailable(_) => "session_unavailable",
             Self::OwnershipUnavailable => "session_ownership_unavailable",
             Self::DispatchLost => "provider_dispatch_unconfirmed",
             Self::StopFailed => "execution_collection_uncertain",

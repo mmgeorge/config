@@ -9,6 +9,103 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+/// Database validation failures reach the initialization response with their concrete cause.
+#[tokio::test]
+async fn initialization_reports_incomplete_current_schema() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let settings = initialize(&root, "mock");
+    let store = crate::storage::SqliteStore::open(&root.path().join("data"))?;
+    let database = crate::storage::test::raw_connection(&root.path().join("data"))?;
+    database.execute_batch("DROP TABLE terminal_request")?;
+    let service = super::bootstrap::service();
+    let response = service.open_session(60, settings).await?;
+    let error = response
+        .error()
+        .expect("initialization must reject incomplete schema");
+    assert_eq!(error.code, "initialize_failed");
+    assert!(
+        error
+            .message
+            .contains("missing required tables: terminal_request"),
+        "{}",
+        error.message
+    );
+    drop(store);
+    Ok(())
+}
+
+/// Recovery failures remain visible and reject prompts without adding undeliverable input.
+#[tokio::test]
+async fn owner_startup_failure_reports_cause_and_rejects_prompt() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
+    let session = broker.snapshot()?.session.id;
+    let database = crate::storage::test::raw_connection(&broker.data_root)?;
+    // The schema passes opening validation; corrupt recovery content exercises the later boundary.
+    database.execute(
+        "INSERT INTO terminal_request(session_id,id,intent,disposition) VALUES(?1,'broken','{}','invalid-json')",
+        [&session],
+    )?;
+    let controller = SessionController::new(broker).await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    controller.attach_input(&sink).await?;
+    let activity = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let activity = controller.observer.snapshot()?.activity;
+            if activity.phase == crate::exchange::ActivityPhase::Unavailable {
+                return Ok::<_, anyhow::Error>(activity);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    let reason = activity.unavailable_reason.as_deref().unwrap();
+    assert!(reason.contains("Recover terminal requests"), "{reason}");
+    assert!(reason.contains("malformed JSON"), "{reason}");
+    prompt::apply(
+        &controller,
+        Request {
+            id: 61,
+            method: "session.prompt.submit".into(),
+            params: json!({"operation_id":"unavailable-input","text":"keep my draft"}),
+        },
+        &sink,
+    )
+    .await?;
+    let response: serde_json::Value = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = output.recv().await?.expect("prompt response");
+            let value: serde_json::Value = serde_json::from_slice(frame.bytes())?;
+            if value["id"] == 61 {
+                return Ok::<_, anyhow::Error>(value);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(
+        response["error"]["code"], "session_unavailable",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(reason),
+        "{response}"
+    );
+    assert!(
+        controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .is_empty()
+    );
+    controller.exchange_owner.close().await;
+    Ok(())
+}
+
 /// Permanent command-result failure releases observers without dropping native cleanup ownership.
 #[tokio::test]
 async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() -> Result<()> {

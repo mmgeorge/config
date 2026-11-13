@@ -2,6 +2,42 @@ use super::{SqliteStore, test::session};
 use crate::session::SessionStore;
 use anyhow::Result;
 
+/// A version marker cannot certify an incomplete schema or authorize repairing it in place.
+#[test]
+fn matching_version_missing_table_is_rejected_on_every_open() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let connection = super::database::HistoryConnection::open(root.path())?;
+    connection.execute_batch("DROP TABLE terminal_request")?;
+    drop(connection);
+
+    for result in [
+        super::database::HistoryConnection::open(root.path()),
+        super::database::HistoryConnection::read_only(root.path()),
+    ] {
+        let error = result.err().expect("incomplete current schema must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("missing required tables: terminal_request"),
+            "{message}"
+        );
+    }
+    let connection = super::test::raw_connection(root.path())?;
+    assert_eq!(
+        connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+        super::schema::VERSION,
+    );
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='terminal_request'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        count, 0,
+        "opening must not repair incompatible disposable state"
+    );
+    Ok(())
+}
+
 #[test]
 fn newer_databases_are_preserved_and_obsolete_history_is_deleted() -> Result<()> {
     let root = tempfile::tempdir()?;

@@ -243,6 +243,8 @@ local function status_text()
     append_status(state.connection_error, "ForgeHarnessGoal")
   elseif state.sync_error then
     append_status("State unavailable: " .. state.sync_error, "ForgeHarnessGoal")
+  elseif activity.unavailable_reason(state) then
+    append_status("Session unavailable: " .. activity.unavailable_reason(state), "ForgeHarnessGoal")
   elseif current_task then
     append_status(task_control.label(current_task), "ForgeHarnessGoal")
   end
@@ -1723,6 +1725,16 @@ local function admit_composer_input(state)
   return true
 end
 
+---Preserve drafts when the owner cannot execute them, while leaving navigation available.
+---@param state ForgeHarnessPresentationState
+---@return boolean
+local function admit_execution(state)
+  local unavailable = activity.unavailable_reason(state)
+  if not unavailable then return true end
+  notifications.error("Session unavailable: " .. unavailable, "ForgeHarness")
+  return false
+end
+
 function M.submit()
   local state = harness_state()
   if not admit_composer_input(state) then return end
@@ -1743,6 +1755,8 @@ function M.submit()
   end
   local accepted, admission_failure = require("forge.views.harness.completion.command_source").accepts_prompt(text)
   if not accepted then notifications.warn(assert(admission_failure), "ForgeHarness") return end
+  if require("forge.views.harness.completion.command_source").queues_execution(text)
+    and not admit_execution(state) then return end
   if text == "/task" or text == "/plan" or text == "/execute" then
     set_composer_text(state.composer_buf, "")
     if text == "/task" then task_control.open(state, picker_host(state), M.task_transition)
@@ -2042,6 +2056,7 @@ function M.submit()
     else settings.log(state.session.id, text:match("^/log%s+(.+)$")) end
     return
   end
+  if not admit_execution(state) then return end
   if state.selected_agent_run_id then
     prompt_history.record(text)
     M.agent_action("followup", state.selected_agent_run_id, text)
@@ -2064,6 +2079,7 @@ end
 function M.steer_submit()
   local state = harness_state()
   if not admit_composer_input(state) then return end
+  if not admit_execution(state) then return end
   if not attachments_ready(state.composer_buf) then return end
   if state.queue_edit then M.submit() return end
   local text = composer_text(state.composer_buf)
@@ -2092,6 +2108,7 @@ function M.queue_submit()
     M.submit()
     return
   end
+  if not admit_execution(state) then return end
   local captured_config, prompt, failure = model_command(text)
   if failure then report_configuration_error(failure) return end
   prompt_history.record(text)
