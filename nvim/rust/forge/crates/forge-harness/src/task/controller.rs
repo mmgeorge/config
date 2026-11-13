@@ -47,6 +47,31 @@ pub(crate) struct SessionTaskController {
 }
 
 impl SessionTaskController {
+    /// Lost native evidence cannot authorize an unfinished terminal request after owner restart.
+    pub(crate) fn recover_terminal_requests(
+        &self,
+        store: &mut SqliteStore,
+        now_ms: i64,
+    ) -> Result<()> {
+        let pending = store.pending_terminal_requests(&self.session_id)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(task) = self.current()?
+            && pending
+                .iter()
+                .any(|(_, owner)| owner.as_deref() == Some(task.id.as_str()))
+            && matches!(task.status(), TaskStatus::Running | TaskStatus::Waiting)
+        {
+            self.change(store, Some(&task.revision), TaskChange::Pause, now_ms)?;
+        }
+        for (id, _) in pending {
+            store.reject_terminal_request(&self.session_id, &id,
+                "owner restarted before terminal settlement; explicit recovery and fresh validation are required")?;
+        }
+        Ok(())
+    }
+
     /// Serialize configuration writes with generation retirement.
     pub(crate) fn configuration_lane(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.admission.configuration_lane()
@@ -450,24 +475,56 @@ impl SessionTaskController {
             &mut super::active::TaskSnapshot,
         ) -> Result<(Output, crate::storage::TaskEffects)>,
     ) -> Result<Output> {
+        self.settle_with_effects(store, permit, now_ms, false, change)
+    }
+
+    /// Retire a completed execution in the same transaction as its evidence and receipt.
+    pub(super) fn settle_with_effects<Output>(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        now_ms: i64,
+        retire_completed: bool,
+        change: impl FnOnce(
+            &mut super::active::TaskSnapshot,
+        ) -> Result<(Output, crate::storage::TaskEffects)>,
+    ) -> Result<Output> {
         store
             .commit_task_effects(
                 &self.session_id,
                 Some(permit.revision()),
                 now_ms,
                 |active| {
-                    let task = active.as_mut().context("session has no active task")?;
-                    permit.validate(Some(task))?;
-                    task.edit(|draft| {
-                        let previous = draft.clone();
-                        let result = change(draft)?;
-                        if !draft.same_contract(&previous) && draft.revision == previous.revision {
-                            draft.renew(now_ms);
-                        } else {
-                            draft.updated_at_ms = now_ms;
-                        }
-                        Ok(result)
-                    })
+                    let current = active.as_ref().context("session has no active task")?;
+                    permit.validate(Some(current))?;
+                    let previous = current.draft();
+                    let mut draft = previous.clone();
+                    let (output, mut effects) = change(&mut draft)?;
+                    if !draft.same_contract(&previous) && draft.revision == previous.revision {
+                        draft.renew(now_ms);
+                    } else {
+                        draft.updated_at_ms = now_ms;
+                    }
+                    if retire_completed && draft.status() == TaskStatus::Completed {
+                        let terminal = outcome_effect(
+                            &self.session_id,
+                            &draft,
+                            super::TaskOutcome {
+                                id: draft.id.clone(),
+                                kind: draft.kind(),
+                                title: draft.title().into(),
+                                state: super::TaskOutcomeState::Complete,
+                                summary: "Accepted plan completed".into(),
+                            },
+                            now_ms,
+                        );
+                        effects.event.extend(terminal.event);
+                        effects.execution.extend(terminal.execution);
+                        *active = None;
+                    } else {
+                        *active = Some(Task::try_from(draft)?);
+                    }
+                    Ok((output, effects))
                 },
             )?
             .context("task update unexpectedly reused a command")
@@ -571,31 +628,6 @@ impl SessionTaskController {
         Ok(permit.clone())
     }
 
-    /// Commit explicit blockage under dispatched authority without marking native work complete.
-    pub(crate) fn block_dispatched_goal(
-        &self,
-        store: &mut SqliteStore,
-        permit: &TaskPermit,
-        reason: String,
-        now_ms: i64,
-    ) -> Result<()> {
-        self.admit_dispatched_goal(permit, false)?;
-        self.update_with_effects(store, permit, now_ms, |task| {
-            match &mut task.workflow {
-                WorkflowSnapshot::Goal { goal } => {
-                    goal.state = GoalState::Blocked;
-                    goal.reported_status = Some(reason);
-                }
-                WorkflowSnapshot::Execute { execution } => {
-                    execution.record.state = PlanExecutionState::Blocked;
-                    execution.record.findings.push(reason);
-                }
-                WorkflowSnapshot::Plan { .. } => return Err(super::StaleTask.into()),
-            }
-            Ok(((), crate::storage::TaskEffects::default()))
-        })
-    }
-
     /// Activates only the contract whose exact entry received a durable provider receipt.
     pub(crate) fn acknowledge_entry(
         &self,
@@ -672,13 +704,74 @@ impl SessionTaskController {
     }
 
     /// Commits one terminal turn's evidence and continuation intent under its admitted revision.
+    #[cfg(test)]
     pub(crate) fn observe_goal(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        completed_turn: crate::task::TaskTurnId,
+        evidence: crate::goal::TurnEvidence,
+        now_ms: i64,
+    ) -> Result<(super::GoalSnapshot, crate::goal::ContinuationDecision)> {
+        self.observe_goal_report(store, permit, completed_turn, evidence, now_ms, None, None)
+    }
+
+    /// Commit the captured workspace and ordinary Goal accounting together.
+    pub(crate) fn observe_goal_with_workspace(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        workspace: Option<(crate::checkpoint::CheckpointRecord, Option<String>)>,
+        completed_turn: crate::task::TaskTurnId,
+        evidence: crate::goal::TurnEvidence,
+        now_ms: i64,
+    ) -> Result<(super::GoalSnapshot, crate::goal::ContinuationDecision)> {
+        self.observe_goal_report(
+            store,
+            permit,
+            completed_turn,
+            evidence,
+            now_ms,
+            None,
+            workspace,
+        )
+    }
+
+    /// Settle a terminal Goal request and its explanation in one observation commit.
+    pub(crate) fn observe_goal_control(
+        &self,
+        store: &mut SqliteStore,
+        control: &crate::goal::GoalControl,
+        workspace: Option<(crate::checkpoint::CheckpointRecord, Option<String>)>,
+        completed_turn: crate::task::TaskTurnId,
+        evidence: crate::goal::TurnEvidence,
+        now_ms: i64,
+    ) -> Result<(super::GoalSnapshot, crate::goal::ContinuationDecision)> {
+        self.observe_goal_report(
+            store,
+            &control.permit,
+            completed_turn,
+            evidence,
+            now_ms,
+            Some(control),
+            workspace,
+        )
+    }
+
+    /// Apply evidence and an optional terminal explanation under the observation fence.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Commit the captured turn, workspace, and optional terminal control under one task fence."
+    )]
+    fn observe_goal_report(
         &self,
         store: &mut SqliteStore,
         permit: &TaskPermit,
         completed_turn: crate::task::TaskTurnId,
         mut evidence: crate::goal::TurnEvidence,
         now_ms: i64,
+        control: Option<&crate::goal::GoalControl>,
+        workspace: Option<(crate::checkpoint::CheckpointRecord, Option<String>)>,
     ) -> Result<(super::GoalSnapshot, crate::goal::ContinuationDecision)> {
         store
             .commit_task_observation(&self.session_id, permit, now_ms, |active| {
@@ -703,8 +796,21 @@ impl SessionTaskController {
                     ));
                 }
                 let previous = task.clone();
+                if let Some((checkpoint, previous_id)) = &workspace {
+                    let WorkflowSnapshot::Goal { goal } = &mut task.workflow else {
+                        anyhow::bail!("workspace evidence requires a Goal task");
+                    };
+                    ensure!(
+                        goal.observed_checkpoint == *previous_id,
+                        "goal workspace baseline changed during capture"
+                    );
+                    goal.observed_checkpoint = Some(checkpoint.id.clone());
+                }
                 let decision = match &mut task.workflow {
                     WorkflowSnapshot::Goal { goal } => {
+                        if let Some(control) = control {
+                            goal.reported_status = Some(control.message.clone());
+                        }
                         crate::goal::observe(&mut goal.state, &mut goal.continuation, evidence)
                     }
                     WorkflowSnapshot::Execute { execution } => {
@@ -740,6 +846,15 @@ impl SessionTaskController {
                     task.renew(now_ms);
                 }
                 let continuation = match (&task.workflow, decision) {
+                    (
+                        WorkflowSnapshot::Execute { .. },
+                        crate::goal::ContinuationDecision::Continue
+                        | crate::goal::ContinuationDecision::RetryNoProgress,
+                    ) => task
+                        .turn
+                        .as_ref()
+                        .filter(|turn| turn.id == completed_turn)
+                        .and_then(|turn| turn.continuation.clone()),
                     (
                         WorkflowSnapshot::Goal { .. },
                         crate::goal::ContinuationDecision::Continue
@@ -783,6 +898,27 @@ impl SessionTaskController {
                 }
                 if active.is_some() {
                     *active = Some(Task::try_from(candidate)?);
+                }
+                if let Some((checkpoint, _)) = workspace {
+                    effects.checkpoint.push(checkpoint);
+                }
+                if let Some(control) = control {
+                    effects.terminal_commit = Some(crate::storage::TerminalCommit {
+                        id: control.request_id.clone(),
+                        result: serde_json::to_value((
+                            &goal,
+                            decision,
+                            crate::goal::GoalRecord {
+                                id: permit.task_id().as_str().into(),
+                                session_id: self.session_id.clone(),
+                                objective: goal.objective.clone(),
+                                state: goal.state,
+                                continuation: goal.continuation.clone(),
+                                created_at_ms: previous.created_at_ms,
+                                updated_at_ms: now_ms,
+                            },
+                        ))?,
+                    });
                 }
                 Ok(((goal, decision), effects))
             })?

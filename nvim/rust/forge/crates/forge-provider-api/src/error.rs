@@ -454,6 +454,8 @@ pub enum ProviderError {
     DeliveryUncertain,
     /// Host cancellation was observed; independent cleanup failure must remain separate.
     Cancelled,
+    /// Native execution ended interrupted without establishing a host cancellation request.
+    Interrupted,
     /// Native terminal failure carries normalized evidence for host-owned retry policy.
     Retryable(Box<retry::RetryableFailure>),
     /// Normalized event delivery failed and its typed transport/observation cause is retained.
@@ -486,6 +488,7 @@ impl ProviderError {
             | Self::NotConsumed
             | Self::DeliveryUncertain
             | Self::Cancelled
+            | Self::Interrupted
             | Self::Retryable(_)
             | Self::Delivery(_)) => unchanged,
         }
@@ -509,6 +512,7 @@ impl ProviderError {
             | Self::PreparationCleanup { .. }
             | Self::NotConsumed
             | Self::DeliveryUncertain
+            | Self::Interrupted
             | Self::Retryable(_)
             | Self::Delivery(_) => false,
         }
@@ -550,6 +554,7 @@ impl std::fmt::Display for ProviderError {
             Self::NotConsumed => formatter.write_str("provider proved input was not consumed"),
             Self::DeliveryUncertain => formatter.write_str("provider input delivery is uncertain"),
             Self::Cancelled => formatter.write_str("provider execution cancelled"),
+            Self::Interrupted => formatter.write_str("provider execution interrupted"),
             Self::Retryable(error) => std::fmt::Display::fmt(error, formatter),
             Self::Delivery(error) => std::fmt::Display::fmt(error, formatter),
         }
@@ -571,7 +576,9 @@ impl std::error::Error for ProviderError {
             Self::PreparationCleanup { cause, .. } => Some(cause.as_ref()),
             Self::Retryable(error) => Some(error.as_ref()),
             Self::Delivery(error) => Some(error),
-            Self::NotConsumed | Self::DeliveryUncertain | Self::Cancelled => None,
+            Self::NotConsumed | Self::DeliveryUncertain | Self::Cancelled | Self::Interrupted => {
+                None
+            }
         }
     }
 }

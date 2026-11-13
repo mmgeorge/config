@@ -8,6 +8,7 @@ use super::SqliteStore;
 /// Records that must become visible in the same commit as the session task mutation.
 #[derive(Default)]
 pub(crate) struct TaskEffects {
+    pub terminal_commit: Option<super::TerminalCommit>,
     /// Revalidate captured workflow and question revisions before reserving continuation input.
     pub continuation_guard: Vec<crate::exchange::command::WorkflowContinuationRequest>,
     /// Replace provider/session identity and exact history atomically with task retirement.
@@ -554,6 +555,9 @@ impl SqliteStore {
             "UPDATE session_record SET updated_at_ms=max(updated_at_ms,?2), payload=json_set(payload,'$.session.active_task',json(?3),'$.session.updated_at_ms',max(updated_at_ms,?2)) WHERE id=?1",
             params![session_id, now_ms, encoded],
         )?;
+            if let Some(receipt) = effects.terminal_commit {
+                super::terminal::commit(&transaction, session_id, receipt)?;
+            }
             if let Some(commit) = effects.owner_task_commit {
                 crate::exchange::journal::commit_task_command(&transaction, session_id, commit)?;
             }

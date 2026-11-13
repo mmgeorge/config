@@ -289,20 +289,19 @@ The example template still needs its required values when `all` is selected.
 Full coverage is not an alternative command synthesized by Harness. Use a
 callback or a separate configured action when full and targeted commands differ.
 
-This repository uses one `lua-test` definition for ordinary Lua coverage.
-Omit inputs for changed-file mapping, supply `files` for explicit paths, select
-a complete feature `suite`, or name one `fixture`:
+This repository runs Lua tests through two plain templates. `lua-test` splices
+the changed files into the runner's `--affected` selection, and
+`lua-test-select` splices an explicit `tests` array of files, directories,
+test names, or `name::case` entries:
 
 ```json
-{"check":"lua-test","inputs":{"fixture":"nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"}}
-{"check":"lua-test","inputs":{"suite":"walkthrough"}}
+{"check":"lua-test"}
+{"check":"lua-test-select","inputs":{"tests":["nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"]}}
+{"check":"lua-test-select","inputs":{"tests":["nvim/lua/forge/tests/integration/walkthrough"]}}
 ```
 
-`suite` defaults to `affected` and `fixture` defaults to an empty string.
-An exact fixture cannot be combined with a named or full suite. Area names such
-as `status` come from the mirrored test directories, not separate saved
-definitions. No Lua check declares a dependency on `rust-build`: tests that
-launch the Forge host assume a current executable.
+Both declare `rust-build` with `after`, so Harness builds the Forge host first
+and skips the Lua tests when the build fails.
 
 Check IDs use language/tool-first names, while display labels name the action.
 `rulesync-local-preview` and `rulesync-global-preview` only preview generation.

@@ -35,7 +35,7 @@ Host paths are relative to `nvim/rust/forge/crates/forge-harness/src/`.
 | History and UI delivery | `checks/publication.rs` |
 | Catalog and previews | `checks/tools.rs`, `checks/preview.rs` |
 
-This repository keeps its runner callbacks under `nvim/tools/checks/`. The Rust callback maps changed files through Cargo metadata only when no package is supplied. `nu --no-config-file nvim/tools/checks/propose-config.nu` prints a proposed checks object without changing `.forge.json`.
+This repository's checks use no callbacks. The Rust checks are plain Cargo commands, and the two managed helpers in `.forge/checks/` take their selection through argv substitution: `lua-tests.nu` runs the Lua tests, and `nushell-syntax.nu` runs `nu-check` on the given files.
 
 ## Verification
 

@@ -590,6 +590,7 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) question_changes: tokio::sync::watch::Receiver<u64>,
     pub(crate) execution_receiver:
         tokio::sync::mpsc::Receiver<crate::plan::execution::ExecutionControl>,
+    pending_execution_phase: Option<Box<execution::PendingExecutionPhase>>,
     pub(crate) pending_revision: Option<(
         tokio::sync::oneshot::Sender<Result<Value>>,
         crate::plan::revision_review::RevisionReviewWait,
@@ -652,6 +653,7 @@ pub(crate) enum ForegroundSignal {
     AdmissionRequested,
     AdmissionPrepared,
     FinalizeEffectsRequested,
+    TerminalWorkspaceCompleted(Result<Box<crate::checkpoint::CheckpointRecord>>),
     PublicationDrained,
     QuestionCatalog(Result<Vec<crate::provider::ProviderModel>>),
     ProviderPrepared(Result<Arc<crate::provider::session_execution::SessionExecution>>),
@@ -798,6 +800,7 @@ impl ForegroundSignal {
             Self::AdmissionRequested => "AdmissionRequested",
             Self::AdmissionPrepared => "AdmissionPrepared",
             Self::FinalizeEffectsRequested => "FinalizeEffectsRequested",
+            Self::TerminalWorkspaceCompleted(..) => "TerminalWorkspaceCompleted",
             Self::PublicationDrained => "PublicationDrained",
             Self::QuestionCatalog(..) => "QuestionCatalog",
             Self::ProviderPrepared(..) => "ProviderPrepared",
@@ -964,6 +967,7 @@ struct AgentInterruptItem {
 /// Own provider work that can run without retaining a broker guard.
 pub(crate) enum ForegroundJob {
     AdmissionWorkspace(foreground_workspace::AdmissionWorkspaceJob),
+    TerminalWorkspace(Box<execution::WorkspaceCaptureJob>),
     ProviderPrepare(foreground_dispatch::ProviderPrepareJob),
     QuestionCatalog(Box<foreground_dispatch::QuestionModelCatalogJob>),
     Publication(PendingProviderDelivery),
@@ -1085,6 +1089,7 @@ impl ForegroundJob {
     pub(crate) fn diagnostic_name(&self) -> &'static str {
         match self {
             Self::AdmissionWorkspace(..) => "AdmissionWorkspace",
+            Self::TerminalWorkspace(..) => "TerminalWorkspace",
             Self::ProviderPrepare(..) => "ProviderPrepare",
             Self::QuestionCatalog(..) => "QuestionCatalog",
             Self::Publication(..) => "Publication",
@@ -1158,7 +1163,8 @@ impl ForegroundJob {
             | Self::ExecutionProgress(_)
             | Self::PlanSubmission(_)
             | Self::PlanQuestion(_)
-            | Self::PlanMutation(_) => true,
+            | Self::PlanMutation(_)
+            | Self::TerminalWorkspace(_) => true,
             Self::AdmissionWorkspace(_)
             | Self::ProviderPrepare(_)
             | Self::QuestionCatalog(_)
@@ -1234,6 +1240,9 @@ impl ForegroundJob {
                     receipts.acknowledge().map(|()| events),
                 ))
             }
+            Self::TerminalWorkspace(job) => Ok(ForegroundSignal::TerminalWorkspaceCompleted(
+                job.run().await.map(Box::new),
+            )),
             Self::AdmissionWorkspace(job) => Ok(ForegroundSignal::AdmissionWorkspaceCompleted(
                 Box::new(job.run().await),
             )),
@@ -8020,6 +8029,33 @@ impl HarnessBroker {
                     submission,
                 },
             )),
+            Ok(execution::ExecutionControlStage::Pending(pending)) => {
+                let result = (|| -> Result<Value> {
+                    anyhow::ensure!(
+                        transaction.pending_execution_phase.is_none(),
+                        "a phase request is already pending"
+                    );
+                    let acknowledgement = pending.acknowledgement();
+                    let authority = transaction
+                        .task_authority
+                        .clone()
+                        .context("phase invocation authority is missing")?;
+                    authority.seal_mutations(|| {
+                        self.store.record_task_terminal_request(
+                            &self.session.id,
+                            pending.request_id(),
+                            Some(pending.task_id()),
+                            &pending,
+                            None,
+                        )?;
+                        transaction.pending_execution_phase = Some(pending);
+                        Ok(())
+                    })?;
+                    Ok(acknowledgement)
+                })();
+                let _ = response.send(result);
+                Ok(ForegroundAction::Wait)
+            }
             Ok(execution::ExecutionControlStage::Complete(value)) => {
                 self.finish_foreground_control(transaction, response, submission, Ok(value))
             }
@@ -8037,10 +8073,42 @@ impl HarnessBroker {
         submission: bool,
         result: Result<execution::ExecutionControlReport>,
     ) -> Result<ForegroundAction> {
-        let result = result.and_then(|report| {
-            self.commit_execution_control_report(report, &mut transaction.state.interaction)
-        });
-        self.finish_foreground_control(transaction, response, submission, result)
+        match result {
+            Ok(report) if !submission => {
+                let result = (|| -> Result<Value> {
+                    anyhow::ensure!(
+                        transaction.pending_execution_phase.is_none(),
+                        "a phase request is already pending"
+                    );
+                    let pending = self.defer_execution_control_report(report);
+                    let acknowledgement = pending.acknowledgement();
+                    let authority = transaction
+                        .task_authority
+                        .clone()
+                        .context("phase invocation authority is missing")?;
+                    authority.seal_mutations(|| {
+                        self.store.record_task_terminal_request(
+                            &self.session.id,
+                            pending.request_id(),
+                            Some(pending.task_id()),
+                            &pending,
+                            None,
+                        )?;
+                        transaction.pending_execution_phase = Some(Box::new(pending));
+                        Ok(())
+                    })?;
+                    Ok(acknowledgement)
+                })();
+                let _ = response.send(result);
+                Ok(ForegroundAction::Wait)
+            }
+            result => {
+                let result = result.and_then(|report| {
+                    self.commit_execution_control_report(report, &mut transaction.state.interaction)
+                });
+                self.finish_foreground_control(transaction, response, submission, result)
+            }
+        }
     }
 
     fn finish_foreground_control(
@@ -9654,8 +9722,27 @@ impl HarnessBroker {
         evidence: crate::goal::TurnEvidence,
         permit: Option<crate::task::TaskPermit>,
         completed_turn: crate::task::TaskTurnId,
+        control: Option<&crate::goal::GoalControl>,
+        workspace: Option<(crate::checkpoint::CheckpointRecord, Option<String>)>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
+        if let Some(control) = control
+            && let Some(crate::storage::TerminalDisposition::Committed { result }) = self
+                .store
+                .terminal_disposition(&self.session.id, &control.request_id)?
+        {
+            let (_, decision, goal): (
+                crate::task::GoalSnapshot,
+                crate::goal::ContinuationDecision,
+                crate::goal::GoalRecord,
+            ) = serde_json::from_value(result)?;
+            event.push(self.event("goal_changed", serde_json::to_value(goal)?)?);
+            return Ok(matches!(
+                decision,
+                crate::goal::ContinuationDecision::Continue
+                    | crate::goal::ContinuationDecision::RetryNoProgress
+            ));
+        }
         let Some(permit) = permit else {
             return Ok(false);
         };
@@ -9666,13 +9753,24 @@ impl HarnessBroker {
         if task.kind() == crate::task::TaskKind::Plan {
             return Err(crate::task::StaleTask.into());
         }
-        let observed = self.task_controller.observe_goal(
-            &mut self.store,
-            &permit,
-            completed_turn.clone(),
-            evidence,
-            self.clock.now_ms(),
-        );
+        let observed = match control {
+            Some(control) => self.task_controller.observe_goal_control(
+                &mut self.store,
+                control,
+                workspace,
+                completed_turn.clone(),
+                evidence,
+                self.clock.now_ms(),
+            ),
+            None => self.task_controller.observe_goal_with_workspace(
+                &mut self.store,
+                &permit,
+                workspace,
+                completed_turn.clone(),
+                evidence,
+                self.clock.now_ms(),
+            ),
+        };
         let (observed, decision) = observed?;
         let goal = GoalRecord {
             id: task.id.as_str().into(),

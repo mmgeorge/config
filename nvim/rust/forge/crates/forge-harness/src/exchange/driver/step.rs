@@ -72,7 +72,7 @@ impl ExchangeDriver {
             && effect_phase_ran
             && foreground.is_none()
             && steering_ready.is_none()
-            && admission.start_command
+            && (admission.start_command || self.pending_plan_acceptance.is_some())
         {
             return StepGate::Restart;
         }
@@ -299,6 +299,131 @@ impl ExchangeDriver {
             services,
             ..
         } = env;
+        let mut waiting = Vec::new();
+        for (original, follower) in std::mem::take(&mut self.acceptance_followers) {
+            match self.commands.committed(&original) {
+                Ok(Some(record)) if record.completion().is_some() => {
+                    let outcome = record
+                        .completion()
+                        .expect("completion checked")
+                        .map(|result| result.outcome);
+                    self.commands
+                        .finish(follower, outcome, trace, session_id, step);
+                }
+                Err(error) => self
+                    .commands
+                    .uncommitted(follower, error, trace, session_id, step),
+                _ if closed => self.commands.finish(
+                    follower,
+                    Err(CommandFailure::ProviderFailed),
+                    trace,
+                    session_id,
+                    step,
+                ),
+                _ => waiting.push((original, follower)),
+            }
+        }
+        self.acceptance_followers = waiting;
+        // Approval occupies owner state, not the command lane. A later explicit control
+        // supersedes it before that control can stop or replace the original invocation.
+        if state.command.is_none() && self.pending_plan_acceptance.is_some() {
+            let superseded = closed
+                || self.commands.next_command().is_some_and(|command| {
+                    !matches!(
+                        command,
+                        Command::Task(
+                            crate::exchange::command::TaskCommand::SetAutoAccept(_)
+                                | crate::exchange::command::TaskCommand::ExecutePlan(_)
+                        )
+                    )
+                });
+            if superseded {
+                let pending = self
+                    .pending_plan_acceptance
+                    .take()
+                    .expect("pending acceptance checked");
+                if let Err(error) = pending.reject(services, "superseded by a later owner control")
+                {
+                    trace.record(
+                        session_id,
+                        "plan.acceptance_rejection_uncommitted",
+                        serde_json::json!({"reason":error.to_string(),"update_step":step}),
+                    );
+                    self.commands.retention_failed(trace, session_id, step);
+                }
+                self.commands.finish(
+                    pending.run.command,
+                    Err(CommandFailure::Task(
+                        crate::exchange::command::TaskCommandFailure::Changed,
+                    )),
+                    trace,
+                    session_id,
+                    step,
+                );
+            } else if matches!(event_status, TurnStatus::Idle) {
+                let mut pending = self
+                    .pending_plan_acceptance
+                    .take()
+                    .expect("pending acceptance checked");
+                let ready = (|| -> Result<()> {
+                    let store = crate::storage::HistoryReader::current(&services.root)?;
+                    let exchange = store
+                        .load_exchange(&pending.exchange)?
+                        .context("approved planning exchange disappeared")?;
+                    anyhow::ensure!(
+                        exchange.state() == crate::exchange::ExchangeState::Complete
+                            && crate::task::latest_turn_completed_normally(&exchange)
+                            && exchange.turn.last().map(|turn| turn.id().to_owned())
+                                == pending.turn,
+                        "approved planning turn did not complete normally"
+                    );
+                    pending
+                        .run
+                        .resume_planning(services)
+                        .map_err(anyhow::Error::new)
+                })();
+                match ready {
+                    Ok(()) => {
+                        state.command = Some(ActiveCommand::Task(pending.run));
+                        return;
+                    }
+                    Err(error) if crate::exchange::failure::storage_failure(&error) => {
+                        trace.record(
+                            session_id,
+                            "plan.acceptance_settlement_uncommitted",
+                            serde_json::json!({"reason":error.to_string(),"update_step":step}),
+                        );
+                        self.commands.uncommitted(
+                            pending.run.command,
+                            crate::exchange::journal::CommandJournalError::DomainCommit,
+                            trace,
+                            session_id,
+                            step,
+                        );
+                    }
+                    Err(error) => {
+                        if let Err(error) = pending.reject(services, &error.to_string()) {
+                            trace.record(
+                                session_id,
+                                "plan.acceptance_rejection_uncommitted",
+                                serde_json::json!({"reason":error.to_string(),"update_step":step}),
+                            );
+                            self.commands.retention_failed(trace, session_id, step);
+                        }
+                        trace.record(session_id, "plan.acceptance_rejected", serde_json::json!({"command_id":pending.run.command.record.request.id.as_str(),"reason":error.to_string(),"update_step":step}));
+                        self.commands.finish(
+                            pending.run.command,
+                            Err(CommandFailure::Task(
+                                crate::exchange::command::TaskCommandFailure::Changed,
+                            )),
+                            trace,
+                            session_id,
+                            step,
+                        );
+                    }
+                }
+            }
+        }
         let start_command = self.admission(services, state, closed).start_command;
         let DriverState {
             foreground,
@@ -315,6 +440,15 @@ impl ExchangeDriver {
             && start_command
             && let Some(queued) = self.commands.start(trace, session_id, step)
         {
+            if let Some(pending) = &self.pending_plan_acceptance
+                && pending
+                    .run
+                    .matches_pending_acceptance(&queued.record.request.command)
+            {
+                self.acceptance_followers
+                    .push((pending.run.command.record.request.id.clone(), queued));
+                return;
+            }
             // Execution never reopens after a lost stop or restart, so cancel cannot wait for it.
             if matches!(self.execution_state, ExecutionState::Failed)
                 && matches!(queued.record.request.command, Command::CancelExchange(_))

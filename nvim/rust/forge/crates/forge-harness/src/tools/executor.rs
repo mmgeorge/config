@@ -110,9 +110,11 @@ impl ControlToolExecutor {
             && invocation.arguments["wait"].as_bool() == Some(true)
             && runtime.context.questions.is_some()
         {
+            if let Some(authority) = &self.authority {
+                authority.admit_mutation()?;
+            }
             let prepared = super::questions::prepare_wait(&runtime, &invocation);
             let plan_document = runtime.plan_document().cloned();
-            let execution_finished = runtime.execution_finished();
             drop(runtime);
             // Question creation and wait retirement are owned by the session queue.
             // Publish cancellation as a settled tool result so host-effect collection
@@ -152,7 +154,6 @@ impl ControlToolExecutor {
                 _execution: execution,
                 result,
                 plan_document,
-                execution_finished,
             });
         }
         let result = tokio::select! {
@@ -164,7 +165,6 @@ impl ControlToolExecutor {
             _execution: execution,
             result,
             plan_document: runtime.plan_document().cloned(),
-            execution_finished: runtime.execution_finished(),
         })
     }
 
@@ -251,8 +251,6 @@ pub(crate) struct ControlToolOutcome<'owner> {
     pub(crate) result: Result<ControlToolResult>,
     /// Captures the canonical plan after execution, including error context.
     pub(crate) plan_document: Option<PlanDocument>,
-    /// Identifies a phase transition that requires ending the native turn.
-    pub(crate) execution_finished: bool,
 }
 
 #[derive(Default)]

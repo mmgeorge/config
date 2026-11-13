@@ -35,6 +35,7 @@ impl std::error::Error for CheckOwnerFailure {}
 /// Carry only host-assigned invocation authority and normalized prepared check work.
 pub(crate) struct ToolCheckRequest {
     pub(crate) scope: InvocationScope,
+    pub(crate) authority: Option<crate::tools::TaskAuthority>,
     pub(crate) call_id: ToolCallId,
     pub(crate) request: RunRequest,
     pub(crate) run: PreparedCheckRun,
@@ -79,9 +80,14 @@ impl CheckOwnerSender {
     }
 
     /// Await run admission only; execution and collection remain with the owner after this returns.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The owner message keeps invocation authority and prepared work explicit."
+    )]
     pub(crate) async fn start(
         &self,
         scope: InvocationScope,
+        authority: Option<crate::tools::TaskAuthority>,
         call_id: ToolCallId,
         request: RunRequest,
         run: PreparedCheckRun,
@@ -91,6 +97,7 @@ impl CheckOwnerSender {
         let (reply, receiver) = oneshot::channel();
         self.send(CheckOwnerEvent::StartTool(Box::new(ToolCheckRequest {
             scope,
+            authority,
             call_id,
             request,
             run,
@@ -211,6 +218,7 @@ impl CheckOwnerRuns {
     pub(crate) fn start(&mut self, request: ToolCheckRequest) -> Result<(), CheckOwnerFailure> {
         let ToolCheckRequest {
             scope,
+            authority,
             call_id,
             request,
             run,
@@ -239,6 +247,12 @@ impl CheckOwnerRuns {
             .map_err(|error| CheckOwnerFailure::Worker(error.into()))?;
             let result = receipt.replay(&scope, &call_id, &request);
             let _ = reply.send(result);
+            return Ok(());
+        }
+        if let Some(authority) = authority
+            && let Err(error) = authority.admit_mutation()
+        {
+            let _ = reply.send(Err(CheckOwnerFailure::Worker(error)));
             return Ok(());
         }
         if self.admitted.len() >= CAPACITY {

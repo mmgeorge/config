@@ -17,52 +17,6 @@ pub(crate) struct GoalProgressResult {
     pub(crate) guard: crate::provider::session_execution::HostEffectGuard,
 }
 
-impl GoalProgressResult {
-    /// Commit workspace evidence and its checkpoint under the same captured task authority.
-    pub(super) fn commit_workspace(
-        self,
-        broker: &mut HarnessBroker,
-    ) -> Result<(bool, crate::provider::session_execution::HostEffectGuard)> {
-        let Self {
-            checkpoint,
-            changed,
-            previous_id,
-            permit,
-            mut guard,
-        } = self;
-        let task = broker
-            .task_controller
-            .current()?
-            .context("goal task disappeared")?;
-        permit.validate_observation(Some(&task))?;
-        let crate::task::WorkflowSnapshot::Goal { goal } = &task.workflow else {
-            return Err(crate::task::StaleTask.into());
-        };
-        anyhow::ensure!(
-            goal.observed_checkpoint == previous_id,
-            "goal workspace baseline changed during capture"
-        );
-        let checkpoint_id = checkpoint.id.clone();
-        guard.begin_mutation();
-        if let Err(error) = broker.task_controller.apply_with_effects(
-            &mut broker.store,
-            &task.permit(),
-            crate::task::TaskEvent::GoalWorkspaceObserved(checkpoint_id),
-            crate::storage::TaskEffects {
-                checkpoint: vec![checkpoint],
-                ..Default::default()
-            },
-            broker.clock.now_ms(),
-        ) {
-            if error.is::<crate::task::StaleTask>() {
-                guard.cancel_definite()?;
-            }
-            return Err(error);
-        }
-        Ok((changed, guard))
-    }
-}
-
 impl GoalProgressJob {
     pub(crate) async fn run(self) -> Result<GoalProgressResult> {
         let Self {

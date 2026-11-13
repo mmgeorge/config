@@ -297,7 +297,15 @@ impl ExchangeDriver {
                 || !self.question_waits.is_idle()
                 || !self.question_tools.is_empty(),
         };
-        Admission::evaluate(&facts)
+        let mut admission = Admission::evaluate(&facts);
+        if self.pending_plan_acceptance.is_some() {
+            admission.start_turn = false;
+            admission.run_automatic_checks = false;
+            admission.start_task_verification = false;
+            admission.start_approval_timeout = false;
+            admission.task_delivery = TaskDeliveryGate::Waiting;
+        }
+        admission
     }
 }
 

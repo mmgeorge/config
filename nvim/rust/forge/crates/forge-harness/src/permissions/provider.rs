@@ -408,6 +408,31 @@ impl ProviderPermissionContext {
                 }
             };
         let deny = |reason: &str| denied(reason, Some(approval_mode));
+        let mutating = origin != PermissionOrigin::SessionStorage
+            && (request.target_list.is_empty()
+                || request.target_list.iter().any(|target| {
+                    use crate::permissions::matcher::PermissionTarget;
+                    match target {
+                        PermissionTarget::Read { .. } => false,
+                        PermissionTarget::UnknownFile { operation } => {
+                            *operation != crate::permissions::directory::DirectoryOperation::Read
+                        }
+                        PermissionTarget::HostTool { name } => !crate::tools::is_read_only(name),
+                        PermissionTarget::Unknown
+                        | PermissionTarget::Command { .. }
+                        | PermissionTarget::Write { .. }
+                        | PermissionTarget::Network { .. }
+                        | PermissionTarget::Mcp { .. }
+                        | PermissionTarget::Elevate { .. }
+                        | PermissionTarget::Tool { .. } => true,
+                    }
+                }));
+        if mutating
+            && let Some(authority) = &task_authority
+            && let Err(error) = authority.admit_mutation()
+        {
+            return deny(&error.to_string());
+        }
         if tool_free {
             return deny(
                 "Automatically rejected because Background generation has no tools. Return only the requested text from the supplied evidence.",
@@ -566,6 +591,12 @@ impl ProviderPermissionContext {
                         "Task authority changed while permission approval was pending: {error:#}"
                     ));
                 }
+                if mutating
+                    && let Some(authority) = &task_authority
+                    && let Err(error) = authority.admit_mutation()
+                {
+                    return deny(&error.to_string());
+                }
                 PermissionResponse::Allow
             }
             Ok(ApprovalResolution::TimedOut) => deny(
@@ -608,6 +639,142 @@ fn denied(reason: &str, approval_mode: Option<ApprovalMode>) -> PermissionRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Standing Allow policy cannot reopen writes after terminal intent, while reads remain available.
+    #[tokio::test]
+    async fn terminal_seal_rejects_allowed_native_writes_and_preserves_reads() -> anyhow::Result<()>
+    {
+        terminal_seal_permission_case(false).await
+    }
+
+    /// An approval captured before terminal intent cannot reopen mutation admission afterward.
+    #[tokio::test]
+    async fn pending_native_approval_cannot_reopen_terminal_seal() -> anyhow::Result<()> {
+        terminal_seal_permission_case(true).await
+    }
+
+    async fn terminal_seal_permission_case(approval_wait: bool) -> anyhow::Result<()> {
+        let (root, _store, controller) = crate::task::SessionTaskController::test_goal();
+        let coordinator =
+            PermissionCoordinator::load(root.path().join("permissions.json"), root.path())?;
+        let owner = crate::provider::ThreadOwner::root("session");
+        let scope = forge_provider_api::InvocationScope::new(owner.clone(), "terminal-turn");
+        let mut tools =
+            crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        tools.bind_test_task_controller(controller);
+        let provider_request = crate::provider::ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: root.path().display().to_string(),
+            input: crate::provider::ProviderInput::from_user_text("Test mutation admission"),
+            mode: crate::provider::PromptMode::Chat,
+            model: "default".into(),
+            effort: "default".into(),
+            context_window: None,
+            service_tier: crate::provider::ServiceTier::Standard,
+            access: crate::session::AccessPolicy {
+                sandbox: false,
+                ..Default::default()
+            },
+            approval_mode: ApprovalMode::Allow,
+            provider_session_id: None,
+            submission: None,
+            acknowledged_child_reports: Vec::new(),
+            recovered_input: Vec::new(),
+            control_context: None,
+            child_agent: None,
+        };
+        let _directories = coordinator.directories(None, &provider_request, &scope)?;
+        let context = ProviderPermissionContext::new(coordinator.clone());
+        let (events, _receiver) = crate::provider::events::channel(scope.clone());
+        context.configure(
+            owner.clone(),
+            ApprovalMode::Allow,
+            root.path().display().to_string(),
+            Some(events.clone()),
+        )?;
+        context.bind_context(Some(&tools))?;
+        let request = |write| PermissionRequest {
+            id: "file-request".into(),
+            provider: forge_providers::registry::nonselectable_id().unwrap(),
+            reason: None,
+            target_list: vec![if write {
+                crate::permissions::matcher::PermissionTarget::Write {
+                    path: root.path().join("file.rs").display().to_string(),
+                }
+            } else {
+                crate::permissions::matcher::PermissionTarget::Read {
+                    path: root.path().join("file.rs").display().to_string(),
+                }
+            }],
+        };
+        let before = context.authorize(&scope, request(true)).await;
+        assert!(matches!(before, PermissionResponse::Allow), "{before:?}");
+        if approval_wait {
+            context.configure(
+                owner,
+                ApprovalMode::Ask,
+                root.path().display().to_string(),
+                Some(events),
+            )?;
+            context.bind_context(Some(&tools))?;
+            let pending = context.authorize(
+                &scope,
+                PermissionRequest {
+                    target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
+                        command: "rg TODO src".into(),
+                        shell: None,
+                    }],
+                    ..request(true)
+                },
+            );
+            tokio::pin!(pending);
+            let approval = tokio::select! {
+                response = &mut pending => panic!("permission resolved before approval: {response:?}"),
+                approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Some(approval) = coordinator.pending_list()?.into_iter().next() {
+                            break anyhow::Ok(approval);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }) => approval??,
+            };
+            crate::tools::TaskAuthority::capture(&tools)
+                .unwrap()
+                .seal_mutations(|| Ok(()))?;
+            let answers = approval
+                .item_list
+                .iter()
+                .map(|item| crate::provider::approval::ApprovalAnswer {
+                    item_id: item.id.clone(),
+                    choice_id: item
+                        .choice_list
+                        .iter()
+                        .find(|choice| choice.id == "allow_once")
+                        .expect("one-time approval available")
+                        .id
+                        .clone(),
+                })
+                .collect::<Vec<_>>();
+            coordinator.resolve(&approval.id, &answers, None).await?;
+            assert!(matches!(pending.await, PermissionResponse::Deny { .. }));
+        } else {
+            crate::tools::TaskAuthority::capture(&tools)
+                .unwrap()
+                .seal_mutations(|| Ok(()))?;
+        }
+        assert!(matches!(
+            context.authorize(&scope, request(true)).await,
+            PermissionResponse::Deny { .. }
+        ));
+        assert!(matches!(
+            context.authorize(&scope, request(false)).await,
+            PermissionResponse::Allow
+        ));
+        Ok(())
+    }
 
     /// Reject every Background request with the tool-free reason, regardless of Allow mode.
     #[tokio::test]

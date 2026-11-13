@@ -16,6 +16,8 @@ pub(crate) struct ForegroundFinalization {
     nonplan_question_terminal: bool,
     goal_terminal_pending: bool,
     goal_continuing: bool,
+    goal_request_rejected: bool,
+    phase_checkpoint: Option<crate::checkpoint::CheckpointRecord>,
     pub(crate) goal_waiting_questions: bool,
     checks: Option<check_admission::AutomaticCheckTransaction>,
     check_result: Option<(Value, Vec<SessionEvent>)>,
@@ -82,8 +84,8 @@ impl ForegroundFinalization {
     /// Settle a cancelled same-invocation follow-up through the envelope that already owns the
     /// prompt submission. The original turn transferred that authority when it first finalized,
     /// so a cancelled clarification, check-repair, or retry turn cannot take it again.
-    pub(crate) fn resume_cancelled(&mut self) -> Result<()> {
-        self.resume(Err(ProviderError::Cancelled), None)
+    pub(crate) fn resume_stopped(&mut self, reason: ProviderError) -> Result<()> {
+        self.resume(Err(reason), None)
     }
 
     fn resume(
@@ -108,6 +110,7 @@ impl ForegroundFinalization {
         self.plan_submission_id = None;
         self.plan_submission_publication_pending = false;
         self.nonplan_question_terminal = false;
+        self.goal_request_rejected = false;
         self.phase = FinalizationPhase::Effects;
         Ok(())
     }
@@ -171,6 +174,8 @@ impl ForegroundFinalization {
             nonplan_question_terminal: false,
             goal_terminal_pending: false,
             goal_continuing: false,
+            goal_request_rejected: false,
+            phase_checkpoint: None,
             goal_waiting_questions: false,
             checks: None,
             check_result: None,
@@ -469,6 +474,62 @@ impl ForegroundFinalization {
 }
 
 impl HarnessBroker {
+    /// Preserve a definite failed native result independently from its recorded terminal intent.
+    pub(super) fn reject_terminal_requests(
+        &mut self,
+        transaction: &ForegroundTransaction,
+        reason: &str,
+    ) -> Result<()> {
+        if let Some(pending) = &transaction.pending_execution_phase {
+            self.store
+                .reject_terminal_request(&self.session.id, pending.request_id(), reason)?;
+        }
+        for batch in transaction.settlement.batches()? {
+            if let Some(control) = &batch.completion.goal_control {
+                self.store.reject_terminal_request(
+                    &self.session.id,
+                    &control.request_id,
+                    reason,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Seal the planning invocation without requesting native interruption.
+    pub(crate) fn seal_plan_acceptance(
+        &self,
+        dispatch: &TurnTransaction,
+        record: impl FnOnce() -> Result<()>,
+    ) -> Result<(String, Option<String>)> {
+        let transaction = match dispatch {
+            TurnTransaction::Running { transaction, .. }
+            | TurnTransaction::Finalizing { transaction, .. } => transaction,
+            _ => anyhow::bail!("plan acceptance has no active planning invocation"),
+        };
+        anyhow::ensure!(
+            matches!(
+                transaction.mode,
+                PromptMode::Plan | PromptMode::PlanDiscussion
+            ),
+            "execution approval cannot advance a non-planning invocation"
+        );
+        transaction
+            .task_authority
+            .as_ref()
+            .context("planning authority is missing")?
+            .seal_mutations(record)?;
+        Ok((
+            transaction.state.interaction.id.clone(),
+            transaction
+                .state
+                .interaction
+                .turn
+                .last()
+                .map(|turn| turn.id().to_owned()),
+        ))
+    }
+
     pub(crate) fn stale_continuation_waits_for_question(&self, dispatch: &TurnTransaction) -> bool {
         matches!(dispatch, TurnTransaction::Finalizing { transaction, .. }
             if transaction.finalization.as_ref().is_some_and(|finalization| finalization.phase == FinalizationPhase::WaitingStaleQuestion))
@@ -592,6 +653,10 @@ impl HarnessBroker {
             .as_mut()
             .context("finalization envelope is missing")?;
         match signal {
+            ForegroundSignal::TerminalWorkspaceCompleted(result) => {
+                finalization.phase_checkpoint = Some(*result?);
+                self.prepare_foreground_host_effects(transaction, admission)
+            }
             ForegroundSignal::FinalizeEffectsRequested => {
                 self.prepare_foreground_host_effects(transaction, admission)
             }
@@ -1188,6 +1253,55 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
         admission: &mut foreground_dispatch::ForegroundAdmission,
     ) -> Result<ForegroundAction> {
+        if transaction.pending_execution_phase.is_some()
+            && transaction
+                .finalization
+                .as_ref()
+                .context("finalization envelope is missing")?
+                .phase_checkpoint
+                .is_none()
+        {
+            return Ok(ForegroundAction::Effect(ForegroundJob::TerminalWorkspace(
+                Box::new(self.prepare_workspace_capture()),
+            )));
+        }
+        if let Some(pending) = transaction.pending_execution_phase.as_ref() {
+            let outcome = &transaction
+                .finalization
+                .as_ref()
+                .context("finalization envelope is missing")?
+                .outcome;
+            if outcome.is_ok()
+                && crate::task::latest_turn_completed_normally(&transaction.state.interaction)
+                && !self.requires_explicit_continuation(&transaction.state.interaction)?
+            {
+                let checkpoint = transaction
+                    .finalization
+                    .as_ref()
+                    .and_then(|state| state.phase_checkpoint.as_ref())
+                    .context("final workspace evidence is missing")?;
+                self.settle_execution_phase(
+                    (**pending).clone(),
+                    checkpoint,
+                    &mut transaction.state.interaction,
+                )?;
+            } else {
+                self.store.reject_terminal_request(
+                    &self.session.id,
+                    pending.request_id(),
+                    "original turn did not complete normally or was stopped",
+                )?;
+                self.trace.record(
+                    &self.session.id,
+                    "execution.request_rejected",
+                    json!({
+                        "exchange_id": transaction.state.interaction.id,
+                        "reason": "the original turn did not complete normally or was stopped",
+                    }),
+                );
+            }
+        }
+        transaction.pending_execution_phase = None;
         let finalization = transaction
             .finalization
             .as_mut()
@@ -1226,7 +1340,7 @@ impl HarnessBroker {
         // Stage the terminal metadata and effects without consuming settlement authority.
         let mut output = match &finalization.outcome {
             Ok(output) => output.clone(),
-            Err(ProviderError::Cancelled) => {
+            Err(ProviderError::Cancelled | ProviderError::Interrupted) => {
                 let mut output = ProviderCompletion::default();
                 output.native.provider_session_id = self
                     .session
@@ -1250,6 +1364,22 @@ impl HarnessBroker {
                 ));
             }
         };
+        if output.goal_control.is_some()
+            && (finalization.outcome.is_err()
+                || !crate::task::latest_turn_completed_normally(&transaction.state.interaction)
+                || self.requires_explicit_continuation(&transaction.state.interaction)?)
+        {
+            output.goal_control.take();
+            finalization.goal_request_rejected = true;
+            self.trace.record(
+                &self.session.id,
+                "goal.request_rejected",
+                json!({
+                    "exchange_id": transaction.state.interaction.id,
+                    "reason": "the original turn did not complete normally or was stopped",
+                }),
+            );
+        }
         output.dispatched_task_permit = transaction.dispatched_task_permit.clone();
         output.dispatched_execution_id = transaction.dispatched_execution_id.clone();
         output.dispatched_entry_id = transaction.dispatched_entry_id.clone();
@@ -1428,8 +1558,10 @@ impl HarnessBroker {
         let (checks, action) = if admission.automatic_check_owner.is_some()
             || finalization.collection.is_some()
             || self.requires_explicit_continuation(interaction)?
-            || matches!(finalization.outcome, Err(ProviderError::Cancelled))
-        {
+            || matches!(
+                finalization.outcome,
+                Err(ProviderError::Cancelled | ProviderError::Interrupted)
+            ) {
             (
                 None,
                 check_admission::AutomaticCheckAction::Finish((value, events)),
@@ -1517,6 +1649,7 @@ impl HarnessBroker {
             Ok(_) if own_turn_stopped => crate::exchange::ExchangeOutcome::Interrupted,
             Ok(_) => crate::exchange::ExchangeOutcome::Complete,
             Err(ProviderError::Cancelled) => crate::exchange::ExchangeOutcome::Cancelled,
+            Err(ProviderError::Interrupted) => crate::exchange::ExchangeOutcome::Interrupted,
             Err(_) => crate::exchange::ExchangeOutcome::Failed,
         };
         let runtime = transaction
@@ -1577,7 +1710,10 @@ impl HarnessBroker {
     ) -> Result<ForegroundAction> {
         if finalization.mode != PromptMode::Background
             && finalization.collection.is_none()
-            && !matches!(finalization.outcome, Err(ProviderError::Cancelled))
+            && !matches!(
+                finalization.outcome,
+                Err(ProviderError::Cancelled | ProviderError::Interrupted)
+            )
         {
             match self.prepare_automatic_compaction() {
                 Ok(Some((job, delivery))) => {
@@ -1606,7 +1742,9 @@ impl HarnessBroker {
     ) -> Result<ForegroundAction> {
         self.refresh_input_schedule()?;
         self.active_wait_projection = None;
-        let response = if matches!(finalization.outcome, Err(ProviderError::Cancelled)) {
+        let response = if matches!(finalization.outcome, Err(ProviderError::Interrupted)) {
+            Response::failure(request_id, "turn_interrupted", "Provider turn interrupted")
+        } else if matches!(finalization.outcome, Err(ProviderError::Cancelled)) {
             let message = if finalization.collection == Some(ForegroundCollection::Restart) {
                 "Turn interrupted to apply configuration"
             } else {
@@ -1893,6 +2031,9 @@ impl HarnessBroker {
         interaction: &Exchange,
     ) -> Result<ForegroundAction> {
         use crate::provider::session_execution::ResultEffectAdmission;
+        if finalization.goal_request_rejected {
+            return self.finish_goal_effects(finalization);
+        }
         let staged = finalization
             .staged
             .as_mut()
@@ -1906,6 +2047,9 @@ impl HarnessBroker {
         // Cancellation can settle an admitted turn before any result batch is
         // produced. Its dispatch permit is not evidence of task progress, and
         // cannot own a goal-effect receipt or reserve a continuation.
+        if matches!(finalization.outcome, Err(ProviderError::Interrupted)) {
+            return self.finish_goal_effects(finalization);
+        }
         if matches!(finalization.outcome, Err(ProviderError::Cancelled))
             && staged
                 .batches
@@ -1964,6 +2108,71 @@ impl HarnessBroker {
         let Some(permit) = permit else {
             return self.finish_goal_effects(finalization);
         };
+        // A durable terminal receipt repairs the in-memory ledger after a commit whose
+        // acknowledgement was lost, even when completion already retired the task.
+        if let Some(control) = &staged.output.goal_control {
+            let id = interaction::goal_evidence_id(staged)?;
+            match self
+                .store
+                .terminal_disposition(&self.session.id, &control.request_id)?
+            {
+                Some(crate::storage::TerminalDisposition::Committed { result }) => {
+                    let (_, decision, goal): (
+                        crate::task::GoalSnapshot,
+                        crate::goal::ContinuationDecision,
+                        crate::goal::GoalRecord,
+                    ) = serde_json::from_value(result)?;
+                    let continuing = matches!(
+                        decision,
+                        crate::goal::ContinuationDecision::Continue
+                            | crate::goal::ContinuationDecision::RetryNoProgress
+                    );
+                    finalization.settlement.reconcile_terminal_effect(
+                        id,
+                        Some(crate::provider::session_execution::HostEffectOutput {
+                            nodes: Vec::new(),
+                            events: vec![self.event("goal_changed", serde_json::to_value(goal)?)?],
+                            elicitation: None,
+                            awaiting_input: false,
+                            publication_drained: false,
+                            plan_document: None,
+                            continuing: Some(continuing),
+                            plan_record: None,
+                        }),
+                    )?;
+                    if !staged.expected_effects.contains(&id) {
+                        staged.expected_effects.push(id);
+                    }
+                    let ResultEffectAdmission::Applied(output) =
+                        finalization.settlement.begin_result_effect(id)?
+                    else {
+                        unreachable!("committed receipt restored the effect");
+                    };
+                    finalization.goal_continuing = continuing;
+                    if output.publication_drained {
+                        return self.finish_goal_effects(finalization);
+                    }
+                    let mut delivery =
+                        self.prepare_provider_delivery(AppliedProviderEvent::None)?;
+                    delivery.events = output.events;
+                    finalization.plan_submission_publication_pending = true;
+                    finalization.goal_terminal_pending = true;
+                    return Ok(ForegroundAction::Effect(
+                        ForegroundJob::PlanTerminalPublication {
+                            delivery,
+                            cell: finalization.settlement.clone(),
+                            id,
+                        },
+                    ));
+                }
+                Some(crate::storage::TerminalDisposition::Pending) => {
+                    finalization
+                        .settlement
+                        .reconcile_terminal_effect(id, None)?;
+                }
+                _ => {}
+            }
+        }
         let Some(task) = self.task_controller.current()? else {
             return self.finish_goal_effects(finalization);
         };
@@ -2085,16 +2294,22 @@ impl HarnessBroker {
             turn_ordinal: interaction.turn.len(),
         };
         let mut events = Vec::new();
-        let continuing =
-            match self.apply_goal_evidence_strict(evidence, evidence_permit, turn, &mut events) {
-                Ok(continuing) => continuing,
-                Err(error) => {
-                    if !has_progress && error.is::<crate::task::StaleTask>() {
-                        guard.cancel_definite()?;
-                    }
-                    return Err(error);
+        let continuing = match self.apply_goal_evidence_strict(
+            evidence,
+            evidence_permit,
+            turn,
+            staged.output.goal_control.as_ref(),
+            None,
+            &mut events,
+        ) {
+            Ok(continuing) => continuing,
+            Err(error) => {
+                if !has_progress && error.is::<crate::task::StaleTask>() {
+                    guard.cancel_definite()?;
                 }
-            };
+                return Err(error);
+            }
+        };
         let id = interaction::goal_evidence_id(staged)?;
         guard.commit_output(HostEffectOutput {
             nodes: Vec::new(),
@@ -2177,7 +2392,15 @@ impl HarnessBroker {
         result: foreground_goal_effect::GoalProgressResult,
     ) -> Result<ForegroundAction> {
         use crate::provider::session_execution::HostEffectOutput;
-        let (changed, guard) = result.commit_workspace(self)?;
+        let foreground_goal_effect::GoalProgressResult {
+            checkpoint,
+            changed,
+            previous_id,
+            permit,
+            mut guard,
+        } = result;
+        permit.validate_observation(self.task_controller.current()?.as_ref())?;
+        guard.begin_mutation();
         let staged = finalization
             .staged
             .as_mut()
@@ -2189,8 +2412,14 @@ impl HarnessBroker {
             turn_ordinal: interaction.turn.len(),
         };
         let mut events = Vec::new();
-        let continuing =
-            self.apply_goal_evidence_strict(evidence, evidence_permit, turn, &mut events)?;
+        let continuing = self.apply_goal_evidence_strict(
+            evidence,
+            evidence_permit,
+            turn,
+            staged.output.goal_control.as_ref(),
+            Some((checkpoint, previous_id)),
+            &mut events,
+        )?;
         let id = interaction::goal_evidence_id(staged)?;
         guard.commit_output(HostEffectOutput {
             nodes: Vec::new(),

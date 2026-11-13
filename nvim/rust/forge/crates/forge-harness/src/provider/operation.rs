@@ -457,6 +457,7 @@ pub(super) fn primary_failure(error: &ProviderError) -> Option<ProviderFailure> 
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
         | ProviderError::Cancelled
+        | ProviderError::Interrupted
         | ProviderError::Retryable(_)
         | ProviderError::Delivery(_) => None,
     }

@@ -906,21 +906,6 @@ impl TurnControl for CallbackRouter {
     ) -> Result<HostTurnStatus, ProviderError> {
         self.callbacks(scope).await?.control.status(scope).await
     }
-    fn tool_finished(
-        &self,
-        scope: &forge_provider_api::InvocationScope,
-        name: Option<&str>,
-    ) -> bool {
-        self.active
-            .try_read()
-            .ok()
-            .and_then(|active| {
-                active
-                    .get(scope)
-                    .map(|registration| registration.callbacks.control.tool_finished(scope, name))
-            })
-            .unwrap_or(false)
-    }
 }
 
 #[async_trait]
@@ -4961,13 +4946,9 @@ mod callback_tests {
         ) -> Result<HostTurnStatus, ProviderError> {
             Ok(HostTurnStatus {
                 replay_safe: true,
-                control_handoff: false,
                 cancelled: false,
                 error: None,
             })
-        }
-        fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool {
-            false
         }
     }
 

@@ -18,6 +18,10 @@ pub use ownership::{TimelineEvent, TimelineOwner};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventKind {
+    /// Show a recorded approval independently of the eventual task transition.
+    TaskAdvancement {
+        message: String,
+    },
     TaskFinished {
         outcome: crate::task::TaskOutcome,
     },

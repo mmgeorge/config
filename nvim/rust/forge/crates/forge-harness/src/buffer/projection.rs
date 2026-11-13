@@ -3372,6 +3372,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
 
 fn session_event_text(event: &SessionEventKind) -> String {
     match event {
+        SessionEventKind::TaskAdvancement { message } => message.clone(),
         SessionEventKind::TaskStarted { start, .. } => start.heading(),
         SessionEventKind::TaskFinished { outcome } => {
             let label = match outcome.kind {

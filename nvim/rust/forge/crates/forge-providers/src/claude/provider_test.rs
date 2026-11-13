@@ -120,13 +120,9 @@ impl forge_provider_api::turn_control::TurnControl for OpenTurnControl {
     ) -> Result<forge_provider_api::turn_control::HostTurnStatus, ProviderError> {
         Ok(forge_provider_api::turn_control::HostTurnStatus {
             replay_safe: false,
-            control_handoff: false,
             cancelled: false,
             error: None,
         })
-    }
-    fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool {
-        false
     }
 }
 
@@ -451,30 +447,31 @@ async fn isolated_text_uses_an_unpersisted_tool_free_process() {
         .unwrap();
     let (events, _) = until_completed(&mut opened.events).await;
     assert_eq!(streamed_text(&events), "generated subject");
-    let record = launcher.record.lock().unwrap();
-    let arguments = &record.launches[0];
-    for flag in [
-        "--no-session-persistence",
-        "--safe-mode",
-        "--tools=",
-        "--permission-prompts=none",
-    ] {
-        assert!(arguments.iter().any(|argument| argument == flag));
-    }
-    assert!(
-        !arguments
+    {
+        let record = launcher.record.lock().unwrap();
+        let arguments = &record.launches[0];
+        for flag in [
+            "--no-session-persistence",
+            "--safe-mode",
+            "--tools=",
+            "--permission-prompts=none",
+        ] {
+            assert!(arguments.iter().any(|argument| argument == flag));
+        }
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.starts_with("--session-id=")
+                    || argument.starts_with("--resume="))
+        );
+        let initialize = record
+            .frames
             .iter()
-            .any(|argument| argument.starts_with("--session-id=")
-                || argument.starts_with("--resume="))
-    );
-    let initialize = record
-        .frames
-        .iter()
-        .find(|frame| frame["request"]["subtype"] == "initialize")
-        .unwrap();
-    assert!(initialize["request"]["sdkMcpServers"].is_null());
-    assert_eq!(initialize["request"]["systemPrompt"], "fixture system");
-    drop(record);
+            .find(|frame| frame["request"]["subtype"] == "initialize")
+            .unwrap();
+        assert!(initialize["request"]["sdkMcpServers"].is_null());
+        assert_eq!(initialize["request"]["systemPrompt"], "fixture system");
+    }
     provider.shutdown(operation_context()).await.unwrap();
 }
 

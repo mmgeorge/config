@@ -318,14 +318,23 @@ impl HarnessBroker {
         }
         let (mut output, question_override) = match outcome {
             ForegroundOutcome::NativeReady(Ok(output)) => (output, None),
-            ForegroundOutcome::NativeReady(Err(error)) if error.is_clean_cancellation() => {
-                if Self::cancellation_restores_prompt(transaction) {
+            ForegroundOutcome::NativeReady(Err(error))
+                if error.is_clean_cancellation() || matches!(error, ProviderError::Interrupted) =>
+            {
+                let stopped = if transaction.collection.is_some() || error.is_clean_cancellation() {
+                    ProviderError::Cancelled
+                } else {
+                    ProviderError::Interrupted
+                };
+                if matches!(stopped, ProviderError::Cancelled)
+                    && Self::cancellation_restores_prompt(transaction)
+                {
                     return self.settle_collected_cancellation(dispatch);
                 }
                 if let Some(finalization) = transaction.finalization.as_mut() {
                     // A continuation turn reuses the envelope that already owns the submission.
                     finalization.mode = transaction.mode;
-                    finalization.resume_cancelled()?;
+                    finalization.resume_stopped(stopped)?;
                 } else {
                     let submission = admission.take_submission()?;
                     let events = std::mem::take(&mut admission.events);
@@ -334,7 +343,7 @@ impl HarnessBroker {
                             submission,
                             transaction.mode,
                             events,
-                            Err(ProviderError::Cancelled),
+                            Err(stopped),
                             transaction.settlement.clone(),
                             None,
                             transaction.collection,
@@ -355,6 +364,10 @@ impl HarnessBroker {
                 return Ok(ForegroundAction::Wait);
             }
             ForegroundOutcome::NativeReady(Err(error)) => {
+                self.reject_terminal_requests(
+                    transaction,
+                    "native turn failed before terminal settlement",
+                )?;
                 return self.fail_foreground(transaction, error.into());
             }
             ForegroundOutcome::RequiredQuestion {

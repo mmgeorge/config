@@ -179,6 +179,7 @@ impl HarnessBroker {
                     | ForegroundSignal::PlanQuestionCompleted(_)
                     | ForegroundSignal::GoalProgressCompleted(_)
                     | ForegroundSignal::ExecutionProgressCompleted(_)
+                    | ForegroundSignal::TerminalWorkspaceCompleted(_)
                     | ForegroundSignal::PlanTerminalPublished(_)
                     | ForegroundSignal::ClarificationPublished(_)
                     | ForegroundSignal::CheckRepairPublished(_)
@@ -561,6 +562,7 @@ impl HarnessBroker {
             | ForegroundSignal::FinalResponsePublished(_)
             | ForegroundSignal::FinalizeChecksRequested
             | ForegroundSignal::FinalizeCheckContinuationRequested
+            | ForegroundSignal::TerminalWorkspaceCompleted(_)
             | ForegroundSignal::FinalizeEffectsRequested
             | ForegroundSignal::PublicationDrained
             | ForegroundSignal::AutomaticCheckRefreshed(_)

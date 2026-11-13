@@ -134,38 +134,14 @@ impl HarnessBroker {
             ));
         }
         if request.batch.completion.goal_control.is_some() {
-            self.trace.record(&self.session.id, "host_effect.lifecycle", json!({"scope":request.scope,"call_id":request.call_id,"batch_revision":request.batch.revision,"stage":"admitted","outcome":"goal"}));
-            let (id, events) = match self.commit_live_goal_effect(transaction, &request) {
-                Ok(committed) => committed,
-                Err(error) => {
-                    self.trace.record(&self.session.id, "host_effect.lifecycle", json!({"scope":request.scope,"call_id":request.call_id,"batch_revision":request.batch.revision,"stage":"rejected","outcome":"goal_commit_failed"}));
-                    let _ = request.reply.send(Err(live_host_failure(&error)));
-                    return Err(error);
-                }
-            };
-            transaction.live_host = Some(LiveHostState {
-                scope: request.scope,
-                call_id: request.call_id,
-                batch_revision: request.batch.revision,
-                reply: Some(request.reply),
-                committed: true,
-                plan: None,
-                permit: None,
-                entry: None,
-                id,
-            });
-            let permit = self.task_controller.current()?.map(|task| task.permit());
-            transaction.live_host.as_mut().unwrap().permit = permit;
-            self.trace_live_host(transaction.live_host.as_ref().unwrap(), "committed", "goal");
-            let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::None)?;
-            delivery.events = events;
-            return Ok(ForegroundAction::Effect(
-                ForegroundJob::PlanTerminalPublication {
-                    delivery,
-                    cell: transaction.settlement.clone(),
-                    id,
-                },
-            ));
+            if let Err(error) = self.validate_live_goal_request(transaction, &request) {
+                request.reject(live_host_failure(&error));
+                return Ok(ForegroundAction::Wait);
+            }
+            let _ = request
+                .reply
+                .send(Ok(crate::provider::LiveHostCommit { task_permit: None }));
+            return Ok(ForegroundAction::Wait);
         }
         let prepared = (|| -> Result<_> {
             anyhow::ensure!(transaction.live_host.is_none(), LiveHostRejection::Busy);

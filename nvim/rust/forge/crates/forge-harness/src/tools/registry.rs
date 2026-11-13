@@ -5,6 +5,27 @@ use serde_json::Value;
 
 pub use forge_provider_api::control::ControlToolDefinition;
 
+/// Identify inspections that remain available after a terminal request seals mutations.
+pub(crate) fn is_read_only(name: &str) -> bool {
+    super::repository::is_tool(name)
+        || super::session::is_tool(name)
+        || (super::lsp::is_tool(name) && !super::lsp::is_mutation(name))
+        || matches!(
+            name,
+            "plan_read"
+                | "plan_status"
+                | "harness_config"
+                | "agent_activity"
+                | "agent_list"
+                | "agent_tool_output"
+                | "check_status"
+                | "check_list"
+                | "check_detail"
+                | "check_definition_list"
+                | "check_definition_details"
+        )
+}
+
 /// Exclude trusted replay metadata from provider-visible schemas and state each tool's
 /// availability requirement.
 fn advertised_definition(mut definition: ControlToolDefinition) -> ControlToolDefinition {

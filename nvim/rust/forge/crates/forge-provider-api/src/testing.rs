@@ -95,6 +95,10 @@ pub enum TestMessageContent {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TestPromptStep {
+    /// Hold this exact point in a scripted response until the test releases it.
+    Barrier { id: TestHoldId },
+    /// Hold native resource collection after the terminal event has been delivered.
+    CollectionBarrier { id: TestHoldId },
     Message {
         content: TestMessageContent,
         text: String,

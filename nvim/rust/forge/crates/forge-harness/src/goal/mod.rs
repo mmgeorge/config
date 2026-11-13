@@ -39,21 +39,22 @@ pub enum GoalState {
     Cleared,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) enum GoalTermination {
     Complete,
     Blocked,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct GoalControl {
+    pub request_id: String,
     pub permit: crate::task::TaskPermit,
     pub termination: GoalTermination,
     pub message: String,
 }
 
 /// Represents the broker action selected after a goal turn ends.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ContinuationDecision {
     Continue,
     RetryNoProgress,
@@ -88,6 +89,8 @@ pub(crate) fn observe(
     if *state != GoalState::Active {
         return ContinuationDecision::Stop;
     }
+    let progress = evidence.workspace_changed;
+    let may_continue = continuation.observe(progress);
     if evidence.structured_complete {
         *state = GoalState::Complete;
         return ContinuationDecision::Complete;
@@ -96,8 +99,6 @@ pub(crate) fn observe(
         *state = GoalState::Blocked;
         return ContinuationDecision::Blocked;
     }
-    let progress = evidence.workspace_changed;
-    let may_continue = continuation.observe(progress);
     if !may_continue {
         *state = GoalState::Stalled;
         return ContinuationDecision::Stalled;

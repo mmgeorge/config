@@ -684,13 +684,30 @@ impl ExchangeDriver {
                         input_control: InputControl::AtExecution,
                     },
                 };
+                let observed = if self
+                    .pending_plan_acceptance
+                    .as_ref()
+                    .is_some_and(|pending| pending.run.command.record.request.id == request.id)
+                {
+                    self.pending_plan_acceptance
+                        .as_mut()
+                        .map(|pending| &mut pending.run.command)
+                } else if let Some((_, follower)) = self
+                    .acceptance_followers
+                    .iter_mut()
+                    .find(|(_, follower)| follower.record.request.id == request.id)
+                {
+                    Some(follower)
+                } else {
+                    active.map(ActiveCommand::queued_mut)
+                };
                 self.commands.admit(
                     CommandAdmission {
                         request,
                         reply,
                         task_admission,
                     },
-                    active.map(ActiveCommand::queued_mut),
+                    observed,
                     trace,
                     session,
                     step,

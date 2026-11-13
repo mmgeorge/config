@@ -1242,6 +1242,7 @@ impl MockProvider {
             admission: Mutex::new(()),
             active: Mutex::new(None),
             cancelled_submission: Mutex::new(None),
+            collection_barrier: Mutex::new(None),
             history_boundary: Mutex::new(None),
             control: self.control.clone(),
         });
@@ -2254,6 +2255,7 @@ struct MockSession {
     admission: Mutex<()>,
     active: Mutex<Option<MockInvocation>>,
     cancelled_submission: Mutex<Option<SubmissionId>>,
+    collection_barrier: Mutex<Option<TestHoldId>>,
     history_boundary: Mutex<Option<CheckpointId>>,
     control: Arc<MockControl>,
 }
@@ -2335,8 +2337,20 @@ impl crate::turn_runner::NativeTurnDriver for MockTurnDriver {
         }
         Ok(())
     }
-    /// Observe synchronous script/callback collection after its run future released ownership.
+    /// Collect the original script's resources independently of its terminal event.
     async fn collect(&self) -> Result<(), ProviderError> {
+        if let Some(id) = self.session.collection_barrier.lock().await.take() {
+            let hold = self.session.control.find(&self.session.owner, &id)?;
+            self.session
+                .control
+                .arrive_hold(
+                    hold,
+                    &self.session.owner,
+                    ExecutionMode::Default,
+                    "Native collection".into(),
+                )
+                .await?;
+        }
         Ok(())
     }
 }
@@ -2348,6 +2362,7 @@ struct MockSteering {
 }
 
 struct ResponseHold {
+    scripted: bool,
     id: TestHoldId,
     owner: ThreadId,
     any_owner: bool,
@@ -2365,6 +2380,35 @@ struct MockControl {
 }
 
 impl MockControl {
+    /// Wait at an already selected native response barrier.
+    async fn arrive_hold(
+        &self,
+        hold: Arc<ResponseHold>,
+        owner: &ThreadId,
+        mode: ExecutionMode,
+        prompt: String,
+    ) -> Result<(), ProviderError> {
+        let pending = PendingTestResponse {
+            id: hold.id.clone(),
+            thread_id: owner.clone(),
+            mode,
+            prompt,
+        };
+        hold.state.send_replace(HoldState::Pending(pending));
+        let mut state = hold.state.subscribe();
+        loop {
+            match state.borrow_and_update().clone() {
+                HoldState::Released => return Ok(()),
+                HoldState::Cancelled => return Err(ProviderError::Cancelled),
+                HoldState::Armed | HoldState::Pending(_) => {}
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown))?;
+        }
+    }
+
     fn find(&self, owner: &ThreadId, id: &TestHoldId) -> Result<Arc<ResponseHold>, ProviderError> {
         self.holds
             .lock()
@@ -2394,6 +2438,7 @@ impl ProviderTestControl for MockControl {
                 })?;
                 let (state, _) = watch::channel(HoldState::Armed);
                 self.holds.lock().unwrap().push_back(Arc::new(ResponseHold {
+                    scripted: false,
                     id: id.clone(),
                     owner: owner.clone(),
                     any_owner,
@@ -2440,6 +2485,21 @@ impl ProviderTestControl for MockControl {
                 Ok(TestControlResult::OwnerCancelled)
             }
             TestControlCommand::Script { script } => {
+                for step in &script.steps {
+                    if let TestPromptStep::Barrier { id }
+                    | TestPromptStep::CollectionBarrier { id } = step
+                    {
+                        let (state, _) = watch::channel(HoldState::Armed);
+                        self.holds.lock().unwrap().push_back(Arc::new(ResponseHold {
+                            scripted: true,
+                            id: id.clone(),
+                            owner: owner.clone(),
+                            any_owner: false,
+                            mode: None,
+                            state,
+                        }));
+                    }
+                }
                 self.scripts
                     .lock()
                     .unwrap()
@@ -2478,7 +2538,8 @@ impl ProviderTestControl for MockControl {
             holds
                 .iter()
                 .find(|hold| {
-                    (hold.any_owner || hold.owner == *owner)
+                    !hold.scripted
+                        && (hold.any_owner || hold.owner == *owner)
                         && hold.mode.is_none_or(|expected| expected == mode)
                         && matches!(*hold.state.borrow(), HoldState::Armed)
                 })
@@ -2487,25 +2548,7 @@ impl ProviderTestControl for MockControl {
         let Some(hold) = hold else {
             return Ok(());
         };
-        let pending = PendingTestResponse {
-            id: hold.id.clone(),
-            thread_id: owner.clone(),
-            mode,
-            prompt,
-        };
-        hold.state.send_replace(HoldState::Pending(pending));
-        let mut state = hold.state.subscribe();
-        loop {
-            match state.borrow_and_update().clone() {
-                HoldState::Released => return Ok(()),
-                HoldState::Cancelled => return Err(ProviderError::Cancelled),
-                HoldState::Armed | HoldState::Pending(_) => {}
-            }
-            state
-                .changed()
-                .await
-                .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Unknown))?;
-        }
+        self.arrive_hold(hold, owner, mode, prompt).await
     }
 
     fn cancel_thread(&self, owner: Option<&ThreadId>) {
@@ -2852,6 +2895,34 @@ async fn run_prompt_inner(
     }
     for step in steps {
         match step {
+            TestPromptStep::CollectionBarrier { id } => {
+                *session.collection_barrier.lock().await = Some(id);
+            }
+            TestPromptStep::Barrier { id } => {
+                let hold = control.find(&owner, &id)?;
+                let result = tokio::select! {
+                    result = control.arrive_hold(hold, &owner, request.execution, prompt.clone()) => result,
+                    _ = cancelled.wait_for(|value| *value) => Err(ProviderError::Cancelled),
+                };
+                if let Err(error) = result {
+                    if matches!(error, ProviderError::Cancelled) {
+                        retain_terminal(
+                            &session,
+                            &sink,
+                            &scope,
+                            Some(turn),
+                            TurnOutcome::Interrupted,
+                            &progress.covered,
+                            None,
+                        )
+                        .await?;
+                        *session.cancelled_submission.lock().await =
+                            Some(request.submission_id.clone());
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
             TestPromptStep::Message { content, text } => {
                 let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())
                     .expect("allocated item ID is nonempty");

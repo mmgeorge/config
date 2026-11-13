@@ -48,3 +48,5 @@ reprojecting
 libtess
 
 gpt
+
+nushell

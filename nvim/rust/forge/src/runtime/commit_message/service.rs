@@ -389,6 +389,7 @@ impl GenerationService {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use forge_diff::cache::CacheLimits;

@@ -19,6 +19,7 @@ pub(crate) struct ExecutionSettlement {
     pub exchange: Exchange,
     pub kind: ExecutionSettlementKind,
     pub title: String,
+    pub terminal_request: Option<String>,
 }
 
 /// Publish only the execution and exchange that successfully committed together.
@@ -42,8 +43,9 @@ impl SessionTaskController {
             exchange,
             kind,
             title,
+            terminal_request,
         } = settlement;
-        self.update_with_effects(store, permit, now_ms, |task| {
+        self.settle_with_effects(store, permit, now_ms, true, |task| {
             let (phase_completion, revised_manual) = match kind {
                 ExecutionSettlementKind::PhaseFinished => (true, None),
                 ExecutionSettlementKind::RevisionSubmitted {
@@ -112,10 +114,14 @@ impl SessionTaskController {
             execution.record = record.clone();
             Ok((
                 SettledExecution {
-                    record,
+                    record: record.clone(),
                     exchange: exchange.clone(),
                 },
                 crate::storage::TaskEffects {
+                    terminal_commit: terminal_request.map(|id| crate::storage::TerminalCommit {
+                        id,
+                        result: record.response(),
+                    }),
                     plan: vec![plan],
                     exchange: vec![exchange],
                     ..Default::default()

@@ -108,6 +108,7 @@ pub(crate) fn trace_failure_kind(error: &ProviderError) -> ProviderFailureKind {
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
         | ProviderError::Cancelled
+        | ProviderError::Interrupted
         | ProviderError::Retryable(_)
         | ProviderError::Delivery(_) => ProviderFailureKind::Unknown,
     }

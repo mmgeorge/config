@@ -255,7 +255,6 @@ struct InvocationState {
     native_input: NativeInputAdmission,
     pending: usize,
     failure: Option<HostEffectFailure>,
-    execution_finished: bool,
     foreground_settled: bool,
 }
 
@@ -714,10 +713,6 @@ impl HostInvocation {
         *record.state.lock().map_err(|_| rejected())? =
             HostCallState::Published(publication.clone());
         record.changed.notify_waiters();
-        self.state
-            .lock()
-            .map_err(|_| rejected())?
-            .execution_finished |= outcome.execution_finished;
         admitted.published = true;
         publication.result.await
     }
@@ -921,11 +916,6 @@ impl TurnControl for HostInvocation {
         let state = self.state.lock().map_err(|_| rejected())?;
         Ok(HostTurnStatus {
             replay_safe: super::retry::replay_safe(&completion),
-            control_handoff: completion.evidence.structured_complete
-                || completion.evidence.structured_blocked
-                || completion.goal_control.is_some()
-                || completion.plan_submit.is_some()
-                || completion.plan_question.is_some(),
             cancelled: matches!(state.admission, Admission::Cancelled),
             error: completion.control_error.map(|_| {
                 ProviderError::Failure(ProviderFailure::new(
@@ -934,14 +924,6 @@ impl TurnControl for HostInvocation {
                 ))
             }),
         })
-    }
-
-    fn tool_finished(&self, scope: &InvocationScope, _name: Option<&str>) -> bool {
-        scope == &self.scope
-            && self
-                .state
-                .lock()
-                .is_ok_and(|state| state.execution_finished)
     }
 }
 

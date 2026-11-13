@@ -685,7 +685,7 @@ mod tests {
             assert!(
                 matches!(
                     error.downcast_ref::<ProviderError>(),
-                    Some(ProviderError::Cancelled)
+                    Some(ProviderError::Interrupted)
                 ),
                 "{error:#}"
             );

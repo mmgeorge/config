@@ -39,34 +39,46 @@
         "command": [
           "nu",
           "--no-config-file",
-          "--stdin",
           ".forge/checks/lua-tests.nu",
-          "check",
-          "affected"
+          "--affected",
+          "{files}"
         ],
         "inputs": {
           "files": {
             "type": "array",
-            "description": "Repository paths",
+            "description": "Changed repository paths; with none, every test runs",
             "required": false,
             "source": "changed_files"
-          },
-          "fixture": {
-            "type": "string",
-            "description": "Lua test file, test name, or name::case",
-            "required": false,
-            "default": ""
-          },
-          "suite": {
-            "type": "string",
-            "description": "Source area (such as status, harness, or lsp), plugin or source directory, all, or affected for the tests covering the changed paths",
-            "required": false,
-            "default": "affected"
           }
         },
-        "label": "Run Lua tests",
+        "label": "Run affected Lua tests",
         "category": "test",
-        "input": true
+        "after": [
+          "rust-build"
+        ]
+      }
+    },
+    "lua-test-select": {
+      "trigger": {},
+      "action": {
+        "command": [
+          "nu",
+          "--no-config-file",
+          ".forge/checks/lua-tests.nu",
+          "{tests}"
+        ],
+        "inputs": {
+          "tests": {
+            "type": "array",
+            "description": "Test files, source files, directories, test names, or name::case",
+            "required": true
+          }
+        },
+        "label": "Run selected Lua tests",
+        "category": "test",
+        "after": [
+          "rust-build"
+        ]
       }
     },
     "nushell-check": {
@@ -84,20 +96,19 @@
         "command": [
           "nu",
           "--no-config-file",
-          "--stdin",
-          "nvim/tools/checks/nushell.nu"
+          ".forge/checks/nushell-syntax.nu",
+          "{files}"
         ],
         "inputs": {
           "files": {
             "type": "array",
-            "description": "Repository paths",
+            "description": "Nushell files to check; with none, every repository Nushell file",
             "required": false,
             "source": "changed_files"
           }
         },
         "label": "Check Nushell syntax",
-        "category": "check",
-        "input": true
+        "category": "check"
       }
     },
     "rulesync-global-preview": {
@@ -229,69 +240,11 @@
       "trigger": {
         "auto": true,
         "paths": [
-          "nvim/rust/forge/src/**/*.rs",
-          "nvim/rust/forge/crates/**/*.rs",
-          "nvim/rust/forge/crates/**/Cargo.toml",
-          "nvim/rust/forge/tests/**/*.rs",
-          "nvim/rust/forge/crates/**/tests/**/*.rs"
+          "nvim/rust/forge/**"
         ],
         "exclude": [
           "**/target/**",
-          "**/node_modules/**"
-        ]
-      },
-      "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          "--stdin",
-          "nvim/tools/checks/rust.nu",
-          "check"
-        ],
-        "inputs": {
-          "executable": {
-            "type": "string",
-            "description": "all, lib, test:<name>, bin:<name>",
-            "required": false,
-            "default": "lib"
-          },
-          "files": {
-            "type": "array",
-            "description": "Repository paths",
-            "required": false,
-            "source": "changed_files"
-          },
-          "full": {
-            "type": "boolean",
-            "description": "Whole workspace",
-            "required": false,
-            "default": false
-          },
-          "package": {
-            "type": "string",
-            "description": "Cargo package",
-            "required": false,
-            "default": ""
-          }
-        },
-        "label": "Check",
-        "category": "check",
-        "input": true
-      }
-    },
-    "rust-check-workspace": {
-      "trigger": {
-        "auto": true,
-        "paths": [
-          "nvim/rust/forge/Cargo.toml",
-          "nvim/rust/forge/Cargo.lock",
-          "nvim/rust/forge/rust-toolchain.toml",
-          "nvim/rust/forge/.cargo/**",
-          "nvim/rust/forge/vendor/**"
-        ],
-        "exclude": [
-          "**/target/**",
-          "**/node_modules/**"
+          "nvim/rust/forge/**/*.md"
         ]
       },
       "action": {
@@ -313,132 +266,11 @@
       "trigger": {
         "auto": true,
         "paths": [
-          "nvim/rust/forge/src/**/*.rs",
-          "nvim/rust/forge/crates/**/*.rs",
-          "nvim/rust/forge/crates/**/Cargo.toml",
-          "nvim/rust/forge/tests/**/*.rs",
-          "nvim/rust/forge/crates/**/tests/**/*.rs"
+          "nvim/rust/forge/**"
         ],
         "exclude": [
           "**/target/**",
-          "**/node_modules/**"
-        ]
-      },
-      "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          "--stdin",
-          "nvim/tools/checks/rust.nu",
-          "format"
-        ],
-        "inputs": {
-          "executable": {
-            "type": "string",
-            "description": "all, lib, test:<name>, bin:<name>",
-            "required": false,
-            "default": "lib"
-          },
-          "files": {
-            "type": "array",
-            "description": "Repository paths",
-            "required": false,
-            "source": "changed_files"
-          },
-          "full": {
-            "type": "boolean",
-            "description": "Whole workspace",
-            "required": false,
-            "default": false
-          },
-          "package": {
-            "type": "string",
-            "description": "Cargo package",
-            "required": false,
-            "default": ""
-          },
-          "test": {
-            "type": "string",
-            "description": "Exact test name",
-            "required": false,
-            "default": ""
-          }
-        },
-        "label": "Check Rust formatting",
-        "category": "format",
-        "input": true
-      }
-    },
-    "rust-format-fix": {
-      "trigger": {
-        "paths": [
-          "nvim/rust/forge/src/**/*.rs",
-          "nvim/rust/forge/crates/**/*.rs",
-          "nvim/rust/forge/crates/**/Cargo.toml",
-          "nvim/rust/forge/tests/**/*.rs",
-          "nvim/rust/forge/crates/**/tests/**/*.rs"
-        ],
-        "exclude": [
-          "**/target/**",
-          "**/node_modules/**"
-        ]
-      },
-      "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          "--stdin",
-          "nvim/tools/checks/rust.nu",
-          "format-fix"
-        ],
-        "inputs": {
-          "executable": {
-            "type": "string",
-            "description": "all, lib, test:<name>, bin:<name>",
-            "required": false,
-            "default": "lib"
-          },
-          "files": {
-            "type": "array",
-            "description": "Repository paths",
-            "required": false,
-            "source": "changed_files"
-          },
-          "full": {
-            "type": "boolean",
-            "description": "Whole workspace",
-            "required": false,
-            "default": false
-          },
-          "package": {
-            "type": "string",
-            "description": "Cargo package",
-            "required": false,
-            "default": ""
-          },
-          "test": {
-            "type": "string",
-            "description": "Exact test name",
-            "required": false,
-            "default": ""
-          }
-        },
-        "label": "Apply Rust formatting",
-        "category": "format",
-        "prepare": true,
-        "input": true
-      }
-    },
-    "rust-format-workspace": {
-      "trigger": {
-        "auto": true,
-        "paths": [
-          "nvim/rust/forge/Cargo.toml",
-          "nvim/rust/forge/rust-toolchain.toml"
-        ],
-        "exclude": [
-          "**/target/**",
-          "**/node_modules/**"
+          "nvim/rust/forge/**/*.md"
         ]
       },
       "action": {
@@ -450,66 +282,25 @@
           "--check"
         ],
         "directory": "nvim/rust/forge",
-        "label": "Check Rust workspace formatting",
+        "label": "Check Rust formatting",
         "category": "format"
       }
     },
-    "rust-lint": {
-      "trigger": {
-        "paths": [
-          "nvim/rust/forge/**"
-        ],
-        "exclude": [
-          "**/target/**",
-          "**/node_modules/**"
-        ]
-      },
+    "rust-format-fix": {
+      "trigger": {},
       "action": {
         "command": [
-          "nu",
-          "--no-config-file",
-          "--stdin",
-          "nvim/tools/checks/rust.nu",
-          "clippy"
+          "cargo",
+          "fmt",
+          "--all"
         ],
-        "inputs": {
-          "executable": {
-            "type": "string",
-            "description": "all, lib, test:<name>, bin:<name>",
-            "required": false,
-            "default": "lib"
-          },
-          "files": {
-            "type": "array",
-            "description": "Repository paths",
-            "required": false,
-            "source": "changed_files"
-          },
-          "full": {
-            "type": "boolean",
-            "description": "Whole workspace",
-            "required": false,
-            "default": false
-          },
-          "package": {
-            "type": "string",
-            "description": "Cargo package",
-            "required": false,
-            "default": ""
-          },
-          "test": {
-            "type": "string",
-            "description": "Exact test name",
-            "required": false,
-            "default": ""
-          }
-        },
-        "label": "Lint Rust",
-        "category": "lint",
-        "input": true
+        "directory": "nvim/rust/forge",
+        "label": "Apply Rust formatting",
+        "category": "format",
+        "prepare": true
       }
     },
-    "rust-lint-no-deps": {
+    "rust-lint": {
       "trigger": {},
       "action": {
         "command": [
@@ -518,23 +309,14 @@
           "--profile",
           "dev",
           "--locked",
-          "--package",
-          "{package}",
-          "--lib",
-          "--no-deps",
+          "--workspace",
+          "--all-targets",
           "--",
           "-D",
           "warnings"
         ],
-        "inputs": {
-          "package": {
-            "type": "string",
-            "description": "Cargo package whose library is linted without dependency diagnostics",
-            "required": true
-          }
-        },
         "directory": "nvim/rust/forge",
-        "label": "Lint Rust library (no dependencies)",
+        "label": "Lint Rust workspace",
         "category": "lint"
       }
     },
@@ -542,73 +324,11 @@
       "trigger": {
         "auto": true,
         "paths": [
-          "nvim/rust/forge/src/**/*.rs",
-          "nvim/rust/forge/crates/**/*.rs",
-          "nvim/rust/forge/crates/**/Cargo.toml"
+          "nvim/rust/forge/**"
         ],
         "exclude": [
           "**/target/**",
-          "**/node_modules/**"
-        ]
-      },
-      "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          "--stdin",
-          "nvim/tools/checks/rust.nu",
-          "test"
-        ],
-        "inputs": {
-          "executable": {
-            "type": "string",
-            "description": "all, lib, test:<name>, bin:<name>",
-            "required": false,
-            "default": "lib"
-          },
-          "files": {
-            "type": "array",
-            "description": "Repository paths",
-            "required": false,
-            "source": "changed_files"
-          },
-          "full": {
-            "type": "boolean",
-            "description": "Whole workspace",
-            "required": false,
-            "default": false
-          },
-          "package": {
-            "type": "string",
-            "description": "Cargo package",
-            "required": false,
-            "default": ""
-          },
-          "test": {
-            "type": "string",
-            "description": "Exact test name",
-            "required": false,
-            "default": ""
-          }
-        },
-        "label": "Run Rust tests",
-        "category": "test",
-        "input": true
-      }
-    },
-    "rust-test-workspace": {
-      "trigger": {
-        "auto": true,
-        "paths": [
-          "nvim/rust/forge/Cargo.toml",
-          "nvim/rust/forge/Cargo.lock",
-          "nvim/rust/forge/rust-toolchain.toml",
-          "nvim/rust/forge/.cargo/**",
-          "nvim/rust/forge/vendor/**"
-        ],
-        "exclude": [
-          "**/target/**",
-          "**/node_modules/**"
+          "nvim/rust/forge/**/*.md"
         ]
       },
       "action": {
@@ -619,10 +339,20 @@
           "--cargo-profile",
           "dev",
           "--locked",
-          "--workspace"
+          "--workspace",
+          "-E",
+          "{filter}"
         ],
+        "inputs": {
+          "filter": {
+            "type": "string",
+            "description": "Nextest filterset, such as package(forge-git), rdeps(forge-diff), or package(forge-git) & test(=writer::case)",
+            "required": false,
+            "default": "all()"
+          }
+        },
         "directory": "nvim/rust/forge",
-        "label": "Run Rust workspace tests",
+        "label": "Run Rust tests",
         "category": "test"
       }
     }

@@ -32,10 +32,11 @@ pub(super) struct ExecutionCapture {
 }
 
 /// Fence control against ownership/finalization changes, not streamed presentation updates.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 struct ExecutionControlExchange {
     id: crate::provider::ExchangeId,
     phase: crate::exchange::ExchangePhase,
+    turn: Option<(String, crate::provider::TurnAddress)>,
     finalization_error: Option<String>,
 }
 
@@ -44,6 +45,10 @@ impl ExecutionControlExchange {
         Self {
             id: exchange.id.as_str().into(),
             phase: exchange.phase.clone(),
+            turn: exchange
+                .turn
+                .last()
+                .map(|turn| (turn.id().to_owned(), turn.provider().clone())),
             finalization_error: exchange.finalization_error.clone(),
         }
     }
@@ -58,6 +63,7 @@ pub(crate) struct ExecutionControlJob {
     exchange: ExecutionControlExchange,
     execution_digest: String,
     plan_digest: String,
+    capture: Option<WorkspaceCaptureJob>,
     evidence: Option<(
         super::checks::ExecutionCheckEvidenceJob,
         ExecutionConformanceJob,
@@ -69,10 +75,13 @@ pub(crate) struct ExecutionControlEvidence {
     job: ExecutionControlJob,
     checks_current: bool,
     progress: SemanticProgress,
+    checkpoint: Option<crate::checkpoint::CheckpointRecord>,
 }
 
 /// A proposed transition held while its implementation report is captured.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct ExecutionControlProposal {
+    request_id: String,
     execution_id: String,
     permit: crate::task::TaskPermit,
     exchange: ExecutionControlExchange,
@@ -84,6 +93,7 @@ pub(super) struct ExecutionControlProposal {
     revised_manual: Vec<String>,
     title: String,
     phase_completion: bool,
+    checkpoint: Option<crate::checkpoint::CheckpointRecord>,
     checks_current: bool,
     now_ms: i64,
 }
@@ -91,7 +101,30 @@ pub(super) struct ExecutionControlProposal {
 /// The synchronous phase either completes or yields an owned report capture.
 pub(super) enum ExecutionControlStage {
     Complete(Value),
+    Pending(Box<PendingExecutionPhase>),
     Report(Box<ExecutionControlReportJob>),
+}
+
+/// Retain a validated phase transition until its native invocation has settled.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub(super) struct PendingExecutionPhase {
+    proposal: Box<ExecutionControlProposal>,
+    report: Option<ImplementationReportResult>,
+}
+
+impl PendingExecutionPhase {
+    pub(super) fn task_id(&self) -> &crate::task::TaskId {
+        self.proposal.permit.task_id()
+    }
+
+    pub(super) fn request_id(&self) -> &str {
+        &self.proposal.request_id
+    }
+
+    /// Acknowledge intent without exposing the proposed successor phase.
+    pub(super) fn acknowledgement(&self) -> Value {
+        json!({"result":"requested"})
+    }
 }
 
 /// Capture the report independently while retaining its uncommitted proposal.
@@ -121,10 +154,15 @@ impl ExecutionControlJob {
             Some((checks, conformance)) => (checks.run().await?, conformance.run().await?),
             None => (false, SemanticProgress::default()),
         };
+        let checkpoint = match self.capture.take() {
+            Some(capture) => Some(capture.run().await?),
+            None => None,
+        };
         Ok(ExecutionControlEvidence {
             job: self,
             checks_current,
             progress,
+            checkpoint,
         })
     }
 }
@@ -146,7 +184,7 @@ pub(crate) struct ExecutionScanResult {
 }
 
 /// Own workspace checkpoint inputs for an unlocked capture.
-pub(super) struct WorkspaceCaptureJob {
+pub(crate) struct WorkspaceCaptureJob {
     workspace: PathBuf,
     data_root: PathBuf,
     objects: crate::storage::objects::ObjectStore,
@@ -200,6 +238,7 @@ pub(super) struct ImplementationReportJob {
 }
 
 /// Retain a captured report and the source digests needed at commit.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct ImplementationReportResult {
     report: crate::plan::implementation_report::ImplementationReport,
     digests: std::collections::BTreeMap<String, String>,
@@ -621,6 +660,8 @@ impl HarnessBroker {
             execution_id: execution_id.to_owned(),
             generation,
             permit: task_permit.clone(),
+            capture: matches!(&operation, ExecutionOperation::Phase(_))
+                .then(|| self.prepare_workspace_capture()),
             operation: Box::new(operation),
             exchange: ExecutionControlExchange::capture(interaction),
             execution_digest: crate::plan::digest(&serde_json::to_vec(&execution)?),
@@ -651,8 +692,28 @@ impl HarnessBroker {
             .await?;
         match self.apply_execution_control(evidence, current_interaction)? {
             ExecutionControlStage::Complete(value) => Ok(value),
+            ExecutionControlStage::Pending(pending) => {
+                self.store.record_terminal_request(
+                    &self.session.id,
+                    pending.request_id(),
+                    &pending,
+                )?;
+                self.commit_execution_control(
+                    *pending.proposal,
+                    pending.report,
+                    current_interaction,
+                )
+            }
             ExecutionControlStage::Report(job) => {
-                self.commit_execution_control_report(job.run().await?, current_interaction)
+                let captured = job.run().await?;
+                if captured.proposal.phase_completion {
+                    self.store.record_terminal_request(
+                        &self.session.id,
+                        &captured.proposal.request_id,
+                        &captured.proposal,
+                    )?;
+                }
+                self.commit_execution_control_report(captured, current_interaction)
             }
         }
     }
@@ -666,6 +727,7 @@ impl HarnessBroker {
             job,
             checks_current,
             progress,
+            checkpoint,
         } = evidence;
         let ExecutionControlJob {
             execution_id,
@@ -1073,6 +1135,7 @@ impl HarnessBroker {
             None
         };
         let proposal = ExecutionControlProposal {
+            request_id: uuid::Uuid::new_v4().to_string(),
             execution_id: execution_id.to_owned(),
             permit,
             exchange,
@@ -1088,6 +1151,7 @@ impl HarnessBroker {
             revised_manual,
             title: title.into(),
             phase_completion,
+            checkpoint,
             checks_current,
             now_ms,
         };
@@ -1098,10 +1162,96 @@ impl HarnessBroker {
                     report,
                 },
             ))),
+            None if phase_completion => Ok(ExecutionControlStage::Pending(Box::new(
+                PendingExecutionPhase {
+                    proposal: Box::new(proposal),
+                    report: None,
+                },
+            ))),
             None => Ok(ExecutionControlStage::Complete(
                 self.commit_execution_control(proposal, None, current_interaction)?,
             )),
         }
+    }
+
+    /// Retain a report-backed phase request without publishing its proposed outcome.
+    pub(super) fn defer_execution_control_report(
+        &self,
+        captured: ExecutionControlReport,
+    ) -> PendingExecutionPhase {
+        PendingExecutionPhase {
+            proposal: captured.proposal,
+            report: Some(captured.report),
+        }
+    }
+
+    /// Commit a pending request only across the matching normal native completion boundary.
+    pub(super) fn settle_execution_phase(
+        &mut self,
+        mut pending: PendingExecutionPhase,
+        final_checkpoint: &crate::checkpoint::CheckpointRecord,
+        interaction: &mut Exchange,
+    ) -> Result<Value> {
+        if let Some(crate::storage::TerminalDisposition::Committed { result }) = self
+            .store
+            .terminal_disposition(&self.session.id, pending.request_id())?
+        {
+            self.reconcile_phase_continuation(&pending, interaction)?;
+            return Ok(result);
+        }
+        anyhow::ensure!(
+            crate::task::latest_turn_completed_normally(interaction)
+                && !self.requires_explicit_continuation(interaction)?,
+            "phase request cannot advance a stopped or non-normal turn"
+        );
+        anyhow::ensure!(
+            pending.proposal.exchange.id.as_str() == interaction.id
+                && pending.proposal.exchange.turn
+                    == ExecutionControlExchange::capture(interaction).turn,
+            "phase request belongs to another exchange"
+        );
+        let checkpoint = pending
+            .proposal
+            .checkpoint
+            .as_ref()
+            .context("phase request has no workspace evidence")?;
+        if !checkpoint.changed_paths(final_checkpoint)?.is_empty() {
+            let reason = "workspace changed after phase completion was requested; request a fresh validation";
+            self.store
+                .reject_terminal_request(&self.session.id, pending.request_id(), reason)?;
+            anyhow::bail!(reason);
+        }
+        // Collection changes the exchange phase, but not the captured task and
+        // accepted-plan fences checked by commit_execution_control.
+        pending.proposal.exchange = ExecutionControlExchange::capture(interaction);
+        pending.proposal.now_ms = self.clock.now_ms();
+        let result = self.commit_execution_control(
+            (*pending.proposal).clone(),
+            pending.report.clone(),
+            interaction,
+        )?;
+        self.reconcile_phase_continuation(&pending, interaction)?;
+        Ok(result)
+    }
+
+    /// A committed transition may have lost its reservation acknowledgement. The turn journal
+    /// makes this repair idempotent and the task identity keeps it off replacement tasks.
+    fn reconcile_phase_continuation(
+        &mut self,
+        pending: &PendingExecutionPhase,
+        interaction: &Exchange,
+    ) -> Result<()> {
+        if self
+            .task_controller
+            .current()?
+            .is_some_and(|task| task.id == *pending.proposal.permit.task_id())
+        {
+            self.reserve_execution_continuation(crate::task::TaskTurnId {
+                exchange_ordinal: interaction.ordinal,
+                turn_ordinal: interaction.turn.len(),
+            })?;
+        }
+        Ok(())
     }
 
     /// Commit a completed report only if the captured control authority is still current.
@@ -1124,6 +1274,7 @@ impl HarnessBroker {
         current_interaction: &mut Exchange,
     ) -> Result<Value> {
         let ExecutionControlProposal {
+            request_id,
             execution_id,
             permit,
             exchange,
@@ -1135,6 +1286,7 @@ impl HarnessBroker {
             revised_manual,
             title,
             phase_completion,
+            checkpoint: _,
             checks_current,
             now_ms,
         } = proposal;
@@ -1228,24 +1380,12 @@ impl HarnessBroker {
                     }
                 },
                 title,
+                terminal_request: phase_completion.then_some(request_id),
             },
             now_ms,
         )?;
         execution = settled.record;
         let interaction = settled.exchange;
-        if execution.state == PlanExecutionState::Complete {
-            let task = self
-                .task_controller
-                .current()?
-                .context("completed execution disappeared")?;
-            self.task_controller.finish(
-                &mut self.store,
-                &task.permit(),
-                crate::task::TaskOutcomeState::Complete,
-                "Accepted plan completed".into(),
-                now_ms,
-            )?;
-        }
         *current_interaction = interaction;
         if !phase_completion && execution.state == crate::plan::PlanExecutionState::Active {
             return self.revision_review_response(&execution_id);

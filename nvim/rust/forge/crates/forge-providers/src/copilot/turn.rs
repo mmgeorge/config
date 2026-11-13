@@ -13,13 +13,12 @@ use tokio::sync::Notify;
 pub(crate) enum IdleOutcome {
     Completed,
     Aborted,
-    HostHandoff,
 }
 
 impl IdleOutcome {
     /// Permit an unfinished native root only after interruption established its terminal idle.
     fn interrupted(self) -> bool {
-        matches!(self, Self::Aborted | Self::HostHandoff)
+        matches!(self, Self::Aborted)
     }
 }
 
@@ -386,10 +385,9 @@ impl CopilotTurnEvent {
                         stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
                     }
                 }
-                (
-                    RootTurnPhase::Running | RootTurnPhase::Finished { .. },
-                    IdleOutcome::Aborted | IdleOutcome::HostHandoff,
-                ) => forge_provider_api::turn::TurnOutcome::Interrupted,
+                (RootTurnPhase::Running | RootTurnPhase::Finished { .. }, IdleOutcome::Aborted) => {
+                    forge_provider_api::turn::TurnOutcome::Interrupted
+                }
                 (RootTurnPhase::Running, IdleOutcome::Completed) => {
                     anyhow::bail!("Copilot input has no completed native turn")
                 }
@@ -1189,7 +1187,7 @@ fn terminal_coverage(state: &CopilotTurnState) -> Result<Vec<forge_provider_api:
         let proven = covered.contains(message)
             && (root.is_some_and(|root| match idle.outcome {
                 IdleOutcome::Completed => matches!(root.phase, RootTurnPhase::Finished { .. }),
-                IdleOutcome::Aborted | IdleOutcome::HostHandoff => true,
+                IdleOutcome::Aborted => true,
             }) || cancelled_before_start(state, idle, message));
         anyhow::ensure!(
             proven,

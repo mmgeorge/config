@@ -440,7 +440,7 @@ pub enum TaskOutcomeState {
 }
 
 /// Binds a task-specific control call to the contract that admitted it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TaskPermit {
     id: TaskId,
     revision: TaskRevision,

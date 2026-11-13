@@ -1299,6 +1299,139 @@ mod tests {
         })
     }
 
+    /// A phase tool acknowledges a proposal without changing the live execution.
+    #[tokio::test]
+    async fn phase_completion_remains_pending_without_normal_native_completion() -> Result<()> {
+        phase_completion_case(false).await
+    }
+
+    /// A native completion cannot certify workspace content changed after validation.
+    #[tokio::test]
+    async fn phase_completion_rejects_workspace_changed_after_request() -> Result<()> {
+        phase_completion_case(true).await
+    }
+
+    async fn phase_completion_case(changed: bool) -> Result<()> {
+        let mut fixture = resolving_execution(&[]).await?;
+        let address = crate::turn::test_support::address(&fixture.exchange, "phase-native-turn");
+        fixture
+            .exchange
+            .turn
+            .push(crate::turn::Turn::new("phase-turn".into(), address, 1));
+        let broker = &mut fixture.broker;
+        let task = broker.task_controller.current()?.unwrap();
+        broker
+            .task_controller
+            .update(&mut broker.store, &task.permit(), 3, |task| {
+                let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow
+                else {
+                    anyhow::bail!("expected execution");
+                };
+                execution.record.phase = crate::plan::PlanPhase::Implement;
+                Ok(())
+            })?;
+        let task = broker.task_controller.current()?.unwrap();
+        let execution = broker.current_execution()?.unwrap();
+        let evidence = broker
+            .prepare_execution_control(
+                &execution.id,
+                execution.generation,
+                &task.permit(),
+                ExecutionOperation::Phase(crate::plan::execution::PlanPhaseDone {
+                    phase: crate::plan::PlanPhase::Implement,
+                    revision: execution.revision,
+                    summary: "Implementation is ready".into(),
+                    verification: None,
+                }),
+                &fixture.exchange,
+            )?
+            .run()
+            .await?;
+        let crate::broker::execution::ExecutionControlStage::Pending(pending) =
+            broker.apply_execution_control(evidence, &mut fixture.exchange)?
+        else {
+            anyhow::bail!("phase completion must remain pending");
+        };
+        assert_eq!(pending.acknowledgement()["result"], "requested");
+        let current = broker.current_execution()?.unwrap();
+        assert_eq!(current.phase, crate::plan::PlanPhase::Implement);
+        assert_eq!(current.generation, execution.generation);
+        assert!(
+            broker
+                .settle_execution_phase(
+                    (*pending).clone(),
+                    &broker.prepare_workspace_capture().run().await?,
+                    &mut fixture.exchange
+                )
+                .is_err()
+        );
+        assert_eq!(
+            broker.current_execution()?.unwrap().phase,
+            crate::plan::PlanPhase::Implement
+        );
+        broker
+            .store
+            .record_terminal_request(&broker.session.id, pending.request_id(), &pending)?;
+        fixture.exchange.turn.last_mut().unwrap().finish(
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            5,
+        )?;
+        if changed {
+            std::fs::write(
+                fixture._workspace.path().join("after-request.txt"),
+                "late writer",
+            )?;
+        }
+        let checkpoint = broker.prepare_workspace_capture().run().await?;
+        let result =
+            broker.settle_execution_phase((*pending).clone(), &checkpoint, &mut fixture.exchange);
+        if changed {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("workspace changed")
+            );
+            assert_eq!(
+                broker.current_execution()?.unwrap().phase,
+                crate::plan::PlanPhase::Implement
+            );
+        } else {
+            result?;
+            assert_eq!(
+                broker.current_execution()?.unwrap().phase,
+                crate::plan::PlanPhase::Checking
+            );
+            let before = broker.task_controller.current()?.unwrap();
+            let reservation = before
+                .turn
+                .as_ref()
+                .unwrap()
+                .continuation
+                .as_ref()
+                .unwrap()
+                .id
+                .clone();
+            broker.settle_execution_phase(*pending, &checkpoint, &mut fixture.exchange)?;
+            let after = broker.task_controller.current()?.unwrap();
+            assert_eq!(
+                after
+                    .turn
+                    .as_ref()
+                    .unwrap()
+                    .continuation
+                    .as_ref()
+                    .unwrap()
+                    .id,
+                reservation
+            );
+            assert_eq!(after.revision, before.revision);
+        }
+        Ok(())
+    }
+
     /// Draft and submit one execution-owned revision, returning the stored plan it produced.
     async fn submit_execution_revision(
         execution_fixture: &mut ResolvingExecution,

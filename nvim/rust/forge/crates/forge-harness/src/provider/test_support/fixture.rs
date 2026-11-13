@@ -1081,6 +1081,7 @@ impl EventFixtureProvider {
                     Err(
                         ProviderError::NotConsumed
                         | ProviderError::Cancelled
+                        | ProviderError::Interrupted
                         | ProviderError::PreparationFailed(_),
                     ) => true,
                     Err(ProviderError::Failure(failure)) => {

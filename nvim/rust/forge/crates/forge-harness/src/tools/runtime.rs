@@ -134,7 +134,11 @@ impl ControlTurnContext {
                 error.as_ref(),
             )
         })?;
-        context.task_authority_progress = None;
+        context.task_authority_progress = self
+            .task_authority_progress
+            .as_ref()
+            .zip(context.task_permit.as_ref())
+            .map(|(progress, permit)| Arc::new(progress.fork(permit.clone())));
         context.task_start = None;
         context.agent = None;
         context.questions = None;
@@ -173,6 +177,7 @@ impl ControlTurnContext {
         self.task_generation = Some(generation);
         self.task_permit = task.map(|task| task.permit());
         self.task_controller = Some(controller);
+        self.bind_task_authority_progress();
     }
     /// Start a new provider observation while retaining this invocation's host authority.
     pub fn begin_provider_execution(
@@ -222,7 +227,7 @@ impl ControlTurnContext {
                     result.checkpoint_id().map(|id| id.as_str().to_owned());
                 Ok(output)
             }
-            TurnOutcome::Interrupted => Err(ProviderError::Cancelled),
+            TurnOutcome::Interrupted => Err(ProviderError::Interrupted),
             TurnOutcome::Failed {
                 error,
                 retry: RetryDecision::NotAllowed,
@@ -385,6 +390,9 @@ impl ControlToolRuntime {
             );
         }
         if super::questions::is_tool(&invocation.name) && self.context.questions.is_some() {
+            if let Some(authority) = super::TaskAuthority::capture(&self.context) {
+                authority.admit_mutation()?;
+            }
             super::validate_arguments(&invocation)?;
             return super::questions::execute(self, invocation, ProviderCompletion::default())
                 .await;
@@ -439,9 +447,14 @@ impl ControlToolRuntime {
             });
         }
         crate::tools::error::ensure!(
-            !self.terminal,
-            "this provider turn already reached a terminal control action"
+            !self.terminal || super::is_read_only(&invocation.name),
+            "this provider turn already requested a terminal transition; only inspection remains available"
         );
+        if !super::is_read_only(&invocation.name)
+            && let Some(authority) = super::TaskAuthority::capture(&self.context)
+        {
+            authority.admit_mutation()?;
+        }
         if let Some(execution) = &self.context.execution {
             match invocation.name.as_str() {
                 "plan_edit" => execution.require_edit_phase()?,
@@ -493,11 +506,6 @@ impl ControlToolRuntime {
             return Err(crate::broker::TurnCancelled.into());
         }
         Ok(())
-    }
-
-    /// Indicates that the current provider turn must stop after delivering its execution result.
-    pub(crate) fn execution_finished(&self) -> bool {
-        self.completion.is_some()
     }
 
     /// Return the staged canonical document after accepted plan edits.

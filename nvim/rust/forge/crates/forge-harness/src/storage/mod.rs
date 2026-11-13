@@ -19,8 +19,10 @@ mod recovery;
 mod schema;
 pub mod state;
 mod task;
+mod terminal;
 pub(crate) use schema::{bootstrap_lock, exclusive_file_lock};
 pub(crate) use task::{PlanArtifactGuard, TaskEffects};
+pub(crate) use terminal::{TerminalCommit, TerminalDisposition};
 mod tool_output;
 pub(crate) mod writer;
 

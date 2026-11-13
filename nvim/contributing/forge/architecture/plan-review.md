@@ -49,6 +49,8 @@ Accepting nonempty inline comments uses the same revision feedback as requesting
 
 `TaskSnapshot.plan_execution` retains selected execution settings and review context separately from acceptance policy. The input coordinator rechecks the flag under control admission before promoting a current submitted document, including recovery after interrupted promotion. Drafts, stale submissions, and paused tasks cannot promote. Review entries retain their originating exchange ID; revision dispatch resumes that exchange and its checkpoint rather than displaying another task-start heading.
 
+Once execution authorization is complete, approval is recorded separately from task installation. A running planning response finishes naturally while the owner retains the pending decision outside the command lane. The timeline shows the wait; cancellation and replacement remain available. The final commit rechecks the selected review digest and source guards. Failed or interrupted planning retains the approval evidence but cannot start Execute automatically. Repeating the same pending selection observes its original decision; a different revision requires a new approval.
+
 After submission, a prompt for the selected waiting Plan task becomes a plan discussion. A successful edit there applies `ChangesRequested` and requires a new submission or question before completion.
 
 ## Question picker

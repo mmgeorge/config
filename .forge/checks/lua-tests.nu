@@ -465,7 +465,6 @@ def default_jobs [] {
 #   nu .forge/checks/lua-tests.nu --filter 'harper|wordlist'          every matching case in the repository
 #   nu .forge/checks/lua-tests.nu --affected nvim/lua/forge/client.lua  tests covering changed paths
 #   nu .forge/checks/lua-tests.nu --lua "vim.g.forge_test_language = 'rust'" buffer  setup before each test
-#   nu --stdin .forge/checks/lua-tests.nu check <suite>               Harness check callback
 def main [
   ...test_path: string  # Test files, source files, directories, test names, or name::case; changed paths with --affected
   --suite: string = "all"  # all, a source area such as status, or a directory under nvim/lua
@@ -485,48 +484,6 @@ def main [
     return
   }
   let outcome_list = run_fixture_list $test_list ($jobs | default (default_jobs)) $setup_list
-  if ($outcome_list | any {|outcome| $outcome.state != "passed" }) { exit 1 }
-}
-
-# Harness check callback: read the version 1 request from stdin, run its fixtures, and write the
-# report and receipt the request names.
-def "main check" [
-  suite: string  # affected for the tests covering changed paths, or a suite name
-  --full  # Run the whole suite unless the request names explicit fixture inputs
-  --jobs: int
-] {
-  let request = $in | from json
-  if $request.version != 1 { error make {msg: "Unsupported check request version"} }
-  cd $repository_root
-  let selected_suite = $request.inputs?.suite? | default $suite
-  let fixture = $request.inputs?.fixture? | default ""
-  let selection_kind = $request.selection?.kind? | default "all"
-  if $fixture != "" and ($selected_suite != "affected" or $full or $selection_kind == "all") {
-    error make {msg: "Choose an exact fixture or a full suite, not both"}
-  }
-  let input_files = $request.inputs?.files? | default ($request.changed_files? | default [])
-  let explicit_files = $suite != "affected" and $selection_kind == "inputs" and not ($request.selection?.inputs?.files? | default [] | is-empty)
-  let test_list = if $fixture != "" {
-    select_fixture_list "all" [$fixture] false
-  } else if $explicit_files {
-    select_fixture_list $selected_suite $input_files false
-  } else if $full or $selection_kind == "all" or $selected_suite != "affected" {
-    select_fixture_list (if $selected_suite == "affected" { "all" } else { $selected_suite }) [] false
-  } else {
-    select_fixture_list "all" $input_files true
-  }
-  let outcome_list = run_fixture_list $test_list ($jobs | default (default_jobs))
-  let report = $outcome_list | sort-by test | each {|outcome|
-    {
-      file: (split_fixture_entry $outcome.test).path
-      state: (if $outcome.state == "passed" { "passed" } else { "failed" })
-      duration_ms: ($outcome.elapsed / 1ms | into int)
-      command: ($outcome.command | str join " ")
-      output: $outcome.output
-    }
-  }
-  {version: 1, result: $report} | to json --raw | save --force $request.report_path
-  {version: 1, selection: $request.selection} | to json --raw | save --force $request.receipt_path
   if ($outcome_list | any {|outcome| $outcome.state != "passed" }) { exit 1 }
 }
 

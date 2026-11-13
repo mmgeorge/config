@@ -211,6 +211,9 @@ impl CheckToolScope {
     ) -> Result<String> {
         if let Some(authority) = &self.task_authority {
             authority.validate_scope()?;
+            if !crate::tools::is_read_only(name) {
+                authority.admit_mutation()?;
+            }
         }
         let delivery = self
             .delivery
@@ -392,7 +395,7 @@ impl CheckToolScope {
                     "an agent started during check resolution"
                 );
                 json!({"run_id":self.runner.owner_sender()?.start(
-                    self.scope.clone(), call_id, retained_request, run, delivery.lifecycle, self.cancelled.clone(),
+                    self.scope.clone(), self.task_authority.clone(), call_id, retained_request, run, delivery.lifecycle, self.cancelled.clone(),
                 ).await?})
             }
             "check_status" => {
@@ -745,6 +748,7 @@ impl CheckSupervisor {
     ) -> Result<Value> {
         if let Some(authority) = authority {
             authority.validate_scope()?;
+            authority.admit_mutation()?;
         }
         ensure!(
             owner.session_id() == self.session_id,

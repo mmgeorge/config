@@ -360,7 +360,7 @@ async fn foreground_backpressure_preserves_burst_cancel_and_successor_order() ->
         );
         engine.cancel(scope).await?;
         let ready = result.await??;
-        assert!(matches!(ready.outcome, Err(ProviderError::Cancelled)));
+        assert!(matches!(ready.outcome, Err(ProviderError::Interrupted)));
         ready.ticket.commit().await?;
         let (_, _, _, successor) = fixture.run(&owner, "after-burst").await?;
         let mut next = fixture.calls.recv().await.context("successor missing")?;

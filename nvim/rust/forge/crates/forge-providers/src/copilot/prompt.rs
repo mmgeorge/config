@@ -234,6 +234,7 @@ pub async fn run(
                         | ProviderError::PreparationCleanup { .. }
                         | ProviderError::DeliveryUncertain
                         | ProviderError::Cancelled
+                        | ProviderError::Interrupted
                         | ProviderError::Retryable(_)
                         | ProviderError::Delivery(_) => None,
                     })
@@ -261,8 +262,6 @@ pub async fn run(
     if let Some(accepted) = options.accepted.take() {
         let _ = accepted.send(Ok(()));
     }
-    let mut tool_names = std::collections::HashMap::new();
-    let mut execution_turn_stopped = false;
     let mut provider_aborted = false;
     let processing: std::result::Result<super::turn::IdleOutcome, ProviderError> = async {
         loop {
@@ -301,7 +300,7 @@ pub async fn run(
                         provider_aborted |= provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true);
                     }
                     if completes_exchange(&provider_event) {
-                        let aborted = !execution_turn_stopped && (provider_aborted || provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true));
+                        let aborted = provider_aborted || provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true);
                         if decoder.root_address().is_none() && !aborted {
                             continue;
                         }
@@ -311,8 +310,7 @@ pub async fn run(
                         } else {
                             Some(provider_event.id.clone())
                         };
-                        let outcome = if execution_turn_stopped { super::turn::IdleOutcome::HostHandoff }
-                            else if aborted { super::turn::IdleOutcome::Aborted }
+                        let outcome = if aborted { super::turn::IdleOutcome::Aborted }
                             else { super::turn::IdleOutcome::Completed };
                         normalize_internal(turn_event.observe_idle_timestamp(&provider_event, outcome, observed_at_ms), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?;
                         continue;
@@ -343,20 +341,7 @@ pub async fn run(
                         native_start.observed(observed_at_ms).await?;
                     }
                     decoder.decode_at(&provider_event, observed_at_ms, output, sink).await?;
-                    if provider_event.agent_id.is_none() && !execution_turn_stopped {
-                        let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
-                        if provider_event.event_type == "tool.execution_start"
-                            && let (Some(call_id), Some(name)) = (call_id, provider_event.data.get("toolName").and_then(Value::as_str)) {
-                            tool_names.insert(call_id.to_owned(), name.to_owned());
-                        }
-                        if provider_event.event_type == "tool.execution_complete" {
-                            let name = call_id.and_then(|id| tool_names.remove(id));
-                        if control.tool_finished(&options.scope, name.as_deref()) {
-                                session.abort().await.map_err(|_| native_failure(ProviderOperation::TurnInterrupt, ProviderFailureKind::Transport))?;
-                                execution_turn_stopped = true;
-                            }
-                        }
-                    }
+
 
                 }
                 result = control.receive(&options.scope) => { result?; }
@@ -416,9 +401,7 @@ fn normalized_result(
         super::turn::IdleOutcome::Completed => forge_provider_api::turn::TurnOutcome::Completed {
             stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
         },
-        super::turn::IdleOutcome::Aborted | super::turn::IdleOutcome::HostHandoff => {
-            forge_provider_api::turn::TurnOutcome::Interrupted
-        }
+        super::turn::IdleOutcome::Aborted => forge_provider_api::turn::TurnOutcome::Interrupted,
     };
     let inputs = normalize_internal(
         turn_event.covered_inputs(),

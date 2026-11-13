@@ -10,7 +10,7 @@ pub(super) fn definition() -> ControlToolDefinition {
         name: NAME,
         description: "Report an active Goal task blocked when no authorized progress remains, with a concrete cause and \
                 what is needed to resume. Not for Execute tasks. Do not use for ordinary effort or user \
-                cancellation. End the turn after success.",
+                cancellation. This records a request; Harness evaluates it after this turn ends.",
         input_schema: strict_object_input_schema(vec![("reason", string_schema())], &["reason"]),
     }
 }
@@ -21,10 +21,16 @@ pub(super) async fn execute(
     invocation: crate::tools::ControlToolInvocation,
     _output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
+    crate::tools::error::ensure!(
+        invocation.arguments["reason"]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty()),
+        "goal control requires a nonempty reason"
+    );
     runtime.terminal = true;
     Ok(crate::tools::ControlToolResult {
         invocation: Some(invocation),
-        message: "Goal control accepted".into(),
+        message: "Goal transition requested. Finish this turn; Harness will evaluate the request after it ends.".into(),
     })
 }
 
@@ -40,6 +46,15 @@ pub(super) fn record(
     let input: Input = serde_json::from_value(invocation.arguments.clone())?;
     if let Some(permit) = &invocation.task_permit {
         output.goal_control = Some(crate::goal::GoalControl {
+            request_id: format!(
+                "goal:{}:{}",
+                permit.revision().as_str(),
+                invocation
+                    .call_id
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("legacy")
+            ),
             permit: permit.clone(),
             termination: crate::goal::GoalTermination::Blocked,
             message: input.reason,

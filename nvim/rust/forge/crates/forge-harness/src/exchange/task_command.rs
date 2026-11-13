@@ -1,5 +1,6 @@
 //! Advance task control through owner collection, atomic task commits, and journaled input scheduling.
 
+use anyhow::Context;
 use forge_protocol::message::SessionEvent;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
@@ -68,6 +69,89 @@ impl TaskCommandRun {
         }
     }
 
+    /// Persist the selected revision and resolved authorization before sealing its invocation.
+    pub(super) fn record_plan_acceptance(&self, services: &OwnerServices) -> anyhow::Result<()> {
+        let TaskStage::AwaitingPlanning(TaskCollection::Execution {
+            selection,
+            validated,
+            ..
+        }) = &self.stage
+        else {
+            anyhow::bail!("plan acceptance is not pending");
+        };
+        self.record_acceptance(selection, validated, services)
+    }
+
+    fn record_acceptance(
+        &self,
+        selection: &super::command::PlanExecutionSelection,
+        validated: &crate::broker::ValidatedPlanExecution,
+        services: &OwnerServices,
+    ) -> anyhow::Result<()> {
+        let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)?;
+        let session = services.observer.session_id();
+        let id = format!(
+            "plan_acceptance:{}",
+            self.command.record.request.id.as_str()
+        );
+        store.record_task_terminal_request(
+            session,
+            &id,
+            selection.prior().map(|task| task.id()),
+            &(selection, validated.request()),
+            Some(crate::timeline::SessionEventRecord {
+                id: format!("{session}:terminal:{id}"),
+                session_id: session.into(),
+                owner: crate::timeline::TimelineOwner::session(session),
+                created_at_ms: owner_now_ms()
+                    .map_err(|error| anyhow::anyhow!(error.diagnostic()))?,
+                detail: crate::timeline::SessionEventKind::TaskAdvancement {
+                    message: "Plan approved; execution is waiting for the planning turn to finish"
+                        .into(),
+                },
+            }),
+        )
+    }
+
+    /// Preserve a definite failed acceptance instead of leaving its timeline waiting forever.
+    pub(super) fn reject_recorded_acceptance(
+        &self,
+        services: &OwnerServices,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        crate::storage::writer::HistoryWriter::lease_for(&services.root)?.reject_terminal_request(
+            services.observer.session_id(),
+            &format!(
+                "plan_acceptance:{}",
+                self.command.record.request.id.as_str()
+            ),
+            reason,
+        )
+    }
+
+    /// Join only an identical selected revision and execution authorization.
+    pub(super) fn matches_pending_acceptance(&self, command: &Command) -> bool {
+        matches!((&self.stage, command),
+            (TaskStage::AwaitingPlanning(TaskCollection::Execution { selection, .. }),
+             Command::Task(TaskCommand::ExecutePlan(other))) if selection.as_ref() == other)
+    }
+
+    /// Resume an approved revision only after its original planning invocation settles.
+    pub(super) fn resume_planning(
+        &mut self,
+        services: &OwnerServices,
+    ) -> Result<(), OperationFailure> {
+        let TaskStage::AwaitingPlanning(TaskCollection::Execution {
+            selection,
+            validated,
+            prior,
+        }) = std::mem::replace(&mut self.stage, TaskStage::Consumed)
+        else {
+            return Err(rejected(TaskCommandFailure::Changed));
+        };
+        self.prepare_execution(*selection, *validated, prior, services)
+    }
+
     /// Drain the collection fact for the foreground that this task operation owns.
     pub(super) fn take_collection_signal(&mut self) -> Option<crate::broker::ForegroundSignal> {
         self.transition
@@ -90,6 +174,7 @@ impl TaskCommandRun {
                 self.transition.is_some()
             }
             TaskStage::AcquiringDelivery(_)
+            | TaskStage::AwaitingPlanning(_)
             | TaskStage::AwaitingInput(_)
             | TaskStage::AwaitingDispatch { .. }
             | TaskStage::Ready(_)
@@ -301,7 +386,9 @@ impl TaskCommandRun {
                 task.await
                     .unwrap_or(Err(CommandFailure::OwnershipUnavailable)),
             ),
-            TaskStage::AwaitingInput(_) => std::future::pending().await,
+            TaskStage::AwaitingPlanning(_) | TaskStage::AwaitingInput(_) => {
+                std::future::pending().await
+            }
             TaskStage::AwaitingDispatch { deadline, .. } => {
                 tokio::time::sleep_until(*deadline).await;
                 TaskCommandEvent::DispatchDeadline
@@ -353,11 +440,11 @@ impl TaskCommandRun {
                 self.control = Some(result.map_err(|error| {
                     OperationFailure::Transition(TransitionFailure::Rejected(error))
                 })?);
-                self.prepare(broker, services)
+                self.prepare(broker, services, foreground)
             }
             TaskCommandEvent::Preflight => {
                 self.stage = TaskStage::Consumed;
-                self.prepare(broker, services)
+                self.prepare(broker, services, foreground)
             }
             TaskCommandEvent::Prepared(result) => {
                 let prepared = result.map_err(rejected)?;
@@ -809,6 +896,7 @@ impl TaskCommandRun {
             | TaskStage::Collecting(_)
             | TaskStage::SettlingFinalization { .. }
             | TaskStage::Commit(_)
+            | TaskStage::AwaitingPlanning(_)
             | TaskStage::AwaitingInput(_)
             | TaskStage::AwaitingDispatch { .. }
             | TaskStage::Ready(_)
@@ -822,6 +910,7 @@ impl TaskCommandRun {
         &mut self,
         broker: &mut crate::broker::HarnessBroker,
         services: &OwnerServices,
+        foreground: TurnStatus,
     ) -> Result<TaskCommandProgress, OperationFailure> {
         let current = services.tasks.current().map_err(OperationFailure::Domain)?;
         if let Command::ContinueWorkflow(request) = &self.command.record.request.command {
@@ -836,6 +925,40 @@ impl TaskCommandRun {
                     deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
                 };
                 return Ok(TaskCommandProgress::waiting());
+            }
+        }
+        if let Command::Task(TaskCommand::ExecutePlan(selection)) =
+            &self.command.record.request.command
+        {
+            let store = crate::storage::HistoryReader::current(&services.root)
+                .map_err(OperationFailure::Domain)?;
+            if let Some(original) = store
+                .committed_plan_acceptance(services.observer.session_id(), selection)
+                .map_err(OperationFailure::Domain)?
+            {
+                let journal = super::journal::CommandJournal::open_metadata(
+                    &services.root,
+                    services.observer.session_id(),
+                )
+                .map_err(|error| OperationFailure::Domain(error.into()))?;
+                let record = journal
+                    .lookup(&original)
+                    .map_err(|error| OperationFailure::Domain(error.into()))?
+                    .context("committed acceptance has no original command")
+                    .map_err(OperationFailure::Domain)?;
+                let outcome = match record.completion() {
+                    Some(Ok(result)) => match result.outcome {
+                        super::command::CommandOutcome::Task(outcome) => Ok(outcome),
+                        _ => return Err(rejected(TaskCommandFailure::Changed)),
+                    },
+                    Some(Err(error)) => Err(error),
+                    None => return Err(OperationFailure::StorageUncommitted),
+                };
+                self.stage = TaskStage::Consumed;
+                return Ok(TaskCommandProgress::Finished {
+                    outcome,
+                    events: Vec::new(),
+                });
             }
         }
         if let Command::Task(intent) = &self.command.record.request.command
@@ -895,15 +1018,20 @@ impl TaskCommandRun {
                     return Ok(TaskCommandProgress::waiting());
                 }
                 crate::broker::PlanExecutionPreparation::Ready(validated) => {
-                    return self.begin_collection(
-                        TaskCollection::Execution {
-                            selection: Box::new(selection),
-                            validated: Box::new(validated),
-                            prior: current.as_ref().map(|task| task.permit()),
-                        },
-                        broker,
-                        services,
-                    );
+                    let prior = current.as_ref().map(|task| task.permit());
+                    if matches!(foreground, TurnStatus::Idle) {
+                        self.record_acceptance(&selection, &validated, services)
+                            .map_err(OperationFailure::Domain)?;
+                        self.prepare_execution(selection, validated, prior, services)?;
+                        return Ok(TaskCommandProgress::waiting());
+                    }
+                    self.stage = TaskStage::AwaitingPlanning(TaskCollection::Execution {
+                        selection: Box::new(selection),
+                        validated: Box::new(validated),
+                        prior,
+                    });
+                    self.control.take();
+                    return Ok(TaskCommandProgress::AwaitingPlanning);
                 }
             }
         }
@@ -1127,15 +1255,23 @@ impl TaskCommandRun {
         let root = services.root.clone();
         let budget = services.goal_max_turns;
         let now_ms = owner_now_ms()?;
+        let acceptance_id = format!(
+            "plan_acceptance:{}",
+            self.command.record.request.id.as_str()
+        );
         self.stage = TaskStage::PreparingExecution {
             task: tokio::task::spawn_blocking(move || {
                 let store = crate::storage::HistoryReader::current(&root)
                     .map_err(|_| TaskCommandFailure::StateUnavailable)?;
                 PlanSourceGuard::Working(selection.source().clone())
                     .validate_storage(&store, observer.session_id())?;
-                let (task, effects) = observer
+                let (task, mut effects) = observer
                     .prepare_execution(validated.request(), budget, now_ms)
                     .map_err(|_| TaskCommandFailure::PreparationUnavailable)?;
+                effects.terminal_commit = Some(crate::storage::TerminalCommit {
+                    id: acceptance_id,
+                    result: serde_json::json!({"approved":true}),
+                });
                 let change = crate::broker::plan_entry::PreparedTaskChange {
                     change: crate::task::TaskChange::prepared(current.as_ref(), task),
                     effects,
@@ -1564,6 +1700,8 @@ pub(super) enum TaskCommandProgress {
     },
     /// Install this exact claimed input in the existing owner delivery pipeline before publication.
     DeliverInput(Box<TaskInputStart>),
+    /// Release the command lane while retaining exact approval and the original native owner.
+    AwaitingPlanning,
     /// Persist the finite control result; this never represents the eventual task answer.
     Finished {
         outcome: Result<TaskCommandOutcome, CommandFailure>,
@@ -1597,6 +1735,7 @@ enum TaskStage {
         deadline: tokio::time::Instant,
     },
     Collecting(TaskCollection),
+    AwaitingPlanning(TaskCollection),
     Commit(TaskCommit),
     /// Settle the exchange a finite control left finalizing, then report the committed outcome.
     SettlingFinalization {

@@ -277,6 +277,14 @@ fn initialize_owner_commands(connection: &Connection) -> Result<()> {
             PRIMARY KEY(session_id,id),
             UNIQUE(session_id,sequence)
         );
+        CREATE TABLE IF NOT EXISTS terminal_request(
+            task_id TEXT,
+            session_id TEXT NOT NULL REFERENCES session_record(id) ON DELETE CASCADE,
+            id TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            PRIMARY KEY(session_id,id)
+        );
         CREATE TABLE IF NOT EXISTS owner_core_log(
             session_id TEXT NOT NULL REFERENCES session_record(id) ON DELETE CASCADE,
             sequence INTEGER NOT NULL CHECK(sequence > 0),

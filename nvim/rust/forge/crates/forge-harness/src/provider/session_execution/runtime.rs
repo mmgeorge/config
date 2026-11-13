@@ -689,6 +689,33 @@ impl SettlementCell {
             None => Ok(None),
         }
     }
+    /// Reconcile a terminal effect only after its transactional receipt has been read.
+    /// `None` proves the domain transaction did not commit; output proves that it did.
+    pub(crate) fn reconcile_terminal_effect(
+        &self,
+        id: HostEffectId,
+        output: Option<HostEffectOutput>,
+    ) -> Result<(), ProviderError> {
+        let mut ledger = self
+            .effects
+            .lock()
+            .map_err(|_| protocol("host effect ledger poisoned"))?;
+        if matches!(ledger.receipts.get(&id), Some(HostEffectState::Applied(_))) {
+            return Ok(());
+        }
+        if let Some(output) = output {
+            ledger
+                .receipts
+                .insert(id, HostEffectState::Applied(Some(Box::new(output))));
+            if !ledger.publication_order.contains(&id) {
+                ledger.publication_order.push(id);
+            }
+        } else if matches!(ledger.receipts.get(&id), Some(HostEffectState::Ambiguous)) {
+            ledger.receipts.remove(&id);
+        }
+        Ok(())
+    }
+
     /// Reserve a presentation-producing effect or retrieve its retained result.
     pub(crate) fn begin_result_effect(
         self: &Arc<Self>,
@@ -4526,6 +4553,50 @@ mod tests {
         guard.begin_mutation();
         drop(guard);
         assert!(cell.begin_plan_effect(second, "plan", 2, "after").is_err());
+        Ok(())
+    }
+
+    /// Durable commit evidence repairs a lost acknowledgement without repeating mutation.
+    #[test]
+    fn terminal_receipt_reconciles_ambiguous_effect_and_publication_once() -> anyhow::Result<()> {
+        let cell = Arc::new(SettlementCell::default());
+        let id = HostEffectId {
+            batch_revision: 1,
+            kind: HostEffectKind::GoalEvidence,
+            ordinal: 0,
+        };
+        let ResultEffectAdmission::Apply(mut guard) = cell.begin_result_effect(id)? else {
+            panic!("new effect")
+        };
+        guard.begin_mutation();
+        drop(guard);
+        assert!(cell.begin_result_effect(id).is_err());
+        cell.reconcile_terminal_effect(id, None)?;
+        let ResultEffectAdmission::Apply(mut guard) = cell.begin_result_effect(id)? else {
+            panic!("rolled back effect")
+        };
+        guard.begin_mutation();
+        drop(guard);
+        let output = HostEffectOutput {
+            nodes: Vec::new(),
+            events: Vec::new(),
+            elicitation: None,
+            awaiting_input: false,
+            publication_drained: false,
+            plan_document: None,
+            continuing: Some(false),
+            plan_record: None,
+        };
+        cell.reconcile_terminal_effect(id, Some(output.clone()))?;
+        cell.reconcile_terminal_effect(id, Some(output.clone()))?;
+        assert!(matches!(
+            cell.begin_result_effect(id)?,
+            ResultEffectAdmission::Applied(_)
+        ));
+        assert_eq!(cell.pending_effect_publications()?, vec![id]);
+        cell.acknowledge_effect_publication(id)?;
+        cell.reconcile_terminal_effect(id, Some(output))?;
+        assert!(cell.pending_effect_publications()?.is_empty());
         Ok(())
     }
 

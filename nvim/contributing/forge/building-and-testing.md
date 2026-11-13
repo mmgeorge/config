@@ -16,21 +16,19 @@ Inside Harness, run the configured checks instead of these commands:
 
 | Purpose | Check |
 | --- | --- |
-| Type check | `rust-check`, or `rust-check-workspace` for shared Rust configuration |
-| Tests | `rust-test` with the exact case or file, or `rust-test-workspace` |
-| Read-only formatting | `rust-format`, or `rust-format-workspace` for shared configuration |
+| Type check | `rust-check`, over the whole workspace and all targets |
+| Tests | `rust-test`, narrowed with a nextest `filter` such as `package(forge-git)` or `rdeps(forge-diff)` |
+| Read-only formatting | `rust-format` |
 | Apply formatting | `rust-format-fix`, then restart from the type check |
 | Lint | `rust-lint` |
-| Lint one library without dependency diagnostics | `rust-lint-no-deps` with an explicit `package` |
 | Build | `rust-build` |
+| Lua tests | `lua-test` for the changed paths, or `lua-test-select` with explicit `tests` |
 
-No check declares a dependency on the build. Lua tests that launch the Forge host assume a current executable, so run `rust-build` after Rust changes and before `lua-test`. Category order does not require earlier checks to pass. If a task has no Rust changes and formatting is required, supply formatter files or select its `all` operation. An empty selection does not skip tests or builds.
+Every Rust check is a plain Cargo command over the whole workspace. `lua-test` and `lua-test-select` declare `rust-build` as a prerequisite, so Harness builds the executable before the Lua tests and skips them when the build fails. Category order does not require earlier checks to pass. An empty selection does not skip tests or builds.
 
 The commands in this guide show what each check runs, and they do not give agents a separate validation path.
 
 `nvim/rust/forge/clippy.toml` makes `rust-lint` reject three calls: a direct `rusqlite::Connection` open, `SqliteStore::open` or `SqliteStore::read_only`, and `std::thread::sleep`. History goes through `HistoryWriter` and `HistoryReader`, and a thread that must wait uses a channel, a condition variable, or the Tokio clock. A production call that cannot comply carries `#[expect(clippy::disallowed_methods, reason = "..")]` stating why; test modules, examples, and stdio fixtures are exempt because they build storage through handles of their own. A Harness test that needs a second connection to the history database, to install a failing trigger or to seed and observe rows, opens it through `storage::test::raw_connection`.
-
-`rust-lint-no-deps` keeps warnings fatal in the selected library while omitting diagnostics from dependencies. Use it to distinguish modified-library findings from a recorded baseline failure in another crate; it does not replace or weaken `rust-lint`.
 
 ## Build the executable
 
@@ -77,7 +75,7 @@ Add `--all-targets` to the check only when changed test or executable targets ne
 
 TypeScript projects run their existing type-check command first, such as `npm run typecheck`, with the project's package manager.
 
-The `rust-test` check uses the repository callback `nvim/tools/checks/rust.nu`, with `package`, `test`, `executable`, `files`, and `full` inputs. Explicit package and test inputs skip package lookup and test listing. The callback runs nextest, so the five-second termination applies to Harness checks too. Deadline tests use Tokio's paused clock rather than the real one.
+The `rust-test` check runs `cargo nextest run --cargo-profile dev --locked --workspace -E <filter>`, with `filter` defaulting to `all()`. A filter that matches no test fails the run. The check runs nextest, so the termination deadline in `.config/nextest.toml` applies to Harness checks too. Deadline tests use Tokio's paused clock rather than the real one.
 
 Test fixtures must use the current public check configuration. Task-specific enablement belongs in admission overrides, and scoped shell helpers must declare `input: true`.
 

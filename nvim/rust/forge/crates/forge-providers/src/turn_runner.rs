@@ -173,6 +173,7 @@ fn invalidates_binding(error: &ProviderError) -> bool {
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
         | ProviderError::Cancelled
+        | ProviderError::Interrupted
         | ProviderError::Retryable(_) => false,
     }
 }
@@ -197,6 +198,7 @@ fn normalized_failure(error: &ProviderError, phase: ProviderPhase) -> ProviderFa
         | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
         | ProviderError::Cancelled
+        | ProviderError::Interrupted
         | ProviderError::Retryable(_) => {
             ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Runtime)
                 .at_phase(phase, FailureDisposition::Invalidated)

@@ -1017,11 +1017,6 @@ impl HarnessService {
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
                     controller.exchange_owner.close().await;
-                    if let Some(control) = controller.provider_handle().mock_response_control() {
-                        control
-                            .cancel_session(controller.observer.session_id())
-                            .await?;
-                    }
                 }
                 for controller in &controllers {
                     let session = controller.observer.session_id();
@@ -1031,6 +1026,14 @@ impl HarnessService {
                         json!({"stage":"exchange_owner"}),
                     );
                     controller.finish_exchange_owner().await?;
+                    // Retire unclaimed fixture holds only after the owner has recorded and
+                    // collected its shutdown stop. Cancelling them first fabricates a native
+                    // interruption before that stop has an owning invocation.
+                    if let Some(control) = controller.provider_handle().mock_response_control() {
+                        control
+                            .cancel_session(controller.observer.session_id())
+                            .await?;
+                    }
                     controller.trace.record(
                         session,
                         "service.shutdown.stage",

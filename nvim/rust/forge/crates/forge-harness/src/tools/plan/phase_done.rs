@@ -10,9 +10,8 @@ pub(super) const NAME: &str = "plan_phase_done";
 pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
-        description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. \
-                Forge validates the expected phase and revision, commits the transition, and returns the next \
-                instructions. Implement and Resolve finish without conformance checks. Verify collects required \
+        description: "Request completion of the current Implement, Verify, or Resolve phase of the active accepted semantic plan. \
+                Forge validates the expected phase and revision now and evaluates the transition after this turn ends. Implement and Resolve finish without conformance checks. Verify collects required \
                 declaration and public API differences together. Extra internal helpers never \
                 gate completion. End the turn after success. Verification \
                 findings enter Resolve, where code defects can be fixed and intentional contract changes can be \
@@ -48,11 +47,11 @@ pub(super) async fn execute(
         .as_ref()
         .context("phase completion requires an active execution")?;
     let request = serde_json::from_value(invocation.arguments.clone())?;
-    let response = execution
+    execution
         .send(crate::plan::execution::ExecutionOperation::Phase(request))
         .await?;
     runtime.terminal = true;
-    let message = execution_response_text("Phase finished.", &response);
+    let message = "Phase completion requested. Finish this turn; Harness will evaluate the transition after it ends.".to_owned();
     runtime.completion = Some((identity, message.clone()));
     Ok(crate::tools::ControlToolResult {
         invocation: None,

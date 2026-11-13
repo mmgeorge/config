@@ -85,6 +85,8 @@ pub(crate) struct ExchangeDriver {
     execution_state: ExecutionState,
     configuration_attempt: Option<ConfigurationAttempt>,
     deferred_configuration: Option<DeferredConfiguration>,
+    pending_plan_acceptance: Option<PendingPlanAcceptance>,
+    acceptance_followers: Vec<(CommandId, super::queue::QueuedCommand)>,
     input_receipts: InputReceipts,
     input_delivery: Option<InputDeliveryRun>,
     question_inputs: super::question_input::QuestionInputs,
@@ -110,6 +112,26 @@ struct DeferredConfiguration {
     after: Option<crate::provider::session_execution::NativeAvailabilityReceipt>,
 }
 
+/// Keep approval outside the command lane so cancellation and native completion remain serviceable.
+struct PendingPlanAcceptance {
+    run: Box<super::task_command::TaskCommandRun>,
+    exchange: String,
+    turn: Option<String>,
+}
+
+impl PendingPlanAcceptance {
+    fn reject(&self, services: &OwnerServices, reason: &str) -> Result<()> {
+        crate::storage::writer::HistoryWriter::lease_for(&services.root)?.reject_terminal_request(
+            services.observer.session_id(),
+            &format!(
+                "plan_acceptance:{}",
+                self.run.command.record.request.id.as_str()
+            ),
+            reason,
+        )
+    }
+}
+
 struct PendingReconnect {
     cursor: Option<super::publication::PublicationSequence>,
     limit: std::num::NonZeroU16,
@@ -132,6 +154,8 @@ impl ExchangeDriver {
             execution_state: ExecutionState::Ready,
             configuration_attempt: None,
             deferred_configuration: None,
+            pending_plan_acceptance: None,
+            acceptance_followers: Vec::new(),
             input_receipts: InputReceipts::default(),
             input_delivery: None,
             question_inputs: super::question_input::QuestionInputs::default(),
@@ -280,6 +304,22 @@ impl ExchangeDriver {
         let mut continuing_event_phase = false;
         let mut event_budget = OWNER_INTAKE_BUDGET;
         let mut command_at_step_entry = false;
+        let recovered = (|| -> Result<()> {
+            let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?;
+            services.tasks.recover_terminal_requests(&mut store, now_ms)
+        })();
+        if let Err(error) = recovered {
+            self.execution_fail(services);
+            trace.record(
+                session_id,
+                "task.terminal_recovery_failed",
+                serde_json::json!({"reason":error.to_string()}),
+            );
+        }
         if let Err(error) = services.checks.install_owner(check_sender) {
             self.execution_fail(services);
             trace.record(

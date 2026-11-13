@@ -39,6 +39,7 @@ pub(crate) use origin::AsideToolScope;
 pub use questions::{
     plan_question_input_schema, question_answer_input_schema, question_withdraw_input_schema,
 };
+pub(crate) use registry::is_read_only;
 pub use registry::{ControlToolDefinition, ControlToolRegistry};
 pub(crate) use runtime::ProviderExecutionPreview;
 pub use runtime::{ControlToolResult, ControlTurnContext};

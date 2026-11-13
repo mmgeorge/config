@@ -10,9 +10,26 @@ use std::time::Duration;
 /// Keep goal completion and final prose distinct from native settlement, then admit another input.
 #[tokio::test]
 async fn goal_completion_settles_final_response_and_accepts_next_input() -> Result<()> {
+    goal_request_waits_for_native_completion(false, false).await
+}
+
+/// Keep a blocking request pending until the provider's final response settles.
+#[tokio::test]
+async fn goal_blocking_waits_for_native_completion() -> Result<()> {
+    goal_request_waits_for_native_completion(true, false).await
+}
+
+/// Native interruption must retain its cause and reject the earlier completion request.
+#[tokio::test]
+async fn goal_completion_does_not_override_native_interruption() -> Result<()> {
+    goal_request_waits_for_native_completion(false, true).await
+}
+
+/// Exercise terminal requests through the same native response barrier.
+async fn goal_request_waits_for_native_completion(blocked: bool, interrupted: bool) -> Result<()> {
     use crate::provider::mock_response::MockResponseCommand;
     use forge_provider_api::testing::{
-        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestHoldId, TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
         TestPromptTerminal,
     };
     let root = tempfile::tempdir()?;
@@ -33,15 +50,34 @@ async fn goal_completion_settles_final_response_and_accepts_next_input() -> Resu
                     acceptance: TestInputAcceptance::BeforeResponse,
                     steps: vec![
                         TestPromptStep::ToolCall {
-                            name: "goal_complete".into(),
-                            arguments: json!({"summary":"Goal finished"}),
+                            name: if blocked {
+                                "goal_blocked"
+                            } else {
+                                "goal_complete"
+                            }
+                            .into(),
+                            arguments: if blocked {
+                                json!({"reason":"Needs external input"})
+                            } else {
+                                json!({"summary":"Goal finished"})
+                            },
+                        },
+                        TestPromptStep::CollectionBarrier {
+                            id: TestHoldId::new("goal-collected")?,
+                        },
+                        TestPromptStep::Barrier {
+                            id: TestHoldId::new("goal-requested")?,
                         },
                         TestPromptStep::Message {
                             content: TestMessageContent::Response,
                             text: "Implemented the goal".into(),
                         },
                     ],
-                    terminal: TestPromptTerminal::Completed,
+                    terminal: if interrupted {
+                        TestPromptTerminal::Cancelled
+                    } else {
+                        TestPromptTerminal::Completed
+                    },
                 },
             },
         )
@@ -59,6 +95,60 @@ async fn goal_completion_settles_final_response_and_accepts_next_input() -> Resu
             &sink,
         )
         .await?;
+    let control = provider
+        .mock_response_control()
+        .context("mock controls missing")?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        control.dispatch(
+            &session_id,
+            MockResponseCommand::Wait {
+                id: "goal-requested".into(),
+            },
+        ),
+    )
+    .await??;
+    let task = controller
+        .task_controller
+        .current()?
+        .context("goal disappeared before native completion")?;
+    assert_eq!(task.status(), crate::task::TaskStatus::Running);
+    assert_eq!(controller.coordinator.execution.available_permits(), 0);
+    control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Release {
+                id: "goal-requested".into(),
+            },
+        )
+        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        control.dispatch(
+            &session_id,
+            MockResponseCommand::Wait {
+                id: "goal-collected".into(),
+            },
+        ),
+    )
+    .await??;
+    assert_eq!(
+        controller
+            .task_controller
+            .current()?
+            .context("goal changed before collection")?
+            .status(),
+        crate::task::TaskStatus::Running
+    );
+    assert_eq!(controller.coordinator.execution.available_permits(), 0);
+    control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Release {
+                id: "goal-collected".into(),
+            },
+        )
+        .await?;
     let store = SqliteStore::open(&controller.data_root)?;
     for ordinal in 1..=2 {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -68,7 +158,14 @@ async fn goal_completion_settles_final_response_and_accepts_next_input() -> Resu
                     && exchange.completed_at_ms().is_some()
                     && controller.coordinator.execution.available_permits() == 1
                 {
-                    assert_eq!(exchange.state(), crate::exchange::ExchangeState::Complete);
+                    assert_eq!(
+                        exchange.state(),
+                        if interrupted {
+                            crate::exchange::ExchangeState::Interrupted
+                        } else {
+                            crate::exchange::ExchangeState::Complete
+                        }
+                    );
                     break Ok::<(), anyhow::Error>(());
                 }
                 tokio::task::yield_now().await;
@@ -76,6 +173,33 @@ async fn goal_completion_settles_final_response_and_accepts_next_input() -> Resu
         })
         .await
         .context("completed goal stranded the session")??;
+        if interrupted {
+            assert_eq!(
+                controller
+                    .task_controller
+                    .current()?
+                    .context("interrupted goal disappeared")?
+                    .status(),
+                crate::task::TaskStatus::Running
+            );
+            assert_eq!(
+                store.list_exchange(&session_id)?.len(),
+                1,
+                "interrupted request must not reserve another turn"
+            );
+            break;
+        }
+        if blocked {
+            assert_eq!(
+                controller
+                    .task_controller
+                    .current()?
+                    .context("blocked goal disappeared")?
+                    .status(),
+                crate::task::TaskStatus::Blocked
+            );
+            break;
+        }
         assert!(controller.task_controller.current()?.is_none());
         if ordinal == 1 {
             service
@@ -166,6 +290,418 @@ async fn directory_planning_submits_real_files_and_preserves_review_snapshot() -
     reader.abort();
     let result = reader.await;
     assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
+    Ok(())
+}
+
+/// Approval retains the planning invocation until its own native terminal result.
+#[tokio::test]
+async fn plan_acceptance_waits_for_planning_and_keeps_cancel_available() -> Result<()> {
+    plan_acceptance_case(false, false).await
+}
+
+/// A later explicit cancellation supersedes approval without admitting Execute.
+#[tokio::test]
+async fn cancellation_supersedes_pending_plan_acceptance() -> Result<()> {
+    plan_acceptance_case(true, false).await
+}
+
+/// Automatic approval uses the same non-interrupting native and collection boundary.
+#[tokio::test]
+async fn automatic_plan_acceptance_waits_for_planning() -> Result<()> {
+    plan_acceptance_case(false, true).await
+}
+
+async fn plan_acceptance_case(cancel: bool, automatic: bool) -> Result<()> {
+    use crate::exchange::command::{
+        Command, CommandId, CommandRequest, InputControl, PlanExecutionSelection, TaskCommand,
+    };
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestHoldId, TestInputAcceptance, TestPromptScript, TestPromptStep, TestPromptTerminal,
+    };
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let files = crate::plan::PlanFileStore::new(&controller.data_root, root.path())?;
+    let mut document = crate::plan::test_fixture("acceptance-fixture", "Retain planning ownership");
+    let mut design = crate::plan::DeclarationDesign::open(root.path())?;
+    design.document.objective = "Retain planning ownership".into();
+    design.document.background = "A native turn is still responding.".into();
+    design.document.design = "Wait for native completion before execution.".into();
+    design.proposed_source.insert(
+        "src/owner.rs".into(),
+        "/// Own state.\npub struct Owner;\n".into(),
+    );
+    design.parsed = crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())?.parsed;
+    document.design = Some(design);
+    let mut plan = files
+        .prepare_entry(
+            &session_id,
+            "Retain planning ownership".into(),
+            Some(document),
+            1,
+        )?
+        .record;
+    let (document, _, digest) =
+        files.submit_document_revision(&session_id, &plan.id, 1, plan.document_version)?;
+    plan.document_version = document.version;
+    plan.submitted_version = Some(document.version);
+    plan.model_revision = 1;
+    plan.review_digest = Some(digest);
+    plan.state = crate::plan::PlanState::AwaitingReview;
+    let mut store = SqliteStore::open(&controller.data_root)?;
+    store.save_plan(&plan)?;
+    let mut planning = crate::task::TaskSnapshot::plan(plan.clone(), 1);
+    if automatic {
+        planning.plan_execution = Some(crate::task::PlanExecutionChoice {
+            execution: crate::task::ExecutionEntry {
+                approval_mode: crate::session::ApprovalMode::Allow,
+                executor: crate::session::PlanExecutor::default(),
+                compact: false,
+            },
+            comment: None,
+        });
+    }
+    controller.task_controller.change(
+        &mut store,
+        None,
+        crate::task::TaskChange::Install(Box::new(crate::task::Task::try_from(planning)?)),
+        1,
+    )?;
+    let provider = controller.provider_handle();
+    let script = provider
+        .mock_response_control()
+        .context("mock controls missing")?;
+    script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![TestPromptStep::Barrier {
+                        id: TestHoldId::new("planning-response")?,
+                    }],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service.dispatch(Some(session_id.clone()), Request { id: 2, method: "session.prompt.submit".into(),
+        params: json!({"operation_id":"planning-response-input","text":"Explain the proposed implementation."}) }, &sink).await?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        script.dispatch(
+            &session_id,
+            MockResponseCommand::Wait {
+                id: "planning-response".into(),
+            },
+        ),
+    )
+    .await??;
+    let current = controller.task_controller.current()?;
+    let selection = PlanExecutionSelection::capture(
+        &plan,
+        current.as_ref(),
+        crate::task::command::ExecuteSelection {
+            approval_mode: Some(crate::session::ApprovalMode::Allow),
+            plan_compact: Some(false),
+            ..Default::default()
+        },
+    )?;
+    let command = CommandRequest {
+        id: CommandId::new("accept-while-planning")?,
+        command: Command::Task(TaskCommand::ExecutePlan(selection)),
+        input_control: InputControl::AtExecution,
+    };
+    let mut duplicate_command = command.clone();
+    let accepted_owner = controller.clone();
+    let accepted_sink = sink.clone();
+    let automatic_command = if automatic {
+        controller
+            .exchange_owner
+            .execute_command(Command::Task(TaskCommand::SetAutoAccept(
+                crate::exchange::command::PlanAcceptancePolicy {
+                    target: crate::exchange::command::TaskSelection::capture(
+                        current.as_ref().unwrap(),
+                    ),
+                    enabled: true,
+                },
+            )))
+            .await?;
+        Some(
+            crate::task::command::SessionCommand::approved_revision(
+                &controller.task_controller.current()?.unwrap(),
+            )?
+            .context("automatic approval was not eligible")?,
+        )
+    } else {
+        None
+    };
+    if let Some(automatic_command) = &automatic_command {
+        duplicate_command.command = Command::Task(
+            TaskCommand::from_session_action(
+                &automatic_command.action,
+                current.as_ref(),
+                Some(&plan),
+                None,
+            )?
+            .context("automatic command must select execution")?,
+        );
+    }
+    let terminal_id = format!(
+        "plan_acceptance:{}",
+        automatic_command
+            .as_ref()
+            .map_or("accept-while-planning", |command| command
+                .operation_id
+                .as_str())
+    );
+    let acceptance = tokio::spawn(async move {
+        if let Some(automatic_command) = automatic_command {
+            super::super::task_state::apply_command(
+                &accepted_owner,
+                accepted_owner.observer.session_id(),
+                &automatic_command,
+                None,
+                8,
+                &accepted_sink,
+            )
+            .await?;
+        } else {
+            accepted_owner
+                .exchange_owner
+                .execute_identified(command, accepted_sink)
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                store.terminal_disposition(&session_id, &terminal_id)?,
+                Some(crate::storage::TerminalDisposition::Pending)
+            ) {
+                break Ok::<(), anyhow::Error>(());
+            }
+            if acceptance.is_finished() {
+                let decision = controller
+                    .exchange_owner
+                    .command_status(CommandId::new(
+                        terminal_id.strip_prefix("plan_acceptance:").unwrap(),
+                    )?)
+                    .await?;
+                anyhow::bail!("acceptance finished before the planning turn: {decision:?}");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("approval did not reach its pending boundary")??;
+    assert_eq!(
+        controller.task_controller.current()?.unwrap().kind(),
+        crate::task::TaskKind::Plan
+    );
+    assert!(!acceptance.is_finished());
+    if cancel {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            controller
+                .exchange_owner
+                .execute_command(Command::CancelExchange(Default::default())),
+        )
+        .await??;
+        assert!(acceptance.await?.is_err());
+        assert_eq!(
+            controller.task_controller.current()?.unwrap().kind(),
+            crate::task::TaskKind::Plan
+        );
+    } else {
+        script
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Script {
+                    script: TestPromptScript {
+                        acceptance: TestInputAcceptance::BeforeResponse,
+                        steps: vec![
+                            TestPromptStep::Barrier { id: TestHoldId::new("implement-ready")? },
+                            TestPromptStep::ToolCall {
+                                name: "plan_phase_done".into(),
+                                arguments: json!({"phase":"implement","revision":1,"summary":"Added the owner"}),
+                            },
+                            TestPromptStep::CollectionBarrier { id: TestHoldId::new("implement-collected")? },
+                            TestPromptStep::Barrier { id: TestHoldId::new("implement-requested")? },
+                            TestPromptStep::Message {
+                                content: forge_provider_api::testing::TestMessageContent::Response,
+                                text: "Implementation finished; Harness will check it.".into(),
+                            },
+                        ],
+                        terminal: TestPromptTerminal::Completed,
+                    },
+                },
+            )
+            .await?;
+        let duplicate_owner = controller.clone();
+        let duplicate_sink = sink.clone();
+        let mut duplicate_command = duplicate_command;
+        let mut repeated_command = duplicate_command.clone();
+        repeated_command.id = CommandId::new("repeat-committed-revision")?;
+        duplicate_command.id = CommandId::new("same-approved-revision")?;
+        let duplicate = tokio::spawn(async move {
+            duplicate_owner
+                .exchange_owner
+                .execute_identified(duplicate_command, duplicate_sink)
+                .await
+        });
+        let journal = crate::exchange::journal::CommandJournal::open_metadata(
+            &controller.data_root,
+            &session_id,
+        )?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if journal
+                    .lookup(&CommandId::new("same-approved-revision")?)?
+                    .is_some_and(|record| {
+                        matches!(
+                            record.state,
+                            crate::exchange::journal::CommandState::Active { .. }
+                        )
+                    })
+                {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                anyhow::ensure!(
+                    !duplicate.is_finished(),
+                    "duplicate approval did not join the pending decision"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        script
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Release {
+                    id: "planning-response".into(),
+                },
+            )
+            .await?;
+        tokio::time::timeout(Duration::from_secs(3), acceptance).await???;
+        tokio::time::timeout(Duration::from_secs(3), duplicate).await???;
+        let before = controller.task_controller.current()?.unwrap();
+        let Command::Task(TaskCommand::ExecutePlan(original)) = &repeated_command.command else {
+            unreachable!()
+        };
+        let accepted = store.load_plan(&plan.id)?.unwrap();
+        let repeated_selection =
+            PlanExecutionSelection::capture(&accepted, Some(&before), original.request().clone())?;
+        let mut changed_settings = original.request().clone();
+        changed_settings.approval_mode = Some(crate::session::ApprovalMode::Deny);
+        let different =
+            PlanExecutionSelection::capture(&accepted, Some(&before), changed_settings)?;
+        assert!(
+            store
+                .committed_plan_acceptance(&session_id, &different)?
+                .is_none()
+        );
+        repeated_command.command = Command::Task(TaskCommand::ExecutePlan(repeated_selection));
+        controller
+            .exchange_owner
+            .execute_identified(repeated_command, sink.clone())
+            .await?;
+        assert_eq!(
+            controller.task_controller.current()?.unwrap().revision,
+            before.revision
+        );
+
+        let history = store.list_exchange(&session_id)?;
+        assert_eq!(
+            history
+                .iter()
+                .find(|exchange| exchange.ordinal == 1)
+                .unwrap()
+                .state(),
+            crate::exchange::ExchangeState::Complete
+        );
+        assert!(matches!(
+            store.terminal_disposition(&session_id, &terminal_id)?,
+            Some(crate::storage::TerminalDisposition::Committed { .. })
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            script.dispatch(
+                &session_id,
+                MockResponseCommand::Wait {
+                    id: "implement-ready".into(),
+                },
+            ),
+        )
+        .await??;
+        std::fs::create_dir_all(root.path().join("src"))?;
+        std::fs::write(
+            root.path().join("src/owner.rs"),
+            "/// Own state.\npub struct Owner;\n",
+        )?;
+        script
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Release {
+                    id: "implement-ready".into(),
+                },
+            )
+            .await?;
+        for barrier in ["implement-requested", "implement-collected"] {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                script.dispatch(
+                    &session_id,
+                    MockResponseCommand::Wait { id: barrier.into() },
+                ),
+            )
+            .await??;
+            assert_eq!(
+                controller.task_controller.current()?.unwrap().phase(),
+                crate::task::TaskPhase::Implement
+            );
+            assert_eq!(controller.coordinator.execution.available_permits(), 0);
+            script
+                .dispatch(
+                    &session_id,
+                    MockResponseCommand::Release { id: barrier.into() },
+                )
+                .await?;
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if controller.task_controller.current()?.is_none()
+                    && controller.coordinator.execution.available_permits() == 1
+                {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("phase request did not finish through native collection and checking")??;
+        assert!(
+            store
+                .list_exchange(&session_id)?
+                .iter()
+                .all(|exchange| exchange.state() == crate::exchange::ExchangeState::Complete)
+        );
+    }
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    reader.await??;
     Ok(())
 }
 

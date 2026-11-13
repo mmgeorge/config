@@ -84,6 +84,9 @@ impl AgentToolScope {
             .as_ref()
         {
             authority.validate_scope()?;
+            if !crate::tools::is_read_only(name) {
+                authority.admit_mutation()?;
+            }
         }
         ensure!(
             self.available(),

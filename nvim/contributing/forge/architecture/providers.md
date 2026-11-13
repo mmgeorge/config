@@ -4,6 +4,12 @@ Each provider reports identities, phases, tools, and failures differently, and a
 
 [Harness](harness.md) covers the session lifecycle, [Permissions](permissions.md) covers approvals, and [Provider configuration](provider-configuration.md) covers settings, resources, and models. Input delivery is in [Provider submissions](../provider-submissions.md).
 
+## Task completion and native outcomes
+
+Adapters report native facts and collect their resources. Successful task tools do not request interruption: there is no `tool_finished` or task handoff callback. Copilot continues through the assistant's final output and ordinary native completion after `plan_phase_done`. Native interruption remains `ProviderError::Interrupted`; an explicit host stop carries its separate cancellation, reconfiguration, or shutdown provenance. A pending completion request cannot turn a failed or interrupted native turn into success.
+
+Mediated native permission callbacks consult the invocation's shared mutation seal before evaluation and again after an approval wait. Copilot returns one-operation approvals; Claude's tool callback returns a scoped allow/deny result. Codex may grant native permissions for the remainder of a turn, and provider-owned caches or already-authorized processes can avoid another host callback. The seal therefore is not a filesystem lock. Direct Harness tools and check starts share the seal; final Execute evidence compares snapshots after collection and rejects workspace changes after the phase request. External editors and already-admitted writers remain possible and must be reflected in collected evidence. No adapter abort is used as a fallback.
+
 ## Provider contract and ownership
 
 The provider boundary spans three crates. `forge-provider-api` defines the object-safe `Provider` interface, normalized requests, events, errors, models, and capabilities. `forge-providers` owns native protocol decoding, process runtimes, SDK handles, resource profiles, and session state; its native modules are private behind the registry. `forge-harness::provider::ProviderBridge` prepares host resources and binds normalized callbacks to tools, permissions, task authority, and durable submissions. The API and native implementation crates do not depend on Harness, and the interface has no Harness-associated types.

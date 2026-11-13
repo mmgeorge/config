@@ -33,14 +33,32 @@ impl PermissionAuthoritySnapshot {
 #[derive(Debug)]
 pub(crate) struct TaskAuthorityProgress {
     current: std::sync::Mutex<TaskPermit>,
+    admission: Arc<std::sync::Mutex<MutationAdmission>>,
+}
+
+/// Keep terminal sealing separate from task revocation and provider collection.
+#[derive(Debug, Default)]
+enum MutationAdmission {
+    #[default]
+    Open,
+    Sealed,
 }
 
 impl TaskAuthorityProgress {
     pub(crate) fn new(permit: TaskPermit) -> Self {
         Self {
             current: std::sync::Mutex::new(permit),
+            admission: Arc::default(),
         }
     }
+    /// Freeze child revision authority while retaining the original invocation's mutation seal.
+    pub(crate) fn fork(&self, permit: TaskPermit) -> Self {
+        Self {
+            current: std::sync::Mutex::new(permit),
+            admission: self.admission.clone(),
+        }
+    }
+
     pub(crate) fn permit(&self) -> Result<TaskPermit> {
         Ok(self
             .current
@@ -56,12 +74,47 @@ pub(crate) struct TaskAuthority {
     controller: Option<Arc<SessionTaskController>>,
     permit: Option<TaskPermit>,
     progress: Option<Arc<TaskAuthorityProgress>>,
+    admission: Option<Arc<std::sync::Mutex<MutationAdmission>>>,
     generation: Option<u64>,
     permission_snapshot: Option<PermissionAuthoritySnapshot>,
     permission_required: bool,
 }
 
 impl TaskAuthority {
+    /// Admit new work only while this invocation has no terminal request.
+    pub(crate) fn admit_mutation(&self) -> Result<()> {
+        if let Some(admission) = &self.admission {
+            let state = admission
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutation admission lock poisoned"))?;
+            ensure!(
+                matches!(*state, MutationAdmission::Open),
+                "This invocation has a pending terminal request. Finish the response; new mutations require a new turn."
+            );
+        }
+        Ok(())
+    }
+
+    /// Record terminal intent and close mutation admission under one serialized boundary.
+    pub(crate) fn seal_mutations<T>(&self, record: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_task_gate(|| {
+            let admission = self
+                .admission
+                .as_ref()
+                .context("invocation mutation admission is missing")?;
+            let mut state = admission
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mutation admission lock poisoned"))?;
+            ensure!(
+                matches!(*state, MutationAdmission::Open),
+                "a terminal request is already pending for this invocation"
+            );
+            let result = record()?;
+            *state = MutationAdmission::Sealed;
+            Ok(result)
+        })
+    }
+
     /// Check that a callback is being committed by the exact session task controller that admitted it.
     pub(crate) fn belongs_to(&self, controller: &Arc<SessionTaskController>) -> bool {
         self.controller
@@ -79,6 +132,10 @@ impl TaskAuthority {
             controller: context.task_controller.clone(),
             permit: context.task_permit.clone(),
             progress: context.task_authority_progress.clone(),
+            admission: context
+                .task_authority_progress
+                .as_ref()
+                .map(|progress| progress.admission.clone()),
             generation: context.task_generation,
             permission_snapshot: context.permission_snapshot.clone(),
             permission_required: context.permission_required,
@@ -250,6 +307,47 @@ mod test {
     use super::*;
     use crate::provider::ScopeOwner;
     use crate::task::TaskChange;
+
+    /// Sealing rejects new mutations, including snapshots, without revoking settlement authority.
+    #[test]
+    fn terminal_seal_preserves_observation_and_rejects_new_mutation() -> Result<()> {
+        let (_root, _store, controller) = SessionTaskController::test_goal();
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.bind_test_task_controller(controller);
+        let authority = TaskAuthority::capture(&context).unwrap();
+        let snapshot = authority.snapshot()?;
+        authority.admit_mutation()?;
+        let mut recorded = false;
+        authority.seal_mutations(|| {
+            recorded = true;
+            Ok(())
+        })?;
+        assert!(recorded);
+        assert!(authority.admit_mutation().is_err());
+        assert!(snapshot.admit_mutation().is_err());
+        authority.validate_scope()?;
+        snapshot.validate_scope()?;
+        assert!(authority.seal_mutations(|| Ok(())).is_err());
+        Ok(())
+    }
+
+    /// Failed request recording leaves subsequent mutation admission available.
+    #[test]
+    fn rejected_terminal_record_does_not_seal_mutations() -> Result<()> {
+        let (_root, _store, controller) = SessionTaskController::test_goal();
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.bind_test_task_controller(controller);
+        let authority = TaskAuthority::capture(&context).unwrap();
+        assert!(
+            authority
+                .seal_mutations::<()>(|| anyhow::bail!("invalid request"))
+                .is_err()
+        );
+        authority.admit_mutation()?;
+        Ok(())
+    }
 
     /// Share the persisted baseline receipt across parent collection while retaining the child's original task fence.
     #[tokio::test]

@@ -240,14 +240,9 @@ impl api::turn_control::TurnControl for IsolatedCallbacks {
     ) -> Result<api::turn_control::HostTurnStatus, ProviderError> {
         Ok(api::turn_control::HostTurnStatus {
             replay_safe: false,
-            control_handoff: false,
             cancelled: false,
             error: None,
         })
-    }
-    /// Report no completed host tools.
-    fn tool_finished(&self, _: &api::InvocationScope, _: Option<&str>) -> bool {
-        false
     }
 }
 

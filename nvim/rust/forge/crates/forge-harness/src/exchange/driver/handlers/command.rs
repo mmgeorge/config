@@ -250,6 +250,29 @@ impl ExchangeDriver {
                         Err(OperationFailure::Domain(error.into()))
                     }
                 };
+                let rejection = match &progress {
+                    Err(error @ OperationFailure::Validation(_)) => Some(error.diagnostic()),
+                    Err(error @ OperationFailure::Domain(source))
+                        if !crate::exchange::failure::storage_failure(source) =>
+                    {
+                        Some(error.diagnostic())
+                    }
+                    Ok(TaskCommandProgress::Finished {
+                        outcome: Err(error),
+                        ..
+                    }) => Some(error.to_string()),
+                    _ => None,
+                };
+                if let Some(reason) = rejection
+                    && let Err(error) = run.reject_recorded_acceptance(services, &reason)
+                {
+                    trace.record(
+                        session_id,
+                        "plan.acceptance_rejection_uncommitted",
+                        serde_json::json!({"reason":error.to_string()}),
+                    );
+                    self.commands.retention_failed(trace, session_id, step);
+                }
                 if !was_preparing && run.preparing() {
                     trace.record(session_id, "exchange.command.effect_requested", serde_json::json!({
                             "command_id":id.as_str(),"effect":"task_creation_preparation","update_step":step,
@@ -311,6 +334,50 @@ impl ExchangeDriver {
                                 "input_revision":input.revision,"update_step":step,
                             }));
                         *command = Some(ActiveCommand::Task(run));
+                    }
+                    Ok(TaskCommandProgress::AwaitingPlanning) => {
+                        let sealed = {
+                            let broker = broker.lock().await;
+                            match foreground.as_ref() {
+                                Some(runtime) => broker
+                                    .seal_plan_acceptance(&runtime.transaction, || {
+                                        run.record_plan_acceptance(services)
+                                    }),
+                                None => Err(anyhow::anyhow!(
+                                    "planning invocation disappeared before acceptance"
+                                )),
+                            }
+                        };
+                        match sealed {
+                            Ok((exchange, turn)) if self.pending_plan_acceptance.is_none() => {
+                                self.pending_plan_acceptance = Some(PendingPlanAcceptance {
+                                    run,
+                                    exchange,
+                                    turn,
+                                });
+                                publish_task_state(
+                                    command_messages.as_ref(),
+                                    services,
+                                    trace,
+                                    session_id,
+                                    &id,
+                                    step,
+                                );
+                                trace.record(session_id, "plan.acceptance_pending", serde_json::json!({"command_id":id.as_str(),"update_step":step}));
+                            }
+                            result => {
+                                trace.record(session_id, "plan.acceptance_rejected", serde_json::json!({"command_id":id.as_str(),"reason":result.err().map(|error| error.to_string()),"update_step":step}));
+                                self.commands.finish(
+                                    run.command,
+                                    Err(CommandFailure::Task(
+                                        crate::exchange::command::TaskCommandFailure::Changed,
+                                    )),
+                                    trace,
+                                    session_id,
+                                    step,
+                                );
+                            }
+                        }
                     }
                     Ok(TaskCommandProgress::Waiting { events, input }) => {
                         publish_control(events, input.as_ref(), env.context(step), &id);

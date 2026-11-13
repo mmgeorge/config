@@ -290,6 +290,7 @@ impl ConfigurationReconcileJob {
             | ProviderError::NotConsumed
             | ProviderError::DeliveryUncertain
             | ProviderError::Cancelled
+            | ProviderError::Interrupted
             | ProviderError::Retryable(_)
             | ProviderError::Delivery(_) => false,
         }

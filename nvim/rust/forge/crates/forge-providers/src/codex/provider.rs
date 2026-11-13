@@ -3976,7 +3976,9 @@ fn configuration_failure(
         ProviderError::Unsupported(_) => (ProviderFailureKind::Policy, fallback_phase),
         ProviderError::NotConsumed => (ProviderFailureKind::Rejected, fallback_phase),
         ProviderError::DeliveryUncertain => (ProviderFailureKind::Unknown, Phase::Dispatch),
-        ProviderError::Cancelled => (ProviderFailureKind::Cancelled, fallback_phase),
+        ProviderError::Cancelled | ProviderError::Interrupted => {
+            (ProviderFailureKind::Cancelled, fallback_phase)
+        }
         ProviderError::Retryable(_) => (ProviderFailureKind::Runtime, fallback_phase),
     };
     ProviderFailure::new(ProviderOperation::ThreadConfigure, kind)
@@ -6989,13 +6991,9 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         ) -> Result<HostTurnStatus, ProviderError> {
             Ok(HostTurnStatus {
                 replay_safe: false,
-                control_handoff: false,
                 cancelled: false,
                 error: None,
             })
-        }
-        fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool {
-            false
         }
     }
 

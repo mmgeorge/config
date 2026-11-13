@@ -239,6 +239,7 @@ impl HarnessBroker {
             _agent_foreground_claim: self.agent_coordinator.claim_foreground(),
             question_changes: self.questions.changed.subscribe(),
             execution_receiver,
+            pending_execution_phase: None,
             pending_revision: None,
             task_authority,
             revision_job_active: false,

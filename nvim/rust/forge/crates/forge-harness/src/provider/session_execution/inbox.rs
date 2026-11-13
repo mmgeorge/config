@@ -954,7 +954,7 @@ mod tests {
         inbox.start_tool_monitor(scope, watchdog, work.provider.clone())?;
         let cancellation = work.result.await?;
         assert!(
-            matches!(cancellation, Err(ProviderError::Cancelled)),
+            matches!(cancellation, Err(ProviderError::Interrupted)),
             "{cancellation:?}"
         );
         wait_for_close(&inbox.closed, &inbox.monitor_closed).await;
