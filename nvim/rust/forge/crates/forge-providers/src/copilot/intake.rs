@@ -532,4 +532,63 @@ mod tests {
         }
         .await
     }
+
+    /// Preserve concise reasoning as status-eligible summaries for streaming and snapshot delivery.
+    #[tokio::test]
+    async fn concise_reasoning_reaches_status_as_summary() -> anyhow::Result<()> {
+        use forge_provider_api::{
+            ItemCompletion, ItemEvent, ItemStart, ProviderEvent, ReasoningKind,
+        };
+
+        for streamed in [false, true] {
+            let (context, mut events) = context("reasoning").await;
+            {
+                let mut context = context.lock().await;
+                let TurnContext {
+                    decoder,
+                    output,
+                    sink,
+                } = &mut *context;
+                if streamed {
+                    decoder
+                        .decode(
+                            &event(
+                                "reasoning-delta",
+                                "assistant.reasoning_delta",
+                                json!({"reasoningId":"summary","deltaContent":"Inspecting"}),
+                            ),
+                            output,
+                            sink,
+                        )
+                        .await?;
+                }
+                decoder.decode(
+                    &event("reasoning-complete", "assistant.reasoning",
+                        json!({"reasoningId":"summary","content":"Inspecting the status adapter."})),
+                    output, sink,
+                ).await?;
+            }
+            let mut reasoning = Vec::new();
+            while let Some(event) = events.try_next()? {
+                if let ProviderEvent::Item { item_id, event, .. } = event.event {
+                    reasoning.push((item_id, event));
+                }
+            }
+            assert_eq!(reasoning.len(), 2);
+            assert_eq!(reasoning[0].0, reasoning[1].0);
+            assert!(
+                matches!(&reasoning[0].1,
+                    ItemEvent::Started(ItemStart::Reasoning(start))
+                        if start.kind == ReasoningKind::Summary
+                            && start.text == if streamed { "Inspecting" } else { "Inspecting the status adapter." }
+                ),
+                "concise reasoning cannot reach the summary-only status renderer: {reasoning:?}"
+            );
+            assert!(matches!(&reasoning[1].1,
+                ItemEvent::Completed(ItemCompletion::Reasoning(completion))
+                    if completion.text == "Inspecting the status adapter."
+            ));
+        }
+        Ok(())
+    }
 }

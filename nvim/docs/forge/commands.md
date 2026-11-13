@@ -483,6 +483,8 @@ italics, aligned with the phase label and wrapped to the available width. The op
 defaults to Off, persists across sessions, and applies without interrupting an
 active response. Thoughts never appear as commentary in the timeline. Only the latest
 readable reasoning summary appears in status when this option is On.
+Copilot supplies these summaries through its concise reasoning stream, independently of
+the commentary shown in exchanges.
 Reasoning completion updates the existing summary without restarting Thinking,
 even when its snapshot arrives after response text. Received-byte progress and
 tool-argument streaming do not count as reasoning text. Copilot remains active

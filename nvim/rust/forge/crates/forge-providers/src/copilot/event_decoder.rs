@@ -1182,7 +1182,8 @@ impl CopilotEventDecoder {
                     .clone()
                     .activity(ItemEvent::Started(ItemStart::Reasoning(ReasoningStart {
                         text: message.text.clone(),
-                        kind: ReasoningKind::Full,
+                        // Creation, resume, and model changes request concise summaries.
+                        kind: ReasoningKind::Summary,
                     }))),
             )
             .await?;
