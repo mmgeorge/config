@@ -129,6 +129,7 @@ impl HarnessBroker {
                     return Ok(ForegroundAction::WaitForPublicationDrain);
                 }
                 ForegroundSignal::CollectionFailed => return Ok(ForegroundAction::Wait),
+                ForegroundSignal::CollectionTimedOut => return Ok(ForegroundAction::Wait),
                 _ => {}
             }
         }
@@ -392,7 +393,19 @@ impl HarnessBroker {
                 if let Some(finalization) = transaction.finalization.as_mut() {
                     finalization.set_collection(disposition);
                 }
-                Ok(ForegroundAction::Wait)
+                self.record_foreground_collection(
+                    transaction,
+                    crate::exchange::ExchangeCollection::Pending,
+                )
+            }
+            ForegroundSignal::CollectionTimedOut => {
+                if transaction.collection.is_none() {
+                    return Ok(ForegroundAction::Wait);
+                }
+                self.record_foreground_collection(
+                    transaction,
+                    crate::exchange::ExchangeCollection::TimedOut,
+                )
             }
             ForegroundSignal::CollectionCompleted(disposition) => {
                 admission.complete_owner_collection(disposition)?;
@@ -413,6 +426,7 @@ impl HarnessBroker {
                 if transaction.failure.is_some() {
                     return self.advance_foreground_failure(dispatch);
                 }
+                transaction.state.interaction.collection = None;
                 Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::CollectionFailed => {
@@ -711,5 +725,38 @@ impl HarnessBroker {
             }
         }
         failure.map_or(Ok(()), Err)
+    }
+
+    /// Persist cleanup reporting and freeze execution time without releasing native ownership.
+    fn record_foreground_collection(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        collection: crate::exchange::ExchangeCollection,
+    ) -> Result<ForegroundAction> {
+        let exchange = &mut transaction.state.interaction;
+        exchange.collection = Some(collection);
+        exchange.pause(self.clock.now_ms());
+        self.store.save_exchange(exchange)?;
+        self.reconcile_live_interaction(Some(exchange), None)?;
+        Ok(ForegroundAction::Wait)
+    }
+
+    /// Retain a stop deadline even after its foreground parked while native cleanup remains owned.
+    pub(crate) fn record_collection_timeout(
+        &mut self,
+        exchange_id: &crate::provider::ExchangeId,
+    ) -> Result<()> {
+        let mut exchange = self
+            .store
+            .load_exchange(exchange_id.as_str())?
+            .context("cleanup deadline lost its original exchange")?;
+        if exchange.is_finished() {
+            return Ok(());
+        }
+        exchange.collection = Some(crate::exchange::ExchangeCollection::TimedOut);
+        exchange.pause(self.clock.now_ms());
+        self.store.save_exchange(&exchange)?;
+        self.reconcile_live_interaction(Some(&exchange), None)?;
+        Ok(())
     }
 }

@@ -31,6 +31,11 @@ the rule file in Neovim refreshes clients so deleting an entry restores configur
 
 Evaluate one completed lexical word and return either `unchanged` or `replace`. The request contains `profile`, `profile_revision`, `occurrence`, `context`, `target`, and optional `protected` ranges. `target` and every protected range use zero-based half-open UTF-8 byte offsets into `context`. The service rejects invalid boundaries, protected targets, technical-token targets, unavailable profiles, and stale profile revisions.
 
+`forge.text.context` strips source-comment markers and joins adjacent nonempty
+comment lines with spaces so wrapping does not create sentence boundaries.
+Replacing each newline with one space preserves captured byte offsets.
+Blank or ineligible lines still end the context; other prose retains newlines.
+
 Both result variants contain the `decision` tag, occurrence and profile identities, and engine revisions. `replace` also contains `original`, `replacement`, and `reasons`. Reasons are `spelling`, `contextual_choice`, `standalone_i`, `first_person_contraction`, and `sentence_start`. The result never rewrites a sentence or authorizes an edit outside the target. Model revision `en-US-bigram-4` preserves words recognized by the English dictionary or profile vocabulary before frequency ranking. Eligible `im` and the explicit negative-contraction set still receive their apostrophes as documented in [Local text correction](../../../docs/forge/text-correction.md#typing-and-rejection). First-person and sentence-start capitalization also remain active. The wire reason vocabulary is unchanged.
 
 Transport errors preserve the existing editor text. The client validates ownership and source text again before applying a replacement. Initialization and correction are independent of the active session, and the generic client must not add session context or `_command` metadata.

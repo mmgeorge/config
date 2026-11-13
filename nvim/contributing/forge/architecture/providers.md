@@ -166,6 +166,8 @@ Harness workflow intent never crosses the provider boundary. `PromptRequest` car
 
 Native adapters signal stop before collecting local callbacks. Codex sends `turn/interrupt`, Copilot sends abort and repeats it to cover a pending send, and ACP revokes callback authority and stops its process tree.
 
+Copilot allows ten seconds for abort, pending sends, and the native prompt task to settle. An abort acknowledgement alone does not prove termination. If that grace expires, or interruption fails while the native task remains active, `BindingState::interrupt` fails the shared SDK generation and force-stops its client. Every session on that generation loses observation; recovery must collect it before admitting replacement work. The grace excludes host callback collection, which retains ownership independently. Neither timeout nor client termination fabricates a successful `Turn.Completed`.
+
 Cancellation before native dispatch keeps its typed cancellation result at every journal and host-admission gate. The execution owner captures the prevented submission and attempt identities before starting asynchronous collection. Completion may remove the live attempt while collection runs; the collection result retains that proof so a matching configuration replacement remains authorized. A newer cancellation fence still rejects an older replacement.
 
 Codex callbacks run outside the socket reader, so an LSP lookup or approval cannot block steering or cancellation. Steering targets the exact active invocation. Shared Harness owns continuation after child completion and submits separately journaled ordinary input with a fresh invocation identity after native settlement and host commit. Adapters never schedule autonomous continuation or reopen settled work.

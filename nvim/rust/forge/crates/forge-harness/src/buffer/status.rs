@@ -263,6 +263,7 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
     match status {
         SessionPhase::Idle => "Idle".into(),
         SessionPhase::Paused => "Paused".into(),
+        SessionPhase::Stopping { collection } => collection.label().into(),
         SessionPhase::Compacting { .. } => {
             let elapsed_seconds = status.elapsed_ms(now_ms) / 1_000;
             format!("Compacting · {elapsed_seconds}s")

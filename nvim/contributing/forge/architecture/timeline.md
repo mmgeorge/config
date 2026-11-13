@@ -50,6 +50,11 @@ An active check is status, not history. `TimelineStream::update_checks` replaces
 
 ## Usage and durations
 
+Interruption cleanup pauses the exchange clock rather than extending displayed model work.
+The retained exchange renders `Stopping`, then `Cleanup timed out - provider state uncertain`
+if its response deadline expires. The latter status does not animate, and neither status claims
+native termination. Collection state persists until settlement or authorized resumption.
+
 Each `Turn` retains identified `TurnUsageReport` observations with independently available input, cached-input, reasoning, and output counts. `UsageReportId` deduplicates replay; an optional `ModelCallId` correlates a call across token and timing reports. Complementary measurements merge atomically, and conflicting evidence fails. `ExchangeMetrics` reconciles cumulative snapshots against their original turn instead of charging a repeated snapshot as another call. `Thread.ContextUsage` updates context occupancy separately from token expenditure.
 
 The outer display duration covers active execution and freezes during user-input and permission waits. Tool time is the union of overlapping calls on that host clock. Native model time instead uses reported call duration or complete positively observed native call endpoints. The ledger does not replace missing call timing with host elapsed time, tool subtraction, or provider collection latency; missing timing keeps native throughput unavailable. A `TurnUsageReport` with endpoints preserves them without synthesizing its `reported_duration_ms` field. Each `ToolCall` retains its first observed execution start and terminal timestamps, and a call first seen at completion shows `—`. It also records `Exchange::tool_instant` readings at those two points. That clock is the exchange's active clock while the exchange runs, so a tool waiting for approval or input pauses with the Working timer; Codex reports a command's execution start before it requests approval, and wall-clock tool time therefore counted the whole wait. After settlement the reading continues in wall time from the frozen duration, so a background command keeps counting. Host-generated tools and records without active readings use wall time.

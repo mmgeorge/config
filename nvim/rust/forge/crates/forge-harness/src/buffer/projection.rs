@@ -3454,7 +3454,9 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     let status = interaction.activity();
     let paused = status == ExchangeActivity::Paused;
     let duration = interaction.elapsed(now_ms) / 1000;
-    let activity = if interaction.state() == ExchangeState::Cancelled {
+    let activity = if let Some(collection) = interaction.collection {
+        collection.label()
+    } else if interaction.state() == ExchangeState::Cancelled {
         "Cancelled"
     } else if interaction.state() == ExchangeState::Finalizing {
         finalization_label(interaction.finalization_outcome())

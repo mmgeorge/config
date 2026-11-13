@@ -66,6 +66,26 @@ pub(crate) enum ExchangeActivity {
     Settled,
 }
 
+/// Retain cleanup reporting independently of native completion and execution admission.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExchangeCollection {
+    /// The owner is waiting for native work and callbacks to settle.
+    Pending,
+    /// The response deadline expired while cleanup still owns its resources.
+    TimedOut,
+}
+
+impl ExchangeCollection {
+    /// Describe cleanup without claiming productive execution or successful cancellation.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Stopping",
+            Self::TimedOut => "Cleanup timed out - provider state uncertain",
+        }
+    }
+}
+
 /// Owns one conversation exchange and its provider turns.
 #[derive(Clone, Debug, Serialize)]
 pub struct Exchange {
@@ -88,6 +108,9 @@ pub struct Exchange {
     /// Durable failure that keeps cleanup retryable without replaying execution.
     #[serde(default)]
     pub finalization_error: Option<String>,
+    /// Cleanup state retained until collection or exchange settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) collection: Option<ExchangeCollection>,
     /// Persistent agent identity that owns this exchange.
     pub agent_id: String,
     pub id: String,
@@ -160,6 +183,9 @@ struct ExchangeRecord {
     /// Durable failure that keeps cleanup retryable without replaying execution.
     #[serde(default)]
     pub finalization_error: Option<String>,
+    /// Cleanup state retained until collection or exchange settlement.
+    #[serde(default)]
+    pub(crate) collection: Option<ExchangeCollection>,
     /// Persistent agent identity that owns this exchange.
     pub agent_id: String,
     pub id: String,
@@ -372,6 +398,7 @@ impl Exchange {
             approval_mode: None,
             phase: crate::exchange::ExchangePhase::Queued,
             finalization_error: None,
+            collection: None,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),
@@ -426,6 +453,7 @@ impl Exchange {
             approval_mode: None,
             phase: crate::exchange::ExchangePhase::Running,
             finalization_error: None,
+            collection: None,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),
@@ -1054,6 +1082,7 @@ impl Exchange {
             self.state() == ExchangeState::Running,
             "completed exchange cannot resume"
         );
+        self.collection = None;
         self.set_awaiting_input(self.elicitation().is_some());
         if self.metrics.awaiting_approval() {
             self.metrics.approval_resume = true;
@@ -1245,6 +1274,7 @@ impl Exchange {
         if approval && !running && !self.metrics.awaiting_approval() {
             let resume = std::mem::take(&mut self.metrics.approval_resume);
             if resume
+                && self.collection.is_none()
                 && self.state() == ExchangeState::Running
                 && !self.awaiting_input()
                 && self.elicitation().is_none()
@@ -1324,6 +1354,7 @@ impl Exchange {
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
         self.phase.complete(outcome, now_ms);
+        self.collection = None;
         self.set_awaiting_input(false);
         Ok(())
     }
@@ -1616,6 +1647,7 @@ mod test {
     fn interaction() -> Exchange {
         Exchange {
             finalization_error: None,
+            collection: None,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),

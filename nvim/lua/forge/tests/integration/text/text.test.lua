@@ -376,6 +376,78 @@ T["eligibility"] = function()
   assert(fixture.exec('return #text_requests')==requests,'read-only native text was admitted')
 end
 
+T["comment_context"] = function()
+  local fixture = text_fixture.open()
+  MiniTest.finally(fixture.close)
+  for _, case in ipairs({
+    { filetype = "lua", lines = { "-- The brown fox did a thing", "-- that" },
+      context = "The brown fox did a thing that " },
+    { filetype = "typescript", lines = { "// The brown fox did a thing", "// that" },
+      context = "The brown fox did a thing that " },
+    { filetype = "typescript", lines = { "/* The brown fox did a thing", " * that", " * continues here. */" },
+      context = "The brown fox did a thing that  continues here." },
+    { filetype = "markdown", lines = { "The brown fox did a thing", "that" },
+      context = "The brown fox did a thing\nthat " },
+  }) do
+    fixture.type("<Esc>")
+    fixture.exec([[
+      local case = ...
+      vim.opt.runtimepath:append(vim.fs.joinpath(vim.fn.stdpath("data"), "site"))
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, case.lines)
+      vim.bo.filetype = case.filetype
+      vim.treesitter.start(0, case.filetype)
+      vim.api.nvim_win_set_cursor(0, { 2, #case.lines[2] - 1 })
+      text_requests = {}
+    ]], { case })
+    fixture.type("A ")
+    wait_until(function() return fixture.exec("return #text_requests") == 1 end,
+      "comment word did not reach correction")
+    local context = fixture.exec("return text_requests[1].occurrence.context")
+    MiniTest.expect.equality(context.text, case.context)
+    MiniTest.expect.equality(context.text:sub(context.target.start + 1, context.target["end"]), "that")
+  end
+  MiniTest.expect.equality(fixture.exec("return text_errors"), {})
+end
+
+T["comment_capitalization"] = function()
+  local fixture = text_fixture.native()
+  MiniTest.finally(fixture.close)
+  for _, case in ipairs({
+    { previous = "// The brown fox did a thing", word = "that", expected = "that" },
+    { previous = "// The brown fox did a thing.", word = "that", expected = "That" },
+    { previous = "// The brown fox did a thing!", word = "that", expected = "That" },
+    { previous = "// The brown fox did a thing?", word = "that", expected = "That" },
+    { previous = "// The brown fox did a thing,", word = "that", expected = "that" },
+    { previous = "// The brown fox did a thing:", word = "that", expected = "that" },
+    { previous = "// Please", word = "recieve", expected = "receive" },
+    { previous = "//", word = "that", expected = "That" },
+    { previous = "", word = "that", expected = "That" },
+    { previous = "const value = 1;", word = "that", expected = "That" },
+  }) do
+    fixture.type("<Esc>")
+    fixture.exec([[
+      local case = ...
+      vim.opt.runtimepath:append(vim.fs.joinpath(vim.fn.stdpath("data"), "site"))
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { case.previous, "// " .. case.word })
+      vim.bo.filetype = "typescript"
+      vim.treesitter.start(0, "typescript")
+      vim.api.nvim_win_set_cursor(0, { 2, #("// " .. case.word) - 1 })
+      text_measurements = {}
+    ]], { case })
+    fixture.type("A ")
+    wait_until(function()
+      return fixture.exec([[
+        for _, measurement in ipairs(text_measurements) do
+          if measurement.event == "text.correction" then return true end
+        end
+        return false
+      ]])
+    end, "comment correction did not settle")
+    MiniTest.expect.equality(fixture.text(), case.previous .. "\n// " .. case.expected .. " ")
+  end
+  MiniTest.expect.equality(fixture.exec("return text_errors"), {})
+end
+
 T["question_slash"] = function()
   local fixture = text_fixture.open()
   MiniTest.finally(fixture.close)

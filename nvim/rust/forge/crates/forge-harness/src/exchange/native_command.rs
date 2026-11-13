@@ -213,7 +213,12 @@ impl NativeCommandRun {
         };
         self.consume_completed_worker(&event);
         match event {
-            NativeCommandEvent::Deadline => Err(OperationFailure::JobDeadline),
+            NativeCommandEvent::Deadline => {
+                if let Some(transition) = self.transition.as_mut() {
+                    transition.report_collection_timeout(broker)?;
+                }
+                Err(OperationFailure::JobDeadline)
+            }
             NativeCommandEvent::Control(result) => {
                 self.control = Some(result.map_err(|error| {
                     OperationFailure::Transition(TransitionFailure::Rejected(error))

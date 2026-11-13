@@ -481,6 +481,64 @@ async fn owner_active_overdue_cancel_recovers_when_late_collection_completes() -
     overdue_cancel_recovers(CollectionBoundary::Active).await
 }
 
+/// Reconfiguration must publish retained cleanup uncertainty without charging it as model work.
+#[tokio::test(start_paused = true)]
+async fn owner_overdue_reconfiguration_preserves_stopped_clock_and_uncertain_status() -> Result<()>
+{
+    let mut fixture =
+        slow_collection_fixture(Duration::from_secs(40), CollectionBoundary::Active).await?;
+    let scenario = async {
+        let command = super::super::native_permission::decode_command(&Request {
+            id: 810,
+            method: "session.command.apply".into(),
+            params: json!({"operation_id":"overdue-settings","action":"permission","change":{"kind":"toggle_write_enabled"}}),
+        })?;
+        let before = fixture.controller.observer.snapshot()?.session.access;
+        let result = fixture.controller.exchange_owner
+            .execute_identified(command, fixture.sink.clone()).await;
+        ensure!(result.is_err(), "unfinished cleanup reported successful configuration");
+        ensure!(fixture.controller.observer.snapshot()?.session.access == before,
+            "timed-out configuration changed settings");
+        let exchange = SqliteStore::open(&fixture.controller.data_root)?
+            .list_exchange(fixture.controller.observer.session_id())?
+            .pop().context("cleanup lost its exchange")?;
+        ensure!(exchange.execution_started_at_ms().is_none(),
+            "cleanup timeout left the model execution clock running");
+        let retained = serde_json::to_value(&exchange)?;
+        ensure!(retained["collection"] == "timed_out",
+            "cleanup timeout was not persisted on its original exchange: {retained}");
+        let status = crate::session::state_machine::SessionPhase::resolve_status(None, None, Some(&exchange));
+        ensure!(matches!(status, crate::session::state_machine::SessionPhase::Stopping {
+            collection: crate::exchange::ExchangeCollection::TimedOut
+        }) && !status.animated(), "overdue cleanup still advertises active generation");
+        ensure!(exchange.elapsed(exchange.created_at_ms + 2_000_000) == exchange.duration_ms(),
+            "overdue cleanup kept accumulating display duration");
+        ensure!(fixture.controller.coordinator.execution.available_permits() == 0,
+            "timeout released the execution owner before native settlement");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        ensure!(fixture.collection_count.load(Ordering::Acquire) == 1,
+            "late cleanup was collected more than once");
+        let collected = SqliteStore::open(&fixture.controller.data_root)?
+            .load_exchange(&exchange.id)?.context("late cleanup lost its exchange")?;
+        ensure!(collected.collection.is_none(), "late collection retained cleanup uncertainty");
+        fixture.controller.exchange_owner.execute_command(
+            crate::exchange::command::Command::CancelExchange(Default::default())
+        ).await?;
+        let settled = SqliteStore::open(&fixture.controller.data_root)?
+            .load_exchange(&exchange.id)?.context("settlement lost its exchange")?;
+        ensure!(settled.collection.is_none(), "settled exchange retained cleanup uncertainty");
+        prompt::apply(&fixture.controller, Request {
+            id: 811,
+            method: "session.prompt.submit".into(),
+            params: json!({"operation_id":"after-settings-timeout","text":"Fresh work after cleanup"}),
+        }, &fixture.sink).await?;
+        ensure!(matches!(fixture.dispatches.recv().await,
+            Some(forge_provider_api::input::PromptInput::Text(text)) if text == "Fresh work after cleanup"));
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    fixture.finish(scenario).await
+}
+
 /// Exercise one response deadline independently of retained preparation or native collection.
 async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
     use crate::exchange::command::{

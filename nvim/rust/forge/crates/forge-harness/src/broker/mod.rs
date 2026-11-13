@@ -642,6 +642,8 @@ pub(crate) enum ForegroundCollection {
 pub(crate) enum ForegroundSignal {
     LiveHost(Box<crate::provider::LiveHostEffect>),
     CollectionStarted(ForegroundCollection),
+    /// The command response timed out; native cleanup retains ownership.
+    CollectionTimedOut,
     CollectionCompleted(ForegroundCollection),
     /// The owner's native collection ended without proving the provider idle, so no
     /// `CollectionCompleted` follows and the owner restarts the provider.
@@ -789,6 +791,7 @@ impl ForegroundSignal {
         match self {
             Self::LiveHost(..) => "LiveHost",
             Self::CollectionStarted(..) => "CollectionStarted",
+            Self::CollectionTimedOut => "CollectionTimedOut",
             Self::CollectionCompleted(..) => "CollectionCompleted",
             Self::CollectionFailed => "CollectionFailed",
             Self::AdmissionWorkspaceCompleted(..) => "AdmissionWorkspaceCompleted",
@@ -9409,6 +9412,7 @@ impl HarnessBroker {
         Ok((
             Exchange {
                 finalization_error: None,
+                collection: None,
                 check_owner: None,
                 output_store: None,
                 archived_output: Default::default(),

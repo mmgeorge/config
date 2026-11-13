@@ -1548,19 +1548,48 @@ impl BindingState {
         let session = self.session.read().await.clone();
         // Stop and writer admission share one state lock; every admitted frame
         // precedes abort, while handoffs attempted after stop are rejected.
-        let abort = super::operation::wait(session.abort())
-            .await
-            .unwrap_or_else(Err);
-        let pending = super::operation::wait(self.turn.finish_pending_sends())
-            .await
-            .unwrap_or_else(Err);
-        match (pending, abort) {
-            (Ok(()), result) | (result, Ok(())) => result,
-            (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
-                primary: Box::new(primary),
-                secondary: vec![secondary],
-            }),
+        let interrupt = async {
+            let abort = super::operation::wait(session.abort())
+                .await
+                .unwrap_or_else(Err);
+            let pending = super::operation::wait(self.turn.finish_pending_sends())
+                .await
+                .unwrap_or_else(Err);
+            match (pending, abort) {
+                (Ok(()), result) | (result, Ok(())) => result?,
+                (Err(primary), Err(secondary)) => {
+                    return Err(ProviderError::Combined {
+                        primary: Box::new(primary),
+                        secondary: vec![secondary],
+                    });
+                }
+            }
+            self.turn.wait_inactive().await;
+            Ok(())
+        };
+        // Bound native settlement, not host callbacks: an abort receipt alone proves no terminal state.
+        let result = match tokio::time::timeout(std::time::Duration::from_secs(10), interrupt).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ProviderFailure::new(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::Timeout,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Collection,
+                forge_provider_api::FailureDisposition::Invalidated,
+            )
+            .into()),
+        };
+        if result.is_err() && self.turn.is_active() {
+            tracing::error!(target: "forge::provider", event_name = "provider.interrupt.unsettled",
+                provider = "copilot", error = ?result.as_ref().err(),
+                "Native execution did not settle after interruption");
+            session
+                .generation
+                .fail(forge_provider_api::ObservationFailure::LifecycleUnavailable);
         }
+        result
     }
 
     /// Join native execution while retaining ownership if the waiter is cancelled or times out.
@@ -5162,7 +5191,7 @@ mod retained_recovery_tests {
     }
 
     /// A native terminal result waits for admitted callbacks before any root completion is published.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn root_completion_waits_for_callback_collection_and_survives_dropped_waiter() {
         async {
             let (provider, opened, _root, peer) = opened_helper_fixture(
@@ -5217,6 +5246,10 @@ mod retained_recovery_tests {
             assert!(futures_util::poll!(abandoned.as_mut()).is_pending());
             drop(abandoned);
             let mut collecting = Box::pin(state.collect_execution());
+            assert!(futures_util::poll!(collecting.as_mut()).is_pending());
+            state.interrupt().await.unwrap();
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            assert!(state.session.read().await.generation.failed().is_none());
             assert!(futures_util::poll!(collecting.as_mut()).is_pending());
             drop(admitted_callback);
             assert!(matches!(collecting.await.unwrap(), Some(Ok(()))));
@@ -5285,6 +5318,96 @@ mod retained_recovery_tests {
     #[derive(Clone, Copy)]
     enum HelperBehavior {
         CompleteTurn,
+        StalledTurn,
+    }
+
+    /// An acknowledged abort without terminal evidence must fence the runtime rather than hang collection.
+    #[tokio::test(start_paused = true)]
+    async fn acknowledged_abort_without_terminal_evidence_fences_runtime() {
+        let (provider, opened, _root, _peer) = opened_helper_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+            HelperBehavior::StalledTurn,
+        )
+        .await;
+        let binding = opened.binding.id;
+        let mut events = opened.events;
+        let state = provider
+            .binding(&binding, ProviderOperation::TurnStart)
+            .await
+            .unwrap();
+        let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "stalled-root");
+        let receipt = Arc::new(AcceptedReceipt {
+            id: "stalled-input".try_into().unwrap(),
+            attempt: forge_provider_api::DeliveryAttemptId::new("stalled-attempt").unwrap(),
+            accepted: AtomicU64::new(0),
+        });
+        let request = queued_request(
+            &binding,
+            scope.clone(),
+            state.request.lock().await.configuration.clone(),
+            receipt,
+        );
+        provider
+            .turn_start(context("stalled-submit"), &binding, request)
+            .await
+            .unwrap();
+        loop {
+            let event = events.recv().await.unwrap().unwrap();
+            if matches!(
+                &event.event,
+                ProviderEvent::Turn {
+                    event: forge_provider_api::TurnEvent::Started(_),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let operation = OperationContext::unbounded(
+            forge_provider_api::OperationId::new("stalled-interrupt").unwrap(),
+            cancellation,
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(11),
+            provider.turn_interrupt(operation, &binding, CancelRequest { scope }),
+        )
+        .await
+        .expect("acknowledged abort left native collection waiting indefinitely");
+        assert!(
+            result.is_err(),
+            "missing terminal evidence became successful cancellation"
+        );
+        assert!(provider.runtime.failed_generation().await.is_some());
+        assert!(!state.turn.is_active());
+        loop {
+            match events.try_next() {
+                Ok(Some(event)) => assert!(
+                    !matches!(
+                        &event.event,
+                        ProviderEvent::Turn {
+                            event: forge_provider_api::TurnEvent::Completed(_),
+                            ..
+                        }
+                    ),
+                    "missing terminal evidence manufactured a completion"
+                ),
+                Err(forge_provider_api::events::EventDeliveryError::Observation(
+                    forge_provider_api::ObservationFailure::LifecycleUnavailable,
+                )) => break,
+                other => panic!("missing explicit lifecycle failure: {other:?}"),
+            }
+        }
+        provider.collect_failed_runtime().await.unwrap();
+        assert!(provider.bindings.lock().await.is_empty());
+        drop(state);
+        provider
+            .shutdown(context("stalled-shutdown"))
+            .await
+            .unwrap();
     }
 
     /// Select whether auxiliary queue admission succeeds while preserving the main lifecycle fixture.
@@ -5329,7 +5452,7 @@ mod retained_recovery_tests {
                     }
                     json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
                 }
-                "session.send" if matches!(helper_behavior, HelperBehavior::CompleteTurn) => {
+                "session.send" => {
                     let notification = |id, parent, kind, data| {
                         json!({"jsonrpc":"2.0","method":"session.event",
                         "params":{"sessionId":request["params"]["sessionId"],"event":{"id":id,"parentId":parent,
@@ -5356,10 +5479,10 @@ mod retained_recovery_tests {
                         ]);
                     } else {
                         frames.push(notification(
-                            "aborted-idle",
+                            "native-start",
                             json!("accepted-user"),
-                            "session.idle",
-                            json!({"aborted":true}),
+                            "assistant.turn_start",
+                            json!({"turnId":"0"}),
                         ));
                     }
                     return frames;

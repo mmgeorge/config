@@ -187,6 +187,22 @@ impl ExchangeStop {
     pub(super) fn take_collection_signal(&mut self) -> Option<crate::broker::ForegroundSignal> {
         self.foreground_signals.pop_front()
     }
+
+    /// Preserve cleanup uncertainty when either the command or its collection deadline expires.
+    pub(super) fn report_collection_timeout(
+        &mut self,
+        broker: &mut HarnessBroker,
+    ) -> Result<(), TransitionFailure> {
+        if let Some(invocation) = &self.invocation {
+            broker
+                .record_collection_timeout(&invocation.scope.exchange_id)
+                .map_err(transition_failure)?;
+            self.foreground_signals
+                .push_back(crate::broker::ForegroundSignal::CollectionTimedOut);
+        }
+        Ok(())
+    }
+
     /// Transfer settled compatibility control into the next phase of the same internal operation.
     pub(super) fn take_control(&mut self) -> Option<OwnedSemaphorePermit> {
         match &mut self.stage {
@@ -594,7 +610,10 @@ impl ExchangeStop {
                     input: None,
                 })
             }
-            TransitionEvent::CollectionDeadline => Err(TransitionFailure::Overdue),
+            TransitionEvent::CollectionDeadline => {
+                self.report_collection_timeout(broker)?;
+                Err(TransitionFailure::Overdue)
+            }
             TransitionEvent::ForegroundUnavailable => Err(TransitionFailure::Uncertain),
             TransitionEvent::ForegroundSettled => {
                 let target = match &self.stage {

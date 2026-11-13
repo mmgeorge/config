@@ -469,6 +469,12 @@ Shell-backed tool headings show the underlying command rather than the shell too
 wrapper, both while running and after completion. Expanding the call retains its
 full arguments. Native tools such as `rg` keep their structured call headings.
 The live status line shows the current phase, elapsed time, and interrupt key.
+When interruption begins, the execution timer stops and status changes to **Stopping**.
+If cleanup outlives its response deadline, **Cleanup timed out - provider state uncertain**
+replaces the spinner. Harness retains ownership until cleanup settles; the timeout does not
+authorize another turn against uncertain provider state. Copilot force-stops its shared native
+runtime if the interrupted prompt does not settle within ten seconds, which also interrupts
+other sessions using that runtime.
 Thought headers show successful/total tools and append changed-file counts when
 nonzero. Repeated successful edits to one file count once. Individual tool errors
 and compaction details remain available in the expanded timeline.

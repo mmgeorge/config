@@ -1447,6 +1447,7 @@ pub(crate) mod test {
     pub(crate) fn running_exchange(id: &str) -> Exchange {
         Exchange {
             finalization_error: None,
+            collection: None,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),

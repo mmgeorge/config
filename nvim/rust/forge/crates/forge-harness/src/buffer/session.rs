@@ -2840,6 +2840,7 @@ mod tests {
     fn interaction_entry(identity: &str) -> TimelineEntry {
         let mut interaction = Exchange {
             finalization_error: None,
+            collection: None,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),

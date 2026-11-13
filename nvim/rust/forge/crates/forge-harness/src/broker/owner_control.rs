@@ -182,7 +182,7 @@ impl HarnessBroker {
         if let Some(target) = target
             && !self.exchange_retracted(target)
         {
-            let selected = self
+            let mut selected = self
                 .store
                 .load_exchange(target.as_str())?
                 .context("collected exchange disappeared")?;
@@ -190,6 +190,10 @@ impl HarnessBroker {
                 selected.session_id == self.session.id,
                 "collection target belongs to another session"
             );
+            if selected.collection.take().is_some() {
+                self.store.save_exchange(&selected)?;
+                self.reconcile_live_interaction(Some(&selected), None)?;
+            }
         }
         Ok(events)
     }

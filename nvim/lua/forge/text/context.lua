@@ -171,7 +171,8 @@ function M.capture(index,boundary,owner,current,callback)
       bytes=bytes+#text+1
       checkpoint()
     end
-    local context=table.concat(parts,"\n")
+    -- Comment wrapping is whitespace, not a sentence boundary; both separators occupy one byte.
+    local context=table.concat(parts,owner.kind=="source" and " " or "\n")
     local before_boundary=original_line:sub(finish+1,column)
     local final_character=vim.fn.strcharpart(word,vim.fn.strchars(word)-1,1)
     local question_slash=before_boundary=="/"

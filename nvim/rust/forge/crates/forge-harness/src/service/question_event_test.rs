@@ -11,6 +11,7 @@ pub(super) async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionControlle
     let session = controller.observer.session_id();
     let exchange = crate::exchange::Exchange {
         finalization_error: None,
+        collection: None,
         check_owner: None,
         output_store: None,
         archived_output: Default::default(),

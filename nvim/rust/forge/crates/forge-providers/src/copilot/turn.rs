@@ -121,6 +121,19 @@ impl CopilotTurnEvent {
         )
     }
 
+    /// Wait for the native prompt owner to release execution, independently of callback collection.
+    pub(crate) async fn wait_inactive(&self) {
+        loop {
+            let changed = self.sends_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.is_active() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Exercise send accounting without a transport in deterministic native lifecycle fixtures.
     #[cfg(test)]
     pub async fn steer(
@@ -1139,6 +1152,7 @@ impl Drop for CopilotTurnEventGuard<'_> {
         {
             state.delivery = TurnDelivery::Retained(active);
         }
+        self.owner.sends_changed.notify_waiters();
     }
 }
 

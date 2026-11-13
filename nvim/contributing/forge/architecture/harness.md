@@ -135,6 +135,14 @@ whose command fails or runs overdue, releases the host-settlement fence of the e
 finalizing (`abort_prior_finalization`); the exchange stays finalizing with the recorded error for
 the next admission to retry.
 
+Cleanup has persisted exchange status independent of the command response. `CollectionStarted`
+pauses the execution clock and displays `Stopping`; an expired collection or configuration
+deadline records `Cleanup timed out - provider state uncertain` without animation. `ExchangeStop`
+also records that deadline directly on its original exchange because reconfiguration can park
+the foreground before native cleanup finishes. Timeout does not release the execution permit.
+Proven settlement or authorized resumption clears the status; approval completion cannot restart
+the clock while cleanup owns it.
+
 The `tool_timeout` setting defaults to ten minutes and applies to shell commands as
 well as tool calls. `SessionEventInbox` retains watchdogs for confirmed background
 commands after foreground completion and routes their later terminal events to the

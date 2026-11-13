@@ -48,6 +48,11 @@ The shared personal vocabulary includes `codex`, preventing replacement with
 
 Standalone `i` and alphabetic sentence starts also receive automatic capitalization. Opening quotes, digits, and punctuation prevent sentence-start capitalization. Forge does not add proper-name, acronym, brand, or title capitalization. Protected code and technical tokens remain excluded, and Backspace can still reject an individual correction.
 
+Within source comments, line breaks act like spaces rather than sentence endings.
+A continuation stays lowercase unless the preceding text ends a sentence.
+Blank lines, empty comment lines, and intervening code still separate comment
+paragraphs. Markdown and prompt line-break behavior is unchanged.
+
 Typing `.`, `,`, `;`, `:`, `!`, or `?` after spaces following an eligible word removes those spaces: `This is a sentence .` becomes `This is a sentence.`. Immediate Backspace removes the punctuation and restores the original spacing, together with any spelling change in that transaction. Retyping the rejected punctuation keeps the original spacing for that occurrence. This rule uses the same prose and editable-region protection as spelling.
 
 Typing a space or newline after a slash immediately following a letter changes

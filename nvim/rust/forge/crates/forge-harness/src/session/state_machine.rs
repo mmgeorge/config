@@ -107,6 +107,9 @@ pub enum SessionPhase {
     #[default]
     Idle,
     Paused,
+    Stopping {
+        collection: crate::exchange::ExchangeCollection,
+    },
     Compacting {
         started_at_ms: i64,
     },
@@ -285,6 +288,9 @@ impl SessionPhase {
         active_wait: Option<&ActiveWait>,
         exchange: Option<&Exchange>,
     ) -> Self {
+        if let Some(collection) = exchange.and_then(|exchange| exchange.collection) {
+            return Self::Stopping { collection };
+        }
         if let Some(started_at_ms) = exchange.and_then(Exchange::compaction_started_at_ms) {
             return Self::Compacting { started_at_ms };
         }
@@ -470,6 +476,9 @@ impl SessionPhase {
                 | Self::Compacting { .. }
                 | Self::WaitingForAgent { .. }
                 | Self::Finalizing { error: None, .. }
+                | Self::Stopping {
+                    collection: crate::exchange::ExchangeCollection::Pending
+                }
         )
     }
 
