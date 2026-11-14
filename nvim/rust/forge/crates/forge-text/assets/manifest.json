@@ -1,5 +1,5 @@
 {
-  "revision": "en-US-bigram-4",
+  "revision": "en-US-bigram-5",
   "upstream_revision": "62131c2ca5bfd7fe8432e28b17b24dd98d959ee0",
   "assets": [
     {
@@ -11,6 +11,17 @@
       "path": "frequency_bigramdictionary_en_243_342.txt",
       "sha256": "c7775c2d4d25930146ae07de85c228330f9b8b6a81c3cc8f6fa52e10246e3de8",
       "source": "https://github.com/wolfgarbe/symspell_rs/blob/62131c2ca5bfd7fe8432e28b17b24dd98d959ee0/data/frequency_bigramdictionary_en_243_342.txt"
+    },
+    {
+      "path": "harper-3.2.0.txt",
+      "sha256": "74ea4c41b0279cb3d59a5d7279b8d458eb4dc0984971cdc4fdd2f9aae301efdd",
+      "source": "https://github.com/Automattic/harper/releases/tag/v3.2.0",
+      "upstream_revision": "ea9ab1b8f95be99a5d4040c53be92a6c2ad7f7f3",
+      "export": "harper-cli 3.2.0 words; decode quoted strings, lowercase, deduplicate, sort, LF",
+      "words": 135845,
+      "role": "protected vocabulary only; no frequency or candidate weights",
+      "license": "Apache-2.0; Harper-LICENSE.txt",
+      "windows_export_archive_sha256": "7dee303ef1f79f7930abd479d6cba18a42055f8a5b77ba3c3afe2f13ac4ecb50"
     }
   ],
   "model": {

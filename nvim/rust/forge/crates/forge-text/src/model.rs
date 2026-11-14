@@ -13,14 +13,17 @@ use symspell_rs::{SymSpell, Verbosity};
 
 const UNIGRAM: &[u8] = include_bytes!("../assets/frequency_dictionary_en_82_765.txt");
 const BIGRAM: &[u8] = include_bytes!("../assets/frequency_bigramdictionary_en_243_342.txt");
+const HARPER_VOCABULARY: &str = include_str!("../assets/harper-3.2.0.txt");
 const UNIGRAM_CHECKSUM: &str = "5eb7d9ca29ba3aee23d11b8b3d3aa048d7e94538b468eeffd9e07f76de7d5125";
 const BIGRAM_CHECKSUM: &str = "c7775c2d4d25930146ae07de85c228330f9b8b6a81c3cc8f6fa52e10246e3de8";
-pub(crate) const MODEL_REVISION: &str = "en-US-bigram-4";
+const HARPER_CHECKSUM: &str = "74ea4c41b0279cb3d59a5d7279b8d458eb4dc0984971cdc4fdd2f9aae301efdd";
+pub(crate) const MODEL_REVISION: &str = "en-US-bigram-5";
 
 /// Own the validated immutable lexical and contextual base shared by terminology profiles.
 pub(crate) struct Model {
     dictionary: SymSpell,
     unigram: HashMap<String, f64>,
+    recognized: HashSet<&'static str>,
     bigram: HashMap<(String, String), f64>,
     predecessor: HashMap<String, f64>,
     total: f64,
@@ -41,6 +44,18 @@ impl Model {
         let mut predecessor = HashMap::new();
         let mut digest = Sha256::new();
         let mut total = 0.0;
+        if format!("{:x}", Sha256::digest(HARPER_VOCABULARY.as_bytes())) != HARPER_CHECKSUM {
+            return Err(TextError::Checksum);
+        }
+        let mut recognized = HashSet::new();
+        for word in HARPER_VOCABULARY.lines() {
+            if closed.load(Ordering::Acquire) {
+                return Err(TextError::Closed);
+            }
+            recognized.insert(word);
+        }
+        digest.update(HARPER_VOCABULARY.as_bytes());
+        digest.update([0]);
         for (ordinal, line) in unigram.lines().enumerate() {
             if closed.load(Ordering::Acquire) {
                 return Err(TextError::Closed);
@@ -114,6 +129,7 @@ impl Model {
         Ok(Self {
             dictionary,
             unigram: frequencies,
+            recognized,
             bigram: contexts,
             predecessor,
             total,
@@ -133,7 +149,7 @@ impl Model {
         Self::load(Cursor::new(UNIGRAM), Cursor::new(BIGRAM), closed)
     }
 
-    /// Get the content identity of both validated dictionaries.
+    /// Get the content identity of the frequency model and protected vocabulary.
     pub(crate) fn revision(&self) -> &str {
         &self.revision
     }
@@ -164,8 +180,9 @@ impl Model {
         }
         let normalized = original.to_lowercase();
         let canonical = normalized.replace('\u{2019}', "'");
-        let protected_word =
-            self.unigram.contains_key(&canonical) || terminology.contains(&normalized);
+        let protected_word = self.unigram.contains_key(&canonical)
+            || self.recognized.contains(canonical.as_str())
+            || terminology.contains(&normalized);
         let mut candidates = self.candidates.get(&normalized).unwrap_or_else(|| {
             let candidates =
                 self.dictionary
@@ -426,5 +443,63 @@ mod tests {
             decide("Please RECIEVE the package near Ω.", "RECIEVE"),
             "RECEIVE"
         );
+    }
+
+    /// Preserve Harper-recognized interjections that are absent from frequency data.
+    #[test]
+    fn harper_vocabulary_protects_interjections() {
+        for (context, target, expected) in [
+            ("oh ", "oh", "Oh"),
+            ("Oh ", "Oh", "Oh"),
+            ("well oh ", "oh", "oh"),
+            ("and oh ", "oh", "oh"),
+            ("Please say ah ", "ah", "ah"),
+            ("Please say uh ", "uh", "uh"),
+            (
+                "Please keep microframeworks ",
+                "microframeworks",
+                "microframeworks",
+            ),
+            (
+                "Please keep rearchitected ",
+                "rearchitected",
+                "rearchitected",
+            ),
+            ("Please keep uncommented ", "uncommented", "uncommented"),
+        ] {
+            assert_eq!(decide(context, target), expected, "{context}");
+        }
+        assert_eq!(decide("Please recieve ", "recieve"), "receive");
+        assert_eq!(decide("Please dont ", "dont"), "don't");
+        assert_eq!(decide("Please i ", "i"), "I");
+    }
+
+    /// Keep the bundled protection vocabulary when callers replace the frequency assets.
+    #[test]
+    fn custom_frequency_assets_preserve_harper_words() {
+        let model = Model::load(
+            Cursor::new("the 100\noch 10\n"),
+            Cursor::new("the och 10\n"),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let decision = model
+            .correct(
+                CorrectRequest {
+                    profile: ProfileId::new("custom".into()).unwrap(),
+                    profile_revision: "revision".into(),
+                    occurrence: OccurrenceId::try_from("occurrence".to_owned()).unwrap(),
+                    context: "the oh ".into(),
+                    target: ByteRange { start: 4, end: 6 },
+                    protected: Vec::new(),
+                },
+                &HashSet::new(),
+                None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(matches!(decision, CorrectionDecision::Unchanged { .. }));
+        assert!(!model.unigram.contains_key("oh"));
+        assert_eq!(model.total, 110.0);
     }
 }

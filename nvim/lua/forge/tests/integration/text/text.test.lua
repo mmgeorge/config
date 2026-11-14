@@ -644,6 +644,15 @@ T["wordlist"] = function()
       {'This is too much.','too','too'},
       {'Say i’ll','i’ll','I’ll'},
       {'Say don’t','don’t','don’t'},
+      {'oh ','oh','Oh'},
+      {'Oh ','Oh','Oh'},
+      {'well oh ','oh','oh'},
+      {'and oh ','oh','oh'},
+      {'Please say ah ','ah','ah'},
+      {'Please say uh ','uh','uh'},
+      {'Please keep microframeworks ','microframeworks','microframeworks'},
+      {'Please keep rearchitected ','rearchitected','rearchitected'},
+      {'Please keep uncommented ','uncommented','uncommented'},
     }
     text_dictionary_gate={remaining=#cases,errors={}}
     for index,case in ipairs(cases) do

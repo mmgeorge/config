@@ -54,7 +54,14 @@ Each connection admits at most 64 request tasks. Ordinary requests can occupy 63
 
 `HarnessService` is constructed lazily and owns session controllers and fork gates. Shutdown closes admission, signals controllers, waits for dispatches and forks, then releases every lease. Background generation shuts down concurrently under the same deadline, so a slow Background task reports its own timeout without skipping the session owners. Both executable entry points finish through `shutdown::run`, which bounds executor teardown to 100 ms. That timeout releases the thread but cannot stop native work, so feature owners must persist required outcomes before returning.
 
+## Local text correction
+
+`forge-text` protects the union of configured terminology, SymSpell's frequency vocabulary, and the bundled expanded Harper 3.2.0 vocabulary before ranking spelling replacements. Harper's snapshot contains inflected forms exported by the upstream CLI and affects recognition only; SymSpell continues to own spelling candidates and frequency scores. Explicit contraction and capitalization rules still apply to recognized words.
+
+The model validates the bundled vocabulary checksum during initialization, including profiles with custom frequency files, and includes its bytes in the dictionary revision. Profiles and editor occurrences carry that revision, so results from another vocabulary cannot apply to the current input. The snapshot is compiled into the executable, uses no runtime network or Harper process, and leaves persistent user settings and personal vocabulary untouched; see [text correction](../../../docs/forge/text-correction.md) and the [asset provenance](../../../rust/forge/crates/forge-text/assets/LICENSES.md).
+
 ## MCP endpoint
+
 
 `forge mcp` is the stateless control-tool transport. It processes one request at a time and writes each complete response as one newline-terminated record. It creates no Harness session, launches no provider, and does not use Neovim's chunked transfer or receive credit.
 
