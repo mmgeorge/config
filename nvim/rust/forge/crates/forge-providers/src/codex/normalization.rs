@@ -200,6 +200,17 @@ impl CodexNormalization {
         Ok(address)
     }
 
+    /// Resolve the host item admitted for one native tool call in a host turn.
+    ///
+    /// Native callbacks such as approvals name the native item ID only. Codex announces each
+    /// item before requesting its approval, so the item is admitted by then; a callback that
+    /// names an unadmitted item resolves to `None`.
+    pub(super) fn tool_item_id(&self, turn_id: &TurnId, native_item_id: &str) -> Option<ItemId> {
+        self.items
+            .get(&(turn_id.clone(), native_item_id.to_owned(), ItemPart::Tool))
+            .map(|item| item.id.clone())
+    }
+
     /// Identify a native turn that a host session operation, not an invocation, owns.
     fn operation_turn(&self, params: &Value) -> bool {
         let Some(thread) = pointer_string(params, &["/threadId", "/thread_id"]) else {

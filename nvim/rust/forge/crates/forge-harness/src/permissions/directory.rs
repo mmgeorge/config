@@ -304,6 +304,7 @@ mod test {
             let mut request = PermissionRequest {
                 id: "write".into(),
                 provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+                subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                 reason: None,
                 target_list: vec![PermissionTarget::Write {
                     path: path.display().to_string(),
@@ -358,6 +359,7 @@ mod test {
                     id: "write".into(),
                     provider: forge_provider_api::ProviderId::new("test")
                         .expect("static provider identity is valid"),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                     reason: None,
                     target_list: vec![target],
                 };
@@ -390,6 +392,7 @@ mod test {
                 id: "file".into(),
                 provider: forge_provider_api::ProviderId::new("test")
                     .expect("static provider identity is valid"),
+                subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                 reason: None,
                 target_list: vec![PermissionTarget::Read {
                     path: "blocked/new-file".into(),
@@ -542,6 +545,7 @@ mod test {
             id: "file".into(),
             provider: forge_provider_api::ProviderId::new("test")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: first.join("file").display().to_string(),

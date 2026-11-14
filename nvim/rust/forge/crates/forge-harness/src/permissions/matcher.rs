@@ -332,6 +332,7 @@ mod test {
                     .evaluate(&PermissionRequest {
                         id: "git-adapter".into(),
                         provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                        subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: command.into(),
@@ -358,6 +359,7 @@ mod test {
                 .evaluate(&PermissionRequest {
                     id: "git-source".into(),
                     provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                     reason: None,
                     target_list: vec![PermissionTarget::Command {
                         command: command.into(),
@@ -421,6 +423,7 @@ mod test {
                 .evaluate(&PermissionRequest {
                     id: "git-options".into(),
                     provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                     reason: None,
                     target_list: vec![PermissionTarget::Command {
                         command: command.into(),
@@ -456,6 +459,7 @@ mod test {
                 .evaluate(&PermissionRequest {
                     id: "git-context".into(),
                     provider: forge_provider_api::ProviderId::new("test").unwrap(),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                     reason: None,
                     target_list: vec![PermissionTarget::Command {
                         command: command.into(),
@@ -473,6 +477,7 @@ mod test {
         let request = |target| PermissionRequest {
             id: "built-in".into(),
             provider: forge_provider_api::ProviderId::new("fixture").unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![target],
         };
@@ -530,6 +535,7 @@ mod test {
         let request = PermissionRequest {
             id: "unknown".into(),
             provider: forge_provider_api::ProviderId::new("fixture").unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Unknown],
         };
@@ -556,6 +562,7 @@ mod test {
                 id: "nushell-file".into(),
                 provider: forge_provider_api::ProviderId::new("test")
                     .expect("static provider identity is valid"),
+                subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                 reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: command.into(),
@@ -578,6 +585,7 @@ mod test {
             id: "1".into(),
             provider: forge_provider_api::ProviderId::new("test")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: String::new(),

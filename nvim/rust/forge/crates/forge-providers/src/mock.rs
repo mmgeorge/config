@@ -7,7 +7,7 @@ use forge_provider_api::{
     approval::ApprovalMode,
     compaction::CompactionResult,
     events::{self, ProviderEventSink},
-    permissions::{PermissionRequest, PermissionResponse, PermissionTarget},
+    permissions::{PermissionRequest, PermissionResponse, PermissionSubject, PermissionTarget},
     provider::Provider,
     session::{
         BindingId, InputAcceptance, PromptRequest, RecoveryToken, SessionBinding, SessionRequest,
@@ -3249,9 +3249,11 @@ async fn run_file_write(
 ) -> Result<(), ProviderError> {
     ensure_open(session, ProviderOperation::TurnStart)?;
     request.permissions.before_tool(&request.scope).await?;
+    // The edit's item is admitted only after its write is authorized.
     let permission = PermissionRequest {
         id: uuid::Uuid::new_v4().to_string(),
         provider: ProviderId::new("mock").expect("static provider identity is valid"),
+        subject: PermissionSubject::Unattached,
         reason: None,
         target_list: vec![PermissionTarget::Write { path: path.clone() }],
     };
@@ -3405,6 +3407,7 @@ async fn run_tool_call(
     let permission = PermissionRequest {
         id: uuid::Uuid::new_v4().to_string(),
         provider: ProviderId::new("mock").expect("mock ID is valid"),
+        subject: PermissionSubject::Tool(item_id.clone()),
         reason: None,
         target_list: vec![PermissionTarget::HostTool { name: name.into() }],
     };

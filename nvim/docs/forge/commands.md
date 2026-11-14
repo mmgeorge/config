@@ -725,10 +725,16 @@ shell commands. Output and progress do not extend a deadline. Expiry records an
 error and stops execution; it does not retry the command. Check commands use the
 same policy and stop the remaining check run on expiry. Changing this setting
 applies to subsequent provider turns and newly started check commands. A running
-invocation retains its captured deadline.
+invocation retains its captured deadline. Time a tool spends waiting for your
+approval does not count against this deadline: the deadline pauses while the
+approval is pending and resumes with its remaining time afterwards. Approvals
+that Harness tools raise for their own work, such as checks and plan capture,
+do not pause it.
 
-Approval timeouts run independently of the picker. An idle session has no periodic
-timeout check. Changing a timeout affects future approvals without
+Approval timeouts run independently of the picker. An expired approval rejects
+that one request, not your instruction: the agent receives the rejection and
+continues the requested work in a follow-up turn without asking you to confirm.
+An idle session has no periodic timeout check. Changing a timeout affects future approvals without
 extending an existing deadline. Ordinary submitted messages update the display
 immediately, then Harness starts, steers, or queues them according to the actual
 execution state. Queue editing remains local while an asynchronous reservation

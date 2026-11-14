@@ -114,8 +114,25 @@ pub enum PermissionTarget {
 pub struct PermissionRequest {
     pub id: String,
     pub provider: crate::ProviderId,
+    /// Identify the tool call this approval gates, so Harness can relate the wait to that tool.
+    pub subject: PermissionSubject,
     pub reason: Option<String>,
     pub target_list: Vec<PermissionTarget>,
+}
+
+/// Name what a permission request gates, using host identities rather than native ones.
+///
+/// Every adapter allocates its own host `ItemId` for each native tool call and keeps the
+/// native-to-host mapping private. An adapter that can attribute an approval to an admitted tool
+/// item must report that item, because Harness cannot recover the relationship from native IDs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "item_id", rename_all = "snake_case")]
+pub enum PermissionSubject {
+    /// Gate the tool item that carried this `ItemId` in its `ItemEvent::Started`.
+    Tool(crate::ItemId),
+    /// Gate no admitted tool item, such as a session-level grant, a host policy evaluation, or a
+    /// native request that arrived before its tool item was admitted.
+    Unattached,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

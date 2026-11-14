@@ -1264,6 +1264,11 @@ impl CopilotEventDecoder {
         };
         sink.send_wait(address.clone().activity(tool_start(&invocation)))
             .await?;
+        if let Some(callbacks) = &self.callbacks {
+            callbacks
+                .observe_native_tool_item(&id, &address.item_id)
+                .await;
+        }
         let input = self.pending_input.remove(&key).unwrap_or_default();
         if !input.is_empty() {
             sink.send_wait(address.clone().activity(ItemEvent::Tool {

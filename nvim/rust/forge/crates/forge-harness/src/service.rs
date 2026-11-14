@@ -1603,7 +1603,19 @@ impl SessionController {
                     biased;
                     changed = schedule.changed() => { if changed.is_err() { return; } continue; }
                     changed = feedback.changed() => { if changed.is_err() { return; } attempted = None; continue; }
-                    changed = cancellation.changed() => { if changed.is_err() { return; } attempted = None; continue; }
+                    changed = cancellation.changed() => {
+                        // `TurnCancellation::arm` installs a fresh signal for every invocation and
+                        // closes the one this watcher observed, so a closed signal means a new
+                        // turn began, not that the session ended. Follow the current invocation.
+                        if changed.is_err() {
+                            let Some(controller) = controller.upgrade() else {
+                                return;
+                            };
+                            cancellation = controller.cancellation.subscribe();
+                        }
+                        attempted = None;
+                        continue;
+                    }
                     () = ready => {}
                 }
                 let Some(controller) = controller.upgrade() else {

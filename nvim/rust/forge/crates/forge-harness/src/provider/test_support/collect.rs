@@ -62,6 +62,27 @@ impl ProviderTestSession {
         let permissions = Arc::new(harness::provider::approval::PermissionCoordinator::new(
             permission_store,
         ));
+        Self::with_permissions(registration, permissions, directory)
+    }
+
+    /// Wrap a native provider around a session's own permission coordinator, as production does,
+    /// so approval timeouts leave their continuation feedback where the session reads it.
+    pub fn from_native_with_permissions(
+        native: Arc<super::fixture::EventFixtureProvider>,
+        permissions: Arc<harness::provider::approval::PermissionCoordinator>,
+    ) -> anyhow::Result<Self> {
+        Self::with_permissions(
+            native.registration(),
+            permissions,
+            Arc::new(tempfile::tempdir()?),
+        )
+    }
+
+    fn with_permissions(
+        registration: forge_providers::registry::RegisteredProvider,
+        permissions: Arc<harness::provider::approval::PermissionCoordinator>,
+        directory: Arc<tempfile::TempDir>,
+    ) -> anyhow::Result<Self> {
         let trace = Arc::new(harness::trace::TraceStore::open(directory.path())?);
         let provider = Arc::new(harness::provider::Provider::new(
             registration,

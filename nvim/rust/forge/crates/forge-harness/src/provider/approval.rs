@@ -17,6 +17,7 @@ use crate::provider::host_event::*;
 use crate::session::{ApprovalMode, InputTimeout, ResolutionSource};
 use anyhow::{Context, Result};
 use forge_provider_api::SanitizedMessage;
+use forge_provider_api::permissions::PermissionSubject;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,6 +26,8 @@ use uuid::Uuid;
 
 /// Retain the original execution's publication, policy, and revocation authority while approval waits.
 struct ApprovalExecution<'scope> {
+    /// Tool item the approval gates, which narrows its published scope to that item.
+    subject: PermissionSubject,
     address: Option<crate::provider::TurnAddress>,
     event_sink: Option<&'scope HarnessEventSink>,
     directory_policy: Option<Arc<DirectoryPolicy>>,
@@ -592,6 +595,7 @@ impl PermissionCoordinator {
                     let mut canonical = PermissionRequest {
                         id: request.id.clone(),
                         provider: request.provider.clone(),
+                        subject: request.subject.clone(),
                         reason: None,
                         target_list: canonical
                             .into_iter()
@@ -770,6 +774,7 @@ impl PermissionCoordinator {
             view,
             evaluation.pending_target_list,
             ApprovalExecution {
+                subject: request.subject.clone(),
                 address,
                 event_sink,
                 directory_policy,
@@ -833,6 +838,7 @@ impl PermissionCoordinator {
                 name: "review_proposal".into(),
             }],
             ApprovalExecution {
+                subject: PermissionSubject::Unattached,
                 address: None,
                 event_sink: Some(event_sink),
                 directory_policy: None,
@@ -851,6 +857,7 @@ impl PermissionCoordinator {
         execution: ApprovalExecution<'_>,
     ) -> Result<ApprovalResolution> {
         let ApprovalExecution {
+            subject,
             address,
             event_sink,
             directory_policy,
@@ -885,7 +892,8 @@ impl PermissionCoordinator {
                 .as_millis(),
         )?;
         view.deadline = timeout.deadline(now_ms)?;
-        let presentation = permission_request(&view, targets, address.as_ref(), event_sink)?;
+        let presentation =
+            permission_request(&view, &subject, targets, address.as_ref(), event_sink)?;
         let expires = tokio::time::Instant::now() + timeout.duration();
         let (sender, mut receiver) = oneshot::channel();
         let token = Uuid::new_v4();
@@ -1364,15 +1372,9 @@ impl PermissionCoordinator {
         let Some(sink) = sink else {
             return Ok(());
         };
-        let scope = match address {
-            Some(address) => ApprovalScope::Turn {
-                thread_id: address.thread_id.clone(),
-                turn_id: address.turn_id.clone(),
-            },
-            None => ApprovalScope::Thread {
-                thread_id: sink.scope().owner().thread_id(),
-            },
-        };
+        let scope = approval_scope(&request.subject, address, Some(sink), || {
+            Ok(sink.scope().owner().thread_id())
+        })?;
         let choice = ApprovalChoice {
             id: "automatic".into(),
             label: "Automatic permission decision".into(),
@@ -1755,27 +1757,61 @@ pub use super::approval_view::{
     ApprovalResolution,
 };
 
+/// Address an approval to the narrowest owner it can name.
+///
+/// A request that names its tool item addresses that item within its turn, taken from the
+/// explicit turn address or, for a provider callback, from the requesting invocation. The tool
+/// watchdog relies on this scope to suspend the item's deadline while the approval is pending.
+/// Every other request keeps its turn scope, or its thread scope when no turn is known.
+fn approval_scope(
+    subject: &PermissionSubject,
+    address: Option<&crate::provider::TurnAddress>,
+    sink: Option<&HarnessEventSink>,
+    thread_id: impl FnOnce() -> Result<forge_provider_api::ThreadId>,
+) -> Result<ApprovalScope> {
+    let turn = match (
+        address,
+        subject,
+        sink.and_then(|sink| sink.scope().invocation()),
+    ) {
+        (Some(address), _, _) => Some((address.thread_id.clone(), address.turn_id.clone())),
+        (None, PermissionSubject::Tool(_), Some(invocation)) => Some((
+            invocation.thread_id.clone(),
+            invocation
+                .turn_id()
+                .context("approval invocation has no turn identity")?,
+        )),
+        (None, _, _) => None,
+    };
+    Ok(match (subject, turn) {
+        (PermissionSubject::Tool(item_id), Some((thread_id, turn_id))) => ApprovalScope::Item {
+            thread_id,
+            turn_id,
+            item_id: item_id.clone(),
+        },
+        (_, Some((thread_id, turn_id))) => ApprovalScope::Turn { thread_id, turn_id },
+        (_, None) => ApprovalScope::Thread {
+            thread_id: thread_id()?,
+        },
+    })
+}
+
 /// Capture the immutable permission owner and independently identified target choices.
 fn permission_request(
     view: &ApprovalRequestView,
+    subject: &PermissionSubject,
     targets: Vec<PermissionTarget>,
     address: Option<&crate::provider::TurnAddress>,
     sink: Option<&HarnessEventSink>,
 ) -> Result<PermissionApprovalRequest> {
-    let scope = match address {
-        Some(address) => ApprovalScope::Turn {
-            thread_id: address.thread_id.clone(),
-            turn_id: address.turn_id.clone(),
-        },
-        None => ApprovalScope::Thread {
-            thread_id: view
-                .execution_owner
-                .clone()
-                .or_else(|| sink.map(|sink| sink.scope().owner()))
-                .context("approval has no original owner")?
-                .thread_id(),
-        },
-    };
+    let scope = approval_scope(subject, address, sink, || {
+        Ok(view
+            .execution_owner
+            .clone()
+            .or_else(|| sink.map(|sink| sink.scope().owner()))
+            .context("approval has no original owner")?
+            .thread_id())
+    })?;
     anyhow::ensure!(
         targets.len() == view.item_list.len(),
         "approval targets do not match presentation items"
@@ -1898,10 +1934,47 @@ mod test {
         }
     }
 
+    /// A provider callback that names its tool item addresses that item, so the tool watchdog
+    /// can suspend exactly that tool's deadline; other callbacks keep their thread scope.
+    #[test]
+    fn provider_callback_approval_addresses_the_tool_item_it_names() {
+        use forge_provider_api::permissions::PermissionSubject;
+        let (sink, _events) = crate::provider::events::channel(scope());
+        let owner_thread = || Ok(scope().thread_id);
+        let item_id = forge_provider_api::ItemId::new("host-command").unwrap();
+        let named = super::approval_scope(
+            &PermissionSubject::Tool(item_id.clone()),
+            None,
+            Some(&sink),
+            owner_thread,
+        )
+        .unwrap();
+        assert!(
+            matches!(&named, super::ApprovalScope::Item {
+                thread_id, turn_id, item_id: scoped,
+            } if *thread_id == scope().thread_id
+                && *turn_id == scope().turn_id().unwrap()
+                && *scoped == item_id),
+            "{named:?}"
+        );
+        let unattached = super::approval_scope(
+            &PermissionSubject::Unattached,
+            None,
+            Some(&sink),
+            owner_thread,
+        )
+        .unwrap();
+        assert!(
+            matches!(unattached, super::ApprovalScope::Thread { .. }),
+            "{unattached:?}"
+        );
+    }
+
     fn normalized_permission(id: &str, target_list: Vec<PermissionTarget>) -> PermissionRequest {
         PermissionRequest {
             id: id.into(),
             provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list,
         }
@@ -2319,6 +2392,7 @@ mod test {
         let invalid = PermissionRequest {
             id: "invalid".into(),
             provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: String::new(),
@@ -2361,6 +2435,7 @@ mod test {
                 let request = PermissionRequest {
                     id: "parse-error".into(),
                     provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                     reason: None,
                     target_list: vec![PermissionTarget::Command {
                         command: "probe 'unfinished".into(),
@@ -2390,6 +2465,7 @@ mod test {
             let corrected = PermissionRequest {
                 id: "parse-error".into(),
                 provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+                subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                 reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: "probe corrected".into(),
@@ -2450,6 +2526,7 @@ mod test {
         let request = PermissionRequest {
             id: "approval-one".into(),
             provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: Some("inspect repository".into()),
             target_list: vec![PermissionTarget::Command {
                 command: "rg TODO src".into(),

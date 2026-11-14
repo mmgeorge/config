@@ -317,6 +317,9 @@ struct CallbackRouter {
     native_calls: RwLock<HashMap<String, InvocationCallbacks>>,
     retired_native_calls: RwLock<HashSet<String>>,
     observed_call_owners: RwLock<HashMap<String, TurnAddress>>,
+    /// Host tool item the event decoder admitted for each native call, so a permission request
+    /// that names only the native call can identify the tool it gates.
+    native_call_items: RwLock<HashMap<String, forge_provider_api::ItemId>>,
     observed_agents: RwLock<HashMap<forge_provider_api::InvocationScope, InvocationCallbacks>>,
     child_resources:
         RwLock<HashMap<forge_provider_api::InvocationScope, super::child_turn::ChildResources>>,
@@ -638,6 +641,7 @@ impl CallbackRouter {
         self.retired_native_calls.write().await.extend(retired);
         self.native_calls.write().await.clear();
         self.observed_call_owners.write().await.clear();
+        self.native_call_items.write().await.clear();
         self.observed_agents.write().await.clear();
         self.child_resources.write().await.clear();
         Ok(())
@@ -1052,6 +1056,10 @@ impl NativeCallbackRouter for CallbackRouter {
         let Ok(mut callback) = self.begin_native_callback(Some(call_id)).await else {
             return PermissionResponse::Cancelled;
         };
+        if let Some(item_id) = self.native_call_items.read().await.get(call_id) {
+            request.subject =
+                forge_provider_api::permissions::PermissionSubject::Tool(item_id.clone());
+        }
         for target in &mut request.target_list {
             if let forge_provider_api::permissions::PermissionTarget::Mcp { target } = target {
                 let Some(canonical) = self.canonical_mcp_target(target).await else {
@@ -1254,6 +1262,7 @@ impl NativeCallbackRouter for CallbackRouter {
         }
         let callbacks = calls.remove(call_id);
         self.observed_call_owners.write().await.remove(call_id);
+        self.native_call_items.write().await.remove(call_id);
         self.retired_native_calls
             .write()
             .await
@@ -1272,10 +1281,18 @@ impl NativeCallbackRouter for CallbackRouter {
             .insert(call_id.to_owned());
         let callbacks = self.native_calls.write().await.remove(call_id);
         self.observed_call_owners.write().await.remove(call_id);
+        self.native_call_items.write().await.remove(call_id);
         if let Some(callbacks) = callbacks {
             self.prune_settled_scope(&callbacks.scope, callbacks.generation)
                 .await;
         }
+    }
+
+    async fn observe_native_tool_item(&self, call_id: &str, item_id: &forge_provider_api::ItemId) {
+        self.native_call_items
+            .write()
+            .await
+            .insert(call_id.to_owned(), item_id.clone());
     }
 }
 
@@ -1659,6 +1676,13 @@ pub(super) trait NativeCallbackRouter: Send + Sync {
         self.release_native_call(call_id).await;
     }
     async fn release_native_call(&self, call_id: &str);
+    /// Record the host tool item the decoder admitted for one native call.
+    ///
+    /// Copilot permission requests name only the native call, so the router resolves the gated
+    /// tool item from this record when the request arrives.
+    async fn observe_native_tool_item(&self, call_id: &str, item_id: &forge_provider_api::ItemId) {
+        let _ = (call_id, item_id);
+    }
 }
 
 pub(super) struct NoopNativeCallbacks;
@@ -5003,6 +5027,7 @@ mod callback_tests {
         let request = PermissionRequest {
             id: "child-permission".into(),
             provider: forge_provider_api::ProviderId::new("copilot").unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![forge_provider_api::permissions::PermissionTarget::Unknown],
         };

@@ -15,7 +15,7 @@ use super::wire::stdout::{
     StreamEvent, SystemFrame, UserFrame,
 };
 use async_trait::async_trait;
-use forge_provider_api::permissions::{PermissionRequest, PermissionResponse};
+use forge_provider_api::permissions::{PermissionRequest, PermissionResponse, PermissionSubject};
 use forge_provider_api::*;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -1242,9 +1242,20 @@ impl ClaudeSessionState {
         let authorizing = async {
             self.observe_native_start(timestamp()).await.ok()?;
             permissions.before_tool(&active.address.scope).await.ok()?;
+            // The decoder admits each `tool_use` block before Claude asks to run it.
+            let subject = self
+                .decoder
+                .lock()
+                .await
+                .tools
+                .get(&tool_use_id)
+                .map_or(PermissionSubject::Unattached, |tool| {
+                    PermissionSubject::Tool(tool.item_id.clone())
+                });
             let request = PermissionRequest {
                 id: uuid::Uuid::new_v4().to_string(),
                 provider: ProviderId::new("claude").ok()?,
+                subject,
                 reason: permission
                     .decision_reason
                     .clone()

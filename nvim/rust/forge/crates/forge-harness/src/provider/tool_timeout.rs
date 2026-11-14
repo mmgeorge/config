@@ -1,7 +1,7 @@
 use super::{HarnessEvent, ProviderEvent, ToolAddress};
 use anyhow::{Result, anyhow};
 use forge_provider_api::{ItemCompletion, ItemEvent, ItemStart, ToolItemEvent, TurnEvent};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -36,10 +36,38 @@ enum ToolDeadline {
         title: String,
         background: bool,
     },
+    /// Suspend the deadline while Harness waits for a decision on this tool's approval.
+    ///
+    /// Providers announce a tool before asking to run it, so a running deadline would otherwise
+    /// charge the user's decision time to the tool and could stop the turn before the approval's
+    /// own timeout resolves it. The deadline resumes with `remaining` once every approval in
+    /// `approval_list` is resolved or cancelled.
+    AwaitingApproval {
+        remaining: Duration,
+        title: String,
+        background: bool,
+        approval_list: BTreeSet<String>,
+    },
     UserInput,
     /// Discovery's check owner enforces its deadline and collects children before replying.
     CheckDiscovery,
     Finished,
+}
+
+impl ToolDeadline {
+    /// Report whether this deadline belongs to foreground execution, which ends with its turn.
+    fn is_foreground(&self) -> bool {
+        matches!(
+            self,
+            Self::Running {
+                background: false,
+                ..
+            } | Self::AwaitingApproval {
+                background: false,
+                ..
+            }
+        )
+    }
 }
 
 /// Hold foreground ownership of timeout collection until the foreground transaction ends.
@@ -111,6 +139,13 @@ impl ToolWatchdog {
 
     /// Track execution deadlines while leaving explicit waits for user answers unbounded.
     pub(crate) fn observe(&self, observation: &HarnessEvent) -> Result<()> {
+        if let HarnessEvent::Host {
+            scope,
+            event: super::HostEvent::PermissionApproval { event, .. },
+        } = observation
+        {
+            return self.observe_approval(scope, event);
+        }
         let HarnessEvent::Native { scope, event, .. } = observation else {
             return Ok(());
         };
@@ -218,8 +253,10 @@ impl ToolWatchdog {
             ItemEvent::Tool {
                 event: ToolItemEvent::TitleChanged(title),
             } => {
-                if let Some(ToolDeadline::Running { title: current, .. }) =
-                    state.tools.get_mut(&address)
+                if let Some(
+                    ToolDeadline::Running { title: current, .. }
+                    | ToolDeadline::AwaitingApproval { title: current, .. },
+                ) = state.tools.get_mut(&address)
                 {
                     current.clone_from(title);
                 }
@@ -227,15 +264,21 @@ impl ToolWatchdog {
             ItemEvent::Tool {
                 event: ToolItemEvent::DescriptorUpdated(descriptor),
             } => {
-                if let Some(ToolDeadline::Running { title, .. }) = state.tools.get_mut(&address) {
+                if let Some(
+                    ToolDeadline::Running { title, .. }
+                    | ToolDeadline::AwaitingApproval { title, .. },
+                ) = state.tools.get_mut(&address)
+                {
                     title.clone_from(&descriptor.title);
                 }
             }
             ItemEvent::Tool {
                 event: ToolItemEvent::Backgrounded,
             } => {
-                if let Some(ToolDeadline::Running { background, .. }) =
-                    state.tools.get_mut(&address)
+                if let Some(
+                    ToolDeadline::Running { background, .. }
+                    | ToolDeadline::AwaitingApproval { background, .. },
+                ) = state.tools.get_mut(&address)
                 {
                     *background = true;
                 }
@@ -253,6 +296,123 @@ impl ToolWatchdog {
                 event:
                     ToolItemEvent::Input(_) | ToolItemEvent::Output(_) | ToolItemEvent::Changes(_),
             } => {}
+        }
+        drop(state);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Suspend a tool's deadline while its approval is pending and resume it once resolved.
+    ///
+    /// Only approvals scoped to an item identify the tool they gate. The item is matched by its
+    /// invocation and host item identity, which adapters allocate uniquely per tool call.
+    fn observe_approval(
+        &self,
+        scope: &super::EventScope,
+        event: &super::PermissionApprovalEvent,
+    ) -> Result<()> {
+        let Some(invocation) = scope.invocation() else {
+            return Ok(());
+        };
+        let (request_id, approval_scope, opened) = match event {
+            super::PermissionApprovalEvent::Requested(request) => {
+                (request.request_id.as_str(), &request.scope, true)
+            }
+            super::PermissionApprovalEvent::Resolved(resolution) => {
+                (resolution.request_id.as_str(), &resolution.scope, false)
+            }
+            super::PermissionApprovalEvent::Cancelled(cancellation) => {
+                (cancellation.request_id.as_str(), &cancellation.scope, false)
+            }
+        };
+        let super::ApprovalScope::Item {
+            thread_id,
+            turn_id,
+            item_id,
+        } = approval_scope
+        else {
+            return Ok(());
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+        let admitted = state
+            .tools
+            .keys()
+            .find(|address| &address.turn.scope == invocation && &address.item_id == item_id)
+            .cloned();
+        let now = Instant::now();
+        match (admitted, opened) {
+            (Some(address), true) => {
+                let deadline = state
+                    .tools
+                    .get_mut(&address)
+                    .expect("admitted deadline is present");
+                match deadline {
+                    ToolDeadline::Running {
+                        deadline: expires,
+                        title,
+                        background,
+                    } => {
+                        *deadline = ToolDeadline::AwaitingApproval {
+                            remaining: expires.saturating_duration_since(now),
+                            title: std::mem::take(title),
+                            background: *background,
+                            approval_list: BTreeSet::from([request_id.to_owned()]),
+                        };
+                    }
+                    ToolDeadline::AwaitingApproval { approval_list, .. } => {
+                        approval_list.insert(request_id.to_owned());
+                    }
+                    ToolDeadline::UserInput
+                    | ToolDeadline::CheckDiscovery
+                    | ToolDeadline::Finished => {}
+                }
+            }
+            // An approval for a tool this watchdog has not admitted yet holds the full deadline
+            // for that tool until the approval resolves.
+            (None, true) if !state.foreground_finished && !state.idle_retired => {
+                state.tools.insert(
+                    ToolAddress {
+                        turn: super::TurnAddress {
+                            scope: invocation.clone(),
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        },
+                        item_id: item_id.clone(),
+                    },
+                    ToolDeadline::AwaitingApproval {
+                        remaining: self.duration,
+                        title: item_id.to_string(),
+                        background: false,
+                        approval_list: BTreeSet::from([request_id.to_owned()]),
+                    },
+                );
+            }
+            (Some(address), false) => {
+                let deadline = state
+                    .tools
+                    .get_mut(&address)
+                    .expect("admitted deadline is present");
+                if let ToolDeadline::AwaitingApproval {
+                    remaining,
+                    title,
+                    background,
+                    approval_list,
+                } = deadline
+                {
+                    approval_list.remove(request_id);
+                    if approval_list.is_empty() {
+                        *deadline = ToolDeadline::Running {
+                            deadline: now + *remaining,
+                            title: std::mem::take(title),
+                            background: *background,
+                        };
+                    }
+                }
+            }
+            (None, _) => return Ok(()),
         }
         drop(state);
         self.changed.notify_one();
@@ -349,15 +509,7 @@ impl ToolWatchdog {
             .lock()
             .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
         for (tool, deadline) in state.tools.iter_mut() {
-            if &tool.turn == address
-                && matches!(
-                    deadline,
-                    ToolDeadline::Running {
-                        background: false,
-                        ..
-                    }
-                )
-            {
+            if &tool.turn == address && deadline.is_foreground() {
                 *deadline = ToolDeadline::Finished;
             }
         }
@@ -390,7 +542,8 @@ impl ToolWatchdog {
                         ToolDeadline::Running {
                             deadline, title, ..
                         } => Some((*deadline, address.clone(), title.clone())),
-                        ToolDeadline::UserInput
+                        ToolDeadline::AwaitingApproval { .. }
+                        | ToolDeadline::UserInput
                         | ToolDeadline::CheckDiscovery
                         | ToolDeadline::Finished => None,
                     })
@@ -429,13 +582,7 @@ impl ToolWatchdog {
         // A certified continuation can start between host commit and result delivery.
         if state.active_native.is_none() {
             for deadline in state.tools.values_mut() {
-                if matches!(
-                    deadline,
-                    ToolDeadline::Running {
-                        background: false,
-                        ..
-                    }
-                ) {
+                if deadline.is_foreground() {
                     *deadline = ToolDeadline::Finished;
                 }
             }
@@ -443,10 +590,12 @@ impl ToolWatchdog {
         }
         // Background deadlines that survive settlement belong to the session monitor.
         state.foreground_attached = false;
-        let pending = state
-            .tools
-            .values()
-            .any(|state| matches!(state, ToolDeadline::Running { .. }));
+        let pending = state.tools.values().any(|state| {
+            matches!(
+                state,
+                ToolDeadline::Running { .. } | ToolDeadline::AwaitingApproval { .. }
+            )
+        });
         drop(state);
         self.changed.notify_waiters();
         Ok(pending)
@@ -533,6 +682,113 @@ mod tests {
                 TestTool::Tool => ItemStart::ToolCall(descriptor),
             }),
         )
+    }
+
+    /// Publish one approval transition scoped to `address`'s tool item.
+    fn approval(address: &ToolAddress, request_id: &str, transition: &str) -> HarnessEvent {
+        let request_id = crate::provider::ApprovalRequestId::new(request_id).unwrap();
+        let scope = crate::provider::ApprovalScope::Item {
+            thread_id: address.turn.thread_id.clone(),
+            turn_id: address.turn.turn_id.clone(),
+            item_id: address.item_id.clone(),
+        };
+        let event = match transition {
+            "requested" => crate::provider::PermissionApprovalEvent::Requested(
+                crate::provider::PermissionApprovalRequest {
+                    request_id,
+                    scope,
+                    reason: None,
+                    targets: Vec::new(),
+                    deadline: None,
+                },
+            ),
+            "resolved" => crate::provider::PermissionApprovalEvent::Resolved(
+                crate::provider::PermissionApprovalResolution {
+                    request_id,
+                    scope,
+                    targets: Vec::new(),
+                    resolved_at_ms: 0,
+                },
+            ),
+            "cancelled" => crate::provider::PermissionApprovalEvent::Cancelled(
+                crate::provider::PermissionApprovalCancellation {
+                    request_id,
+                    scope,
+                    reason: crate::provider::ApprovalCancellationReason::UserCancelled,
+                    cancelled_at_ms: 0,
+                },
+            ),
+            other => panic!("unknown approval transition {other}"),
+        };
+        HarnessEvent::Host {
+            scope: address.turn.scope.clone().into(),
+            event: crate::provider::HostEvent::PermissionApproval {
+                execution_kind: crate::provider::ApprovalExecutionKind::Managed,
+                event,
+            },
+        }
+    }
+
+    /// Start a command the way Codex does: announced and running before its approval opens.
+    fn start_command(watchdog: &ToolWatchdog, command: &ToolAddress) -> Result<()> {
+        watchdog.observe(&requested(
+            command,
+            TestTool::Command,
+            serde_json::json!({}),
+        ))?;
+        watchdog.observe(&item(
+            command,
+            ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
+            },
+        ))
+    }
+
+    /// Time spent waiting for approval does not count toward the tool's deadline.
+    ///
+    /// The deadline keeps the time it had left when the approval opened and resumes only after
+    /// every approval for the tool resolves, whether by decision or cancellation.
+    #[tokio::test(start_paused = true)]
+    async fn approval_suspends_its_tool_deadline_until_every_approval_resolves() -> Result<()> {
+        let watchdog = watchdog()?;
+        let command = address("command");
+        start_command(&watchdog, &command)?;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        watchdog.observe(&approval(&command, "first", "requested"))?;
+        watchdog.observe(&approval(&command, "second", "requested"))?;
+        let mut pending = Box::pin(watchdog.expired());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            futures_util::poll!(pending.as_mut()).is_pending(),
+            "a pending approval let the tool deadline expire"
+        );
+        watchdog.observe(&approval(&command, "first", "resolved"))?;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            futures_util::poll!(pending.as_mut()).is_pending(),
+            "the deadline resumed while another approval was pending"
+        );
+        watchdog.observe(&approval(&command, "second", "cancelled"))?;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(
+            futures_util::poll!(pending.as_mut()).is_pending(),
+            "the resumed deadline lost the time it had left"
+        );
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert_eq!(pending.await?.unwrap().address, command);
+        Ok(())
+    }
+
+    /// An approval suspends only the tool it names.
+    #[tokio::test(start_paused = true)]
+    async fn approval_for_another_tool_leaves_running_deadlines_in_force() -> Result<()> {
+        let watchdog = watchdog()?;
+        let command = address("command");
+        start_command(&watchdog, &command)?;
+        watchdog.observe(&approval(&address("other"), "other", "requested"))?;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(watchdog.expired().await?.unwrap().address, command);
+        Ok(())
     }
 
     /// User waits and owner-timed discovery do not disable unrelated tool deadlines.

@@ -35,6 +35,7 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
             id: "matrix".into(),
             provider: forge_provider_api::ProviderId::new("test")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: source.clone(),
@@ -67,6 +68,7 @@ fn reject_matrix(shell: CommandShell, fixture_list: &[&str]) {
             id: "matrix".into(),
             provider: forge_provider_api::ProviderId::new("test")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: (*source).into(),
@@ -263,6 +265,7 @@ fn wrapper_denials_and_body_denials_cannot_be_bypassed() {
             id: "wrapper".into(),
             provider: forge_provider_api::ProviderId::new("test")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: source.into(),

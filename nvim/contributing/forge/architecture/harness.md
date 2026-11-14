@@ -92,6 +92,24 @@ each invocation's deadline once. The root broker and `AgentRuntime` stop provide
 execution when the earliest unfinished tool expires and retain the timeout as a
 failure. Output, title changes, and replayed start events cannot extend a deadline.
 
+A pending approval suspends its tool's deadline. Codex announces a command as running before it
+asks to run it, so the deadline starts before the approval opens; with both timeouts at their
+ten-minute defaults the tool deadline always fired first, interrupted the turn, cancelled the
+approval as `TurnInterrupted`, and failed the exchange. The watchdog now observes
+`PermissionApproval` events scoped to `ApprovalScope::Item`. A request moves the matching
+invocation's deadline to `AwaitingApproval` with its remaining time, and the deadline restarts
+from that remainder once every approval for the item resolves or is cancelled. An approval for an
+item the watchdog has not yet admitted holds a full-duration entry, so the later start cannot arm
+a deadline beneath the wait. Approvals without a tool subject leave every running deadline in
+force. The approval's own timeout therefore decides the wait, and its rejection continues the
+work through a permission-timeout turn.
+
+The approval-timeout watcher in `SessionController::attach_timeout` follows the current
+invocation's `TurnCancellationSignal`. `TurnCancellation::arm` installs a fresh signal for every
+turn and closes the previous one, so a closed signal means a new turn began, not that the session
+ended: the watcher resubscribes to the current signal. Exiting on that closure would end the
+watcher at the session's first turn and silently drop every later permission-timeout continuation.
+
 While a foreground attempt runs, `ForegroundWait` holds a `ForegroundToolOwner` on its
 watchdog, and the foreground is the sole collector of a timed-out turn. The inbox tool
 monitor only signals expiry and waits for that owner to release before it collects

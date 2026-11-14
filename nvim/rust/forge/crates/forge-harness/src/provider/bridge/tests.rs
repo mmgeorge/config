@@ -585,7 +585,7 @@ async fn duplicate_binding_preserves_original_registry_and_quarantines_cleanup()
         provider.sessions.lock().await.get(&first_owner).unwrap().observed_contexts.lock().unwrap().insert(child_address.turn_id.clone(), child_policy.clone());
         let mut callback = tokio::spawn(async move {
             use forge_provider_api::permissions::ProviderPermissions;
-            child_policy.authorize(&child_scope, forge_provider_api::permissions::PermissionRequest { id:"native-pending".into(),provider:forge_providers::registry::nonselectable_id().unwrap(),reason:None,target_list:vec![forge_provider_api::permissions::PermissionTarget::Tool {target:"fixture-pending-child".into()}] }).await
+            child_policy.authorize(&child_scope, forge_provider_api::permissions::PermissionRequest { id:"native-pending".into(),provider:forge_providers::registry::nonselectable_id().unwrap(),subject:forge_provider_api::permissions::PermissionSubject::Unattached,reason:None,target_list:vec![forge_provider_api::permissions::PermissionTarget::Tool {target:"fixture-pending-child".into()}] }).await
         });
         *stage.lock().unwrap() = "await child approval";
         loop {

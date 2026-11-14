@@ -122,6 +122,7 @@ mod tests {
         let request = |paths: Vec<PermissionTarget>| PermissionRequest {
             id: "permission".into(),
             provider: forge_provider_api::ProviderId::new("copilot").expect("registered identity"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: paths,
         };
@@ -181,6 +182,7 @@ mod tests {
         let request = PermissionRequest {
             id: "permission".into(),
             provider: forge_provider_api::ProviderId::new("copilot").expect("registered identity"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Write {
                 path: root.join("linked/plan.md").to_string_lossy().into_owned(),

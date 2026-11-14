@@ -13,7 +13,7 @@ use forge_provider_api::{
     events::{self, ProviderEventSink, ProviderEventStream},
     generation::ReasoningSelection,
     input::PromptInput,
-    permissions::{PermissionRequest, PermissionResponse, PermissionTarget},
+    permissions::{PermissionRequest, PermissionResponse, PermissionSubject, PermissionTarget},
     provider::Provider,
     session::{
         BindingId, InputAcceptance, ModelSelection, PromptRequest, SessionBinding, SessionRequest,
@@ -5641,6 +5641,37 @@ async fn dispatch_native_request(
     handle_native_request(session, request, message).await
 }
 
+/// Name the host tool item a native callback gates.
+///
+/// Codex callbacks carry only the native item ID, which the normalizer mapped to a host
+/// `ItemId` when the item started. A callback without a native item, or one whose item was never
+/// admitted, gates no host tool item.
+async fn callback_subject(
+    session: &CodexBinding,
+    request: &PromptRequest,
+    owner: &super::normalization::NativeCallbackOwner,
+    native_item_id: Option<&str>,
+) -> PermissionSubject {
+    let Some(native_item_id) = native_item_id else {
+        return PermissionSubject::Unattached;
+    };
+    let turn_id = match owner {
+        super::normalization::NativeCallbackOwner::Root => request.scope.turn_id().ok(),
+        super::normalization::NativeCallbackOwner::ObservedChild(child) => {
+            Some(child.turn_id.clone())
+        }
+    };
+    let Some(turn_id) = turn_id else {
+        return PermissionSubject::Unattached;
+    };
+    session
+        .normalization
+        .lock()
+        .await
+        .tool_item_id(&turn_id, native_item_id)
+        .map_or(PermissionSubject::Unattached, PermissionSubject::Tool)
+}
+
 async fn handle_native_request(
     session: &CodexBinding,
     request: &PromptRequest,
@@ -5693,6 +5724,8 @@ async fn handle_native_request(
                 let permission = PermissionRequest {
                     id: uuid::Uuid::new_v4().to_string(),
                     provider: crate::registry::select("codex").expect("Codex is registered"),
+                    subject: callback_subject(session, &request, &owner, params["callId"].as_str())
+                        .await,
                     reason: None,
                     target_list: vec![PermissionTarget::HostTool {
                         name: name.to_owned(),
@@ -5752,9 +5785,14 @@ async fn handle_native_request(
         | "item/fileChange/requestApproval"
         | "item/permissions/requestApproval"
         | "mcpServer/elicitation/request" => {
-            let prepared = session.approval_context.prepare(message).map_err(|_| {
-                failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
-            })?;
+            let subject =
+                callback_subject(session, &request, &owner, params["itemId"].as_str()).await;
+            let prepared = session
+                .approval_context
+                .prepare(message, subject)
+                .map_err(|_| {
+                    failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol)
+                })?;
             let decision = match &owner {
                 super::normalization::NativeCallbackOwner::Root => {
                     request

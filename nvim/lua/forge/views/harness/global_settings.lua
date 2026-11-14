@@ -11,7 +11,8 @@ local provider_fields = { model = true, effort = true, context_window = true, se
 local function present(value)
   if value == vim.NIL then return nil end
   if type(value) ~= "table" then return value end
-  local result = {}
+  -- Retain JSON object markers so empty resource maps stay objects when saved.
+  local result = setmetatable({}, getmetatable(value))
   for key, field in pairs(value) do result[key] = present(field) end
   return result
 end

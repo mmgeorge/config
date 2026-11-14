@@ -522,6 +522,7 @@ impl LspScope {
             id: self.interaction.clone(),
             provider: forge_provider_api::ProviderId::new("harness-lsp")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Read { path }],
         })?;

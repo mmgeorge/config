@@ -14,6 +14,8 @@ Executor and Background admission retain a catalog-validated model selection bef
 
 Direct field edits merge into the latest settings layer inside an immediate SQLite transaction. They do not reuse a revision read before another request can commit. Whole-layer replacement retains its expected-revision check. Timeout edits serialize persistence and runtime publication per session without acquiring the active task or broker lock.
 
+The global-defaults editor removes JSON nulls for presentation while preserving dictionary markers. Saving a portable setting resends the latest global layer, so empty skill and MCP selections must remain JSON objects; encoding them as arrays rejects the whole update before persistence.
+
 ## Resources
 
 `ResourceCatalog` reads MCP definitions from `config_dir/rulesync-global/.rulesync/mcp.json` and the workspace `.rulesync/mcp.json`, and skills from the matching Rulesync skill directories, without prompt bodies or credentials. Each entry carries `Global`, `Workspace`, or `Provider` scope. Applying a native import requires the reviewed fingerprint and preference revision, and imported MCP values keep references into the original file, so Forge never copies literal credentials.

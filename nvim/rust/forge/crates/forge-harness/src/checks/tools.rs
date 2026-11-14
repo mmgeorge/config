@@ -658,6 +658,7 @@ impl CheckToolScope {
                     id: uuid::Uuid::new_v4().to_string(),
                     provider: forge_provider_api::ProviderId::new("harness-checks")
                         .expect("static provider identity is valid"),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                     reason: Some("Configured project checks".into()),
                     target_list,
                 },

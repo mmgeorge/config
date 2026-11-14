@@ -42,6 +42,7 @@ pub(super) async fn execute(
             id: uuid::Uuid::new_v4().to_string(),
             provider: forge_provider_api::ProviderId::new("harness")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: Some("Capture source declarations into the planning directory".into()),
             target_list: vec![
                 PermissionTarget::Read {

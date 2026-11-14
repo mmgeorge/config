@@ -1,10 +1,17 @@
 use super::AcpKind as ProviderKind;
 use anyhow::Context;
-use forge_provider_api::permissions::{PermissionRequest, PermissionTarget};
+use forge_provider_api::permissions::{PermissionRequest, PermissionSubject, PermissionTarget};
 use serde_json::Value;
 
 /// Resolve a complete ACP tool snapshot into shared permission targets.
-pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<PermissionRequest> {
+///
+/// `subject` names the host tool item the session admitted for this tool call, which only the
+/// session can resolve.
+pub fn permission_request(
+    kind: ProviderKind,
+    tool: &Value,
+    subject: PermissionSubject,
+) -> anyhow::Result<PermissionRequest> {
     let input = &tool["rawInput"];
     let mut target_list = Vec::new();
     let mcp_target = tool.pointer("/_meta/mcp").and_then(|metadata| {
@@ -114,6 +121,7 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
     Ok(PermissionRequest {
         id: uuid::Uuid::new_v4().to_string(),
         provider: kind.id(),
+        subject,
         reason: None,
         target_list,
     })
@@ -178,6 +186,7 @@ mod tests {
                 "kind":"move","locations":[{"path":"before.rs"}],
                 "content":[{"type":"diff","path":"after.rs"}],"rawInput":{"path":"third.rs"}
             }),
+            PermissionSubject::Unattached,
         )?;
         assert_eq!(request.target_list.len(), 3);
         assert!(request.target_list.contains(&PermissionTarget::Write {
@@ -191,7 +200,8 @@ mod tests {
                 ProviderKind::Antigravity,
                 &json!({
                     "kind":"edit","locations":[{"path":"valid"},{}]
-                })
+                }),
+                PermissionSubject::Unattached,
             )
             .is_err()
         );
@@ -203,13 +213,18 @@ mod tests {
         for provider in [ProviderKind::Antigravity] {
             for kind in [Value::Null, json!("other"), json!("future")] {
                 assert!(
-                    permission_request(provider, &json!({"kind":kind, "rawInput":{"path":"file"}}))
-                        .is_err()
+                    permission_request(
+                        provider,
+                        &json!({"kind":kind, "rawInput":{"path":"file"}}),
+                        PermissionSubject::Unattached,
+                    )
+                    .is_err()
                 );
             }
             let read = permission_request(
                 provider,
                 &json!({"kind":"read", "rawInput":{"path":"file"}}),
+                PermissionSubject::Unattached,
             )
             .unwrap();
             assert!(matches!(
@@ -219,6 +234,7 @@ mod tests {
             let write = permission_request(
                 provider,
                 &json!({"kind":"edit", "rawInput":{"path":"file"}}),
+                PermissionSubject::Unattached,
             )
             .unwrap();
             assert!(matches!(

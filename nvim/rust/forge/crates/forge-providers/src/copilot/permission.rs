@@ -83,6 +83,8 @@ pub fn permission_from_copilot(
         id,
         provider: forge_provider_api::ProviderId::new("copilot")
             .expect("registered Copilot identity"),
+        // The callback router resolves the gated tool item from the request's native call.
+        subject: forge_provider_api::permissions::PermissionSubject::Unattached,
         reason: None,
         target_list,
     }

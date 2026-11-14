@@ -698,6 +698,7 @@ mod tests {
         let request = |write| PermissionRequest {
             id: "file-request".into(),
             provider: forge_providers::registry::nonselectable_id().unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![if write {
                 crate::permissions::matcher::PermissionTarget::Write {
@@ -787,6 +788,7 @@ mod tests {
         let request = || forge_provider_api::permissions::PermissionRequest {
             id: "read".into(),
             provider: forge_providers::registry::nonselectable_id().unwrap(),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![forge_provider_api::permissions::PermissionTarget::Read {
                 path: root.path().join("file.rs").to_string_lossy().into_owned(),

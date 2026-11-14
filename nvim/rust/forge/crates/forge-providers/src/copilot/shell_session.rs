@@ -217,6 +217,13 @@ impl NativeCallbackRouter for HelperCallbacks {
             target.release_native_call(call_id).await;
         }
     }
+
+    /// Forward helper tool items so helper permissions identify the tool they gate.
+    async fn observe_native_tool_item(&self, call_id: &str, item_id: &forge_provider_api::ItemId) {
+        if let Some(target) = self.target.upgrade() {
+            target.observe_native_tool_item(call_id, item_id).await;
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq)]

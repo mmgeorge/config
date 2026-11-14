@@ -969,7 +969,25 @@ impl AcpSessionState {
                     }
                 }
             }
-            let request = super::permission::permission_request(self.kind, &tool)?;
+            // The agent reports a tool call before asking to run it, which admits its host item;
+            // a request for a call that was never admitted gates no host item.
+            let subject = match item_id {
+                Some(item_id) => self
+                    .admitted_tool
+                    .lock()
+                    .await
+                    .get(&(session_id.to_owned(), item_id.to_owned()))
+                    .map_or(
+                        forge_provider_api::permissions::PermissionSubject::Unattached,
+                        |admitted| {
+                            forge_provider_api::permissions::PermissionSubject::Tool(
+                                admitted.item_id.clone(),
+                            )
+                        },
+                    ),
+                None => forge_provider_api::permissions::PermissionSubject::Unattached,
+            };
+            let request = super::permission::permission_request(self.kind, &tool, subject)?;
             let resolution = if let Some(permissions) = &permissions {
                 let decision = if child {
                     permissions

@@ -157,6 +157,7 @@ impl HarnessInspectionScope {
             id: "harness-inspection".into(),
             provider: forge_provider_api::ProviderId::new("harness")
                 .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: workspace.into(),

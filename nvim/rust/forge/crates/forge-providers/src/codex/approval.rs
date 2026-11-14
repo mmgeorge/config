@@ -2,7 +2,8 @@ use crate::permission_input::{normalize_permission_payload, provider_path, provi
 use anyhow::{Context, Result, ensure};
 use forge_provider_api::access::DirectoryOperation;
 use forge_provider_api::permissions::{
-    CommandAnalysisError, PermissionRequest, PermissionResponse, PermissionTarget,
+    CommandAnalysisError, PermissionRequest, PermissionResponse, PermissionSubject,
+    PermissionTarget,
 };
 use forge_shell::shell::{CommandAnalysisFailure, CommandShell};
 use serde_json::{Value, json};
@@ -93,11 +94,14 @@ impl ApprovalContext {
     }
 
     /// Resolve every target, rejecting malformed metadata without returning a partial request.
-    pub fn prepare(&self, message: &Value) -> Result<PreparedApproval> {
+    ///
+    /// `subject` names the host tool item the native request gates, which only the caller can
+    /// resolve through the normalizer's item table.
+    pub fn prepare(&self, message: &Value, subject: PermissionSubject) -> Result<PreparedApproval> {
         let method = message["method"]
             .as_str()
             .context("approval omitted method")?;
-        let mut request = permission_from_provider(method, message, "")?;
+        let mut request = permission_from_provider(method, message, "", subject)?;
         let mut observation = None;
         if method == "item/fileChange/requestApproval" {
             let params = &message["params"];
@@ -195,6 +199,7 @@ pub fn permission_from_provider(
     method: &str,
     message: &Value,
     _workspace: &str,
+    subject: PermissionSubject,
 ) -> Result<PermissionRequest> {
     let params = message.get("params").unwrap_or(&Value::Null);
     let id = format!("approval-{}", Uuid::new_v4());
@@ -238,6 +243,7 @@ pub fn permission_from_provider(
     Ok(PermissionRequest {
         id,
         provider,
+        subject,
         reason,
         target_list,
     })
@@ -346,7 +352,9 @@ mod tests {
                 {"path":"second.rs","kind":{"type":"add"},"diff":"new"}
             ]),
         ));
-        let prepared = context.prepare(&request("thread", "turn", "edit"))?;
+        let edit = PermissionSubject::Tool(forge_provider_api::ItemId::new("host-edit")?);
+        let prepared = context.prepare(&request("thread", "turn", "edit"), edit.clone())?;
+        assert_eq!(prepared.request.subject, edit);
         assert_eq!(
             prepared.request.target_list,
             vec![
@@ -366,13 +374,19 @@ mod tests {
             request("thread", "other", "edit"),
         ] {
             assert!(matches!(
-                context.prepare(&other)?.request.target_list[0],
+                context
+                    .prepare(&other, PermissionSubject::Unattached)?
+                    .request
+                    .target_list[0],
                 PermissionTarget::UnknownFile { .. }
             ));
         }
         assert!(
             ApprovalContext::default()
-                .prepare(&request("thread", "turn", "edit"))?
+                .prepare(
+                    &request("thread", "turn", "edit"),
+                    PermissionSubject::Unattached
+                )?
                 .observation
                 .is_none()
         );
@@ -413,6 +427,7 @@ mod tests {
                         "item/commandExecution/requestApproval",
                         &message,
                         ".",
+                        PermissionSubject::Unattached,
                     )
                     .unwrap();
                     assert_eq!(

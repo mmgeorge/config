@@ -123,6 +123,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                         id: "approval".into(),
                         provider: forge_provider_api::ProviderId::new("fixture")
                             .expect("fixture identity is valid"),
+                        subject: forge_provider_api::permissions::PermissionSubject::Unattached,
                         reason: None,
                         target_list: vec![PermissionTarget::Tool {
                             target: "probe_task".into(),

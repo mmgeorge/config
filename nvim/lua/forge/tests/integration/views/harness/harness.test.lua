@@ -13,6 +13,50 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["global_timeout_preserves_resource_maps"] = function()
+  vim.o.columns, vim.o.lines = 140, 55
+  local workspace = temp.directory("global-timeout")
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  stub(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local function call(method, params)
+    local result, failure, done
+    client.request({ method = method, params = params }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish", { errors = errors })
+    eq(failure, nil)
+    return result
+  end
+  local snapshot = call("settings.get", { provider = "mock", workspace = workspace })
+  call("settings.update", { scope = "global", provider = "mock", workspace = workspace,
+    expected_revision = snapshot.revision, desired = {
+      approval_timeout = { amount = 10, unit = "m" }, tool_timeout = { amount = 10, unit = "m" },
+      skill = vim.empty_dict(), mcp = vim.empty_dict(),
+    } })
+  local picker = require("forge.views.picker")
+  require("forge.views.harness.global_settings").open({ control_win = vim.api.nvim_get_current_win() })
+  wait_until(function() return picker.is_open("harness-config") end, "defaults did not open", { errors = errors })
+  for _, timeout in ipairs({ "approval_timeout", "tool_timeout" }) do
+    local completed, failure
+    picker._state_for_test().spec.on_field_submit({ field = { id = timeout } }, "11m", function(error)
+      failure, completed = error, true
+    end)
+    wait_until(function() return completed end, "timeout did not save", { errors = errors })
+    eq(failure, nil)
+    snapshot = call("settings.get", { provider = "mock", workspace = workspace })
+    eq(snapshot.layers.global[timeout], { amount = 11, unit = "m" })
+    eq(vim.json.encode(snapshot.layers.global.skill), "{}")
+    eq(vim.json.encode(snapshot.layers.global.mcp), "{}")
+  end
+  picker.close()
+  errors:assert_none()
+  eq(host.stop(), true)
+end
+
 T["background"] = function()
 local root = temp.directory("background")
 local workspace = root .. "/repository"
