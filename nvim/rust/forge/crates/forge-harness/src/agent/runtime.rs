@@ -41,6 +41,7 @@ impl AgentRuntime {
             .repository_admit(
                 &owner,
                 &self.task_id,
+                self.trace.root(),
                 std::path::Path::new(&self.request.workspace),
                 self.cancellation.clone(),
             )

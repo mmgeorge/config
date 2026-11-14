@@ -2,6 +2,50 @@ use super::{SqliteStore, test::session};
 use crate::session::SessionStore;
 use anyhow::Result;
 
+/// A matching version cannot certify altered table constraints or a missing required index.
+#[test]
+fn matching_version_rejects_changed_structure() -> Result<()> {
+    for alteration in [
+        "DROP INDEX session_workspace_activity",
+        "DROP TABLE setting_application; CREATE TABLE setting_application(session_id TEXT,payload TEXT)",
+    ] {
+        let root = tempfile::tempdir()?;
+        let connection = super::database::HistoryConnection::open(root.path())?;
+        connection.execute_batch(alteration)?;
+        drop(connection);
+        for result in [
+            super::database::HistoryConnection::open(root.path()),
+            super::database::HistoryConnection::read_only(root.path()),
+        ] {
+            let error = result.err().expect("changed schema must fail");
+            assert!(format!("{error:#}").contains("incompatible"));
+        }
+    }
+    Ok(())
+}
+
+/// Both readers reject an older or newer version without modifying its records.
+#[test]
+fn mismatched_versions_reject_both_open_modes() -> Result<()> {
+    for version in [super::state::VERSION - 1, super::state::VERSION + 1] {
+        let root = tempfile::tempdir()?;
+        let connection = super::database::HistoryConnection::open(root.path())?;
+        connection.pragma_update(None, "user_version", version)?;
+        drop(connection);
+        assert!(super::database::HistoryConnection::open(root.path()).is_err());
+        assert!(super::database::HistoryConnection::read_only(root.path()).is_err());
+        assert_eq!(
+            super::test::raw_connection(root.path())?.pragma_query_value(
+                None,
+                "user_version",
+                |row| row.get::<_, u32>(0)
+            )?,
+            version
+        );
+    }
+    Ok(())
+}
+
 /// A version marker cannot certify an incomplete schema or authorize repairing it in place.
 #[test]
 fn matching_version_missing_table_is_rejected_on_every_open() -> Result<()> {

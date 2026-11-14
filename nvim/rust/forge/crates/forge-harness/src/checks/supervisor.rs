@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const CHECK_HISTORY_VERSION: u32 = 23;
+const CHECK_HISTORY_VERSION: u32 = crate::storage::state::VERSION;
 
 /// Binds check history to one session, workspace, and storage location.
 pub struct CheckSupervisorContext {
@@ -469,6 +469,7 @@ impl CheckSupervisor {
             super::adapter::DiscoverMode::Static => None,
             super::adapter::DiscoverMode::Exact => {
                 Some(super::reservation::CheckReservation::acquire(
+                    &self.data_root,
                     &self.workspace,
                     super::CheckPurpose::Verify,
                 )?)
@@ -1084,7 +1085,11 @@ impl CheckSupervisor {
         } else {
             super::CheckPurpose::Verify
         };
-        let workspace = super::reservation::CheckReservation::acquire(&self.workspace, purpose)?;
+        let workspace = super::reservation::CheckReservation::acquire(
+            &self.data_root,
+            &self.workspace,
+            purpose,
+        )?;
         if purpose == super::CheckPurpose::Prepare {
             super::discovery::DiscoveryInputs::for_run(self, &run)?;
         }

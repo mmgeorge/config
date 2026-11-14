@@ -302,10 +302,12 @@ impl Transaction {
         }
         // Acquire before exposing a committable transaction; the worker retains it through publication.
         let repository = match repository_scope {
-            Some(owner) => {
-                crate::checks::MutationReservation::acquire_scoped(&scope.workspace, Some(owner))
-            }
-            None => crate::checks::MutationReservation::acquire(&scope.workspace),
+            Some(owner) => crate::checks::MutationReservation::acquire_scoped(
+                &scope.root,
+                &scope.workspace,
+                Some(owner),
+            ),
+            None => crate::checks::MutationReservation::acquire(&scope.root, &scope.workspace),
         }
         .map_err(MutationError::Reservation)?;
         scope.check().map_err(MutationError::Service)?;
@@ -702,6 +704,7 @@ mod tests {
         let (scope, lease) = service.scope(
             "test".into(),
             "turn".into(),
+            root.join("harness-state"),
             root.into(),
             compiled,
             tokio::sync::watch::channel(false).1,
@@ -729,7 +732,12 @@ mod tests {
         let (scope, _lease, policy) = fixture(root.path());
         let edits =
             serde_json::json!([{"kind":"text","path":"a","before":"old","after":"new","edits":1}]);
-        let reader = CheckReservation::acquire(root.path(), CheckPurpose::Verify).unwrap();
+        let reader = CheckReservation::acquire(
+            &(root.path()).join("harness-state"),
+            root.path(),
+            CheckPurpose::Verify,
+        )
+        .unwrap();
         assert!(matches!(
             Transaction::prepare(&scope, &policy, prepared(edits.clone()), None),
             Err(MutationError::Reservation(_))
@@ -737,12 +745,33 @@ mod tests {
         assert_eq!(fs::read(root.path().join("a")).unwrap(), b"old");
         drop(reader);
         let mut transaction = Transaction::prepare(&scope, &policy, prepared(edits), None).unwrap();
-        assert!(CheckReservation::acquire(root.path(), CheckPurpose::Verify).is_err());
+        assert!(
+            CheckReservation::acquire(
+                &(root.path()).join("harness-state"),
+                root.path(),
+                CheckPurpose::Verify
+            )
+            .is_err()
+        );
         transaction.commit().unwrap();
         assert_eq!(fs::read(root.path().join("a")).unwrap(), b"new");
-        assert!(CheckReservation::acquire(root.path(), CheckPurpose::Verify).is_err());
+        assert!(
+            CheckReservation::acquire(
+                &(root.path()).join("harness-state"),
+                root.path(),
+                CheckPurpose::Verify
+            )
+            .is_err()
+        );
         drop(transaction);
-        assert!(CheckReservation::acquire(root.path(), CheckPurpose::Verify).is_ok());
+        assert!(
+            CheckReservation::acquire(
+                &(root.path()).join("harness-state"),
+                root.path(),
+                CheckPurpose::Verify
+            )
+            .is_ok()
+        );
     }
 
     /// Commit under the caller's reservation and return its slot only after durable publication.
@@ -751,7 +780,11 @@ mod tests {
         use crate::repository_access::{RepositoryAccess, RepositoryReservation};
         let root = tempfile::tempdir()?;
         fs::write(root.path().join("a"), b"old")?;
-        let owner = RepositoryReservation::acquire(root.path(), RepositoryAccess::Write)?;
+        let owner = RepositoryReservation::acquire(
+            &(root.path()).join("harness-state"),
+            root.path(),
+            RepositoryAccess::Write,
+        )?;
         let parent = owner.scope();
         let (scope, _lease, policy) = fixture(root.path());
         let edits = prepared(serde_json::json!([
@@ -768,6 +801,7 @@ mod tests {
         let _resumed = parent.enter(root.path(), RepositoryAccess::Write)?;
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(root.path()).join("harness-state"),
                 root.path(),
                 crate::checks::CheckPurpose::Verify
             )
@@ -782,7 +816,11 @@ mod tests {
         use crate::repository_access::{RepositoryAccess, RepositoryReservation};
         let root = tempfile::tempdir()?;
         fs::write(root.path().join("a"), b"old")?;
-        let owner = RepositoryReservation::acquire(root.path(), RepositoryAccess::Write)?;
+        let owner = RepositoryReservation::acquire(
+            &(root.path()).join("harness-state"),
+            root.path(),
+            RepositoryAccess::Write,
+        )?;
         let parent = owner.scope();
         let (scope, _lease, policy) = fixture(root.path());
         let edits = prepared(serde_json::json!([
@@ -797,6 +835,7 @@ mod tests {
         assert_eq!(fs::read(root.path().join("a"))?, b"old");
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(root.path()).join("harness-state"),
                 root.path(),
                 crate::checks::CheckPurpose::Verify
             )
@@ -804,6 +843,7 @@ mod tests {
         );
         drop(transaction);
         let _reader = crate::checks::CheckReservation::acquire(
+            &(root.path()).join("harness-state"),
             root.path(),
             crate::checks::CheckPurpose::Verify,
         )?;

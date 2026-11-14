@@ -8,6 +8,7 @@ use crate::session::ApprovalMode;
 #[tokio::test]
 async fn committed_child_file_change_survives_native_error() -> Result<()> {
     let directory = tempfile::tempdir()?;
+    crate::storage::layout::prepare(directory.path())?;
     let path = directory.path().join("changed.rs");
     std::fs::write(&path, "old")?;
     let context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);

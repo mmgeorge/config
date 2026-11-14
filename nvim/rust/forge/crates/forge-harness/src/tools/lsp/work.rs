@@ -135,6 +135,7 @@ mod tests {
         let worker_archive = archive.clone();
         let expected = change.clone();
         let reservation = crate::checks::CheckReservation::acquire(
+            &(directory.path()).join("harness-state"),
             directory.path(),
             crate::checks::CheckPurpose::Prepare,
         )?;
@@ -164,6 +165,7 @@ mod tests {
         assert!(archive.collected_file_changes().is_empty());
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(directory.path()).join("harness-state"),
                 directory.path(),
                 crate::checks::CheckPurpose::Verify,
             )
@@ -178,6 +180,7 @@ mod tests {
         assert_eq!(archive.collected_file_changes(), vec![expected]);
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(directory.path()).join("harness-state"),
                 directory.path(),
                 crate::checks::CheckPurpose::Verify,
             )

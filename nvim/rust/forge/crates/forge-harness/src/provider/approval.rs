@@ -2522,15 +2522,29 @@ mod test {
             PermissionStore::load(directory.path().join("permissions.json"), directory.path())
                 .unwrap(),
         ));
+        store
+            .write()
+            .unwrap()
+            .set_rule_list(&[(
+                "read".into(),
+                "*".into(),
+                crate::permissions::document::PermissionDecision::Ask,
+            )])
+            .unwrap();
         let coordinator = Arc::new(PermissionCoordinator::new(Arc::clone(&store)));
         let request = PermissionRequest {
             id: "approval-one".into(),
             provider: forge_provider_api::ProviderId::new("mock").unwrap(),
             subject: forge_provider_api::permissions::PermissionSubject::Unattached,
             reason: Some("inspect repository".into()),
-            target_list: vec![PermissionTarget::Command {
-                command: "rg TODO src".into(),
-                shell: None,
+            target_list: vec![PermissionTarget::Read {
+                path: directory
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .join("approval-only.rs")
+                    .to_string_lossy()
+                    .into_owned(),
             }],
         };
         let (event_sink, mut event_stream) = crate::provider::events::channel(scope());
@@ -2583,6 +2597,9 @@ mod test {
         ));
         assert_eq!(resolved_view.targets.len(), owned.item_list.len());
         let source = store.read().unwrap().open().1;
-        assert!(source.contains("\"rg *\": \"allow\""));
+        assert!(
+            source.contains("allow") && source.contains("read"),
+            "{source}"
+        );
     }
 }

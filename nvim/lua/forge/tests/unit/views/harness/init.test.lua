@@ -38,7 +38,7 @@ T["provider_switch"] = function()
   local activated, saved, initialize_options, lease_picker, activation_options
   require('forge.infra.notifications').error = function() end
   require('forge.infra.notifications').warn = function() end
-  require('forge.harness.provider_preference').save = function(provider) saved = provider return true end
+  require('forge.harness.provider_preference').save = function(provider, callback) saved = provider callback(true) end
   require('forge.views.harness.session_navigation').activate = function(result, options)
     activated, activation_options = result, options
     state.session = result.session

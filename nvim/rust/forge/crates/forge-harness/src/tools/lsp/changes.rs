@@ -60,7 +60,10 @@ mod tests {
     fn archived_changes_hold_reservation_until_durable_acknowledgment() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let change = HostFileChange {
-            reservation: Some(crate::checks::MutationReservation::acquire(root.path())?),
+            reservation: Some(crate::checks::MutationReservation::acquire(
+                &(root.path()).join("harness-state"),
+                root.path(),
+            )?),
             scope: crate::provider::InvocationScope::new(
                 crate::provider::ThreadOwner::root("session"),
                 "turn",
@@ -80,6 +83,7 @@ mod tests {
         drop(change);
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(root.path()).join("harness-state"),
                 root.path(),
                 crate::checks::CheckPurpose::Verify
             )
@@ -90,6 +94,7 @@ mod tests {
         archived[0].recorded()?;
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(root.path()).join("harness-state"),
                 root.path(),
                 crate::checks::CheckPurpose::Verify
             )

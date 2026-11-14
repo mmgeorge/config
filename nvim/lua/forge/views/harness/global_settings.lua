@@ -22,7 +22,7 @@ end
 function M.open(host)
   sequence = sequence + 1
   local revision = sequence
-  local provider = provider_preference.load(config.options.harness.providers, config.options.harness.provider)
+  local provider = config.options.harness.provider
   local workspace = vim.fn.getcwd()
   local function current()
     return revision == sequence and vim.api.nvim_win_is_valid(host.control_win)
@@ -107,10 +107,12 @@ function M.open(host)
         table.sort(entries, function(a, b) return a.label < b.label end)
         picker.open({ host = provider_host, page_list = { { id = "default-provider", title = "Default provider", option_list = entries } },
           on_confirm = function(result)
-            local ok, save_failure = provider_preference.save(result.option.id)
-            if not ok then notifications.error(save_failure, "ForgeConfig") return end
-            picker.close(false)
-            M.open(host)
+            provider_preference.save(result.option.id, function(ok, save_failure)
+              if not ok then notifications.error(save_failure, "ForgeConfig") return end
+              config.options.harness.provider = result.option.id
+              picker.close(false)
+              M.open(host)
+            end)
           end })
       end
       require("forge.views.harness.settings").open(state, host, nil, target)

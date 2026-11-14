@@ -12,6 +12,8 @@ pub(super) fn handles(method: RuntimeMethod) -> bool {
     matches!(
         method,
         RuntimeMethod::SettingsGet
+            | RuntimeMethod::SettingsProviderGet
+            | RuntimeMethod::SettingsProviderSet
             | RuntimeMethod::SettingsUpdate
             | RuntimeMethod::SettingsImportPreview
             | RuntimeMethod::SettingsImportApply
@@ -49,6 +51,21 @@ pub(super) async fn dispatch(
         );
     }
     match method {
+        RuntimeMethod::SettingsProviderGet | RuntimeMethod::SettingsProviderSet => {
+            let root = PathBuf::from(&registry.initialize.data_root);
+            if method == RuntimeMethod::SettingsProviderSet {
+                let provider = request.params["provider"]
+                    .as_str()
+                    .context("provider is required")?;
+                forge_providers::registry::select(provider)?;
+                crate::storage::preferences::host_set(&root, "provider", &provider)?;
+            }
+            let provider = crate::storage::preferences::host_get::<String>(&root, "provider")?;
+            message_sink
+                .send_response(Response::success(request.id, json!({"provider":provider}))?)
+                .await?;
+            Ok(())
+        }
         RuntimeMethod::SettingsGet
         | RuntimeMethod::SettingsUpdate
         | RuntimeMethod::SettingsImportPreview

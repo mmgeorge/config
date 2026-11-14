@@ -514,6 +514,7 @@ async fn bridge(
     root: &std::path::Path,
     native: Arc<BridgeFixtureProvider>,
 ) -> Result<ProviderBridge, anyhow::Error> {
+    crate::storage::layout::prepare(root)?;
     Ok(ProviderBridge::new(
         forge_providers::registry::RegisteredProvider::new(native.descriptor(), native, None),
         PermissionCoordinator::load(root.join("permissions.json"), root)?,

@@ -2002,6 +2002,7 @@ impl BrokerRuntime {
                 path.to_string_lossy().into_owned()
             }
         };
+        let trace = Arc::new(TraceStore::open(&data_root)?);
         let permission_file = request
             .permission_file
             .as_deref()
@@ -2019,7 +2020,7 @@ impl BrokerRuntime {
         )?));
         let permission_coordinator =
             Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
-        let trace = Arc::new(TraceStore::open(&data_root)?);
+
         let provider = crate::provider::build(
             request.provider.clone(),
             Arc::clone(&permission_coordinator),
@@ -4538,6 +4539,7 @@ impl HarnessBroker {
                 let (scope, lease) = self.lsp.scope(
                     self.session.id.clone(),
                     admission.task.id.clone(),
+                    self.data_root.clone(),
                     PathBuf::from(&self.session.workspace),
                     policy,
                     cancellation.clone(),

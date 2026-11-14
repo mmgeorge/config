@@ -13,17 +13,18 @@ pub(crate) struct MutationReservation(Arc<Mutex<Option<CheckReservation>>>);
 
 impl MutationReservation {
     /// Acquire independent write access before a source transaction can commit.
-    pub(crate) fn acquire(workspace: &Path) -> Result<Self> {
-        Self::acquire_scoped(workspace, None)
+    pub(crate) fn acquire(root: &Path, workspace: &Path) -> Result<Self> {
+        Self::acquire_scoped(root, workspace, None)
     }
 
     /// Borrow the caller's write protection, or acquire independent access when no owner exists.
     pub(crate) fn acquire_scoped(
+        root: &Path,
         workspace: &Path,
         scope: Option<&RepositoryScope>,
     ) -> Result<Self> {
         Ok(Self(Arc::new(Mutex::new(Some(
-            CheckReservation::acquire_scoped(workspace, super::CheckPurpose::Prepare, scope)?,
+            CheckReservation::acquire_scoped(root, workspace, super::CheckPurpose::Prepare, scope)?,
         )))))
     }
 
@@ -79,12 +80,17 @@ impl CheckReservation {
     }
 
     /// Admit verification alongside readers, or preparation only with no competing owner.
-    pub(crate) fn acquire(workspace: &Path, purpose: super::CheckPurpose) -> Result<Self> {
-        Self::acquire_scoped(workspace, purpose, None)
+    pub(crate) fn acquire(
+        root: &Path,
+        workspace: &Path,
+        purpose: super::CheckPurpose,
+    ) -> Result<Self> {
+        Self::acquire_scoped(root, workspace, purpose, None)
     }
 
     /// Suspend an existing caller while this check owns its descendant execution slot.
     pub(crate) fn acquire_scoped(
+        root: &Path,
         workspace: &Path,
         purpose: super::CheckPurpose,
         scope: Option<&RepositoryScope>,
@@ -95,7 +101,7 @@ impl CheckReservation {
         };
         let owner = match scope {
             Some(scope) => scope.borrow(workspace, access)?,
-            None => RepositoryReservation::acquire(workspace, access)?,
+            None => RepositoryReservation::acquire(root, workspace, access)?,
         };
         let execution = owner.scope().enter(workspace, access)?;
         Ok(Self {
@@ -113,9 +119,14 @@ mod tests {
     #[test]
     fn borrowed_checks_hold_the_parent_until_their_result_is_recorded() -> Result<()> {
         let workspace = tempfile::tempdir()?;
-        let owner = RepositoryReservation::acquire(workspace.path(), RepositoryAccess::Write)?;
+        let owner = RepositoryReservation::acquire(
+            &(workspace.path()).join("harness-state"),
+            workspace.path(),
+            RepositoryAccess::Write,
+        )?;
         let scope = owner.scope();
         let verification = CheckReservation::acquire_scoped(
+            &(workspace.path()).join("harness-state"),
             workspace.path(),
             super::super::CheckPurpose::Verify,
             Some(&scope),
@@ -126,11 +137,19 @@ mod tests {
                 .is_err()
         );
         assert!(
-            CheckReservation::acquire(workspace.path(), super::super::CheckPurpose::Verify)
-                .is_err()
+            CheckReservation::acquire(
+                &(workspace.path()).join("harness-state"),
+                workspace.path(),
+                super::super::CheckPurpose::Verify
+            )
+            .is_err()
         );
         drop(verification);
-        let mutation = MutationReservation::acquire_scoped(workspace.path(), Some(&scope))?;
+        let mutation = MutationReservation::acquire_scoped(
+            &(workspace.path()).join("harness-state"),
+            workspace.path(),
+            Some(&scope),
+        )?;
         let copy = mutation.clone();
         mutation.validate()?;
         assert!(
@@ -148,16 +167,27 @@ mod tests {
     #[test]
     fn expired_borrow_does_not_fall_back_to_independent_access() -> Result<()> {
         let workspace = tempfile::tempdir()?;
-        let owner = RepositoryReservation::acquire(workspace.path(), RepositoryAccess::Write)?;
+        let owner = RepositoryReservation::acquire(
+            &(workspace.path()).join("harness-state"),
+            workspace.path(),
+            RepositoryAccess::Write,
+        )?;
         let scope = owner.scope();
         drop(owner);
-        let error =
-            MutationReservation::acquire_scoped(workspace.path(), Some(&scope)).unwrap_err();
+        let error = MutationReservation::acquire_scoped(
+            &(workspace.path()).join("harness-state"),
+            workspace.path(),
+            Some(&scope),
+        )
+        .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<crate::repository_access::RepositoryAccessError>(),
             Some(crate::repository_access::RepositoryAccessError::Expired(_))
         ));
-        let _independent = MutationReservation::acquire(workspace.path())?;
+        let _independent = MutationReservation::acquire(
+            &(workspace.path()).join("harness-state"),
+            workspace.path(),
+        )?;
         Ok(())
     }
 }

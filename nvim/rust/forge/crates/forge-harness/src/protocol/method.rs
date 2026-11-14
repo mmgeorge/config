@@ -57,6 +57,10 @@ pub enum RuntimeMethod {
     SettingsGet,
     #[serde(rename = "settings.update")]
     SettingsUpdate,
+    #[serde(rename = "settings.provider.get")]
+    SettingsProviderGet,
+    #[serde(rename = "settings.provider.set")]
+    SettingsProviderSet,
     #[serde(rename = "settings.import.preview")]
     SettingsImportPreview,
     #[serde(rename = "settings.import.apply")]

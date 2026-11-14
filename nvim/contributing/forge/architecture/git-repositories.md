@@ -55,3 +55,9 @@ Statistics compare only changed sides with the pinned `gix-imara-diff` histogram
 ## Commands
 
 `forge_git::command::read_command` owns one child and drains both pipes concurrently, preserving binary output and exit status. Cancellation, timeout, or reader errors terminate the child, wait for it, and join both readers. `file_command` streams large blob output into a temporary file with a 30-second deadline. Only diagnostic commands keep bounded output tails.
+
+## Harness operation recovery
+
+Harness keeps repository access and admission locks in the shared per-user reservation directory, including an explicitly configured override. Separate Harness roots therefore contend on the same canonical repository identity. Each operation retains its Harness state lease and writes its journal beneath `state/vN/repository-operations/`; shared discovery records contain only owner lease and process-containment identities.
+
+Admission checks live ownership and process collection before reading current-version operation payloads. Retired payloads are never decoded as current records. History clear enumerates every retired `.operations` directory in the shared reservation namespace, independently of deleted sessions or path aliases. It preserves shared locks and unrelated directories. Cleanup can discard retired records only after their leases and containment evidence prove collection; a missing containment identity blocks recovery unless a completed collection record already establishes it. Version cleanup removes its discovery references under the shared admission gate and leaves shared lock files intact.

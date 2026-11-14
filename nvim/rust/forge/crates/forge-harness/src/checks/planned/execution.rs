@@ -323,7 +323,7 @@ impl PlannedTestExecution {
                 }
             };
             lines.push(format!(
-                "{}: {} — {outcome}",
+                "{}: {} â€” {outcome}",
                 resolution.file, resolution.name
             ));
         }
@@ -643,7 +643,7 @@ mod tests {
         execution.bind_inputs(serde_json::from_value(json!({
             "source_snapshot":"snapshot", "context":context, "test_scopes":scopes,
             "discovery":{"snapshot":context.snapshot,"task_id":context.task_id,"overrides":context.task_overrides},
-            "verification":{"source_identity":"source", "record":{"version":5,"session_id":"session","workspace":std::env::temp_dir().join("forge-planned-tests"),"generation":0,"requirements":{}}}
+            "verification":{"source_identity":"source", "record":{"version":crate::storage::state::VERSION,"session_id":"session","workspace":std::env::temp_dir().join("forge-planned-tests"),"generation":0,"requirements":{}}}
         }))?)?;
         Ok(execution)
     }
@@ -999,7 +999,7 @@ mod tests {
             restored
                 .review_lines()
                 .iter()
-                .any(|line| line.contains("removed_case — Removal verified"))
+                .any(|line| line.contains("removed_case â€” Removal verified"))
         );
         let mut invalid = serde_json::to_value(&execution).unwrap();
         invalid["state"]["inventories"][0]["supplementary"]["Available"]["items"][0]["line"] =

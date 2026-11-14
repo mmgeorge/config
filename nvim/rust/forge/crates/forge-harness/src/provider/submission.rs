@@ -14,7 +14,7 @@ use super::{Provider, ProviderRequest};
 use crate::trace::TraceStore;
 use forge_provider_api::{DeliveryAttemptId, RecoveryToken, SubmissionId};
 
-const SUBMISSION_FORMAT_VERSION: u32 = 4;
+const SUBMISSION_FORMAT_VERSION: u32 = crate::storage::state::VERSION;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -282,10 +282,21 @@ impl SubmissionStore {
             clippy::disallowed_methods,
             reason = "the submission journal is a separate database with its own writer"
         )]
-        let connection = Connection::open(directory.join("provider-submissions.sqlite3"))?;
+        let mut connection = Connection::open(directory.join("provider-submissions.sqlite3"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let _bootstrap = crate::storage::bootstrap_lock(&directory, "provider-submissions")?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let populated: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')", [], |row| row.get(0))?;
+        ensure!(
+            version == SUBMISSION_FORMAT_VERSION || (version == 0 && !populated),
+            "incompatible provider submission schema {version}; expected {SUBMISSION_FORMAT_VERSION}"
+        );
+        if version == SUBMISSION_FORMAT_VERSION {
+            connection.prepare("SELECT id,runtime,provider,payload FROM submission LIMIT 0")?;
+        } else {
+            connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+            let transaction = connection.transaction()?;
+            transaction.execute_batch("
             CREATE TABLE IF NOT EXISTS submission (
                 id TEXT PRIMARY KEY, runtime TEXT NOT NULL, provider TEXT NOT NULL, payload TEXT NOT NULL
             );
@@ -295,6 +306,9 @@ impl SubmissionStore {
                 WHERE json_extract(payload,'$.delivery.state') IN ('prepared','sending');
             CREATE INDEX IF NOT EXISTS submission_sending ON submission(runtime,provider)
                 WHERE json_extract(payload,'$.delivery.state')='sending';")?;
+            transaction.pragma_update(None, "user_version", SUBMISSION_FORMAT_VERSION)?;
+            transaction.commit()?;
+        }
         let created = Arc::new(Self {
             _lease: lease,
             connection: Mutex::new(connection),

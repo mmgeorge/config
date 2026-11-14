@@ -1344,6 +1344,7 @@ impl HarnessBroker {
         let (lsp, lsp_lease) = self.lsp.scope(
             self.session.id.clone(),
             staged.exchange.id.clone(),
+            self.data_root.clone(),
             PathBuf::from(&self.session.workspace),
             policy,
             self.turn_cancellation.subscribe(),

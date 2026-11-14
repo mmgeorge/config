@@ -32,6 +32,7 @@ fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
 fn apply_preflight_rejects_mixed_categories_and_implicit_mutations() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let mut prerequisite = definition("prerequisite", "unused");
     let mut formatter = definition("format", "unused");
     formatter.category = CheckCategory::Format;
@@ -92,6 +93,7 @@ fn apply_preflight_rejects_mixed_categories_and_implicit_mutations() -> Result<(
 fn preparation_order_follows_operations_and_keeps_dependency_checks_readonly() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let config: CheckConfig = serde_json::from_value(serde_json::json!({
         "compiler":{"action":{"category":"typecheck","adapter":{"script":{"command":["unused"]}}}},
         "build":{"action":{"category":"build","adapter":{"script":{"command":["unused"]}}}},
@@ -252,6 +254,7 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
 async fn adapter_empty_defaults_skip_but_explicit_empty_selectors_admit_all() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let config: CheckConfig = serde_json::from_value(serde_json::json!({
         "unit":{"action":{"category":"test","adapter":{"script":{"command":["unused"]}}}},
         "compiler":{"action":{"category":"typecheck","adapter":{"script":{"command":["unused"]}}}}
@@ -347,6 +350,7 @@ fn removed_planned_case_input_reports_migration_without_changing_configuration()
 fn custom_history_ignores_legacy_sidecars_and_excludes_other_versions() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     save(workspace.path(), vec![definition("custom", "unused")]);
     let runner = make_runner(workspace.path(), data.path());
     let mut run = runner
@@ -402,6 +406,7 @@ fn recovery_preserves_partial_results_and_committed_outcomes() -> Result<()> {
 
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let mut check = definition("unit", "unused");
     check.category = CheckCategory::Test;
     check.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
@@ -520,6 +525,7 @@ fn recovery_preserves_partial_results_and_committed_outcomes() -> Result<()> {
 fn verification_requirements_survive_history_loss_and_reject_stale_passes() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let mut check = definition("format", "unused");
     check.category = CheckCategory::Format;
     check.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
@@ -781,6 +787,7 @@ fn verification_requirements_survive_history_loss_and_reject_stale_passes() -> R
 fn discovery_inputs_reject_changed_task_preferences_and_missing_retained_settings() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     save(workspace.path(), vec![definition("check", "unused")]);
     let runner = make_runner(workspace.path(), data.path());
     let mut overrides = CheckOverrides::default();
@@ -815,6 +822,7 @@ fn discovery_inputs_reject_changed_task_preferences_and_missing_retained_setting
 async fn submission_warnings_compare_the_captured_preference_namespace() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     save(workspace.path(), vec![definition("check", "unused")]);
     let runner = make_runner(workspace.path(), data.path());
     let mut design = crate::plan::DeclarationDesign::default();
@@ -851,6 +859,7 @@ async fn submission_warnings_compare_the_captured_preference_namespace() -> Resu
 fn verification_identity_survives_policy_changes_but_rejects_tool_changes() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let mut check = definition("format", "unused");
     check.category = CheckCategory::Format;
     check.enabled = false;
@@ -1034,6 +1043,7 @@ fn verification_identity_survives_policy_changes_but_rejects_tool_changes() -> R
 fn verification_ledger_rejects_invalid_restore_without_resetting() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let ledger =
         verification::VerificationRequirements::open(data.path(), workspace.path(), "session")?;
     assert!(ledger.pending(None)?.is_empty());
@@ -1077,6 +1087,7 @@ fn verification_ledger_rejects_invalid_restore_without_resetting() -> Result<()>
 fn required_verification_selects_readonly_prerequisites() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let mut build = definition("build", "build");
     build.category = CheckCategory::Build;
     build.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
@@ -1159,6 +1170,7 @@ fn required_verification_selects_readonly_prerequisites() -> Result<()> {
 fn undecodable_check_record_does_not_block_session_open() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     std::fs::create_dir_all(data.path().join("torn-run"))?;
     std::fs::write(data.path().join("torn-run/record.json"), br#"{"version":"#)?;
     let runner = make_runner(workspace.path(), data.path());
@@ -1174,12 +1186,16 @@ fn discovery_reservation_excludes_runs_and_releases_without_history() -> Result<
     use super::adapter::DiscoverMode::{Exact, Static};
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     save(workspace.path(), vec![definition("unit", "exit 0")]);
     let runner = make_runner(workspace.path(), data.path());
     let peer_data = tempfile::tempdir()?;
     let peer = make_runner(workspace.path(), peer_data.path());
-    let preparation =
-        reservation::CheckReservation::acquire(workspace.path(), CheckPurpose::Prepare)?;
+    let preparation = reservation::CheckReservation::acquire(
+        &(workspace.path()).join("harness-state"),
+        workspace.path(),
+        CheckPurpose::Prepare,
+    )?;
     assert!(
         runner
             .discovery_reserve("blocked-by-preparation", Exact)
@@ -1202,7 +1218,12 @@ fn discovery_reservation_excludes_runs_and_releases_without_history() -> Result<
     let peer_reader = peer.discovery_reserve("peer-reader", Exact)?;
     let reservation = runner.discovery_reserve("first-discovery", Exact)?;
     assert!(
-        reservation::CheckReservation::acquire(workspace.path(), CheckPurpose::Prepare,).is_err()
+        reservation::CheckReservation::acquire(
+            &(workspace.path()).join("harness-state"),
+            workspace.path(),
+            CheckPurpose::Prepare,
+        )
+        .is_err()
     );
     assert!(
         runner
@@ -1243,6 +1264,7 @@ fn discovery_reservation_excludes_runs_and_releases_without_history() -> Result<
 fn script_evidence_does_not_reuse_an_undeclared_tool_identity() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     let tool = data.path().join("external-tool");
     std::fs::write(&tool, "old tool")?;
     let mut check = definition("unit", "unused");
@@ -1336,6 +1358,7 @@ fn script_evidence_does_not_reuse_an_undeclared_tool_identity() -> Result<()> {
 async fn revoked_callback_cannot_write_check_configuration() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
     save(workspace.path(), vec![definition("unit", "exit 0")]);
     let before = std::fs::read(workspace.path().join(".forge.json"))?;
     let runner = make_runner(workspace.path(), data.path());

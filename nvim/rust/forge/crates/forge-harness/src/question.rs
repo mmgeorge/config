@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 /// Disposable question-record format validated before session owners start.
-pub(crate) const FORMAT_VERSION: u32 = 5;
+pub(crate) const FORMAT_VERSION: u32 = crate::storage::state::VERSION;
 
 /// Identify one question without confusing it with an exchange or task.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

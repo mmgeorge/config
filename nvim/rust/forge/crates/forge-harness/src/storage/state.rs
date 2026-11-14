@@ -6,10 +6,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 /// Disposable-state contract shared by databases, journals, plans, and captured files.
-pub const VERSION: u32 = 50;
+pub const VERSION: u32 = 52;
 
 /// Pin one executable's state version until its final storage user releases it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct StateLease {
     _file: std::sync::Arc<File>,
 }
@@ -17,6 +17,7 @@ pub(crate) struct StateLease {
 impl StateLease {
     /// Acquire the current version while excluding directory cleanup.
     pub(crate) fn open(root: &Path) -> Result<Self> {
+        super::layout::prepare(root)?;
         fs::create_dir_all(root)?;
         let _admission = super::bootstrap_lock(root, "state")?;
         let lease = version_lock(root, VERSION)?;
@@ -62,8 +63,19 @@ pub struct ClearFailure {
 
 /// Delete unlocked disposable versions without opening or modifying persistent settings.
 pub fn clear(root: &Path) -> Result<ClearReport> {
+    if super::layout::clear_legacy(root)? {
+        return Ok(ClearReport {
+            current_cleared: true,
+            removed: vec![root.to_owned()],
+            retained: Vec::new(),
+        });
+    }
     fs::create_dir_all(root)?;
     let _admission = super::bootstrap_lock(root, "state")?;
+    // Retired global journals can outlive every session that originally referenced them.
+    for journal in crate::repository_access::reset_preflight()? {
+        crate::repository_access::clear_retired(&journal)?;
+    }
     let state = root.join("state");
     let mut report = ClearReport {
         current_cleared: true,
@@ -71,7 +83,10 @@ pub fn clear(root: &Path) -> Result<ClearReport> {
         retained: Vec::new(),
     };
     match fs::symlink_metadata(&state) {
-        Ok(metadata) => ensure!(metadata.is_dir(), "Forge state root is not a directory"),
+        Ok(metadata) => ensure!(
+            metadata.is_dir() && !super::layout::is_link(&state)?,
+            "Forge state root is not a plain directory"
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         Err(error) => return Err(error).context("inspect Forge state root"),
     }
@@ -89,40 +104,33 @@ pub fn clear(root: &Path) -> Result<ClearReport> {
         let result = (|| -> Result<()> {
             let version = version.context("unrecognized state directory")?;
             ensure!(
-                entry.file_type()?.is_dir(),
+                entry.file_type()?.is_dir() && !super::layout::is_link(&path)?,
                 "state version is not a directory"
             );
             let lease = version_lock(root, version)?;
             lease
                 .try_lock()
                 .context("state version is locked by a running Forge host")?;
-            // Inspect every database before removing any dependent plan, object, or journal.
-            let mut connections = Vec::new();
-            for file in fs::read_dir(&path)? {
-                let file = file?;
-                if file
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "sqlite3")
-                {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "cleanup probes another state version's database, which has no writer in this process"
-                    )]
-                    let connection = rusqlite::Connection::open_with_flags(
-                        file.path(),
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-                    )?;
-                    // A live database owner retains the version; waiting on SQLite's busy
-                    // handler would only stall cleanup before reporting the same retention.
-                    connection.busy_timeout(std::time::Duration::ZERO)?;
-                    connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
-                    connection.execute_batch("BEGIN EXCLUSIVE")?;
-                    connections.push(connection);
-                }
-            }
-            drop(connections);
+            let legacy_path = root.join("state-locks").join(format!("v{version}.lock"));
+            let legacy_lease = if legacy_path.try_exists()? {
+                let legacy = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&legacy_path)?;
+                legacy
+                    .try_lock()
+                    .context("state version is locked by a retired Forge host")?;
+                Some(legacy)
+            } else {
+                None
+            };
+            let mut owners = super::layout::CleanupOwnership::default();
+            owners.inspect(&path)?;
+            let repositories = crate::repository_access::clear_version(&path)?;
+            owners.close_databases();
             fs::remove_dir_all(&path).with_context(|| format!("delete {}", path.display()))?;
+            drop(repositories);
+            drop(legacy_lease);
             Ok(())
         })();
         match result {
@@ -147,7 +155,7 @@ pub fn clear(root: &Path) -> Result<ClearReport> {
 
 /// Keep lock inodes outside disposable directories so deletion cannot split ownership.
 fn version_lock(root: &Path, version: u32) -> Result<File> {
-    let locks = root.join("state-locks");
+    let locks = root.join("locks");
     fs::create_dir_all(&locks)?;
     Ok(OpenOptions::new()
         .create(true)
@@ -166,6 +174,7 @@ mod tests {
     #[test]
     fn clear_versions_excludes_live_owners_and_preserves_settings() -> Result<()> {
         let root = tempfile::tempdir()?;
+        super::super::layout::prepare(root.path())?;
         let old = root.path().join("state/v1");
         fs::create_dir_all(old.join("objects"))?;
         fs::write(old.join("objects/retained"), "captured file")?;
@@ -180,6 +189,8 @@ mod tests {
         store.save_session(&crate::storage::test::session("session", "workspace"))?;
         let mut pins = crate::storage::model_pin::ModelPinStore::open(root.path())?;
         pins.set("mock", "chosen-model", true)?;
+        super::super::preferences::host_set(root.path(), "provider", &"mock")?;
+        super::super::preferences::host_set(root.path(), "logging", &crate::trace::LogLevel::Warn)?;
         let preference = crate::session::HarnessPreference {
             access: Default::default(),
             shell: Default::default(),
@@ -249,6 +260,17 @@ mod tests {
             serialize_permission_document(&permissions)?,
         )?;
         let assert_persistent_settings = || -> Result<()> {
+            assert_eq!(
+                super::super::preferences::host_get::<String>(root.path(), "provider")?.as_deref(),
+                Some("mock")
+            );
+            assert_eq!(
+                super::super::preferences::host_get::<crate::trace::LogLevel>(
+                    root.path(),
+                    "logging"
+                )?,
+                Some(crate::trace::LogLevel::Warn)
+            );
             let reopened = crate::settings::SettingsStore::open(root.path())?;
             let after = reopened.get("workspace", "session", "mock")?;
             assert_eq!(
@@ -263,6 +285,7 @@ mod tests {
             );
             Ok(())
         };
+        drop(settings);
         let locked = clear(root.path())?;
         assert!(!locked.current_cleared);
         assert_eq!(locked.retained.len(), 2);
@@ -288,7 +311,7 @@ mod tests {
         drop(old_owner);
         let complete = clear(root.path())?;
         assert!(complete.retained.is_empty());
-        assert!(!root.path().join("state").exists());
+        assert!(!old.exists());
         assert_persistent_settings()?;
         let fresh = SqliteStore::open(root.path())?;
         assert!(fresh.load_session("session")?.is_none());
@@ -297,6 +320,28 @@ mod tests {
             serde_json::to_value(fresh.load_preference("workspace", "mock")?.unwrap())?,
             serde_json::to_value(preference)?
         );
+        Ok(())
+    }
+
+    /// A legacy-only lease protects its whole version while unlocked siblings can be removed.
+    #[test]
+    fn legacy_lease_retains_only_its_version() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        super::super::layout::prepare(root.path())?;
+        fs::create_dir_all(root.path().join("state/v1"))?;
+        fs::create_dir_all(root.path().join("state/v2"))?;
+        fs::create_dir_all(root.path().join("state-locks"))?;
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.path().join("state-locks/v1.lock"))?;
+        owner.lock_shared()?;
+        fs::write(root.path().join("state/v1/retained"), "keep")?;
+        let report = clear(root.path())?;
+        assert_eq!(report.retained.len(), 1);
+        assert!(root.path().join("state/v1/retained").is_file());
+        assert!(!root.path().join("state/v2").exists());
         Ok(())
     }
 }

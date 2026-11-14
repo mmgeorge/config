@@ -1269,6 +1269,18 @@
       "readiness": "runtime",
       "admission": "ordinary",
       "recovery": "session_command"
+    },
+    "settings.provider.get": {
+      "session_context": "none",
+      "readiness": "host",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "settings.provider.set": {
+      "session_context": "none",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
     }
   }
 }

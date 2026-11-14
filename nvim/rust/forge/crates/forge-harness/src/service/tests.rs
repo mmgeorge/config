@@ -70,6 +70,7 @@ async fn lsp_callbacks_enforce_session_and_request_ownership() -> Result<()> {
     let (scope, lease) = registry.runtime.lsp.scope(
         session_id.clone(),
         "callback-interaction".into(),
+        registry.initialize.data_root.clone().into(),
         fixture.path().into(),
         policy,
         tokio::sync::watch::channel(false).1,

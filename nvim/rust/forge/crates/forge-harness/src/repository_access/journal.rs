@@ -9,8 +9,69 @@ use std::{
     sync::Mutex,
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = crate::storage::state::VERSION;
 static QUARANTINED: Mutex<Vec<QuarantinedOwner>> = Mutex::new(Vec::new());
+
+/// Inspect retired ownership evidence without decoding a superseded operation payload.
+pub(super) fn legacy_inspect(directory: &Path) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let mut lease = Vec::new();
+    let owners = directory.join("owners");
+    if owners.try_exists()? {
+        for entry in std::fs::read_dir(&owners)? {
+            let path = entry?.path();
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            file.try_lock()
+                .with_context(|| format!("live retired repository owner: {}", path.display()))?;
+            lease.push(file);
+        }
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        // The containment identity is process evidence, not a legacy operation reader.
+        let evidence: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        if evidence.get("phase").and_then(serde_json::Value::as_str) == Some("collected") {
+            continue;
+        }
+        let containment = evidence
+            .get("containment")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| {
+                format!(
+                    "retired repository operation lacks process containment evidence: {}",
+                    path.display()
+                )
+            })?;
+        let identity = uuid::Uuid::parse_str(containment)?;
+        let collected =
+            forge_shell::containment::ProcessContainment::recover(&identity.to_string())?;
+        ensure!(
+            matches!(
+                collected,
+                forge_shell::containment::CollectionStatus::Collected
+            ),
+            "retired repository operation has unresolved processes: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Remove only a retired operation directory whose processes are proven collected.
+pub(super) fn legacy_collect(directory: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    legacy_inspect(directory)?;
+    std::fs::remove_dir_all(directory).with_context(|| {
+        format!(
+            "remove collected retired repository operations {}",
+            directory.display()
+        )
+    })?;
+    Ok(())
+}
 
 /// Preserve the cause that prevents safe repository admission or journal publication.
 #[derive(Debug, thiserror::Error)]
@@ -52,12 +113,76 @@ pub(super) struct RepositoryJournal {
     record: Mutex<OperationRecord>,
     containment: std::sync::Arc<forge_shell::containment::ProcessContainment>,
     admission: PathBuf,
+    _state: Option<crate::storage::state::StateLease>,
+    reference: Option<PathBuf>,
 }
 
 impl RepositoryJournal {
+    /// Resolve process containment across Harness roots without reading another version's payload.
+    pub(super) fn discover(
+        directory: &Path,
+        key: &str,
+        workspace: &Path,
+    ) -> Result<(), JournalError> {
+        let references = directory.join(format!("{key}.references"));
+        if !references
+            .try_exists()
+            .map_err(|source| io(&references, source))?
+        {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&references).map_err(|source| io(&references, source))? {
+            let path = entry.map_err(|source| io(&references, source))?.path();
+            let reference: ProcessReference = serde_json::from_slice(&read_bytes(&path)?)
+                .map_err(|source| json(&path, source))?;
+            let lease = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&reference.lease)
+                .map_err(|source| io(&reference.lease, source))?;
+            match lease.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(std::fs::TryLockError::Error(source)) => {
+                    return Err(io(&reference.lease, source));
+                }
+                Ok(()) => {}
+            }
+            let _source = recovery_access(directory, key, workspace)?;
+            match forge_shell::containment::ProcessContainment::recover(
+                &reference.containment.to_string(),
+            )
+            .map_err(|source| io(&path, source))?
+            {
+                forge_shell::containment::CollectionStatus::Collected => {
+                    std::fs::remove_file(&path).map_err(|source| io(&path, source))?;
+                }
+                forge_shell::containment::CollectionStatus::Pending
+                | forge_shell::containment::CollectionStatus::Unsupported => {
+                    return Err(JournalError::Uncollected {
+                        path,
+                        operation: reference.operation,
+                        pid: reference.pid,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate all existing records under the admission gate before granting source access.
+    #[cfg(test)]
     pub(super) fn recover(
         directory: &Path,
+        key: &str,
+        workspace: &Path,
+    ) -> Result<(), JournalError> {
+        Self::recover_at(directory, directory, key, workspace)
+    }
+
+    /// Recover versioned payloads under their unchanged shared source lock.
+    pub(super) fn recover_at(
+        directory: &Path,
+        shared: &Path,
         key: &str,
         workspace: &Path,
     ) -> Result<(), JournalError> {
@@ -122,13 +247,7 @@ impl RepositoryJournal {
                 ));
             }
             if record.phase != OperationPhase::Collected && recovery_lock.is_none() {
-                recovery_lock = Some(recovery_access(
-                    directory
-                        .parent()
-                        .ok_or_else(|| invalid(&directory, "journal has no parent"))?,
-                    key,
-                    workspace,
-                )?);
+                recovery_lock = Some(recovery_access(shared, key, workspace)?);
             }
             // Collect the registered tree independently of the dead owner's process identity.
             if matches!(
@@ -190,6 +309,7 @@ impl RepositoryJournal {
     }
 
     /// Persist prepared ownership before any operation can execute or borrow it.
+    #[cfg(test)]
     pub(super) fn begin(
         directory: &Path,
         key: &str,
@@ -197,7 +317,43 @@ impl RepositoryJournal {
         operation: uuid::Uuid,
         access: RepositoryAccess,
     ) -> Result<Self, JournalError> {
-        let admission = directory.join(format!("{key}.admission.lock"));
+        Self::begin_owned(
+            directory, directory, key, workspace, operation, access, None,
+        )
+    }
+
+    /// Publish state-owned recovery and shared process discovery before granting execution.
+    pub(super) fn begin_at(
+        directory: &Path,
+        shared: &Path,
+        key: &str,
+        workspace: &Path,
+        operation: uuid::Uuid,
+        access: RepositoryAccess,
+        state: crate::storage::state::StateLease,
+    ) -> Result<Self, JournalError> {
+        Self::begin_owned(
+            directory,
+            shared,
+            key,
+            workspace,
+            operation,
+            access,
+            Some(state),
+        )
+    }
+
+    /// Establish the journal and its optional cross-root containment reference atomically with admission.
+    fn begin_owned(
+        directory: &Path,
+        shared: &Path,
+        key: &str,
+        workspace: &Path,
+        operation: uuid::Uuid,
+        access: RepositoryAccess,
+        state: Option<crate::storage::state::StateLease>,
+    ) -> Result<Self, JournalError> {
+        let admission = shared.join(format!("{key}.admission.lock"));
         let directory = directory.join(format!("{key}.operations"));
         let owners = directory.join("owners");
         std::fs::create_dir_all(&owners).map_err(|source| io(&owners, source))?;
@@ -244,6 +400,29 @@ impl RepositoryJournal {
             outcomes: BTreeMap::new(),
         };
         write_record(&path, &record)?;
+        let reference = if state.is_some() {
+            let references = shared.join(format!("{key}.references"));
+            std::fs::create_dir_all(&references).map_err(|source| io(&references, source))?;
+            let reference = references.join(format!("{operation}.json"));
+            let value = ProcessReference {
+                lease: lease_path,
+                containment: containment_id,
+                operation,
+                pid: record.owner.pid,
+            };
+            let encoded = serde_json::to_vec(&value).map_err(|source| json(&reference, source))?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&reference)
+                .map_err(|source| io(&reference, source))?;
+            file.write_all(&encoded)
+                .map_err(|source| io(&reference, source))?;
+            file.sync_all().map_err(|source| io(&reference, source))?;
+            Some(reference)
+        } else {
+            None
+        };
         Ok(Self {
             directory,
             path,
@@ -251,6 +430,8 @@ impl RepositoryJournal {
             record: Mutex::new(record),
             containment,
             admission,
+            _state: state,
+            reference,
         })
     }
 
@@ -423,7 +604,15 @@ impl RepositoryJournal {
                 *record = next;
             }
         }
-        self.update_under_gate(Some(OperationPhase::Collected), Some(Vec::new()))
+        self.update_under_gate(Some(OperationPhase::Collected), Some(Vec::new()))?;
+        if let Some(path) = &self.reference {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io(path, error)),
+            }
+        }
+        Ok(())
     }
 
     /// Serialize journal writes with admission; admission itself never waits for source access.
@@ -571,6 +760,16 @@ impl OperationRecord {
 struct QuarantinedOwner {
     journal: RepositoryJournal,
     _source: File,
+}
+
+/// Stable discovery evidence contains no version-specific operation payload.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessReference {
+    lease: PathBuf,
+    containment: uuid::Uuid,
+    operation: uuid::Uuid,
+    pid: NonZeroU32,
 }
 
 /// Require exclusive source access before reconciling an abandoned operation.

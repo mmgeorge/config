@@ -28,6 +28,8 @@ pub(crate) enum RepositoryAccessError {
     DifferentRepository { owned: PathBuf, requested: PathBuf },
     #[error("repository_ownership_unavailable: {0}")]
     Unavailable(&'static str),
+    #[error("repository state ownership failed: {0:#}")]
+    State(#[source] anyhow::Error),
     #[error("repository access I/O failed for {}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -60,10 +62,11 @@ impl RepositoryReservation {
 
     /// Acquire source access in the per-user namespace without waiting on an owner.
     pub(crate) fn acquire(
+        root: &Path,
         workspace: &Path,
         access: RepositoryAccess,
     ) -> Result<Self, RepositoryAccessError> {
-        Self::acquire_in(&reservation_directory()?, workspace, access)
+        Self::acquire_at(root, &reservation_directory()?, workspace, access)
     }
 
     /// Get a revocable capability without extending this owner's lifetime.
@@ -76,11 +79,24 @@ impl RepositoryReservation {
     }
 
     /// Acquire access under the journal admission gate in an explicitly selected namespace.
+    #[cfg(test)]
     fn acquire_in(
         directory: &Path,
         workspace: &Path,
         access: RepositoryAccess,
     ) -> Result<Self, RepositoryAccessError> {
+        Self::acquire_at(&directory.join("harness"), directory, workspace, access)
+    }
+
+    /// Retain a state version while preserving the shared repository lock identity.
+    fn acquire_at(
+        root: &Path,
+        directory: &Path,
+        workspace: &Path,
+        access: RepositoryAccess,
+    ) -> Result<Self, RepositoryAccessError> {
+        let state =
+            crate::storage::state::StateLease::open(root).map_err(RepositoryAccessError::State)?;
         let workspace = Arc::new(canonical_workspace(workspace)?);
         let identity = workspace
             .to_str()
@@ -95,11 +111,35 @@ impl RepositoryReservation {
         // Keep the gate separate from source access so healthy readers can coexist.
         let gate = lock_file(&directory.join(format!("{key}.admission.lock")))?;
         lock(&gate, &workspace, RepositoryAccess::Write)?;
-        RepositoryJournal::recover(directory, &key, &workspace)?;
+        let legacy = directory.join(format!("{key}.operations"));
+        if legacy
+            .try_exists()
+            .map_err(|source| RepositoryAccessError::Io {
+                path: legacy.clone(),
+                source,
+            })?
+        {
+            let source = lock_file(&directory.join(format!("{key}.lock")))?;
+            lock(&source, &workspace, RepositoryAccess::Write)?;
+            return Err(RepositoryAccessError::Unavailable(
+                "incompatible repository operation storage; run :ForgeHistoryClear before starting Harness",
+            ));
+        }
+        RepositoryJournal::discover(directory, &key, &workspace)?;
+        let operations = crate::storage::state::directory(root).join("repository-operations");
+        RepositoryJournal::recover_at(&operations, directory, &key, &workspace)?;
         let file = lock_file(&directory.join(format!("{key}.lock")))?;
         lock(&file, &workspace, access)?;
         let id = uuid::Uuid::new_v4();
-        let journal = RepositoryJournal::begin(directory, &key, &workspace, id, access)?;
+        let journal = RepositoryJournal::begin_at(
+            &operations,
+            directory,
+            &key,
+            &workspace,
+            id,
+            access,
+            state,
+        )?;
         Ok(Self {
             core: Arc::new(ReservationCore {
                 file: Some(file),
@@ -502,9 +542,196 @@ fn reservation_directory() -> Result<PathBuf, RepositoryAccessError> {
     Ok(directory.join("forge").join("repository-reservations"))
 }
 
+/// Block cutover while retired ownership lacks proof of complete process collection.
+pub(crate) fn reset_preflight() -> anyhow::Result<Vec<PathBuf>> {
+    reset_preflight_at(&reservation_directory()?)
+}
+
+/// Enumerate the retired namespace independently of disposable session history.
+fn reset_preflight_at(directory: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut retired = Vec::new();
+    if !directory.try_exists()? {
+        return Ok(retired);
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "operations")
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            !crate::storage::layout::is_link(&path)?,
+            "retired repository storage is a symlink or junction: {}",
+            path.display()
+        );
+        let key = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid retired repository identity"))?;
+        let gate = lock_file(&directory.join(format!("{key}.admission.lock")))?;
+        gate.try_lock().map_err(|error| {
+            anyhow::anyhow!(
+                "retired repository admission is live at {}: {error}",
+                path.display()
+            )
+        })?;
+        let source = lock_file(&directory.join(format!("{key}.lock")))?;
+        source.try_lock().map_err(|error| {
+            anyhow::anyhow!(
+                "retired repository access is live at {}: {error}",
+                path.display()
+            )
+        })?;
+        super::journal::legacy_inspect(&path)?;
+        retired.push(path);
+    }
+    Ok(retired)
+}
+/// Collect dependent repository processes before removing any file in a state version.
+pub(crate) fn clear_retired(path: &Path) -> anyhow::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("retired journal has no parent"))?;
+    let key = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid retired repository identity"))?;
+    let gate = lock_file(&directory.join(format!("{key}.admission.lock")))?;
+    gate.try_lock()?;
+    let source = lock_file(&directory.join(format!("{key}.lock")))?;
+    source.try_lock()?;
+    super::journal::legacy_collect(path)
+}
+
+/// Collect dependent repository processes before removing any file in a state version.
+pub(crate) fn clear_version(version: &Path) -> anyhow::Result<RepositoryCleanup> {
+    let operations = version.join("repository-operations");
+    if !operations.try_exists()? {
+        return Ok(RepositoryCleanup { _gates: Vec::new() });
+    }
+    let shared = reservation_directory()?;
+    let mut gates = Vec::new();
+    let mut references = Vec::new();
+    for entry in std::fs::read_dir(&operations)? {
+        let path = entry?.path();
+        let key = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid repository operation directory"))?;
+        let gate = lock_file(&shared.join(format!("{key}.admission.lock")))?;
+        gate.try_lock()?;
+        let source = lock_file(&shared.join(format!("{key}.lock")))?;
+        source.try_lock()?;
+        super::journal::legacy_inspect(&path)?;
+        let discovery = shared.join(format!("{key}.references"));
+        if discovery.try_exists()? {
+            for reference in std::fs::read_dir(discovery)? {
+                let reference = reference?.path();
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&reference)?)?;
+                if value
+                    .get("lease")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|lease| Path::new(lease).starts_with(version))
+                {
+                    references.push(reference);
+                }
+            }
+        }
+        gates.push((gate, source));
+    }
+    for reference in references {
+        std::fs::remove_file(reference)?;
+    }
+    Ok(RepositoryCleanup { _gates: gates })
+}
+
+/// Hold global repository admission through deletion of the version's dependent files.
+pub(crate) struct RepositoryCleanup {
+    _gates: Vec<(File, File)>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retired journals remain discoverable after every old session has been deleted.
+    #[test]
+    fn cleanup_resolves_retired_repository_identity() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let identity = canonical_workspace(workspace.path())?;
+        let key = crate::plan::digest(identity.to_str().unwrap().as_bytes());
+        let journal = directory.path().join(format!("{key}.operations"));
+        std::fs::create_dir_all(&journal)?;
+        std::fs::write(
+            journal.join("retired.json"),
+            r#"{"version":1,"phase":"collected"}"#,
+        )?;
+        let unrelated = directory.path().join("unrelated-cache");
+        std::fs::create_dir(&unrelated)?;
+        assert_eq!(reset_preflight_at(directory.path())?, vec![journal.clone()]);
+        clear_retired(&journal)?;
+        assert!(unrelated.is_dir());
+        assert!(directory.path().join(format!("{key}.lock")).is_file());
+        let reservation = RepositoryReservation::acquire_at(
+            root.path(),
+            directory.path(),
+            workspace.path(),
+            RepositoryAccess::Read,
+        )?;
+        reservation.published()?;
+        Ok(())
+    }
+
+    /// State roots share source exclusion and retained workers protect their complete version.
+    #[test]
+    fn separate_roots_share_repository_identity_and_retain_workers() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let first_root = tempfile::tempdir()?;
+        let second_root = tempfile::tempdir()?;
+        let first = RepositoryReservation::acquire_at(
+            first_root.path(),
+            directory.path(),
+            workspace.path(),
+            RepositoryAccess::Write,
+        )?;
+        assert!(matches!(
+            RepositoryReservation::acquire_at(
+                second_root.path(),
+                directory.path(),
+                workspace.path(),
+                RepositoryAccess::Read
+            ),
+            Err(RepositoryAccessError::Busy(_))
+        ));
+        let execution = first
+            .scope()
+            .enter(workspace.path(), RepositoryAccess::Write)?;
+        let worker = execution.process_owner();
+        drop(execution);
+        drop(first);
+        assert!(!crate::storage::state::clear(first_root.path())?.current_cleared);
+        drop(worker);
+        let cleared = crate::storage::state::clear(first_root.path())?;
+        assert!(cleared.current_cleared, "{cleared:?}");
+        let second = RepositoryReservation::acquire_at(
+            second_root.path(),
+            directory.path(),
+            workspace.path(),
+            RepositoryAccess::Read,
+        )?;
+        assert!(
+            crate::storage::state::directory(second_root.path())
+                .join("repository-operations")
+                .is_dir()
+        );
+        second.published()?;
+        Ok(())
+    }
 
     /// A detached process worker owns the execution slot even after its requesting task disappears.
     #[test]
@@ -736,7 +963,7 @@ mod tests {
         std::fs::write(&file, b"fixture")?;
         assert!(matches!(
             RepositoryReservation::acquire_in(&file, workspace.path(), RepositoryAccess::Read),
-            Err(RepositoryAccessError::Io { .. })
+            Err(RepositoryAccessError::Io { .. } | RepositoryAccessError::State(_))
         ));
         Ok(())
     }
@@ -796,6 +1023,10 @@ mod tests {
         let key = crate::plan::digest(canonical.to_str().unwrap().as_bytes());
         let record = directory
             .path()
+            .join("harness")
+            .join("state")
+            .join(format!("v{}", crate::storage::state::VERSION))
+            .join("repository-operations")
             .join(format!("{key}.operations"))
             .join(format!("{}.json", root.id));
         let backup = record.with_extension("saved");
@@ -842,6 +1073,10 @@ mod tests {
         let key = crate::plan::digest(canonical.to_str().unwrap().as_bytes());
         let record = directory
             .path()
+            .join("harness")
+            .join("state")
+            .join(format!("v{}", crate::storage::state::VERSION))
+            .join("repository-operations")
             .join(format!("{key}.operations"))
             .join(format!("{}.json", root.id));
         let backup = record.with_extension("saved");

@@ -152,12 +152,15 @@ T["admission_queue"] = function()
   assert(writes[#writes].method == "provider.registry.list", "full transport starved runtime startup registry")
   emit({ id = writes[#writes].id, result = dofile("nvim/lua/forge/tests/support/provider_catalog.lua").registry() })
   wait_until(function() return #writes == offset + 258 end, "runtime initialization request was not dispatched")
+  assert(writes[#writes].method == "settings.provider.get", "full transport starved saved provider lookup")
+  emit({ id = writes[#writes].id, result = {} })
+  wait_until(function() return #writes == offset + 259 end, "runtime initialization request was not dispatched")
   assert(writes[#writes].method == "session.initialize", "full transport starved runtime initialization")
   emit({ id = writes[#writes].id, result = { initialized = true } })
-  wait_until(function() return #writes == offset + 259 end, "trace configuration request was not dispatched")
+  wait_until(function() return #writes == offset + 260 end, "trace configuration request was not dispatched")
   eq(writes[#writes].method, "host.trace.configure")
   emit({ id = writes[#writes].id, result = { level = "none" } })
-  wait_until(function() return #writes == offset + 260 end, "initialized waiting request was not dispatched")
+  wait_until(function() return #writes == offset + 261 end, "initialized waiting request was not dispatched")
   assert(writes[#writes].params.label == "startup-waiting", "initialized request never reached transport")
   respond(writes[#writes])
   wait_until(function() return results["startup-waiting"] end, "startup-waiting reply did not complete")
@@ -180,6 +183,10 @@ T["callback_isolation"] = function()
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
         sent[request.method] = request.id
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then emit({ id = request.id, result = { protocol_version = response_version } }) end
         if request.method == "provider.registry.list" and initializing_harness then
           emit({ id = request.id, result = dofile("nvim/lua/forge/tests/support/provider_catalog.lua").registry() })
@@ -299,6 +306,10 @@ T["exit_admission"] = function()
     return {
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           options.stdout(nil, vim.json.encode({ id = request.id, result = {
             protocol_version = require("forge.protocol").VERSION,
@@ -349,6 +360,10 @@ T["request_contract"] = function()
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
         requests[#requests + 1] = request
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           respond(request, { protocol_version = protocol.VERSION })
         elseif request.method == "provider.registry.list" then
@@ -446,6 +461,10 @@ T["startup_cancellation"] = function()
     return {
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           options.stdout(nil, vim.json.encode({ id = request.id, result = {
             protocol_version = require("forge.protocol").VERSION,
@@ -611,6 +630,10 @@ T["client"] = function()
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
         write_order[#write_order + 1] = request.method
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           options.stdout(nil, vim.json.encode({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) .. "\n")
         elseif request.method == "repository.status.document" then
@@ -654,6 +677,10 @@ T["client"] = function()
           return
         end
         local result = {}
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then result.protocol_version = require("forge.protocol").VERSION
         elseif request.method == "provider.registry.list" then result = dofile("nvim/lua/forge/tests/support/provider_catalog.lua").registry()
         elseif request.method == "session.initialize" then result.session = { id = "admission" } end
@@ -731,9 +758,17 @@ T["client"] = function()
     return {
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           eq(request.params.recovery_directory, vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "recovery", "github", "v1"))
           eq(request.params.status_ignored_directory, vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "status-ignored"))
+        end
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
         end
         if request.method == "host.initialize" then
           output(nil, vim.json.encode({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) .. "\n")
@@ -794,7 +829,11 @@ T["result_transfer"] = function()
       return {
         write = function(_, encoded)
           local request = vim.json.decode(encoded)
-          if request.method == "host.initialize" then
+          if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
+        if request.method == "host.initialize" then
             emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
           elseif request.method == method then
             request_id = request.id
@@ -962,6 +1001,10 @@ T["receive"] = function()
           assert(request.params.bytes == acknowledged_bytes, "client credit byte total differs")
           return
         end
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
         elseif request.method == "provider.registry.list" then
@@ -1019,6 +1062,10 @@ T["transport_failure"] = function()
     return {
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           emitted(nil, vim.json.encode({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) .. "\n")
         elseif request.method == "provider.registry.list" then
@@ -1101,6 +1148,10 @@ local function exit_inside_frame_recovers(windows)
       pid = 4242,
       write = function(_, encoded)
         local request = vim.json.decode(encoded)
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           emitted(nil, vim.json.encode({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } }) .. "\n")
         end
@@ -1243,6 +1294,10 @@ T["provider_registry_config_reload"] = function()
         local request = vim.json.decode(encoded)
         if request.method == "host.transport.consumed" or request.method == "host.shutdown" then return end
         local result = {}
+        if request.method == "settings.provider.get" then
+          options.stdout(nil, vim.json.encode({ id = request.id, result = {} }) .. "\n")
+          return
+        end
         if request.method == "host.initialize" then
           result.protocol_version = require("forge.protocol").VERSION
         elseif request.method == "provider.registry.list" then

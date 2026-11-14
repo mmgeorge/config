@@ -198,6 +198,7 @@ mod test {
     #[test]
     fn shared_resources_apply_selection_without_exposing_launch_credentials() {
         let root = tempfile::tempdir().unwrap();
+        crate::storage::layout::prepare(root.path()).unwrap();
         let global = root.path().join("rulesync-global/.rulesync");
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(global.join("skills/shared-skill")).unwrap();

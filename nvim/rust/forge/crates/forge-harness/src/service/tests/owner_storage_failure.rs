@@ -61,7 +61,7 @@ async fn owner_startup_failure_reports_cause_and_rejects_prompt() -> Result<()> 
     })
     .await??;
     let reason = activity.unavailable_reason.as_deref().unwrap();
-    assert!(reason.contains("Recover terminal requests"), "{reason}");
+    assert!(reason.contains("Recover owner state"), "{reason}");
     assert!(reason.contains("malformed JSON"), "{reason}");
     prompt::apply(
         &controller,

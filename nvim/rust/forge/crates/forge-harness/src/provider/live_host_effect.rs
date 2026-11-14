@@ -86,6 +86,7 @@ mod tests {
             let call = ToolCallId::new("committed-rename")?;
             let change = crate::tools::lsp::HostFileChange {
                 reservation: Some(crate::checks::MutationReservation::acquire(
+                    &(directory.path()).join("harness-state"),
                     directory.path(),
                 )?),
                 scope: scope.clone(),
@@ -122,6 +123,7 @@ mod tests {
             let preview = slot.preview()?;
             assert!(
                 crate::checks::CheckReservation::acquire(
+                    &(directory.path()).join("harness-state"),
                     directory.path(),
                     crate::checks::CheckPurpose::Verify
                 )
@@ -130,6 +132,7 @@ mod tests {
             preview.batches[0].completion.host_file_changes[0].recorded()?;
             assert!(
                 crate::checks::CheckReservation::acquire(
+                    &(directory.path()).join("harness-state"),
                     directory.path(),
                     crate::checks::CheckPurpose::Verify
                 )

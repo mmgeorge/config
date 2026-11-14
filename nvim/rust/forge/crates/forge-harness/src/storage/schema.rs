@@ -7,6 +7,8 @@ const APPLICATION: i64 = 0x464f5247;
 /// Tables created atomically before a history database can be opened.
 const REQUIRED_TABLES: &[&str] = &[
     "session_record",
+    "setting_application",
+    "session_setting_layer",
     "session_question_state",
     "task_record",
     "exchange_record",
@@ -126,6 +128,7 @@ pub(super) fn validate(connection: &Connection) -> Result<i64> {
             "Harness database schema {VERSION} is incomplete: missing required tables: {}; clear this state version with ForgeHistoryClear",
             missing.join(", ")
         );
+        validate_structure(connection)?;
         for query in [
             "SELECT session_id,command_id,operation_id FROM owner_command_join LIMIT 0",
             "SELECT session_id,format_version,payload FROM session_question_state LIMIT 0",
@@ -146,6 +149,35 @@ pub(super) fn validate(connection: &Connection) -> Result<i64> {
     Ok(version)
 }
 
+/// Compare required SQL structures against the schema this executable creates.
+fn validate_structure(connection: &Connection) -> Result<()> {
+    static EXPECTED: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let expected = EXPECTED.get_or_init(|| {
+        #[expect(clippy::disallowed_methods, reason = "derive schema validation from the production initializer without opening user state")]
+        let mut reference = Connection::open_in_memory().expect("in-memory schema connection must open");
+        initialize(&mut reference).expect("compiled history schema must initialize");
+        schema_objects(&reference).expect("compiled schema must be readable")
+    });
+    let actual = schema_objects(connection)?;
+    for (name, definition) in expected {
+        ensure!(
+            actual
+                .iter()
+                .any(|(actual_name, actual_definition)| actual_name == name
+                    && actual_definition == definition),
+            "Harness required schema is incompatible: {name}; clear this state version with ForgeHistoryClear"
+        );
+    }
+    Ok(())
+}
+
+/// Read table constraints and required indices without reading session payloads.
+fn schema_objects(connection: &Connection) -> Result<Vec<(String, String)>> {
+    Ok(connection.prepare("SELECT name,sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name")?
+        .query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1)?.split_whitespace().collect::<String>())))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Create the exact schema for this executable's disposable-state version.
 pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -154,6 +186,8 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
         .context("acquire Harness schema initialization write lock")?;
     transaction.execute_batch(
         r#"
+            CREATE TABLE setting_application (session_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE session_setting_layer (scope TEXT NOT NULL CHECK(scope='session'), identity TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(scope,identity));
             CREATE TABLE IF NOT EXISTS session_record (
                 id TEXT PRIMARY KEY,
                 workspace TEXT NOT NULL,

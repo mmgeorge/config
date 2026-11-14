@@ -823,6 +823,24 @@ impl HarnessService {
                 .await?;
             return Ok(());
         }
+        if matches!(
+            method,
+            RuntimeMethod::SettingsProviderGet | RuntimeMethod::SettingsProviderSet
+        ) && let Some(root) = request.params.get("data_root").and_then(Value::as_str)
+        {
+            let root = PathBuf::from(root);
+            if method == RuntimeMethod::SettingsProviderSet {
+                let provider = request.params["provider"]
+                    .as_str()
+                    .context("provider is required")?;
+                forge_providers::registry::select(provider)?;
+                crate::storage::preferences::host_set(&root, "provider", &provider)?;
+            }
+            let provider = crate::storage::preferences::host_get::<String>(&root, "provider")?;
+            sink.send_response(Response::success(request.id, json!({"provider":provider}))?)
+                .await?;
+            return Ok(());
+        }
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
         registry.runtime.lsp.attach(sink.clone());
@@ -1195,6 +1213,7 @@ impl HarnessService {
         initialize: InitializeRequest,
         mode: InitializationMode,
     ) -> Result<Value> {
+        crate::storage::layout::prepare(PathBuf::from(&initialize.data_root).as_path())?;
         let startup_started = std::time::Instant::now();
         let mut startup_timing = serde_json::Map::new();
         let mut harness = self.registry.lock().await;
@@ -1216,6 +1235,8 @@ impl HarnessService {
                 "Harness is already initialized"
             );
         }
+        let bootstrap_trace =
+            crate::trace::TraceStore::open(PathBuf::from(&initialize.data_root).as_path())?;
         if let Some(root) = &initialize.config_dir {
             crate::settings::SettingsStore::open(PathBuf::from(&initialize.data_root).as_path())?
                 .configure_catalog(PathBuf::from(root).as_path())?;
@@ -1249,6 +1270,7 @@ impl HarnessService {
                 Arc::clone(&self.diff),
             )?
         };
+        drop(bootstrap_trace);
         startup_timing.insert(
             "runtime_ready_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
@@ -1312,6 +1334,10 @@ impl HarnessService {
         );
         let snapshot = controller.observer.snapshot()?;
         let mut result = serde_json::to_value(&snapshot)?;
+        let notice = PathBuf::from(&initialize.data_root).join("reset-notice.txt");
+        if notice.try_exists()? {
+            result["storage_notice"] = json!(std::fs::read_to_string(notice)?);
+        }
         startup_timing.insert(
             "snapshot_serialized_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
@@ -3354,6 +3380,7 @@ async fn route_control_request(
 }
 
 fn initialize_failure(request_id: u64, error: &anyhow::Error) -> Response {
+    eprintln!("Forge initialization failed: {error:#}");
     tracing::error!(target: "forge::ipc", event_name = "ipc.initialize.failed",
         request_id, error = %format_args!("{error:#}"));
     error.downcast_ref::<SessionLeaseConflict>().map_or_else(

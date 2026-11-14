@@ -1357,6 +1357,7 @@ mod tests {
         let report = finalization.capture_report().await?;
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(fixture._workspace.path()).join("harness-state"),
                 fixture._workspace.path(),
                 crate::checks::CheckPurpose::Prepare,
             )
@@ -1366,6 +1367,7 @@ mod tests {
             .broker
             .commit_task_check_finalization(finalization, report)?;
         let _writer = crate::checks::CheckReservation::acquire(
+            &(fixture._workspace.path()).join("harness-state"),
             fixture._workspace.path(),
             crate::checks::CheckPurpose::Prepare,
         )?;
@@ -1394,6 +1396,7 @@ mod tests {
             crate::plan::PlanPhase::Checking
         );
         let _writer = crate::checks::CheckReservation::acquire(
+            &(fixture._workspace.path()).join("harness-state"),
             fixture._workspace.path(),
             crate::checks::CheckPurpose::Prepare,
         )?;
@@ -1422,6 +1425,7 @@ mod tests {
             crate::plan::PlanPhase::Checking
         );
         let _writer = crate::checks::CheckReservation::acquire(
+            &(fixture._workspace.path()).join("harness-state"),
             fixture._workspace.path(),
             crate::checks::CheckPurpose::Prepare,
         )?;
@@ -1473,6 +1477,7 @@ mod tests {
         let snapshot = broker.prepare_workspace_capture().run_reserved().await?;
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(workspace.path()).join("harness-state"),
                 workspace.path(),
                 crate::checks::CheckPurpose::Prepare
             )
@@ -1489,6 +1494,7 @@ mod tests {
         assert!(broker.task_controller.current()?.is_none());
         drop(snapshot);
         let _writer = crate::checks::CheckReservation::acquire(
+            &(workspace.path()).join("harness-state"),
             workspace.path(),
             crate::checks::CheckPurpose::Prepare,
         )?;
@@ -1884,6 +1890,7 @@ mod tests {
         let checkpoint = broker.prepare_workspace_capture().run_reserved().await?;
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(fixture._workspace.path()).join("harness-state"),
                 fixture._workspace.path(),
                 crate::checks::CheckPurpose::Prepare,
             )
@@ -1935,6 +1942,7 @@ mod tests {
         }
         drop(checkpoint);
         let _writer = crate::checks::CheckReservation::acquire(
+            &(fixture._workspace.path()).join("harness-state"),
             fixture._workspace.path(),
             crate::checks::CheckPurpose::Prepare,
         )?;

@@ -148,39 +148,39 @@ fn logging_levels_filter_events_and_preserve_redacted_span_context() {
     }
 }
 
-/// Preserve explicit legacy choices and report invalid settings instead of resetting them.
+/// Discard legacy logging and preserve malformed canonical settings without replacement.
 #[test]
-fn logging_configuration_migrates_choices_and_rejects_malformed_settings() {
-    for (enabled, expected) in [(true, LogLevel::Trace), (false, LogLevel::None)] {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("harness-trace-config.json");
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&json!({"enabled":enabled})).unwrap(),
-        )
-        .unwrap();
-        let trace = TraceStore::open(directory.path()).unwrap();
-        assert_eq!(trace.status().level, expected);
-        assert_eq!(
-            trace.configure_default(LogLevel::Info).unwrap().level,
-            expected
-        );
-        drop(trace);
-        let contents: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(contents["level"], serde_json::to_value(expected).unwrap());
-        assert!(contents.get("enabled").is_none());
-    }
+fn logging_configuration_resets_legacy_and_rejects_malformed_settings() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("harness-trace-config.json");
-    let invalid = br#"{"level":"unsupported"}"#;
-    std::fs::write(&path, invalid).unwrap();
-    let error = TraceStore::open(directory.path()).err().unwrap();
+    std::fs::write(&path, br#"{"enabled":false}"#).unwrap();
     assert!(
-        error.to_string().contains("harness-trace-config.json"),
-        "{error}"
+        TraceStore::open(directory.path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains(":ForgeHistoryClear")
     );
-    assert_eq!(std::fs::read(&path).unwrap(), invalid);
+    assert!(path.exists());
+    crate::storage::state::clear(directory.path()).unwrap();
+    let trace = TraceStore::open(directory.path()).unwrap();
+    assert_eq!(trace.status().level, LogLevel::Info);
+    assert!(!path.exists());
+    trace.configure(LogLevel::None).unwrap();
+    drop(trace);
+    assert_eq!(
+        TraceStore::open(directory.path()).unwrap().status().level,
+        LogLevel::None
+    );
+    crate::storage::preferences::open(directory.path())
+        .unwrap()
+        .execute(
+            "UPDATE host_preference SET payload=?1 WHERE name='logging'",
+            [r#""unsupported""#],
+        )
+        .unwrap();
+    let error = TraceStore::open(directory.path()).err().unwrap();
+    assert!(error.to_string().contains("logging"), "{error}");
 }
 
 /// Keep concurrent coarse events instead of treating ordinary producer contention as lost diagnostics.

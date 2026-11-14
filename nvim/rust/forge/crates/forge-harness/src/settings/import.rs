@@ -578,6 +578,7 @@ mod test {
     fn imports_are_atomic_scoped_and_disabled_until_selected() -> Result<()> {
         use crate::settings::{SessionResources, SettingScope, SettingsStore};
         let root = tempfile::tempdir()?;
+        crate::storage::layout::prepare(root.path()).unwrap();
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace)?;
         let source = root.path().join("native.json");

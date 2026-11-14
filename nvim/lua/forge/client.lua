@@ -1,7 +1,6 @@
 local M = {}
 
 local builder = require("forge.builder")
-local provider_preference = require("forge.harness.provider_preference")
 local config = require("forge.infra.config")
 local notifications = require("forge.infra.notifications")
 local protocol = require("forge.protocol")
@@ -295,7 +294,7 @@ local function adopt_provider_registry(registry)
     error("Unknown Harness provider: " .. tostring(config.options.harness.provider))
   end
   if not config.harness_provider_explicit and not session.harness.session then
-    config.options.harness.provider = provider_preference.load(providers, registry.default_provider)
+    config.options.harness.provider = registry.default_provider
   end
   return providers
 end
@@ -735,9 +734,6 @@ local function session_send_initialize(callback, initialize_options, startup)
   local client = host_state()
   local mode = initialize_options and initialize_options.services_only and "runtime" or "harness"
   local harness_config = config.options.harness
-  if not config.harness_provider_explicit and not session.harness.session then
-    harness_config.provider = provider_preference.load(harness_config.providers, harness_config.provider)
-  end
   local descriptor = session_provider_descriptor()
   local function initialized(result, request_error, error_detail)
     if startup then startup.mark("harness.initialize.received", { error = request_error,
@@ -748,6 +744,7 @@ local function session_send_initialize(callback, initialize_options, startup)
       session_finish_initialize(mode, callback, nil, request_error, error_detail)
       return
     end
+    if result and result.storage_notice then vim.notify(result.storage_notice, vim.log.levels.WARN, { title = "Forge storage reset" }) end
     client.runtime_ready = true
     if mode == "harness" then client.snapshot = result end
     local initialized_session_id = result and result.session and result.session.id
@@ -788,7 +785,21 @@ local function session_send_initialize(callback, initialize_options, startup)
     services_only = mode == "runtime",
   }
   if startup then startup.mark("harness.initialize.requested") end
-  send_request(nil, "session.initialize", params, initialized)
+  if not config.harness_provider_explicit and not session.harness.session then
+    send_request(nil, "settings.provider.get", { data_root = params.data_root }, function(saved, failure)
+      if failure then initialized(nil, failure) return end
+      local selected = saved and saved.provider
+      if selected and selected ~= vim.NIL then
+        if not harness_config.providers[selected] then initialized(nil, "Saved provider is unavailable: " .. tostring(selected)) return end
+        harness_config.provider = selected
+        local chosen = session_provider_descriptor()
+        params.provider = { kind = chosen.kind, command = chosen.command }
+      end
+      send_request(nil, "session.initialize", params, initialized)
+    end)
+  else
+    send_request(nil, "session.initialize", params, initialized)
+  end
 
 end
 

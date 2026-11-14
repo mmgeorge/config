@@ -199,10 +199,9 @@ function M.switch_provider(provider, destination)
             end
             controller.render()
           end)
-          local saved, save_error = provider_preference.save(provider)
-          if not saved then
-            notifications.error(save_error or "Failed to save provider preference", "Harness provider")
-          end
+          provider_preference.save(provider, function(saved, save_error)
+            if not saved then notifications.error(save_error or "Failed to save provider preference", "Harness provider") end
+          end)
         end,
         on_error = function(switch_error)
           notifications.error("Failed to switch Harness provider: " .. switch_error, "Harness provider")

@@ -216,7 +216,7 @@ impl TraceWriter {
     /// Create the only filesystem owner for a canonical data root.
     pub(super) fn open(root: &Path) -> TraceResult<Self> {
         let files = Files::open(root)?;
-        let shared = Arc::new(Shared::new(files.level, files.config_path.exists()));
+        let shared = Arc::new(Shared::new(files.level, files.configured));
         let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_RECORDS);
         let worker_shared = shared.clone();
         let join = std::thread::Builder::new()
@@ -512,22 +512,10 @@ struct EncodedRecord {
     buffer: RecordBuffer,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct TraceConfig {
-    level: LogLevel,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyTraceConfig {
-    enabled: bool,
-}
-
 struct Files {
     root: PathBuf,
     path: PathBuf,
-    config_path: PathBuf,
+    configured: bool,
     file: Option<File>,
     level: LogLevel,
     _lease: crate::storage::state::StateLease,
@@ -536,31 +524,11 @@ struct Files {
 impl Files {
     /// Open persistent configuration before publishing the writer to producers.
     fn open(root: &Path) -> TraceResult<Self> {
+        let saved = crate::storage::preferences::host_get::<LogLevel>(root, "logging")
+            .map_err(TraceError::State)?;
+        let configured = saved.is_some();
+        let level = saved.unwrap_or(LogLevel::Info);
         let lease = crate::storage::state::StateLease::open(root).map_err(TraceError::State)?;
-        let config_path = root.join("harness-trace-config.json");
-        let level = match fs::read(&config_path) {
-            Ok(contents) => match serde_json::from_slice::<TraceConfig>(&contents) {
-                Ok(config) => config.level,
-                Err(current_error) => {
-                    let legacy: LegacyTraceConfig =
-                        serde_json::from_slice(&contents).map_err(|_| {
-                            TraceError::Configuration {
-                                path: config_path.clone(),
-                                source: current_error,
-                            }
-                        })?;
-                    let level = if legacy.enabled {
-                        LogLevel::Trace
-                    } else {
-                        LogLevel::None
-                    };
-                    write_config(&config_path, level)?;
-                    level
-                }
-            },
-            Err(error) if error.kind() == ErrorKind::NotFound => LogLevel::Info,
-            Err(source) => return Err(io_error("read trace configuration", &config_path, source)),
-        };
         let path = crate::storage::state::directory(root).join("harness-trace.jsonl");
         let file = (level != LogLevel::None)
             .then(|| open_global(&path))
@@ -569,7 +537,7 @@ impl Files {
             _lease: lease,
             root: root.to_owned(),
             path,
-            config_path,
+            configured,
             file,
             level,
         })
@@ -644,13 +612,15 @@ impl Files {
         default_only: bool,
         shared: &Shared,
     ) -> TraceResult<()> {
-        if default_only && self.config_path.exists() {
+        if default_only && self.configured {
             return Ok(());
         }
         let file = (level != LogLevel::None)
             .then(|| open_global(&self.path))
             .transpose()?;
-        write_config(&self.config_path, level)?;
+        crate::storage::preferences::host_set(&self.root, "logging", &level)
+            .map_err(TraceError::State)?;
+        self.configured = true;
         self.file = file;
         if self.level != level {
             shared.epoch.fetch_add(1, Ordering::AcqRel);
@@ -807,25 +777,6 @@ impl Files {
         }
         Ok(())
     }
-}
-
-/// Publish validated settings atomically, leaving the prior preference intact on failure.
-fn write_config(path: &Path, level: LogLevel) -> TraceResult<()> {
-    let parent = path
-        .parent()
-        .expect("trace configuration has a data-root parent");
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|source| io_error("prepare trace configuration", path, source))?;
-    serde_json::to_writer_pretty(&mut temporary, &TraceConfig { level })
-        .map_err(TraceError::Encoding)?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|source| io_error("flush trace configuration", path, source))?;
-    temporary
-        .persist(path)
-        .map_err(|error| io_error("publish trace configuration", path, error.error))?;
-    Ok(())
 }
 
 /// Get the receipt time before a record enters the bounded writer queue.

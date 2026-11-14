@@ -40,7 +40,7 @@ impl<Payload> SettingsRecord<Payload> {
         if record.get("format_version").and_then(Value::as_u64)
             != Some(u64::from(SETTINGS_FORMAT_VERSION))
         {
-            return Ok(None);
+            anyhow::bail!("unsupported saved settings record format");
         }
         let record: Self =
             serde_json::from_value(record).context("decode current settings record")?;
@@ -272,6 +272,7 @@ pub(crate) struct CatalogSnapshot {
 /// Owns Forge preference persistence separately from provider configuration files.
 pub struct SettingsStore {
     connection: Connection,
+    _state: crate::storage::database::HistoryConnection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -295,64 +296,57 @@ impl SettingsStore {
         self.connection.execute_batch(sql)?;
         Ok(())
     }
+    /// Read persistent settings without creating or repairing their schema.
     pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
+        crate::storage::layout::prepare(data_root)?;
         #[expect(
             clippy::disallowed_methods,
-            reason = "settings live in their own database outside versioned state"
+            reason = "read-only canonical settings boundary"
         )]
         let connection = Connection::open_with_flags(
             data_root.join("settings.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        anyhow::ensure!(
-            version == 1,
-            "Settings database schema {version} is incompatible with this Harness; initialize or update Harness"
-        );
-        Ok(Self { connection })
+        crate::storage::preferences::validate(&connection)?;
+        Self::attach_state(
+            connection,
+            crate::storage::database::HistoryConnection::read_only(data_root)?,
+            data_root,
+        )
     }
 
-    /// Opens settings without repeating schema writes for a current database.
+    /// Open persistent settings and attach their disposable application state.
     pub fn open(data_root: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_root)?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "settings live in their own database outside versioned state"
-        )]
-        let mut connection = Connection::open(data_root.join("settings.db"))?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        anyhow::ensure!(
-            version <= 1,
-            "Settings database schema {version} is newer than supported schema 1; update Harness"
-        );
-        if version == 0 {
-            let _bootstrap = crate::storage::bootstrap_lock(data_root, "settings")?;
-            connection.pragma_update(None, "journal_mode", "WAL")?;
-            let transaction =
-                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let version: i64 =
-                transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            anyhow::ensure!(
-                version <= 1,
-                "Settings database changed to an unsupported schema"
-            );
-            if version == 0 {
-                transaction.execute_batch("
-            CREATE TABLE IF NOT EXISTS setting_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
-            INSERT OR IGNORE INTO setting_revision VALUES (1,0);
-            CREATE TABLE IF NOT EXISTS setting_layer (scope TEXT NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(scope,identity));
-            CREATE TABLE IF NOT EXISTS setting_catalog (id INTEGER PRIMARY KEY CHECK(id=1), root TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS setting_operation (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS setting_application (session_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS setting_resource (id TEXT PRIMARY KEY, scope TEXT NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL);")?;
-                transaction.pragma_update(None, "user_version", 1)?;
-            }
-            transaction.commit()?;
-        }
-        Ok(Self { connection })
+        Self::attach_state(
+            crate::storage::preferences::open(data_root)?,
+            crate::storage::database::HistoryConnection::open(data_root)?,
+            data_root,
+        )
+    }
+
+    /// Keep session application snapshots under the current state lease.
+    fn attach_state(
+        connection: Connection,
+        state: crate::storage::database::HistoryConnection,
+        data_root: &Path,
+    ) -> Result<Self> {
+        connection.execute(
+            "ATTACH DATABASE ?1 AS runtime",
+            [crate::storage::state::database(data_root)
+                .to_string_lossy()
+                .as_ref()],
+        )?;
+        connection.execute_batch("CREATE TEMP VIEW setting_layer AS SELECT * FROM persistent_setting_layer UNION ALL SELECT * FROM runtime.session_setting_layer;
+            CREATE TEMP TRIGGER setting_layer_insert INSTEAD OF INSERT ON setting_layer BEGIN
+            INSERT INTO persistent_setting_layer SELECT NEW.scope,NEW.identity,NEW.payload WHERE NEW.scope <> 'session'
+                ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload;
+            INSERT INTO session_setting_layer SELECT NEW.scope,NEW.identity,NEW.payload WHERE NEW.scope = 'session'
+                ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload;
+            END;")?;
+        Ok(Self {
+            connection,
+            _state: state,
+        })
     }
 
     /// Register the physical dotfiles root without importing native preference state.
@@ -497,7 +491,7 @@ impl SettingsStore {
     }
 
     /// Resolve current portable layers and provider-local tuning without implicit imports.
-    /// Ignore unsupported saved formats and propagate current-format decoding failures.
+    /// Reject unsupported or malformed saved settings without replacing user choices.
     pub fn get(&self, workspace: &str, session: &str, provider: &str) -> Result<SettingsSnapshot> {
         let (revision, global, workspace, session, provider) = self.connection.query_row(
             "SELECT revision,
@@ -571,7 +565,7 @@ impl SettingsStore {
             .revision)
     }
 
-    /// Hold the settings revision stable while committing a captured host configuration.
+    /// Commit the host's recovery intent before writing settings without holding either database lock across the other writer.
     pub(crate) fn commit_configuration<T>(
         &mut self,
         expected_revision: u64,
@@ -581,10 +575,7 @@ impl SettingsStore {
         intent: Option<&crate::storage::configuration::ConfigurationIntent>,
         apply: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let revision = u64::try_from(transaction.query_row(
+        let revision = u64::try_from(self.connection.query_row(
             "SELECT revision FROM setting_revision WHERE id=1",
             [],
             |row| row.get::<_, i64>(0),
@@ -593,16 +584,29 @@ impl SettingsStore {
             revision == expected_revision,
             "settings revision conflict: expected {expected_revision}, current {revision}"
         );
-        let value = Self::write_configuration(
-            &transaction,
-            revision,
-            target,
-            portable,
-            provider,
-            intent,
-            apply,
-        )?;
-        transaction.commit()?;
+        let value = apply()?;
+        if let Some(intent) = intent {
+            self.recover_configuration(intent)?;
+        } else {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let revision = u64::try_from(transaction.query_row(
+                "SELECT revision FROM setting_revision WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)?;
+            Self::write_configuration(
+                &transaction,
+                revision,
+                target,
+                portable,
+                provider,
+                None,
+                || Ok(()),
+            )?;
+            transaction.commit()?;
+        }
         Ok(value)
     }
 
@@ -705,7 +709,10 @@ impl SettingsStore {
             if let Some(shell) = setting.shell {
                 shell.executable()?;
             }
-            transaction.execute("INSERT INTO setting_layer VALUES (?1,?2,?3) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload", params![scope, identity, SettingsRecord::encode(&setting)?])?;
+            transaction.execute(
+                "INSERT INTO setting_layer VALUES (?1,?2,?3)",
+                params![scope, identity, SettingsRecord::encode(&setting)?],
+            )?;
             next = next.checked_add(1).context("settings revision exhausted")?;
         }
         if let Some((provider, value)) = provider {
@@ -733,7 +740,10 @@ impl SettingsStore {
                     destination.insert(field.clone(), value.clone());
                 }
             }
-            transaction.execute("INSERT INTO setting_layer VALUES ('provider',?1,?2) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload", params![provider, serde_json::to_string(&preference)?])?;
+            transaction.execute(
+                "INSERT INTO setting_layer VALUES ('provider',?1,?2)",
+                params![provider, serde_json::to_string(&preference)?],
+            )?;
             next = next.checked_add(1).context("settings revision exhausted")?;
         }
         if next != revision {
@@ -793,7 +803,7 @@ impl SettingsStore {
         *access = access.clone().validate()?;
         transaction.execute(
             "INSERT INTO setting_layer VALUES ('global','',?1)
-            ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload",
+           ",
             [SettingsRecord::encode(&settings)?],
         )?;
         transaction.execute(
@@ -822,25 +832,13 @@ impl SettingsStore {
         let Some((owner, payload)) = saved else {
             return Ok(None);
         };
-        let Some(mut receipt) = SettingsRecord::<SettingsReceipt>::decode(&payload)? else {
+        let Some(receipt) = SettingsRecord::<SettingsReceipt>::decode(&payload)? else {
             return Ok(None);
         };
         ensure!(
             owner == session,
             "settings operation belongs to another session"
         );
-        // Version-one receipts retain wire names from before the interface rename.
-        if let Some(method) = receipt.request.get_mut("method") {
-            match method.as_str() {
-                Some("backend.mcp.set_enabled") => {
-                    *method = serde_json::json!("settings.mcp.set_enabled")
-                }
-                Some("backend.skills.set_enabled") => {
-                    *method = serde_json::json!("settings.skill.set_enabled")
-                }
-                _ => {}
-            }
-        }
         ensure!(
             receipt.request == *request,
             "settings operation ID was reused with a different request"
@@ -1011,8 +1009,10 @@ impl SettingsStore {
                 field.push(definition_field);
             }
         }
-        transaction.execute("INSERT INTO setting_layer VALUES (?1,?2,?3) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload",
-            params![scope,identity,SettingsRecord::encode(&setting)?])?;
+        transaction.execute(
+            "INSERT INTO setting_layer VALUES (?1,?2,?3)",
+            params![scope, identity, SettingsRecord::encode(&setting)?],
+        )?;
         let next = revision
             .checked_add(1)
             .context("settings revision exhausted")?;
@@ -1138,8 +1138,10 @@ impl SettingsStore {
                 destination.insert(field.clone(), value.clone());
             }
         }
-        transaction.execute("INSERT INTO setting_layer VALUES ('provider',?1,?2) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload",
-            params![provider,serde_json::to_string(&preference)?])?;
+        transaction.execute(
+            "INSERT INTO setting_layer VALUES ('provider',?1,?2)",
+            params![provider, serde_json::to_string(&preference)?],
+        )?;
         let next = revision
             .checked_add(1)
             .context("settings revision exhausted")?;
@@ -1187,7 +1189,7 @@ impl SettingsStore {
         let payload = self
             .connection
             .query_row(
-                "SELECT payload FROM setting_application WHERE session_id=?1",
+                "SELECT payload FROM runtime.setting_application WHERE session_id=?1",
                 [session],
                 |row| row.get::<_, String>(0),
             )
@@ -1251,7 +1253,7 @@ impl SettingsStore {
     }
 
     fn save_application(&self, session: &str, application: &SettingsApplication) -> Result<()> {
-        self.connection.execute("INSERT INTO setting_application VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",
+        self.connection.execute("INSERT INTO runtime.setting_application VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",
             params![session,SettingsRecord::encode(application)?])?;
         Ok(())
     }
@@ -1335,112 +1337,24 @@ mod test {
         Ok(())
     }
 
+    /// Reject unsupported saved values while retaining the user's original payload.
     #[test]
-    fn incompatible_settings_stay_hidden_across_every_persistence_path() -> Result<()> {
+    fn incompatible_settings_report_their_cause_without_reset() -> Result<()> {
         let fixture = tempfile::tempdir()?;
-        let mut store = SettingsStore::open(fixture.path())?;
-        let obsolete = r#"{"format_version":4,"payload":{"access":{"sandbox":true,"write_access":"workspace","writable_directory":[],"windows_sandbox":true},"status_thoughts":false}}"#;
-        for (scope, identity) in [
-            ("global", ""),
-            ("workspace", "workspace"),
-            ("session", "source"),
-        ] {
-            store.connection.execute(
-                "INSERT INTO setting_layer VALUES (?1,?2,?3)",
-                params![scope, identity, obsolete],
-            )?;
-        }
-        store.connection.execute(
-            "INSERT INTO setting_application VALUES ('source',?1)",
-            [format!(r#"{{"desired_revision":0,"generation":0,"state":"applied","effective":{obsolete}}}"#)],
-        )?;
-        store.connection.execute(
-            "INSERT INTO setting_operation VALUES ('old','source',?1)",
-            [r#"{"request":{},"mutation":{"revision":0,"field":["default_write_permission"]}}"#],
-        )?;
-        store.save_provider(0, "mock", &serde_json::json!({"model":"saved-model"}))?;
-        let before = store.get("workspace", "source", "mock")?;
-        assert!(before.desired.check_editing.is_none());
-        assert!(before.desired.status_thoughts.is_none());
-        assert_eq!(before.provider["model"], "saved-model");
-        for scope in [
-            SettingScope::Global,
-            SettingScope::Workspace,
-            SettingScope::Session,
-        ] {
-            assert!(
-                store
-                    .layer_settings(scope, "workspace", "source")?
-                    .check_editing
-                    .is_none()
-            );
-        }
-        assert_eq!(store.application("source")?.state, "unverified");
-        assert!(
-            store
-                .operation("source", "old", &serde_json::json!({}))?
-                .is_none()
-        );
-        assert!(
-            store
-                .operation("other", "old", &serde_json::json!({}))?
-                .is_none()
-        );
-        store.fork_session("source", "obsolete-fork")?;
-        assert!(store.layer("session", "obsolete-fork")?.is_none());
-        assert_eq!(store.layer("global", "")?.as_deref(), Some(obsolete));
-
-        store.grant_directories(&[crate::permissions::directory::DirectoryGrant {
-            operation: crate::permissions::directory::DirectoryOperation::Read,
-            path: fixture.path().to_string_lossy().into_owned(),
-        }])?;
-        let current = PortableSettings {
-            check_editing: Some(true),
-            status_thoughts: Some(true),
-            ..Default::default()
-        };
-        let revision = store.get("workspace", "source", "mock")?.revision;
-        store.update(
-            revision,
-            SettingScope::Workspace,
-            "workspace",
-            "source",
-            &current,
-        )?;
-        let revision = store.get("workspace", "source", "mock")?.revision;
-        let request = serde_json::json!({"settings": current});
-        let mutation = store.update_operation(
-            revision,
-            crate::settings::SettingTarget {
-                scope: SettingScope::Session,
-                workspace: "workspace",
-                session: "source",
-            },
-            &current,
-            "current",
-            &request,
-        )?;
-        store.begin_application("source", "current", mutation.revision)?;
-        store.confirm_application("source", "current", mutation.revision, current)?;
-        store.fork_session("source", "current-fork")?;
-        drop(store);
-
         let store = SettingsStore::open(fixture.path())?;
-        for session in ["source", "current-fork"] {
-            let settings = store.get("workspace", session, "mock")?;
-            assert_eq!(settings.desired.check_editing, Some(true));
-            assert_eq!(settings.desired.status_thoughts, Some(true));
-            assert_eq!(settings.desired.access.unwrap().readable_directory.len(), 1);
-            assert_eq!(settings.provider["model"], "saved-model");
-        }
-        assert_eq!(store.application("source")?.state, "applied");
-        assert_eq!(
+        let obsolete = r#"{"format_version":4,"payload":{"status_thoughts":false}}"#;
+        store.connection.execute(
+            "INSERT INTO setting_layer VALUES ('global','',?1)",
+            [obsolete],
+        )?;
+        assert!(
             store
-                .operation("source", "current", &request)?
-                .unwrap()
-                .revision,
-            mutation.revision
+                .get("workspace", "session", "mock")
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
         );
+        assert_eq!(store.layer("global", "")?.as_deref(), Some(obsolete));
         Ok(())
     }
 

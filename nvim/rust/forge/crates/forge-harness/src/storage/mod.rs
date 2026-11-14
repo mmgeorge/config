@@ -7,12 +7,13 @@ pub(crate) mod configuration;
 mod current;
 pub mod database;
 pub(crate) mod inspection;
+pub(crate) mod layout;
 pub(crate) mod lifecycle;
 pub(crate) mod model_pin;
 pub mod objects;
 mod observed_agent;
 mod ownership;
-mod preferences;
+pub(crate) mod preferences;
 mod question;
 mod reader;
 pub(crate) use reader::HistoryReader;
@@ -45,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-const SESSION_FORMAT_VERSION: u32 = 66;
+const SESSION_FORMAT_VERSION: u32 = state::VERSION;
 const PREFERENCE_FORMAT_VERSION: u32 = 44;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
@@ -172,8 +173,8 @@ impl SqliteStore {
     pub fn open(data_root: &Path) -> Result<Self> {
         fs::create_dir_all(data_root)
             .with_context(|| format!("create Harness data directory {}", data_root.display()))?;
-        let objects = objects::ObjectStore::open(data_root)?;
         let connection = database::HistoryConnection::open(data_root)?;
+        let objects = objects::ObjectStore::open(data_root)?;
         Ok(Self {
             connection: writer::OrderedConnection::new(connection),
             admission: admission::registry(data_root)?,
@@ -209,17 +210,17 @@ impl SqliteStore {
             "SELECT payload FROM preferences.preference_record WHERE workspace = ?1 AND backend = ?2",
             params![workspace, provider],
         )?;
-        let Some(payload) =
-            payload.filter(|payload| payload["format_version"] == PREFERENCE_FORMAT_VERSION)
-        else {
+        let Some(payload) = payload else {
             return Ok(None);
         };
-        let Some(preference) = payload
+        anyhow::ensure!(
+            payload["format_version"] == PREFERENCE_FORMAT_VERSION,
+            "unsupported saved workspace preference format"
+        );
+        let preference = payload
             .get("preference")
             .filter(|preference| preference.is_object())
-        else {
-            return Ok(None);
-        };
+            .context("saved workspace preference is not an object")?;
         Ok(Some(serde_json::from_value(preference.clone())?))
     }
 

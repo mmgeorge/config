@@ -166,6 +166,7 @@ impl AgentCommandSender {
         &self,
         owner: &ThreadOwner,
         task_id: &str,
+        root: &std::path::Path,
         workspace: &std::path::Path,
         mut cancelled: watch::Receiver<bool>,
     ) -> Result<Arc<crate::repository_access::RepositoryReservation>> {
@@ -193,6 +194,7 @@ impl AgentCommandSender {
             }
             // No coordinator or broker lock is held while inspecting repository ownership.
             match crate::repository_access::RepositoryReservation::acquire(
+                root,
                 workspace,
                 crate::repository_access::RepositoryAccess::Write,
             ) {

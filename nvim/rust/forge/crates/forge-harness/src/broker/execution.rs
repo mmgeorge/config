@@ -210,6 +210,7 @@ impl WorkspaceCaptureJob {
     /// Acquire repository read access outside broker ownership and retain it with the snapshot.
     pub(super) async fn run_reserved(self) -> Result<ReservedWorkspace> {
         let reservation = crate::checks::CheckReservation::acquire(
+            &self.data_root,
             &self.workspace,
             crate::checks::CheckPurpose::Verify,
         )?;

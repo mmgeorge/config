@@ -783,6 +783,7 @@ mod receipt_tests {
         broker.store.save_exchange(&exchange)?;
         let change = crate::tools::lsp::HostFileChange {
             reservation: Some(crate::checks::MutationReservation::acquire(
+                &(workspace.path()).join("harness-state"),
                 workspace.path(),
             )?),
             scope,
@@ -815,6 +816,7 @@ mod receipt_tests {
         );
         assert!(
             crate::checks::CheckReservation::acquire(
+                &(workspace.path()).join("harness-state"),
                 workspace.path(),
                 crate::checks::CheckPurpose::Verify
             )
@@ -832,6 +834,7 @@ mod receipt_tests {
             vec![change]
         );
         let _verification = crate::checks::CheckReservation::acquire(
+            &(workspace.path()).join("harness-state"),
             workspace.path(),
             crate::checks::CheckPurpose::Verify,
         )?;

@@ -64,6 +64,11 @@ impl TraceStore {
         })
     }
 
+    /// Get the owning Harness root for state-bound repository operations.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Get the cached trace preference without filesystem access.
     pub fn status(&self) -> TraceStatus {
         TraceStatus {

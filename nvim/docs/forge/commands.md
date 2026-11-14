@@ -35,8 +35,10 @@ version; the command reports its path and reason while clearing unlocked sibling
 It removes `state/` when empty. Settings, model preferences and pins, permissions,
 repository files, and unsent composer text survive. Reopen `:ForgeHarness` afterward
 to start a new session. Breaking state versions select a new directory automatically,
-so old editors do not prevent new hosts from starting. The former unversioned
-storage layout lies outside this command's deletion scope.
+so old editors do not prevent new hosts from starting. The one-time old-layout
+cleanup described below also belongs to this command.
+
+The first startup after the storage-layout change reports an incompatible layout and requires `:ForgeHistoryClear`; startup does not delete old content. That explicit command discards the old Harness root, including old preferences, and restores defaults. It refuses the reset while an old host or unresolved repository process owns the data. Later `:ForgeHistoryClear` runs preserve the new `settings.db`, provider selection, model pins, logging preferences, and external permission rules. An unknown layout or corrupt new settings database reports an error and never triggers another reset.
 
 `harness_session_log` reads newest-first and returns up to 1,000 complete entries
 per page by default. Its optional positive integer `limit` selects another page

@@ -23,7 +23,7 @@ pub(crate) struct HistoryConnection {
 
 impl HistoryConnection {
     /// Open only this executable's history version, leaving older hosts undisturbed.
-    pub(in crate::storage) fn open(root: &Path) -> Result<Self, DatabaseError> {
+    pub(crate) fn open(root: &Path) -> Result<Self, DatabaseError> {
         let lease = super::state::StateLease::open(root).map_err(DatabaseError::Initialization)?;
         let directory = super::state::directory(root);
         let _bootstrap = super::schema::bootstrap_lock(&directory, "harness")
@@ -57,7 +57,7 @@ impl HistoryConnection {
     }
 
     /// Read current history without admitting schema writes.
-    pub(in crate::storage) fn read_only(root: &Path) -> Result<Self, DatabaseError> {
+    pub(crate) fn read_only(root: &Path) -> Result<Self, DatabaseError> {
         let lease = super::state::StateLease::open(root).map_err(DatabaseError::Initialization)?;
         let connection = connection_open(root, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         if super::schema::validate(&connection).map_err(DatabaseError::Initialization)?

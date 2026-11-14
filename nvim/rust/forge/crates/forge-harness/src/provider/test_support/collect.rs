@@ -53,6 +53,7 @@ impl ProviderTestSession {
         registration: forge_providers::registry::RegisteredProvider,
     ) -> anyhow::Result<Self> {
         let directory = Arc::new(tempfile::tempdir()?);
+        harness::storage::layout::prepare(directory.path())?;
         let permission_store = Arc::new(std::sync::RwLock::new(
             harness::permissions::store::PermissionStore::load(
                 directory.path().join("permissions.json"),

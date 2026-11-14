@@ -1311,6 +1311,7 @@ async fn child_file_change_reservation_requires_durable_completion() -> Result<(
         .await?;
     let change = crate::tools::lsp::HostFileChange {
         reservation: Some(crate::checks::MutationReservation::acquire(
+            &(repository.path()).join("harness-state"),
             repository.path(),
         )?),
         scope: address.scope,
@@ -1344,6 +1345,7 @@ async fn child_file_change_reservation_requires_durable_completion() -> Result<(
     );
     assert!(
         crate::checks::CheckReservation::acquire(
+            &(repository.path()).join("harness-state"),
             repository.path(),
             crate::checks::CheckPurpose::Verify
         )
@@ -1364,6 +1366,7 @@ async fn child_file_change_reservation_requires_durable_completion() -> Result<(
     assert_eq!(recorded.host_file_changes, vec![change]);
     assert_eq!(recorded.state(), ExchangeState::Failed);
     let _verification = crate::checks::CheckReservation::acquire(
+        &(repository.path()).join("harness-state"),
         repository.path(),
         crate::checks::CheckPurpose::Verify,
     )?;

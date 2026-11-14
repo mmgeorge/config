@@ -29,6 +29,7 @@ def main [] {
   let run = ($runs | path join ($env.NEXTEST_RUN_ID | str substring 0..<8))
   rm --recursive --force $run
   mkdir $run
+  mkdir ($run | path join 'repository-reservations')
 
   let template = ($run | path join "git-template")
   mkdir $template
@@ -46,6 +47,7 @@ def main [] {
     $"TEMP=($run)"
     $"TMPDIR=($run)"
     $"FORGE_TEST_GIT_TEMPLATE=($template)"
+    $"FORGE_REPOSITORY_RESERVATIONS_DIR=($run | path join 'repository-reservations')"
   ]
   | str join "\n"
   | $in + "\n"

@@ -657,6 +657,18 @@ mod tests {
         let (root, _store, controller) = crate::task::SessionTaskController::test_goal();
         let coordinator =
             PermissionCoordinator::load(root.path().join("permissions.json"), root.path())?;
+        {
+            let store = coordinator.store();
+            let mut store = store.write().unwrap();
+            let mut document = crate::permissions::document::default_permission_document();
+            crate::permissions::document::set_permission_rule(
+                &mut document,
+                "edit",
+                "*",
+                crate::permissions::document::PermissionDecision::Ask,
+            )?;
+            store.save(&crate::permissions::document::serialize_permission_document(&document)?)?;
+        }
         let owner = crate::provider::ThreadOwner::root("session");
         let scope = forge_provider_api::InvocationScope::new(owner.clone(), "terminal-turn");
         let mut tools =
@@ -723,9 +735,14 @@ mod tests {
             let pending = context.authorize(
                 &scope,
                 PermissionRequest {
-                    target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
-                        command: "rg TODO src".into(),
-                        shell: None,
+                    target_list: vec![crate::permissions::matcher::PermissionTarget::Write {
+                        path: root
+                            .path()
+                            .parent()
+                            .unwrap()
+                            .join("approval-only.rs")
+                            .display()
+                            .to_string(),
                     }],
                     ..request(true)
                 },

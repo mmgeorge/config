@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const VERSION: u32 = 5;
+const VERSION: u32 = crate::storage::state::VERSION;
 
 /// Identify the executable contract independently of selection and presentation policy.
 #[derive(PartialEq)]

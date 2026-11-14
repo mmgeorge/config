@@ -6,7 +6,7 @@ Settings that change mid-turn, or credentials copied into provider files, would 
 
 ## Settings
 
-`SettingsStore` owns revisioned global, workspace, and session layers in `settings.db`, read from one committed snapshot. Unspecified fields inherit, and provider tuning stays scoped to its backend. `settings.update` and `settings.reset` require the expected revision and apply through task transition admission. A mutation commits its revision and operation receipt together, so a retry with the same operation ID recovers instead of applying twice, and a reused ID with different content is rejected. Configuration timeline records name changed fields, never values.
+`SettingsStore` owns revisioned global and workspace layers in `settings.db`, with session overrides and application snapshots in the current versioned history database. Its connection reads those layers through an attached database. Unspecified fields inherit, and provider tuning stays scoped to its backend. `settings.update` and `settings.reset` require the expected revision and apply through task transition admission. A mutation commits its revision and operation receipt together, so a retry with the same operation ID recovers instead of applying twice, and a reused ID with different content is rejected. Configuration timeline records name changed fields, never values.
 
 New sessions resolve saved defaults, and resumed sessions keep their own model and tuning. Native forks copy explicit session overrides into an independent layer.
 

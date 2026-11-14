@@ -199,7 +199,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             })),
         },
     })?;
-    async {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             // Working status can publish before deferred native open admits the invocation.
             if !foreground.active.load(Ordering::Acquire)
@@ -225,8 +225,9 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             drop(broker);
             tokio::task::yield_now().await;
         }
-    }
-    .await?;
+    })
+    .await
+    .context("accepted turn never reached its published working state")??;
     assert!(engine.active_invocation_snapshot()?.is_some());
     assert_eq!(controller.coordinator.execution.available_permits(), 0);
     let submission_id = foreground
@@ -243,7 +244,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     let before_loss = delivered.lock().unwrap().len();
 
     foreground.fail.notify_one();
-    async {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             // Observation loss closes the provider's event stream, so the owner fails the turn,
             // drains the input queue, and restarts the provider on its own initiative.
@@ -267,8 +268,9 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             }
             tokio::task::yield_now().await;
         }
-    }
-    .await?;
+    })
+    .await
+    .context("observation loss never completed recovery and publication")??;
     assert_eq!(
         controller.coordinator.execution.available_permits(),
         1,
