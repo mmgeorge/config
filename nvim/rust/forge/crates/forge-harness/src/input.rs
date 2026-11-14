@@ -76,6 +76,8 @@ pub enum InputPurpose {
         task_id: Option<String>,
         message_kind: crate::question::QuestionMessageKind,
         reply: forge_provider_api::QuestionReply,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_replies: Vec<forge_provider_api::QuestionReply>,
     },
     /// Keep taskless continuation tied to the immutable exchange selected before admission.
     WorkflowContinuation {

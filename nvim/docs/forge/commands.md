@@ -677,9 +677,12 @@ Questions have no timeout. By default, the agent receives question IDs immediate
 and can keep working while you answer. For an important decision that blocks
 progress, the agent can request `wait: true`; the question appears as **Required**
 and its tool call waits for the answers. Open questions with
-`oe` or `/questions`; Tab and Shift-Tab switch questions. Enter submits one answer
-immediately, and **Ask…** requests clarification without answering. Closing the
-picker retains pending questions and drafts. Pending questions branch beneath the
+`oe` or `/questions`; Tab and Shift-Tab switch questions, including answered drafts.
+Enter records a draft and advances to the next unanswered question. Confirming the
+last pending question submits all answers together; ignoring an optional question
+counts toward completing that set. Earlier answers remain editable until submission.
+**Ask…** requests clarification immediately without answering. Closing the picker or
+switching sessions retains each session's pending answers and text drafts. Pending questions branch beneath the
 status text, with previews capped at two display lines and the answer hotkey beside
 interrupt. The picker retains the full text. Optional questions remain answerable
 after work finishes or chat execution is cancelled; late answers do not restart the

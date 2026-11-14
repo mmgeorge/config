@@ -28,14 +28,20 @@ function HarnessSnapshot.apply(state, result)
     state.questions = nil
     state.publication_cursor, state.publication_received, state.publication_more = nil, nil, nil
     if session_changed then
-      if require("forge.views.picker").is_open("questions") then require("forge.views.picker").close(false) end
+      local picker = require("forge.views.picker")
+      if picker.is_open("questions") then
+        state.question_picker_resume = picker.capture_state()
+        picker.close(false)
+      end
       state.question_view_by_session = state.question_view_by_session or {}
       state.question_view_by_session[state.session.id] = {
         drafts = state.question_drafts, resume = state.question_picker_resume, history = state.question_show_history,
+        answers = state.question_answer_state,
       }
       local question_view = state.question_view_by_session[result.session.id] or {}
       state.question_drafts, state.question_picker_resume = question_view.drafts, question_view.resume
       state.question_show_history = question_view.history
+      state.question_answer_state = question_view.answers
       state.question_saving, state.question_failure = nil, nil
     end
     state.restore_applying, state.activity = nil, nil

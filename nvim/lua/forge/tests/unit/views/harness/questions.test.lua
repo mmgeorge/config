@@ -47,6 +47,7 @@ T["questions"] = function()
   keymap.invoke(help_key, { buffer = picker._state_for_test().buf })
   assert(buffer.text(0):find("Ignore optional question", 1, true),
     "optional question omitted ignore from help")
+  assert(buffer.text(0):find("Save draft and advance", 1, true), "help omitted batched confirmation behavior")
   keymap.invoke("q")
   keymap.invoke("<Tab>", { buffer = picker._state_for_test().buf })
   assert(picker._state_for_test().state.page_index == 1, "Tab did not cycle question tabs")
@@ -56,10 +57,13 @@ T["questions"] = function()
   assert(picker._state_for_test().state.page_index == 2, "Shift-Tab did not select the previous question")
   keymap.invoke("<S-Tab>", { buffer = picker._state_for_test().buf })
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
-  assert(#sent == 1 and sent[1].spec.params.command.action.answer.option_id == "tabs")
+  eq(#sent, 0)
+  eq(state.question_answer_state.answers.first.action.answer.option_id, "tabs")
   assert(questions.count(state) == 2, "uncommitted answer changed pending count")
-  state.questions.questions[1].resolution = { kind = "answered" }
-  sent[1].callback({ revision = 2, questions = state.questions.questions })
+  local external = vim.deepcopy(state.questions)
+  external.revision = 2
+  external.questions[1].resolution = { kind = "answered" }
+  questions.receive(state, external)
   instance = picker._state_for_test()
   assert(#instance.spec.page_list == 1 and instance.spec.page_list[1].id == "second")
   assert(instance.spec.page_list[1].title == "second · Optional", "optional question lost its label")
@@ -90,18 +94,12 @@ T["questions"] = function()
   eq(questions.count(state), 2)
   picker.close(false)
 
-  -- Each saved answer advances the picker; only the final committed answer closes it.
+  -- Confirmed drafts advance locally; only the committed batch closes the picker.
   state.questions = { revision = 4, questions = { question("first", "required"), question("second", "optional") } }
   state.question_picker_resume = nil
   questions.open(state, host)
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
-  local first_answer = sent[#sent]
-  local answered = vim.deepcopy(state.questions)
-  answered.revision = 5
-  answered.questions[1].resolution = { kind = "answered" }
-  first_answer.callback(answered)
-  assert(picker.is_open("questions"), "saving the first answer closed a pending question")
-  eq(picker._state_for_test().spec.page_list[1].id, "second")
+  eq(picker._state_for_test().spec.page_list[picker._state_for_test().state.page_index].id, "second")
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
   local last_answer = sent[#sent]
   instance = picker._state_for_test()
@@ -110,15 +108,18 @@ T["questions"] = function()
   local notifications = require("forge.infra.notifications")
   local original_error = notifications.error
   notifications.error = function() end
+  local failed_operation = last_answer.spec.params.operation_id
   last_answer.callback(nil, "Answer could not be saved")
   notifications.error = original_error
-  assert(picker.is_open("questions") and questions.count(state) == 1,
+  assert(picker.is_open("questions") and questions.count(state) == 2,
     "failed final answer closed the picker or resolved the question")
-  eq(state.question_failure, "Answer could not be saved")
+  eq(state.question_answer_state.failure, "Answer could not be saved")
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
   last_answer = sent[#sent]
-  answered = vim.deepcopy(state.questions)
+  eq(last_answer.spec.params.operation_id, failed_operation)
+  local answered = vim.deepcopy(state.questions)
   answered.revision = 6
+  answered.questions[1].resolution = { kind = "answered" }
   answered.questions[2].resolution = { kind = "answered" }
   last_answer.callback(answered)
   assert(not picker.is_open("questions"), "final saved answer left an empty picker open")
@@ -136,7 +137,7 @@ T["questions"] = function()
   assert(picker.is_open("questions"), "idle cancellation hid an unanswered optional question")
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
   local idle_answer = sent[#sent]
-  eq(idle_answer.spec.params.command.question_id, "cancelled-work")
+  eq(idle_answer.spec.params.answers[1].question_id, "cancelled-work")
   local idle_answered = vim.deepcopy(state.questions)
   idle_answered.revision = 8
   idle_answered.questions[1].resolution = { kind = "answered" }
@@ -160,7 +161,7 @@ T["questions"] = function()
   questions.open(state, host)
   keymap.invoke("d", { buffer = picker._state_for_test().buf })
   local ignored = sent[#sent]
-  assert(ignored.spec.params.command.action.kind == "dismiss", "ignore did not submit dismissal")
+  assert(ignored.spec.params.answers[1].action.kind == "dismiss", "ignore did not submit dismissal")
   local dismissed = vim.deepcopy(state.questions)
   dismissed.revision = 11
   dismissed.questions[1].resolution = { kind = "dismissed" }
@@ -224,16 +225,10 @@ T["questions"] = function()
   local submit_other = keymap.get("<C-s>", { buffer = editing_buffer }).callback
   assert(submit_other, "retained answer editor lost its submit binding")
   submit_other()
-  local other_answer = sent[#sent]
-  eq(other_answer.spec.params.command.question_id, "editing")
-  eq(other_answer.spec.params.command.action.answer.kind, "other")
-  eq(other_answer.spec.params.command.action.answer.text, "abcdef")
-  local saved_other = vim.deepcopy(state.questions)
-  saved_other.revision = 15
-  saved_other.questions[1].resolution = { kind = "answered" }
-  other_answer.callback(saved_other)
-  assert(not vim.api.nvim_win_is_valid(editing_window), "resolved question retained its obsolete editor")
-  eq(picker._state_for_test().spec.page_list[1].id, "arrived")
+  eq(state.question_answer_state.answers.editing.action.answer.kind, "other")
+  eq(state.question_answer_state.answers.editing.action.answer.text, "abcdef")
+  assert(not vim.api.nvim_win_is_valid(editing_window), "confirmed answer retained its obsolete editor")
+  eq(picker._state_for_test().spec.page_list[picker._state_for_test().state.page_index].id, "arrived")
   picker.close(false)
   -- Choosing a structured answer must not resubmit the retained clarification draft.
   state.questions = { revision = 16, questions = { question("clarify-then-answer", "required") } }
@@ -265,7 +260,7 @@ T["questions"] = function()
   keymap.invoke(first_choice_key, { buffer = picker._state_for_test().buf })
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
   local selected_answer = sent[#sent]
-  local selected_action = selected_answer.spec.params.command.action
+  local selected_action = selected_answer.spec.params.answers[1].action
   assert(#sent == before_answer + 1 and selected_action.kind == "answer",
     "confirming a selected answer resubmitted the Ask draft")
   assert(selected_action.answer.kind == "selected" and selected_action.answer.option_id == "tabs")
@@ -288,11 +283,94 @@ T["questions"] = function()
   buffer.set(instance.input_buf, { "Keep the compact layout." })
   keymap.invoke("<C-f>", { buffer = picker._state_for_test().input_buf })
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
-  local feedback_answer = sent[#sent].spec.params.command.action
+  local feedback_answer = sent[#sent].spec.params.answers[1].action
   assert(feedback_answer.kind == "answer" and feedback_answer.answer.option_id == "tabs")
   assert(feedback_answer.answer.feedback == "Keep the compact layout.",
     "confirming a structured answer discarded its explicit feedback")
   picker.close(false)
+end
+
+T["answers_stay_editable_until_the_last_question"] = function()
+  vim.o.columns, vim.o.lines = 120, 45
+  local config = vim.deepcopy(require("forge.infra.config").options)
+  config.harness.provider = "mock"
+  require("forge").setup(config)
+  local questions = require("forge.views.harness.questions")
+  local picker = require("forge.views.picker")
+  local requests = mock_client.record({ copy_params = true })
+  local state = { session = { id = "batch-session" }, questions = { revision = 1, questions = {} } }
+  for _, id in ipairs({ "first", "second" }) do
+    state.questions.questions[#state.questions.questions + 1] = {
+      id = id, requirement = "required", resolution = { kind = "pending" }, discussion = {},
+      content = { revision = 1, header = id, question = "Which layout?", options = {
+        { id = "tabs", label = "Tabs", description = "Compact" },
+        { id = "sidebar", label = "Sidebar", description = "Wide" },
+      } },
+    }
+  end
+  local window = vim.api.nvim_get_current_win()
+  questions.open(state, { window_list = { window }, control_win = window })
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  eq(#requests, 0)
+  eq(picker._state_for_test().state.page_index, 2)
+  keymap.invoke("<S-Tab>", { buffer = picker._state_for_test().buf })
+  eq(picker._state_for_test().spec.page_list[1].id, "first")
+  picker._state_for_test().state.selected_index_by_page.first = 2
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  eq(#requests, 0)
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  eq(#requests, 1)
+  eq(requests[1].spec.method, "session.question.answer_batch")
+  eq(requests[1].spec.params.answers[1].action.answer.option_id, "sidebar")
+  eq(requests[1].spec.params.answers[2].action.answer.option_id, "tabs")
+end
+
+T["incoming_changes_invalidate_only_affected_drafts"] = function()
+  local config = vim.deepcopy(require("forge.infra.config").options)
+  config.harness.provider = "mock"
+  require("forge").setup(config)
+  local questions = require("forge.views.harness.questions")
+  local picker = require("forge.views.picker")
+  local requests = mock_client.record()
+  local function question(id)
+    return { id = id, requirement = "optional", discussion = {}, resolution = { kind = "pending" },
+      content = { revision = 1, header = id, question = "Choose", options = { { id = "yes", label = "Yes" } } } }
+  end
+  local state = { session = { id = "changes" }, questions = { revision = 1, questions = { question("first"), question("second") } } }
+  local window = vim.api.nvim_get_current_win()
+  local host = { window_list = { window }, control_win = window }
+  questions.open(state, host)
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  eq(#requests, 0)
+  picker.close()
+  questions.open(state, host)
+  eq(state.question_answer_state.answers.first.action.answer.option_id, "yes")
+  local changed = vim.deepcopy(state.questions)
+  changed.revision = 2
+  changed.questions[#changed.questions + 1] = question("third")
+  questions.receive(state, changed)
+  eq(#requests, 0)
+  assert(state.question_answer_state.answers.first)
+  changed = vim.deepcopy(changed)
+  changed.revision = 3
+  changed.questions[1].content.revision = 2
+  questions.receive(state, changed)
+  eq(state.question_answer_state.answers.first, nil)
+  eq(#requests, 0)
+  keymap.invoke("d", { buffer = picker._state_for_test().buf })
+  assert(state.question_answer_state.answers.second)
+  changed = vim.deepcopy(changed)
+  changed.revision = 4
+  changed.questions[3].resolution = { kind = "withdrawn" }
+  questions.receive(state, changed)
+  eq(#requests, 0)
+  assert(state.question_answer_state.answers.second)
+  questions.open(state, host, "first")
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  eq(#requests, 1)
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  eq(#requests, 1)
+  eq(requests[1].spec.params.answers[2].action.kind, "dismiss")
 end
 
 return T

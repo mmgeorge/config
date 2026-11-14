@@ -47,6 +47,7 @@ pub(crate) fn input_purpose_is_current(
         InputPurpose::Question {
             question_id,
             content_revision,
+            additional_replies,
             ..
         } => {
             if let Some(revision) = content_revision {
@@ -56,6 +57,21 @@ pub(crate) fn input_purpose_is_current(
                 if !current.questions.iter().any(|question| {
                     &question.id == question_id && question.content.revision == *revision
                 }) {
+                    return Ok(false);
+                }
+            }
+            for reply in additional_replies {
+                let id = crate::question::QuestionId::try_from(reply.question_id.clone())
+                    .map_err(InputAuthorityError::Questions)?;
+                let current = questions
+                    .snapshot()
+                    .map_err(InputAuthorityError::Questions)?;
+                if !current.questions.iter().any(|question| {
+                    question.id == id && question.content.revision == reply.revision
+                }) || !questions
+                    .delivery_is_current(&id)
+                    .map_err(InputAuthorityError::Questions)?
+                {
                     return Ok(false);
                 }
             }

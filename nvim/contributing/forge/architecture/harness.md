@@ -336,6 +336,21 @@ operation receipts, and pending outbox in `session_question_state` in
 without the broker's execution lock. Independent SQLite connections serialize
 mutations with immediate transactions.
 
+The question picker owns unsubmitted answer drafts by session, question identity,
+and content revision. Confirming an intermediate answer advances locally; confirming
+the last unanswered question submits `session.question.answer_batch`. The owner
+validates and applies the complete set in one transaction, retaining one exact retry
+receipt and publishing one question snapshot. A stale or invalid entry rolls back
+the entire set. Clarification and historical corrections retain their separate paths.
+
+Batch commits group message-delivered replies by task attribution. Each group enters
+the input journal once and renders all its question identities and answers in a
+single provider turn. Database bootstrap creates and validates the question table
+before starting owners; opening a question controller never repairs missing schema.
+Waiting tools observe the committed set through their existing
+answer destination and do not also receive message delivery. Disposable state version
+49 separates the grouped outbox and input payload from older executables.
+
 The input worker transfers each outbox entry into the existing input journal using
 a stable operation ID, then acknowledges that transfer. Provider acknowledgment
 remains owned by the submission journal. A crash before transfer repeats admission;

@@ -70,11 +70,24 @@ enum ChangeSource {
 
 /// Keep an allowed question action paired with the scope that may commit it.
 pub(crate) struct QuestionChange {
-    command: QuestionCommand,
+    mutation: QuestionMutation,
     source: ChangeSource,
 }
 
+enum QuestionMutation {
+    Single(QuestionCommand),
+    Batch(crate::question::QuestionBatch),
+}
+
 impl QuestionChange {
+    /// Admit one validated set of user decisions to the same owner boundary as single answers.
+    pub(crate) fn batch(batch: crate::question::QuestionBatch) -> Self {
+        Self {
+            mutation: QuestionMutation::Batch(batch),
+            source: ChangeSource::User,
+        }
+    }
+
     /// Create an answer, clarification, correction, or dismissal event from the user interface.
     pub(crate) fn user(command: QuestionCommand) -> Result<Self, QuestionEventError> {
         match command.action {
@@ -88,7 +101,7 @@ impl QuestionChange {
         }
         Self::validate(&command)?;
         Ok(Self {
-            command,
+            mutation: QuestionMutation::Single(command),
             source: ChangeSource::User,
         })
     }
@@ -113,7 +126,7 @@ impl QuestionChange {
         }
         Self::validate(&command)?;
         Ok(Self {
-            command,
+            mutation: QuestionMutation::Single(command),
             source: ChangeSource::Tool {
                 authority: Box::new(authority),
                 call,
@@ -126,9 +139,11 @@ impl QuestionChange {
         &self,
         controller: &QuestionController,
     ) -> Result<Option<QuestionSnapshot>, QuestionEventError> {
-        controller
-            .replay_mutation(&self.command)
-            .map_err(QuestionEventError::Replay)
+        match &self.mutation {
+            QuestionMutation::Single(command) => controller.replay_mutation(command),
+            QuestionMutation::Batch(batch) => controller.replay_batch(batch),
+        }
+        .map_err(QuestionEventError::Replay)
     }
 
     /// Get invocation authority for model-owned mutations; user decisions remain independent events.
@@ -141,12 +156,18 @@ impl QuestionChange {
 
     /// Get the caller's immutable operation identity for correlated owner logs.
     pub(super) fn operation_id(&self) -> &str {
-        &self.command.operation_id
+        match &self.mutation {
+            QuestionMutation::Single(command) => &command.operation_id,
+            QuestionMutation::Batch(batch) => batch.operation_id(),
+        }
     }
 
     /// Get the exact question selected before asynchronous intake.
     pub(super) fn question(&self) -> &QuestionId {
-        &self.command.question_id
+        match &self.mutation {
+            QuestionMutation::Single(command) => &command.question_id,
+            QuestionMutation::Batch(batch) => batch.first_question(),
+        }
     }
 
     /// Commit under the owner's mutation boundary and the tool's captured authority where applicable.
@@ -158,11 +179,17 @@ impl QuestionChange {
         if let Some(snapshot) = self.replay(controller)? {
             return Ok(snapshot);
         }
-        match self.source {
-            ChangeSource::User => controller
-                .apply(self.command)
+        match (self.source, self.mutation) {
+            (ChangeSource::User, QuestionMutation::Single(command)) => {
+                controller.apply(command).map_err(QuestionEventError::State)
+            }
+            (ChangeSource::User, QuestionMutation::Batch(batch)) => controller
+                .apply_batch(batch)
                 .map_err(QuestionEventError::State),
-            ChangeSource::Tool { authority, call: _ } => {
+            (ChangeSource::Tool { .. }, QuestionMutation::Batch(_)) => {
+                Err(QuestionEventError::InvalidAction)
+            }
+            (ChangeSource::Tool { authority, call: _ }, QuestionMutation::Single(command)) => {
                 if !authority.belongs_to(tasks) {
                     return Err(QuestionEventError::ForeignScope);
                 }
@@ -170,7 +197,7 @@ impl QuestionChange {
                 let question = questions
                     .questions
                     .iter()
-                    .find(|question| question.id == self.command.question_id)
+                    .find(|question| question.id == command.question_id)
                     .ok_or(QuestionEventError::TargetMissing)?;
                 if question.task_id.as_deref()
                     != authority.task_id().map(crate::task::TaskId::as_str)
@@ -178,7 +205,7 @@ impl QuestionChange {
                     return Err(QuestionEventError::ForeignScope);
                 }
                 authority
-                    .commit(|| Ok(controller.apply(self.command)))
+                    .commit(|| Ok(controller.apply(command)))
                     .map_err(QuestionEventError::Authority)?
                     .map_err(QuestionEventError::State)
             }

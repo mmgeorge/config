@@ -136,6 +136,7 @@ The [GitHub request and result schemas](github-schemas.md) define remote reads, 
 | `session.provider.mock_response` | [session](session.md#sessionprovidermock_response) | Required explicit session ID |
 | `session.provider.model.list` | [session](session.md#sessionprovidermodellist) | Required explicit session ID |
 | `session.provider.skill.list` | [session](session.md#sessionproviderskilllist) | Required explicit session ID |
+| `session.question.answer_batch` | [session](session.md#sessionquestionanswer_batch) | Required explicit session ID |
 | `session.question.answer` | [session](session.md#sessionquestionanswer) | Required explicit session ID |
 | `session.question.continue` | [session](session.md#sessionquestioncontinue) | Required explicit session ID |
 | `session.question.skip` | [session](session.md#sessionquestionskip) | Required explicit session ID |

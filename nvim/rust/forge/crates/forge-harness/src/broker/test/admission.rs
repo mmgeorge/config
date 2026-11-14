@@ -89,6 +89,7 @@ async fn detached_required_answer_continues_original_exchange_before_or_after_co
             .find(|message| message.kind == QuestionMessageKind::Answer)
             .unwrap();
         broker.input_purpose = crate::input::InputPurpose::Question {
+            additional_replies: Vec::new(),
             content_revision: None,
             question_id,
             task_id: None,

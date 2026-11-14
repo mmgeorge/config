@@ -27,6 +27,7 @@ local picker_filter = require("forge.views.picker.filter")
 ---@field field_descriptions? boolean Show focused-field help beneath the list. Defaults to true.
 ---@field field_description_height? integer Reserve this many rows for focused-field help, clipping overflow with an ellipsis.
 ---@field toggle_on_confirm? boolean Also toggle boolean fields with the confirm command.
+---@field confirm_description? string Explain the page's confirmation behavior in shared key help.
 ---@field [string] any Existing field, search, and input options.
 
 --- Detached view state for re-entry into the same logical picker.

@@ -1089,6 +1089,23 @@ Read skills available to the selected provider context.
 
 No parameter fields. Returns an array of [SkillDefinition](runtime-schemas.md#skilldefinition): name, description, enabled/user-invocable flags, optional resource binding/scope, path, source, and argument hint. Empty supported catalogs return `[]`. Unsupported skill discovery fails explicitly with `unsupported provider capability: skill_catalog`. The discovery deadline is 30 seconds. It may contact the selected provider but does not invoke a skill, change its enabled state, or emit request progress.
 
+## `session.question.answer_batch`
+
+Commit an ordered set of user answers or optional dismissals atomically. The owner
+returns one question snapshot only after every entry has validated and committed.
+
+Supply `operation_id` and a nonempty `answers` array. Each entry contains
+`question_id`, `revision`, and `action`, where `action` is an ordinary `answer`
+(selected option with optional feedback, or custom text) or `dismiss`. Duplicate
+question IDs, stale revisions, invalid options, and dismissal of required questions
+reject the whole batch. Retry the identical payload with the same operation ID to
+recover its original result without another delivery. New content needs a new ID.
+Message answers sharing task attribution enter one provider input; waiting tools
+receive their resolved records through their existing destination.
+
+**Transport:** Required explicit session ID. Readiness: `runtime`. Admission:
+`ordinary`. Recovery: caller retries with the batch operation ID.
+
 ## `session.question.answer`
 
 Commit an answer to a pending question.

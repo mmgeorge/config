@@ -115,6 +115,8 @@ pub enum RuntimeMethod {
     SessionPlanList,
     #[serde(rename = "session.question.answer")]
     SessionQuestionAnswer,
+    #[serde(rename = "session.question.answer_batch")]
+    SessionQuestionAnswerBatch,
     #[serde(rename = "session.question.skip")]
     SessionQuestionSkip,
     #[serde(rename = "session.question.continue")]
@@ -215,6 +217,7 @@ impl RuntimeMethod {
                 | Self::SessionCheckComplete
                 | Self::SessionPlanAccept
                 | Self::SessionPlanChangesRequest
+                | Self::SessionQuestionAnswerBatch
                 | Self::SessionQuestionAnswer
                 | Self::SessionQuestionSkip
                 | Self::SessionQuestionContinue

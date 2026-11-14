@@ -93,6 +93,24 @@ pub(crate) fn for_kind(kind: &TurnKind) -> Option<String> {
         ),
         TurnKind::PlanReviewQuestion { .. } => PLAN_REVIEW_QUESTION.into(),
         TurnKind::QuestionsResolved { .. } => QUESTIONS_RESOLVED.into(),
+        TurnKind::QuestionBatch { responses } => {
+            if responses.iter().any(|response| {
+                matches!(
+                    response.response,
+                    QuestionReplyResponse::Answer {
+                        required_questions_remain: true,
+                        ..
+                    } | QuestionReplyResponse::Correction {
+                        required_questions_remain: true,
+                        ..
+                    }
+                )
+            }) {
+                MORE_REQUIRED.replace("{what}", "answers")
+            } else {
+                return None;
+            }
+        }
         TurnKind::QuestionResponse { response } => match &response.response {
             QuestionReplyResponse::Answer {
                 required_questions_remain: true,

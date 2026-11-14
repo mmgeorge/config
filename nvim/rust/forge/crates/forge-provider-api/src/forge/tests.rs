@@ -435,3 +435,30 @@ fn tasks_render_their_typed_fields() {
         "<task kind=\"execute\" execution_id=\"ex\" plan_id=\"p-1\" phase=\"verify\" revision=\"3\">\n<phase_instructions>\nVerify.\n</phase_instructions>\n<design>\n{}\n</design>\n</task>"
     );
 }
+
+/// Preserve every response identity and keep batch data out of developer instructions.
+#[test]
+fn question_batch_renders_all_answers_in_one_user_block() {
+    let first = reply(QuestionReplyResponse::Answer {
+        answer: "Redis".into(),
+        required_questions_remain: false,
+    });
+    let mut second = first.clone();
+    second.question_id = "q:2".into();
+    second.question = "Which region?".into();
+    second.response = QuestionReplyResponse::Answer {
+        answer: "West".into(),
+        required_questions_remain: false,
+    };
+    let input = TurnInput::new(TurnKind::QuestionBatch {
+        responses: vec![first, second],
+    });
+    let blocks = render(&context(), &input, ContextChannel::DeveloperMessage);
+    assert!(input.is_question_response());
+    assert!(!blocks.lead.contains("question_response"));
+    assert_eq!(blocks.user.matches("<question_response ").count(), 2);
+    for value in ["q:1", "q:2", "Redis", "West"] {
+        assert!(blocks.user.contains(value));
+    }
+    assert!(!blocks.lead.contains("Other required questions remain"));
+}

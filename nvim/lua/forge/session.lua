@@ -74,6 +74,7 @@ M.empty_diff_rows = {}
 ---@field session table?
 ---@field access_preference? ForgeDirectoryPolicy Saved choices before provider capability limits.
 ---@field questions? ForgeQuestionView
+---@field question_answer_state? ForgeQuestionAnswerState
 ---@field question_drafts? table<string, table<string, string>>
 ---@field question_view_by_session? table<string, table>
 ---@field question_picker_resume? ForgePickerResumeState

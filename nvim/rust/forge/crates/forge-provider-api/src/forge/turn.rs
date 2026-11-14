@@ -43,6 +43,8 @@ pub enum TurnKind {
     QuestionsResolved { original: PromptInput },
     /// The user responded to one question in the question UI.
     QuestionResponse { response: QuestionReply },
+    /// Carry a complete set of question answers in one provider input.
+    QuestionBatch { responses: Vec<QuestionReply> },
     /// Recorded planning answers resume planning.
     PlanFeedback { feedback: PlanFeedback },
     /// Recorded answers continue a task's original request.
@@ -412,6 +414,7 @@ impl TurnInput {
             | TurnKind::Background { input }
             | TurnKind::QuestionsResolved { original: input } => Some(input),
             TurnKind::QuestionResponse { .. }
+            | TurnKind::QuestionBatch { .. }
             | TurnKind::PlanFeedback { .. }
             | TurnKind::WorkflowAnswers { .. }
             | TurnKind::PlanReview { .. }
@@ -447,7 +450,10 @@ impl TurnInput {
 
     /// Report whether this turn answers a question.
     pub fn is_question_response(&self) -> bool {
-        matches!(*self.kind, TurnKind::QuestionResponse { .. })
+        matches!(
+            *self.kind,
+            TurnKind::QuestionResponse { .. } | TurnKind::QuestionBatch { .. }
+        )
     }
 
     /// Describe the turn for transcripts and logs: the user's text, or a short label.
@@ -460,6 +466,19 @@ impl TurnInput {
             | TurnKind::PlanReviewQuestion { input }
             | TurnKind::Background { input } => input.display_text(),
             TurnKind::QuestionsResolved { .. } => "Questions resolved".into(),
+            TurnKind::QuestionBatch { responses } => responses
+                .iter()
+                .map(|response| match &response.response {
+                    QuestionReplyResponse::Answer { answer, .. }
+                    | QuestionReplyResponse::Correction { answer, .. } => {
+                        format!("{}: {}", response.question, answer)
+                    }
+                    QuestionReplyResponse::Clarification { text, .. } => {
+                        format!("{}: {}", response.question, text)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
             TurnKind::QuestionResponse { response } => match &response.response {
                 QuestionReplyResponse::Answer { answer, .. }
                 | QuestionReplyResponse::Correction { answer, .. } => answer.clone(),
@@ -517,6 +536,11 @@ impl TurnInput {
         match self.kind.as_ref() {
             TurnKind::PendingQuestions { questions, .. } => questions.write(writer),
             TurnKind::QuestionResponse { response } => write_question_response(response, writer),
+            TurnKind::QuestionBatch { responses } => {
+                for response in responses {
+                    write_question_response(response, writer);
+                }
+            }
             TurnKind::PlanFeedback { feedback } => match feedback {
                 PlanFeedback::Answers { answers } => answers.write(writer),
                 PlanFeedback::Withdrawn { reason } => {

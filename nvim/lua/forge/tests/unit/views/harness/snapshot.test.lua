@@ -63,17 +63,21 @@ T["snapshot"] = function()
   snapshot.apply(state, response)
   assert(state.execution_notice == "Command failed", "session projection cleared an independently owned command diagnostic")
   state.question_drafts = { choice = { ask = "Explain the tradeoff" } }
+  local saved_answers = { answers = { choice = { revision = 1, action = { kind = "dismiss" } } } }
+  state.question_answer_state = saved_answers
   state.question_picker_resume = { page_id = "choice" }
   response.session.id = "replacement-session"
   response.snapshot_revision = 1
   assert(snapshot.apply(state, response))
   assert(not require("forge.views.harness.activity").busy(state), "replacement session inherited activity")
   assert(state.question_drafts == nil, "a different session inherited question drafts")
+  assert(state.question_answer_state == nil, "a different session inherited staged answers")
   state.question_drafts = { choice = { ask = "A different question" } }
   response.session.id = "snapshot-test"
   assert(snapshot.apply(state, response))
   assert(state.question_drafts.choice.ask == "Explain the tradeoff", "returning to a session lost its question draft")
   eq(state.question_picker_resume.page_id, "choice")
+  assert(state.question_answer_state == saved_answers, "returning to a session lost its staged answers")
   -- Receiving a page cannot certify the owner's post-send durable acknowledgment.
   state.publication_cursor = 4
   response.owner_publication = { receipt_id = "slow-page", after = 4, through = 7, high_water = 9, more = true }

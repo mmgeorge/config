@@ -7,6 +7,7 @@ const APPLICATION: i64 = 0x464f5247;
 /// Tables created atomically before a history database can be opened.
 const REQUIRED_TABLES: &[&str] = &[
     "session_record",
+    "session_question_state",
     "task_record",
     "exchange_record",
     "exchange_comment",
@@ -127,10 +128,20 @@ pub(super) fn validate(connection: &Connection) -> Result<i64> {
         );
         for query in [
             "SELECT session_id,command_id,operation_id FROM owner_command_join LIMIT 0",
+            "SELECT session_id,format_version,payload FROM session_question_state LIMIT 0",
             "SELECT session_id,record FROM owner_cancellation LIMIT 0",
         ] {
-            connection.prepare(query).context("Harness cancellation schema is incompatible; clear this state version with ForgeHistoryClear")?;
+            connection.prepare(query).context("Harness required schema is incompatible; clear this state version with ForgeHistoryClear")?;
         }
+        let incompatible_questions: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_question_state WHERE format_version <> ?1)",
+            [crate::question::FORMAT_VERSION],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !incompatible_questions,
+            "Harness question state format is incompatible; clear this state version with ForgeHistoryClear"
+        );
     }
     Ok(version)
 }
@@ -147,6 +158,11 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
                 id TEXT PRIMARY KEY,
                 workspace TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_question_state (
+                session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,
+                format_version INTEGER NOT NULL,
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS task_record (

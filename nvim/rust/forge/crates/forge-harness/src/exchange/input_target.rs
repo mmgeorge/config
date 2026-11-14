@@ -141,6 +141,7 @@ pub(super) fn prepare(
                 task_id: outbox.task_id,
                 message_kind: outbox.kind,
                 reply: outbox.reply,
+                additional_replies: outbox.additional_replies,
             };
             Ok(Some(message.id.clone()))
         }

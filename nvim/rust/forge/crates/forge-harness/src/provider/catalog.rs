@@ -99,6 +99,20 @@ impl ProviderInput {
         Self::kind(forge_provider_api::forge::TurnKind::QuestionResponse { response })
     }
 
+    /// Build one provider turn while preserving every response in a committed group.
+    pub(crate) fn question_replies(
+        response: &forge_provider_api::QuestionReply,
+        additional: &[forge_provider_api::QuestionReply],
+    ) -> Self {
+        if additional.is_empty() {
+            return Self::question_reply(response.clone());
+        }
+        let mut responses = Vec::with_capacity(additional.len() + 1);
+        responses.push(response.clone());
+        responses.extend_from_slice(additional);
+        Self::kind(forge_provider_api::forge::TurnKind::QuestionBatch { responses })
+    }
+
     /// Carry files selected at user-input admission without discovering files in prompt text.
     pub(crate) fn with_attachments(
         mut self,

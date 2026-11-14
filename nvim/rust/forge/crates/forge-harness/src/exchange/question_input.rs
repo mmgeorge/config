@@ -118,6 +118,7 @@ impl QuestionInputs {
                         task_id: message.task_id,
                         message_kind: message.kind,
                         reply: message.reply,
+                        additional_replies: message.additional_replies,
                     },
                     attachments: Vec::new(),
                     config: None,
@@ -329,6 +330,7 @@ fn same_input(saved: &InputMessage, expected: &InputMessage) -> bool {
                 task_id: saved_task,
                 message_kind: saved_kind,
                 reply: saved_reply,
+                additional_replies: saved_additional,
             },
             InputPurpose::Question {
                 content_revision,
@@ -336,6 +338,7 @@ fn same_input(saved: &InputMessage, expected: &InputMessage) -> bool {
                 task_id,
                 message_kind,
                 reply,
+                additional_replies,
             },
         ) => {
             saved_revision.is_none_or(|saved| Some(saved) == *content_revision)
@@ -343,6 +346,7 @@ fn same_input(saved: &InputMessage, expected: &InputMessage) -> bool {
                 && saved_task == task_id
                 && saved_kind == message_kind
                 && saved_reply == reply
+                && saved_additional == additional_replies
         }
         (
             InputPurpose::QuestionContinuation {

@@ -1467,9 +1467,11 @@ impl HarnessBroker {
         self.store.save_exchange(&exchange)?;
         let text = admission.text.clone();
         let input = match &admission.purpose {
-            crate::input::InputPurpose::Question { reply, .. } => {
-                ProviderInput::question_reply(reply.clone())
-            }
+            crate::input::InputPurpose::Question {
+                reply,
+                additional_replies,
+                ..
+            } => ProviderInput::question_replies(reply, additional_replies),
             _ => ProviderInput::from_user_text(text.clone()),
         };
         self.stage_foreground_interaction(&text, mode, None, input)
@@ -1492,9 +1494,11 @@ impl HarnessBroker {
             let visible = discussion.visible_text.clone();
             admission.question_discussion = Some(discussion);
             let input = match &admission.purpose {
-                crate::input::InputPurpose::Question { reply, .. } => {
-                    ProviderInput::question_reply(reply.clone())
-                }
+                crate::input::InputPurpose::Question {
+                    reply,
+                    additional_replies,
+                    ..
+                } => ProviderInput::question_replies(reply, additional_replies),
                 _ => ProviderInput::from_user_text(text),
             };
             return self.stage_foreground_interaction(

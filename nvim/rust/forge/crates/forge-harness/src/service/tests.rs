@@ -960,6 +960,7 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
         assert!(controller.questions.outbox()?.is_empty());
         assert!(
             !controller.task_input_is_current(&crate::input::InputPurpose::Question {
+                additional_replies: Vec::new(),
                 content_revision: None,
                 question_id: question_ids[1].clone(),
                 task_id: None,

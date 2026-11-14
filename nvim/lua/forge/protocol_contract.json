@@ -1,5 +1,5 @@
 {
-  "version": 41,
+  "version": 42,
   "node": {
     "kind": [
       "exchange",
@@ -1163,6 +1163,12 @@
       "recovery": "none"
     },
     "session.provider.skill.list": {
+      "session_context": "required",
+      "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "session.question.answer_batch": {
       "session_context": "required",
       "readiness": "runtime",
       "admission": "ordinary",

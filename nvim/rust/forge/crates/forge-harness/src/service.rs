@@ -591,6 +591,13 @@ impl HarnessService {
         request: &mut Request,
     ) -> Result<()> {
         use session_command::SessionCommand;
+        if RuntimeMethod::decode(&request.method)? == RuntimeMethod::SessionQuestionAnswerBatch {
+            let batch: crate::question::QuestionBatch =
+                serde_json::from_value(request.params.clone())?;
+            request.method = "session.question.answer".into();
+            request.params = json!({"batch": batch});
+            return Ok(());
+        }
         if matches!(
             RuntimeMethod::decode(&request.method)?,
             RuntimeMethod::SessionQuestionAnswer | RuntimeMethod::SessionQuestionSkip
@@ -3180,6 +3187,26 @@ async fn route_control_request(
 ) -> Result<bool> {
     if cancellation::handles(request) {
         cancellation::apply(controller, request, message_sink).await?;
+        return Ok(true);
+    }
+    if method == RuntimeMethod::SessionQuestionAnswer
+        && let Some(batch) = request.params.get("batch")
+    {
+        let batch: crate::question::QuestionBatch = serde_json::from_value(batch.clone())?;
+        let result = controller
+            .exchange_owner
+            .question_events()
+            .change(crate::exchange::QuestionChange::batch(batch))
+            .await;
+        let response = match result {
+            Ok(snapshot) => Response::success(request.id, &snapshot)?,
+            Err(error) => Response::failure(
+                request.id,
+                error.code(),
+                format!("{:#}", anyhow::Error::new(error)),
+            ),
+        };
+        message_sink.send_control_response(response).await?;
         return Ok(true);
     }
     if matches!(

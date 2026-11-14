@@ -292,6 +292,9 @@ local function show_help(instance)
     if page.toggle_on_confirm and vim.tbl_contains(confirm_keys, mapping.lhs) then
       description = "Toggle, edit, or open the selected setting"
     end
+    if page.confirm_description and vim.tbl_contains(confirm_keys, mapping.lhs) then
+      description = page.confirm_description
+    end
     if description and description ~= "" then
       local binding = by_description[description]
       if not binding then

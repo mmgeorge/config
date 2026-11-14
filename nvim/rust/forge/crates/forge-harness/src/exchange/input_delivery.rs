@@ -564,8 +564,12 @@ impl InputDeliveryRun {
                     .descriptor()
                     .kind;
                 let input = match &self.message.purpose {
-                    crate::input::InputPurpose::Question { reply, .. } => {
-                        crate::provider::ProviderInput::question_reply(reply.clone())
+                    crate::input::InputPurpose::Question {
+                        reply,
+                        additional_replies,
+                        ..
+                    } => {
+                        crate::provider::ProviderInput::question_replies(reply, additional_replies)
                             .with_attachments(attachments.clone())
                     }
                     crate::input::InputPurpose::Clarification { .. }

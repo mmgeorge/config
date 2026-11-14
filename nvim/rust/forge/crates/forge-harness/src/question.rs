@@ -1,5 +1,8 @@
 //! Durable user decisions independent of provider exchanges and workflow phases.
 
+mod batch;
+pub(crate) use batch::QuestionBatch;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -8,7 +11,8 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-const FORMAT_VERSION: u32 = 4;
+/// Disposable question-record format validated before session owners start.
+pub(crate) const FORMAT_VERSION: u32 = 5;
 
 /// Identify one question without confusing it with an exchange or task.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -223,6 +227,12 @@ pub(crate) enum QuestionAction {
     Withdraw { reason: String },
 }
 
+/// Keep independently submitted replies separate while grouping one completed decision set.
+enum ReplyGrouping {
+    Individual,
+    ByTask,
+}
+
 /// Retain user input until the independent input journal acknowledges admission.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct QuestionOutbox {
@@ -232,6 +242,8 @@ pub(crate) struct QuestionOutbox {
     pub(crate) kind: QuestionMessageKind,
     pub(crate) text: String,
     pub(crate) reply: forge_provider_api::QuestionReply,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) additional_replies: Vec<forge_provider_api::QuestionReply>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -311,7 +323,6 @@ impl QuestionController {
     /// Create a controller using the session database's durable SQLite policy.
     pub(crate) fn open(root: &Path, session_id: &str) -> Result<Self> {
         let writer = crate::storage::writer::HistoryWriter::for_root(root)?;
-        writer.connection()?.execute_batch("CREATE TABLE IF NOT EXISTS session_question_state(session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,format_version INTEGER NOT NULL,payload TEXT NOT NULL);")?;
         Ok(Self {
             writer,
             waiting: Mutex::new(Vec::new()),
@@ -483,6 +494,31 @@ impl QuestionController {
         &self,
         command: &QuestionCommand,
     ) -> std::result::Result<Option<QuestionSnapshot>, QuestionCreationReplayError> {
+        self.replay_operation(
+            &command.operation_id,
+            serde_json::to_string(command)
+                .map_err(|error| QuestionCreationReplayError::State(error.into()))?,
+        )
+    }
+
+    /// Replay a complete batch before considering fresh mutation authority.
+    pub(crate) fn replay_batch(
+        &self,
+        batch: &QuestionBatch,
+    ) -> std::result::Result<Option<QuestionSnapshot>, QuestionCreationReplayError> {
+        self.replay_operation(
+            batch.operation_id(),
+            serde_json::to_string(batch)
+                .map_err(|error| QuestionCreationReplayError::State(error.into()))?,
+        )
+    }
+
+    /// Compare the original request with its durable result receipt.
+    fn replay_operation(
+        &self,
+        operation_id: &str,
+        encoded: String,
+    ) -> std::result::Result<Option<QuestionSnapshot>, QuestionCreationReplayError> {
         let connection = self
             .writer
             .connection()
@@ -490,17 +526,15 @@ impl QuestionController {
         let state = self
             .load(&connection)
             .map_err(QuestionCreationReplayError::State)?;
-        let Some(previous) = state.operations.get(&command.operation_id) else {
+        let Some(previous) = state.operations.get(operation_id) else {
             return Ok(None);
         };
-        let encoded = serde_json::to_string(command)
-            .map_err(|error| QuestionCreationReplayError::State(error.into()))?;
         if previous != &encoded {
             return Err(QuestionCreationReplayError::IdentityConflict);
         }
         state
             .mutation_results
-            .get(&command.operation_id)
+            .get(operation_id)
             .cloned()
             .map(Some)
             .ok_or(QuestionCreationReplayError::LegacyResultUnavailable)
@@ -905,6 +939,7 @@ impl QuestionController {
                     text: message.text.clone(),
                     reply: saved_reply(&state, &question.id, &message.id, message.kind)
                         .map_err(QuestionWaitError::State)?,
+                    additional_replies: Vec::new(),
                 });
             }
         }
@@ -938,6 +973,34 @@ impl QuestionController {
         );
         let encoded = serde_json::to_string(&command)?;
         let operation_id = command.operation_id.clone();
+        self.apply_commands(
+            operation_id,
+            encoded,
+            vec![command],
+            ReplyGrouping::Individual,
+        )
+    }
+
+    /// Commit all decisions together; a failed entry discards every staged mutation.
+    pub(crate) fn apply_batch(&self, batch: QuestionBatch) -> Result<QuestionSnapshot> {
+        let encoded = serde_json::to_string(&batch)?;
+        let operation_id = batch.operation_id().to_owned();
+        self.apply_commands(
+            operation_id,
+            encoded,
+            batch.into_commands(),
+            ReplyGrouping::ByTask,
+        )
+    }
+
+    /// Retain one exact result and publication for an indivisible mutation.
+    fn apply_commands(
+        &self,
+        operation_id: String,
+        encoded: String,
+        commands: Vec<QuestionCommand>,
+        grouping: ReplyGrouping,
+    ) -> Result<QuestionSnapshot> {
         let mut connection = self.writer.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut state = self.load(&transaction)?;
@@ -952,187 +1015,40 @@ impl QuestionController {
                 .cloned()
                 .ok_or_else(|| QuestionCreationReplayError::LegacyResultUnavailable.into());
         }
-        // Apply the mutation before retaining the exact response in the same durable transaction.
-        let mutate = |state: &mut QuestionState| -> Result<()> {
-            let other_required_pending = state.snapshot.questions.iter().any(|question| {
-                question.id != command.question_id
-                    && question.requirement == QuestionRequirement::Required
-                    && question.pending()
-            });
-            let question = state
-                .snapshot
-                .questions
-                .iter_mut()
-                .find(|question| question.id == command.question_id)
-                .context("question does not belong to this session")?;
-            let cancelled = state.cancelled_exchanges.contains(&question.exchange_id);
-            ensure!(
-                question.content.revision == command.revision,
-                "question changed; review its current choices before submitting"
-            );
-            ensure!(
-                !matches!(question.resolution, QuestionResolution::Retired { .. }),
-                "question owner is no longer active"
-            );
-            let message_id = command.operation_id.clone();
-            let mut outbound = None;
-            match command.action {
-                QuestionAction::Answer { answer } => {
-                    ensure!(
-                        question.pending(),
-                        "question already resolved; send a correction instead"
-                    );
-                    let text = answer_text(&question.content, &answer)?;
-                    question.resolution = QuestionResolution::Answered {
-                        answer,
-                        message_id: message_id.clone(),
-                    };
-                    outbound = Some((QuestionMessageKind::Answer, text));
-                }
-                QuestionAction::Clarify { text } => {
-                    ensure!(!cancelled, "question execution was cancelled");
-                    ensure!(question.pending(), "question is no longer pending");
-                    ensure!(!text.trim().is_empty(), "clarification is empty");
-                    outbound = Some((QuestionMessageKind::Clarification, text));
-                }
-                QuestionAction::Correct { text } => {
-                    ensure!(
-                        matches!(question.resolution, QuestionResolution::Answered { .. }),
-                        "only an answered question accepts a correction"
-                    );
-                    ensure!(!text.trim().is_empty(), "correction is empty");
-                    outbound = Some((QuestionMessageKind::Correction, text));
-                }
-                QuestionAction::Dismiss => {
-                    ensure!(question.pending(), "question is no longer pending");
-                    ensure!(
-                        question.requirement == QuestionRequirement::Optional,
-                        "required questions cannot be dismissed"
-                    );
-                    question.resolution = QuestionResolution::Dismissed;
-                }
-                QuestionAction::Reply {
-                    message_id: parent,
-                    text,
-                } => {
-                    ensure!(!text.trim().is_empty(), "clarification reply is empty");
-                    ensure!(
-                        question
-                            .discussion
-                            .iter()
-                            .any(|message| message.id == parent
-                                && message.kind == QuestionMessageKind::Clarification),
-                        "clarification message not found"
-                    );
-                    question.discussion.push(QuestionMessage {
-                        id: message_id.clone(),
-                        kind: QuestionMessageKind::Reply,
-                        text,
-                        reply_to: Some(parent),
-                    });
-                }
-                QuestionAction::Revise { draft } => {
-                    ensure!(question.pending(), "resolved questions cannot be revised");
-                    ensure!(
-                        draft.requirement == question.requirement,
-                        "question requirement cannot change during revision"
-                    );
-                    let next = content(
-                        draft,
-                        question
-                            .content
-                            .revision
-                            .checked_add(1)
-                            .context("question revision exhausted")?,
-                    )?;
-                    question
-                        .previous
-                        .push(std::mem::replace(&mut question.content, next));
-                }
-                QuestionAction::Withdraw { reason } => {
-                    ensure!(question.pending(), "question is no longer pending");
-                    ensure!(!reason.trim().is_empty(), "withdrawal reason is required");
-                    question.resolution = QuestionResolution::Withdrawn { reason };
-                }
-            }
-            if let Some((kind, text)) = outbound {
-                question.discussion.push(QuestionMessage {
-                    id: message_id.clone(),
-                    kind,
-                    text: text.clone(),
-                    reply_to: None,
-                });
-                // Optional answers remain durable history without authorizing another native turn.
-                if cancelled {
-                    return Ok(());
-                }
-                let waiting = question.delivery == QuestionDelivery::ToolResult
-                    && self
-                        .waiting
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?
-                        .contains(&question.id);
-                if waiting
-                    && matches!(
-                        kind,
-                        QuestionMessageKind::Answer | QuestionMessageKind::Correction
-                    )
+        let outbox_start = state.outbox.len();
+        for command in commands {
+            self.apply_to_state(&mut state, command)?;
+        }
+        if matches!(grouping, ReplyGrouping::ByTask) {
+            // Preserve task routing while admitting each owner's complete set as one input.
+            let pending = state.snapshot.required_pending();
+            let mut grouped: Vec<QuestionOutbox> = Vec::new();
+            for mut message in state.outbox.split_off(outbox_start) {
+                if let forge_provider_api::QuestionReplyResponse::Answer {
+                    required_questions_remain,
+                    ..
+                } = &mut message.reply.response
                 {
-                    return Ok(());
+                    *required_questions_remain = pending;
                 }
-                let response = match kind {
-                    QuestionMessageKind::Clarification => {
-                        forge_provider_api::QuestionReplyResponse::Clarification {
-                            options: question
-                                .content
-                                .options
-                                .iter()
-                                .map(|option| forge_provider_api::QuestionReplyOption {
-                                    id: option.id.clone(),
-                                    label: option.label.clone(),
-                                    description: option.description.clone(),
-                                    recommended: option.recommended,
-                                })
-                                .collect(),
-                            text: text.clone(),
-                            reply_to: None,
-                        }
-                    }
-                    QuestionMessageKind::Answer => {
-                        forge_provider_api::QuestionReplyResponse::Answer {
-                            answer: text.clone(),
-                            required_questions_remain: other_required_pending,
-                        }
-                    }
-                    QuestionMessageKind::Correction => {
-                        forge_provider_api::QuestionReplyResponse::Correction {
-                            answer: text.clone(),
-                            required_questions_remain: other_required_pending,
-                        }
-                    }
-                    QuestionMessageKind::Reply => anyhow::bail!(
-                        "a discussion reply cannot be submitted as a question response"
-                    ),
-                };
-                let reply = forge_provider_api::QuestionReply {
-                    question_id: question.id.as_str().to_owned(),
-                    revision: question.content.revision,
-                    message_id: message_id.clone(),
-                    question: question.content.question.clone(),
-                    response,
-                };
-                state.outbox.push(QuestionOutbox {
-                    id: message_id,
-                    question_id: question.id.clone(),
-                    task_id: question.task_id.clone(),
-                    kind,
-                    text,
-                    reply,
-                });
+                if let Some(group) = grouped
+                    .iter_mut()
+                    .find(|group| group.task_id == message.task_id)
+                {
+                    group.text.push_str("\n\n");
+                    group
+                        .text
+                        .push_str(&format!("{}: {}", message.reply.question, message.text));
+                    group.additional_replies.push(message.reply);
+                } else {
+                    message.id = format!("{operation_id}:delivery:{}", grouped.len());
+                    message.text = format!("{}: {}", message.reply.question, message.text);
+                    grouped.push(message);
+                }
             }
-            Ok(())
-        };
-        mutate(&mut state)?;
+            state.outbox.extend(grouped);
+        }
+
         state.snapshot.revision = state
             .snapshot
             .revision
@@ -1147,6 +1063,186 @@ impl QuestionController {
         transaction.commit()?;
         self.changed.send_replace(snapshot.revision);
         Ok(snapshot)
+    }
+
+    /// Stage one validated action in the transaction's private state.
+    fn apply_to_state(&self, state: &mut QuestionState, command: QuestionCommand) -> Result<()> {
+        let other_required_pending = state.snapshot.questions.iter().any(|question| {
+            question.id != command.question_id
+                && question.requirement == QuestionRequirement::Required
+                && question.pending()
+        });
+        let question = state
+            .snapshot
+            .questions
+            .iter_mut()
+            .find(|question| question.id == command.question_id)
+            .context("question does not belong to this session")?;
+        let cancelled = state.cancelled_exchanges.contains(&question.exchange_id);
+        ensure!(
+            question.content.revision == command.revision,
+            "question changed; review its current choices before submitting"
+        );
+        ensure!(
+            !matches!(question.resolution, QuestionResolution::Retired { .. }),
+            "question owner is no longer active"
+        );
+        let message_id = command.operation_id.clone();
+        let mut outbound = None;
+        match command.action {
+            QuestionAction::Answer { answer } => {
+                ensure!(
+                    question.pending(),
+                    "question already resolved; send a correction instead"
+                );
+                let text = answer_text(&question.content, &answer)?;
+                question.resolution = QuestionResolution::Answered {
+                    answer,
+                    message_id: message_id.clone(),
+                };
+                outbound = Some((QuestionMessageKind::Answer, text));
+            }
+            QuestionAction::Clarify { text } => {
+                ensure!(!cancelled, "question execution was cancelled");
+                ensure!(question.pending(), "question is no longer pending");
+                ensure!(!text.trim().is_empty(), "clarification is empty");
+                outbound = Some((QuestionMessageKind::Clarification, text));
+            }
+            QuestionAction::Correct { text } => {
+                ensure!(
+                    matches!(question.resolution, QuestionResolution::Answered { .. }),
+                    "only an answered question accepts a correction"
+                );
+                ensure!(!text.trim().is_empty(), "correction is empty");
+                outbound = Some((QuestionMessageKind::Correction, text));
+            }
+            QuestionAction::Dismiss => {
+                ensure!(question.pending(), "question is no longer pending");
+                ensure!(
+                    question.requirement == QuestionRequirement::Optional,
+                    "required questions cannot be dismissed"
+                );
+                question.resolution = QuestionResolution::Dismissed;
+            }
+            QuestionAction::Reply {
+                message_id: parent,
+                text,
+            } => {
+                ensure!(!text.trim().is_empty(), "clarification reply is empty");
+                ensure!(
+                    question
+                        .discussion
+                        .iter()
+                        .any(|message| message.id == parent
+                            && message.kind == QuestionMessageKind::Clarification),
+                    "clarification message not found"
+                );
+                question.discussion.push(QuestionMessage {
+                    id: message_id.clone(),
+                    kind: QuestionMessageKind::Reply,
+                    text,
+                    reply_to: Some(parent),
+                });
+            }
+            QuestionAction::Revise { draft } => {
+                ensure!(question.pending(), "resolved questions cannot be revised");
+                ensure!(
+                    draft.requirement == question.requirement,
+                    "question requirement cannot change during revision"
+                );
+                let next = content(
+                    draft,
+                    question
+                        .content
+                        .revision
+                        .checked_add(1)
+                        .context("question revision exhausted")?,
+                )?;
+                question
+                    .previous
+                    .push(std::mem::replace(&mut question.content, next));
+            }
+            QuestionAction::Withdraw { reason } => {
+                ensure!(question.pending(), "question is no longer pending");
+                ensure!(!reason.trim().is_empty(), "withdrawal reason is required");
+                question.resolution = QuestionResolution::Withdrawn { reason };
+            }
+        }
+        if let Some((kind, text)) = outbound {
+            question.discussion.push(QuestionMessage {
+                id: message_id.clone(),
+                kind,
+                text: text.clone(),
+                reply_to: None,
+            });
+            // Optional answers remain durable history without authorizing another native turn.
+            if cancelled {
+                return Ok(());
+            }
+            let waiting = question.delivery == QuestionDelivery::ToolResult
+                && self
+                    .waiting
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?
+                    .contains(&question.id);
+            if waiting
+                && matches!(
+                    kind,
+                    QuestionMessageKind::Answer | QuestionMessageKind::Correction
+                )
+            {
+                return Ok(());
+            }
+            let response = match kind {
+                QuestionMessageKind::Clarification => {
+                    forge_provider_api::QuestionReplyResponse::Clarification {
+                        options: question
+                            .content
+                            .options
+                            .iter()
+                            .map(|option| forge_provider_api::QuestionReplyOption {
+                                id: option.id.clone(),
+                                label: option.label.clone(),
+                                description: option.description.clone(),
+                                recommended: option.recommended,
+                            })
+                            .collect(),
+                        text: text.clone(),
+                        reply_to: None,
+                    }
+                }
+                QuestionMessageKind::Answer => forge_provider_api::QuestionReplyResponse::Answer {
+                    answer: text.clone(),
+                    required_questions_remain: other_required_pending,
+                },
+                QuestionMessageKind::Correction => {
+                    forge_provider_api::QuestionReplyResponse::Correction {
+                        answer: text.clone(),
+                        required_questions_remain: other_required_pending,
+                    }
+                }
+                QuestionMessageKind::Reply => {
+                    anyhow::bail!("a discussion reply cannot be submitted as a question response")
+                }
+            };
+            let reply = forge_provider_api::QuestionReply {
+                question_id: question.id.as_str().to_owned(),
+                revision: question.content.revision,
+                message_id: message_id.clone(),
+                question: question.content.question.clone(),
+                response,
+            };
+            state.outbox.push(QuestionOutbox {
+                id: message_id,
+                question_id: question.id.clone(),
+                task_id: question.task_id.clone(),
+                kind,
+                text,
+                reply,
+                additional_replies: Vec::new(),
+            });
+        }
+        Ok(())
     }
 
     fn load(&self, connection: &Connection) -> Result<QuestionState> {
@@ -1334,60 +1430,13 @@ fn saved_reply(
     Ok(reply)
 }
 
-/// Rebuild older outbox entries from canonical discussion, never from their native text envelope.
+/// Reject incompatible disposable question records instead of migrating session history.
 fn decode_question_state(version: u32, encoded: &str) -> Result<QuestionState> {
-    if version == FORMAT_VERSION {
-        return Ok(serde_json::from_str(encoded)?);
-    }
-    ensure!(version == 3, "unsupported question state format");
-    #[derive(Deserialize)]
-    struct LegacyOutbox {
-        id: String,
-        question_id: QuestionId,
-        task_id: Option<String>,
-        kind: QuestionMessageKind,
-    }
-    #[derive(Deserialize)]
-    struct LegacyState {
-        snapshot: QuestionSnapshot,
-        outbox: Vec<LegacyOutbox>,
-        operations: BTreeMap<String, String>,
-        chat_continuation: BTreeMap<String, ChatContinuation>,
-        cancelled_exchanges: BTreeSet<String>,
-    }
-    let legacy: LegacyState = serde_json::from_str(encoded)?;
-    let state = QuestionState {
-        snapshot: legacy.snapshot,
-        operations: legacy.operations,
-        chat_continuation: legacy.chat_continuation,
-        cancelled_exchanges: legacy.cancelled_exchanges,
-        ..QuestionState::default()
-    };
-    let outbox = legacy
-        .outbox
-        .into_iter()
-        .map(|entry| {
-            let reply = saved_reply(&state, &entry.question_id, &entry.id, entry.kind)?;
-            let text = match &reply.response {
-                forge_provider_api::QuestionReplyResponse::Answer { answer, .. }
-                | forge_provider_api::QuestionReplyResponse::Correction { answer, .. } => {
-                    answer.clone()
-                }
-                forge_provider_api::QuestionReplyResponse::Clarification { text, .. } => {
-                    text.clone()
-                }
-            };
-            Ok(QuestionOutbox {
-                id: entry.id,
-                question_id: entry.question_id,
-                task_id: entry.task_id,
-                kind: entry.kind,
-                text,
-                reply,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(QuestionState { outbox, ..state })
+    ensure!(
+        version == FORMAT_VERSION,
+        "unsupported question state format {version}; expected {FORMAT_VERSION}"
+    );
+    Ok(serde_json::from_str(encoded)?)
 }
 
 /// Release live answer destinations when a waiting tool completes or is cancelled.
@@ -2012,6 +2061,113 @@ mod tests {
         drop(wait);
         let restored = QuestionController::open(root.path(), "session")?;
         assert_eq!(restored.outbox()?.len(), 1);
+        Ok(())
+    }
+
+    /// A batch resolves every answer in one revision and leaves one durable delivery.
+    #[test]
+    fn batch_answers_commit_once_and_replay_without_duplicate_delivery() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "create-batch",
+            "exchange",
+            QuestionOrigin::Chat,
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Optional),
+            ],
+        )?;
+        let batch: QuestionBatch = serde_json::from_value(serde_json::json!({
+            "operation_id": "answer-batch", "answers": ids.iter().map(|id| serde_json::json!({
+                "question_id": id, "revision": 1,
+                "action": {"kind": "answer", "answer": {"kind": "other", "text": id.as_str()}}
+            })).collect::<Vec<_>>()
+        }))?;
+        let before = controller.snapshot()?.revision;
+        let committed = controller.apply_batch(batch.clone())?;
+        assert_eq!(committed.revision, before + 1);
+        assert!(
+            committed
+                .questions
+                .iter()
+                .all(|question| !question.pending())
+        );
+        let outbox = controller.outbox()?;
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].additional_replies.len(), 1);
+        assert!(matches!(
+            outbox[0].reply.response,
+            forge_provider_api::QuestionReplyResponse::Answer {
+                required_questions_remain: false,
+                ..
+            }
+        ));
+        let replayed = controller.apply_batch(batch)?;
+        assert_eq!(
+            serde_json::to_value(replayed)?,
+            serde_json::to_value(&committed)?
+        );
+        assert_eq!(controller.outbox()?.len(), 1);
+        let reopened = QuestionController::open(root.path(), "session")?;
+        assert_eq!(reopened.outbox()?[0].additional_replies.len(), 1);
+        Ok(())
+    }
+
+    /// A live waiting tool receives the complete commit without duplicate message delivery.
+    #[tokio::test]
+    async fn batch_answers_release_wait_without_message_delivery() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let mut waiting = Box::pin(controller.ask_wait(
+            "wait-batch",
+            "exchange",
+            None,
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Required),
+            ],
+        ));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        let snapshot = controller.snapshot()?;
+        let batch: QuestionBatch = serde_json::from_value(serde_json::json!({
+            "operation_id":"wait-answers", "answers": snapshot.questions.iter().map(|question| serde_json::json!({
+                "question_id":question.id, "revision":1,
+                "action":{"kind":"answer", "answer":{"kind":"other", "text":"Yes"}}
+            })).collect::<Vec<_>>()
+        }))?;
+        controller.apply_batch(batch)?;
+        let answers = waiting.await?;
+        assert_eq!(answers.len(), 2);
+        assert!(answers.iter().all(|question| !question.pending()));
+        assert!(controller.outbox()?.is_empty());
+        Ok(())
+    }
+
+    /// A stale final entry must not commit the valid first answer or its outbox record.
+    #[test]
+    fn batch_rejection_preserves_all_questions_and_outbox() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "create-batch",
+            "exchange",
+            QuestionOrigin::Chat,
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Required),
+            ],
+        )?;
+        let before = serde_json::to_value(controller.snapshot()?)?;
+        let batch: QuestionBatch = serde_json::from_value(serde_json::json!({
+            "operation_id": "stale-batch", "answers": [
+                {"question_id": ids[0], "revision": 1, "action": {"kind":"answer", "answer":{"kind":"other", "text":"first"}}},
+                {"question_id": ids[1], "revision": 2, "action": {"kind":"answer", "answer":{"kind":"other", "text":"second"}}}
+            ]
+        }))?;
+        assert!(controller.apply_batch(batch).is_err());
+        assert_eq!(serde_json::to_value(controller.snapshot()?)?, before);
+        assert!(controller.outbox()?.is_empty());
         Ok(())
     }
 
