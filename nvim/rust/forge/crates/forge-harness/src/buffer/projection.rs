@@ -2139,7 +2139,14 @@ impl TimelineRenderer<'_> {
                                     && lifecycle.answer.as_deref() == Some(prompt.text.as_str())))) {
                         continue;
                     }
+                    // An unconfirmed steer reached the provider, but no report shows the model read
+                    // it, so its row keeps the text and states that limit.
+                    let unconfirmed =
+                        prompt.consumption == crate::exchange::InputConsumption::Unconfirmed;
                     let label = match prompt.intent {
+                        crate::exchange::InputIntent::Steering if unconfirmed => {
+                            "Steering (not confirmed read)"
+                        }
                         crate::exchange::InputIntent::Steering => "Steering",
                         crate::exchange::InputIntent::Clarification => "You asked",
                         crate::exchange::InputIntent::Answer => "You answered",
@@ -2158,10 +2165,13 @@ impl TimelineRenderer<'_> {
                     };
                     let width = self.content_width();
                     let renderer = TranscriptRenderer::new(&width)?;
-                    let block = renderer.prompt(
-                        BlockId(format!("{}:prompt", prompt.id)),
-                        &format!("{label}: {text}"),
-                    )?;
+                    let id = BlockId(format!("{}:prompt", prompt.id));
+                    let text = format!("{label}: {text}");
+                    let block = if unconfirmed {
+                        renderer.unconfirmed_prompt(id, &text)?
+                    } else {
+                        renderer.prompt(id, &text)?
+                    };
                     self.prompt.push(block.id.clone());
                     self.push(block)?;
                 }
@@ -4205,6 +4215,111 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(text.matches("What is this repo?").count(), 1, "{text}");
+        Ok(())
+    }
+
+    /// Steering waits outside the transcript, anchors never render, and unconfirmed rows keep
+    /// their text without the marker that response reveal anchors on.
+    #[test]
+    fn steering_rows_follow_their_consumption_state() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"steered", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Summarize the repo", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let early = forge_provider_api::SubmissionId::try_from("early".to_owned())?;
+        exchange.observe_event(
+            &crate::turn::test_support::item_event(
+                &address,
+                "early-echo",
+                forge_provider_api::ItemEvent::Started(forge_provider_api::ItemStart::UserMessage(
+                    forge_provider_api::UserMessageStart {
+                        text: "Anchored before acknowledgement".into(),
+                        submission_id: Some(early),
+                    },
+                )),
+            ),
+            1,
+        )?;
+        exchange.append_acknowledged_input(
+            &address.scope,
+            Some("waiting".into()),
+            Some(forge_provider_api::SubmissionId::try_from(
+                "waiting".to_owned(),
+            )?),
+            crate::exchange::InputIntent::Steering,
+            "Prefer the short form".into(),
+            2,
+        )?;
+        let render = |exchange: &Exchange| -> anyhow::Result<super::ProjectedEntry> {
+            project_at(
+                &TimelineEntry::Exchange {
+                    id: exchange.id.clone(),
+                    created_at_ms: 0,
+                    exchange: exchange.clone().into(),
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                3,
+            )
+        };
+        let text = |projected: &super::ProjectedEntry| {
+            projected
+                .entry
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let live = render(&exchange)?;
+        assert!(
+            !text(&live).contains("Prefer the short form"),
+            "{}",
+            text(&live)
+        );
+        assert!(!text(&live).contains("Anchored before"), "{}", text(&live));
+
+        exchange.finish(crate::exchange::ExchangeOutcome::Interrupted, 4)?;
+        let settled = render(&exchange)?;
+        assert!(
+            text(&settled).contains("Steering (not confirmed read): Prefer the short form"),
+            "{}",
+            text(&settled)
+        );
+        assert!(
+            !text(&settled).contains("Anchored before"),
+            "{}",
+            text(&settled)
+        );
+        let row = settled
+            .entry
+            .block
+            .iter()
+            .find(|block| block.id.0 == "waiting:prompt")
+            .context("unconfirmed row")?;
+        let marker = row
+            .metadata
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.marker.as_ref())
+            .context("unconfirmed row marker")?;
+        assert_eq!(marker.capture, "ForgeHarnessUnconfirmedPrompt");
+        assert!(
+            row.metadata
+                .decoration
+                .iter()
+                .any(|decoration| decoration.capture == "ForgeHarnessPrompt"),
+            "unconfirmed input lost its prompt styling"
+        );
+        assert!(
+            settled.prompt.contains(&row.id),
+            "prompt navigation skipped the row"
+        );
         Ok(())
     }
 }

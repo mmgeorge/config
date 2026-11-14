@@ -24,10 +24,12 @@ impl<'exchange> ExchangeLayout<'exchange> {
         let mut opening = Vec::new();
         let mut results = Vec::new();
         let mut conclusion = Vec::new();
+        // Steering awaiting consumption and consumption anchors have no transcript position yet,
+        // so they cannot mark where a response begins.
         let mut activity = exchange
             .node_list
             .iter()
-            .filter(|node| !questions.nested.contains(node.id()))
+            .filter(|node| !questions.nested.contains(node.id()) && exchange.displays_node(node))
             .collect::<Vec<_>>();
         // Results move ahead of the response of the turn that produced them, including
         // a plan submission recorded after that response. Once a later turn starts in

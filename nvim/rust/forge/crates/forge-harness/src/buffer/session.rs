@@ -39,6 +39,8 @@ struct OpenPresentation {
     status: super::status::StatusDocument,
     display: super::identity::DisplayRegistry,
     history_input_id: HashSet<String>,
+    /// Acknowledged steering whose provider has not reported consumption, in timeline order.
+    awaiting_steering: Vec<StagedInput>,
     unsettled_exchange: Vec<String>,
     syntax_done: HashSet<TargetId>,
     /// Targets captured for analysis whose highlight has not been applied yet.
@@ -745,18 +747,13 @@ impl SessionPresentation {
             "snapshot_created_ms",
             started.elapsed().as_secs_f64() * 1000.0,
         );
-        let opened = PresentationOpen {
-            diff_view: forge_diff::view::DiffViewOptions::default(),
-            status: status.snapshot(),
-            syntax_pending: !syntax.is_empty(),
-            transcript: snapshot,
-            startup_timing,
-        };
-        self.open = Some(OpenPresentation {
+        let syntax_pending = !syntax.is_empty();
+        let mut open = OpenPresentation {
             diff: diff_view::TimelineDiffStore::default(),
             status,
             display,
             history_input_id: history_input_ids(self.timeline.entry_list()),
+            awaiting_steering: awaiting_steering(self.timeline.entry_list()),
             unsettled_exchange: unsettled,
             syntax_done: HashSet::new(),
             syntax_in_flight: HashSet::new(),
@@ -779,7 +776,18 @@ impl SessionPresentation {
             pending_bytes: 0,
             input: HashMap::from([(view, InputSequence(0))]),
             failure: None,
-        });
+        };
+        // A reopened presentation shows steering still waiting for its provider, which no
+        // editor staging describes anymore.
+        update_staging_block(&mut open)?;
+        let opened = PresentationOpen {
+            diff_view: forge_diff::view::DiffViewOptions::default(),
+            status: open.status.snapshot(),
+            syntax_pending,
+            transcript: snapshot,
+            startup_timing,
+        };
+        self.open = Some(open);
         Ok(opened)
     }
 
@@ -1255,6 +1263,7 @@ impl SessionPresentation {
                     .extend(history_input_ids(std::slice::from_ref(entry)));
             }
         }
+        open.awaiting_steering = awaiting_steering(self.timeline.entry_list());
         let unsettled = if let Some(run_id) = open.agent_scope.as_deref() {
             unsettled_exchanges(
                 find_agent_exchanges(self.timeline.entry_list(), run_id)
@@ -2186,29 +2195,70 @@ fn history_input_ids(entries: &[TimelineEntry]) -> HashSet<String> {
     ids
 }
 
+/// Collect acknowledged steering that waits for consumption in open top-level exchanges.
+fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<StagedInput> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TimelineEntry::Exchange { exchange, .. } if !exchange.is_finished() => Some(exchange),
+            _ => None,
+        })
+        .flat_map(|exchange| exchange.awaiting_inputs())
+        .map(|prompt| StagedInput::Message {
+            id: prompt.id.clone(),
+            text: prompt.text.clone(),
+            failed: false,
+        })
+        .collect()
+}
+
+/// Build the status staging block from durable waiting steering, then editor staging.
+///
+/// The status section lists each steering message in one place. Acknowledgement creates the
+/// durable copy under the staged message's ID, which removes the staged copy in the same
+/// publication; consumption then moves the message from this section into the transcript.
 fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     use forge_buffer::identity::BlockId;
     let block_id = BlockId("harness:staging".into());
-    if let Some(staging) = &open.staging {
+    let staged = |values: &[StagedInput]| {
+        values
+            .iter()
+            .filter(|value| match value {
+                StagedInput::Text(_) => true,
+                StagedInput::Message { id, .. } => !open.history_input_id.contains(id),
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let (staged_steering, staged_queue) = open
+        .staging
+        .as_ref()
+        .map(|staging| (staged(&staging.steering), staged(&staging.queue)))
+        .unwrap_or_default();
+    let steering = open
+        .awaiting_steering
+        .iter()
+        .cloned()
+        .chain(staged_steering)
+        .collect::<Vec<_>>();
+    if !steering.is_empty() || !staged_queue.is_empty() {
         let width = open.transcript.views.profile().unwrap_or(&open.last_width);
         let mut rows = Vec::new();
         let mut decoration = Vec::new();
         append_staging_section(
             &mut rows,
             "Steering active turn",
-            &staging.steering,
+            &steering,
             width,
             false,
-            &open.history_input_id,
             &mut decoration,
         )?;
         append_staging_section(
             &mut rows,
             "Queued follow-up inputs",
-            &staging.queue,
+            &staged_queue,
             width,
             true,
-            &open.history_input_id,
             &mut decoration,
         )?;
         let mut block = forge_buffer::block::BufferBlock {
@@ -2244,16 +2294,8 @@ fn append_staging_section(
     values: &[StagedInput],
     width: &WidthProfile,
     preview: bool,
-    history_input_id: &HashSet<String>,
     decoration: &mut Vec<forge_buffer::block::Decoration>,
 ) -> Result<()> {
-    let values: Vec<_> = values
-        .iter()
-        .filter(|value| match value {
-            StagedInput::Text(_) => true,
-            StagedInput::Message { id, .. } => !history_input_id.contains(id),
-        })
-        .collect();
     if values.is_empty() {
         return Ok(());
     }
@@ -2873,6 +2915,7 @@ mod tests {
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             checklist: None,
+            closed_input_consumption: Vec::new(),
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },
@@ -2933,6 +2976,119 @@ mod tests {
             agent_by_id: HashMap::new(),
             exchange: (interaction).into(),
         }
+    }
+
+    /// The status section shows each steering message once, from staging through acknowledgement,
+    /// without Lua staging, until consumption moves it into the transcript.
+    #[test]
+    fn steering_keeps_one_visible_copy_through_consumption() -> Result<()> {
+        let steer = "keep it short";
+        let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"steered", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Summarize", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            agent_by_id: HashMap::new(),
+            exchange: exchange.clone().into(),
+        }])?;
+        let document = DocumentId("timeline:steering".into());
+        owner.open(
+            document.clone(),
+            ViewId("timeline:steering:view".into()),
+            WidthProfile::default(),
+        )?;
+        let text = |snapshot: BufferSnapshot| {
+            snapshot
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let visible = |owner: &SessionPresentation| -> Result<(usize, usize)> {
+            let status = text(owner.open.as_ref().context("open")?.status.snapshot());
+            let transcript = text(owner.snapshot(&document)?);
+            Ok((
+                status.matches(steer).count(),
+                transcript.matches(steer).count(),
+            ))
+        };
+        let staged = || {
+            vec![StagedInput::Message {
+                id: "steer".into(),
+                text: steer.into(),
+                failed: false,
+            }]
+        };
+
+        owner.set_staging(&document, 1, Vec::new(), staged())?;
+        assert_eq!(visible(&owner)?, (1, 0));
+        let submission = forge_provider_api::SubmissionId::try_from("steer-submission".to_owned())?;
+        exchange.append_acknowledged_input(
+            &address.scope,
+            Some("steer".into()),
+            Some(submission.clone()),
+            crate::exchange::InputIntent::Steering,
+            steer.into(),
+            1,
+        )?;
+        owner.update_live(Some(&exchange), None, SessionPhase::Idle, false)?;
+        assert_eq!(
+            visible(&owner)?,
+            (1, 0),
+            "acknowledgement duplicated or dropped"
+        );
+        owner.set_staging(&document, 2, Vec::new(), Vec::new())?;
+        assert_eq!(
+            visible(&owner)?,
+            (1, 0),
+            "durable waiting needed Lua staging"
+        );
+        let status = text(owner.open.as_ref().context("open")?.status.snapshot());
+        assert!(status.contains("Steering active turn"), "{status}");
+
+        // A presentation opened while the steer waits lists it with no editor staging.
+        owner.close(&document)?;
+        let reopened = DocumentId("timeline:steering:reopened".into());
+        let opened = owner.open(
+            reopened.clone(),
+            ViewId("timeline:steering:reopened:view".into()),
+            WidthProfile::default(),
+        )?;
+        assert_eq!(
+            serde_json::to_string(&opened.status)?
+                .matches(steer)
+                .count(),
+            1
+        );
+        let document = reopened;
+
+        exchange.observe_event(
+            &crate::turn::test_support::item_event(
+                &address,
+                "echo",
+                forge_provider_api::ItemEvent::Started(forge_provider_api::ItemStart::UserMessage(
+                    forge_provider_api::UserMessageStart {
+                        text: steer.into(),
+                        submission_id: Some(submission),
+                    },
+                )),
+            ),
+            2,
+        )?;
+        owner.update_live(Some(&exchange), None, SessionPhase::Idle, false)?;
+        let status = text(owner.open.as_ref().context("open")?.status.snapshot());
+        let transcript = text(owner.snapshot(&document)?);
+        assert_eq!(status.matches(steer).count(), 0, "{status}");
+        assert_eq!(transcript.matches(steer).count(), 1, "{transcript}");
+        Ok(())
     }
 
     #[test]

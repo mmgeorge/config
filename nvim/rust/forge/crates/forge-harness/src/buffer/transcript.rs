@@ -168,6 +168,19 @@ impl<'profile> TranscriptRenderer<'profile> {
     }
 
     pub fn prompt(&self, id: BlockId, source: &str) -> Result<BufferBlock> {
+        self.input_row(id, source, "ForgeHarnessPrompt")
+    }
+
+    /// Render user input that reached the provider without a report that the model read it.
+    ///
+    /// The row keeps prompt styling, but its marker uses `ForgeHarnessUnconfirmedPrompt`, which
+    /// links to the prompt highlight, because the editor's response reveal anchors on
+    /// `ForgeHarnessPrompt` markers as the input that started the reply being read.
+    pub fn unconfirmed_prompt(&self, id: BlockId, source: &str) -> Result<BufferBlock> {
+        self.input_row(id, source, "ForgeHarnessUnconfirmedPrompt")
+    }
+
+    fn input_row(&self, id: BlockId, source: &str, marker: &str) -> Result<BufferBlock> {
         // The concealed marker moves into the sign column, which indents every display row.
         let mut block = self.literal(id, &format!("● {source}"), 0)?;
         block.metadata.decoration.push(Decoration {
@@ -181,7 +194,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             capture: "ForgeHarnessPrompt".into(),
             priority: 100,
         });
-        Self::heading_marker(&mut block, "ForgeHarnessPrompt");
+        Self::heading_marker(&mut block, marker);
         block.metadata.node = Some(forge_buffer::node::NodeState::new(
             forge_buffer::identity::FoldId(block.id.0.clone()),
             forge_buffer::node::NodeKind::Message,

@@ -6838,6 +6838,7 @@ impl HarnessBroker {
                 let applied = self.apply_input_acceptance(
                     runtime,
                     &mut transaction.state.interaction,
+                    &scope,
                     &receipt,
                     &presentation,
                 )?;
@@ -8738,6 +8739,7 @@ impl HarnessBroker {
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
+        scope: &crate::provider::InvocationScope,
         receipt: &Arc<crate::provider::submission::Submission>,
         acknowledgement: &InputPresentation,
     ) -> Result<AppliedProviderEvent> {
@@ -8814,9 +8816,11 @@ impl HarnessBroker {
                                 matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
                                 return Ok(AppliedProviderEvent::Effects(effects));
                             }
+                // The wait ends when the input reaches the provider, before the model reads it.
                 interaction.observe_blocker("agent_wait".into(), false, now_ms);
                 runtime.active_wait = None;
-                interaction.append_acknowledged_input(
+                let prompt = interaction.append_acknowledged_input(
+                    scope,
                     input_id.clone(),
                     Some(receipt.receipt_id().clone()),
                     crate::exchange::InputIntent::Steering,
@@ -8824,10 +8828,9 @@ impl HarnessBroker {
                     now_ms,
                 )?;
                 self.store.save_exchange(interaction)?;
-                let prompt = interaction.node_list.last().and_then(|node| match node {
-                    ExchangeNode::ExchangeInput { prompt } => Some(prompt.clone()),
-                    _ => None,
-                });
+                // Awaiting and unconfirmed input has not been shown to reach the model, so only an
+                // acknowledgement that adopts an earlier consumption report publishes the prompt.
+                let prompt = prompt.consumption.is_consumed().then_some(prompt);
                 effects.push(self.prepare_live_interaction(
                     SessionUpdate::Timeline {
                         update: TimelineUpdate::Node { prompt },
@@ -8872,7 +8875,7 @@ impl HarnessBroker {
         match presentation {
             InputPresentation::Steering { text } => {
                 if !interaction.node_list.iter().any(|node| matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == id)) {
-                    interaction.append_acknowledged_input(Some(id), Some(receipt.receipt_id().clone()), crate::exchange::InputIntent::Steering, text.clone(), now_ms)?;
+                    interaction.append_acknowledged_input(scope, Some(id), Some(receipt.receipt_id().clone()), crate::exchange::InputIntent::Steering, text.clone(), now_ms)?;
                 }
             }
             InputPresentation::TaskStarted { start, prompt } => {
@@ -8913,10 +8916,14 @@ impl HarnessBroker {
         if let Some(routed) = self.apply_settled_parent_event(interaction, &observation)? {
             return Ok(routed);
         }
+        let mut consumed_input = None;
         let applied = match &observation {
             HarnessEvent::Native { scope, event, .. } => {
                 let event = event.as_ref();
-                interaction.observe_provider_event(scope, event, self.clock.now_ms())?
+                let observed =
+                    interaction.observe_provider_evidence(scope, event, self.clock.now_ms())?;
+                consumed_input = observed.consumed_input;
+                observed.changed
             }
             HarnessEvent::Host { scope, event } => {
                 interaction.observe_host_event(scope, event, self.clock.now_ms())?
@@ -9004,11 +9011,26 @@ impl HarnessBroker {
             }
         }
         let content = self.prepare_live_interaction(observation, interaction)?;
-        Ok(match runtime_update {
-            Some(update) => {
-                AppliedProviderEvent::Effects(vec![AppliedProviderEvent::Update(update), content])
-            }
-            None => content,
+        let mut effects = runtime_update
+            .map(AppliedProviderEvent::Update)
+            .into_iter()
+            .collect::<Vec<_>>();
+        effects.push(content);
+        // The record reports each input's first consumption once, which is when it enters the
+        // transcript; an acknowledgement after an earlier report publishes it instead.
+        if let Some(prompt) = consumed_input {
+            effects.push(self.prepare_live_interaction(
+                SessionUpdate::Timeline {
+                    update: TimelineUpdate::Node {
+                        prompt: Some(prompt),
+                    },
+                },
+                interaction,
+            )?);
+        }
+        Ok(match effects.len() {
+            1 => effects.pop().expect("one effect"),
+            _ => AppliedProviderEvent::Effects(effects),
         })
     }
 
@@ -9540,6 +9562,7 @@ impl HarnessBroker {
                 metrics: crate::exchange::ExchangeMetrics::default(),
                 comment: Vec::new(),
                 checklist: None,
+                closed_input_consumption: Vec::new(),
 
                 question: crate::exchange::ExchangeQuestion::None,
                 clock: crate::exchange::ExchangeClock::Running {

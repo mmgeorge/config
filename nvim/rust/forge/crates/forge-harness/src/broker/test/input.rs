@@ -393,3 +393,277 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     }.await
 }
+
+/// When the fixture reports the steered input's consumption relative to its acknowledgement.
+#[derive(Clone, Copy, PartialEq)]
+enum ConsumptionReport {
+    /// The provider echoes the input once its response begins, after acknowledgement.
+    AfterAcknowledgement,
+    /// The provider echoes the input before it acknowledges receipt.
+    BeforeAcknowledgement,
+    /// The provider covers the input in its terminal result without ever echoing it.
+    Never,
+}
+
+/// Drive one steered foreground turn and return its prompt-bearing publications and record.
+async fn steered_publications(
+    report: ConsumptionReport,
+) -> Result<(
+    Vec<crate::exchange::ExchangeInput>,
+    usize,
+    crate::exchange::Exchange,
+)> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let echo_now = Arc::new(tokio::sync::Semaphore::new(0));
+    let echo_sent = Arc::new(tokio::sync::Semaphore::new(0));
+    let steered = Arc::new(std::sync::Mutex::new(
+        None::<forge_provider_api::CoveredInput>,
+    ));
+    let mut capability = crate::provider::test_support::fixture_capability();
+    capability.integration.tracked_submission = true;
+    capability.integration.local_acceptance = false;
+    let descriptor = crate::provider::ProviderDescriptor {
+        kind: crate::provider::ProviderId::new("test-consumption").expect("fixture ID is valid"),
+        label: "Steering consumption fixture".into(),
+        capability,
+    };
+    let echo = |address: &crate::provider::TurnAddress,
+                item: &str,
+                covered: &forge_provider_api::CoveredInput| {
+        let start = forge_provider_api::UserMessageStart {
+            text: "prefer the short form".into(),
+            submission_id: Some(covered.submission_id().clone()),
+        };
+        [
+            forge_provider_api::ItemEvent::Started(forge_provider_api::ItemStart::UserMessage(
+                start,
+            )),
+            forge_provider_api::ItemEvent::Completed(
+                forge_provider_api::ItemCompletion::UserMessage(
+                    forge_provider_api::MessageCompletion {
+                        text: "prefer the short form".into(),
+                        outcome: forge_provider_api::MessageOutcome::Completed,
+                    },
+                ),
+            ),
+        ]
+        .map(|event| ProviderEvent::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: forge_provider_api::ItemId::new(item).expect("fixture item is nonempty"),
+            event,
+        })
+    };
+    let provider = crate::provider::test_support::EventFixtureProvider::new(descriptor, {
+        let (started, release, echo_now, echo_sent, steered) = (
+            started.clone(),
+            release.clone(),
+            echo_now.clone(),
+            echo_sent.clone(),
+            steered.clone(),
+        );
+        move |request, sink, start, _cancellation| {
+            let (started, release, echo_now, echo_sent, steered) = (
+                started.clone(),
+                release.clone(),
+                echo_now.clone(),
+                echo_sent.clone(),
+                steered.clone(),
+            );
+            async move {
+                start.observed(0).await?;
+                let address = crate::provider::test_support::address(&request.scope);
+                started.add_permits(1);
+                if report == ConsumptionReport::BeforeAcknowledgement {
+                    crate::provider::test_support::wait_gate(&echo_now).await?;
+                    let covered = steered.lock().unwrap().clone().expect("steered input");
+                    for event in echo(&address, "early-echo", &covered) {
+                        sink.send_wait(crate::provider::test_support::activity(event)?)
+                            .await?;
+                    }
+                    echo_sent.add_permits(1);
+                }
+                crate::provider::test_support::wait_gate(&release).await?;
+                let covered = steered.lock().unwrap().clone().expect("steered input");
+                if report == ConsumptionReport::AfterAcknowledgement {
+                    // A repeated report under a new item must not publish the prompt twice.
+                    for item in ["echo", "echo-again"] {
+                        for event in echo(&address, item, &covered) {
+                            sink.send_wait(crate::provider::test_support::activity(event)?)
+                                .await?;
+                        }
+                    }
+                }
+                for event in completed_message(
+                    &address,
+                    "response",
+                    crate::provider::TestMessageContent::Response,
+                    "Short form",
+                ) {
+                    sink.send_wait(crate::provider::test_support::activity(event)?)
+                        .await?;
+                }
+                let mut coverage = request.input_coverage();
+                coverage.push(covered);
+                Ok(forge_provider_api::TurnResult::new(
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                    1,
+                    None,
+                    coverage,
+                    Vec::new(),
+                    None,
+                )
+                .expect("fixture native coverage is valid"))
+            }
+        }
+    });
+    let provider = provider.with_steering({
+        let (steered, echo_now, echo_sent) = (steered.clone(), echo_now.clone(), echo_sent.clone());
+        move |request| {
+            let (steered, echo_now, echo_sent) =
+                (steered.clone(), echo_now.clone(), echo_sent.clone());
+            async move {
+                let receipt = request.delivery.receipt().expect("journaled steering");
+                *steered.lock().unwrap() = Some(forge_provider_api::CoveredInput::new(
+                    receipt.id().clone(),
+                    receipt.attempt_id()?,
+                ));
+                if report == ConsumptionReport::BeforeAcknowledgement {
+                    echo_now.add_permits(1);
+                    crate::provider::test_support::wait_gate(&echo_sent).await?;
+                }
+                Ok(())
+            }
+        }
+    });
+    let session = crate::provider::test_support::ProviderTestSession::from_native(provider)?;
+    broker.provider = session.provider_handle();
+    let provider_id = broker.provider.descriptor().kind;
+    let lane = broker.parent_input.clone();
+    let catalog = broker.provider_catalog_request()?;
+    let journal =
+        crate::provider::submission::SubmissionStore::open(data.path(), broker.trace.clone())?;
+    let (sink, mut stream) = publication::channel();
+    broker.event_sink = Some(sink);
+    let collected = tokio::spawn(async move {
+        let mut prompts = Vec::new();
+        let mut acknowledgements = 0;
+        while let Ok(Some(update)) = stream.recv().await {
+            if let publication::SessionUpdate::Timeline {
+                update: publication::TimelineUpdate::Node { prompt },
+            } = update
+            {
+                match prompt {
+                    Some(prompt) => prompts.push(prompt),
+                    None => acknowledgements += 1,
+                }
+            }
+        }
+        (prompts, acknowledgements)
+    });
+    let running = tokio::spawn(async move {
+        let result = broker
+            .run_interaction(
+                "initial request".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("initial request".into())),
+            )
+            .await;
+        broker.event_sink = None;
+        (broker, result)
+    });
+    await_boundary_barrier(&started).await?;
+    let submission = journal.prepare_input(
+        &catalog,
+        ProviderInput::from_user_text("prefer the short form"),
+        provider_id,
+        Some("steer-message".into()),
+    )?;
+    lane.steer(crate::provider::SteeringInput::User {
+        text: "prefer the short form".into(),
+        attachments: Vec::new(),
+        submission: Some(submission),
+    })
+    .await?;
+    release.add_permits(1);
+    let (broker, result) = running.await?;
+    result?;
+    let exchange = broker
+        .store
+        .list_exchange(&broker.session.id)?
+        .pop()
+        .expect("steered exchange");
+    drop(broker);
+    let (prompts, acknowledgements) = collected.await?;
+    Ok((prompts, acknowledgements, exchange))
+}
+
+/// Report the consumption state of the steered input and whether its row precedes the response.
+fn steered_row(exchange: &crate::exchange::Exchange) -> (crate::exchange::InputConsumption, bool) {
+    let position = |matches: &dyn Fn(&crate::exchange::ExchangeNode) -> bool| {
+        exchange.node_list.iter().position(matches)
+    };
+    let row = position(&|node| {
+        matches!(node, crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.id == "steer-message")
+    })
+    .expect("steered input row");
+    let response = position(&|node| {
+        matches!(node, crate::exchange::ExchangeNode::TurnContent { .. })
+            && exchange.displays_node(node)
+    })
+    .expect("response node");
+    let crate::exchange::ExchangeNode::ExchangeInput { prompt } = &exchange.node_list[row] else {
+        unreachable!("position matched an input");
+    };
+    (prompt.consumption.clone(), row < response)
+}
+
+/// The echo publishes the consumed prompt once; acknowledgement alone publishes no prompt.
+#[tokio::test]
+async fn steering_consumption_publishes_its_prompt_once() -> Result<()> {
+    let (prompts, acknowledgements, exchange) =
+        steered_publications(ConsumptionReport::AfterAcknowledgement).await?;
+    assert_eq!(acknowledgements, 1);
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_eq!(prompts[0].id, "steer-message");
+    assert!(prompts[0].consumption.is_consumed());
+    assert_eq!(
+        steered_row(&exchange),
+        (crate::exchange::InputConsumption::Consumed, true)
+    );
+    Ok(())
+}
+
+/// A report that precedes acknowledgement publishes the prompt when acknowledgement adopts it.
+#[tokio::test]
+async fn early_consumption_publishes_its_prompt_at_acknowledgement() -> Result<()> {
+    let (prompts, _, exchange) =
+        steered_publications(ConsumptionReport::BeforeAcknowledgement).await?;
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(prompts[0].consumption.is_consumed());
+    assert_eq!(
+        steered_row(&exchange),
+        (crate::exchange::InputConsumption::Consumed, true)
+    );
+    Ok(())
+}
+
+/// Terminal coverage without a report settles the input unconfirmed and publishes no prompt.
+#[tokio::test]
+async fn covered_steering_without_report_settles_unconfirmed() -> Result<()> {
+    let (prompts, acknowledgements, exchange) =
+        steered_publications(ConsumptionReport::Never).await?;
+    assert_eq!(acknowledgements, 1);
+    assert!(prompts.is_empty(), "{prompts:?}");
+    assert_eq!(
+        steered_row(&exchange).0,
+        crate::exchange::InputConsumption::Unconfirmed
+    );
+    Ok(())
+}

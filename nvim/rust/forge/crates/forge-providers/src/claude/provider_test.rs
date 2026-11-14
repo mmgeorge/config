@@ -1294,3 +1294,322 @@ async fn a_conversation_that_ran_a_turn_is_never_started_again() {
     );
     provider.shutdown(operation_context()).await.unwrap();
 }
+
+/// Produces one user frame's replies from every input uuid written so far.
+type ScriptedReply = fn(&[Value]) -> Vec<Value>;
+
+/// Answer the nth user frame with `script[n]`, given every input uuid written so far, and end an
+/// interrupted turn the way the CLI does.
+fn scripted_peer(script: Vec<ScriptedReply>) -> Arc<PeerLauncher> {
+    let script = Arc::new(script);
+    PeerLauncher::new(move || {
+        let script = script.clone();
+        let mut uuids = Vec::new();
+        Box::new(move |frame| {
+            if frame["request"]["subtype"] == "interrupt" {
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    result_interrupted(),
+                ]);
+            }
+            uuids.push(user_uuid(frame)?);
+            Some(
+                script
+                    .get(uuids.len() - 1)
+                    .map_or_else(Vec::new, |step| step(&uuids)),
+            )
+        })
+    })
+}
+
+/// Steer under a journaled receipt, the delivery whose consumption Harness waits for.
+fn journaled_steering(
+    scope: forge_provider_api::InvocationScope,
+    text: &str,
+    id: &str,
+) -> forge_provider_api::session::SteeringRequest {
+    forge_provider_api::session::SteeringRequest {
+        delivery: forge_provider_api::session::SteeringDelivery::Journaled {
+            receipt: receipt(id),
+        },
+        ..steering_request(scope, text)
+    }
+}
+
+/// Summarize events as streamed text and consumed user inputs, in arrival order.
+fn consumption_trace(events: &[forge_provider_api::ProviderEvent]) -> Vec<String> {
+    use forge_provider_api::message::{ItemCompletion, ItemEvent, ItemStart, MessageItemEvent};
+    events
+        .iter()
+        .filter_map(|event| match event {
+            forge_provider_api::ProviderEvent::Item { event, .. } => match event {
+                ItemEvent::Started(ItemStart::UserMessage(start)) => Some(format!(
+                    "user {} {}",
+                    start.text,
+                    start
+                        .submission_id
+                        .as_ref()
+                        .map_or("-", SubmissionId::as_str)
+                )),
+                ItemEvent::Completed(ItemCompletion::UserMessage(_)) => Some("user done".into()),
+                ItemEvent::Started(ItemStart::AgentMessage(start)) if !start.text.is_empty() => {
+                    Some(start.text.clone())
+                }
+                ItemEvent::Message {
+                    event: MessageItemEvent::Delta(text),
+                } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+async fn start_prompt(
+    provider: &ClaudeProvider,
+    binding: &forge_provider_api::BindingId,
+    turn: &str,
+) -> forge_provider_api::InvocationScope {
+    let request = prompt_request(
+        binding,
+        turn,
+        receipt(turn),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    provider
+        .turn_start(operation_context(), binding, request)
+        .await
+        .unwrap();
+    scope
+}
+
+/// Steering folded into the running CLI turn reports consumption when the CLI starts it, which
+/// the pinned 2.1.317 CLI does after the tool result and before the model request that reads it.
+#[tokio::test]
+async fn folded_steer_reports_consumption_at_its_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = scripted_peer(vec![
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[0], "queued"),
+                lifecycle(&uuids[0], "started"),
+            ];
+            frames.extend(text_message("msg-1", &["first"]));
+            frames
+        },
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[1], "queued"),
+                lifecycle(&uuids[1], "started"),
+            ];
+            frames.extend(text_message("msg-2", &[" second"]));
+            frames.extend([
+                lifecycle(&uuids[1], "completed"),
+                lifecycle(&uuids[0], "completed"),
+                result_success(),
+            ]);
+            frames
+        },
+    ]);
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let scope = start_prompt(&provider, &binding, "turn-1").await;
+    until_message(&mut opened.events).await;
+    provider
+        .turn_steer(
+            operation_context(),
+            &binding,
+            journaled_steering(scope, "more", "steer"),
+        )
+        .await
+        .unwrap();
+    let (events, _) = until_completed(&mut opened.events).await;
+    assert_eq!(
+        consumption_trace(&events),
+        ["user more steer", "user done", " second"]
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A steer queued across the CLI's result starts a follow-up CLI turn inside the same Forge turn,
+/// and its consumption report precedes that turn's output.
+#[tokio::test]
+async fn deferred_steer_reports_consumption_before_the_follow_up_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = scripted_peer(vec![
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[0], "queued"),
+                lifecycle(&uuids[0], "started"),
+            ];
+            frames.extend(text_message("msg-1", &["first"]));
+            frames
+        },
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[1], "queued"),
+                lifecycle(&uuids[0], "completed"),
+                result_success(),
+                lifecycle(&uuids[1], "started"),
+            ];
+            frames.extend(text_message("msg-2", &[" second"]));
+            frames.extend([lifecycle(&uuids[1], "completed"), result_success()]);
+            frames
+        },
+    ]);
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let scope = start_prompt(&provider, &binding, "turn-1").await;
+    until_message(&mut opened.events).await;
+    provider
+        .turn_steer(
+            operation_context(),
+            &binding,
+            journaled_steering(scope, "more", "steer"),
+        )
+        .await
+        .unwrap();
+    let (events, completed) = until_completed(&mut opened.events).await;
+    assert_eq!(
+        consumption_trace(&events),
+        ["user more steer", "user done", " second"]
+    );
+    assert!(matches!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
+    ));
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Only a journaled steer the CLI starts reports consumption, and only once: the prompt, context
+/// input, a cancelled steer, and a steer that completes without starting report nothing.
+#[tokio::test]
+async fn only_started_journaled_steers_report_consumption() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = scripted_peer(vec![
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[0], "queued"),
+                lifecycle(&uuids[0], "started"),
+            ];
+            frames.extend(text_message("msg-1", &["first"]));
+            frames
+        },
+        |uuids| {
+            vec![
+                lifecycle(&uuids[1], "queued"),
+                lifecycle(&uuids[1], "started"),
+            ]
+        },
+        |uuids| {
+            vec![
+                lifecycle(&uuids[2], "queued"),
+                lifecycle(&uuids[2], "cancelled"),
+            ]
+        },
+        |uuids| {
+            vec![
+                lifecycle(&uuids[3], "queued"),
+                lifecycle(&uuids[3], "completed"),
+            ]
+        },
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[4], "queued"),
+                lifecycle(&uuids[4], "started"),
+                lifecycle(&uuids[4], "started"),
+            ];
+            frames.extend(text_message("msg-2", &[" second"]));
+            frames.extend([
+                lifecycle(&uuids[1], "completed"),
+                lifecycle(&uuids[4], "completed"),
+                lifecycle(&uuids[0], "completed"),
+                result_success(),
+            ]);
+            frames
+        },
+    ]);
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let scope = start_prompt(&provider, &binding, "turn-1").await;
+    until_message(&mut opened.events).await;
+    for request in [
+        steering_request(scope.clone(), "context"),
+        journaled_steering(scope.clone(), "cancelled", "cancelled"),
+        journaled_steering(scope.clone(), "skipped", "skipped"),
+        journaled_steering(scope, "twice", "twice"),
+    ] {
+        provider
+            .turn_steer(operation_context(), &binding, request)
+            .await
+            .unwrap();
+    }
+    let (events, _) = until_completed(&mut opened.events).await;
+    assert_eq!(
+        consumption_trace(&events),
+        ["user twice twice", "user done", " second"]
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A steer its interrupted invocation never started cannot report into the next invocation.
+#[tokio::test]
+async fn stale_steer_start_reports_nothing_to_a_successor() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = scripted_peer(vec![
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[0], "queued"),
+                lifecycle(&uuids[0], "started"),
+            ];
+            frames.extend(text_message("msg-1", &["partial"]));
+            frames
+        },
+        |uuids| vec![lifecycle(&uuids[1], "queued")],
+        |uuids| {
+            let mut frames = vec![
+                lifecycle(&uuids[1], "started"),
+                lifecycle(&uuids[2], "queued"),
+                lifecycle(&uuids[2], "started"),
+            ];
+            frames.extend(text_message("msg-3", &["next"]));
+            frames.extend([lifecycle(&uuids[2], "completed"), result_success()]);
+            frames
+        },
+    ]);
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let scope = start_prompt(&provider, &binding, "turn-1").await;
+    until_message(&mut opened.events).await;
+    provider
+        .turn_steer(
+            operation_context(),
+            &binding,
+            journaled_steering(scope.clone(), "late", "late"),
+        )
+        .await
+        .unwrap();
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    let (first, completed) = until_completed(&mut opened.events).await;
+    assert_eq!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Interrupted
+    );
+    assert!(
+        consumption_trace(&first)
+            .iter()
+            .all(|entry| !entry.starts_with("user"))
+    );
+    start_prompt(&provider, &binding, "turn-2").await;
+    let (second, _) = until_completed(&mut opened.events).await;
+    assert_eq!(consumption_trace(&second), ["next"]);
+    provider.shutdown(operation_context()).await.unwrap();
+}

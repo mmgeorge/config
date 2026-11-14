@@ -504,7 +504,7 @@ pub struct SessionUpdateSink(tokio::sync::mpsc::Sender<SessionPublication>);
 pub struct SessionUpdateStream(tokio::sync::mpsc::Receiver<SessionPublication>);
 
 enum SessionPublication {
-    Update(SessionUpdate),
+    Update(Box<SessionUpdate>),
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -516,7 +516,7 @@ pub fn channel() -> (SessionUpdateSink, SessionUpdateStream) {
 impl SessionUpdateSink {
     pub async fn send_wait(&self, update: SessionUpdate) -> Result<(), std::io::Error> {
         self.0
-            .send(SessionPublication::Update(update))
+            .send(SessionPublication::Update(Box::new(update)))
             .await
             .map_err(|_| {
                 std::io::Error::new(
@@ -565,7 +565,7 @@ impl SessionUpdateStream {
     pub async fn recv(&mut self) -> Result<Option<SessionUpdate>, std::io::Error> {
         loop {
             match self.0.recv().await {
-                Some(SessionPublication::Update(update)) => return Ok(Some(update)),
+                Some(SessionPublication::Update(update)) => return Ok(Some(*update)),
                 Some(SessionPublication::Flush(reply)) => {
                     let _ = reply.send(());
                 }
@@ -577,7 +577,7 @@ impl SessionUpdateStream {
     pub fn try_recv(&mut self) -> Result<SessionUpdate, std::io::Error> {
         loop {
             match self.0.try_recv() {
-                Ok(SessionPublication::Update(update)) => return Ok(update),
+                Ok(SessionPublication::Update(update)) => return Ok(*update),
                 Ok(SessionPublication::Flush(reply)) => {
                     let _ = reply.send(());
                 }

@@ -1481,6 +1481,7 @@ pub(crate) mod test {
             metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             checklist: None,
+            closed_input_consumption: Vec::new(),
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Running {
@@ -1542,5 +1543,94 @@ pub(crate) mod test {
             serde_json::to_value(store.list_exchange("session").unwrap()).unwrap(),
             snapshot
         );
+    }
+
+    /// No provider survives recovery, so every detached branch settles waiting steering, and a
+    /// late acknowledgement of a retained finalizing exchange cannot wait again.
+    #[test]
+    fn recovery_settles_steering_awaiting_consumption() {
+        use crate::exchange::{ExchangeOutcome, ExchangeState, InputConsumption, InputIntent};
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
+        store.save_session(&session("session", "D:/work")).unwrap();
+        store.save_agent_run(&Agent::primary("session", 0)).unwrap();
+        let steered = |id: &str, ordinal: u64| {
+            let mut exchange = running_exchange(id);
+            exchange.ordinal = ordinal;
+            let address = crate::turn::test_support::address(&exchange, "turn");
+            exchange.start_turn(address.clone(), 30).unwrap();
+            exchange
+                .append_acknowledged_input(
+                    &address.scope,
+                    Some(format!("{id}:steer")),
+                    Some(
+                        forge_provider_api::SubmissionId::try_from(format!("{id}:submission"))
+                            .unwrap(),
+                    ),
+                    InputIntent::Steering,
+                    "prefer the short form".into(),
+                    40,
+                )
+                .unwrap();
+            (exchange, address)
+        };
+        let (running, _) = steered("running", 1);
+        store.save_exchange(&running).unwrap();
+        let (mut finalizing, _) = steered("finalizing", 2);
+        finalizing
+            .begin_finalization(ExchangeOutcome::Complete, 50)
+            .unwrap();
+        store.save_exchange(&finalizing).unwrap();
+        let (mut settled_turn, settled_address) = steered("settled-turn", 3);
+        settled_turn
+            .settle_running_turns(ExchangeOutcome::Interrupted, 45)
+            .unwrap();
+        settled_turn
+            .begin_finalization(ExchangeOutcome::Interrupted, 50)
+            .unwrap();
+        store.save_exchange(&settled_turn).unwrap();
+        let (mut parked, _) = steered("parked", 4);
+        parked
+            .settle_running_turns(ExchangeOutcome::Interrupted, 45)
+            .unwrap();
+        parked.set_awaiting_input(true);
+        parked.pause(46);
+        store.save_exchange(&parked).unwrap();
+
+        store.interrupt_detached_execution("session").unwrap();
+        let recovered = store.list_exchange("session").unwrap();
+        let state = |id: &str| {
+            recovered
+                .iter()
+                .find(|exchange| exchange.id == id)
+                .map(|exchange| exchange.state())
+                .unwrap()
+        };
+        assert_eq!(state("running"), ExchangeState::Interrupted);
+        assert_eq!(state("finalizing"), ExchangeState::Finalizing);
+        assert_eq!(state("settled-turn"), ExchangeState::Finalizing);
+        assert_eq!(state("parked"), ExchangeState::Running);
+        for exchange in &recovered {
+            assert_eq!(exchange.awaiting_inputs().count(), 0, "{}", exchange.id);
+            assert!(exchange.node_list.iter().any(|node| matches!(node,
+                crate::exchange::ExchangeNode::ExchangeInput { prompt }
+                    if prompt.consumption == InputConsumption::Unconfirmed)));
+        }
+
+        let mut late = recovered
+            .into_iter()
+            .find(|exchange| exchange.id == "settled-turn")
+            .unwrap();
+        let prompt = late
+            .append_acknowledged_input(
+                &settled_address.scope,
+                Some("late".into()),
+                Some(forge_provider_api::SubmissionId::try_from("late".to_owned()).unwrap()),
+                InputIntent::Steering,
+                "accepted while detached".into(),
+                60,
+            )
+            .unwrap();
+        assert_eq!(prompt.consumption, InputConsumption::Unconfirmed);
     }
 }

@@ -65,6 +65,9 @@ function M.setup()
   vim.api.nvim_set_hl(0, "ForgeHarnessSessionName", { fg = "#c0c0c0", italic = true })
   vim.api.nvim_set_hl(0, "ForgeLoading", { fg = "#666666" })
   vim.api.nvim_set_hl(0, "ForgeHarnessPrompt", { fg = palette.light_blue, bold = true })
+  -- Steering the provider never reported reading keeps prompt styling, but its distinct marker
+  -- capture keeps response reveal from anchoring on it.
+  vim.api.nvim_set_hl(0, "ForgeHarnessUnconfirmedPrompt", { link = "ForgeHarnessPrompt" })
   vim.api.nvim_set_hl(0, "ForgeHarnessThought", { fg = palette.white, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessThinking", { fg = palette.white, bold = true })
   vim.api.nvim_set_hl(0, "ForgeTimelineStatus", { fg = palette.white })

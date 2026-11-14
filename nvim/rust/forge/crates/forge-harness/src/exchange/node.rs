@@ -156,6 +156,45 @@ pub struct ExchangeInput {
     /// The provider submission that delivered this input, which its native echo carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_id: Option<forge_provider_api::SubmissionId>,
+    /// What the provider has reported about this input joining its running turn.
+    #[serde(default, skip_serializing_if = "InputConsumption::is_consumed")]
+    pub consumption: InputConsumption,
+}
+
+impl ExchangeInput {
+    /// Report whether this input waits in the status area for its provider's consumption report.
+    pub fn is_awaiting_consumption(&self) -> bool {
+        matches!(
+            self.consumption,
+            InputConsumption::AwaitingConsumption { .. }
+        )
+    }
+}
+
+/// Distinguishes acknowledged provider steering from steering the model has received.
+///
+/// A provider acknowledges steering when it owns the message, which can precede the model call
+/// that reads it by the remainder of the current call. Only positive evidence that the input
+/// joined processing, such as its native user item, establishes consumption; acceptance and a
+/// turn's covered inputs do not.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputConsumption {
+    /// The provider reported the input inside its turn, or the input needed no report.
+    #[default]
+    Consumed,
+    /// The provider acknowledged receipt under this invocation and has not reported consumption.
+    AwaitingConsumption {
+        invocation: forge_provider_api::InvocationScope,
+    },
+    /// The exchange settled, or its provider can no longer report, without a consumption report.
+    Unconfirmed,
+}
+
+impl InputConsumption {
+    pub fn is_consumed(&self) -> bool {
+        matches!(self, Self::Consumed)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

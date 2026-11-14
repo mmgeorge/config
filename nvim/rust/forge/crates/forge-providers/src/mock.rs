@@ -2834,6 +2834,38 @@ async fn run_prompt_inner(
         }
         return Err(error);
     }
+    // The response begins here, so this is where the mock consumes queued steering. Each
+    // journaled input reports its consumption as a native user item carrying its submission,
+    // the same evidence real providers publish, before any output that could use it.
+    for input in &steering {
+        let Some(submission) = input.submission.clone() else {
+            continue;
+        };
+        let item_id =
+            ItemId::new(uuid::Uuid::new_v4().to_string()).expect("allocated item ID is nonempty");
+        sink.send_wait(AdapterActivity::Item {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            item_id: item_id.clone(),
+            event: ItemEvent::Started(ItemStart::UserMessage(
+                forge_provider_api::UserMessageStart {
+                    text: input.text.clone(),
+                    submission_id: Some(submission),
+                },
+            )),
+        })
+        .await?;
+        sink.send_wait(AdapterActivity::Item {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            item_id,
+            event: ItemEvent::Completed(ItemCompletion::UserMessage(MessageCompletion {
+                text: input.text.clone(),
+                outcome: MessageOutcome::Completed,
+            })),
+        })
+        .await?;
+    }
 
     let unscripted = script.is_none();
     let script = match script {

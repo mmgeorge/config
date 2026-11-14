@@ -49,12 +49,6 @@ function M.open(options, callback)
   local queued, active = {}, false
   local flush_staging
   local flush_diff
-  local staging_reveal, staging_revealed
-  local function cancel_staging_reveal()
-    local pending = staging_reveal
-    staging_reveal = nil
-    if pending then pending.timer:stop() pending.timer:close() end
-  end
   local function fail(message)
     if startup then startup.finish("failed", { error = tostring(message) }) end
     local previous = owner.failure
@@ -337,7 +331,7 @@ function M.open(options, callback)
   owner.views[options.transcript_window] = owner.view
   flush_staging = function()
     if not alive() or not owner.ready or owner.failure or owner.selecting or owner.applying
-      or staging_reveal or owner.staging_inflight or vim.deep_equal(owner.staging, owner.applied_staging) then return end
+      or owner.staging_inflight or vim.deep_equal(owner.staging, owner.applied_staging) then return end
     local pending = vim.deepcopy(owner.staging)
     owner.staging_inflight = true
     owner.staging_sequence = (owner.staging_sequence or 0) + 1
@@ -368,25 +362,10 @@ function M.open(options, callback)
       staged.steering[#staged.steering + 1] = entry.id
         and { id = entry.id, text = entry.text, failed = entry.failed == true } or entry.text or ""
     end
+    -- Staged steering publishes at once: the host keeps an acknowledged message in the same status
+    -- section until its provider reports consumption, so the message has one visible place
+    -- from submission onward.
     owner.staging = staged
-    local immediate = #staged.queue > 0 or #staged.steering == 0
-    for _, entry in ipairs(staged.steering) do
-      if type(entry) == "table" and entry.failed then immediate = true end
-    end
-    if immediate then
-      cancel_staging_reveal()
-      staging_revealed = #staged.queue > 0 or #staged.steering > 0
-    elseif not staging_revealed and not staging_reveal then
-      local pending = {}
-      staging_reveal = pending
-      pending.timer = vim.defer_fn(function()
-        if staging_reveal ~= pending then return end
-        staging_reveal = nil
-        if not alive() then return end
-        staging_revealed = true
-        flush_staging()
-      end, 100)
-    end
     flush_staging()
   end
 
@@ -1083,7 +1062,6 @@ function M.open(options, callback)
   function owner.close(close_options)
     if owner.closed then return true end
     if startup then startup.finish("closed_before_redraw") end
-    cancel_staging_reveal()
     local collected = owner.host_generation ~= client.host_get_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
     owner.closed = true

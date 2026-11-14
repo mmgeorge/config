@@ -607,25 +607,7 @@ T["presentation"] = function()
   composer = buffer.scratch()
   window = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(window, transcript)
-  local staged_request, reveal_timer = {}, {}
-  local elapsed = 0
-  vim.defer_fn = function(callback, delay)
-    if delay ~= 100 then return original_defer(callback, delay) end
-    local timer = { callback = callback, deadline = elapsed + delay }
-    function timer:stop() self.stopped = true end
-    function timer:close() self.closed = true end
-    reveal_timer[#reveal_timer + 1] = timer
-    return timer
-  end
-  local function advance(milliseconds)
-    elapsed = elapsed + milliseconds
-    for _, timer in ipairs(reveal_timer) do
-      if not timer.stopped and not timer.closed and timer.deadline <= elapsed then
-        timer:close()
-        timer.callback()
-      end
-    end
-  end
+  local staged_request = {}
   owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
     transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
     is_alive = function() return true end, read_only = true,
@@ -641,47 +623,23 @@ T["presentation"] = function()
   owner.sync = function() end
   local first = { id = "first", text = "first direction" }
   local second = { id = "second", text = "second direction" }
+  -- The host keeps acknowledged steering in its status section until consumption, so the editor
+  -- publishes staged steering at once instead of delaying it behind a reveal timer.
   owner.set_staging({}, { first })
-  advance(99)
-  assert(#staged_request == 0, "hidden steering was published before its reveal deadline")
-  owner.set_staging({}, {})
-  local cancelled = reveal_timer[1]
-  assert(cancelled.stopped and cancelled.closed, "accepted steering retained its reveal timer")
-  owner.set_staging({}, { second })
-  cancelled.callback()
-  advance(1)
-  assert(#staged_request == 0, "stale reveal published a newer steering message early")
+  assert(#staged_request == 1 and staged_request[1].steering[1].id == first.id,
+    "new steering was not published immediately")
   owner.set_staging({}, { second, first })
-  assert(#reveal_timer == 2, "steering updates postponed the original reveal deadline")
-  advance(99)
-  assert(#staged_request == 1 and #staged_request[1].steering == 2,
-    "reveal did not publish the latest steering messages at 100 ms")
-  owner.set_staging({}, { first })
-  assert(#staged_request == 2 and staged_request[2].steering[1].id == first.id,
-    "visible steering updates acquired another delay")
-  owner.set_staging({}, {})
-  assert(#staged_request == 3 and #staged_request[3].steering == 0,
-    "accepted visible steering was not removed immediately")
-  owner.set_staging({}, { second })
-  local before_queue = reveal_timer[#reveal_timer]
-  owner.set_staging({ first }, { second })
-  assert(#staged_request == 4 and before_queue.stopped,
-    "explicit queue did not reveal immediately and cancel the steering delay")
-  owner.set_staging({}, {})
-  owner.set_staging({}, { first })
-  local before_failure = reveal_timer[#reveal_timer]
+  assert(#staged_request == 2 and #staged_request[2].steering == 2, "a steering update was delayed")
+  owner.set_staging({}, { second, first })
+  assert(#staged_request == 2, "unchanged staging was published again")
   owner.set_staging({}, { { id = first.id, text = "failed direction", failed = true } })
-  assert(#staged_request == 6 and staged_request[6].steering[1].failed and before_failure.stopped,
-    "failure was hidden behind the steering delay")
-  owner.set_staging({}, {})
-  owner.set_staging({}, { second })
-  local before_close = reveal_timer[#reveal_timer]
+  assert(#staged_request == 3 and staged_request[3].steering[1].failed, "a steering failure was delayed")
+  owner.set_staging({ first }, {})
+  assert(#staged_request == 4 and #staged_request[4].steering == 0 and #staged_request[4].queue == 1,
+    "accepted steering was not removed with the queue update")
   assert(owner.close())
-  assert(before_close.stopped and before_close.closed, "closing retained the steering reveal timer")
-  before_close.callback()
-  owner.set_staging({}, { first })
-  advance(100)
-  assert(#staged_request == 7, "closed presentation published delayed steering")
+  owner.set_staging({}, { second })
+  assert(#staged_request == 4, "closed presentation published steering")
 end
 
 T["publication"] = function()

@@ -103,6 +103,20 @@ struct TurnDecoder {
     last_result: Option<ResultFrame>,
 }
 
+/// A journaled steering input written to the CLI that has not yet joined processing.
+///
+/// The CLI reports `command_lifecycle started` for the input's frame `uuid` when it adds the
+/// input to the next model request, both when the input folds into the running CLI turn after a
+/// tool result and when it starts a follow-up CLI turn. That report is the input's consumption
+/// evidence, which the adapter publishes as a native user item carrying `submission_id`.
+#[derive(Clone)]
+struct RecordedSteering {
+    submission_id: SubmissionId,
+    /// The invocation that steered, which the report must still address.
+    scope: InvocationScope,
+    text: String,
+}
+
 /// Session catalog learned from `initialize` and `system/init`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SessionCatalog {
@@ -127,6 +141,8 @@ pub(crate) struct ClaudeSessionState {
     host_tools: std::sync::Mutex<Vec<control::ControlToolDefinition>>,
     decoder: Mutex<TurnDecoder>,
     commands: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<CommandState>>>,
+    /// Journaled steering by frame `uuid`, held until the CLI starts, cancels, or loses it.
+    steering: std::sync::Mutex<HashMap<String, RecordedSteering>>,
     turn_end: std::sync::Mutex<Option<oneshot::Sender<Result<TurnEnd, ProviderError>>>>,
     output: Mutex<completion::ProviderCompletion>,
     catalog: RwLock<SessionCatalog>,
@@ -151,6 +167,7 @@ impl ClaudeSessionState {
             host_tools: std::sync::Mutex::new(Vec::new()),
             decoder: Mutex::new(TurnDecoder::default()),
             commands: std::sync::Mutex::new(HashMap::new()),
+            steering: std::sync::Mutex::new(HashMap::new()),
             turn_end: std::sync::Mutex::new(None),
             output: Mutex::new(completion::ProviderCompletion::default()),
             catalog: RwLock::new(SessionCatalog::default()),
@@ -214,6 +231,7 @@ impl ClaudeSessionState {
     /// Revoke a failed native binding without waiting on the callback currently reporting it.
     pub(crate) async fn invalidate_binding(&self, cause: ProviderError) {
         self.close_admission();
+        self.recorded_steering().clear();
         self.retain_failure(cause.clone()).await;
         self.revoke_authority().await;
         self.end_turn(Err(cause.clone()));
@@ -349,9 +367,73 @@ impl ClaudeSessionState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(uuid);
+        self.recorded_steering().remove(uuid);
         if let Some(active) = self.active.write().await.as_mut() {
             active.commands.retain(|command| command != uuid);
         }
+    }
+
+    /// Retain a journaled steering input before its frame is written, so the CLI's `started`
+    /// report for `uuid` can publish its consumption under the steering invocation.
+    pub(crate) fn record_steering(
+        &self,
+        uuid: &str,
+        submission_id: SubmissionId,
+        scope: InvocationScope,
+        text: String,
+    ) {
+        self.recorded_steering().insert(
+            uuid.to_owned(),
+            RecordedSteering {
+                submission_id,
+                scope,
+                text,
+            },
+        );
+    }
+
+    fn recorded_steering(&self) -> std::sync::MutexGuard<'_, HashMap<String, RecordedSteering>> {
+        self.steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Publish a started steering input's consumption on its original turn.
+    ///
+    /// The report addresses the active turn only while that turn still belongs to the steering
+    /// invocation; evidence for a retired invocation is dropped rather than attached to its
+    /// successor.
+    async fn publish_consumed_steering(
+        &self,
+        steering: RecordedSteering,
+    ) -> Result<(), ProviderError> {
+        let Some(address) = self
+            .active_address()
+            .await
+            .filter(|address| address.scope == steering.scope)
+        else {
+            return Ok(());
+        };
+        let item_id = ItemId::new(format!("steering:{}", steering.submission_id.as_str()))
+            .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
+        self.emit(item(
+            &address,
+            &item_id,
+            ItemEvent::Started(ItemStart::UserMessage(UserMessageStart {
+                text: steering.text.clone(),
+                submission_id: Some(steering.submission_id),
+            })),
+        ))
+        .await?;
+        self.emit(item(
+            &address,
+            &item_id,
+            ItemEvent::Completed(ItemCompletion::UserMessage(MessageCompletion {
+                text: steering.text,
+                outcome: MessageOutcome::Completed,
+            })),
+        ))
+        .await
     }
 
     /// Mark the active turn as interrupted so its next result ends it even with queued input.
@@ -424,6 +506,9 @@ impl ClaudeSessionState {
         let Some(active) = self.active.read().await.clone() else {
             return Ok(());
         };
+        // Steering the retiring invocation never started has no turn left to report into.
+        self.recorded_steering()
+            .retain(|_, steering| steering.scope != active.address.scope);
         let completed = matches!(outcome, turn::TurnOutcome::Completed { .. });
         let mut events = Vec::new();
         {
@@ -518,7 +603,10 @@ impl ClaudeSessionState {
     /// turn running nor an input left to start one, the cancellation is the last frame the CLI
     /// sends for it, so the cancellation ends the turn as interrupted. Waiting for a `result`
     /// instead runs out the interrupt grace period and invalidates a healthy binding.
-    async fn command_lifecycle(&self, lifecycle: CommandLifecycleFrame) {
+    async fn command_lifecycle(
+        &self,
+        lifecycle: CommandLifecycleFrame,
+    ) -> Result<(), ProviderError> {
         {
             let mut commands = self
                 .commands
@@ -534,11 +622,25 @@ impl ClaudeSessionState {
                 commands.remove(&lifecycle.command_uuid);
             }
         }
+        // `started` is the boundary where steering joins the next model request. A cancelled
+        // input, or one that completes without starting, never reached the model. The emission
+        // runs before this method takes the active write lock because `emit` reads that turn.
+        let steering = match lifecycle.state {
+            CommandState::Started | CommandState::Cancelled | CommandState::Completed => {
+                self.recorded_steering().remove(&lifecycle.command_uuid)
+            }
+            _ => None,
+        };
+        if lifecycle.state == CommandState::Started
+            && let Some(steering) = steering
+        {
+            self.publish_consumed_steering(steering).await?;
+        }
         if !matches!(
             lifecycle.state,
             CommandState::Started | CommandState::Cancelled
         ) {
-            return;
+            return Ok(());
         }
         let checkpoint = self.decoder.lock().await.checkpoint.clone();
         let mut active = self.active.write().await;
@@ -546,14 +648,14 @@ impl ClaudeSessionState {
             .as_mut()
             .filter(|active| active.commands.contains(&lifecycle.command_uuid))
         else {
-            return;
+            return Ok(());
         };
         if lifecycle.state == CommandState::Started {
             active.native_turn_running = true;
-            return;
+            return Ok(());
         }
         if active.native_turn_running || self.awaits_native_start(active) {
-            return;
+            return Ok(());
         }
         self.end_turn(Ok(TurnEnd {
             outcome: turn::TurnOutcome::Interrupted,
@@ -562,6 +664,7 @@ impl ClaudeSessionState {
             checkpoint,
             commands: active.commands.clone(),
         }));
+        Ok(())
     }
 
     /// Report whether the CLI still holds an input of this turn that it has not started.
@@ -807,10 +910,7 @@ impl ClaudeSessionState {
             }
             StdoutFrame::Result(result) => self.result(result).await,
             StdoutFrame::System(system) => self.system(system).await,
-            StdoutFrame::CommandLifecycle(lifecycle) => {
-                self.command_lifecycle(lifecycle).await;
-                Ok(())
-            }
+            StdoutFrame::CommandLifecycle(lifecycle) => self.command_lifecycle(lifecycle).await,
             StdoutFrame::Recognized { .. } => Ok(()),
             StdoutFrame::Unknown { kind, .. } => self.unsupported(&kind).await,
             StdoutFrame::ControlRequest(_)

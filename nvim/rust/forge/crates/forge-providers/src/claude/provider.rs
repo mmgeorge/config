@@ -1375,6 +1375,16 @@ impl ClaudeProvider {
                 return Err(cause);
             }
         };
+        // Context-only steering has no submission for Harness to match, so only journaled
+        // steering waits for the CLI's `started` report.
+        if let Some(submission_id) = &submission_id {
+            session.state.record_steering(
+                &uuid,
+                submission_id.clone(),
+                request.scope.clone(),
+                user_text(&request.input),
+            );
+        }
         let session_id = session.conversation.id().to_owned();
         let delivered = deliver_input(
             &session,

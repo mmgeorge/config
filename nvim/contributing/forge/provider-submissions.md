@@ -55,13 +55,27 @@ SDK 1.0.26 documents that cancelling after its writer commits a frame can lose t
 
 Claude Code runs as `claude -p` with stream-json input and output. Every user frame Forge writes carries a client-minted `uuid`, and the CLI answers each one with `command_lifecycle` frames (`queued`, `started`, `completed`) that echo it. `deliver_input` in `claude/provider.rs` commits `Sending` with a token naming the session, the input `uuid`, and the journal attempt before the write, and commits `Accepted` only after the CLI reports that `uuid` as queued or later; the write alone proves nothing. Reconciliation returns `Accepted` only for an exact previously accepted receipt and `Unknown` otherwise, because the CLI offers no read-only history query.
 
-Steering writes another user frame into the running process. The CLI either folds it into the current model turn, completing its command before the turn's `result`, or leaves it queued at that `result` and starts a follow-up CLI turn for it. `ClaudeSessionState` therefore ends a Forge turn at a `result` only when none of the turn's tracked commands is still queued or unseen. A steer that arrives after the turn end is decided fails with `PreparationFailed` and a rejected receipt, so Harness delivers it as a new prompt instead of losing it.
+Steering writes another user frame into the running process. The CLI either folds it into the current model turn, completing its command before the turn's `result`, or leaves it queued at that `result` and starts a follow-up CLI turn for it. Either way, the CLI reports the steer `started` when it joins the next model request, which is the consumption report described above. `ClaudeSessionState` therefore ends a Forge turn at a `result` only when none of the turn's tracked commands is still queued or unseen. A steer that arrives after the turn end is decided fails with `PreparationFailed` and a rejected receipt, so Harness delivers it as a new prompt instead of losing it.
 
 ### ACP
 
 Antigravity uses [ACP v1 prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn). The `session/prompt` response ends the turn, so it is not an early acceptance receipt, and v1 has no mandatory client-assigned ID to prove delivery. Forge commits the session ID and method as `Sending` immediately before the transport call. Startup and attachment failures leave input `Prepared`. Antigravity does not advertise steering.
 
 The [ACP v2 draft](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) makes `session/prompt` return when the message enters the conversation. Forge negotiates v1, and must not apply v2 semantics to a v1 connection.
+
+## Acceptance and consumption
+
+Acceptance proves that the provider owns an input, so the journal never replays it. It does not prove that the model read the input: a provider can hold steering until its current model call ends. Harness therefore keeps accepted steering in the status area as `AwaitingConsumption` until the adapter reports consumption, and the meaning of `Accepted` does not change. An adapter reports consumption by publishing a completed native user item whose `UserMessageStart::submission_id` is the steering submission, on the turn of the invocation that steered, at the point where the input joined processing and before any output that uses it.
+
+| Adapter | Consumption report |
+| --- | --- |
+| Codex | `userMessage` item whose `clientId` matches the `clientUserMessageId` sent on `turn/steer`. |
+| Copilot | Root `user.message` with the accepted `messageId`, published by `EventDecoder::consumed_input`. |
+| Claude Code stream-json | `command_lifecycle started` for the steering frame `uuid`, published by `ClaudeSessionState::command_lifecycle`. |
+| Mock | One user item per journaled steer when the held response begins. |
+| Antigravity ACP v1 | Not applicable; ACP steering is unsupported. |
+
+A covered input in a terminal result is not a consumption report, because coverage lists accepted attempts and a terminal result can describe interruption or failure. An exchange that settles without a report, and recovery that detaches the invocation, settle the input as `Unconfirmed`: its transcript row keeps the user's text with the label `Steering (not confirmed read)`, and its `Accepted` journal entry is never resent.
 
 ## Recovery before the next prompt
 
@@ -74,6 +88,8 @@ Failure to reconcile blocks dispatch and reports the last error, keeping both th
 Persist the opaque correlation token before the first possible write, and acknowledge only a successful native response. Implement `Provider::input_reconcile` with read-only, fully paginated history. Return `SubmissionEvidence::Accepted` only for a positively identified input, `NotAccepted` only when positive evidence proves that exact attempt cannot later be consumed, and `Unknown` otherwise. Never turn a timeout, an empty history page, or a message substring into a rejection.
 
 Render the turn with `PromptRequest::blocks` for the provider's channel and deliver it before the input in the same submission. With a developer-message channel, send `Blocks::lead` as one developer message, place `Blocks::user` at the start of the user message, and declare `ContextChannel::DeveloperMessage` in the provider's `ProviderIntegration::context_channel` so the open-time instructions describe it; otherwise place `PromptRequest::user_message_block` at the start of the user message. Send the user's own words from `TurnInput::user_input` unwrapped after the block, precede each recovered input with `RecoveredInput::block`, and render a steered input with `forge::input_block`. Never inspect other `TurnKind`s or write Harness text yourself; every element and instruction comes from `forge_provider_api::forge`. Return `InputAcceptance` only for a submission that carried its context, because Harness marks those sections delivered on acceptance and does not send them again ([Turn context](architecture/providers.md#turn-context)). Supply `SessionRequest::system_instructions` once, through the native system prompt or an open-time channel, and never repeat it on ordinary prompts unless the conversation may have lost it.
+
+A provider that supports steering must also publish the consumption report described in [Acceptance and consumption](#acceptance-and-consumption) at the boundary its own trace establishes; without one, every steer ends as an unconfirmed row.
 
 Test the write-before-acknowledge crash, acknowledgment commit failure, expired history, cancellation, attachments, and later queued input before enabling recovery.
 

@@ -42,6 +42,7 @@ pub(super) async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionControlle
         metrics: Default::default(),
         comment: Vec::new(),
         checklist: None,
+        closed_input_consumption: Vec::new(),
         question: crate::exchange::ExchangeQuestion::None,
         clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
     };

@@ -536,7 +536,13 @@ that ends without confirmation, Harness restarts the provider before it runs any
 else. Commands, including `Ctrl-C`, wait until the restart finishes. If the provider
 cannot restart, the session shows an error, later commands fail immediately, and the
 session must be reopened.
-Pending steering appears above queued follow-ups in the status split. Explicitly
+Pending steering appears above queued follow-ups in the status split, under
+"Steering active turn". A steered message stays there after the provider accepts it,
+until the provider reports that the message joined the running turn; it then moves
+into the transcript at that point, before the output that used it. If the exchange ends
+without that report, for example after an interruption, the message appears in the
+transcript as `Steering (not confirmed read)`. Harness never resends such a message,
+because the provider did accept it. Explicitly
 queued messages remain visible while execution is paused or idle. Direct submissions
 enter exchange history. The lower prompt buffer contains only the draft being edited.
 The prompt grows with visual wrapped rows up to its configured maximum height.

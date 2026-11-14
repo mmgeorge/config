@@ -704,6 +704,7 @@ pub(super) fn completed_interaction(
         metrics: crate::exchange::ExchangeMetrics::default(),
         comment: Vec::new(),
         checklist: None,
+        closed_input_consumption: Vec::new(),
 
         question: crate::exchange::ExchangeQuestion::None,
         clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 1 },

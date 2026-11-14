@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 /// Disposable-state contract shared by databases, journals, plans, and captured files.
-pub const VERSION: u32 = 49;
+pub const VERSION: u32 = 50;
 
 /// Pin one executable's state version until its final storage user releases it.
 #[derive(Clone)]

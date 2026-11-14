@@ -46,6 +46,12 @@ impl Exchange {
         nodes: &[&'source ExchangeNode],
         include_initial: bool,
     ) -> Result<ExchangeContentView<'source>> {
+        let nodes = nodes
+            .iter()
+            .copied()
+            .filter(|node| self.displays_node(node))
+            .collect::<Vec<_>>();
+        let nodes = nodes.as_slice();
         let visible: HashMap<_, _> = nodes
             .iter()
             .enumerate()

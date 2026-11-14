@@ -76,8 +76,8 @@ pub use checklist::{ChecklistItem, ChecklistSnapshot, ChecklistTracker};
 pub(crate) use lifecycle::{ExchangeClock, ExchangePhase, ExchangeQuestion};
 pub use metrics::ExchangeMetrics;
 pub use node::{
-    ActiveWait, ArtifactChange, DeclarationRevision, ExchangeInput, ExchangeNode, InputIntent,
-    PlanCommentResolution, QuestionInput, VerificationResult,
+    ActiveWait, ArtifactChange, DeclarationRevision, ExchangeInput, ExchangeNode, InputConsumption,
+    InputIntent, PlanCommentResolution, QuestionInput, VerificationResult,
 };
 pub use origin::{ExchangeOrigin, TaskStart};
 pub(crate) use record::ExchangeActivity;

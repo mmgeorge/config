@@ -84,6 +84,13 @@ impl SqliteStore {
                 )
             });
             let background_changed = exchange.interrupt_detached_background_tools(observed_at)?;
+            // No provider survives recovery, so no open exchange can still receive consumption
+            // evidence. Settling it here covers the branches that never reach `Exchange::finish`,
+            // including a finalizing exchange without a running turn.
+            let consumption_changed = matches!(
+                exchange.state(),
+                ExchangeState::Running | ExchangeState::Finalizing
+            ) && exchange.close_input_consumption();
             if (exchange.awaiting_input()
                 && !running_turn
                 && exchange.execution_started_at_ms().is_none())
@@ -93,7 +100,7 @@ impl SqliteStore {
                 )
                 || (exchange.state() == ExchangeState::Finalizing && !running_turn)
             {
-                if background_changed {
+                if background_changed || consumption_changed {
                     transaction.execute(
                         "UPDATE exchange_record SET payload=?2 WHERE id=?1",
                         params![exchange.id, serde_json::to_string(&exchange)?],

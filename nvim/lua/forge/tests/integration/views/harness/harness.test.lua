@@ -3279,4 +3279,98 @@ T["question_batch_reaches_provider_together"] = function()
   eq(host.stop(), true)
 end
 
+-- An acknowledged steer has reached the provider but not the model. MockProvider consumes
+-- steering only when its held response begins, so until then the message belongs in the
+-- "Steering active turn" status section, and the transcript row appears at consumption.
+T["steering_waits_for_consumption"] = function()
+  local workspace = temp.directory("steering-consumption")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  local client = host.start({ config = true }).client
+  local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
+  local session = require("forge.session")
+  local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local function transcript_text()
+    local current = session.harness
+    return current.transcript_buf and vim.api.nvim_buf_is_valid(current.transcript_buf)
+      and buffer.text(current.transcript_buf) or ""
+  end
+  local function status_text()
+    local status = session.harness.presentation and session.harness.presentation.status_view
+    return status and vim.api.nvim_buf_is_valid(status.buffer) and buffer.text(status.buffer) or ""
+  end
+  local wait_options = { timeout_ms = 1500, context = function()
+    return "transcript:\n" .. transcript_text() .. "\nstatus:\n" .. status_text()
+  end }
+  vim.fn.chdir(workspace)
+  require("forge").setup({ diff_logging = false, harness = { provider = "mock" } })
+  require("forge.views.harness").open()
+  local state = session.harness
+  MiniTest.finally(function()
+    pcall(require("forge.views.harness.workspace").release, session.harness)
+    if session.harness.presentation then pcall(session.harness.presentation.close) end
+  end)
+  wait_until(function()
+    return state.ready and state.session ~= nil and state.presentation and state.presentation.ready
+  end, "Harness did not start", wait_options)
+  local controller = require("forge.views.harness.controller")
+  local activity = require("forge.views.harness.activity")
+  local steer_text = "Prefer the shortest answer"
+  ---Report the acknowledged steer exactly once, in the status section, and not in the transcript.
+  local function waiting_in_status()
+    local status = status_text()
+    local section = status:find("Steering active turn", 1, true)
+    local _, occurrences = status:gsub(vim.pesc(steer_text), "")
+    return #session.harness.pending_steer == 0 and section ~= nil and occurrences == 1
+      and status:find(steer_text, section, true) ~= nil and not transcript_text():find(steer_text, 1, true)
+  end
+
+  local function mock_response(params)
+    local result, failure, done
+    client.request({ session_id = state.session.id, method = "session.provider.mock_response", params = params },
+      function(value, error) result, failure, done = value, error, true end)
+    wait_until(function() return done end, "mock " .. params.operation .. " did not finish", wait_options)
+    eq(failure, nil)
+    return result
+  end
+  -- The response starts at the hold, where the mock consumes steering, and the scripted barrier
+  -- then keeps the turn live so the consumed row is visible before the response exists.
+  mock_response({ operation = "script", script = { steps = {
+    { kind = "barrier", id = "after-consumption" },
+    { kind = "message", content = "response", text = "Short answer" },
+  }, terminal = "completed" } })
+  local hold = mock_provider.hold(state.session.id)
+  buffer.set(state.composer_buf, { "Start the task" })
+  controller.submit()
+  eq(hold:wait().prompt, "Start the task")
+  buffer.set(state.composer_buf, { steer_text })
+  controller.steer_submit()
+  wait_until(waiting_in_status, "acknowledged steering left the status section before consumption", wait_options)
+
+  -- Closing the panes and reopening the retained session keeps the steer waiting.
+  vim.cmd("aboveleft new")
+  vim.api.nvim_win_close(state.composer_win, true)
+  vim.api.nvim_win_close(state.transcript_win, true)
+  require("forge.views.harness").open()
+  wait_until(function()
+    local current = session.harness
+    return current.initial_snapshot_pending == nil and current.presentation and current.presentation.ready
+      and waiting_in_status()
+  end, "reopening lost the waiting steer", wait_options)
+
+  hold:release()
+  mock_response({ operation = "wait", id = "after-consumption" })
+  wait_until(function()
+    return transcript_text():find("Steering: " .. steer_text, 1, true) ~= nil
+      and not status_text():find("Steering active turn", 1, true)
+  end, "consumption did not move the steer from status into the transcript", wait_options)
+  assert(not transcript_text():find("Short answer", 1, true), "the response preceded its consumed steering")
+  mock_response({ operation = "release", id = "after-consumption" })
+  wait_until(function() return not activity.busy(session.harness) end, "the steered turn did not settle", wait_options)
+  assert(transcript_text():find("Short answer", 1, true), "the steered response did not render")
+  assert(not status_text():find("Steering active turn", 1, true),
+    "consumed steering returned to the status section:\n" .. status_text())
+  diagnostics:assert_none()
+  eq(host.stop(), true)
+end
+
 return T

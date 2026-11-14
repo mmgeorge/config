@@ -7,7 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug)]
 enum InputAppend {
     User,
-    Acknowledged,
+    /// The provider acknowledged receipt under this invocation.
+    Acknowledged(forge_provider_api::InvocationScope),
+}
+
+/// Reports the effect of one native observation on the exchange record.
+#[derive(Debug, Default)]
+pub(crate) struct ProviderObservation {
+    /// Whether the observation changed durable exchange state.
+    pub changed: bool,
+    /// The acknowledged input this observation first showed as consumed.
+    pub consumed_input: Option<ExchangeInput>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -162,6 +172,10 @@ pub struct Exchange {
     pub comment: Vec<ExchangeComment>,
     #[serde(default)]
     pub checklist: Option<ChecklistSnapshot>,
+    /// Invocations whose provider can no longer report input consumption, such as after recovery
+    /// detached them. An input acknowledged under one of them settles as unconfirmed at once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) closed_input_consumption: Vec<forge_provider_api::InvocationScope>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +251,8 @@ struct ExchangeRecord {
     pub comment: Vec<ExchangeComment>,
     #[serde(default)]
     pub checklist: Option<ChecklistSnapshot>,
+    #[serde(default)]
+    pub(crate) closed_input_consumption: Vec<forge_provider_api::InvocationScope>,
 }
 
 impl<'de> Deserialize<'de> for Exchange {
@@ -424,6 +440,7 @@ impl Exchange {
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
             checklist: None,
+            closed_input_consumption: Vec::new(),
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
@@ -483,6 +500,7 @@ impl Exchange {
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
             checklist: None,
+            closed_input_consumption: Vec::new(),
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
@@ -641,12 +659,28 @@ impl Exchange {
         event: &forge_provider_api::ProviderEvent,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
+        Ok(self
+            .observe_provider_evidence(scope, event, now_ms)?
+            .changed)
+    }
+
+    /// Reduce native evidence and report which acknowledged input it first showed as consumed.
+    pub(crate) fn observe_provider_evidence(
+        &mut self,
+        scope: &crate::provider::EventScope,
+        event: &forge_provider_api::ProviderEvent,
+        now_ms: i64,
+    ) -> anyhow::Result<ProviderObservation> {
         let mut candidate = self.clone();
-        let changed = candidate.reduce_provider_event(scope, event, now_ms)?;
+        let mut consumed_input = None;
+        let changed = candidate.reduce_provider_event(scope, event, now_ms, &mut consumed_input)?;
         if changed {
             *self = candidate;
         }
-        Ok(changed)
+        Ok(ProviderObservation {
+            changed,
+            consumed_input: consumed_input.filter(|_| changed),
+        })
     }
 
     fn reduce_provider_event(
@@ -654,6 +688,7 @@ impl Exchange {
         scope: &crate::provider::EventScope,
         event: &forge_provider_api::ProviderEvent,
         now_ms: i64,
+        consumed_input: &mut Option<ExchangeInput>,
     ) -> anyhow::Result<bool> {
         use forge_provider_api::{ItemEvent, ItemStart, ProviderEvent, TurnEvent};
         if !self.owns_scope(scope) {
@@ -838,7 +873,14 @@ impl Exchange {
                         // A provider may consume steering after acknowledgement, for example once
                         // its current model call ends, so the echo marks where the input applies.
                         if let Some(submission) = submission {
-                            self.move_input_to_tail(&submission);
+                            let anchor = ExchangeNode::TurnContent {
+                                id: format!("{turn_id}:content:{item_id}"),
+                                turn_id: turn_id.clone(),
+                                item: item.clone(),
+                            };
+                            if let Some(prompt) = self.consume_input(index, &submission, anchor) {
+                                *consumed_input = Some(prompt);
+                            }
                         }
                         continue;
                     }
@@ -1171,6 +1213,8 @@ impl Exchange {
             }
         }
         self.settle_tools(now_ms);
+        // The restarted provider cannot report what the interrupted invocation consumed.
+        self.close_input_consumption();
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
         Ok(())
@@ -1354,6 +1398,7 @@ impl Exchange {
         }
         self.settle_running_turns(outcome, now_ms)?;
         self.settle_tools(now_ms);
+        self.settle_input_consumption();
         self.pause(now_ms);
         self.metrics.settle(self.elapsed(now_ms));
         self.phase.complete(outcome, now_ms);
@@ -1425,10 +1470,13 @@ impl Exchange {
 
     /// Retain accepted native input while its original exchange is still settling.
     ///
-    /// The submission identifies the input's native echo, which moves the row to the point where
-    /// the provider consumed it when that differs from acknowledgement.
+    /// Acknowledgement proves only that the provider owns the input. Journaled steering therefore
+    /// waits as [`InputConsumption::AwaitingConsumption`] until its native echo reports the
+    /// position where the provider consumed it. An echo that arrived first left an ordering
+    /// anchor, which this acknowledgement replaces with a consumed row at that position.
     pub(crate) fn append_acknowledged_input(
         &mut self,
+        invocation: &forge_provider_api::InvocationScope,
         id: Option<String>,
         submission_id: Option<forge_provider_api::SubmissionId>,
         intent: InputIntent,
@@ -1436,7 +1484,7 @@ impl Exchange {
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
         self.record_input(
-            InputAppend::Acknowledged,
+            InputAppend::Acknowledged(invocation.clone()),
             id,
             submission_id,
             intent,
@@ -1459,17 +1507,20 @@ impl Exchange {
     ) -> anyhow::Result<ExchangeInput> {
         let accepts_input = match admission {
             InputAppend::User => self.state() == ExchangeState::Running,
-            InputAppend::Acknowledged => matches!(
+            InputAppend::Acknowledged(_) => matches!(
                 self.state(),
                 ExchangeState::Running | ExchangeState::Finalizing
             ),
         };
-        if let Some(id) = &id
-            && let Some(prompt) = self.node_list.iter().find_map(|node| match node {
-                ExchangeNode::ExchangeInput { prompt } if &prompt.id == id => Some(prompt),
-                _ => None,
-            })
-        {
+        if let Some(prompt) = self.node_list.iter().find_map(|node| match node {
+            ExchangeNode::ExchangeInput { prompt }
+                if id.as_ref() == Some(&prompt.id)
+                    || (submission_id.is_some() && prompt.submission_id == submission_id) =>
+            {
+                Some(prompt)
+            }
+            _ => None,
+        }) {
             return Ok(prompt.clone());
         }
         anyhow::ensure!(
@@ -1479,12 +1530,32 @@ impl Exchange {
             self.state(),
             question.is_some()
         );
-        for turn in self
-            .turn
-            .iter_mut()
-            .filter(|turn| turn.state() == crate::turn::TurnState::Running)
-        {
-            turn.close_message();
+        // Only journaled provider steering can report consumption; other input is part of the
+        // exchange as soon as Harness records it.
+        let steering = match (&admission, &submission_id) {
+            (InputAppend::Acknowledged(invocation), Some(submission))
+                if intent == InputIntent::Steering =>
+            {
+                Some((invocation, submission))
+            }
+            _ => None,
+        };
+        let anchor = steering
+            .and_then(|(invocation, submission)| self.consumption_anchor(invocation, submission));
+        let consumption = match steering {
+            None => InputConsumption::Consumed,
+            Some(_) if anchor.is_some() => InputConsumption::Consumed,
+            Some((invocation, _)) if self.closed_input_consumption.contains(invocation) => {
+                InputConsumption::Unconfirmed
+            }
+            Some((invocation, _)) => InputConsumption::AwaitingConsumption {
+                invocation: invocation.clone(),
+            },
+        };
+        // Steering joins the provider's message stream only at its consumption boundary, so
+        // acknowledgement leaves the current message open.
+        if steering.is_none() {
+            self.close_running_messages();
         }
 
         let prompt_ordinal = self
@@ -1500,24 +1571,162 @@ impl Exchange {
             text,
             created_at_ms: now_ms,
             submission_id,
+            consumption,
         };
-        self.node_list.push(ExchangeNode::ExchangeInput {
+        let node = ExchangeNode::ExchangeInput {
             prompt: prompt.clone(),
-        });
+        };
+        match anchor {
+            Some(position) => self.node_list[position] = node,
+            None => self.node_list.push(node),
+        }
         self.reconcile_entries()?;
         Ok(prompt)
     }
 
-    /// Move the acknowledged input a native echo identifies to the current timeline tail.
-    fn move_input_to_tail(&mut self, submission: &forge_provider_api::SubmissionId) {
-        let Some(position) = self.node_list.iter().position(|node| {
+    /// Find the ordering anchor a consumption report left before its acknowledgement arrived.
+    ///
+    /// The anchor must belong to a turn of the acknowledging invocation, so evidence from
+    /// another invocation never positions this input.
+    fn consumption_anchor(
+        &self,
+        invocation: &forge_provider_api::InvocationScope,
+        submission: &forge_provider_api::SubmissionId,
+    ) -> Option<usize> {
+        self.node_list.iter().position(|node| {
+            self.consumption_anchor_submission(node)
+                .is_some_and(|(scope, anchored)| scope == invocation && anchored == submission)
+        })
+    }
+
+    /// Identify a native user item retained only as a consumption anchor.
+    ///
+    /// A native echo of a Forge submission has no transcript row of its own: once acknowledged,
+    /// the input's `ExchangeInput` replaces it, and until then it only reserves a position.
+    pub(crate) fn consumption_anchor_submission(
+        &self,
+        node: &ExchangeNode,
+    ) -> Option<(
+        &forge_provider_api::InvocationScope,
+        &forge_provider_api::SubmissionId,
+    )> {
+        let ExchangeNode::TurnContent {
+            turn_id,
+            item: crate::turn::TurnItem::Message { id },
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let turn = self.turn.iter().find(|turn| turn.id() == turn_id)?;
+        let message = turn.messages().iter().find(|message| message.id() == id)?;
+        if message.kind() != crate::turn::MessageKind::User {
+            return None;
+        }
+        Some((&turn.provider().scope, message.submission_id()?))
+    }
+
+    /// Report whether the transcript shows this node at its exchange position.
+    ///
+    /// Steering awaiting consumption belongs to the status area, and a consumption anchor only
+    /// reserves the position that its input's row takes once acknowledged.
+    pub(crate) fn displays_node(&self, node: &ExchangeNode) -> bool {
+        match node {
+            ExchangeNode::ExchangeInput { prompt } => !prompt.is_awaiting_consumption(),
+            ExchangeNode::TurnContent { .. } => self.consumption_anchor_submission(node).is_none(),
+            _ => true,
+        }
+    }
+
+    /// Enumerate acknowledged steering that waits for its provider's consumption report.
+    pub(crate) fn awaiting_inputs(&self) -> impl Iterator<Item = &ExchangeInput> {
+        self.node_list.iter().filter_map(|node| match node {
+            ExchangeNode::ExchangeInput { prompt } if prompt.is_awaiting_consumption() => {
+                Some(prompt)
+            }
+            _ => None,
+        })
+    }
+
+    /// Apply one native consumption report for a journaled submission.
+    ///
+    /// An acknowledged input of the reporting invocation becomes consumed at the current tail,
+    /// which is where the provider reported including it. A report that precedes acknowledgement
+    /// retains `anchor` at the tail instead. Either first report closes the turn's current
+    /// message so later output follows the input. A repeated report, a report for an input that
+    /// already settled, and a report from another invocation change nothing.
+    fn consume_input(
+        &mut self,
+        turn_index: usize,
+        submission: &forge_provider_api::SubmissionId,
+        anchor: ExchangeNode,
+    ) -> Option<ExchangeInput> {
+        let invocation = self.turn[turn_index].provider().scope.clone();
+        if let Some(position) = self.node_list.iter().position(|node| {
             matches!(node, ExchangeNode::ExchangeInput { prompt }
                 if prompt.submission_id.as_ref() == Some(submission))
-        }) else {
-            return;
-        };
-        let node = self.node_list.remove(position);
-        self.node_list.push(node);
+        }) {
+            let ExchangeNode::ExchangeInput { prompt } = &mut self.node_list[position] else {
+                unreachable!("position matched an input node");
+            };
+            if !matches!(&prompt.consumption,
+                InputConsumption::AwaitingConsumption { invocation: owner } if *owner == invocation)
+            {
+                return None;
+            }
+            prompt.consumption = InputConsumption::Consumed;
+            let consumed = prompt.clone();
+            let node = self.node_list.remove(position);
+            self.node_list.push(node);
+            self.turn[turn_index].close_message();
+            return Some(consumed);
+        }
+        if self.node_list.iter().any(|node| {
+            self.consumption_anchor_submission(node)
+                .is_some_and(|(_, anchored)| anchored == submission)
+        }) {
+            return None;
+        }
+        self.node_list.push(anchor);
+        self.turn[turn_index].close_message();
+        None
+    }
+
+    /// Settle every input still awaiting consumption as unconfirmed.
+    ///
+    /// The submission journal keeps such input `Accepted`, so settlement never authorizes replay.
+    pub(crate) fn settle_input_consumption(&mut self) -> bool {
+        let mut changed = false;
+        for node in &mut self.node_list {
+            if let ExchangeNode::ExchangeInput { prompt } = node
+                && prompt.is_awaiting_consumption()
+            {
+                prompt.consumption = InputConsumption::Unconfirmed;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Record that no provider of this exchange's invocations can report consumption anymore.
+    ///
+    /// Recovery calls this when it detaches execution, including while it retains `Finalizing`.
+    /// Awaiting inputs settle as unconfirmed, and a later acknowledgement under one of these
+    /// invocations settles at once instead of recreating a status row that nothing would clear.
+    pub(crate) fn close_input_consumption(&mut self) -> bool {
+        let mut changed = self.settle_input_consumption();
+        let invocations = self
+            .turn
+            .iter()
+            .map(|turn| turn.provider().scope.clone())
+            .collect::<Vec<_>>();
+        for invocation in invocations {
+            if !self.closed_input_consumption.contains(&invocation) {
+                self.closed_input_consumption.push(invocation);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Admit question feedback with a durable target before the provider can produce a reply.
@@ -1681,6 +1890,7 @@ mod test {
             metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
             checklist: None,
+            closed_input_consumption: Vec::new(),
 
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
@@ -1829,12 +2039,14 @@ mod test {
     #[test]
     fn finalizing_exchange_retains_acknowledged_input_without_reopening() {
         let mut exchange = interaction();
+        let invocation = crate::turn::test_support::address(&exchange, "first").scope;
         exchange.resume(10).unwrap();
         exchange
             .begin_finalization(ExchangeOutcome::Complete, 30)
             .unwrap();
         let prompt = exchange
             .append_acknowledged_input(
+                &invocation,
                 Some("late-steering".into()),
                 None,
                 InputIntent::Steering,
@@ -1855,6 +2067,7 @@ mod test {
         assert!(
             exchange
                 .append_acknowledged_input(
+                    &invocation,
                     Some("late-steering".into()),
                     None,
                     InputIntent::Steering,
@@ -1867,6 +2080,7 @@ mod test {
         assert!(
             exchange
                 .append_acknowledged_input(
+                    &invocation,
                     Some("after-terminal".into()),
                     None,
                     InputIntent::Steering,
@@ -1876,5 +2090,338 @@ mod test {
                 .is_err()
         );
         assert_eq!(exchange.state(), ExchangeState::Complete);
+    }
+
+    fn submission(id: &str) -> forge_provider_api::SubmissionId {
+        forge_provider_api::SubmissionId::try_from(id.to_owned()).unwrap()
+    }
+
+    /// Start one native turn of the fixture exchange under its own invocation.
+    fn running_turn(
+        exchange: &mut Exchange,
+        name: &str,
+        now_ms: i64,
+    ) -> crate::provider::TurnAddress {
+        let address = crate::turn::test_support::address(exchange, name);
+        let started = turn_event(
+            &address,
+            forge_provider_api::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                started_at_ms: now_ms,
+            }),
+        );
+        assert!(exchange.observe_event(&started, now_ms).unwrap());
+        address
+    }
+
+    /// Report one native user item that carries a Forge submission, as providers do at consumption.
+    fn echo(
+        address: &crate::provider::TurnAddress,
+        item_id: &str,
+        submission_id: &forge_provider_api::SubmissionId,
+    ) -> HarnessEvent {
+        item_event(
+            address,
+            item_id,
+            ItemEvent::Started(ItemStart::UserMessage(
+                forge_provider_api::UserMessageStart {
+                    text: "prefer the short form".into(),
+                    submission_id: Some(submission_id.clone()),
+                },
+            )),
+        )
+    }
+
+    fn observe(exchange: &mut Exchange, event: &HarnessEvent, now_ms: i64) -> ProviderObservation {
+        let HarnessEvent::Native { scope, event, .. } = event else {
+            panic!("fixture events are native");
+        };
+        exchange
+            .observe_provider_evidence(scope, event, now_ms)
+            .unwrap()
+    }
+
+    fn acknowledge(
+        exchange: &mut Exchange,
+        address: &crate::provider::TurnAddress,
+        submission_id: &forge_provider_api::SubmissionId,
+        now_ms: i64,
+    ) -> ExchangeInput {
+        exchange
+            .append_acknowledged_input(
+                &address.scope,
+                Some(format!("input:{}", submission_id.as_str())),
+                Some(submission_id.clone()),
+                InputIntent::Steering,
+                "prefer the short form".into(),
+                now_ms,
+            )
+            .unwrap()
+    }
+
+    /// Name the displayed nodes in order, which is the transcript's exchange order.
+    fn displayed(exchange: &Exchange) -> Vec<String> {
+        exchange
+            .node_list
+            .iter()
+            .filter(|node| exchange.displays_node(node))
+            .map(|node| node.id().to_owned())
+            .collect()
+    }
+
+    fn consumption(exchange: &Exchange, id: &str) -> InputConsumption {
+        exchange
+            .node_list
+            .iter()
+            .find_map(|node| match node {
+                ExchangeNode::ExchangeInput { prompt } if prompt.id == id => {
+                    Some(prompt.consumption.clone())
+                }
+                _ => None,
+            })
+            .expect("input node")
+    }
+
+    /// Acknowledgement waits for consumption, and the echo places the row where it arrived.
+    #[test]
+    fn steering_echo_consumes_acknowledged_input_at_its_position() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let address = running_turn(&mut exchange, "first", 1);
+        let steer = submission("steer");
+        let before = crate::turn::test_support::message(
+            &address,
+            "before",
+            Some(AgentMessageRole::Commentary),
+            "Reading files",
+        );
+        assert!(exchange.observe_event(&before, 2).unwrap());
+        let prompt = acknowledge(&mut exchange, &address, &steer, 3);
+        assert_eq!(
+            prompt.consumption,
+            InputConsumption::AwaitingConsumption {
+                invocation: address.scope.clone()
+            }
+        );
+        assert!(!displayed(&exchange).contains(&prompt.id));
+        assert_eq!(exchange.awaiting_inputs().count(), 1);
+        // Acknowledgement leaves the current message streaming, so a delta still extends it.
+        let delta = item_event(
+            &address,
+            "before",
+            ItemEvent::Message {
+                event: forge_provider_api::MessageItemEvent::Delta(" and tests".into()),
+            },
+        );
+        assert!(exchange.observe_event(&delta, 4).unwrap());
+        assert_eq!(
+            exchange.turn[0].messages()[0].text(),
+            "Reading files and tests"
+        );
+
+        let consumed = observe(&mut exchange, &echo(&address, "echo", &steer), 5);
+        assert_eq!(
+            consumed.consumed_input.map(|input| input.id),
+            Some(prompt.id.clone())
+        );
+        assert_eq!(
+            consumption(&exchange, &prompt.id),
+            InputConsumption::Consumed
+        );
+        let after = crate::turn::test_support::message(
+            &address,
+            "after",
+            Some(AgentMessageRole::Response),
+            "Short form",
+        );
+        assert!(exchange.observe_event(&after, 6).unwrap());
+        let order = displayed(&exchange);
+        let row = order.iter().position(|id| *id == prompt.id).unwrap();
+        let response = order
+            .iter()
+            .position(|id| id.ends_with(":message:3"))
+            .unwrap();
+        assert!(row < response, "{order:?}");
+
+        // Neither a repeated report nor a repeated acknowledgement moves the row or closes output.
+        let repeated = observe(&mut exchange, &echo(&address, "echo-again", &steer), 7);
+        assert!(repeated.consumed_input.is_none());
+        let streaming = item_event(
+            &address,
+            "after",
+            ItemEvent::Message {
+                event: forge_provider_api::MessageItemEvent::Delta(" answer".into()),
+            },
+        );
+        assert!(exchange.observe_event(&streaming, 8).unwrap());
+        assert_eq!(exchange.turn[0].messages()[2].text(), "Short form answer");
+        assert_eq!(
+            acknowledge(&mut exchange, &address, &steer, 9).id,
+            prompt.id
+        );
+        assert_eq!(displayed(&exchange), order);
+    }
+
+    /// An echo that precedes acknowledgement reserves the input's position, even past completion.
+    #[test]
+    fn early_echo_anchors_acknowledgement_before_later_output() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let address = running_turn(&mut exchange, "first", 1);
+        let steer = submission("steer");
+        let early = observe(&mut exchange, &echo(&address, "echo", &steer), 2);
+        assert!(early.changed && early.consumed_input.is_none());
+        let after = crate::turn::test_support::message(
+            &address,
+            "after",
+            Some(AgentMessageRole::Response),
+            "Short form",
+        );
+        assert!(exchange.observe_event(&after, 3).unwrap());
+        let completed = crate::turn::test_support::completed_event(
+            &address,
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            4,
+        );
+        assert!(exchange.observe_event(&completed, 4).unwrap());
+        assert!(
+            displayed(&exchange)
+                .iter()
+                .all(|id| !id.ends_with(":message:1")),
+            "the anchor rendered as a native user row"
+        );
+        // The retained anchor survives serialization with its turn and submission identity.
+        let mut exchange: Exchange =
+            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+        let messages_before = exchange.turn[0].messages().len();
+        let prompt = acknowledge(&mut exchange, &address, &steer, 5);
+        assert_eq!(prompt.consumption, InputConsumption::Consumed);
+        assert_eq!(exchange.turn[0].messages().len(), messages_before);
+        let order = displayed(&exchange);
+        let row = order.iter().position(|id| *id == prompt.id).unwrap();
+        let response = order
+            .iter()
+            .position(|id| id.ends_with(":message:2"))
+            .unwrap();
+        assert!(row < response, "{order:?}");
+        let rows = exchange
+            .node_list
+            .iter()
+            .filter(|node| matches!(node, ExchangeNode::ExchangeInput { .. }))
+            .count();
+        acknowledge(&mut exchange, &address, &steer, 6);
+        assert_eq!(
+            exchange
+                .node_list
+                .iter()
+                .filter(|node| matches!(node, ExchangeNode::ExchangeInput { .. }))
+                .count(),
+            rows
+        );
+    }
+
+    /// Terminal coverage is not consumption evidence, whatever the outcome; settlement is.
+    #[test]
+    fn covered_input_without_echo_waits_until_settlement() {
+        for outcome in [
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            crate::turn::TurnOutcome::Interrupted,
+        ] {
+            let mut exchange = interaction();
+            exchange.resume(1).unwrap();
+            let address = running_turn(&mut exchange, "first", 1);
+            let prompt = acknowledge(&mut exchange, &address, &submission("steer"), 2);
+            let completed = crate::turn::test_support::completed_event(&address, outcome, 3);
+            assert!(exchange.observe_event(&completed, 3).unwrap());
+            assert!(matches!(
+                consumption(&exchange, &prompt.id),
+                InputConsumption::AwaitingConsumption { .. }
+            ));
+            let exchange_outcome = match outcome {
+                crate::turn::TurnOutcome::Completed { .. } => ExchangeOutcome::Complete,
+                _ => ExchangeOutcome::Interrupted,
+            };
+            exchange.finish(exchange_outcome, 4).unwrap();
+            assert_eq!(
+                consumption(&exchange, &prompt.id),
+                InputConsumption::Unconfirmed
+            );
+            assert!(displayed(&exchange).contains(&prompt.id));
+        }
+        // A failed exchange settles a still-running turn and its awaiting input together.
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let address = running_turn(&mut exchange, "first", 1);
+        let prompt = acknowledge(&mut exchange, &address, &submission("steer"), 2);
+        exchange.finish(ExchangeOutcome::Failed, 3).unwrap();
+        assert_eq!(
+            consumption(&exchange, &prompt.id),
+            InputConsumption::Unconfirmed
+        );
+    }
+
+    /// Evidence from another invocation or turn cannot consume or position an input.
+    #[test]
+    fn foreign_evidence_cannot_consume_input() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let first = running_turn(&mut exchange, "first", 1);
+        let steer = submission("steer");
+        let prompt = acknowledge(&mut exchange, &first, &steer, 2);
+        // A turn the exchange never admitted reports nothing.
+        let unknown = crate::turn::test_support::address(&exchange, "unknown");
+        assert!(!observe(&mut exchange, &echo(&unknown, "echo", &steer), 3).changed);
+        let mut foreign = interaction();
+        foreign.id = "interaction-two".into();
+        let foreign_address = crate::turn::test_support::address(&foreign, "first");
+        assert!(!observe(&mut exchange, &echo(&foreign_address, "echo", &steer), 3).changed);
+        // A later invocation of the same exchange cannot consume the first invocation's input.
+        let completed = crate::turn::test_support::completed_event(
+            &first,
+            crate::turn::TurnOutcome::Interrupted,
+            4,
+        );
+        assert!(exchange.observe_event(&completed, 4).unwrap());
+        let second = running_turn(&mut exchange, "second", 5);
+        let report = observe(&mut exchange, &echo(&second, "echo", &steer), 6);
+        assert!(report.consumed_input.is_none());
+        assert!(matches!(
+            consumption(&exchange, &prompt.id),
+            InputConsumption::AwaitingConsumption { invocation } if invocation == first.scope
+        ));
+    }
+
+    /// Recovery closes consumption evidence, so late acknowledgement cannot recreate waiting state.
+    #[test]
+    fn closed_consumption_settles_late_acknowledgement() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let address = running_turn(&mut exchange, "first", 1);
+        let waiting = acknowledge(&mut exchange, &address, &submission("waiting"), 2);
+        exchange
+            .begin_finalization(ExchangeOutcome::Complete, 3)
+            .unwrap();
+        assert!(exchange.close_input_consumption());
+        assert!(!exchange.close_input_consumption());
+        assert_eq!(
+            consumption(&exchange, &waiting.id),
+            InputConsumption::Unconfirmed
+        );
+        let mut exchange: Exchange =
+            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+        let late = acknowledge(&mut exchange, &address, &submission("late"), 4);
+        assert_eq!(late.consumption, InputConsumption::Unconfirmed);
+        assert_eq!(exchange.awaiting_inputs().count(), 0);
+        // Without closure, a finalizing exchange still waits for its normal finish.
+        let mut open = interaction();
+        open.resume(1).unwrap();
+        let address = running_turn(&mut open, "first", 1);
+        open.begin_finalization(ExchangeOutcome::Complete, 2)
+            .unwrap();
+        let late = acknowledge(&mut open, &address, &submission("late"), 3);
+        assert!(late.is_awaiting_consumption());
     }
 }
