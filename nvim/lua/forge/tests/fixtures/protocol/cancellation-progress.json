@@ -1,0 +1,20 @@
+{
+  "blockers": {
+    "checks_running": false,
+    "children": 0,
+    "foreground": true,
+    "input_delivery": false,
+    "publication_active": false,
+    "queued_publications": 0,
+    "recovery_jobs": false,
+    "running_jobs": 1,
+    "staged_effects": ["FinalCheckpoint"]
+  },
+  "exchange_id": "exchange-one",
+  "operation_id": "cancel-one",
+  "phase": "draining",
+  "response_timed_out": true,
+  "revision": 3,
+  "started_at_ms": 100,
+  "updated_at_ms": 200
+}

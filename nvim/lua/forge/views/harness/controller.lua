@@ -86,13 +86,15 @@ end
 ---@param state table
 local function cancel_exchange(state)
   local session_id = state.session and state.session.id
-  if not session_id then return end
+  if not session_id or cleanup_progress.pending(state) then return end
+  local epoch = state.runtime_epoch
   local operation_id = require("forge.command").identity()
   if state.input then state.input.pause_operation_id = operation_id end
   cleanup_progress.begin(state, operation_id)
   client.request({ session_id = session_id, method = "session.turn.cancel",
     params = { operation_id = operation_id, restore_prompt_if_no_output = true } }, function(_, failure, detail)
     if not state.session or state.session.id ~= session_id then return end
+    if not cleanup_progress.respond(state, operation_id, epoch) then return end
     if failure then
       if detail and detail.code == "execution_collection_timeout" then cleanup_progress.timeout(state, operation_id) end
       notifications.error(failure, "Harness cancellation")

@@ -72,6 +72,8 @@ pub(crate) enum ExchangeActivity {
 pub enum ExchangeCollection {
     /// The owner is waiting for native work and callbacks to settle.
     Pending,
+    /// Native work has ended; the owner is draining or committing host settlement.
+    Settling,
     /// The response deadline expired while cleanup still owns its resources.
     TimedOut,
 }
@@ -81,6 +83,7 @@ impl ExchangeCollection {
     pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "Stopping",
+            Self::Settling => "Cancellation pending - settling host work",
             Self::TimedOut => "Cleanup timed out - provider state uncertain",
         }
     }

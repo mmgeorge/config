@@ -180,6 +180,16 @@ pub(super) fn apply_input(
         .request
         .input_operation(&policy)
         .map_err(InputCommandFailure::Codec)?;
+    if let Some(after) = &operation.after_control {
+        operation.after_control = Some(
+            super::journal::CommandJournal::control_operation(
+                &services.history,
+                services.observer.session_id(),
+                after,
+            )
+            .map_err(InputCommandFailure::Domain)?,
+        );
+    }
     match prepared {
         PreparedInput::Ordinary => {
             let target = match &run.command.record.request.command {

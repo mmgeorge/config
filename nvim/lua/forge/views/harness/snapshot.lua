@@ -40,11 +40,13 @@ function HarnessSnapshot.apply(state, result)
     end
     state.restore_applying, state.activity = nil, nil
     require("forge.views.harness.cleanup_progress").settled(state)
+    state.cancellation = nil
     if state.presentation and state.presentation.transcript then
       state.presentation.status_view:resize()
     end
   end
   state.runtime_epoch, state.snapshot_revision = result.runtime_epoch, result.snapshot_revision
+  require("forge.views.harness.cleanup_progress").apply(state, result.cancellation)
   if result.activity then activity.receive(state, result.activity, result.runtime_epoch) end
   local publication = result.owner_publication
   if publication then

@@ -1,6 +1,7 @@
 //! Apply command wakes for the exchange driver loop.
 
 use super::super::*;
+use crate::exchange::transition::TransitionEvent;
 
 impl ExchangeDriver {
     /// Apply one active-command fact.
@@ -774,13 +775,24 @@ impl ExchangeDriver {
             }
             CommandEvent::Cancel(event) => {
                 let Some(ActiveCommand::Cancel {
-                    command: queued,
+                    command: mut queued,
                     mut transition,
                 }) = command.take()
                 else {
                     unreachable!("cancellation evidence belongs to the active cancellation command")
                 };
                 let command_id = queued.record.request.id.clone();
+                if matches!(event, TransitionEvent::CollectionDeadline) {
+                    self.execution_stop_begin(services);
+                    self.commands.finish_observers(
+                        &mut queued,
+                        Err(CommandFailure::StopTimedOut),
+                        trace,
+                        session_id,
+                        step,
+                    );
+                    transition.expire_response();
+                }
                 trace.record(
                     session_id,
                     "exchange.command.event",
@@ -846,7 +858,10 @@ impl ExchangeDriver {
                         events,
                     }) => {
                         publish_control(events, None, env.context(step), &command_id);
-                        if self.commands.storage_unavailable() {
+                        if transition.response_expired() {
+                            // The historical timeout response stays terminal; cleanup has now settled.
+                            self.execution_reopen(services);
+                        } else if self.commands.storage_unavailable() {
                             let mut queued = queued;
                             self.commands
                                 .lose_observation(&mut queued, trace, session_id, step);

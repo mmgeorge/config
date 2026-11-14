@@ -1,6 +1,8 @@
 mod active;
 mod activity;
+mod cancellation;
 pub use activity::{ActivityPhase, ActivitySnapshot};
+pub use cancellation::{CancellationBlockers, CancellationPhase, CancellationProgress};
 pub(crate) mod agent_command;
 mod change;
 mod change_result;

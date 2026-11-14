@@ -238,6 +238,9 @@ fn preview_lines(timeline: &[TimelineEntry], now_ms: i64) -> Result<Vec<String>>
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
+    /// Last durable cancellation operation, independent of its caller's response deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<crate::exchange::CancellationProgress>,
     /// Latest activity committed by the session owner, independent of request callbacks.
     pub activity: crate::exchange::ActivitySnapshot,
     pub(crate) questions: crate::question::QuestionSnapshot,
@@ -964,6 +967,18 @@ struct AgentInterruptItem {
     cleanup_succeeded: bool,
 }
 
+/// Classify work by its authority after the owner begins collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ForegroundEffectDisposition {
+    /// Complete already-owned cleanup or settlement.
+    Settlement,
+    /// Retire reserved work through its normal completion signal.
+    Retire,
+    /// Reject work that would start or mutate an invocation.
+    Invocation,
+}
+
 /// Own provider work that can run without retaining a broker guard.
 pub(crate) enum ForegroundJob {
     AdmissionWorkspace(foreground_workspace::AdmissionWorkspaceJob),
@@ -1142,7 +1157,7 @@ impl ForegroundJob {
     }
 
     /// Identify cleanup and settlement work that remains authorized after new invocation effects close.
-    pub(crate) fn is_collection(&self) -> bool {
+    pub(crate) fn disposition(&self) -> ForegroundEffectDisposition {
         match self {
             Self::AdmissionCleanup(_)
             | Self::AdmissionFailureCheckpoint(_)
@@ -1164,7 +1179,7 @@ impl ForegroundJob {
             | Self::PlanSubmission(_)
             | Self::PlanQuestion(_)
             | Self::PlanMutation(_)
-            | Self::TerminalWorkspace(_) => true,
+            | Self::TerminalWorkspace(_) => ForegroundEffectDisposition::Settlement,
             Self::AdmissionWorkspace(_)
             | Self::ProviderPrepare(_)
             | Self::QuestionCatalog(_)
@@ -1183,7 +1198,6 @@ impl ForegroundJob {
             | Self::LivePlanMutation(_)
             | Self::LivePlanSubmission(_)
             | Self::TaskCompaction(_)
-            | Self::Compaction(_)
             | Self::PlanTerminalPublication { .. }
             | Self::PlanScan(_)
             | Self::ExecutionControl { .. }
@@ -1191,11 +1205,20 @@ impl ForegroundJob {
             | Self::AgentResult { .. }
             | Self::AgentSpawnSelect { .. }
             | Self::AgentMessageSteer { .. }
-            | Self::AutomaticCheckRefresh(_)
-            | Self::AutomaticCheckRun(_)
-            | Self::UserSteering { .. } => false,
+            | Self::UserSteering { .. } => ForegroundEffectDisposition::Invocation,
+            Self::Compaction(_) | Self::AutomaticCheckRefresh(_) | Self::AutomaticCheckRun(_) => {
+                ForegroundEffectDisposition::Retire
+            }
         }
     }
+    /// Acknowledge discarded work so the reducer cannot wait on a job that never starts.
+    pub(crate) fn retire(self) -> ForegroundSignal {
+        match self {
+            Self::Compaction(job) => ForegroundSignal::CompactionCompleted(Box::new(job.cancel())),
+            _ => ForegroundSignal::EffectFailed(TurnCancelled.into()),
+        }
+    }
+
     /// Identify presentation batches that must be delivered in session order.
     pub(crate) fn is_publication(&self) -> bool {
         matches!(

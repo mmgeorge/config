@@ -51,6 +51,7 @@ uuid = { workspace = true, features = ["serde", "v4"] }
 
 [dev-dependencies]
 forge-git = { workspace = true, features = ["test-fixtures"] }
+forge-recorded-fixtures = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }

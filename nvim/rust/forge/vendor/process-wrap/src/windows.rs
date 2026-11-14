@@ -83,29 +83,6 @@ pub(crate) fn job_creation_flags(user_flags: PROCESS_CREATION_FLAGS) -> JobCreat
 	}
 }
 
-#[cfg(test)]
-mod creation_flag_tests {
-	use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
-
-	use super::*;
-
-	#[test]
-	fn adds_suspension_without_losing_user_flags() {
-		let user_flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
-		let policy = job_creation_flags(user_flags);
-		assert_eq!(policy.flags, user_flags | CREATE_SUSPENDED);
-		assert!(policy.resume_after_assignment);
-	}
-
-	#[test]
-	fn preserves_explicit_suspension() {
-		let user_flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
-		let policy = job_creation_flags(user_flags);
-		assert_eq!(policy.flags, user_flags);
-		assert!(!policy.resume_after_assignment);
-	}
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct JobHandle(pub HANDLE);
 
@@ -415,4 +392,27 @@ pub(crate) fn wait_on_job(
 	}
 
 	Ok(ControlFlow::Break(()))
+}
+
+#[cfg(test)]
+mod creation_flag_tests {
+	use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+	use super::*;
+
+	#[test]
+	fn adds_suspension_without_losing_user_flags() {
+		let user_flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+		let policy = job_creation_flags(user_flags);
+		assert_eq!(policy.flags, user_flags | CREATE_SUSPENDED);
+		assert!(policy.resume_after_assignment);
+	}
+
+	#[test]
+	fn preserves_explicit_suspension() {
+		let user_flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+		let policy = job_creation_flags(user_flags);
+		assert_eq!(policy.flags, user_flags);
+		assert!(!policy.resume_after_assignment);
+	}
 }

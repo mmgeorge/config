@@ -33,6 +33,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "tool_output_position",
     "command_receipt",
     "owner_command",
+    "owner_command_join",
+    "owner_cancellation",
     "terminal_request",
     "owner_core_log",
     "owner_publication",
@@ -123,6 +125,12 @@ pub(super) fn validate(connection: &Connection) -> Result<i64> {
             "Harness database schema {VERSION} is incomplete: missing required tables: {}; clear this state version with ForgeHistoryClear",
             missing.join(", ")
         );
+        for query in [
+            "SELECT session_id,command_id,operation_id FROM owner_command_join LIMIT 0",
+            "SELECT session_id,record FROM owner_cancellation LIMIT 0",
+        ] {
+            connection.prepare(query).context("Harness cancellation schema is incompatible; clear this state version with ForgeHistoryClear")?;
+        }
     }
     Ok(version)
 }
@@ -331,6 +339,19 @@ fn initialize_owner_commands(connection: &Connection) -> Result<()> {
             state TEXT NOT NULL,
             PRIMARY KEY(session_id,id),
             UNIQUE(session_id,sequence)
+        );
+        CREATE TABLE IF NOT EXISTS owner_command_join(
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            PRIMARY KEY(session_id,command_id),
+            CHECK(command_id <> operation_id),
+            FOREIGN KEY(session_id,command_id) REFERENCES owner_command(session_id,id) ON DELETE CASCADE,
+            FOREIGN KEY(session_id,operation_id) REFERENCES owner_command(session_id,id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS owner_cancellation(
+            session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,
+            record TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS terminal_request(
             task_id TEXT,

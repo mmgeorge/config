@@ -970,6 +970,9 @@ impl ExchangeDriver {
         step: u64,
         closed: bool,
     ) {
+        if let Err(error) = self.cancellation_publish(env, state, step) {
+            self.startup_fail(&env.services, "Record cancellation progress", &error);
+        }
         let DriverEnv {
             trace,
             session_id,

@@ -7,7 +7,7 @@ use anyhow::Result;
 fn matching_version_missing_table_is_rejected_on_every_open() -> Result<()> {
     let root = tempfile::tempdir()?;
     let connection = super::database::HistoryConnection::open(root.path())?;
-    connection.execute_batch("DROP TABLE terminal_request")?;
+    connection.execute_batch("DROP TABLE terminal_request; DROP TABLE owner_cancellation; DROP TABLE owner_command_join;")?;
     drop(connection);
 
     for result in [
@@ -17,7 +17,13 @@ fn matching_version_missing_table_is_rejected_on_every_open() -> Result<()> {
         let error = result.err().expect("incomplete current schema must fail");
         let message = format!("{error:#}");
         assert!(
-            message.contains("missing required tables: terminal_request"),
+            [
+                "terminal_request",
+                "owner_cancellation",
+                "owner_command_join"
+            ]
+            .iter()
+            .all(|table| message.contains(table)),
             "{message}"
         );
     }

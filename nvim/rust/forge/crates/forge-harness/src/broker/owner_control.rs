@@ -177,6 +177,7 @@ impl HarnessBroker {
     pub(crate) fn owner_collection_completed(
         &mut self,
         target: Option<&crate::provider::ExchangeId>,
+        collection: Option<crate::exchange::ExchangeCollection>,
     ) -> Result<Vec<SessionEvent>> {
         let events = self.drain_session_events()?;
         if let Some(target) = target
@@ -190,7 +191,8 @@ impl HarnessBroker {
                 selected.session_id == self.session.id,
                 "collection target belongs to another session"
             );
-            if selected.collection.take().is_some() {
+            if selected.collection.is_some() {
+                selected.collection = collection;
                 self.store.save_exchange(&selected)?;
                 self.reconcile_live_interaction(Some(&selected), None)?;
             }

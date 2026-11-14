@@ -26,6 +26,15 @@ pub(crate) enum CoreRecord {
         command: CommandId,
         kind: CoreCommandKind,
     },
+    /// Attach a distinct cancellation receipt to the operation that already owns its target.
+    CommandJoined {
+        command: CommandId,
+        operation: CommandId,
+    },
+    /// Commit progress and its read projection together, including safe blocker evidence.
+    CancellationProgress {
+        progress: super::CancellationProgress,
+    },
     /// Record effect admission in the same transaction as the active command revision.
     CommandStarted { command: CommandId, revision: u64 },
     /// Record a committed outcome before attempting any response publication.

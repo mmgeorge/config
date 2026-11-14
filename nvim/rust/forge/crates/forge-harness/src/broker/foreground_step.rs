@@ -427,7 +427,12 @@ impl HarnessBroker {
                 if transaction.failure.is_some() {
                     return self.advance_foreground_failure(dispatch);
                 }
-                transaction.state.interaction.collection = None;
+                transaction.state.interaction.collection = match disposition {
+                    ForegroundCollection::Cancel(_) => {
+                        Some(crate::exchange::ExchangeCollection::Settling)
+                    }
+                    ForegroundCollection::Restart => None,
+                };
                 Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::CollectionFailed => {
@@ -459,6 +464,9 @@ impl HarnessBroker {
                             .downcast_ref::<ProviderError>()
                             .is_some_and(ProviderError::is_clean_cancellation)) =>
             {
+                if already_finalizing {
+                    return self.fail_foreground(transaction, error);
+                }
                 transaction.native_open = transaction.native.has_dispatched_task();
                 if !transaction.native_open && !already_finalizing {
                     transaction

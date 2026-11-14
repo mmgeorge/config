@@ -340,8 +340,10 @@ mod tests {
         assert_eq!(document.test_scopes, scopes);
         let restored: DesignDocument = serde_json::from_value(serde_json::to_value(&document)?)?;
         assert_eq!(restored, document);
-        let mut design = crate::plan::DeclarationDesign::default();
-        design.document = document.clone();
+        let mut design = crate::plan::DeclarationDesign {
+            document: document.clone(),
+            ..Default::default()
+        };
         let parsed = crate::plan::design_artifact::parse_authored("Scope", &design, &config)?;
         assert_eq!(parsed.document.test_scopes, scopes);
         let mut snapshot = crate::checks::ConfigSnapshot::load(workspace.path())?;

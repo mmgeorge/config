@@ -187,24 +187,40 @@ impl CommandJournal {
         for (id, state, request) in records {
             let previous: CommandState = serde_json::from_str(&state)?;
             let was_active = matches!(&previous, CommandState::Active { .. });
+            let operation: Option<String> = transaction.query_row(
+                "SELECT operation_id FROM owner_command_join WHERE session_id=?1 AND command_id=?2",
+                params![self.session, id], |row| row.get(0),
+            ).optional()?;
+            let joined_outcome = operation
+                .map(|operation| {
+                    read_record(&transaction, &self.session, &operation).map(|record| {
+                        record
+                            .and_then(|record| record.completion())
+                            .map(|outcome| outcome.map(|result| result.outcome))
+                    })
+                })
+                .transpose()?
+                .flatten();
             let next = CommandState::Finished {
                 revision: previous
                     .revision()
                     .checked_add(1)
                     .ok_or(CommandJournalError::RevisionExhausted)?,
-                outcome: Err(match previous {
-                    CommandState::Active {
-                        task_commit: Some(committed),
-                        ..
-                    } => CommandFailure::TaskSynchronization {
-                        committed,
-                        failure: super::command::TaskSynchronizationFailure::Interrupted,
-                    },
-                    CommandState::Active {
-                        task_commit: None, ..
-                    }
-                    | CommandState::Queued { .. }
-                    | CommandState::Finished { .. } => CommandFailure::Interrupted,
+                outcome: joined_outcome.unwrap_or_else(|| {
+                    Err(match previous {
+                        CommandState::Active {
+                            task_commit: Some(committed),
+                            ..
+                        } => CommandFailure::TaskSynchronization {
+                            committed,
+                            failure: super::command::TaskSynchronizationFailure::Interrupted,
+                        },
+                        CommandState::Active {
+                            task_commit: None, ..
+                        }
+                        | CommandState::Queued { .. }
+                        | CommandState::Finished { .. } => CommandFailure::Interrupted,
+                    })
                 }),
             };
             transaction.execute(
@@ -236,6 +252,29 @@ impl CommandJournal {
                         },
                         outcome: CoreOutcome::Interrupted,
                     },
+                )?;
+            }
+        }
+        let cancellation: Option<String> = transaction
+            .query_row(
+                "SELECT record FROM owner_cancellation WHERE session_id=?1",
+                [&self.session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(cancellation) = cancellation {
+            let mut progress: super::CancellationProgress = serde_json::from_str(&cancellation)?;
+            if progress.phase.active() {
+                progress.phase = super::CancellationPhase::Failed;
+                progress.revision = progress
+                    .revision
+                    .checked_add(1)
+                    .ok_or(CommandJournalError::RevisionExhausted)?;
+                progress.updated_at_ms = crate::broker::Clock::now_ms(&crate::broker::SystemClock);
+                append_core_record(
+                    &transaction,
+                    &self.session,
+                    &CoreRecord::CancellationProgress { progress },
                 )?;
             }
         }
@@ -272,6 +311,15 @@ impl CommandJournal {
         &mut self,
         request: &CommandRequest,
     ) -> Result<CommandRecord, CommandJournalError> {
+        self.admit_operation(request, None)
+    }
+
+    /// Commit observer admission and its operation identity in one transaction.
+    pub(super) fn admit_operation(
+        &mut self,
+        request: &CommandRequest,
+        operation: Option<&CommandId>,
+    ) -> Result<CommandRecord, CommandJournalError> {
         let mut connection = self.history()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(previous) = read_record(&transaction, &self.session, request.id.as_str())? {
@@ -299,6 +347,20 @@ impl CommandJournal {
                 kind: CoreCommandKind::from(&request.command),
             },
         )?;
+        if let Some(operation) = operation {
+            transaction.execute(
+                "INSERT INTO owner_command_join(session_id,command_id,operation_id) VALUES(?1,?2,?3)",
+                params![self.session, request.id.as_str(), operation.as_str()],
+            )?;
+            append_core_record(
+                &transaction,
+                &self.session,
+                &CoreRecord::CommandJoined {
+                    command: request.id.clone(),
+                    operation: operation.clone(),
+                },
+            )?;
+        }
         transaction.commit()?;
         Ok(CommandRecord {
             request: request.clone(),
@@ -306,6 +368,23 @@ impl CommandJournal {
                 .map_err(|_| CommandJournalError::RevisionExhausted)?,
             state,
         })
+    }
+
+    /// Resolve an observer's input-control authority through the existing history owner.
+    pub(crate) fn control_operation(
+        history: &crate::storage::writer::HistoryWriter,
+        session: &str,
+        command: &str,
+    ) -> anyhow::Result<String> {
+        let connection = history.connection()?;
+        let operation: Option<String> = connection
+            .query_row(
+                "SELECT operation_id FROM owner_command_join WHERE session_id=?1 AND command_id=?2",
+                params![session, command],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(operation.unwrap_or_else(|| command.to_owned()))
     }
 
     /// Commit active status before launching the command's first effect.
@@ -790,6 +869,12 @@ fn append_core_record(
         "INSERT INTO owner_core_log(session_id,sequence,record) VALUES(?1,?2,?3)",
         params![session, sequence, encoded],
     )?;
+    if let CoreRecord::CancellationProgress { progress } = record {
+        transaction.execute(
+            "INSERT INTO owner_cancellation(session_id,record) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET record=excluded.record",
+            params![session, serde_json::to_string(progress)?],
+        )?;
+    }
     u64::try_from(sequence).map_err(|_| CommandJournalError::RevisionExhausted)
 }
 

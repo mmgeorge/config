@@ -661,6 +661,7 @@ T["mode_restart"] = function()
     state.execution_notice, state.host_error = nil, nil
     state.cancel_requested = false
     state.cleanup_operation_id, state.cleanup_epoch, state.cleanup_notice = nil, nil, nil
+    state.cleanup_request_id, state.cleanup_request_epoch = nil, nil
     state.sync_error, state.connection_error = nil, nil
     state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
     state.queue, state.pending_steer, state.capability = {}, {}, {}
@@ -696,15 +697,11 @@ T["mode_restart"] = function()
     assert(cancellation.spec.params.restore_prompt_if_no_output)
     controller.cancel_turn()
     local latest_cancellation = last("session.turn.cancel")
-    assert(latest_cancellation.spec.params.operation_id ~= cancellation.spec.params.operation_id,
-      "cancellation intents reused an operation identity")
+    eq(latest_cancellation, cancellation)
     cancellation.callback({ cancel_requested = true })
-    assert(state.cleanup_operation_id == latest_cancellation.spec.params.operation_id and activity.busy(state),
-      "old cancellation reply cleared current cleanup or manufactured idle activity")
-    latest_cancellation.callback({ cancel_requested = true })
     assert(not state.cleanup_operation_id and activity.busy(state), "cancellation reply manufactured idle activity")
     assert(activity.receive(state, { revision = 3, phase = "idle" }, state.runtime_epoch))
-    assert(not activity.busy(state) and #requests == 3 and #failures == 0)
+    assert(not activity.busy(state) and #requests == 2 and #failures == 0)
   end
   reset()
   local input_state = require("forge.views.harness.input_state")
@@ -720,16 +717,13 @@ T["mode_restart"] = function()
   assert(first_submit.spec.params.after_control == first_cancel.spec.params.operation_id and first_submit.spec.params.control_revision == 4,
     "immediate submit omitted its pending cancellation or predicted a control revision")
   controller.cancel_turn()
-  local second_cancel = last("session.turn.cancel")
+  eq(#requests, 2)
   first_cancel.callback({ cancel_requested = true })
-  assert(state.input.pause_operation_id == second_cancel.spec.params.operation_id
-    and state.cleanup_operation_id == second_cancel.spec.params.operation_id,
-    "older cancellation reply cleared the newer cancellation correlation")
   input_state.submit(state, "latest follow-up", {}, "auto")
   local second_submit = last("session.input.apply")
-  assert(second_submit.spec.params.after_control == second_cancel.spec.params.operation_id and second_submit.spec.params.control_revision == 4,
-    "submit did not follow the latest pending cancellation")
-  assert(#requests == 4 and #failures == 0, "cancellation submission introduced polling or errors")
+  assert(second_submit.spec.params.after_control == first_cancel.spec.params.operation_id
+    and second_submit.spec.params.control_revision == 4, "submit lost its cancellation correlation")
+  assert(#requests == 3 and #failures == 0, "cancellation submission introduced polling or errors")
   state.input = nil
   reset()
   controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "ask" } })
@@ -1065,19 +1059,12 @@ T["submit_steering"] = function()
     and cancellation.request.params.restore_prompt_if_no_output == true)
   assert(buffer.line(state.composer_buf, 1) == "Keep my unsent draft" and #host.requests == before
     and vim.deep_equal(state.queue, retained))
-  -- The session owner joins a cancellation issued during cleanup with the one already collecting,
-  -- so Lua forwards it under its own identity instead of predicting host execution state.
   local control_count = #controls
   controller.cancel_turn()
-  local repeated = controls[#controls]
-  assert(#transitions == transition_count and #controls == control_count + 1
-    and repeated.request.method == "session.turn.cancel",
-    "cancellation during cleanup was not forwarded to the session owner")
-  assert(repeated.request.params.operation_id ~= cancellation.request.params.operation_id,
-    "repeated cancellation reused the first cancellation identity")
+  assert(#transitions == transition_count and #controls == control_count,
+    "repeated cancellation submitted a second in-flight request")
   assert(buffer.line(state.composer_buf, 1) == "Keep my unsent draft" and #host.requests == before and vim.deep_equal(state.queue, retained))
   cancellation.callback({ cancel_requested = true })
-  repeated.callback({ cancel_requested = true })
   assert(buffer.line(state.composer_buf, 1) == "Keep my unsent draft" and vim.deep_equal(state.queue, retained))
 
   local child_action

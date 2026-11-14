@@ -457,6 +457,21 @@ impl BrokerObserver {
                     .map(|question| question.exchange_id.clone()),
             };
         }
+        let cancellation = store.cancellation_progress(&source_session.id)?;
+        if let Some(progress) = cancellation
+            .as_ref()
+            .filter(|progress| progress.phase.active())
+        {
+            status = crate::session::state_machine::SessionPhase::Stopping {
+                collection: match progress.phase {
+                    crate::exchange::CancellationPhase::Acquiring
+                    | crate::exchange::CancellationPhase::Collecting => {
+                        crate::exchange::ExchangeCollection::Pending
+                    }
+                    _ => crate::exchange::ExchangeCollection::Settling,
+                },
+            };
+        }
         self.trace.record(
             &source_session.id,
             "status_projected",
@@ -519,6 +534,7 @@ impl BrokerObserver {
             })
             .collect();
         Ok(BrokerSnapshot {
+            cancellation,
             activity: self
                 .activity
                 .read()

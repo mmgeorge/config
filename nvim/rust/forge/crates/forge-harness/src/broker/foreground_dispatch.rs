@@ -99,6 +99,17 @@ enum AdmissionPhase {
 }
 
 impl TurnTransaction {
+    /// Get whether the owner has revoked admission for this foreground's invocation work.
+    pub(crate) fn collection_requested(&self) -> bool {
+        match self {
+            Self::Admitting(admission) => admission.collection.is_some(),
+            Self::Running { transaction, .. } | Self::Finalizing { transaction, .. } => {
+                transaction.collection.is_some()
+            }
+            Self::Done(_) | Self::Transitioning => false,
+        }
+    }
+
     /// Capture the latest admitted invocation in this foreground's explicit execution chain.
     pub(crate) fn invocation_scope(
         &self,

@@ -70,6 +70,10 @@ impl ForegroundFinalization {
     /// Capture a collection transition authorized by the exchange owner before reading native termination.
     pub(crate) fn set_collection(&mut self, disposition: ForegroundCollection) {
         self.collection = Some(disposition);
+        if self.phase == FinalizationPhase::WaitingStaleQuestion {
+            self.phase = FinalizationPhase::ResumeStale;
+            self.check_continuation_requested = false;
+        }
     }
 
     /// Reuse this host envelope for an admitted same-invocation follow-up.
@@ -837,6 +841,12 @@ impl HarnessBroker {
                     "clarification publication was not pending"
                 );
                 admission.events.extend(result?);
+                if finalization.collection.is_some() {
+                    finalization.clarification_request = None;
+                    admission.clarification = None;
+                    finalization.resume_stopped(ProviderError::Cancelled)?;
+                    return Ok(ForegroundAction::Wait);
+                }
                 let request = finalization
                     .clarification_request
                     .take()
@@ -894,6 +904,20 @@ impl HarnessBroker {
                 self.prepare_foreground_final_checks(transaction, admission)
             }
             ForegroundSignal::FinalizeCheckContinuationRequested => {
+                if finalization.collection.is_some() {
+                    finalization.pending_check_action = None;
+                    finalization.pending_stale_continuation = None;
+                    if finalization.phase == FinalizationPhase::ResumeStale {
+                        finalization.resume_stopped(ProviderError::Cancelled)?;
+                        return Ok(ForegroundAction::Wait);
+                    }
+                    let checks = finalization
+                        .checks
+                        .as_mut()
+                        .context("cancelled check continuation is missing")?;
+                    let result = self.take_automatic_check_result(checks);
+                    return self.prepare_final_response(finalization, admission.request.id, result);
+                }
                 if finalization.phase == FinalizationPhase::ResumeStale {
                     if self
                         .questions
@@ -1013,6 +1037,11 @@ impl HarnessBroker {
                     "automatic repair publication was not pending"
                 );
                 admission.events.extend(result?);
+                if finalization.collection.is_some() {
+                    finalization.repair_request = None;
+                    finalization.resume_stopped(ProviderError::Cancelled)?;
+                    return Ok(ForegroundAction::Wait);
+                }
                 let request = finalization
                     .repair_request
                     .take()
@@ -1096,6 +1125,13 @@ impl HarnessBroker {
                             .auto_compaction_job
                             .take()
                             .context("automatic compaction job is missing")?;
+                        if finalization.collection.is_some() {
+                            let (delivery, _, _) = self.commit_owned_compaction(job.cancel())?;
+                            finalization.phase = FinalizationPhase::AutoCompactionEnd;
+                            return Ok(ForegroundAction::Effect(
+                                ForegroundJob::AutoCompactionPublication(delivery),
+                            ));
+                        }
                         finalization.phase = FinalizationPhase::AutoCompactionRunning;
                         Ok(ForegroundAction::Effect(ForegroundJob::Compaction(
                             Box::new(job),
@@ -1673,6 +1709,24 @@ impl HarnessBroker {
         action: check_admission::AutomaticCheckAction,
     ) -> Result<ForegroundAction> {
         use check_admission::AutomaticCheckAction;
+        if finalization.collection.is_some()
+            && matches!(
+                &action,
+                AutomaticCheckAction::Refresh(_)
+                    | AutomaticCheckAction::Run(_)
+                    | AutomaticCheckAction::Repair { .. }
+                    | AutomaticCheckAction::Revalidate
+            )
+        {
+            let checks = finalization
+                .checks
+                .as_mut()
+                .context("cancelled automatic check transaction is missing")?;
+            let result = self.take_automatic_check_result(checks);
+            finalization.pending_check_action = None;
+            finalization.pending_stale_continuation = None;
+            return self.prepare_final_response(finalization, request_id, result);
+        }
         match action {
             AutomaticCheckAction::Refresh(job) => Ok(ForegroundAction::Effect(
                 ForegroundJob::AutomaticCheckRefresh(Box::new(job)),
@@ -2503,5 +2557,171 @@ impl HarnessBroker {
             .settlement
             .seal_effects(&staged.expected_effects)?;
         finalization.effects_applied()
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    /// Build a finalizing mock-provider foreground without starting any native work.
+    async fn finalizing_fixture() -> Result<(
+        HarnessBroker,
+        ForegroundTransaction,
+        Box<super::super::foreground_dispatch::ForegroundAdmission>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    )> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.checkpoint = None;
+        let (publication, _updates) = publication::channel();
+        let TurnTransaction::Admitting(admission) = broker.begin_foreground_dispatch(
+            Request {
+                id: 1,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"finish"}),
+            },
+            publication,
+        )?
+        else {
+            anyhow::bail!("fixture did not admit a prompt")
+        };
+        let mut staged = broker.stage_foreground_interaction(
+            "finish",
+            PromptMode::Chat,
+            Some(&ExchangeAdmission::chat("finish".into())),
+            ProviderInput::from_user_text("finish"),
+        )?;
+        broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+        let engine = broker
+            .execution_registry()
+            .owner(crate::provider::ThreadOwner::root(&broker.session.id))
+            .await?;
+        let transaction = broker.construct_foreground_transaction(&staged, engine)?;
+        Ok((broker, transaction, admission, workspace, data))
+    }
+
+    /// An acknowledged start publication cannot launch compaction after cancellation.
+    #[tokio::test]
+    async fn cancelled_compaction_publication_advances_without_starting_work() -> Result<()> {
+        let (mut broker, mut transaction, mut admission, _workspace, _data) =
+            finalizing_fixture().await?;
+        let mut finalization = ForegroundFinalization::new(
+            admission.take_submission()?,
+            PromptMode::Chat,
+            Vec::new(),
+            Ok(ProviderCompletion::default()),
+            transaction.settlement.clone(),
+            None,
+            Some(ForegroundCollection::Cancel(
+                crate::exchange::command::CancelledInputPolicy::Retain,
+            )),
+        );
+        finalization.phase = FinalizationPhase::AutoCompactionStart;
+        finalization.check_result = Some((Value::Null, Vec::new()));
+        broker.capability.native_compact = true;
+        broker.session.provider_session_id = Some("fixture-history".into());
+        let (job, _) =
+            broker.prepare_owned_compaction(compaction::CompactionProvenance::Automatic {
+                turn_id: "fixture-turn".into(),
+            })?;
+        finalization.auto_compaction_job = Some(job);
+        transaction.finalization = Some(finalization);
+        let mut dispatch = TurnTransaction::Finalizing {
+            transaction: Box::new(transaction),
+            admission,
+        };
+        let action = broker.step_foreground(
+            &mut dispatch,
+            ForegroundSignal::AutoCompactionPublished(Ok(Vec::new())),
+        )?;
+        assert!(
+            matches!(
+                action,
+                ForegroundAction::Effect(ForegroundJob::AutoCompactionPublication(_))
+            ),
+            "cancelled compaction started work instead of publishing retirement"
+        );
+        let action = broker.step_foreground(
+            &mut dispatch,
+            ForegroundSignal::AutoCompactionPublished(Ok(Vec::new())),
+        )?;
+        assert!(
+            matches!(
+                action,
+                ForegroundAction::Effect(ForegroundJob::FinalResponsePublication(_))
+            ),
+            "cancelled compaction did not advance to response publication"
+        );
+        Ok(())
+    }
+
+    /// A late clarification publication cannot restart collected work.
+    #[tokio::test]
+    async fn cancelled_clarification_publication_never_restarts_native_work() -> Result<()> {
+        cancelled_continuation(FinalizationPhase::ClarificationPublication).await
+    }
+
+    /// A late repair publication cannot restart collected work.
+    #[tokio::test]
+    async fn cancelled_repair_publication_never_restarts_native_work() -> Result<()> {
+        cancelled_continuation(FinalizationPhase::CheckRepairPublication).await
+    }
+
+    /// A late stale-context continuation cannot restart collected work.
+    #[tokio::test]
+    async fn cancelled_stale_continuation_never_restarts_native_work() -> Result<()> {
+        cancelled_continuation(FinalizationPhase::ResumeStale).await
+    }
+
+    /// Drive one publication race directly through its retained finalization state.
+    async fn cancelled_continuation(phase: FinalizationPhase) -> Result<()> {
+        let (mut broker, mut transaction, mut admission, _workspace, _data) =
+            finalizing_fixture().await?;
+        let mut finalization = ForegroundFinalization::new(
+            admission.take_submission()?,
+            PromptMode::Chat,
+            Vec::new(),
+            Ok(ProviderCompletion::default()),
+            transaction.settlement.clone(),
+            None,
+            Some(ForegroundCollection::Cancel(
+                crate::exchange::command::CancelledInputPolicy::Retain,
+            )),
+        );
+        finalization.phase = phase;
+        transaction.finalization = Some(finalization);
+        let mut dispatch = TurnTransaction::Finalizing {
+            transaction: Box::new(transaction),
+            admission,
+        };
+        let signal = match phase {
+            FinalizationPhase::ClarificationPublication => {
+                ForegroundSignal::ClarificationPublished(Ok(Vec::new()))
+            }
+            FinalizationPhase::CheckRepairPublication => {
+                ForegroundSignal::CheckRepairPublished(Ok(Vec::new()))
+            }
+            FinalizationPhase::ResumeStale => ForegroundSignal::FinalizeCheckContinuationRequested,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            broker.step_foreground(&mut dispatch, signal)?,
+            ForegroundAction::Wait
+        ));
+        let TurnTransaction::Finalizing { transaction, .. } = dispatch else {
+            anyhow::bail!("cancelled continuation restarted native execution");
+        };
+        let finalization = transaction.finalization.as_ref().unwrap();
+        assert!(finalization.phase == FinalizationPhase::Effects);
+        assert!(matches!(
+            finalization.outcome,
+            Err(ProviderError::Cancelled)
+        ));
+        assert!(!transaction.native.has_dispatched_task());
+        Ok(())
     }
 }

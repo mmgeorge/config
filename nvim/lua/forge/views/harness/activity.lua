@@ -25,7 +25,8 @@ function M.receive(state, incoming, epoch)
   local previous = state.activity
   if previous and incoming.revision < previous.revision then return false end
   state.activity = incoming
-  if incoming.phase == "idle" then require("forge.views.harness.cleanup_progress").settled(state) end
+  local cleanup_progress = require("forge.views.harness.cleanup_progress")
+  if incoming.phase == "idle" and not cleanup_progress.active(state) then cleanup_progress.settled(state) end
   return true
 end
 

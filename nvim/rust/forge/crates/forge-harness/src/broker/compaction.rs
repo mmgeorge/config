@@ -31,6 +31,14 @@ pub(crate) struct CompactionResult {
 }
 
 impl CompactionJob {
+    /// Retire reserved work without sending a compaction request to the provider.
+    pub(crate) fn cancel(self) -> CompactionResult {
+        CompactionResult {
+            state: self.state,
+            output: Err(ProviderError::Cancelled),
+        }
+    }
+
     /// Get the host-created attempt identity before moving this job into its retained worker.
     pub(crate) fn id(&self) -> &str {
         &self.state.compaction.id

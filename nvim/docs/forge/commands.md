@@ -527,6 +527,10 @@ removes that exchange and returns the prompt to the composer; the provider's ech
 your own prompt does not count as activity. If the composer already holds newer text,
 the prompt stays in the queue as an unsent draft that you can retry or edit instead. After visible activity, the exchange stays
 in history as cancelled.
+Cancellation remains pending until native work and host settlement finish. Repeated
+`Ctrl-C` presses share the pending request. If its response times out, cleanup continues
+and the notice identifies the phase still running; another cancel is not required.
+A reopened view restores that progress from the host snapshot.
 When a turn fails in a way that leaves the provider's state unknown, such as a send
 that ends without confirmation, Harness restarts the provider before it runs anything
 else. Commands, including `Ctrl-C`, wait until the restart finishes. If the provider

@@ -23,6 +23,7 @@ pub(super) struct CommandQueue {
     journal: CommandJournal,
     order: VecDeque<CommandId>,
     pending: HashMap<CommandId, QueuedCommand>,
+    joined: HashMap<CommandId, Vec<QueuedCommand>>,
     availability: QueueAvailability,
     publications: Option<std::sync::Arc<super::publication::SessionPublications>>,
 }
@@ -44,6 +45,11 @@ impl CommandQueue {
         session: &str,
         step: u64,
     ) {
+        if let Some(observers) = self.joined.remove(&command.record.request.id) {
+            for mut observer in observers {
+                self.lose_observation(&mut observer, trace, session, step);
+            }
+        }
         if command
             .lose_observation(&mut self.journal, trace, session, step)
             .is_err()
@@ -102,6 +108,7 @@ impl CommandQueue {
             journal,
             order: VecDeque::new(),
             pending: HashMap::new(),
+            joined: HashMap::new(),
             availability: QueueAvailability::Open,
             publications: None,
         })
@@ -240,7 +247,12 @@ impl CommandQueue {
             }
             let destination = match active {
                 Some(active) if active.record.request.id == request.id => Some(active),
-                Some(_) | None => self.pending.get_mut(&request.id),
+                Some(_) | None => self.pending.get_mut(&request.id).or_else(|| {
+                    self.joined
+                        .values_mut()
+                        .flatten()
+                        .find(|command| command.record.request.id == request.id)
+                }),
             };
             if let Some(command) = destination {
                 command.waiters.push(reply);
@@ -249,21 +261,44 @@ impl CommandQueue {
             self.storage_failed(CommandJournalError::NotActive, reply, response_log);
             return;
         }
-        match self.journal.admit(&request) {
+        let shared = active.filter(|active| {
+            self.order.is_empty() && equivalent_cancellation(&active.record.request, &request)
+        });
+        let operation = shared.as_ref().map(|active| &active.record.request.id);
+        let admitted = match operation {
+            Some(operation) => self.journal.admit_operation(&request, Some(operation)),
+            None => self.journal.admit(&request),
+        };
+        match admitted {
             Ok(record) => {
                 trace.record(session, "exchange.command.queued", serde_json::json!({
                     "command_id":request.id.as_str(),"sequence":record.sequence,"revision":record.state.revision(),"update_step":step,
                 }));
-                self.order.push_back(request.id.clone());
-                self.pending.insert(
-                    request.id,
-                    QueuedCommand {
-                        record,
-                        waiters: vec![reply],
-                        admitted_at: tokio::time::Instant::now(),
-                        task_admission,
-                    },
-                );
+                let command = QueuedCommand {
+                    record,
+                    waiters: vec![reply],
+                    admitted_at: tokio::time::Instant::now(),
+                    task_admission,
+                };
+                if let Some(active) = shared {
+                    if let Some(outcome) = active.record.completion() {
+                        self.finish(
+                            command,
+                            outcome.map(|result| result.outcome),
+                            trace,
+                            session,
+                            step,
+                        );
+                    } else {
+                        self.joined
+                            .entry(active.record.request.id.clone())
+                            .or_default()
+                            .push(command);
+                    }
+                } else {
+                    self.order.push_back(request.id.clone());
+                    self.pending.insert(request.id, command);
+                }
             }
             Err(CommandJournalError::IdentityConflict) => {
                 self.respond(
@@ -332,14 +367,25 @@ impl CommandQueue {
         session: &str,
         step: u64,
     ) {
+        if command.record.completion().is_some() {
+            return;
+        }
         if self.storage_unavailable() {
             let mut command = command;
             self.lose_observation(&mut command, trace, session, step);
             return;
         }
-        match self.journal.finish(&command.record.request.id, outcome) {
+        match self
+            .journal
+            .finish(&command.record.request.id, outcome.clone())
+        {
             Ok(record) => {
                 self.publish_completion(&record, trace, session, step);
+                if let Some(observers) = self.joined.remove(&command.record.request.id) {
+                    for observer in observers {
+                        self.finish(observer, outcome.clone(), trace, session, step);
+                    }
+                }
                 if command
                     .notify(&mut self.journal, record, trace, session, step)
                     .is_err()
@@ -348,6 +394,27 @@ impl CommandQueue {
                 }
             }
             Err(error) => self.uncommitted(command, error, trace, session, step),
+        }
+    }
+
+    /// Complete response observers without transferring the active cleanup operation.
+    pub(super) fn finish_observers(
+        &mut self,
+        command: &mut QueuedCommand,
+        outcome: Result<super::command::CommandOutcome, super::command::CommandFailure>,
+        trace: &crate::trace::TraceStore,
+        session: &str,
+        step: u64,
+    ) {
+        let observers = QueuedCommand {
+            record: command.record.clone(),
+            admitted_at: command.admitted_at,
+            task_admission: None,
+            waiters: std::mem::take(&mut command.waiters),
+        };
+        self.finish(observers, outcome, trace, session, step);
+        if let Ok(Some(record)) = self.journal.lookup(&command.record.request.id) {
+            command.record = record;
         }
     }
 
@@ -490,7 +557,24 @@ impl CommandQueue {
         for (_, command) in self.pending.drain() {
             command.fail_observers(error.clone(), trace, session, step);
         }
+        for command in self.joined.drain().flat_map(|(_, observers)| observers) {
+            command.fail_observers(error.clone(), trace, session, step);
+        }
     }
+}
+
+/// Sharing never bypasses an explicit input revision or changes draft-restoration policy.
+fn equivalent_cancellation(active: &CommandRequest, incoming: &CommandRequest) -> bool {
+    matches!((&active.command, &incoming.command),
+        (super::command::Command::CancelExchange(active), super::command::Command::CancelExchange(incoming))
+            if active.input == incoming.input)
+        && matches!(
+            (&active.input_control, &incoming.input_control),
+            (
+                super::command::InputControl::AtExecution,
+                super::command::InputControl::AtExecution
+            )
+        )
 }
 
 /// Retain resolvers with the exact record they observe until terminal notification.
@@ -669,6 +753,196 @@ mod tests {
             command: Command::CancelExchange(CancelExchangeRequest::default()),
             input_control: InputControl::default(),
         }
+    }
+
+    /// Repeated cancel identities observe the active stop without starting another FIFO operation.
+    #[tokio::test]
+    async fn equivalent_cancellations_share_active_operation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        super::super::core_log::persist_test_session(root.path(), "session")?;
+        let trace = crate::trace::TraceStore::open(root.path())?;
+        let mut queue = CommandQueue::open(root.path(), "session")?;
+        let (first_reply, first_response) = oneshot::channel();
+        queue.admit(
+            CommandAdmission {
+                request: request("first"),
+                reply: first_reply,
+                task_admission: None,
+            },
+            None,
+            &trace,
+            "session",
+            1,
+        );
+        let mut active = queue.start(&trace, "session", 2).unwrap();
+        let (second_reply, second_response) = oneshot::channel();
+        queue.admit(
+            CommandAdmission {
+                request: request("second"),
+                reply: second_reply,
+                task_admission: None,
+            },
+            Some(&mut active),
+            &trace,
+            "session",
+            3,
+        );
+        assert!(
+            !queue.has_pending(),
+            "equivalent cancellation queued another stop"
+        );
+        queue.finish_observers(
+            &mut active,
+            Err(CommandFailure::StopTimedOut),
+            &trace,
+            "session",
+            4,
+        );
+        for response in [first_response, second_response] {
+            assert!(matches!(
+                response.await?,
+                Err(ExecuteCommandError::Failed(CommandFailure::StopTimedOut))
+            ));
+        }
+        let (late_reply, late_response) = oneshot::channel();
+        queue.admit(
+            CommandAdmission {
+                request: request("late"),
+                reply: late_reply,
+                task_admission: None,
+            },
+            Some(&mut active),
+            &trace,
+            "session",
+            5,
+        );
+        assert!(
+            !queue.has_pending(),
+            "late observer restarted a timed-out stop"
+        );
+        assert!(matches!(
+            late_response.await?,
+            Err(ExecuteCommandError::Failed(CommandFailure::StopTimedOut))
+        ));
+        Ok(())
+    }
+
+    /// Joined receipts preserve their own identity and cannot cross a distinct queued intent.
+    #[tokio::test]
+    async fn joined_cancellation_preserves_replay_identity_and_fifo_boundaries()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        super::super::core_log::persist_test_session(root.path(), "session")?;
+        let trace = crate::trace::TraceStore::open(root.path())?;
+        let mut queue = CommandQueue::open(root.path(), "session")?;
+        let (reply, _) = oneshot::channel();
+        queue.admit(
+            CommandAdmission {
+                request: request("first"),
+                reply,
+                task_admission: None,
+            },
+            None,
+            &trace,
+            "session",
+            1,
+        );
+        let mut active = queue.start(&trace, "session", 2).unwrap();
+        let mut responses = Vec::new();
+        for _ in 0..2 {
+            let (reply, response) = oneshot::channel();
+            queue.admit(
+                CommandAdmission {
+                    request: request("joined"),
+                    reply,
+                    task_admission: None,
+                },
+                Some(&mut active),
+                &trace,
+                "session",
+                3,
+            );
+            responses.push(response);
+        }
+        let mut different = request("different-policy");
+        different.command = Command::CancelExchange(CancelExchangeRequest {
+            input: super::super::command::CancelledInputPolicy::RestoreIfUnconsumed,
+        });
+        let (reply, _) = oneshot::channel();
+        queue.admit(
+            CommandAdmission {
+                request: different,
+                reply,
+                task_admission: None,
+            },
+            Some(&mut active),
+            &trace,
+            "session",
+            4,
+        );
+        let (reply, _) = oneshot::channel();
+        queue.admit(
+            CommandAdmission {
+                request: request("after-boundary"),
+                reply,
+                task_admission: None,
+            },
+            Some(&mut active),
+            &trace,
+            "session",
+            5,
+        );
+        assert_eq!(
+            queue.order.len(),
+            2,
+            "coalescing overtook an intervening command"
+        );
+        queue.finish(
+            active,
+            Ok(super::super::command::CommandOutcome::Cancelled(
+                super::super::command::CancellationOutcome::NoWork,
+            )),
+            &trace,
+            "session",
+            6,
+        );
+        for response in responses {
+            let result = response.await??;
+            assert_eq!(result.id.as_str(), "joined");
+            assert_eq!(result.sequence, 2);
+        }
+        let history = crate::storage::writer::HistoryWriter::for_root(root.path())?;
+        assert_eq!(
+            CommandJournal::control_operation(&history, "session", "joined")?,
+            "first"
+        );
+        assert_eq!(
+            CommandJournal::control_operation(&history, "session", "after-boundary")?,
+            "after-boundary"
+        );
+        Ok(())
+    }
+
+    /// Recover aliases from a committed operation result without replaying either command.
+    #[test]
+    fn recovery_completes_joined_receipt_from_original_outcome() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        super::super::core_log::persist_test_session(root.path(), "session")?;
+        let mut journal = CommandJournal::open(root.path(), "session")?;
+        let original = request("original");
+        let admitted = journal.admit(&original)?;
+        journal.start(&admitted)?;
+        journal.admit_operation(&request("joined"), Some(&original.id))?;
+        journal.finish(&original.id, Err(CommandFailure::StopTimedOut))?;
+        journal.recover()?;
+        assert!(matches!(
+            journal
+                .lookup(&CommandId::new("joined")?)?
+                .unwrap()
+                .completion(),
+            Some(Err(CommandFailure::StopTimedOut))
+        ));
+        Ok(())
     }
 
     /// A failed required response record fences admission and resolves all waiters without a trace queue dependency.

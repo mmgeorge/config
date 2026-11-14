@@ -266,6 +266,25 @@ async fn slow_collection_fixture(
     let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider.provider_handle());
+    // A reopened session already has progress; the next owner must continue its revision.
+    crate::exchange::journal::CommandJournal::open(
+        &broker.data_root,
+        broker.observer().session_id(),
+    )?
+    .append_core(
+        &crate::exchange::core_log::CoreRecord::CancellationProgress {
+            progress: crate::exchange::CancellationProgress {
+                operation_id: crate::exchange::command::CommandId::new("prior-cancellation")?,
+                exchange_id: None,
+                revision: 40,
+                phase: crate::exchange::CancellationPhase::Settled,
+                response_timed_out: false,
+                started_at_ms: 1,
+                updated_at_ms: 2,
+                blockers: Default::default(),
+            },
+        },
+    )?;
     let controller = SessionController::new(broker).await?;
     controller
         .trace
@@ -596,11 +615,18 @@ async fn overdue_cancel_recovers(boundary: CollectionBoundary) -> Result<()> {
         ensure!(started.elapsed() >= Duration::from_secs(50));
         ensure!(fixture.collection_count.load(Ordering::Acquire) == 1, "late native cleanup did not remain singular");
         ensure!(fixture.engine.active_invocation_scope()?.is_none(), "native execution remained active after late collection");
-        fixture.controller.exchange_owner.execute_command(
-            Command::CancelExchange(CancelExchangeRequest::default())
-        ).await.context("cancel was refused after late collection completed")?;
-        // The overdue stop's retained transition outlives it; a child quiescence left in it
-        // would park every later root turn at completion.
+        let exchange = SqliteStore::open(&fixture.controller.data_root)?
+            .list_exchange(fixture.controller.observer.session_id())?
+            .pop().context("late collection lost its exchange")?;
+        ensure!(exchange.state() == crate::exchange::ExchangeState::Cancelled,
+            "late collection required another cancel to settle: {:?}", exchange.state());
+        let progress = fixture.controller.observer.snapshot()?.cancellation
+            .context("late cancellation lost its durable progress")?;
+        ensure!(progress.revision > 40, "new owner reset the saved cancellation revision");
+        ensure!(progress.phase == crate::exchange::CancellationPhase::Settled,
+            "late cancellation did not publish settlement");
+        ensure!(progress.response_timed_out, "settlement lost the response timeout");
+        // Late collection must release child admission without another cancellation command.
         ensure!(!fixture.controller.agent_coordinator.is_quiescing(),
             "the overdue stop retained its child quiescence after it settled");
         let completions = fixture.events.lock().expect("fixture events poisoned")
@@ -694,10 +720,11 @@ async fn cancels_queued_behind_a_failed_stop_are_answered() -> Result<()> {
         })
         .await
         .context("the cancellations queued behind the failed stop were never answered")??;
-        ensure!(
-            queued.0.is_ok() && queued.1.is_ok(),
-            "a cancellation that found the restarted provider idle was refused"
-        );
+        for response in [queued.0, queued.1] {
+            ensure!(matches!(response,
+                Err(ExecuteCommandError::Failed(CommandFailure::StopFailed))),
+                "a joined cancellation did not receive the original operation failure");
+        }
         prompt::apply(
             &fixture.controller,
             Request {

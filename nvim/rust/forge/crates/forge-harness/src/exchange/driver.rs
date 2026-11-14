@@ -45,6 +45,7 @@ use crate::broker::{
 use crate::trace::TraceStore;
 
 mod admission;
+mod cancellation;
 mod check_admission;
 mod execution_state;
 mod handlers;
@@ -84,6 +85,7 @@ pub(crate) struct ExchangeDriver {
     commands: CommandQueue,
     execution_state: ExecutionState,
     failure_reason: Option<String>,
+    cancellation_progress: Option<super::CancellationProgress>,
     configuration_attempt: Option<ConfigurationAttempt>,
     deferred_configuration: Option<DeferredConfiguration>,
     pending_plan_acceptance: Option<PendingPlanAcceptance>,
@@ -154,6 +156,7 @@ impl ExchangeDriver {
             commands,
             execution_state: ExecutionState::Ready,
             failure_reason: None,
+            cancellation_progress: None,
             configuration_attempt: None,
             deferred_configuration: None,
             pending_plan_acceptance: None,
@@ -192,12 +195,29 @@ impl ExchangeDriver {
             || !state.check_runs.is_empty()
             || state.task_verification.is_some();
         match self.execution_state {
+            ExecutionState::Stopping
+                if matches!(state.command, Some(ActiveCommand::Cancel { .. })) =>
+            {
+                if has_work {
+                    scope.map_or(TurnStatus::Local, TurnStatus::Running)
+                } else {
+                    TurnStatus::Idle
+                }
+            }
             ExecutionState::Ready if has_work => {
                 scope.map_or(TurnStatus::Local, TurnStatus::Running)
             }
-            // A failed owner admits no new work, so once its last work ends nothing can run, and
-            // shutdown must see it idle or its stop never finishes.
-            ExecutionState::Ready | ExecutionState::Failed if !has_work => TurnStatus::Idle,
+            // Delivery retirement and provider recovery both wait for the foreground to end.
+            // Admission remains fenced independently; reporting Blocked here would make each
+            // wait for the other after the last foreground has already settled.
+            ExecutionState::Ready
+            | ExecutionState::Stopping
+            | ExecutionState::Restarting
+            | ExecutionState::Failed
+                if !has_work =>
+            {
+                TurnStatus::Idle
+            }
             ExecutionState::Ready
             | ExecutionState::Stopping
             | ExecutionState::Restarting
@@ -308,6 +328,7 @@ impl ExchangeDriver {
         let mut command_at_step_entry = false;
         let recovered = (|| -> Result<()> {
             let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)?;
+            self.cancellation_progress = store.cancellation_progress(session_id)?;
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_millis()
@@ -315,7 +336,7 @@ impl ExchangeDriver {
             services.tasks.recover_terminal_requests(&mut store, now_ms)
         })();
         if let Err(error) = recovered {
-            self.startup_fail(services, "Recover terminal requests", &error);
+            self.startup_fail(services, "Recover owner state", &error);
             trace.record(
                 session_id,
                 "task.terminal_recovery_failed",
@@ -1423,7 +1444,9 @@ async fn collect_failed_foreground(
         .transaction
         .fail_live_host_observer(&trace, &session);
     runtime.reject_pending_live_effects();
-    runtime.staged_effects.retain(ForegroundJob::is_collection);
+    runtime
+        .staged_effects
+        .retain(|job| job.disposition() == crate::broker::ForegroundEffectDisposition::Settlement);
     runtime.run_effects(ForegroundEffectGate::CollectionOnly);
     let approvals = std::panic::AssertUnwindSafe(async {
         permissions
@@ -1933,13 +1956,13 @@ impl ActiveTurn {
             action?
         };
         if collection_started {
-            let pending = self.staged_effects.len();
-            self.staged_effects.retain(ForegroundJob::is_collection);
-            if self.staged_effects.len() != pending {
-                self.collection_signals
-                    .push_back(ForegroundSignal::EffectFailed(
-                        crate::broker::TurnCancelled.into(),
-                    ));
+            let pending = std::mem::take(&mut self.staged_effects);
+            for job in pending {
+                if job.disposition() == crate::broker::ForegroundEffectDisposition::Settlement {
+                    self.staged_effects.push_back(job);
+                } else {
+                    self.collection_signals.push_back(job.retire());
+                }
             }
         }
         if completed_publication && let Some(publication) = self.publications.pop_front() {
@@ -2040,8 +2063,12 @@ impl ActiveTurn {
                 .staged_effects
                 .pop_front()
                 .expect("the captured staged prefix remains owned");
-            if matches!(gate, ForegroundEffectGate::Open) || job.is_collection() {
+            if matches!(gate, ForegroundEffectGate::Open)
+                || job.disposition() == crate::broker::ForegroundEffectDisposition::Settlement
+            {
                 self.jobs.spawn(run_foreground_job(job));
+            } else if self.transaction.collection_requested() {
+                self.collection_signals.push_back(job.retire());
             } else {
                 self.staged_effects.push_back(job);
             }

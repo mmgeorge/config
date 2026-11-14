@@ -50,10 +50,7 @@ An active check is status, not history. `TimelineStream::update_checks` replaces
 
 ## Usage and durations
 
-Interruption cleanup pauses the exchange clock rather than extending displayed model work.
-The retained exchange renders `Stopping`, then `Cleanup timed out - provider state uncertain`
-if its response deadline expires. The latter status does not animate, and neither status claims
-native termination. Collection state persists until settlement or authorized resumption.
+Interruption cleanup pauses the exchange clock rather than extending displayed model work. Cancellation snapshots retain a stopping phase through native collection, host drain, settlement, and recovery. The operation's response timeout is a separate flag and cannot certify settlement. The composer notice names the pending phase and survives reconnects through the durable cancellation projection; older revisions and callbacks from another runtime epoch cannot replace it. Reconfiguration keeps its separate nonanimated uncertainty status until collection or authorized resumption.
 
 Each `Turn` retains identified `TurnUsageReport` observations with independently available input, cached-input, reasoning, and output counts. `UsageReportId` deduplicates replay; an optional `ModelCallId` correlates a call across token and timing reports. Complementary measurements merge atomically, and conflicting evidence fails. `ExchangeMetrics` reconciles cumulative snapshots against their original turn instead of charging a repeated snapshot as another call. `Thread.ContextUsage` updates context occupancy separately from token expenditure.
 

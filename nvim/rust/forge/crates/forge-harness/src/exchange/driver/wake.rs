@@ -223,7 +223,7 @@ impl ExchangeDriver {
         {
             trace.record(session_id, "exchange.turn.waiting", serde_json::json!({
                 "work_id":runtime.id,"update_step":step,"running_jobs":(runtime.jobs.len() + runtime.publication_job.len()),
-                "staged_effects":runtime.staged_effects.iter().map(|job| (job.diagnostic_name(), job.is_collection())).collect::<Vec<_>>(),
+                "staged_effects":runtime.staged_effects.iter().map(|job| (job.diagnostic_name(), job.disposition())).collect::<Vec<_>>(),
                 "queued_publications":runtime.publications.len(),"publication_active":!runtime.publication_job.is_empty(),
                 "publication_drain_requested":runtime.publication_drain_requested,
                 "deferred_publications":deferred_publications.updates.len(),

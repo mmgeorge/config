@@ -146,6 +146,27 @@ T["snapshot"] = function()
     "replacement runtime input was applied to the previous runtime's input owner")
 end
 
+T["active_cancellation_survives_idle_activity_and_runtime_replacement"] = function()
+  local snapshot = require("forge.views.harness.snapshot")
+  local cleanup = require("forge.views.harness.cleanup_progress")
+  local progress = vim.json.decode(table.concat(vim.fn.readfile(
+    "nvim/lua/forge/tests/fixtures/protocol/cancellation-progress.json"), "\n"))
+  local state = { session = { id = "cancellation" }, runtime_epoch = "old-owner" }
+  cleanup.begin(state, "old-request")
+  local result = { session = { id = "cancellation" }, runtime_epoch = "new-owner",
+    snapshot_revision = 1, activity = { revision = 1, phase = "idle" }, cancellation = progress }
+  eq(snapshot.apply(state, result), true)
+  eq(cleanup.pending(state), false)
+  eq(cleanup.active(state), true)
+  eq(state.cleanup_operation_id, progress.operation_id)
+  eq(state.cleanup_notice, "Cancellation pending - draining host work (response timed out)")
+  result.snapshot_revision = 2
+  result.cancellation = vim.tbl_extend("force", progress, { revision = progress.revision + 1, phase = "settled" })
+  eq(snapshot.apply(state, result), true)
+  eq(cleanup.active(state), false)
+  eq(state.cleanup_notice, nil)
+end
+
 T["vanished_child_returns_presentation_to_main"] = function()
   local snapshot = require("forge.views.harness.snapshot")
   package.loaded["forge.lsp.startup"] = { start = function() end }

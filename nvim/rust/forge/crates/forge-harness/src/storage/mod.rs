@@ -2,6 +2,7 @@ use crate::provider::ScopeOwner;
 pub(crate) mod admission;
 mod agent_policy;
 mod archive;
+mod cancellation;
 pub(crate) mod configuration;
 mod current;
 pub mod database;

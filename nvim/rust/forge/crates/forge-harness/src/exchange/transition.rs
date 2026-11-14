@@ -42,6 +42,13 @@ pub(super) enum StopIntent {
 }
 
 impl StopIntent {
+    /// Keep cancellation visible while its host settlement still owns the exchange.
+    fn collected_status(self) -> Option<super::ExchangeCollection> {
+        match self {
+            Self::Cancel(_) => Some(super::ExchangeCollection::Settling),
+            Self::Reconfigure { .. } => None,
+        }
+    }
     /// Get collection scope without consulting semaphore counts or provider identity.
     fn children(self) -> ChildCollectionPolicy {
         match self {
@@ -104,6 +111,45 @@ pub(super) struct ExchangeStop {
 }
 
 impl ExchangeStop {
+    /// Project the retained owner stage without consuming native or host work.
+    pub(super) fn cancellation_progress(&self) -> (super::CancellationPhase, Option<ExchangeId>) {
+        use super::CancellationPhase;
+        let phase = match self.stage {
+            TransitionStage::Acquiring(_) | TransitionStage::Preparing { .. } => {
+                CancellationPhase::Acquiring
+            }
+            TransitionStage::Collecting { .. } => CancellationPhase::Collecting,
+            TransitionStage::Draining { .. } => CancellationPhase::Draining,
+            TransitionStage::Settling { .. } => CancellationPhase::Settling,
+            TransitionStage::Ready { .. } | TransitionStage::Consumed => CancellationPhase::Settled,
+            TransitionStage::Uncertain { .. } => CancellationPhase::Recovering,
+        };
+        let target = match &self.stage {
+            TransitionStage::Collecting { target, .. }
+            | TransitionStage::Draining { target, .. }
+            | TransitionStage::Settling { target, .. } => {
+                target.as_ref().map(|target| target.id().clone())
+            }
+            _ => None,
+        };
+        (
+            phase,
+            self.invocation
+                .as_ref()
+                .map(|invocation| invocation.scope.exchange_id.clone())
+                .or(target),
+        )
+    }
+
+    /// End response observation without abandoning collection or foreground settlement.
+    pub(super) fn expire_response(&mut self) {
+        self.reporting.response_expired = true;
+    }
+
+    pub(super) fn response_expired(&self) -> bool {
+        self.reporting.response_expired
+    }
+
     /// Correlate retained cleanup evidence without exposing provider payloads or writable state.
     pub(super) fn core_transition(
         &self,
@@ -355,6 +401,9 @@ impl ExchangeStop {
 
     /// Await identified facts while the driver keeps processing native events and queued intent.
     pub(super) async fn next(&mut self, foreground: TurnStatus) -> TransitionEvent {
+        if self.reporting.response_expired {
+            return self.next_stage(foreground).await;
+        }
         let report_at = self.reporting.next_at();
         tokio::select! {
             biased;
@@ -556,6 +605,7 @@ impl ExchangeStop {
                         target
                             .as_ref()
                             .map(crate::broker::ExchangeControlSelection::id),
+                        self.intent.collected_status(),
                     )
                     .map_err(transition_failure)?;
                 self.foreground_signals.push_back(
@@ -611,6 +661,12 @@ impl ExchangeStop {
                 })
             }
             TransitionEvent::CollectionDeadline => {
+                if self.reporting.response_expired {
+                    return Ok(TransitionProgress::Waiting {
+                        events: Vec::new(),
+                        input: None,
+                    });
+                }
                 self.report_collection_timeout(broker)?;
                 Err(TransitionFailure::Overdue)
             }
@@ -1166,7 +1222,10 @@ impl RetainedTransition {
             | TransitionStage::Consumed => None,
         };
         let events = broker
-            .owner_collection_completed(target.map(crate::broker::ExchangeControlSelection::id))
+            .owner_collection_completed(
+                target.map(crate::broker::ExchangeControlSelection::id),
+                self.intent.collected_status(),
+            )
             .map_err(transition_failure)?;
         Ok(events)
     }
@@ -1238,6 +1297,7 @@ struct TransitionReporting {
     admitted_at: tokio::time::Instant,
     policy: Option<forge_provider_api::CleanupPolicy>,
     pending_published: bool,
+    response_expired: bool,
 }
 
 impl TransitionReporting {
@@ -1252,6 +1312,7 @@ impl TransitionReporting {
             admitted_at,
             policy,
             pending_published: false,
+            response_expired: false,
         }
     }
 

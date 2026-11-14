@@ -997,6 +997,7 @@ dependencies = [
  "forge-protocol",
  "forge-provider-api",
  "forge-providers",
+ "forge-recorded-fixtures",
  "forge-shell",
  "futures-util",
  "glob",
