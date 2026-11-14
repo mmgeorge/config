@@ -76,6 +76,7 @@ end
 ---@return fun() cancel
 ---@return fun()? expire
 function M.request(workspace, arguments, authorize, receive, budget, readiness)
+  local selected_client = readiness and readiness.client
   local finished, outstanding, attempted, responses, collecting = false, 0, 0, 0, false
   local requests, buffers, versions, clients, raw, warnings = {}, {}, {}, {}, {}, {}
   local result = { rows = {}, source = "workspace" }
@@ -83,12 +84,10 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   if workspace_query then result.coverage = {} end
   local deadline = assert(vim.uv.new_timer())
   local guard = assert(vim.uv.new_timer())
-  local cancel_startup
   local send
   local function finish(failure)
     if finished then return end
     finished = true
-    if cancel_startup then cancel_startup() end
     deadline:stop() deadline:close()
     guard:stop() guard:close()
     for _, request in ipairs(requests) do
@@ -375,7 +374,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   end
   local function start()
     if arguments.operation == "status" then
-      for _, client in ipairs(vim.lsp.get_clients({ _uninitialized = true })) do
+      for _, client in ipairs(selected_client and { selected_client } or {}) do
         local filetype = arguments.path and vim.filetype.match({ filename = arguments.path })
         local config = client.config --[[@as vim.lsp.Config]]
         if not client:is_stopped() and source.belongs(client, workspace)
@@ -395,61 +394,45 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       finish() return
     end
     if workspace_query then
-      local selected = {}
-      for _, client in ipairs(vim.lsp.get_clients()) do
-        local root = client.root_dir or client.config.root_dir
-        root = type(root) == "string" and root or workspace
-        local startup_failed = false
-        for _, coverage in ipairs(result.coverage) do
-          if coverage.name == client.name and source.canonical(coverage.root) == source.canonical(root) then startup_failed = true break end
-        end
-        if not startup_failed and not client:is_stopped() and source.belongs(client, arguments.search_path or workspace) then
-          local coverage = { name = client.name, root = type(root) == "string" and root or workspace, state = "pending" }
-          result.coverage[#result.coverage + 1] = coverage
-          local provider = client.server_capabilities and client.server_capabilities.diagnosticProvider
-          local supported = arguments.operation == "workspace_symbols" and client:supports_method(methods.workspace_symbols)
-            or arguments.operation == "diagnostics" and type(provider) == "table" and provider.workspaceDiagnostics == true
-          if supported then selected[#selected + 1] = { client = client, coverage = coverage, provider = provider }
-          else
-            coverage.state, coverage.message = "unsupported", "Server does not support workspace " .. (arguments.operation == "diagnostics" and "diagnostics." or "symbols.")
-            warnings[#warnings + 1] = client.name .. ": " .. coverage.message
-          end
-        end
-      end
-      if #selected == 0 then
-        if #result.coverage == 0 then finish("unavailable: No running project language server.")
-        else collect() end
-        return
-      end
+      local client = selected_client
+      if not client or client:is_stopped() then finish("unavailable: selected LSP is not running") return end
+      local root = client.root_dir or client.config.root_dir
+      local coverage = { name = client.name, root = type(root) == "string" and root or workspace, state = "pending" }
+      result.coverage[1] = coverage
+      local provider = client.server_capabilities and client.server_capabilities.diagnosticProvider
+      local supported = arguments.operation == "workspace_symbols" and client:supports_method(methods.workspace_symbols)
+        or arguments.operation == "diagnostics" and type(provider) == "table" and provider.workspaceDiagnostics == true
+      if not supported then finish("unsupported: selected LSP does not support workspace " .. arguments.operation) return end
       outstanding = outstanding + 1
-      for _, selected in ipairs(selected) do
-        local client = selected.client
-        if arguments.operation == "workspace_symbols" then
-          send(client, methods.workspace_symbols, symbol_query(client), nil, function(value) symbols(value, client) end, nil, selected.coverage)
-        else
-          send(client, "workspace/diagnostic", { identifier = selected.provider.identifier, previousResultIds = {} }, nil, function(value)
-            assert(type(value) == "table" and type(value.items) == "table", "Missing workspace diagnostic report")
-            for _, report in ipairs(value.items) do
-              assert(report.kind == "full" and type(report.items) == "table", "Workspace report omitted diagnostics without a previous result")
-              for _, diagnostic in ipairs(report.items) do
-                local severity = ({ "error", "warning", "information", "hint" })[diagnostic.severity or 1] or "error"
-                if not arguments.severity or arguments.severity == "all" or arguments.severity == severity then
-                  location({ uri = report.uri, range = diagnostic.range }, client,
-                    client.name .. ": " .. severity .. (diagnostic.code and "[" .. tostring(diagnostic.code) .. "]" or "") .. ": " .. diagnostic.message)
-                end
+      if arguments.operation == "workspace_symbols" then
+        send(client, methods.workspace_symbols, symbol_query(client), nil, function(value) symbols(value, client) end, nil, coverage)
+      else
+        send(client, "workspace/diagnostic", { identifier = provider.identifier, previousResultIds = {} }, nil, function(value)
+          assert(type(value) == "table" and type(value.items) == "table", "Missing workspace diagnostic report")
+          for _, report in ipairs(value.items) do
+            assert(report.kind == "full" and type(report.items) == "table", "Workspace report omitted diagnostics without a previous result")
+            for _, diagnostic in ipairs(report.items) do
+              local severity = ({ "error", "warning", "information", "hint" })[diagnostic.severity or 1] or "error"
+              if not arguments.severity or arguments.severity == "all" or arguments.severity == severity then
+                location({ uri = report.uri, range = diagnostic.range }, client,
+                  client.name .. ": " .. severity .. (diagnostic.code and "[" .. tostring(diagnostic.code) .. "]" or "") .. ": " .. diagnostic.message)
               end
             end
-          end, nil, selected.coverage)
-        end
+          end
+        end, nil, coverage)
       end
       outstanding = outstanding - 1 collect() return
     end
+    if not selected_client then finish("invalid_workspace: semantic request has no selected client") return end
     local path = assert(arguments.path, "operation requires a source path")
     local buffer = source.loaded(path)
     local filetype = buffer and vim.bo[buffer].filetype or vim.filetype.match({ filename = path })
     if not filetype then finish("unsupported: Cannot determine the language of " .. path) return end
     local method = arguments.operation ~= "diagnostics" and methods[arguments.operation] or nil
-    local client, failure = source.select_client(path, filetype, buffer, method, workspace)
+    local client, failure = selected_client, "invalid_workspace: no selected client"
+    if client and method and not client:supports_method(method, buffer) then
+      finish("unsupported: selected LSP does not support " .. method) return
+    end
     if not client then finish(failure) return end
     if arguments.operation == "workspace_symbols" then
       send(client, methods.workspace_symbols, symbol_query(client), buffer, function(value) symbols(value, client) end)
@@ -486,10 +469,8 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
     local success, failure = pcall(start)
     if not success then finish(tostring(failure)) end
   end
-  if workspace_query and arguments.startup_issues then ready(nil, arguments.startup_issues)
-  else cancel_startup = require("forge.lsp.startup").wait(workspace, arguments.path or arguments.search_path, ready,
-    { method = workspace_query and arguments.operation == "diagnostics" and "workspace/diagnostic" or methods[arguments.operation],
-      ready = readiness }) end
+  if selected_client then ready()
+  else finish("invalid_workspace: semantic request has no selected client") end
   return function() finish("cancelled: LSP request cancelled.") end, expire
 end
 

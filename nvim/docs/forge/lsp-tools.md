@@ -1,8 +1,22 @@
 # Agent LSP tools
 
-Enable **LSP tools** in `/config` to expose nine read-only tools and two rename tools to root and child
-agents. The setting defaults to off. Disabling it revokes agent requests without
+Enable **LSP tools** in `/config` to expose eleven read-only tools and two rename tools to root and child
+agents. Semantic commands require `workspace`, the path to one Cargo.toml or
+package.json, relative to the session repository. Every request uses one LSP.
+`lsp_workspace_list` lists manifests without starting servers; `lsp_source_symbols`
+searches parsed source without an LSP. The setting defaults to off. Disabling it revokes agent requests without
 stopping editor servers or disabling plan navigation.
+
+Select the Neovim configuration with `require("forge").setup({ lsp = {
+workspace_servers = { rust = "rust_analyzer", typescript = "tsgo" } } })`
+when more than one enabled configuration matches a language. These values name
+existing configurations; Forge preserves their settings and commands. A sole
+matching configuration needs no preference. An ambiguous selection starts none.
+
+All semantic tools, including file-target navigation, diagnostics, status, and
+renames, require `workspace`. Paths remain relative to the session repository.
+`lsp_context` without workspace accepts only a local file target with no semantic
+relationships. Status inspects the selected server without starting it.
 
 ## Choose a tool
 
@@ -12,14 +26,16 @@ context or a semantic query. No tool moves the editor cursor.
 | Tool | Input | Result |
 | --- | --- | --- |
 | `lsp_overview` | Directory `path` (default `.`), `depth=2`, `declaration_depth=2`, `visibility=public` | Public declarations, fields, and methods grouped by directory and file |
-| `lsp_symbols` | File/directory `path`, optional name `query`, `depth=2`, `visibility=all` | Scoped declaration signatures, or workspace name matches when query has no path |
+| `lsp_workspace_list` | Optional directory `path` | Cargo.toml and package.json manifest paths |
+| `lsp_source_symbols` | File/directory `path`, optional `query`, `depth`, `visibility` | Parsed source declarations |
+| `lsp_symbols` | Required `workspace` and `query` | Symbols from one selected language server |
 | `lsp_definition` | Target selector, `kind=definition` | Definitions, type declarations (`type`), or implementations (`implementation`) |
 | `lsp_context` | Target selector, optional `include`, optional `start_line` | Containing declaration, source documentation, and body |
 | `lsp_references` | Target selector, `include_declaration=false` | Uses grouped by enclosing declaration, with one source line before and after |
 | `lsp_calls` | Target selector, required `direction=incoming` or `outgoing` | One level of callers or callees in an aligned symbol tree |
 | `lsp_paths` | `from` and `to` selectors, `max_depth=5`, `max_paths=3`, `max_requests=64` | Complete static call paths in aligned trees |
 | `lsp_diagnostics` | Optional file/directory `path`, `severity=all` | File diagnostics, or workspace reports with per-server coverage when path is omitted or a directory |
-| `lsp_status` | Optional `path` | Server roots, initialization state, and supported capabilities |
+| `lsp_status` | Optional `path` | Selected server root, initialization state, and supported capabilities |
 | `lsp_rename_symbol` | Target selector and required `new_name` | Apply a symbol rename across files |
 | `lsp_rename_file` | Required `old_path`, `new_path` | Move a file or directory and update references |
 
@@ -27,9 +43,9 @@ Paths are workspace-relative or authorized absolute paths. Lines and columns sta
 at one. Columns count Unicode code points, not bytes or screen cells. A returned
 identifier position can be passed directly to another tool.
 
-Symbol name searches with an explicit file or directory filter captured source
+Source symbol searches with an explicit file or directory filter captured source
 declarations before pagination. Name matching uses a case-insensitive substring of
-the short or qualified name. Without a path, a name query searches the language
+the short or qualified name. A semantic `lsp_symbols` query searches the selected language
 server's workspace symbols. `scope=all` can then include authorized dependency
 symbols outside the workspace.
 Overview and source-scoped symbol listings parse source directly, without starting
@@ -38,9 +54,9 @@ Context with a local target also reads source directly; requested relationships
 and workspace name searches wait for the relevant servers. Optional hover is
 included only when its server is already ready. Semantic queries reuse server
 readiness within one tool call and check it again on the next call.
-Workspace discovery excludes nested Git repositories and linked worktrees. Query
-a nested checkout explicitly to discover its servers independently. Root discovery
-queues candidates and resolves at most four concurrently.
+Workspace listing excludes nested Git repositories and linked worktrees. List a
+nested checkout explicitly to discover its manifests. A semantic request starts
+only the configuration selected for its manifest.
 Root discovery skips callbacks that do not answer within two seconds; a server
 that has started retains the longer initialization timeout.
 Rust searches request all symbol kinds from rust-analyzer rather than its default

@@ -634,6 +634,18 @@ impl LspScope {
     /// Run a decoded query under the live editor scope and read policy.
     pub(super) async fn query(self: &Arc<Self>, mut arguments: Arguments) -> Result<String> {
         self.check()?;
+        if let Some(manifest) = &arguments.workspace {
+            let path = self.authorize(manifest).await?;
+            ensure!(
+                path.is_file(),
+                "workspace manifest must be an existing file"
+            );
+            arguments.workspace = Some(
+                path.to_string_lossy()
+                    .trim_start_matches("\\\\?\\")
+                    .replace('\\', "/"),
+            );
+        }
         if let Some(path) = &arguments.path {
             arguments.path = Some(
                 self.authorize(path)

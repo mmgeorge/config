@@ -1,4 +1,5 @@
 ---@class ForgeConfig
+---@field lsp? {workspace_servers?: {rust?: string, typescript?: string}}
 ---@field text_correction ForgeTextCorrectionConfig
 ---@field harper ForgeHarperConfig
 ---@field status_buffer_name string

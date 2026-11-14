@@ -48,7 +48,7 @@ local function rename_workspace()
     return true, 1
   end
   scene.mock = mock
-  stub(require("forge.lsp.startup"), "wait", function(_, _, callback) callback() return function() end end)
+  stub(require("forge.lsp.workspace"), "resolve", function(_, _, callback) callback({client = mock}) return function() end end)
   stub(vim.lsp, "get_clients", function() return { mock } end)
   stub(vim.lsp, "get_client_by_id", function(id) return id == mock.id and mock or nil end)
   scene.buffer = vim.fn.bufadd(scene.item)

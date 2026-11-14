@@ -6,12 +6,13 @@ pub(super) const NAME: &str = "lsp_symbols";
 
 /// Describe symbols queries and their accepted inputs.
 pub(super) fn definition() -> ControlToolDefinition {
-    let (mut properties, required) = super::schema::base_schema("symbols");
+    let (mut properties, mut required) = super::schema::base_schema("symbols");
+    required.push("query");
     let fields = &mut properties;
-    fields.insert("query".into(), json!({"type":"string","minLength":1,"description":"Optional workspace symbol name search. Omit to list declarations under path."}));
+    fields.insert("query".into(), json!({"type":"string","minLength":1,"description":"Symbol name query sent to the single selected workspace LSP."}));
     ControlToolDefinition {
         name: NAME,
-        description: "Find declarations by name or list a file/directory. Returns signatures, hierarchy, and reusable \
+        description: "Search one manifest-selected language server for symbols. Returns signatures, hierarchy, and reusable \
                 identifier positions, without bodies.",
         input_schema: json!({"type":"object","additionalProperties":false,"required":required,"properties":properties}),
     }

@@ -21,13 +21,13 @@ pub(super) fn definitions() -> Vec<ControlToolDefinition> {
         ControlToolDefinition {
             name: SYMBOL,
             description: "Rename a symbol using its language server. Accepts the same exact target selectors as lsp_definition. Applies all returned text and file operations to disk. Requires existing write permission for every affected path; fails without prompting on denied access or unsaved affected buffers.",
-            input_schema: json!({"type":"object","additionalProperties":false,"required":["new_name"],"properties":fields}),
+            input_schema: json!({"type":"object","additionalProperties":false,"required":["workspace","new_name"],"properties":fields}),
         },
         ControlToolDefinition {
             name: FILE,
             description: "Move a file or directory and update references using language servers. Requires willRenameFiles support, a vacant destination, existing read/write permission on all affected paths, and clean affected buffers. No permission prompts or plain filesystem fallback.",
-            input_schema: json!({"type":"object","additionalProperties":false,"required":["old_path","new_path"],"properties":{
-                "old_path":{"type":"string","minLength":1},"new_path":{"type":"string","minLength":1}
+            input_schema: json!({"type":"object","additionalProperties":false,"required":["workspace","old_path","new_path"],"properties":{
+                "workspace":{"type":"string","minLength":1},"old_path":{"type":"string","minLength":1},"new_path":{"type":"string","minLength":1}
             }}),
         },
     ]
@@ -58,10 +58,12 @@ pub(crate) fn allowed_mode(mode: crate::provider::PromptMode) -> bool {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Request {
     Symbol {
+        workspace: String,
         target: super::request::Target,
         new_name: String,
     },
     File {
+        workspace: String,
         old_path: String,
         new_path: String,
     },
@@ -69,6 +71,21 @@ pub(super) enum Request {
 
 /// Decode public arguments through the existing exact target validator.
 fn parse(name: &str, mut value: Value) -> Result<Request> {
+    let workspace = value
+        .as_object_mut()
+        .and_then(|fields| fields.remove("workspace"))
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or(MutationError::Argument("workspace manifest is required"))?;
+    if !matches!(
+        std::path::Path::new(&workspace)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("Cargo.toml" | "package.json")
+    ) {
+        return Err(MutationError::Argument(
+            "workspace must name Cargo.toml or package.json",
+        ));
+    }
     if name == SYMBOL {
         let new_name = value
             .as_object_mut()
@@ -79,9 +96,14 @@ fn parse(name: &str, mut value: Value) -> Result<Request> {
         if new_name.trim().is_empty() {
             return Err(MutationError::Argument("new_name must be nonempty"));
         }
-        super::request::Arguments::parse("lsp_definition", value.clone())
-            .map_err(MutationError::Service)?;
+        super::request::Arguments::parse("lsp_definition", {
+            let mut arguments = value.clone();
+            arguments["workspace"] = json!(workspace);
+            arguments
+        })
+        .map_err(MutationError::Service)?;
         Ok(Request::Symbol {
+            workspace,
             target: serde_json::from_value(value)?,
             new_name,
         })
@@ -96,7 +118,11 @@ fn parse(name: &str, mut value: Value) -> Result<Request> {
         if old_path.trim().is_empty() || new_path.trim().is_empty() {
             return Err(MutationError::Argument("paths must be nonempty"));
         }
-        Ok(Request::File { old_path, new_path })
+        Ok(Request::File {
+            workspace,
+            old_path,
+            new_path,
+        })
     }
 }
 
@@ -151,6 +177,12 @@ pub(super) async fn execute(
     scope.check().map_err(MutationError::Service)?;
     let guard = scope.service.mutations.clone().lock_owned().await;
     let mut request = request;
+    let manifest = match &mut request {
+        Request::Symbol { workspace, .. } | Request::File { workspace, .. } => workspace,
+    };
+    *manifest = super::transaction::authorize(&scope, &policy, manifest, false)?
+        .to_string_lossy()
+        .into_owned();
     match &mut request {
         Request::Symbol { target, .. } => {
             if let Some(path) = target.path_mut() {
@@ -159,7 +191,9 @@ pub(super) async fn execute(
                     .into_owned();
             }
         }
-        Request::File { old_path, new_path } => {
+        Request::File {
+            old_path, new_path, ..
+        } => {
             *old_path = super::transaction::authorize(&scope, &policy, old_path, true)?
                 .to_string_lossy()
                 .into_owned();

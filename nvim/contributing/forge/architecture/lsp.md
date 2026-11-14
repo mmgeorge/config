@@ -6,7 +6,7 @@ The [tool reference](../../../docs/forge/lsp-tools.md) defines arguments and for
 
 ## Request flow
 
-Nine read-only `lsp_*` tools expose source overview, symbol discovery, navigation, context, references, calls, call paths, diagnostics, and status. `SourceDeclaration` extraction for Rust, TypeScript, JavaScript, and Lua supplies source ranges, signatures, nesting, and visibility, separately from plan projection.
+Eleven read-only `lsp_*` tools expose source overview, symbol discovery, navigation, context, references, calls, call paths, diagnostics, and status. `SourceDeclaration` extraction for Rust, TypeScript, JavaScript, and Lua supplies source ranges, signatures, nesting, and visibility, separately from plan projection.
 
 Rust owns one interaction scope per root or child turn, with the read policy and setting generation. It admits at most four requests per host, each with a 60-second startup wait and a ten-second operation deadline, or 30 seconds for path searches. Correlated `lsp.request` events reach the editor regardless of the selected view, and `session.lsp.authorize`, `session.lsp.respond`, and `session.lsp.analyze` bypass the busy broker lock. Target authorization precedes every editor read, and Rust checks returned paths again before publishing text. Cancellation sends `lsp.cancel`, and late replies cannot revive the request.
 
@@ -14,17 +14,17 @@ Rust owns one interaction scope per root or child turn, with the read policy and
 
 The shared Lua adapter owns client selection, hidden source buffers, and reference-counted leases. Agent queries read live editor contents, while plan navigation rejects source that differs from its captured digest. Unused hidden buffers expire 60 seconds after their last request.
 
-`forge.lsp.startup` starts servers only for requests that need them. Overview, source-scoped symbol listings, and context with a local target parse authorized source directly. Context adds optional hover only from an already-ready server. Semantic operations own readiness checks, scoped by path and supported method; a request remembers ready clients across target resolution and subsequent lookups. Each new request checks readiness again. Query deadlines include the 60-second startup allowance.
+`forge.lsp.workspace` discovers Cargo.toml and package.json manifests without starting servers. Semantic requests require an authorized manifest path and resolve it through the enabled Neovim configuration. A sole matching configuration is selected automatically; `lsp.workspace_servers.rust` and `.typescript` name preferred existing configurations when multiple configurations match. Ambiguity fails before startup. One selected client remains bound through target resolution, follow-up queries, diagnostics, and rename preparation; no operation combines servers.
 
-Discovery finds JavaScript and TypeScript projects by `package.json` and Rust projects by `Cargo.toml`, and keeps every distinct root. Scoped directory requests reuse completed parent discovery, inspect ancestor manifests, and exclude vendored and build directories. Discovery stops at nested Git repositories, including linked worktrees identified by a `.git` file; an explicit request inside that boundary discovers the nested workspace independently. File renames discover from their source path and contact matching providers for that path. Clients already serving a root are reused, and Harness never stops shared servers.
+`forge.lsp.startup` starts only the selected configuration for semantic requests. Overview, source-scoped symbol listings, and context with a local target parse authorized source directly. Context without workspace performs no semantic requests. Context with workspace may add hover from the selected server. Semantic operations own readiness checks, scoped by path and supported method; a request remembers ready clients across target resolution and subsequent lookups. Each new request checks readiness again. Query deadlines include the 60-second startup allowance.
 
-Workspace discovery admits at most four root candidates concurrently and yields to editor input between admission batches. Remaining candidates stay queued, so concurrency control does not truncate the project inventory. A `root_dir` callback that does not answer within two seconds is skipped without reporting a server failure, and a late callback cannot start its server. The separate 60-second initialization allowance begins when a server is launched or reused.
+Manifest discovery lists every nested Cargo.toml and package.json outside dependency, build, cache, and nested Git directories. It does not resolve roots or start servers. Semantic startup resolves only the selected manifest through one enabled configuration. Duplicate matching clients are an error. Concurrent requests reuse the same startup job and wait for initialization and reported indexing to finish. Cancelled waiters do not stop editor-owned servers.
 
 ## Result accuracy
 
 `forge.lsp.target` resolves names and occurrences, failing on ambiguity or incomplete search before the semantic operation starts. `forge.lsp.paths` walks outgoing call hierarchy edges with cycle checks, and captures every visited file so any change invalidates the result.
 
-`forge.lsp.diagnostics` reuses a pull report only while its buffer tick and client generation match, and reports push-only diagnostics with unknown freshness. Workspace diagnostics and symbols keep per-server coverage. Empty results, incomplete coverage, unsupported capabilities, startup failure, and disconnected servers each produce a distinct message.
+`forge.lsp.diagnostics` reuses a pull report only while its buffer tick and client generation match, and reports push-only diagnostics with unknown freshness. Workspace diagnostics and symbols report the selected server's coverage. Empty results, incomplete coverage, unsupported capabilities, startup failure, and disconnected servers each produce a distinct message.
 
 ## Rename ownership
 

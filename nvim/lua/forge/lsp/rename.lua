@@ -286,7 +286,7 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
     local stat = vim.uv.fs_stat(filename)
     local directory = stat and stat.type == "directory" or false
     local selected = {}
-    for _, client in ipairs(vim.lsp.get_clients()) do
+    for _, client in ipairs(readiness.client and { readiness.client } or {}) do
       if not client:is_stopped() and source.belongs(client, filename) and matches(client, method, filename, directory) then
         selected[#selected + 1] = client
       end
@@ -405,7 +405,8 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
       if not target then finish(failure) return end
       local filetype = vim.filetype.match({ filename = target.path }) or ""
       local buffer = source.loaded(target.path)
-      local client, error = source.select_client(target.path, filetype, buffer, "textDocument/rename", workspace)
+      local client, error = readiness.client, "invalid_workspace: no selected client"
+      if client and not client:supports_method("textDocument/rename", buffer) then finish("unsupported: selected LSP does not support rename") return end
       if not client then finish(error) return end
       read(target.path, function(contents)
         if not buffer then
@@ -440,7 +441,7 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
     local failure = touch(old) or touch(new)
     if failure then finish(failure) return end
     local selected = {}
-    for _, client in ipairs(vim.lsp.get_clients()) do
+    for _, client in ipairs(readiness.client and { readiness.client } or {}) do
       if not client:is_stopped() and source.belongs(client, old) and matches(client, "workspace/willRenameFiles", old, stat.type == "directory") then
         selected[#selected + 1] = client
       end
@@ -465,17 +466,13 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
     end
     next_client()
   end
-  local rename_path = request.kind == "symbol" and request.target.path or request.old_path
-  local cancel = require("forge.lsp.startup").wait(workspace, rename_path, guard(function(failure)
+  local cancel = require("forge.lsp.workspace").resolve(request.workspace, authorize, guard(function(selected, failure)
     active_cancel = nil
     if failure then finish(failure) return end
+    readiness = selected
     timer:start(10000, 0, vim.schedule_wrap(function() finish("timeout: Rename preparation exceeded 10 seconds.") end))
     if request.kind == "symbol" then symbol() else file() end
-  end), { ready = readiness, method = request.kind == "symbol" and "textDocument/rename" or nil,
-    accepts = request.kind == "file" and function(client)
-      local stat = vim.uv.fs_stat(request.old_path)
-      return stat ~= nil and matches(client, "workspace/willRenameFiles", request.old_path, stat.type == "directory")
-    end or nil })
+  end))
   if not finished then active_cancel = active_cancel or cancel end
   return function() finish("cancelled: Rename request cancelled.") end
 end

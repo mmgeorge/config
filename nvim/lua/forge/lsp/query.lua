@@ -61,7 +61,7 @@ end
 ---@return fun()
 function M.request(workspace, arguments, authorize, analyze, receive)
   local finished, active_cancel, active_expire = false, nil, nil
-  local source_listing = arguments.operation == "overview" or arguments.operation == "symbols" and (arguments.path ~= nil or not arguments.query)
+  local source_listing = arguments.operation == "overview" or arguments.operation == "source_symbols"
   local draining
   local readiness = {}
   local result = { rows = {}, source = "live source", warnings = {}, omitted_visibility = {}, omitted_visibility_count = 0 }
@@ -103,6 +103,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
     if finished then return end
     local workspace_query = not request.path and (request.operation == "workspace_symbols" or request.operation == "diagnostics")
     local completed = false
+    if not readiness.client then finish("invalid_argument: semantic operation requires workspace") return end
     local cancel, expire = semantic.request(workspace, request, authorize, function(reply, failure)
       completed = true
       if finished then return end
@@ -287,10 +288,10 @@ function M.request(workspace, arguments, authorize, analyze, receive)
         end, true)
       end
       -- Hover is supplementary: source remains useful when a server has no hover support.
-      local client = source.select_client(assert(arguments.path), vim.filetype.match({ filename = arguments.path }) or "", source.loaded(arguments.path), "textDocument/hover", workspace)
+      local client = readiness.client
       local callable = vim.tbl_contains({ "function_item", "function_signature_item", "function_declaration",
         "generator_function_declaration", "method_definition", "method_signature", "abstract_method_signature" }, declaration.kind)
-      if client and client.initialized and not callable
+      if client and client:supports_method("textDocument/hover") and client.initialized and not callable
         and not (client.progress and next(client.progress.pending or {})) then
         readiness[client.id] = client
         local completed = false
@@ -409,8 +410,30 @@ function M.request(workspace, arguments, authorize, analyze, receive)
       end)
     else start() end
   end
-  if arguments.operation == "status" then start()
-  else resolved_start() end
+  if arguments.operation == "workspace_list" then
+    require("forge.lsp.workspace").list(arguments.path or workspace, authorize, active, function(reply, failure)
+      if reply then result = reply end
+      finish(failure)
+    end)
+  elseif arguments.operation == "status" then
+    local config, failure = require("forge.lsp.workspace").config(arguments.workspace)
+    if not config then finish(failure) return function() end end
+    local candidates = {}
+    for _, client in ipairs(vim.lsp.get_clients({ name = config.name, _uninitialized = true })) do
+      if source.covers(client, arguments.workspace) and not client:is_stopped() then candidates[#candidates + 1] = client end
+    end
+    if #candidates > 1 then finish("ambiguous_server: multiple matching clients")
+    elseif #candidates == 0 then result.message = config.name .. ": not started" finish()
+    else readiness.client = candidates[1] start() end
+  elseif arguments.workspace then
+    active_cancel = require("forge.lsp.workspace").resolve(arguments.workspace, authorize, function(selected, failure)
+      if finished then return end
+      if not selected then finish(failure) return end
+      readiness = selected
+      if arguments.operation == "status" then start() else resolved_start() end
+    end)
+  elseif source_listing or arguments.operation == "context" and arguments.path and not arguments.include then resolved_start()
+  else finish("invalid_argument: workspace manifest is required") end
   return function() finish("cancelled: LSP request cancelled.") end
 end
 

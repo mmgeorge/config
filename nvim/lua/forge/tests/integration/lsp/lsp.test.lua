@@ -91,20 +91,29 @@ T["rename_tool_applies_edits_and_respects_write_access"] = function()
   wait_until(function() return state.session ~= nil end, "Harness did not start",
     { timeout_ms = 4000, context = error_text })
   request("session.configure", { lsp_tools = true })
-  startup.wait = function(_, _, callback) callback() return function() end end
+  vim.lsp.get_configs = function() return { { name = "rename-fixture", filetypes = { "rust" } } } end
+  startup.selected = function(_, _, callback) callback(mock) return function() end end
   vim.lsp.get_clients = function() return { mock } end
   vim.lsp.get_client_by_id = function(id) return id == mock.id and mock or nil end
   local item_buffer = vim.fn.bufadd(workspace .. "/src/item.rs")
   vim.fn.bufload(item_buffer)
   vim.bo[item_buffer].filetype = "rust"
-  local result = query("lsp_rename_symbol", { path = "src/item.rs", line = 1, column = 8, new_name = "count" })
+  local unrelated_calls = 0
+  local unrelated = vim.deepcopy(mock)
+  unrelated.id = 8902
+  unrelated.request = function() unrelated_calls = unrelated_calls + 1 error("unrelated LSP contacted") end
+  vim.lsp.get_clients = function() return { mock, unrelated } end
+  query("lsp_workspace_list", {})
+  assert(unrelated_calls == 0, "inventory contacted an LSP")
+  local result = query("lsp_rename_symbol", { workspace = "Cargo.toml", path = "src/item.rs", line = 1, column = 8, new_name = "count" })
   assert(table.concat(vim.fn.readfile(workspace .. "/src/item.rs"), "\n"):find("fn count", 1, true), result)
   assert(table.concat(vim.fn.readfile(workspace .. "/src/lib.rs"), "\n"):find("item::count()", 1, true), result)
   assert(buffer.line(item_buffer, 1):find("fn count", 1, true), "editor did not refresh")
   request("session.configure", { access = vim.tbl_extend("force", state.session.access, { write_access = "off" }) })
-  result = query("lsp_rename_symbol", { path = "src/item.rs", line = 1, column = 8, new_name = "blocked" })
+  result = query("lsp_rename_symbol", { workspace = "Cargo.toml", path = "src/item.rs", line = 1, column = 8, new_name = "blocked" })
   assert(table.concat(vim.fn.readfile(workspace .. "/src/item.rs"), "\n"):find("fn count", 1, true), result)
   assert(#(state.approval or {}) == 0, "write-off opened approval")
+  assert(unrelated_calls == 0, "rename contacted an unrelated LSP")
 end
 
 return T

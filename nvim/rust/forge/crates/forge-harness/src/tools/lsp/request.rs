@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 pub(super) enum Operation {
     Overview,
     Symbols,
+    SourceSymbols,
+    WorkspaceList,
     Definition,
     Context,
     References,
@@ -99,6 +101,8 @@ impl Target {
 pub(super) struct Arguments {
     pub operation: Operation,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<Target>,
@@ -162,7 +166,7 @@ impl Arguments {
         if arguments.path.is_none()
             && matches!(
                 arguments.operation,
-                Operation::Overview | Operation::Symbols
+                Operation::Overview | Operation::SourceSymbols
             )
             && !(arguments.operation == Operation::Symbols && arguments.query.is_some())
         {
@@ -172,6 +176,29 @@ impl Arguments {
     }
 
     fn validate(&self) -> Result<()> {
+        let needs_workspace = !matches!(
+            self.operation,
+            Operation::Overview | Operation::SourceSymbols | Operation::WorkspaceList
+        ) && !(self.operation == Operation::Context
+            && self.path.is_some()
+            && self.include.as_ref().is_none_or(Vec::is_empty));
+        ensure!(
+            !needs_workspace || self.workspace.is_some(),
+            "workspace manifest is required"
+        );
+        ensure!(
+            self.workspace.as_ref().is_none_or(|path| matches!(
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some("Cargo.toml" | "package.json")
+            )),
+            "workspace must name Cargo.toml or package.json"
+        );
+        ensure!(
+            self.operation != Operation::Symbols || self.query.is_some(),
+            "symbols requires query"
+        );
         let position = matches!(
             self.operation,
             Operation::Definition | Operation::Context | Operation::References | Operation::Calls
@@ -234,7 +261,11 @@ impl Arguments {
             "query must be nonempty"
         );
         ensure!(
-            self.query.is_none() || self.operation == Operation::Symbols,
+            self.query.is_none()
+                || matches!(
+                    self.operation,
+                    Operation::Symbols | Operation::SourceSymbols
+                ),
             "query only applies to symbols"
         );
         ensure!(
@@ -266,7 +297,10 @@ impl Arguments {
         ensure!(
             self.depth.is_none_or(|value| value <= 8)
                 && (self.depth.is_none()
-                    || matches!(self.operation, Operation::Overview | Operation::Symbols)),
+                    || matches!(
+                        self.operation,
+                        Operation::Overview | Operation::SourceSymbols
+                    )),
             "depth must be 0-8 for directory tools"
         );
         ensure!(
@@ -277,11 +311,13 @@ impl Arguments {
         );
         ensure!(
             self.visibility.is_none()
-                || matches!(self.operation, Operation::Overview | Operation::Symbols)
-                    && matches!(
-                        self.visibility.as_deref(),
-                        Some("all" | "public" | "internal" | "private")
-                    ),
+                || matches!(
+                    self.operation,
+                    Operation::Overview | Operation::SourceSymbols
+                ) && matches!(
+                    self.visibility.as_deref(),
+                    Some("all" | "public" | "internal" | "private")
+                ),
             "invalid visibility filter"
         );
         ensure!(
@@ -332,5 +368,49 @@ impl Arguments {
             "status has no content budget"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Arguments;
+    use serde_json::json;
+
+    #[test]
+    fn semantic_tools_require_manifest_selection() {
+        for tool in [
+            "lsp_symbols",
+            "lsp_definition",
+            "lsp_references",
+            "lsp_calls",
+            "lsp_diagnostics",
+            "lsp_status",
+        ] {
+            assert!(Arguments::parse(tool, json!({})).is_err());
+        }
+        assert!(
+            Arguments::parse(
+                "lsp_symbols",
+                json!({"workspace":"Cargo.toml","query":"Store"})
+            )
+            .is_ok()
+        );
+        assert!(
+            Arguments::parse("lsp_symbols", json!({"workspace":"src","query":"Store"})).is_err()
+        );
+        assert!(Arguments::parse("lsp_workspace_list", json!({})).is_ok());
+        assert!(
+            Arguments::parse("lsp_source_symbols", json!({"path":"src","query":"Store"})).is_ok()
+        );
+        assert!(
+            Arguments::parse("lsp_context", json!({"path":"src/lib.rs","symbol":"Store"})).is_ok()
+        );
+        assert!(
+            Arguments::parse(
+                "lsp_context",
+                json!({"path":"src/lib.rs","symbol":"Store","include":["references"]})
+            )
+            .is_err()
+        );
     }
 }

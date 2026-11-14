@@ -13,10 +13,12 @@ mod render;
 mod request;
 mod schema;
 mod service;
+mod source_symbols;
 mod status;
 mod symbols;
 mod transaction;
 mod work;
+mod workspace_list;
 
 pub(crate) use catalog::is_tool;
 pub(in crate::tools) use catalog::{TOOLSET, definitions, execute, record};

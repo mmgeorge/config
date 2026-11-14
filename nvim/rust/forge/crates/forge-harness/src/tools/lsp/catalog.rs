@@ -8,6 +8,8 @@ pub(in crate::tools) fn definitions() -> Vec<ControlToolDefinition> {
     let mut tools = vec![
         super::overview::definition(),
         super::symbols::definition(),
+        super::source_symbols::definition(),
+        super::workspace_list::definition(),
         super::definition::definition(),
         super::context::definition(),
         super::references::definition(),
@@ -27,6 +29,8 @@ pub(crate) fn is_tool(name: &str) -> bool {
     [
         super::overview::NAME,
         super::symbols::NAME,
+        super::source_symbols::NAME,
+        super::workspace_list::NAME,
         super::definition::NAME,
         super::context::NAME,
         super::references::NAME,
@@ -49,6 +53,12 @@ pub(in crate::tools) async fn execute(
     }
     match invocation.name.as_str() {
         super::overview::NAME => super::overview::execute(runtime, invocation, output).await,
+        super::source_symbols::NAME => {
+            super::source_symbols::execute(runtime, invocation, output).await
+        }
+        super::workspace_list::NAME => {
+            super::workspace_list::execute(runtime, invocation, output).await
+        }
         super::symbols::NAME => super::symbols::execute(runtime, invocation, output).await,
         super::definition::NAME => super::definition::execute(runtime, invocation, output).await,
         super::context::NAME => super::context::execute(runtime, invocation, output).await,
