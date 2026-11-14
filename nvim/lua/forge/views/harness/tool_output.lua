@@ -30,23 +30,21 @@ function M.open(options)
       callback(params.operation == "close" and {} or nil, params.operation ~= "close" and "Harness host generation changed" or nil)
       return
     end
-    local completed = false
-    local deadline
-    local function receive(result, failure)
-      if completed then return end
-      completed = true
-      if deadline then deadline:stop() deadline:close() deadline = nil end
-      if owner.host_generation ~= client.host_get_generation() then
-        if not owner.closed then failed("Forge host changed. Reopen tool output to reconnect.") end
-        return
-      end
-      local ok, callback_error = pcall(callback, result, failure)
-      if not ok and alive() then failed("Tool output callback failed: " .. tostring(callback_error)) end
-    end
-    deadline = vim.defer_fn(function()
-      receive(nil, "Tool output request timed out; press r to refresh before retrying")
-    end, 30000)
-    client.request({ session_id = options.session_id, method = "session.document", params = params }, receive)
+    local receive = require("forge.infra.request_completion").new({
+      timeout_ms = 30000,
+      timeout_message = "Tool output request timed out; press r to refresh before retrying",
+      complete = function(result, failure)
+        if owner.host_generation ~= client.host_get_generation() then
+          if not owner.closed then failed("Forge host changed. Reopen tool output to reconnect.") end
+          return
+        end
+        callback(result, failure)
+      end,
+      failed = function(failure) if alive() then failed("Tool output callback failed: " .. failure) end end,
+    })
+    local dispatched, failure = pcall(client.request,
+      { session_id = options.session_id, method = "session.document", params = params }, receive)
+    if not dispatched then receive(nil, tostring(failure)) end
   end
   function owner.close()
     if owner.closed then return end

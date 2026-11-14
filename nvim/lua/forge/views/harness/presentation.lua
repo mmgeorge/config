@@ -46,7 +46,7 @@ function M.open(options, callback)
   local function notice(message)
     if options.notice then options.notice(message) end
   end
-  local queued, active = {}, false
+  local queued, active, retrying = {}, false, false
   local flush_staging
   local flush_diff
   local function fail(message)
@@ -166,7 +166,7 @@ function M.open(options, callback)
     clamp_after_render()
   end
   local function dispatch_next()
-    if active or owner.applying then return end
+    if active or retrying or owner.applying then return end
     if #queued == 0 then if flush_diff then flush_diff() end return end
     while #queued > 0 and not valid_request(queued[1]) do
       local discarded = table.remove(queued, 1)
@@ -175,16 +175,11 @@ function M.open(options, callback)
     if #queued == 0 then return end
     active = true
     local current = table.remove(queued, 1)
-    local completed = false
-    local deadline
     local started = perf.now()
     perf.event("harness", "ui.request", { phase = "begin", session_id = options.session_id,
       operation = current.params.operation, revision = current.params.revision,
       queue_count = #queued, elapsed_ms = perf.elapsed_ms(current.queued_at) })
-    local function receive(result, failure, detail)
-      if completed then return end
-      completed = true
-      if deadline then deadline:stop() deadline:close() deadline = nil end
+    local function complete_request(result, failure, detail)
       local operation = current.params.operation
       local code = detail and detail.code
       local read = operation == "sync" or operation == "snapshot" or operation == "open"
@@ -202,7 +197,8 @@ function M.open(options, callback)
           { owner = identity, category = "presentation", severity = "info" })
         if options.on_update then options.on_update() end
         table.insert(queued, 1, current)
-        vim.defer_fn(function() active = false dispatch_next() end, 1000)
+        retrying = true
+        vim.defer_fn(function() retrying = false dispatch_next() end, 1000)
         return
       end
       if not failure then diagnostic.set(owner, "sync_failure", nil) end
@@ -215,19 +211,24 @@ function M.open(options, callback)
           if valid_request(current) then current.done(result, failure, detail)
           elseif current.cancel then current.cancel() end
         end)
-      active = false
       if not accepted and alive() then fail("Presentation callback failed: " .. tostring(callback_error)) end
       if failure and code == "outcome_unknown" and alive() and owner.ready then owner.sync() end
-      dispatch_next()
     end
-    deadline = vim.defer_fn(function()
-      if completed then return end
-      receive(nil, "Presentation response is delayed", { code = "outcome_unknown" })
-    end, 30000)
+    local receive = require("forge.infra.request_completion").new({
+      timeout_ms = 30000, timeout_message = "Presentation response is delayed",
+      complete = complete_request,
+      failed = function(failure) fail("Presentation completion failed: " .. failure) end,
+      finally = function() active = false dispatch_next() end,
+    })
     if owner.host_generation ~= client.host_get_generation() or not client.host_is_accepting() then
       receive(current.params.operation == "close" and {} or nil, current.params.operation ~= "close" and "Harness host generation changed" or nil)
-    elseif options.request then options.request(current.params, receive)
-    else client.request({ session_id = options.session_id, method = "session.document", params = current.params }, receive) end
+    else
+      local dispatched, failure = pcall(function()
+        if options.request then options.request(current.params, receive)
+        else client.request({ session_id = options.session_id, method = "session.document", params = current.params }, receive) end
+      end)
+      if not dispatched then receive(nil, tostring(failure), { code = "invalid_state" }) end
+    end
   end
   local function request(params, done, valid, cancel)
     if owner.host_generation ~= client.host_get_generation() or not client.host_is_accepting() then

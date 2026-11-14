@@ -332,4 +332,74 @@ T["startup"] = function()
   assert(calls == 1 and not source.loaded(path), "late root callback restarted a closed workspace")
 end
 
+T["discovery_respects_nested_repository_boundaries"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local directory = temp.directory("discovery-boundary")
+  local nested = directory .. "/archive/checkout"
+  local project = directory .. "/project"
+  vim.fn.mkdir(nested, "p")
+  vim.fn.mkdir(project, "p")
+  vim.fn.writefile({ "gitdir: elsewhere" }, nested .. "/.git")
+  vim.fn.writefile({ "return {}" }, nested .. "/main.lua")
+  vim.fn.writefile({ "return {}" }, project .. "/main.lua")
+  local queried = {}
+  stub(vim.lsp, "get_configs", function()
+    return { { name = "lua", filetypes = { "lua" }, root_dir = function(target, receive)
+      queried[#queried + 1] = require("forge.lsp.source").canonical(vim.api.nvim_buf_get_name(target))
+      receive(nil)
+    end, workspace_required = true } }
+  end)
+  stub(vim.lsp, "get_clients", function() return {} end)
+  local startup = require("forge.lsp.startup")
+  local state = startup.start(directory)
+  wait_until(function() return state.discovered end, "discovery did not finish")
+  eq(queried, { require("forge.lsp.source").canonical(project .. "/main.lua") })
+  queried = {}
+  state = startup.start(nested)
+  wait_until(function() return state.discovered end, "explicit nested workspace did not finish")
+  eq(queried, { require("forge.lsp.source").canonical(nested .. "/main.lua") })
+end
+
+T["root_discovery_paces_candidates_without_dropping_projects"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local directory = temp.directory("discovery-scheduling")
+  local callbacks, launches, active, maximum = {}, {}, 0, 0
+  -- Directory entries are tiny; held root callbacks create pressure directly at the boundary.
+  for index = 1, 7 do
+    vim.fn.mkdir(directory .. "/project-" .. index, "p")
+    vim.fn.writefile({ "return {}" }, directory .. "/project-" .. index .. "/main.lua")
+  end
+  stub(vim.lsp, "get_configs", function()
+    return { { name = "lua", filetypes = { "lua" }, root_dir = function(target, receive)
+      active = active + 1
+      maximum = math.max(maximum, active)
+      callbacks[#callbacks + 1] = function()
+        active = active - 1
+        receive(vim.fs.dirname(vim.api.nvim_buf_get_name(target)))
+      end
+    end } }
+  end)
+  stub(vim.lsp, "get_clients", function() return {} end)
+  stub(vim.lsp, "start", function(config)
+    launches[#launches + 1] = config.root_dir
+    return #launches
+  end)
+  stub(vim.lsp, "get_client_by_id", function(identity)
+    return { id = identity, initialized = true, is_stopped = function() return false end }
+  end)
+  local state = require("forge.lsp.startup").start(directory)
+  wait_until(function() return #callbacks > 0 end, "no root callbacks")
+  -- A single callback batch must leave room for editor input and control requests.
+  eq(#callbacks <= 4, true)
+  local answered = 0
+  while answered < 7 do
+    wait_until(function() return #callbacks > answered end, "queued candidates never ran")
+    answered = answered + 1
+    callbacks[answered]()
+  end
+  wait_until(function() return state.discovered end, "root discovery did not settle")
+  eq(maximum <= 4, true)
+  eq(#launches, 7)
+end
+
 return T

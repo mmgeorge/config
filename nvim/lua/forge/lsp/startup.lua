@@ -27,12 +27,15 @@ local M = {}
 ---@field discovered boolean
 ---@field jobs table<string, ForgeLspStartupJob>
 ---@field configs vim.lsp.Config[]
+---@field boundaries string[] Nested repositories excluded from this discovery.
 ---@field timer uv.uv_timer_t
 ---@field closed? boolean
 ---@field failure? string
 
 ---@type table<string, ForgeLspStartup>
 local workspaces = {}
+-- Admission bounds concurrent root work, never the inventory of projects.
+local root_concurrency = 4
 local excluded = { [".git"] = true, node_modules = true, target = true, vendor = true, build = true, dist = true, [".cache"] = true }
 local package_filetypes = {
   javascript = true, javascriptreact = true, typescript = true, typescriptreact = true,
@@ -186,28 +189,39 @@ end
 ---@param state ForgeLspStartup
 ---@param candidates table<string, {path: string, filetype: string}[]>
 local function select_sources(state, candidates)
-  local remaining = 0
-  for _, sources in pairs(candidates) do remaining = remaining + #sources end
-  if remaining == 0 then state.discovering, state.discovered = false, true return end
-  local function selected()
-    remaining = remaining - 1
-    if remaining == 0 then state.discovering, state.discovered = false, true end
-  end
+  local queue, cursor, active, scheduled = {}, 1, 0, false
   for _, config in ipairs(state.configs) do
-    local sources = candidates[config.name]
-    if sources then
-      local roots = {}
-      for _, candidate in ipairs(sources) do
-        launch(state, config, candidate.path, candidate.filetype, function(root)
-          if not root then return false end
-          root = source.canonical(root)
-          if roots[root] or not (source.inside(root, state.workspace) or source.inside(state.workspace, root)) then return false end
-          roots[root] = true
-          return true
-        end, selected)
-      end
+    local roots = {}
+    for _, candidate in ipairs(candidates[config.name] or {}) do
+      queue[#queue + 1] = { config = config, candidate = candidate, roots = roots }
     end
   end
+  local pump
+  local function schedule()
+    if scheduled or state.closed then return end
+    scheduled = true
+    -- A timer yields to input between admission batches; vim.schedule alone can drain back-to-back.
+    vim.defer_fn(function() scheduled = false pump() end, 1)
+  end
+  pump = function()
+    if state.closed then return end
+    while active < root_concurrency and cursor <= #queue do
+      local entry = queue[cursor]
+      cursor, active = cursor + 1, active + 1
+      launch(state, entry.config, entry.candidate.path, entry.candidate.filetype, function(root)
+        if not root then return false end
+        root = source.canonical(root)
+        if entry.roots[root] or not (source.inside(root, state.workspace) or source.inside(state.workspace, root)) then return false end
+        entry.roots[root] = true
+        return true
+      end, function()
+        active = active - 1
+        schedule()
+      end)
+    end
+    if cursor > #queue and active == 0 then state.discovering, state.discovered = false, true end
+  end
+  schedule()
 end
 
 ---@param state ForgeLspStartup
@@ -222,44 +236,61 @@ local function discover(state)
     end
     local directory = queue[cursor]
     cursor = cursor + 1
-    vim.uv.fs_scandir(directory, function(failure, scan)
-      vim.schedule(function()
-        if state.closed then return end
-        if failure then
-          state.failure = "Could not discover project language sources: " .. failure
-          state.discovering = false
-          require("forge.infra.notifications").error(state.failure, "Harness LSP startup")
-          return
-        end
-        local function read_batch()
+    local function scan_directory()
+      vim.uv.fs_scandir(directory, function(failure, scan)
+        vim.schedule(function()
           if state.closed then return end
-          for _ = 1, 256 do
-            local name, kind = vim.uv.fs_scandir_next(scan)
-            if not name then next_directory() return end
-            local path = directory .. "/" .. name
-            if kind == "directory" and not excluded[name] then
-              queue[#queue + 1] = path
-            elseif kind == "file" then
-              local filetype
-              for _, config in ipairs(state.configs) do
-                local manifest = project_manifest(config)
-                if not manifest or name == manifest then
-                  filetype = filetype or vim.filetype.match({ filename = path })
-                end
-                local matches = manifest and name == manifest or not manifest
-                  and filetype and vim.tbl_contains(config.filetypes or {}, filetype)
-                local key = config.name .. ":" .. directory
-                if matches and not candidate_directory[key] then
-                  candidate_directory[key] = true
-                  candidates[config.name] = candidates[config.name] or {}
-                  table.insert(candidates[config.name], { path = path, filetype = filetype })
+          if failure then
+            state.failure = "Could not discover project language sources: " .. failure
+            state.discovering = false
+            require("forge.infra.notifications").error(state.failure, "Harness LSP startup")
+            return
+          end
+          local function read_batch()
+            if state.closed then return end
+            for _ = 1, 256 do
+              local name, kind = vim.uv.fs_scandir_next(scan)
+              if not name then next_directory() return end
+              local path = directory .. "/" .. name
+              if kind == "directory" and not excluded[name] then
+                queue[#queue + 1] = path
+              elseif kind == "file" then
+                local filetype
+                for _, config in ipairs(state.configs) do
+                  local manifest = project_manifest(config)
+                  if not manifest or name == manifest then
+                    filetype = filetype or vim.filetype.match({ filename = path })
+                  end
+                  local matches = manifest and name == manifest or not manifest
+                    and filetype and vim.tbl_contains(config.filetypes or {}, filetype)
+                  local key = config.name .. ":" .. directory
+                  if matches and not candidate_directory[key] then
+                    candidate_directory[key] = true
+                    candidates[config.name] = candidates[config.name] or {}
+                    table.insert(candidates[config.name], { path = path, filetype = filetype })
+                  end
                 end
               end
             end
+            vim.schedule(read_batch)
           end
-          vim.schedule(read_batch)
-        end
-        read_batch()
+          read_batch()
+        end)
+      end)
+    end
+    if directory == state.workspace then scan_directory() return end
+    -- A nested .git file (linked worktree) or directory owns a different workspace.
+    vim.uv.fs_stat(directory .. "/.git", function(failure, stat)
+      vim.schedule(function()
+        if state.closed then return end
+        if stat then
+          state.boundaries[#state.boundaries + 1] = directory
+          next_directory()
+        elseif failure and not failure:match("ENOENT") and not failure:match("ENOTDIR") then
+          state.failure = "Could not inspect project boundary: " .. failure
+          state.discovering = false
+          require("forge.infra.notifications").error(state.failure, "Harness LSP startup")
+        else scan_directory() end
       end)
     end)
   end
@@ -271,7 +302,7 @@ end
 local function workspace_state(workspace)
   workspace = source.canonical(workspace)
   if workspaces[workspace] then return workspaces[workspace] end
-  local state = { workspace = workspace, discovering = false, discovered = false, jobs = {}, configs = {}, timer = assert(vim.uv.new_timer()) }
+  local state = { workspace = workspace, discovering = false, discovered = false, jobs = {}, configs = {}, boundaries = {}, timer = assert(vim.uv.new_timer()) }
   workspaces[workspace] = state
   local ok, configs = pcall(vim.lsp.get_configs, { enabled = true })
   if ok then state.configs = configs
@@ -286,7 +317,8 @@ end
 function M.start(workspace)
   workspace = source.canonical(workspace)
   for root, existing in pairs(workspaces) do
-    if existing.discovered and not existing.closed and source.inside(workspace, root) then
+    if existing.discovered and not existing.closed and source.inside(workspace, root)
+      and not vim.iter(existing.boundaries):any(function(boundary) return source.inside(workspace, boundary) end) then
       local running = true
       for _, job in pairs(existing.jobs) do
         local client = job.client and vim.lsp.get_client_by_id(job.client)

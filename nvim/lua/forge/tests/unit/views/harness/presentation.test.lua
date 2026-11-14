@@ -443,6 +443,7 @@ T["presentation"] = function()
   local deferred = {}
   vim.defer_fn = function(callback, delay)
     local timer = { callback = callback, delay = delay }
+    function timer:is_closing() return self.closed == true end
     function timer:stop() self.stopped = true end
     function timer:close() self.closed = true end
     deferred[#deferred + 1] = timer
@@ -1608,6 +1609,7 @@ T["update_scheduling"] = function()
   vim.defer_fn = function(callback, delay)
     delays[#delays + 1] = delay
     local timer = { callback = callback }
+    function timer.is_closing() return timer.closed == true end
     function timer.stop() timer.stopped = true end
     function timer.close() timer.closed = true end
     if delay == 1000 then timers[#timers + 1] = timer end

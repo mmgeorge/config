@@ -8,6 +8,7 @@ local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
 local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
 local mock_client = dofile("nvim/lua/forge/tests/support/mock_client.lua")
 local host = dofile("nvim/lua/forge/tests/support/host.lua")
+local deferred = dofile("nvim/lua/forge/tests/support/deferred.lua")
 local git_repository = dofile("nvim/lua/forge/tests/support/git_repository.lua")
 local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/tests/fixtures/check_tool.lua", ":p"))
 
@@ -3428,6 +3429,55 @@ T["steering_waits_for_consumption"] = function()
     "consumed steering returned to the status section:\n" .. status_text())
   diagnostics:assert_none()
   eq(host.stop(), true)
+end
+
+T["transcript_timeout_recovers_and_ignores_late_response"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local workspace = temp.directory("transcript-timeout")
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  stub(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  local state = require("forge.session").harness
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  require("forge.views.harness").open()
+  MiniTest.finally(function()
+    pcall(require("forge.views.harness.workspace").release, state)
+    if state.presentation then pcall(state.presentation.close) end
+  end)
+  wait_until(function() return state.presentation and state.presentation.ready
+    and not state.presentation.syncing end, "Harness did not open", { errors = errors })
+  local owner = state.presentation
+  local timers = deferred.install({ 30000, 1000 })
+  local request = client.request
+  local held, delayed, hold = nil, nil, true
+  mock_client.respond({ ["session.document"] = function(spec, callback)
+    if spec.params.operation == "sync" and hold then
+      hold = false
+      held = callback
+      request(spec, function(...) delayed = { ... } end)
+    else request(spec, callback) end
+  end }, { unknown = "record" })
+  owner.sync()
+  wait_until(function() return delayed ~= nil end, "host did not answer held sync")
+  eq(owner.syncing, true)
+  MiniTest.expect.no_error(function() timers.fire(30000) end)
+  eq(owner.sync_failure ~= nil, true)
+  timers.fire(1000)
+  wait_until(function() return not owner.syncing and not owner.sync_failure end,
+    "transcript did not recover after timeout", { errors = errors })
+  local revision = owner.transcript.revision
+  held(unpack(delayed))
+  eq(owner.transcript.revision, revision)
+  -- Restore real control requests while retaining deterministic presentation deadlines.
+  stub(client, "request", request)
+  buffer.set(state.composer_buf, { "Recovered transcript" })
+  require("forge.views.harness.controller").submit()
+  wait_until(function() return buffer.text(state.transcript_buf):find("Recovered transcript", 1, true)
+    and not require("forge.views.harness.activity").busy(state) end,
+    "MockProvider response did not reach recovered transcript", { errors = errors })
+  eq(owner.failure, nil)
+  errors:assert_none()
 end
 
 return T

@@ -38,6 +38,9 @@ Context with a local target also reads source directly; requested relationships
 and workspace name searches wait for the relevant servers. Optional hover is
 included only when its server is already ready. Semantic queries reuse server
 readiness within one tool call and check it again on the next call.
+Workspace discovery excludes nested Git repositories and linked worktrees. Query
+a nested checkout explicitly to discover its servers independently. Root discovery
+queues candidates and resolves at most four concurrently.
 Root discovery skips callbacks that do not answer within two seconds; a server
 that has started retains the longer initialization timeout.
 Rust searches request all symbol kinds from rust-analyzer rather than its default
