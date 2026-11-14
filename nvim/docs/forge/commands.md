@@ -63,8 +63,8 @@ replaying an uncertain prompt.
 | `:ForgeDiffCompactPreview` | None | Preview the compacted working-tree diff |
 | `:ForgeDiffCompactPreview!` | Bang | Preview the compacted staged diff |
 
-`:ForgeStatus` displays its buffer in the current window without creating a split
-or tab. It replaces the displayed buffer even when the window was pinned to it.
+`:ForgeStatus` opens in a new tab, preserving the invoking window and its buffer.
+If its buffer is already displayed, the command focuses that tab.
 
 ForgeStatus file rows, file-specific comparison labels, and single-file discard
 confirmations show paths relative to the editor cwd in the window that opened the view.
@@ -418,11 +418,14 @@ source.
 
 | Command | Arguments | Behavior |
 | --- | --- | --- |
-| `:ForgeHarness` | None | Focus the open Harness, or open it in the current tab |
-| `:ForgeHarnessNew` | None | Create a fresh Harness session in the current Harness panes, or open it in the current tab |
+| `:ForgeHarness` | None | Focus the open Harness, or open it in a new tab |
+| `:ForgeHarnessNew` | None | Create a fresh Harness session in a new tab |
 | `:ForgeConfig` | None | Edit the current session from its panes, or global defaults elsewhere without opening a session |
 | `:ForgeHarnessLog` | Optional logging level, `open`, or `clear` | Open the active session's log, select its recording threshold, or clear its files |
 | `:ForgePermissions` | None | Edit the Harness permissions document |
+
+`/clear` replaces the session in the current Harness tab after creation succeeds.
+`/new` opens a fresh session in a new tab.
 
 `ForgeHarnessLog` requires an open Harness session. Check-worker and tool-export
 cleanup diagnostics follow the same `/log` setting instead of printing to process

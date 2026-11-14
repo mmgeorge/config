@@ -257,12 +257,27 @@ function M.open(started_at)
   require("forge.startup_log").write("status.command.enter")
   require("forge.client").host_start()
   local native = require("forge.status")
-  local workspace, window = vim.fn.getcwd(), vim.api.nvim_get_current_win()
+  local workspace = vim.fn.getcwd()
   if native_main_status and native_main_status.workspace == workspace and native_main_status.state.active
     and vim.api.nvim_buf_is_valid(native_main_status.state.replica.buffer)
   then
     if not native_main_status.state.ready then return native_main_status.state end
+    local window
+    for _, candidate in ipairs(vim.fn.win_findbuf(native_main_status.state.replica.buffer)) do
+      if vim.api.nvim_win_get_config(candidate).relative == "" then window = candidate break end
+    end
+    local created_tab
+    if window then
+      vim.api.nvim_set_current_win(window)
+    else
+      vim.cmd("tabnew")
+      created_tab = vim.api.nvim_get_current_tabpage()
+      window = vim.api.nvim_get_current_win()
+    end
     local mounted, failure = native.show(native_main_status.state, window)
+    if not mounted and created_tab and vim.api.nvim_tabpage_is_valid(created_tab) then
+      vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(created_tab))
+    end
     if not mounted then notify_error(failure or "Status window could not be opened", "Forge") return end
     require("forge.startup_log").write("status.buffer.reused", {
       elapsed_ms = math.floor((vim.uv.hrtime() - command_started) / 1e6),
@@ -271,8 +286,19 @@ function M.open(started_at)
     return native_main_status.state
   end
   if native_main_status and native_main_status.state.active then native.close(native_main_status.state) end
+  vim.cmd("tabnew")
+  local opening_tab = vim.api.nvim_get_current_tabpage()
+  local window = vim.api.nvim_get_current_win()
+  local opening_buffer = vim.api.nvim_win_get_buf(window)
   local state = native.open({ workspace = workspace, window = window, started_at = command_started,
-    name = config.options.status_buffer_name or "ForgeStatus", filetype = "ForgeStatus" })
+    name = config.options.status_buffer_name or "ForgeStatus", filetype = "ForgeStatus",
+    on_error = function()
+      if vim.api.nvim_tabpage_is_valid(opening_tab) and vim.api.nvim_win_is_valid(window)
+        and #vim.api.nvim_tabpage_list_wins(opening_tab) == 1
+        and vim.api.nvim_win_get_buf(window) == opening_buffer and not vim.bo[opening_buffer].modified then
+        vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(opening_tab))
+      end
+    end })
   native_main_status = { workspace = workspace, state = state }
   return state
 end

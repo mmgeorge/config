@@ -5,7 +5,7 @@ local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-T["open_uses_current_tab_on_first_launch"] = function()
+T["open_uses_new_tab_on_first_launch"] = function()
   local session = require("forge.session")
   local client = require("forge.client")
   local controller = require("forge.views.harness.controller")
@@ -16,13 +16,13 @@ T["open_uses_current_tab_on_first_launch"] = function()
   controller.render = function() end
   client.session_initialize = function() end
   require("forge").open_harness()
-  eq(#vim.api.nvim_list_tabpages(), tab_count)
-  eq(state.timeline_tab, tab)
+  eq(#vim.api.nvim_list_tabpages(), tab_count + 1)
+  eq(state.timeline_tab ~= tab, true)
   assert(vim.api.nvim_win_is_valid(state.transcript_win))
   assert(vim.api.nvim_win_is_valid(state.composer_win))
   local composer = state.composer_win
   require("forge").open_harness()
-  eq(#vim.api.nvim_list_tabpages(), tab_count)
+  eq(#vim.api.nvim_list_tabpages(), tab_count + 1)
   eq(state.composer_win, composer)
   state.startup_trace.finish("test")
 end

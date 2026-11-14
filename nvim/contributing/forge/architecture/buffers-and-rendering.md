@@ -61,6 +61,11 @@ Status keeps file bodies separately from visible rows. If a generation change di
 ## Conventions
 
 The shared picker owns its modal buffer, mappings, input overlays, and cleanup.
+Options can supply structured `child_field_list` entries with `label` and `value`
+strings. The shared layout aligns their value column using display-cell widths,
+preserves nested label indentation, and wraps values beneath that column. Labels
+that leave no room for values stack above them. Existing `child_line_list` entries
+retain prose wrapping, and both forms belong to the option's child row range.
 Its optional `page_navigation = "tabs"` presentation uses the same `page_list`
 and per-page selection state as ordinary pickers. `page_navigation.measure`
 reserves two header rows before `layout.build` wraps the page, and

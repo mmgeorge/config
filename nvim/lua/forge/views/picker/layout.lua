@@ -45,6 +45,11 @@ local PickerLayout = {}
 ---@field spans? ForgePickerColumnSpan[]
 ---@field focus_offset? integer Zero-based byte offset initially kept visible.
 
+--- Configuration field rendered beneath an option, aligned with its sibling values.
+---@class ForgePickerDetailField
+---@field label string Field name, including indentation for nested properties.
+---@field value string Field value; an empty label continues the preceding list.
+
 local function wrap(text, width, prefix, continuation)
   local result = {}
   local current = prefix
@@ -135,6 +140,34 @@ local function wrap_preformatted(text, width)
     source_offset = source_offset + line_size + 1
   end
   return { lines = result, segment_list = segment_list }
+end
+
+--- Keep field values aligned while retaining whitespace and wrapping complete content.
+---@param fields ForgePickerDetailField[]
+---@param width integer
+---@return string[]
+local function detail_field_lines(fields, width)
+  local result = {}
+  local label_width = 0
+  for _, field in ipairs(fields) do label_width = math.max(label_width, vim.fn.strdisplaywidth(field.label)) end
+  local stacked = label_width + 6 >= width
+  local value_prefix = stacked and "      " or string.rep(" ", label_width + 6)
+  local value_width = math.max(1, width - vim.fn.strdisplaywidth(value_prefix))
+  for _, field in ipairs(fields) do
+    if stacked and field.label ~= "" then
+      for _, fragment in ipairs(wrap_cell(field.label, width - 4)) do result[#result + 1] = "    " .. fragment.text end
+    end
+    local prefix = stacked and value_prefix
+      or "    " .. field.label .. string.rep(" ", label_width - vim.fn.strdisplaywidth(field.label) + 2)
+    if field.value == "" then
+      if not stacked then result[#result + 1] = "    " .. field.label end
+    else
+      for index, fragment in ipairs(wrap_cell(field.value, value_width)) do
+        result[#result + 1] = (index == 1 and prefix or value_prefix) .. fragment.text
+      end
+    end
+  end
+  return result
 end
 
 ---@param page { option_list: table[], wrap_column?: integer, show_item_counter?: boolean, highlight_selected_line?: boolean, highlight_selected_text?: boolean, [string]: any }
@@ -368,6 +401,7 @@ function PickerLayout.build(page, selected_index, width, options)
     for _, child in ipairs(option.child_line_list or {}) do
       append(lines, wrap(child, usable_width, "    ", "      "))
     end
+    append(lines, detail_field_lines(option.child_field_list or {}, usable_width))
     option_range[index] = { first = first, last = #lines }
     primary_range[index] = { first = first, last = primary_last, spans = primary.spans, key_end = option.key and (2 + #option.key) }
     if primary_last < #lines then child_range[index] = { first = primary_last + 1, last = #lines } end

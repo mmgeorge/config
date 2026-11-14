@@ -15,7 +15,7 @@ local category_priority = { typecheck = 0, test = 1, format = 2, lint = 3, build
 ---@field area string
 ---@field trigger {auto?: boolean, paths?: string[], exclude?: string[]}
 ---@field directory string
----@field action {command?: string|string[], adapter?: table, inputs?: table<string, {type: string, description: string, required?: boolean, default?: any, source?: string}>, input?: boolean, directory?: string, after?: string[]}
+---@field action {command?: string|string[], adapter?: table, inputs?: table<string, {type: string, description: string, required?: boolean, default?: any, source?: string}>, prepare?: boolean, directory?: string, after?: string[]}
 ---@field depends_on string[]
 
 ---@class ForgeCheckCatalog
@@ -177,70 +177,55 @@ function Checks.open(state, host)
     for _, check in ipairs(definition_list) do if check.id == selected_id then return check end end
   end
 
-  local function applicability(check)
-    for _, item in ipairs(catalog.applicability or {}) do
-      if item.id == check.id then return (item.selected and "Selected: " or "Not selected: ") .. item.reason end
+  local function details(check)
+    ---@type ForgePickerDetailField[]
+    local result = {}
+    local function add(name, value)
+      if value == nil or value == vim.NIL then return end
+      if type(value) ~= "table" then
+        result[#result + 1] = { label = name, value = tostring(value) }
+      elseif vim.islist(value) then
+        for index, entry in ipairs(value) do add(index == 1 and name or "", entry) end
+      else
+        local names = vim.tbl_keys(value)
+        table.sort(names)
+        if #names == 0 then return end
+        result[#result + 1] = { label = name, value = "" }
+        local indent = (name:match("^%s*") or "") .. "  "
+        for _, property in ipairs(names) do add(indent .. property, value[property]) end
+      end
     end
-    return "Not evaluated"
-  end
-
-  local function latest(check)
-    for index = #(catalog.history or {}), 1, -1 do
-      local matches = {}
-      local priority = { configuration_error = 8, failed = 7, blocked = 6, interrupted = 5, running = 4, pending = 3, skipped = 2, passed = 1 }
-      local result
-      for _, command in ipairs(catalog.history[index].commands or {}) do
-        if present(command.context) and command.context.definition_id == check.id then
-          matches[#matches + 1] = command
-          if not result or (priority[command.state] or 0) > (priority[result.state] or 0) then result = command end
+    local function add_command(name, command)
+      if type(command) == "table" then
+        command = table.concat(vim.tbl_map(function(argument)
+          if argument == "" or argument:find('[%s"\\]') then return vim.json.encode(argument) end
+          return argument
+        end, command), " ")
+      end
+      add(name, command)
+    end
+    if check.action.adapter then
+      local adapter = next(check.action.adapter)
+      add("adapter", adapter)
+      local options = check.action.adapter[adapter]
+      local names = vim.tbl_keys(options)
+      table.sort(names)
+      for _, name in ipairs(names) do
+        local value = options[name]
+        local default = adapter == "rust_nextest"
+          and (name == "nextest_profile" and value == "default" or name == "all_features" and value == false)
+        if not default then
+          if name == "command" then add_command("  " .. name, value) else add("  " .. name, value) end
         end
       end
-      if result then
-        result = vim.deepcopy(result)
-        result.expanded = matches
-        return result
-      end
+    else
+      add_command("command", check.action.command)
     end
-    return nil
-  end
-
-  local function details(check)
-    local command = check.action.command
-    local action = check.action.adapter and ("Adapter: " .. vim.json.encode(check.action.adapter))
-      or ("Action: " .. (type(command) == "table" and table.concat(vim.tbl_map(vim.json.encode, command), " ") or command))
-    local result = { "Directory: " .. check.directory, action }
-    result[#result + 1] = "Prerequisites: " .. (#(check.depends_on or {}) > 0 and table.concat(check.depends_on, ", ") or "None")
-    result[#result + 1] = "Trigger: " .. vim.json.encode(check.trigger)
-    result[#result + 1] = "Area: " .. check.area
-    result[#result + 1] = applicability(check)
-    if check.action.inputs then result[#result + 1] = "Inputs: " .. vim.json.encode(check.action.inputs) end
-    for _, preview in ipairs(catalog.preview or {}) do
-      if preview.id == check.id then
-        result[#result + 1] = (preview.pending and "Pending: " or preview.selected and "Will run: " or "Not selected: ") .. preview.command
-        result[#result + 1] = preview.reason
-      end
-    end
-    for _, coverage in ipairs(catalog.coverage or {}) do
-      if coverage.id == check.id then
-        local evidence = coverage.evidence
-        result[#result + 1] = type(evidence) == "table"
-          and ("Current evidence: " .. evidence.state .. " · run " .. evidence.run_id)
-          or "Coverage: pending execution"
-      end
-    end
-    local command = latest(check)
-    if command then
-      if type(command.error) == "string" then result[#result + 1] = command.error end
-      if present(command.context) then
-        result[#result + 1] = "Requested: " .. vim.json.encode(command.context.selection)
-        if present(command.context.resolved) then result[#result + 1] = "Resolved: " .. vim.json.encode(command.context.resolved) end
-      end
-      result[#result + 1] = "Output: " .. command.output
-      for _, invocation in ipairs(command.expanded or {}) do
-        result[#result + 1] = invocation.state .. ": " .. invocation.command
-        result[#result + 1] = "Output: " .. invocation.output
-      end
-    end
+    add("after", check.action.after)
+    add("paths", check.trigger.paths)
+    add("exclude", check.trigger.exclude)
+    add("prepare", check.action.prepare)
+    add("inputs", check.action.inputs)
     return result
   end
 
@@ -270,7 +255,7 @@ function Checks.open(state, host)
       rows[#rows + 1] = { id = check.id, label = check.name, value = check,
         columns = { (enabled and "● " or "○ ") .. check.name, check.category,
           field.render(automatic and "Yes" or "No", focus == "auto"), check.area },
-        child_line_list = expanded[check.id] and details(check) or nil }
+        child_field_list = expanded[check.id] and details(check) or nil }
     end
     local history = {}
     for index = #(catalog.history or {}), 1, -1 do

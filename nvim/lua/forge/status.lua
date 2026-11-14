@@ -20,6 +20,7 @@ local host_unavailable_message = "Forge host stopped or restarted; refresh or re
 ---@field handler? table<string, function>
 ---@field before_open? fun(start: fun())
 ---@field on_ready? fun(state: ForgeNativeStatus)
+---@field on_error? fun(failure: string)
 ---@field open_commit? function
 ---@field open_pr? function
 ---@field open_about? function
@@ -1042,6 +1043,7 @@ function M.open(options)
     end
     M.close(state)
     notice(failure)
+    if options.on_error then options.on_error(failure) end
   end
   request(state, opening, function(result, failure)
     if failure or not result then

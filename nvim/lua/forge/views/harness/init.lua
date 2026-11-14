@@ -114,7 +114,7 @@ function M.open()
     and vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf)
   local timeline_key = retained_session and state.session.id or ("initial-pending-" .. tostring(vim.uv.hrtime()))
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
-    layout.open(timeline_key, "current")
+    layout.open(timeline_key, "tab")
   layout.attach_auto_height(state.composer_buf, state.composer_win)
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
   controller.attach()

@@ -100,7 +100,14 @@ run when required by a selected check, including checks with automatic selection
 
 In `/checks`, `●` marks an enabled check and `○` marks a disabled check. Space
 toggles the selected check. The Auto field controls automatic selection with the left/right arrows. These changes affect task overrides. Enter does not run
-checks. The History page retains previous runs. Enable check editing and request
+checks. Press `i` to expand configuration fields beneath the selected check.
+Field names follow the saved configuration (`adapter`, `command`, `after`,
+`paths`, and `exclude`), with adapter options indented and list entries aligned
+in the value column. Long values wrap without truncation. Empty lists and the
+default nextest profile and disabled `all_features` option are omitted. Directory
+and automatic selection remain in the main row. The expansion contains no run
+history, selection reasons, coverage, or output paths.
+The History page retains previous runs. Enable check editing and request
 changes in chat to edit project defaults. Plan review shows automatic selection reasons and checks
 explicitly requested by the plan.
 
