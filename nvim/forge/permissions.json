@@ -249,6 +249,7 @@
       "gunzip *": "allow",
       "head": "allow",
       "head *": "allow",
+      "help *": "allow",
       "host": "allow",
       "host *": "allow",
       "hostname": "allow",

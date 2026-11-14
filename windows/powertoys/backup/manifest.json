@@ -3,23 +3,23 @@
   "files": [
     {
       "file": "PowerToys\\AdvancedPaste\\settings.json",
-      "sha256": "41a201238025dc37e3f54f731886b5bec25a18f0bf27e6a75d53c9dacb6f124c"
+      "sha256": "1ee03bac1a898a1319f26f9a053c3d72334fa647cd3a1b4e3f409c318d49bcee"
     },
     {
       "file": "PowerToys\\AlwaysOnTop\\settings.json",
-      "sha256": "0f356b53bf95ea98034b6ca1609c7e02deee1defbd7691fe7e2a26deb3416c3f"
+      "sha256": "984fdc6ce719bbd37183248b3fbdcb83330ac914a68fc1589d1b69d7309426e1"
     },
     {
       "file": "PowerToys\\Awake\\settings.json",
-      "sha256": "f1717472bb1879a602fe834c1e1e059337c27cd75048d0b3cdb7a2bd89d7eec0"
+      "sha256": "dda07e35fdcbe314cb39a2906d3d4cac8e13d7257db3908bd600780578da7d26"
     },
     {
       "file": "PowerToys\\ColorPicker\\settings.json",
-      "sha256": "d1a62804d3be9729e1b69b9fcf52fb5ef75e1d0a544cd04370700d4612683675"
+      "sha256": "a6db7b96e0a931e6e40809d78003c30296a37db8b90b9ed1735573037d20b19d"
     },
     {
       "file": "PowerToys\\CropAndLock\\settings.json",
-      "sha256": "1648af097527f007087cbe71e78b6400935d800a40b5f59f37061f7dc7387c0e"
+      "sha256": "4c7d49413aa8f36dd8c0fd64610d79beba35f2ba499b917fdf8004462033beca"
     },
     {
       "file": "PowerToys\\CursorWrap\\settings.json",
@@ -31,23 +31,23 @@
     },
     {
       "file": "PowerToys\\FancyZones\\custom-layouts.json",
-      "sha256": "ba40f2b075b7126e2480a9028ed28da44f6b1de83108aab3989d174f0429bd5e"
+      "sha256": "df55edd72fe2bab086a06bd79f2f2f2c97bb4471709820bc1800da33ed526cfe"
     },
     {
       "file": "PowerToys\\FancyZones\\default-layouts.json",
-      "sha256": "633c3b06e9d57d4198a229e17dcebcc570fb92c1c11a7758851bfc9f716fecfa"
+      "sha256": "2193a62b54cc0cefd932559ff55d57372e4a4baeed4148876e66ad2434ffa32a"
     },
     {
       "file": "PowerToys\\FancyZones\\layout-hotkeys.json",
-      "sha256": "538866863ce7a1dcab750f7c20a25f4f19e0b3187effdafa86b8ffc281701d30"
+      "sha256": "ec776977cf2d1bec0f7c90845b76f8fdd9c51ffbbcf1fe046ec8142f1d292902"
     },
     {
       "file": "PowerToys\\FancyZones\\layout-templates.json",
-      "sha256": "55be3eb147857a5fcf6c58a02e25ee57dd0cce26382fc7ffa619a7137ab08421"
+      "sha256": "cc8fdfaafed357755b74a344ddaa10b65c7777e370ba80463d292efde023d325"
     },
     {
       "file": "PowerToys\\FancyZones\\settings.json",
-      "sha256": "ee7514fdf4f44044aa99c6536ec2dafc2836031dc28ea573b019f34384b35b7f"
+      "sha256": "351644458d341ce0c371b17095e585abff189f09c2faa7779c095fd4d3bb72bb"
     },
     {
       "file": "PowerToys\\File Locksmith\\file-locksmith-settings.json",
@@ -55,11 +55,11 @@
     },
     {
       "file": "PowerToys\\FindMyMouse\\settings.json",
-      "sha256": "3730261865c90a4d0911e5a2a6314dcc1a7b14dba2091c9c20713578af162aea"
+      "sha256": "990e4c39bcacc92283be1a305cda15bcd1f1bec82cded274c2caef99ef84380b"
     },
     {
       "file": "PowerToys\\Hosts\\settings.json",
-      "sha256": "b184a24fb4806f5bcc71456ed1adbdfab93d5f0763caed400d5ecb70654862af"
+      "sha256": "1183fff6a22e9263959278187ac56c2abe07ed4b5011f37f235401d99633e966"
     },
     {
       "file": "PowerToys\\Image Resizer\\image-resizer-settings.json",
@@ -67,7 +67,7 @@
     },
     {
       "file": "PowerToys\\Keyboard Manager\\default.json",
-      "sha256": "c688c2491f9fc9cab00586b98fa7f7c70b81f51644d00cb6fb85f7d3340e0f88"
+      "sha256": "9f20487e52f60e54e0e97fdef936298fb4c32e5b11a053285e046f6d9b3c449b"
     },
     {
       "file": "PowerToys\\Keyboard Manager\\settings.json",
@@ -79,35 +79,35 @@
     },
     {
       "file": "PowerToys\\Measure Tool\\settings.json",
-      "sha256": "b3982e3f24c0884c1fde6e068b6fff07e0c8d1100feb29382285497e010f7e88"
+      "sha256": "a9a22dde77cd820da91e3c5802cf425aaf233c870f9922776f564963c01bac8d"
     },
     {
       "file": "PowerToys\\MouseHighlighter\\settings.json",
-      "sha256": "6a74bba6e0436afe84bc2423bc416a21988feeebb684564f156f48effc618d9f"
+      "sha256": "962326cad3de8f392ec771607e2507628017dd5275038f6d3e6d8c3318c44153"
     },
     {
       "file": "PowerToys\\MouseJump\\settings.json",
-      "sha256": "980b42117bfad3b872bbbb399b3577a469b3cc87c339e77cb09ee5f756809fbd"
+      "sha256": "4054c75160f97baf5270f8d358cb1ae24ed0f23d95ce296c2652e9f82bc208b9"
     },
     {
       "file": "PowerToys\\MousePointerCrosshairs\\settings.json",
-      "sha256": "688d297bdf5dda820a860ec8d6b622e625500223e3c5fdf4c798d48d85612f84"
+      "sha256": "16f1c3f5a880fe47ad38246f8cf2250dc69743f31d19dc80ff8f283be92bed8c"
     },
     {
       "file": "PowerToys\\MouseWithoutBorders\\settings.json",
-      "sha256": "f65c6b23ff6adc60bbc3dddb2e98eab5f36aaad8c7318a9bc7f70253ceacd4b8"
+      "sha256": "da25a01fd99889a75bef81c9223aac8cb84a99f26b6c0bfb02a279045c1e7d76"
     },
     {
       "file": "PowerToys\\NewPlus\\settings.json",
-      "sha256": "dddeacb176b39e94b6ba2395d4764801d3bc63a18c1a49e6e6017f32d5610f3c"
+      "sha256": "6d60a97d7177840a0660197b7fff5c41d69d960d41f792a9505ae6d538a2170f"
     },
     {
       "file": "PowerToys\\Peek\\preview-settings.json",
-      "sha256": "d045d5ac89529aa4774f4861baedb95cd7fd0d67f1d19311e7a57ecb09c95152"
+      "sha256": "e625f11f9990c6608e816d29e1aab32bbe54e49c733b9765068a9f4a23acb5f0"
     },
     {
       "file": "PowerToys\\Peek\\settings.json",
-      "sha256": "a6d9467ec4fedd9d4cdb76363d50e8210b5354fe24cbd9c96eb9d524e9fc19fb"
+      "sha256": "5ee5df4be9bf9590f0f3b7f63a0b0dc019f4cf396003ec99a18a0ee00f0f3fd5"
     },
     {
       "file": "PowerToys\\PowerRename\\power-rename-settings.json",
@@ -115,31 +115,31 @@
     },
     {
       "file": "PowerToys\\PowerToys Run\\Settings\\Plugins\\Microsoft.Plugin.Folder\\FolderSettings.json",
-      "sha256": "d7ed8a0919e2cd2093c8c456b1a024f53f7f1b5ee66e98a98398728c1be3b12c"
+      "sha256": "022b482f07d148aa6078ef4e8a0a103db1e2e38881281d08c64ab5389d3578af"
     },
     {
       "file": "PowerToys\\PowerToys Run\\Settings\\Plugins\\Microsoft.Plugin.Indexer\\IndexerSettings.json",
-      "sha256": "2bded36bcb9f604b95faf106f93c015faefc977aba84a4e4b389580e2135b8b0"
+      "sha256": "cbdc50bb481206c64258d6063bdca2f47965c545e476629cf40b70d5696dd283"
     },
     {
       "file": "PowerToys\\PowerToys Run\\Settings\\Plugins\\Microsoft.Plugin.Program\\ProgramPluginSettings.json",
-      "sha256": "4cc0c4e7667fb5412fccca3e14f3fff695999f33732447f3df88d09d296d523a"
+      "sha256": "01dfc0900d44dde4bb6602263af793b29720906a2a77de812b0ae65afcc9a91d"
     },
     {
       "file": "PowerToys\\PowerToys Run\\Settings\\Plugins\\Microsoft.Plugin.Shell\\ShellPluginSettings.json",
-      "sha256": "d707c846c935ec6cfa72b5718dfa8d57508458610600e30d415d5a122b0f2b3b"
+      "sha256": "20a3a948afcf8e7aa8131bb6751ce3ab9374a875b3f538ab89ff4e406744eef3"
     },
     {
       "file": "PowerToys\\PowerToys Run\\Settings\\Plugins\\Microsoft.Plugin.Uri\\UriSettings.json",
-      "sha256": "70364c787419ebeb22e10bfab93bd74f32e85dc5ae854cded5331e006dd08a4f"
+      "sha256": "6cf433470344666af3a6895ca73ccb3b22bee1a33ce6ddfb413679e3b490c6b0"
     },
     {
       "file": "PowerToys\\PowerToys Run\\Settings\\PowerToysRunSettings.json",
-      "sha256": "d201cbbc7c94dbf93774e896440ecda68acfa3a7a8246bbd711d76935fd4a7a4"
+      "sha256": "96b3b16ec9e03285fbadf58d5353ac407ce75f32b23f5a032ef3e86a83565308"
     },
     {
       "file": "PowerToys\\PowerToys Run\\settings.json",
-      "sha256": "25e0acc05fdcfdcfd141fbcc19aee704bda15a6f60d4e7c989b9f95d443d0060"
+      "sha256": "abfbcc4bb746ac17638a6fd756d354381b068a6aa7ec61c1941b82dba6882a1c"
     },
     {
       "file": "PowerToys\\QuickAccent\\settings.json",
@@ -155,19 +155,19 @@
     },
     {
       "file": "PowerToys\\Shortcut Guide\\settings.json",
-      "sha256": "f626fafc20c1bcaa56c638255cf169b157426753eebf7451c91abbfcc3ae834c"
+      "sha256": "2d8cbcd6808ab52dbdcc5a658346766bcefa1d98281a5e5851936a5fb0e09b76"
     },
     {
       "file": "PowerToys\\TextExtractor\\settings.json",
-      "sha256": "6c223c1e3c1e6889a65a156030c2db726a14ce08e0254508ab2256341c261a53"
+      "sha256": "d6492ab56c890d737df51816d42375cc1a2ad6ad60fa02f7745866f26812f1d4"
     },
     {
       "file": "PowerToys\\Workspaces\\settings.json",
-      "sha256": "c06f23c788beb6641c7a2d8e6ff1d99c1adab731a71b697675ea8f51f7e0a3d1"
+      "sha256": "239eb5c2a0fdce74599081c216ee079e61b6c792d28043c285dd11da22462026"
     },
     {
       "file": "CommandPalette\\settings.json",
-      "sha256": "acc2e1fb91ccd5cf146ed76a5d1a169f6f255d62996bd309e67ee17e31c3db8b"
+      "sha256": "b36dfcd68178525a5a5ad7b409c95040b4d50f7d733f95df6f6b4c68e632cb35"
     }
   ]
 }

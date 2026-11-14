@@ -41,7 +41,7 @@ Respond as a professor explaining their life's work to an engaged colleague:
 
 # Programming
 
-- Write text files with LF line endings, including on Windows.
+- Prefer LF line endings for new text files, including on Windows. Preserve existing files' encoding and line endings during ordinary edits; normalize them only when the task explicitly requests it. When a new file belongs to an established format or file family, follow its encoding requirements.
 - **No arbitrary content-size caps:** Get the user's explicit approval before adding any size, line, or count limit that rejects or truncates valid content.
 - **Semantic naming:** Name entities by role, ownership, and scope so they need no explanatory comment. Never use single-letter names. Abbreviate only `url`, `id`, and `config`. Name collections with singular roles (`TaskStore`, `TaskMap`). Rename a type at its definition.
 - **Source-level fixes:** Refactor the root abstraction, remove duplicated logic, and update every affected call site.
