@@ -18,12 +18,28 @@ pub enum CheckInputType {
     Object,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckInputSource {
     ChangedFiles,
-    PlannedCases,
     Workspace,
+}
+
+impl<'de> Deserialize<'de> for CheckInputSource {
+    /// Reject legacy plan callbacks instead of fabricating adapter test selections.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "changed_files" => Ok(Self::ChangedFiles),
+            "workspace" => Ok(Self::Workspace),
+            "planned_cases" => Err(serde::de::Error::custom(
+                "input source `planned_cases` is removed; planned tests are selected through test adapter IDs; remove this input and use a test adapter",
+            )),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &["changed_files", "workspace"],
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -75,9 +91,7 @@ pub(super) fn validate_schema(schema: &CheckInputMap) -> Result<()> {
         if let Some(source) = input.source {
             let expected = match source {
                 CheckInputSource::Workspace => CheckInputType::String,
-                CheckInputSource::ChangedFiles | CheckInputSource::PlannedCases => {
-                    CheckInputType::Array
-                }
+                CheckInputSource::ChangedFiles => CheckInputType::Array,
             };
             ensure!(
                 input.kind == expected,
@@ -93,7 +107,6 @@ pub(super) fn resolve(
     explicit: &CheckInputValues,
     workspace: &std::path::Path,
     files: &[String],
-    cases: &[super::CheckCase],
 ) -> Result<CheckInputValues> {
     for name in explicit.keys() {
         ensure!(schema.contains_key(name), "undeclared check input: {name}");
@@ -109,7 +122,6 @@ pub(super) fn resolve(
                         Value::String(workspace.to_string_lossy().into_owned())
                     }
                     CheckInputSource::ChangedFiles => serde_json::json!(files),
-                    CheckInputSource::PlannedCases => serde_json::json!(cases),
                 })
             })
             .or_else(|| input.default.clone());

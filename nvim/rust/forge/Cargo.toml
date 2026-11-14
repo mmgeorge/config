@@ -7,7 +7,7 @@ license.workspace = true
 
 [workspace]
 resolver = "3"
-members = ["crates/forge-provider-api", "crates/forge-shell", "crates/forge-providers", "crates/forge-text", "crates/forge-buffer", "crates/forge-protocol", "crates/forge-method-policy", "crates/forge-recorded-fixtures", "crates/forge-harness", "crates/forge-git", "crates/forge-diff", "crates/forge-github", "crates/forge-review", "crates/forge-status"]
+members = ["crates/forge-provider-api", "crates/forge-shell", "crates/forge-providers", "crates/forge-text", "crates/forge-buffer", "crates/forge-protocol", "crates/forge-method-policy", "crates/forge-recorded-fixtures", "crates/forge-harness", "crates/forge-git", "crates/forge-diff", "crates/forge-github", "crates/forge-review", "crates/forge-status", "vendor/process-wrap"]
 exclude = ["vendor/gix-path", "vendor/tree-sitter-powershell"]
 
 [workspace.package]
@@ -42,6 +42,7 @@ dunce = "1.0.5"
 futures-util = "0.3"
 github-copilot-sdk = { version = "=1.0.26", default-features = false, features = ["runtime"] }
 gix = { version = "=0.87.1", default-features = false }
+glob = "=0.3.4"
 hex = "0.4"
 home = "0.5"
 imara-diff = { package = "gix-imara-diff", version = "=0.2.5", default-features = false }
@@ -50,6 +51,7 @@ jsonschema = { version = "0.49", default-features = false }
 junction = { version = "=2.1.0", default-features = false }
 libc = "0.2.189"
 memchr = "2"
+nextest-metadata = "=0.15.0"
 process-wrap = { version = "=10.0.1", default-features = false }
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 redb = "=2.6.3"
@@ -71,6 +73,7 @@ spdx = "0.13.4"
 stacker = "=0.1.25"
 strip-ansi-escapes = "0.2.1"
 symspell_rs = "=7.0.1"
+syn = { version = "=2.0.119", default-features = false, features = ["derive", "parsing"] }
 tempfile = "3.23"
 thiserror = "2.0"
 tokio = "1.48"
@@ -111,6 +114,7 @@ windows = "0.62.2"
 
 [patch.crates-io]
 gix-path = { path = "vendor/gix-path" }
+process-wrap = { path = "vendor/process-wrap" }
 tree-sitter-powershell = { path = "vendor/tree-sitter-powershell" }
 
 [dependencies]

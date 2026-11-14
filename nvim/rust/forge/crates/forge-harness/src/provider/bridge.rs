@@ -418,6 +418,15 @@ enum BindingMetadata {
 
 impl ResourceLease for EndpointLease {}
 
+struct RepositoryProcessLease(Arc<dyn forge_shell::process::ProcessOwner>);
+
+impl ResourceLease for RepositoryProcessLease {
+    /// Keep native process launch tied to its host-admitted repository operation.
+    fn process_owner(&self) -> Option<Arc<dyn forge_shell::process::ProcessOwner>> {
+        Some(self.0.clone())
+    }
+}
+
 /// Keep host observation available before native initialization without inventing events.
 pub(crate) struct HostEventStream {
     receiver: mpsc::UnboundedReceiver<Result<ProviderObservation, EventDeliveryError>>,
@@ -584,7 +593,13 @@ impl ProviderBridge {
                         approval: request.approval_mode,
                         resources,
                     },
-                    resource_lease: None,
+                    resource_lease: request
+                        .control_context
+                        .as_ref()
+                        .and_then(|context| context.repository_process.clone())
+                        .map(|owner| {
+                            Arc::new(RepositoryProcessLease(owner)) as Arc<dyn ResourceLease>
+                        }),
                     tools,
                     tool_endpoint: None,
                     system_instructions,

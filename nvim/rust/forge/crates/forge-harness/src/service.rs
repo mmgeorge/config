@@ -368,6 +368,10 @@ impl HarnessService {
                     }
                 };
                 if source.document.design.is_some() {
+                    source.warning_status = controller
+                        .checks
+                        .submission_warning_status(source.document.design.as_ref().unwrap())
+                        .await;
                     let trace = registry.runtime.trace();
                     if trace.is_enabled() {
                         source.trace = Some(crate::plan::review_source::ReviewTrace {

@@ -1,0 +1,7 @@
+[profile.default]
+default-filter = "not test(=excluded)"
+retries = 0
+
+[[profile.default.overrides]]
+filter = "test(=times_out)"
+slow-timeout = { period = "100ms", terminate-after = 1, grace-period = "0s" }

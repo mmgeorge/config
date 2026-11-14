@@ -430,6 +430,21 @@ impl ExchangeDriver {
                     }
                 }
             }
+            trace.record(
+                session_id,
+                "exchange.task_check.readiness",
+                serde_json::json!({
+                    "disposition": if relevant { "applicable" } else { "irrelevant" },
+                    "phase": if admission.start_task_verification { "admissible" } else { "busy" },
+                    "status": match &readiness {
+                        Some(InputReadiness::Started) => "started",
+                        Some(InputReadiness::WaitExecution) => "execution",
+                        Some(InputReadiness::Waiting) => "waiting",
+                        None => "irrelevant",
+                    },
+                    "update_step": step,
+                }),
+            );
             for reply in self.task_check_requests.drain(..) {
                 let _ = reply.send(Ok(readiness));
             }
@@ -487,9 +502,7 @@ impl ExchangeDriver {
         // Revalidate tool candidates after this update's command has closed any collection gate.
         if let Some(request) = pending_check_tools.pop_front() {
             if !admission.open_check_tools {
-                let _ = request
-                    .reply
-                    .send(Err(crate::checks::owner::CheckOwnerFailure::Unavailable));
+                request.reject(crate::checks::owner::CheckOwnerFailure::Unavailable);
             } else {
                 match broker.try_lock() {
                     Ok(mut broker) => match broker.owner_control_view() {
@@ -511,8 +524,8 @@ impl ExchangeDriver {
                                 .and_then(|runtime| {
                                     runtime.transaction.invocation_scope().ok().flatten()
                                 });
-                            let current = dispatched.as_ref() == Some(&request.scope)
-                                || view.steering_scope.as_ref() == Some(&request.scope);
+                            let current = dispatched.as_ref() == Some(request.scope())
+                                || view.steering_scope.as_ref() == Some(request.scope());
                             let published = view.events.into_iter().try_for_each(|event| {
                                 retain_publication(
                                     event,
@@ -525,12 +538,12 @@ impl ExchangeDriver {
                             });
                             if published.is_err() {
                                 self.execution_fail(services);
-                                let _ = request.reply.send(Err(
-                                    crate::checks::owner::CheckOwnerFailure::Unavailable,
-                                ));
+                                request
+                                    .reject(crate::checks::owner::CheckOwnerFailure::Unavailable);
                             } else if current {
-                                if check_scope.as_ref() != Some(&request.scope)
-                                    && let Some(prior) = check_scope.replace(request.scope.clone())
+                                if check_scope.as_ref() != Some(request.scope())
+                                    && let Some(prior) =
+                                        check_scope.replace(request.scope().clone())
                                 {
                                     let _ = check_runs.retire_scope(&prior);
                                 }
@@ -538,15 +551,11 @@ impl ExchangeDriver {
                                     trace.record(session_id, "exchange.check.admission_failed", serde_json::json!({"reason":error.to_string(),"update_step":step}));
                                 }
                             } else {
-                                let _ = request
-                                    .reply
-                                    .send(Err(crate::checks::owner::CheckOwnerFailure::StaleScope));
+                                request.reject(crate::checks::owner::CheckOwnerFailure::StaleScope);
                             }
                         }
                         Err(error) => {
-                            let _ = request
-                                .reply
-                                .send(Err(crate::checks::owner::CheckOwnerFailure::Worker(error)));
+                            request.reject(crate::checks::owner::CheckOwnerFailure::Worker(error));
                         }
                     },
                     Err(_) => {

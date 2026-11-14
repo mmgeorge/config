@@ -1,0 +1,10 @@
+error: error parsing message format version
+
+Caused by:
+  invalid format version: 999.0
+
+Caused by:
+  version component `major` could not be parsed as an integer
+
+Caused by:
+  number too large to fit in target type

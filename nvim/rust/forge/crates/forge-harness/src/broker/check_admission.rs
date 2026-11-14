@@ -42,6 +42,7 @@ pub(crate) struct AutomaticCheckRun {
 pub(crate) struct AutomaticCheckResult {
     capture: AutomaticCheckRefresh,
     run: CheckRun,
+    verification_satisfied: bool,
 }
 
 /// Own one task verification process and the authority that admitted it.
@@ -49,6 +50,7 @@ pub(crate) struct TaskCheckRun {
     capture: AutomaticCheckRefresh,
     permit: crate::task::TaskPermit,
     run: PreparedCheckRun,
+    deadline: crate::checks::CheckDeadline,
 }
 
 /// Retain task and execution authority with completed verification evidence.
@@ -56,6 +58,16 @@ pub(crate) struct TaskCheckResult {
     capture: AutomaticCheckRefresh,
     permit: crate::task::TaskPermit,
     run: CheckRun,
+}
+
+impl TaskCheckResult {
+    /// Discard completion authority while preserving the collected attempt for history.
+    pub(super) fn into_interrupted(self) -> CheckRun {
+        let mut run = self.run;
+        run.interrupt();
+        run.completed_plan = None;
+        run
+    }
 }
 
 /// Distinguish invalidated work from a prepared check or an empty selection.
@@ -121,6 +133,7 @@ impl HarnessBroker {
         interaction: &Exchange,
         permit: crate::task::TaskPermit,
         run: PreparedCheckRun,
+        deadline: crate::checks::CheckDeadline,
     ) -> Result<TaskCheckRun> {
         permit.validate(self.task_controller.current()?.as_ref())?;
         let capture = self.capture_automatic_check(interaction)?;
@@ -132,6 +145,7 @@ impl HarnessBroker {
             capture,
             permit,
             run,
+            deadline,
         })
     }
 
@@ -184,7 +198,9 @@ impl HarnessBroker {
                 &self.session.provider,
             )?
             .desired;
-        if !desired.automatic_checks_enabled() {
+        if !desired.automatic_checks_enabled()
+            && !self.check_runner.has_verification_requirements()?
+        {
             self.observer.completion_queue.finish()?;
             return Ok((None, AutomaticCheckAction::Finish(result)));
         }
@@ -245,7 +261,9 @@ impl HarnessBroker {
                 &self.session.provider,
             )?
             .desired;
-        if !desired.automatic_checks_enabled() {
+        if !desired.automatic_checks_enabled()
+            && !self.check_runner.has_verification_requirements()?
+        {
             tx.automatic.pending = false;
             tx.automatic.blocked = None;
             tx.automatic.delivered.clear();
@@ -299,11 +317,18 @@ impl HarnessBroker {
         {
             return Ok(AutomaticCheckAction::Revalidate);
         }
+        let verification_satisfied = result.verification_satisfied;
         let Some(run) = self.commit_automatic_check(&tx.interaction, result)? else {
             return Ok(AutomaticCheckAction::Revalidate);
         };
         if run.state == CheckState::Interrupted {
             return Err(TurnCancelled.into());
+        }
+        if matches!(run.state, CheckState::Passed | CheckState::Skipped) && !verification_satisfied
+        {
+            return Ok(AutomaticCheckAction::Refresh(
+                self.capture_automatic_check(&tx.interaction)?,
+            ));
         }
         if run.state == CheckState::Stale {
             return Ok(AutomaticCheckAction::Refresh(
@@ -317,7 +342,9 @@ impl HarnessBroker {
                 &self.session.provider,
             )?
             .desired;
-        if !desired.automatic_checks_enabled() {
+        if !desired.automatic_checks_enabled()
+            && !self.check_runner.has_verification_requirements()?
+        {
             tx.automatic.pending = false;
             tx.automatic.blocked = None;
             tx.automatic.delivered.clear();
@@ -471,10 +498,25 @@ impl HarnessBroker {
             capture.shell,
             "Automatic completion checks".into(),
         )?;
+        let desired = crate::settings::SettingsStore::open(&self.data_root)?
+            .get(
+                &self.session.workspace,
+                &self.session.id,
+                &self.session.provider,
+            )?
+            .desired;
+        if !desired.automatic_checks_enabled() {
+            for command in &mut run.commands {
+                command.selected = false;
+                command.state = CheckState::Skipped;
+                command.error = Some("Automatic checks are disabled".into());
+            }
+        }
         if !run
             .commands
             .iter()
             .any(|command| command.state != CheckState::Skipped)
+            && !capture.supervisor.has_verification_requirements()?
         {
             return Ok(AutomaticCheckAdmission::Empty);
         }
@@ -574,11 +616,18 @@ impl AutomaticCheckRun {
                 self.run,
                 self.capture.sink.clone(),
                 Some(self.capture.cancelled.subscribe()),
+                None,
             )
+            .await?;
+        let verification_satisfied = self
+            .capture
+            .supervisor
+            .completion_verification_satisfied()
             .await?;
         Ok(AutomaticCheckResult {
             capture: self.capture,
             run,
+            verification_satisfied,
         })
     }
 }
@@ -602,6 +651,7 @@ impl TaskCheckRun {
                 self.run,
                 self.capture.sink.clone(),
                 Some(self.capture.cancelled.subscribe()),
+                Some(self.deadline),
             )
             .await?;
         Ok(TaskCheckResult {

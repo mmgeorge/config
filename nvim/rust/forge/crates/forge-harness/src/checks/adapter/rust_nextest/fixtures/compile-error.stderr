@@ -1,0 +1,11 @@
+   Compiling nextest-protocol-fixture v0.1.0 (/nextest-fixture)
+error: expected one of `!` or `::`, found `is`
+  --> src\lib.rs:17:6
+   |
+17 | this is deliberately invalid Rust
+   |      ^^ expected one of `!` or `::`
+
+error: could not compile `nextest-protocol-fixture` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `nextest-protocol-fixture` (lib) due to 1 previous error
+error: command `'C:\Users\mattm\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe' '--color=auto' test --no-run '--message-format=json-render-diagnostics' --workspace '--profile=dev' --locked --offline` exited with code 101

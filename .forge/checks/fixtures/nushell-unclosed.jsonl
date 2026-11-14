@@ -1,0 +1,6 @@
+{"type":"diagnostic","severity":"Error","message":"Unclosed delimiter.","span":{"start":29,"end":30}}
+{"type":"diagnostic","severity":"Error","message":"Unclosed delimiter.","span":{"start":29,"end":30}}
+{"type":"diagnostic","severity":"Error","message":"Unclosed delimiter.","span":{"start":29,"end":30}}
+{"type":"diagnostic","severity":"Error","message":"Unclosed delimiter.","span":{"start":30,"end":30}}
+{"type":"hint","typename":"string","position":{"start":4,"end":8}}
+{"type":"hint","typename":"string","position":{"start":20,"end":25}}

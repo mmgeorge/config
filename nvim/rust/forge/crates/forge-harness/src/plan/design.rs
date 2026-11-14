@@ -47,6 +47,9 @@ static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sy
 /// Owns baseline declarations and the agent's proposed file contents.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationDesign {
+    /// Retain static test observations with the revision and inputs that produced them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_warnings: Option<crate::checks::SubmissionWarnings>,
     /// Bind a submitted planning directory to its immutable raw input snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoring_fingerprint: Option<String>,
@@ -109,6 +112,7 @@ fn default_line_width() -> usize {
 impl Default for DeclarationDesign {
     fn default() -> Self {
         Self {
+            submission_warnings: None,
             authoring_fingerprint: None,
             check_preview: Vec::new(),
             check_preview_source: String::new(),
@@ -270,6 +274,7 @@ impl DeclarationDesign {
             &self.document.tests,
             &self.document.checks,
             &self.document.disabled_checks,
+            &self.document.test_scopes,
             manifests,
         ))?))
     }
@@ -279,9 +284,11 @@ impl DeclarationDesign {
         self.check_configuration.as_ref().map(|snapshot| snapshot.config.definitions.iter().map(|check| {
             let enabled = check.enabled && !self.document.disabled_checks.contains(&check.id)
                 && (check.auto || self.document.checks.contains(&check.id)
+                    || self.document.test_scopes.get(&check.id) == Some(&super::PlanTestScope::WholeSuite)
                     || self.check_preview.iter().any(|preview| preview.id == check.id && preview.selected));
             serde_json::json!({"id":check.id, "name":check.name, "stage":check.category,
                 "enabled":enabled, "available":check.enabled,
+                "test_scope": (check.category == crate::checks::CheckCategory::Test).then(|| self.document.test_scopes.get(&check.id).copied().unwrap_or_default()),
                 "reason":self.check_preview.iter().find(|preview| preview.id == check.id).map(|preview| &preview.reason)})
         }).collect()).unwrap_or_default()
     }
@@ -387,6 +394,12 @@ impl DeclarationDesign {
     /// Validate every proposed overview before exposing a persisted revision.
     pub fn validate(&self) -> Result<()> {
         self.document.validate()?;
+        if let Some(configuration) = &self.check_configuration {
+            DesignDocument::validate_test_scopes(
+                &configuration.config,
+                &self.document.test_scopes,
+            )?;
+        }
         for (path, text) in &self.cargo_lock {
             validate_relative_path(path)?;
             ensure!(

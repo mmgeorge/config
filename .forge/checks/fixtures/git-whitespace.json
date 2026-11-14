@@ -1,0 +1,3 @@
+{
+  "stdout": "whitespace.txt:2: trailing whitespace.\n+bad  \n"
+}

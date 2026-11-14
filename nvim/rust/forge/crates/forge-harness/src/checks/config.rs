@@ -6,58 +6,114 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Classifies check purpose independently of its runner or execution dependencies.
 pub enum CheckCategory {
     Format,
     Lint,
-    Check,
+    #[serde(rename = "typecheck")]
+    TypeCheck,
     Test,
     Build,
+    Custom,
 }
 
-impl CheckCategory {
-    pub(crate) fn priority(self) -> u8 {
-        match self {
-            Self::Check => 0,
-            Self::Test => 1,
-            Self::Format => 2,
-            Self::Lint => 3,
-            Self::Build => 4,
+impl<'de> Deserialize<'de> for CheckCategory {
+    /// Decode the category without silently retaining the removed `check` spelling.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "typecheck" => Ok(Self::TypeCheck),
+            "test" => Ok(Self::Test),
+            "format" => Ok(Self::Format),
+            "lint" => Ok(Self::Lint),
+            "build" => Ok(Self::Build),
+            "custom" => Ok(Self::Custom),
+            "check" => Err(serde::de::Error::custom(
+                "category `check` was renamed to `typecheck`; choose an adapter from check_definition_list, or use `custom` for a plain command",
+            )),
+            _ => Err(serde::de::Error::unknown_variant(
+                &name,
+                &["typecheck", "test", "format", "lint", "build", "custom"],
+            )),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-/// Determines whether successful execution certifies stable inputs or prepares new inputs.
-pub enum CheckPurpose {
-    #[default]
-    /// Certifies unchanged inputs after successful execution.
-    Verify,
-    /// Permits source edits and records the resulting inputs after successful execution.
-    Prepare,
+impl CheckCategory {
+    /// Get the configuration spelling used by diagnostics and adapter contracts.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::TypeCheck => "typecheck",
+            Self::Test => "test",
+            Self::Format => "format",
+            Self::Lint => "lint",
+            Self::Build => "build",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub(crate) fn priority(self) -> u8 {
+        match self {
+            Self::TypeCheck => 0,
+            Self::Test => 1,
+            Self::Format => 2,
+            Self::Lint => 3,
+            Self::Build => 4,
+            Self::Custom => 5,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Selects project-wide or task-derived coverage without changing command text.
 pub enum CheckScope {
     #[default]
     All,
-    ChangedFiles,
-    ChangedCases,
-    /// Runs only tests marked new in the accepted plan.
-    NewCases,
+    Paths,
+    Tests,
+}
+
+impl<'de> Deserialize<'de> for CheckScope {
+    /// Reject removed scope spellings without silently changing persisted selection policy.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "all" => Ok(Self::All),
+            "paths" => Ok(Self::Paths),
+            "tests" => Ok(Self::Tests),
+            "changed_files" => Err(serde::de::Error::custom(
+                "scope `changed_files` was removed; use `paths` for path/custom checks or `tests` for test adapters",
+            )),
+            "changed_cases" | "new_cases" => Err(serde::de::Error::custom(
+                "planned-case scopes were removed; use `tests` and select Planned or Whole suite in plan review",
+            )),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &["all", "paths", "tests"],
+            )),
+        }
+    }
+}
+
+impl CheckScope {
+    /// Get whether a category accepts this default selection policy.
+    pub(crate) fn supports(self, category: CheckCategory) -> bool {
+        match self {
+            Self::All => true,
+            Self::Paths => category != CheckCategory::Test,
+            Self::Tests => category == CheckCategory::Test,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Supplies shell source or a direct executable with resolved argument bindings.
 pub struct CheckOperation {
-    #[serde(default)]
-    pub input: bool,
+    /// Permit this custom command to change source before verification runs.
+    pub prepare: bool,
     /// Shell source when args is absent, otherwise an executable name or path.
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +125,15 @@ pub struct CheckOperation {
 }
 
 impl CheckOperation {
+    /// Derive the custom command's source contract from its configured preparation policy.
+    pub(crate) fn purpose(&self) -> super::CheckPurpose {
+        if self.prepare {
+            super::CheckPurpose::Prepare
+        } else {
+            super::CheckPurpose::Verify
+        }
+    }
+
     /// Renders the complete configured invocation for review and permission matching.
     pub fn display(&self) -> String {
         self.args.as_ref().map_or_else(
@@ -85,9 +150,6 @@ pub struct CheckDefinition {
     pub id: String,
     pub name: String,
     pub category: CheckCategory,
-    #[serde(default)]
-    /// Source mutation contract, defaulting to read-only verification.
-    pub purpose: CheckPurpose,
     pub enabled: bool,
     #[serde(default = "automatic_default")]
     /// Selects this check automatically when its trigger matches.
@@ -100,13 +162,35 @@ pub struct CheckDefinition {
     pub scope: CheckScope,
     #[serde(default = "root_directory")]
     pub directory: String,
-    pub all: CheckOperation,
-    #[serde(default)]
-    pub files: Option<CheckOperation>,
-    #[serde(default)]
-    pub cases: Option<CheckOperation>,
+    pub runner: CheckRunner,
     #[serde(default)]
     pub depends_on: Vec<String>,
+}
+
+/// Keep command-only checks separate from structured category adapters.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckRunner {
+    Command(CheckOperation),
+    Adapter(super::adapter::AdapterConfig),
+}
+
+impl CheckRunner {
+    /// Get a command, if this check uses the command contract.
+    pub fn command(&self) -> Option<&CheckOperation> {
+        match self {
+            Self::Command(command) => Some(command),
+            Self::Adapter(_) => None,
+        }
+    }
+
+    /// Get the configured invocation without resolving task-specific inputs.
+    pub fn display(&self) -> String {
+        match self {
+            Self::Command(command) => command.display(),
+            Self::Adapter(adapter) => adapter.display(),
+        }
+    }
 }
 
 fn root_directory() -> String {
@@ -129,15 +213,13 @@ pub struct CheckConfig {
 }
 
 impl CheckConfig {
-    /// Rejects explicit plan selections that cannot execute from this configuration.
+    /// Reject unknown plan selections; execution admission applies live task enablement.
     pub(crate) fn validate_selection(&self, ids: &[String]) -> Result<()> {
         for id in ids {
-            let definition = self
-                .definitions
+            self.definitions
                 .iter()
                 .find(|definition| &definition.id == id)
                 .with_context(|| format!("unknown planned check: {id}"))?;
-            ensure!(definition.enabled, "planned check is disabled: {id}");
         }
         Ok(())
     }
@@ -156,6 +238,11 @@ impl CheckConfig {
             );
             definition.trigger.validate()?;
             ensure!(
+                definition.scope.supports(definition.category),
+                "{}: scope is incompatible with its check category",
+                definition.id
+            );
+            ensure!(
                 !definition.id.is_empty()
                     && definition
                         .id
@@ -172,10 +259,13 @@ impl CheckConfig {
             );
             ensure!(!definition.name.trim().is_empty(), "invalid check name");
             relative_path(&definition.directory)?;
-            for operation in std::iter::once(&definition.all)
-                .chain(definition.files.iter())
-                .chain(definition.cases.iter())
-            {
+            if let Some(operation) = definition.runner.command() {
+                ensure!(
+                    definition.category == CheckCategory::Custom,
+                    "{}: category `{}` requires an adapter, not a plain command; choose an adapter from check_definition_list, or use `custom`",
+                    definition.id,
+                    definition.category.as_str()
+                );
                 ensure!(
                     !operation.command.trim().is_empty()
                         && !operation.command.contains(['\0', '\r', '\n']),
@@ -184,18 +274,19 @@ impl CheckConfig {
                 );
                 super::invocation::validate(operation)?;
             }
-            match definition.scope {
-                CheckScope::ChangedFiles => ensure!(
-                    definition.files.is_some(),
-                    "{} does not implement file selection",
+            if let CheckRunner::Adapter(adapter) = &definition.runner {
+                ensure!(
+                    definition.category != CheckCategory::Custom,
+                    "{}: category `custom` requires a plain command, not an adapter; use a contract category from check_definition_list",
                     definition.id
-                ),
-                CheckScope::ChangedCases | CheckScope::NewCases => ensure!(
-                    definition.cases.is_some(),
-                    "{} does not implement case selection",
-                    definition.id
-                ),
-                CheckScope::All => {}
+                );
+                adapter.validate(definition.category).map_err(|error| {
+                    let message = format!(
+                        "{}: invalid adapter: {error}; see check_definition_list",
+                        definition.id
+                    );
+                    anyhow::Error::new(error).context(message)
+                })?;
             }
         }
         self.order()?;
@@ -204,31 +295,30 @@ impl CheckConfig {
 
     /// Orders the catalog by preparation, category priority, and explicit prerequisites.
     ///
-    /// Configured order breaks priority ties. Missing or cyclic prerequisites are errors.
+    /// Check IDs break priority ties. Missing or cyclic prerequisites are errors.
     pub fn order(&self) -> Result<Vec<usize>> {
-        self.order_selected(
+        self.order_preparing(
             &self
                 .definitions
                 .iter()
+                .filter(|definition| {
+                    definition
+                        .runner
+                        .command()
+                        .is_some_and(|operation| operation.prepare)
+                })
                 .map(|definition| definition.id.clone())
                 .collect(),
         )
     }
 
-    /// Orders selected preparation and its prerequisites before unrelated verification.
+    /// Order this run's preparation commands and their prerequisites before unrelated verification.
     ///
-    /// Includes unselected catalog entries without promoting their preparation prerequisites.
+    /// Include unselected catalog entries without promoting their preparation prerequisites.
     /// Explicit dependencies precede category priority. Missing or cyclic prerequisites are errors.
-    pub(crate) fn order_selected(&self, selected: &BTreeSet<String>) -> Result<Vec<usize>> {
+    pub(crate) fn order_preparing(&self, preparing: &BTreeSet<String>) -> Result<Vec<usize>> {
         // Promote preparation prerequisites so unrelated verification cannot precede source edits.
-        let mut preparation: BTreeSet<_> = self
-            .definitions
-            .iter()
-            .filter(|definition| {
-                selected.contains(&definition.id) && definition.purpose == CheckPurpose::Prepare
-            })
-            .map(|definition| definition.id.as_str())
-            .collect();
+        let mut preparation: BTreeSet<_> = preparing.iter().map(String::as_str).collect();
         let mut pending: Vec<_> = preparation.iter().copied().collect();
         while let Some(id) = pending.pop() {
             let definition = self
@@ -257,12 +347,12 @@ impl CheckConfig {
                             .iter()
                             .all(|id| completed.contains(id.as_str()))
                 })
-                .min_by_key(|(index, definition)| {
+                .min_by_key(|(_, definition)| {
                     let category = definition.category.priority();
                     (
                         !preparation.contains(definition.id.as_str()),
                         category,
-                        *index,
+                        definition.id.as_str(),
                     )
                 });
             let Some((index, definition)) = next else {
@@ -290,6 +380,23 @@ impl ConfigSnapshot {
         let checks = document
             .get("checks")
             .context("checks_not_configured: enable /checks edit on and request configuration in chat, then retry submission")?;
+        if let Some(checks) = checks.as_object() {
+            for (id, check) in checks {
+                if check["action"]["category"] == "check" {
+                    anyhow::bail!(
+                        "{id}: category `check` was renamed to `typecheck`; choose an adapter from check_definition_list, or use `custom` for a plain command"
+                    );
+                }
+                if let Some(inputs) = check["action"]["inputs"].as_object() {
+                    for (name, input) in inputs {
+                        ensure!(
+                            input["source"] != "planned_cases",
+                            "{id}: input `{name}` uses removed source `planned_cases`; remove this input and use a test adapter with adapter IDs"
+                        );
+                    }
+                }
+            }
+        }
         let config: CheckConfig =
             serde_json::from_value(checks.clone()).context("invalid checks configuration")?;
         config.validate()?;

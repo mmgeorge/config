@@ -10,6 +10,27 @@ local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["timeline_activation_dispatches_quickfix_and_source_columns"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local actions = require("forge.views.harness.source_actions")
+  state.transcript_buf = vim.api.nvim_get_current_buf()
+  state.session = { id = "fixture", workspace = "workspace" }
+  local action = { kind = "quickfix", title = "Compiler", items = {} }
+  state.presentation = {
+    activate = function(callback) callback(action, {}) end,
+    open_output = function() return false end,
+  }
+  local received
+  actions.quickfix = function(workspace, value) received = { workspace, value } end
+  actions.open_file = function(workspace, value) received = { workspace, value } end
+  controller.open_timeline_entry()
+  eq(received, { "workspace", action })
+  action = { kind = "file", path = "file.rs", line = 7, column = 9 }
+  controller.open_timeline_entry()
+  eq(received, { "workspace", action })
+end
+
 T["unavailable_owner_shows_failure_and_preserves_prompt"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")

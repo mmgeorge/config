@@ -2,11 +2,15 @@ use super::CheckRun;
 use crate::broker::publication::{SessionUpdate, SessionUpdateSink};
 use anyhow::{Context, Result};
 use std::{path::PathBuf, sync::Arc};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+};
 
 /// Persists the latest snapshot independently of command I/O and cancellation.
 pub(super) struct CheckPublication {
     update: watch::Sender<Arc<CheckRun>>,
+    barrier: mpsc::Sender<oneshot::Sender<Result<()>>>,
     worker: JoinHandle<Result<()>>,
 }
 
@@ -14,12 +18,13 @@ impl CheckPublication {
     /// Starts persistence with the admitted run's first snapshot.
     ///
     /// Every write replaces the whole record, so a failed progress write is superseded by the
-    /// next successful one. The worker therefore keeps writing after a failure, and only a
-    /// failure of the last snapshot, which `finish` always supplies, reaches the caller. A
+    /// next successful one. The worker therefore keeps writing after a failure. Explicit
+    /// barriers report their own write errors; `finish` reports the final snapshot's error. A
     /// transient error, such as a Windows sharing violation on one rename, cannot turn a run
     /// whose terminal record was saved into an execution error.
     pub(super) fn new(path: PathBuf, run: &CheckRun) -> Self {
         let (update, mut pending) = watch::channel(Arc::new(run.clone()));
+        let (barrier, mut barriers) = mpsc::channel::<oneshot::Sender<Result<()>>>(1);
         let worker = tokio::spawn(async move {
             loop {
                 let run = Arc::clone(&pending.borrow_and_update());
@@ -33,8 +38,26 @@ impl CheckPublication {
                 .and_then(|written| written);
                 // `changed` reports an unseen snapshot before it reports the closed channel, so
                 // the terminal snapshot sent by `finish` is always written last.
-                if pending.changed().await.is_err() {
-                    return written;
+                tokio::select! {
+                    biased;
+                    Some(reply) = barriers.recv() => {
+                        // Consume pending progress before committing so an older snapshot
+                        // cannot overwrite the barrier's snapshot after acknowledgment.
+                        let current = Arc::clone(&pending.borrow_and_update());
+                        let path = path.clone();
+                        let committed = tokio::task::spawn_blocking(move || {
+                            super::supervisor::write_record(&path, &current)
+                        })
+                        .await
+                        .context("check persistence worker failed")
+                        .and_then(|written| written);
+                        let _ = reply.send(committed);
+                    }
+                    changed = pending.changed() => {
+                        if changed.is_err() {
+                            return written;
+                        }
+                    }
                 }
                 if let Err(error) = written {
                     tracing::warn!(
@@ -47,12 +70,29 @@ impl CheckPublication {
                 }
             }
         });
-        Self { update, worker }
+        Self {
+            update,
+            barrier,
+            worker,
+        }
     }
 
     /// Replaces pending progress while a prior snapshot is being written.
     pub(super) fn update(&self, run: &CheckRun) {
         self.update.send_replace(Arc::new(run.clone()));
+    }
+
+    /// Commit this snapshot before allowing an operation that can mutate source.
+    pub(super) async fn persist(&self, run: &CheckRun) -> Result<()> {
+        self.update(run);
+        let (reply, received) = oneshot::channel();
+        self.barrier
+            .send(reply)
+            .await
+            .context("check persistence worker is unavailable")?;
+        received
+            .await
+            .context("check persistence barrier was not acknowledged")?
     }
 
     /// Flushes the terminal snapshot and returns any persistence failure.
@@ -164,5 +204,60 @@ impl CheckNotification {
                 serde_json::json!({}),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the ordinary serialized history contract without starting a check process.
+    fn run() -> CheckRun {
+        serde_json::from_value(serde_json::json!({
+            "id":"run", "owner":{"kind":"session","session_id":"session"},
+            "revision":0, "shell":"system", "executable":null, "workspace":".",
+            "environment_digest":"test", "started_at_ms":1, "completed_at_ms":null,
+            "state":"running", "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null, "workspace_digest":{}, "commands":[]
+        }))
+        .unwrap()
+    }
+
+    /// Acknowledgment means the requested state is on disk and older progress cannot replace it.
+    #[tokio::test]
+    async fn barrier_commits_latest_state_before_acknowledgment() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("run/record.json");
+        let mut run = run();
+        let publication = CheckPublication::new(path.clone(), &run);
+        run.revision = 1;
+        publication.update(&run);
+        run.revision = 2;
+        publication.persist(&run).await?;
+        let recorded: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(recorded["run"]["revision"], 2);
+        run.revision = 3;
+        publication.finish(&run).await?;
+        let recorded: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(recorded["run"]["revision"], 3);
+        Ok(())
+    }
+
+    /// Failed barriers retain the I/O cause; repairing storage allows a later explicit commit.
+    #[tokio::test]
+    async fn barrier_reports_storage_failure_and_worker_can_recover() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let parent = root.path().join("blocked");
+        std::fs::write(&parent, "not a directory")?;
+        let path = parent.join("record.json");
+        let run = run();
+        let publication = CheckPublication::new(path.clone(), &run);
+        let error = publication.persist(&run).await.unwrap_err();
+        assert!(error.chain().any(|cause| cause.is::<std::io::Error>()));
+        std::fs::remove_file(&parent)?;
+        publication.persist(&run).await?;
+        assert!(path.is_file());
+        publication.finish(&run).await?;
+        Ok(())
     }
 }

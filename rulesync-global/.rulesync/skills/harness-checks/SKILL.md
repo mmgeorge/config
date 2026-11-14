@@ -1,83 +1,49 @@
 ---
 name: harness-checks
 description: >-
-  Configure Forge Harness project checks, automatic triggers, typed command inputs,
-  and repository-owned callbacks through check_definition_edit. Use when adding, editing,
-  or repairing .forge.json checks or managed .forge/checks/ helpers. Do not use for
-  merely running existing checks or changing task-specific check selection.
+  Configure Forge Harness project checks, category adapters, automatic triggers,
+  and custom command inputs through check_definition_edit. Use when adding,
+  editing, or repairing .forge.json checks or managed .forge/checks/ helpers.
+  Do not use for merely running checks or changing task-specific selection.
 targets:
   - '*'
 ---
 
 # Harness Checks
 
-Configure checks only through `check_definition_edit` when check editing is enabled. Read `check_definition_list` for the current revision, definitions, live automatic-check policy, and live `check_editing` permission. Preserve unrelated configuration. Every submission requires review outside YOLO. Configuration does not execute checks or validate helper-language syntax. The list contains input descriptions but omits full commands, history, and previews. Read `check_definition_details` with `check_id` for each existing definition that must be preserved or edited. Publish the complete intended definition map, not a partial replacement. Successful edits return the new revision and changed names.
+Configure checks through `check_definition_edit` when check editing is enabled. Preserve unrelated definitions and settings. Every submission requires review outside YOLO. Configuration publication does not execute checks or validate helper-language syntax.
 
-Inspect repository scripts and manifests before choosing commands. The check executor treats all commands as opaque. It never detects Cargo, npm, a language, or a runner, never performs test discovery, and never adds runner flags.
+## Inspect and publish
 
-## Declared inputs and templates
+1. Read `check_definition_list` for the current revision, compiled `adapters` catalog, live automatic-check policy, and `check_editing` permission. Read `check_definition_details` with `check_id` for every existing definition being preserved or edited; the list omits complete commands and adapter options. If configuration is invalid, inspect the saved definitions before replacing them.
+2. Inspect repository manifests, scripts, and tool versions. Choose an explicit category: `typecheck`, `test`, `format`, `lint`, `build`, or `custom`. There is no default category; `check` is obsolete.
+3. For a contract category, choose a built-in adapter whose catalog `categories` include the category and whose `use_when` fits the project. Use the catalog's script adapter when no built-in adapter fits. Read its options schema and protocol documentation; do not invent adapter names, options, supported operations, or minimum tool versions.
+4. Submit `expected_revision`, the complete intended `config` map, and any managed `helpers`. A helper includes its inspected `expected_digest`, or null for a new file. If a revision or digest changed, read the current contents and reconcile before resubmitting. Helpers must live under `.forge/checks/`.
+5. Inspect the returned revision and changed names, then reread affected definitions. Validate helper syntax separately and exercise the configured argv through Harness. A successful configuration edit is not execution evidence.
 
-Checks map names to `trigger` and `action`. A command array starts with a fixed executable. A string runs through the configured shell.
+## Categories and adapters
 
-```json
-{
-  "unit": {
-    "trigger": {"auto": false},
-    "action": {
-      "command": ["cargo", "test", "--package", "{package}", "--lib", "--", "{test}", "--exact"],
-      "category": "test",
-      "inputs": {
-        "package": {"type": "string", "description": "Package containing the test", "required": true},
-        "test": {"type": "string", "description": "Exact library test name", "required": true}
-      }
-    }
-  }
-}
-```
+Use `action.adapter` for structured contract results and `action.command` for `custom` checks. Never supply both. Adapter checks reject `inputs`, callback `input`, and `prepare`; format and lint mutation belongs to their supported apply operation. Keep `trigger`, `directory`, `label`, and `after` as explicit configuration.
 
-Call this check with `{"check":"unit","inputs":{"package":"engine","test":"tests::example"}}`. `package` and `test` are ordinary names declared by this check. No package manager field or reserved runner-specific selectors exist.
+Get the concrete adapter configuration from the running build's catalog. Do not copy a remembered built-in configuration: installed adapters and their options can differ between builds. A repository script must implement the declared category's protocol, including selection validation, streaming results, and completion. A script adapter starts at the repository root and receives the check directory in its request. For Nushell, include `--stdin` and `--no-config-file` in the configured argv so the JSON request reaches `$in`.
 
-Each input declares `type` and `description`. Types are string, integer, number, boolean, array, and object. `required` defaults to false. An optional `default` must match the type. Optional automatic `source` bindings are `changed_files` (array), `planned_cases` (array), and `workspace` (string). Explicit values override context sources and defaults. Missing required values and unknown inputs fail.
+Use `custom` for commands judged by exit status that fit no category contract, such as a configuration preview. A custom action can declare typed `inputs`: each input has `type` and `description`, optional `required` and type-correct `default`, and a supported contextual `source`. A complete argv element `{name}` substitutes a scalar or splices an array of scalars; embedded `prefix-{name}` remains literal. Custom commands receive closed stdin. The removed `input: true` callback mode is rejected; callback receipts and generic file reports are no longer read.
 
-A complete argv element `{name}` substitutes a scalar or splices an array of scalars. Other text stays literal, including `prefix-{name}` and JSON arguments. No shell interpolation or implicit per-element fan-out occurs. Use a callback for conditionals, multiple commands, object inputs, or source-to-package mapping. Shell-string commands receive declared inputs through stdin, not interpolation.
+<details>
+<summary>Staged migration of existing command checks</summary>
 
-## Repository callbacks
+Some builds still accept commands in contract categories while those adapters are being delivered. Preserve accepted existing command definitions until their category adapter is available; this is a rollout exception, not the final contract. In this repository, the initial migration consolidates the Lua checks into one test adapter, puts non-test commands in `custom`, and retains the Rust test command until its built-in adapter is delivered. Keep legacy plan-selection consumers until plan integration replaces them. Report unsupported settings explicitly instead of discarding authored inputs or resetting the configuration.
 
-Set `input: true` to send JSON on stdin. The callback uses the same declared input contract as a template. Example action:
+</details>
 
-```json
-{
-  "command": ["nu", "--no-config-file", "--stdin", ".forge/checks/test.nu"],
-  "input": true,
-  "category": "test",
-  "inputs": {
-    "files": {"type": "array", "description": "Changed repository paths", "source": "changed_files"},
-    "package": {"type": "string", "description": "Explicit package", "default": ""},
-    "test": {"type": "string", "description": "Explicit test", "default": ""}
-  }
-}
-```
+## Execution and verification
 
-The request contains `version: 1`, `check_id`, `workspace`, resolved `inputs`, `changed_files`, `selection`, `receipt_path`, and `report_path`. `selection` records full, changed-file, planned-case, or explicit-input context. The callback owns runner arguments, any manifest lookup, test filtering, zero-match detection, and failure interpretation. It must propagate nonzero exits and preserve full diagnostics rather than returning success-shaped fallbacks.
+Read the running tool schemas before selecting work. Test adapters accept test item IDs and affected paths; discovery supplies opaque IDs that must be passed back unchanged. Use static discovery for inspection that must not build or execute test binaries. Exact discovery can build and requires execution authority. A discovery result is not a test pass.
 
-On success write `{"version":1,"selection":<request.selection>}` to `receipt_path`. Explicit-input receipts must match the requested input map exactly. An optional report at `report_path` contains `version: 1` and a `result` array. Each result has repository-relative `file`, terminal `state`, optional `duration_ms`, `command`, and complete `output`. Translate runner output in the callback, not in Harness. Malformed reports and reported failures cannot count as success. Plain commands use their exit status without implicit coverage parsing.
+An explicit all request is mutually exclusive with a selection. Do not turn a missing baseline, unknown ID, or empty targeted result into a whole-suite run. Where supported, path-category checks take paths and format/lint checks expose apply; inspect advertised capabilities before requesting an operation. After a source-changing operation, rerun verification for the resulting workspace.
 
-Use Nushell for cross-platform callbacks in this dotfiles repository. Managed helper files under `.forge/checks/` are published through `check_definition_edit` with their inspected `expected_digest`, or null for a new file. Harness does not select an interpreter from an extension or secretly run syntax validation. Configure language-specific validation explicitly as another check.
+`check_run` returns a run ID. Poll `check_status` with that ID and an allowed `wait_ms`; use `check_detail` after completion for invocation metadata, logs, and supported structured result pages. Follow returned cursors with the same ID and stream. `check_cancel` requests cancellation; wait for terminal status before claiming collection. Preserve actual execution and I/O errors.
 
-## Authoring validation stages
+Configure compiler/type validation before tests, formatting verification, lint, and build. Preserve the project's compiler, profile, features, target selection, and artifact directory across stages. A later source fix requires verification again. In this dotfiles repository, use Nushell for shared scripts and validate their syntax before running them.
 
-When creating or revising project checks, configure compiler/type validation as the first verification stage, in category `check`. Inspect the repository's manifests, compiler configuration, and existing scripts before choosing the command. Rust projects use `cargo check` for the affected package and targets. TypeScript projects use their existing package type-check script or configured `tsc --noEmit` command, with their existing package manager and local toolchain. Do not invent a TypeScript project, compiler configuration, or global compiler dependency when the repository has none.
-
-Follow with tests, read-only formatting, linting, and build. Test compilation and linting do not replace the first compiler/type-check stage. Keep source-changing formatting in a separate preparation action before validation, and restart compiler/type validation if a later fix changes source. Preserve the project's target, feature, profile, and artifact-directory choices across these stages.
-
-## Triggers and execution
-
-`trigger.auto` defaults to false. Paths are repository-relative globs, with `*`, `?`, and `**`. Exclusions remove matching paths. Automatic triggers select checks, not package names or runner arguments. Empty check maps are valid.
-
-`action.directory` is repository-relative. Optional `label`, `category`, `prepare`, and `after` control display, ordering, mutation, and prerequisites. Every command defaults to category `check` unless explicitly configured. Use `prepare: true` for source-changing commands. Dependencies express required success, not category order.
-
-`check_run` accepts a check name or list, plus optional `inputs` or `all: true`. These two options cannot be combined. Full context does not synthesize a broader command or supply missing required inputs. Define full behavior in a callback or separate saved check. Omitted inputs use configured defaults and automatic sources.
-
-`check_run` immediately returns only `run_id`. Use `check_status` with that ID and optional `wait_ms` (0 through 60000) to wait for completion. Status returns compact progress and the latest nonempty output line, not full logs. `check_list` returns those summaries for currently running IDs. Use `check_detail` only after completion for exact invocation metadata and logs. A running detail request directs the caller to wait with `check_status`. Follow `next_cursor` using the same ID and stream to retrieve the complete log. `check_cancel` requests cancellation without claiming process cleanup has finished. Unknown IDs and I/O errors remain failures.
-
-Preserve the selected compiler, profile, flags, and artifact directory in the repository command. Follow the global smallest-sufficient-coverage policy. Never silently broaden a failed or empty targeted request.
+`trigger.auto` defaults to false. Trigger paths are repository-relative globs; exclusions remove matches. Triggers select checks, not package names or runner arguments. `after` declares required successful dependencies. Do not assume category ordering substitutes for a dependency.

@@ -1,0 +1,62 @@
+{
+  "recorded_at": "2026-11-13T10:38:29.431151100-08:00",
+  "platform": {
+    "name": "windows",
+    "arch": "x86_64",
+    "family": "windows",
+    "kernel_version": "26300"
+  },
+  "nextest": "cargo-nextest 0.9.151 (6b3f99457 2026-11-02)\nrelease: 0.9.151\ncommit-hash: 6b3f994577a98874a2e0ea5bef77fbbab3434044\ncommit-date: 2026-11-02\nhost: x86_64-pc-windows-msvc",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "method": "Harness command lifetime; one initially empty target directory per selection, then an unchanged warm run; list counts from retained native JSON documents; no evidence reuse",
+  "measurements": [
+    {
+      "selection": "parent",
+      "cache": "cold",
+      "cases": 161,
+      "list_count": 1,
+      "version_count": 1,
+      "elapsed_ms": 1623
+    },
+    {
+      "selection": "parent",
+      "cache": "warm",
+      "cases": 161,
+      "list_count": 1,
+      "version_count": 1,
+      "elapsed_ms": 1250
+    },
+    {
+      "selection": "full",
+      "cache": "cold",
+      "cases": 161,
+      "list_count": 4,
+      "version_count": 1,
+      "elapsed_ms": 2276
+    },
+    {
+      "selection": "full",
+      "cache": "warm",
+      "cases": 161,
+      "list_count": 4,
+      "version_count": 1,
+      "elapsed_ms": 2175
+    },
+    {
+      "selection": "partial",
+      "cache": "cold",
+      "cases": 1,
+      "list_count": 2,
+      "version_count": 1,
+      "elapsed_ms": 1259
+    },
+    {
+      "selection": "partial",
+      "cache": "warm",
+      "cases": 1,
+      "list_count": 2,
+      "version_count": 1,
+      "elapsed_ms": 825
+    }
+  ]
+}

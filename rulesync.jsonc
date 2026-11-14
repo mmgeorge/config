@@ -2,9 +2,9 @@
   "$schema": "https://github.com/dyoshikawa/rulesync/releases/latest/download/config-schema.json",
   "targets": [
     "claudecode",
-    "codexcli",
     "copilotcli",
-    "antigravity-cli"
+    "antigravity-cli",
+    "codexcli"
   ],
   "features": [
     "rules",

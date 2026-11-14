@@ -10,11 +10,16 @@ pub(super) fn definition() -> ControlToolDefinition {
         description: "Start saved checks selected from check_definition_list. Supply check as a name or list and \
                 optional declared inputs, for example \
                 {check:\"unit\",inputs:{package:\"engine\",test:\"tests::example\"}} when those names are \
-                declared. Omit inputs for defaults/context sources, or use all:true for full context, never both. \
+                declared. Test adapters accept tests:{ids:[\"opaque item ID\"],affected:[\"src/file\"]}. \
+                Typecheck, format, lint, and build adapters accept paths:[\"src/file\"]. \
+                Format and lint adapters accept apply:true for source-changing fixes. \
+                Omit selection for defaults/context sources, or use all:true for full context. Never combine \
+                inputs, tests, paths, and all. \
                 Commands remain opaque and callers cannot replace them. Every admitted request immediately \
                 returns only run_id, even if execution finishes immediately. Never waits. Use check_status to \
                 wait or poll, check_detail after completion for logs, and check_cancel to stop work. Unavailable \
-                during plan execution or while writing agents are active.",
+                while writing agents are active. During plan execution, verification requires Verify \
+                and apply requires Resolve.",
         input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::CheckRunRequest))
             .expect("check run schema is serializable"),
     }

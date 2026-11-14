@@ -34,7 +34,11 @@ fn request(operation_id: &str, task_name: &str) -> (AgentRequest, SpawnAgentRequ
     )
 }
 
-fn admit(coordinator: &AgentCoordinator, operation_id: &str, task_name: &str) -> AgentWork {
+pub(super) fn admit(
+    coordinator: &AgentCoordinator,
+    operation_id: &str,
+    task_name: &str,
+) -> AgentWork {
     let (request, spawn) = request(operation_id, task_name);
     let admission = coordinator
         .reserve_spawn(
@@ -52,6 +56,51 @@ fn admit(coordinator: &AgentCoordinator, operation_id: &str, task_name: &str) ->
         AgentCommit::Admitted(work) => work,
         AgentCommit::Existing(_) => panic!("new request reused an admission"),
     }
+}
+
+/// A check closes child admission without parking the root, including a reservation race.
+#[test]
+fn check_launch_hold_fences_reserved_children_until_collection() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let (initial_request, spawn) = request("reserved", "worker");
+    let reserved = coordinator
+        .reserve_spawn(
+            &initial_request,
+            &spawn,
+            selection(forge_providers::registry::nonselectable_id().unwrap()),
+            "parent",
+            1,
+        )
+        .unwrap();
+    let first = coordinator.hold_launches().unwrap();
+    let second = coordinator.hold_launches().unwrap();
+    assert!(!coordinator.is_quiescing());
+    let AgentCommit::Admitted(work) = reserved.commit().unwrap() else {
+        panic!("first commit cannot replay existing work");
+    };
+    assert!(!work.launch);
+    assert_eq!(coordinator.active_count(), 0);
+    assert!(coordinator.ready_launch().unwrap().is_none());
+    let (next_request, next_spawn) = request("new", "worker");
+    assert!(
+        coordinator
+            .reserve_spawn(
+                &next_request,
+                &next_spawn,
+                selection(forge_providers::registry::nonselectable_id().unwrap()),
+                "parent",
+                2,
+            )
+            .is_err()
+    );
+    drop(first);
+    assert!(coordinator.ready_launch().unwrap().is_none());
+    drop(second);
+    assert_eq!(
+        coordinator.ready_launch().unwrap().unwrap().task.id,
+        work.task.id
+    );
+    assert!(coordinator.hold_launches().is_err());
 }
 
 #[test]

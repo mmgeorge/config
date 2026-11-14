@@ -32,41 +32,25 @@ pub(crate) async fn plan(
         return Ok(Vec::new());
     };
     let files = design.changed_paths();
-    let mut changed = Vec::new();
-    let mut new = Vec::new();
-    for file in &design.document.tests {
-        for case in &file.cases {
-            let selection = super::CheckCase {
-                file: file.file.clone(),
-                name: case.name.clone(),
-                target: case.target.clone(),
-            };
-            if case.change == crate::plan::DesignTestChange::New {
-                new.push(selection.clone());
-            }
-            if matches!(
-                case.change,
-                crate::plan::DesignTestChange::New | crate::plan::DesignTestChange::Modified
-            ) {
-                changed.push(selection);
-            }
-        }
-    }
     let mut config = snapshot.config.clone();
     for check in &mut config.definitions {
         if design.document.disabled_checks.contains(&check.id) {
             check.enabled = false;
         }
     }
-    resolve(
-        workspace,
-        &config,
-        &files,
-        Some(&changed),
-        Some(&new),
-        &design.document.checks,
-    )
-    .await
+    let mut included = design.document.checks.clone();
+    for check in &config.definitions {
+        if check.enabled
+            && check.category == CheckCategory::Test
+            && (design.document.test_scopes.get(&check.id)
+                == Some(&crate::plan::PlanTestScope::WholeSuite)
+                || !design.document.tests.is_empty())
+            && !included.contains(&check.id)
+        {
+            included.push(check.id.clone());
+        }
+    }
+    resolve(workspace, &config, &files, &included, Some(design)).await
 }
 
 /// Builds a read-only preview from task inputs without creating run history or output files.
@@ -74,9 +58,8 @@ pub(super) async fn resolve(
     workspace: &Path,
     config: &CheckConfig,
     files: &[String],
-    cases: Option<&[super::CheckCase]>,
-    new_cases: Option<&[super::CheckCase]>,
     included: &[String],
+    plan: Option<&crate::plan::DeclarationDesign>,
 ) -> Result<Vec<CheckPreview>> {
     let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
         include: included.to_vec(),
@@ -94,50 +77,78 @@ pub(super) async fn resolve(
     let selection = if request.ids.is_empty() {
         BTreeMap::new()
     } else {
-        request.selections(config, files, cases, new_cases, true)?
+        request.selections(config, files, true)?
     };
     let mut result = Vec::new();
-    for index in config.order_selected(&request.ids.iter().cloned().collect())? {
+    let preparing = config
+        .definitions
+        .iter()
+        .filter(|definition| {
+            request.ids.contains(&definition.id)
+                && definition
+                    .runner
+                    .command()
+                    .is_some_and(|operation| operation.prepare)
+        })
+        .map(|definition| definition.id.clone())
+        .collect();
+    for index in config.order_preparing(&preparing)? {
         let definition = &config.definitions[index];
         let applicable = &applicability[index];
         let scope = selection
             .get(&definition.id)
             .cloned()
             .unwrap_or(CheckSelection::All);
-        let operation = super::supervisor::operation(definition, &scope).unwrap_or(&definition.all);
+        let operation = definition.runner.command();
         let mut preview = CheckPreview {
             id: definition.id.clone(),
             category: definition.category,
-            command: operation.display(),
+            command: definition.runner.display(),
             scope: definition.scope,
             reason: applicable.reason.clone(),
             pending: false,
             selected: applicable.selected,
         };
-        if applicable.selected && scope.empty() {
-            preview.selected = false;
-            preview.pending = matches!(scope, CheckSelection::Cases { .. })
-                && (if definition.scope == CheckScope::NewCases {
-                    new_cases.is_none()
-                } else {
-                    cases.is_none()
-                });
-            preview.reason = if preview.pending {
-                "Plan case inventory is unavailable"
-            } else if definition.scope == CheckScope::NewCases {
-                "No new tests in this plan"
+        if let Some(plan) = plan
+            && definition.category == CheckCategory::Test
+        {
+            let plan = &plan.document;
+            let whole = plan.test_scopes.get(&definition.id)
+                == Some(&crate::plan::PlanTestScope::WholeSuite);
+            let present = plan
+                .tests
+                .iter()
+                .flat_map(|file| &file.cases)
+                .any(|case| case.change != crate::plan::DesignTestChange::Removed);
+            preview.selected = definition.enabled && (whole || present);
+            preview.pending = preview.selected && !whole;
+            preview.reason = if !definition.enabled {
+                "Disabled for this plan"
+            } else if whole {
+                "Reviewer requested the whole test suite"
+            } else if plan.tests.is_empty() {
+                "No test execution requested by this plan"
+            } else if !present {
+                "No test execution requested; removed tests will be verified absent during Check"
             } else {
-                "No matching changes"
+                "Planned test ownership will be resolved during Check"
             }
             .into();
-        } else if applicable.selected {
+            result.push(preview);
+            continue;
+        }
+        if applicable.selected && scope.default_empty() {
+            preview.selected = false;
+            preview.reason = "No matching changes".into();
+        } else if applicable.selected
+            && let Some(operation) = operation
+        {
             match super::invocation::resolve(
                 workspace,
                 &definition.directory,
                 operation,
                 &scope,
                 &applicable.matched_files,
-                cases.unwrap_or_default(),
             ) {
                 Ok(invocations) => {
                     for invocation in invocations {
@@ -171,4 +182,82 @@ pub(super) async fn resolve(
         result.push(preview);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Supply a plan with a manual test check to keep trigger selection out of ownership preview.
+    fn design() -> crate::plan::DeclarationDesign {
+        serde_json::from_value(json!({
+            "baseline":{}, "moved":{},
+            "check_configuration":{"digest":"preview", "helper_digest":{}, "config":{
+                "build":{"trigger":{"auto":false},"action":{"category":"custom","command":["unused"]}},
+                "unit":{"trigger":{"auto":false},"action":{"category":"test","after":["build"],"adapter":{"script":{"command":["unused"]}}}}
+            }}
+        })).unwrap()
+    }
+
+    /// Separate empty and removal-only inventories from execution without launching discovery.
+    #[tokio::test]
+    async fn plan_preview_distinguishes_removal_verification_from_test_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut design = design();
+        let preview = plan(workspace.path(), &design).await.unwrap();
+        let unit = preview.iter().find(|item| item.id == "unit").unwrap();
+        assert!(!unit.selected && !unit.pending);
+        assert_eq!(unit.reason, "No test execution requested by this plan");
+        design.document.tests = serde_json::from_value(json!([{
+            "file":"tests.lua", "cases":[{"name":"old", "change":"removed", "description":"retired"}]
+        }])).unwrap();
+        let preview = plan(workspace.path(), &design).await.unwrap();
+        let unit = preview.iter().find(|item| item.id == "unit").unwrap();
+        assert!(!unit.selected && !unit.pending);
+        assert!(unit.reason.contains("verified absent"));
+        design.document.tests[0].cases[0].change = crate::plan::DesignTestChange::Reused;
+        let preview = plan(workspace.path(), &design).await.unwrap();
+        let unit = preview.iter().find(|item| item.id == "unit").unwrap();
+        assert!(unit.selected && unit.pending);
+        assert!(
+            preview
+                .iter()
+                .find(|item| item.id == "build")
+                .unwrap()
+                .selected
+        );
+    }
+
+    /// Include manual whole-suite choices and their prerequisites even without planned tests.
+    #[tokio::test]
+    async fn whole_suite_preview_selects_dependencies_and_honors_disabled_checks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut design = design();
+        design
+            .document
+            .test_scopes
+            .insert("unit".into(), crate::plan::PlanTestScope::WholeSuite);
+        let preview = plan(workspace.path(), &design).await.unwrap();
+        let unit = preview.iter().find(|item| item.id == "unit").unwrap();
+        assert!(unit.selected && !unit.pending);
+        assert!(
+            preview
+                .iter()
+                .find(|item| item.id == "build")
+                .unwrap()
+                .selected
+        );
+        design.document.disabled_checks.push("unit".into());
+        let preview = plan(workspace.path(), &design).await.unwrap();
+        assert!(preview.iter().all(|item| !item.selected));
+        assert_eq!(
+            preview
+                .iter()
+                .find(|item| item.id == "unit")
+                .unwrap()
+                .reason,
+            "Disabled for this plan"
+        );
+    }
 }

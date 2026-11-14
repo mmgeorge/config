@@ -622,6 +622,7 @@ impl HarnessBroker {
                 plan_record: None,
             })?;
         }
+        change.recorded()?;
         Ok(())
     }
 
@@ -702,9 +703,12 @@ impl HarnessBroker {
             }
         } else {
             for change in &output.host_file_changes {
-                if interaction.record_host_file_change(change)? {
-                    self.store.save_exchange(interaction)?;
+                let mut candidate = interaction.clone();
+                if candidate.record_host_file_change(change)? {
+                    self.store.save_exchange(&candidate)?;
+                    *interaction = candidate;
                 }
+                change.recorded()?;
             }
         }
 
@@ -749,6 +753,90 @@ impl HarnessBroker {
 #[cfg(test)]
 mod receipt_tests {
     use super::*;
+
+    /// Keep mutation exclusion after a failed save and acknowledge only the successful retry.
+    #[tokio::test]
+    async fn failed_file_change_save_retains_reservation_and_unsaved_state() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let (mut exchange, _, _) = broker
+            .test_stage_interaction_for_turn("Record committed rename", true, 100)
+            .await?;
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root(&broker.session.id),
+            exchange.id.clone(),
+        );
+        let address = crate::provider::test_support::address(&scope);
+        exchange.observe_provider_event(
+            &address.scope.clone().into(),
+            &crate::provider::ProviderEvent::Turn {
+                thread_id: address.thread_id,
+                turn_id: address.turn_id,
+                event: crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 100,
+                }),
+            },
+            100,
+        )?;
+        broker.store.save_exchange(&exchange)?;
+        let change = crate::tools::lsp::HostFileChange {
+            reservation: Some(crate::checks::MutationReservation::acquire(
+                workspace.path(),
+            )?),
+            scope,
+            call_id: forge_provider_api::control::ToolCallId::new("rename")?,
+            native_item_id: None,
+            changes: Default::default(),
+        };
+        let database = crate::storage::test::raw_connection(data.path())?;
+        database.execute_batch(
+            "CREATE TRIGGER refuse_file_change BEFORE UPDATE ON exchange_record
+             BEGIN SELECT RAISE(ABORT,'file change refused'); END;",
+        )?;
+        let completion = || ProviderCompletion {
+            host_file_changes: vec![change.clone()],
+            ..Default::default()
+        };
+        let error = broker
+            .stage_host_completion(&mut exchange, completion(), PromptMode::Chat)
+            .err()
+            .context("failed storage unexpectedly acknowledged the mutation")?;
+        assert!(format!("{error:#}").contains("file change refused"));
+        assert!(exchange.host_file_changes.is_empty());
+        assert!(
+            broker
+                .store
+                .load_exchange(&exchange.id)?
+                .context("original exchange disappeared")?
+                .host_file_changes
+                .is_empty()
+        );
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                workspace.path(),
+                crate::checks::CheckPurpose::Verify
+            )
+            .is_err()
+        );
+        database.execute_batch("DROP TRIGGER refuse_file_change;")?;
+        broker.stage_host_completion(&mut exchange, completion(), PromptMode::Chat)?;
+        assert_eq!(exchange.host_file_changes, vec![change.clone()]);
+        assert_eq!(
+            broker
+                .store
+                .load_exchange(&exchange.id)?
+                .context("recorded exchange disappeared")?
+                .host_file_changes,
+            vec![change]
+        );
+        let _verification = crate::checks::CheckReservation::acquire(
+            workspace.path(),
+            crate::checks::CheckPurpose::Verify,
+        )?;
+        Ok(())
+    }
 
     /// A routing thread is not durable history, and absent terminal metadata cannot erase known history.
     #[tokio::test]

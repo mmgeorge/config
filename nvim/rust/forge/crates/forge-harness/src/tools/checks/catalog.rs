@@ -6,6 +6,7 @@ pub(in crate::tools) fn definitions() -> Vec<ControlToolDefinition> {
         super::definition_list::definition(),
         super::definition_details::definition(),
         super::definition_edit::definition(),
+        super::discover::definition(),
         super::run::definition(),
         super::status::definition(),
         super::list::definition(),
@@ -20,6 +21,7 @@ pub(in crate::tools) fn is_tool(name: &str) -> bool {
         super::definition_list::NAME,
         super::definition_details::NAME,
         super::definition_edit::NAME,
+        super::discover::NAME,
         super::run::NAME,
         super::status::NAME,
         super::list::NAME,
@@ -46,6 +48,7 @@ pub(in crate::tools) async fn execute(
             super::definition_edit::execute(runtime, invocation, output).await
         }
         super::run::NAME => super::run::execute(runtime, invocation, output).await,
+        super::discover::NAME => super::discover::execute(runtime, invocation, output).await,
         super::status::NAME => super::status::execute(runtime, invocation, output).await,
         super::list::NAME => super::list::execute(runtime, invocation, output).await,
         super::detail::NAME => super::detail::execute(runtime, invocation, output).await,

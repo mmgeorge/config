@@ -48,6 +48,10 @@ pub struct ControlTurnContext {
     pub has_active_elicitation: bool,
     pub has_active_execution: bool,
     pub workspace_root: Option<PathBuf>,
+    /// Borrow the authenticated owner's source access without serializing a capability to the model.
+    pub(crate) repository_access: Option<crate::repository_access::RepositoryScope>,
+    /// Retain the provider's registered process container through native collection.
+    pub(crate) repository_process: Option<Arc<dyn forge_shell::process::ProcessOwner>>,
     pub repository: Option<Arc<super::repository::RepositoryToolScope>>,
     pub(crate) harness: Option<Arc<super::session::HarnessInspectionScope>>,
     pub(crate) lsp: Option<Arc<super::lsp::LspScope>>,
@@ -293,6 +297,8 @@ impl ControlTurnContext {
             has_active_execution: false,
             workspace_root: None,
             repository: None,
+            repository_access: None,
+            repository_process: None,
             harness: None,
             lsp: None,
             aside: None,
@@ -956,9 +962,9 @@ mod test {
             workspace.join(".forge.json"),
             json!({"checks":{
                 "build":{"trigger":{"auto":true,"paths":["**"]},
-                    "action":{"command":["build"],"label":"Build","category":"build"}},
+                    "action":{"adapter":{"script":{"command":["build"]}},"label":"Build","category":"build"}},
                 "unit":{"trigger":{"auto":false,"paths":["**"]},
-                    "action":{"command":["unit"],"label":"Unit","category":"test","after":["build"]}}
+                    "action":{"adapter":{"script":{"command":["unit"]}},"label":"Unit","category":"test","after":["build"]}}
             }})
             .to_string(),
         )
@@ -1407,6 +1413,8 @@ mod test {
             permission_required: false,
             file_permissions: None,
             repository: None,
+            repository_access: None,
+            repository_process: None,
             harness: None,
             lsp: None,
             aside: None,

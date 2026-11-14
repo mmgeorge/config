@@ -85,6 +85,9 @@ mod tests {
                 InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
             let call = ToolCallId::new("committed-rename")?;
             let change = crate::tools::lsp::HostFileChange {
+                reservation: Some(crate::checks::MutationReservation::acquire(
+                    directory.path(),
+                )?),
                 scope: scope.clone(),
                 call_id: call.clone(),
                 native_item_id: None,
@@ -117,6 +120,21 @@ mod tests {
                 assert!(sender.commit(scope, call, batch).await.is_err());
             }
             let preview = slot.preview()?;
+            assert!(
+                crate::checks::CheckReservation::acquire(
+                    directory.path(),
+                    crate::checks::CheckPurpose::Verify
+                )
+                .is_err()
+            );
+            preview.batches[0].completion.host_file_changes[0].recorded()?;
+            assert!(
+                crate::checks::CheckReservation::acquire(
+                    directory.path(),
+                    crate::checks::CheckPurpose::Verify
+                )
+                .is_ok()
+            );
             assert!(!preview.batches[0].is_rejected());
             assert_eq!(
                 preview

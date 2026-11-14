@@ -36,7 +36,7 @@ assert_equal(branch_source.existing_remote_action({ local_exists = true, checked
 assert_equal(branch_source.existing_remote_action({ local_exists = true, same_tip = true }),
   'use_local', 'matching local branch must be reused')
 assert_equal(branch_source.existing_remote_action({ local_exists = true }),
-  'reset_to_remote', 'behind local branch must update to the selected remote')
+  'fast_forward', 'behind local branch must update to the selected remote')
 
 local current_action
 local command_history = {}
@@ -81,6 +81,7 @@ package.preload.wezterm = function()
     executable_dir = wezterm_dir,
     home_dir = wezterm_dir,
     mux = {
+      all_windows = function() return {} end,
       get_workspace_names = function()
         return { 'default' }
       end,
@@ -93,14 +94,35 @@ package.preload.wezterm = function()
       if command_contains(command, 'worktree list --porcelain') then
         return true, fake_repository.worktrees, ''
       end
+      if command_contains(command, 'worktree remove D:/code/test-wt/master') then
+        if fake_repository.removal_error then
+          return false, '', fake_repository.removal_error
+        end
+        if fake_repository.removal_hides_path then fake_repository.missing_worktree = true end
+        fake_repository.worktrees = 'worktree ' .. fake_repository.common_dir .. '\nbare\n\n'
+        return true, '', ''
+      end
+      if command[1] == 'powershell.exe' and command_contains(command, 'Get-Item -LiteralPath') then
+        if fake_repository.inaccessible then return false, '', 'access denied' end
+        return true, fake_repository.missing_worktree and 'missing\n' or 'available\n', ''
+      end
       if command[1] == 'cmd.exe' then
+        if fake_repository.inaccessible and command_contains(command, 'if exist "D:/code/test-wt/master"') then
+          return false, '', 'access denied'
+        end
+        if fake_repository.missing_worktree and command_contains(command, 'if exist "D:/code/test-wt/master"') then
+          return true, 'no\n', ''
+        end
         return true, 'yes\n', ''
       end
       if command_contains(command, ' remote') then
         return true, 'origin\n', ''
       end
+      if command_contains(command, 'for-each-ref') and fake_repository.branch_error then
+        return false, '', fake_repository.branch_error
+      end
       if command_contains(command, 'for-each-ref') and command_contains(command, 'refs/remotes/origin') then
-        return true, 'origin\t100\trefs/remotes/origin/master\tEND\norigin/main\t100\t\tEND\norigin/coworker/demo\t90\t\tEND\norigin/behind\t80\t\tEND\n', ''
+        return true, 'origin\t100\trefs/remotes/origin/master\tEND\norigin/main\t100\t\tEND\norigin/master\t100\t\tEND\norigin/coworker/demo\t90\t\tEND\norigin/behind\t80\t\tEND\n', ''
       end
       if command_contains(command, 'for-each-ref') and command_contains(command, 'refs/heads') then
         return true, 'main\t100\t\tEND\nlocal-only\t90\t\tEND\n', ''
@@ -115,6 +137,9 @@ package.preload.wezterm = function()
       end
       if command_contains(command, 'rev-parse --verify origin/behind') then
         return true, 'remote-tip\n', ''
+      end
+      if command_contains(command, 'rev-list --left-right --count') then
+        return true, (fake_repository.comparison or '0 1') .. '\n', ''
       end
       if command_contains(command, 'rev-parse --verify behind') then
         return true, 'local-tip\n', ''
@@ -274,14 +299,14 @@ current_action.spec.action(fake_window, fake_pane, 'progress')
 assert_equal(current_action.kind, 'workspace', 'new local branch must switch to a progress workspace immediately')
 assert_equal(current_action.spec.name, 'repo:mmgeorge/progress',
   'progress workspace must use the future worktree branch name')
-assert_equal(current_action.spec.spawn.cwd, 'D:/repo',
+assert_equal(current_action.spec.spawn.cwd, 'D:/repo/.git',
   'progress runner must start from the existing repository path')
 assert_equal(current_action.spec.spawn.args[1], 'nu',
   'progress workflow must use the cross-platform Nushell runner')
 assert_equal(current_spawn_contains('--no-config-file'), false,
   'progress runner must not suppress the user Nushell configuration')
 assert_equal(current_spawn_contains(
-  'create-worktree.nu --repository-path D:/repo --worktree-path D:/mmgeorge/progress --start-point main --new-branch mmgeorge/progress'), true,
+  'create-worktree.nu --repository-path D:/repo/.git --worktree-path D:/mmgeorge/progress --start-point main --new-branch mmgeorge/progress'), true,
   'progress workspace must receive the complete worktree creation request')
 assert_equal(current_spawn_contains('--use-cached-remote-base'), true,
   'new branch from a local base must compare against its cached remote branch')
@@ -368,7 +393,7 @@ recorded_commands = {}
 for _, command in ipairs(command_history) do
   table.insert(recorded_commands, table.concat(command, ' '))
 end
-assert_equal(command_history_contains('branch --force behind origin/behind'), true,
+assert_equal(command_history_contains('fetch --no-tags --no-write-fetch-head --no-recurse-submodules . refs/remotes/origin/behind:refs/heads/behind'), true,
   'remote source must fast-forward a matching local branch that is behind\n' .. table.concat(recorded_commands, '\n'))
 
 open_branch_source('existing')
@@ -434,7 +459,194 @@ assert_equal(main_worktree_choice.label:sub(1, 2), '* ',
 assert_equal(choice_by_id('D:/code/test-wt/.bare'), nil,
   'bare Git storage must not appear as a worktree')
 
+open_branch_source('new')
+choose_id('remote')
+assert_equal(command_history_contains('git -C D:/code/test-wt/.bare remote'), true,
+  'remote discovery must use Git storage even when the main worktree exists')
+assert_equal(command_history_contains('git -C D:/code/test-wt/.bare fetch'), true,
+  'remote refresh must use Git storage even when the main worktree exists')
+assert_equal(command_history_contains('git -C D:/code/test-wt/.bare for-each-ref'), true,
+  'branch listing must use Git storage even when the main worktree exists')
+choose_id('origin/main')
+current_action.spec.action(fake_window, fake_pane, 'healthy')
+assert_equal(current_action.spec.spawn.cwd, 'D:/code/test-wt/.bare',
+  'creation must use Git storage even when the main worktree exists')
+assert_equal(current_spawn_contains('--repository-path D:/code/test-wt/.bare'), true,
+  'Git creation commands must target storage instead of the main worktree')
+
 fake_repository.pane_path = 'D:/code/test-wt/.bare'
 worktree.menu()(fake_window, fake_pane)
 assert_equal(choice_by_id('remove-current'), nil,
   'bare Git storage must not resolve as a removable current worktree')
+
+-- A deleted linked worktree must not become the cwd for repository operations.
+fake_repository.worktrees = fake_repository.worktrees:gsub(
+  'branch refs/heads/master\n',
+  'branch refs/heads/master\nprunable gitdir file points to non-existent location\n'
+)
+fake_repository.pane_path = 'D:/code/test-wt'
+open_branch_source('new')
+choose_id('remote')
+assert_equal(command_history_contains('git -C D:/code/test-wt/.bare remote'), true,
+  'remote discovery must use Git storage when all linked worktrees are stale')
+assert_equal(command_history_contains('git -C D:/code/test-wt/master'), false,
+  'stale worktree paths must not be used for Git commands')
+assert_equal(choice_by_id('origin/main') ~= nil, true,
+  'remote branches must populate when the main worktree was deleted')
+assert_equal(choice_by_id('origin/master') ~= nil, true,
+  'remote master must remain available alongside main')
+choose_id('origin/main')
+current_action.spec.action(fake_window, fake_pane, 'recovered')
+assert_equal(current_action.kind, 'workspace',
+  'a new branch from a bare repository must launch the creation runner')
+assert_equal(current_action.spec.spawn.cwd, 'D:/code/test-wt/.bare',
+  'the creation runner must start in the surviving bare repository')
+assert_equal(current_spawn_contains('--repository-path D:/code/test-wt/.bare'), true,
+  'the creation runner must run Git against the surviving bare repository')
+worktree.menu()(fake_window, fake_pane)
+assert_equal(choice_by_id('D:/code/test-wt/master'), nil,
+  'stale linked worktrees must not be offered as switch targets')
+
+fake_repository.worktrees = fake_repository.worktrees:gsub('refs/heads/master', 'refs/heads/main')
+local stale_inventory = fake_repository.worktrees
+fake_repository.missing_worktree = true
+open_branch_source('existing')
+assert_equal(command_history_contains('worktree remove D:/code/test-wt/master'), false,
+  'browsing branches must not remove registrations')
+assert_equal(command_history_contains('worktree remove --force'), false,
+  'stale registration cleanup must never force removal')
+choose_id('local')
+assert_equal(choice_by_id('main') ~= nil, true,
+  'a stale registration must not hide local main')
+choose_id('main')
+assert_equal(current_action.kind, 'workspace', 'local main must launch checkout after stale registration cleanup')
+
+fake_repository.worktrees = stale_inventory
+open_branch_source('existing')
+choose_id('remote')
+choose_id('origin/main')
+assert_equal(current_action.kind, 'workspace', 'remote main must launch checkout after stale registration cleanup')
+
+fake_repository.worktrees = stale_inventory
+fake_repository.removal_error = 'registration cleanup failed'
+open_branch_source('existing')
+choose_id('local')
+choose_id('main')
+assert_equal(notification_contains('registration cleanup failed'), true,
+  'failed registration cleanup must show the underlying Git error')
+fake_repository.removal_error = nil
+
+fake_repository.missing_worktree = false
+open_branch_source('existing')
+assert_equal(command_history_contains('worktree remove D:/code/test-wt/master'), false,
+  'an existing directory must not be removed even if Git marks its registration prunable')
+choose_id('remote')
+choose_id('origin/main')
+assert_equal(notification_contains('checkout requires'), true,
+  'checkout must continue protecting a registered branch with an existing directory')
+
+
+-- Fresh admission must switch to a live checkout rather than recreate it.
+fake_repository.worktrees = stale_inventory:gsub('prunable gitdir file points to non%-existent location\n', '')
+open_branch_source('existing')
+choose_id('local')
+choose_id('main')
+assert_equal(current_action.kind, 'workspace', 'live local branch must switch to its worktree')
+assert_equal(current_action.spec.name, 'test-wt:main', 'live checkout must select the existing branch workspace')
+assert_equal(current_spawn_contains('create-worktree.nu'), false, 'switching must not run creation')
+assert_equal(command_history_contains('worktree remove'), false, 'switching must not remove registrations')
+
+fake_repository.worktrees = stale_inventory
+fake_repository.inaccessible = true
+open_branch_source('existing')
+choose_id('local')
+choose_id('main')
+assert_equal(notification_contains('inaccessible'), true, 'path probe failures must be explicit')
+assert_equal(command_history_contains('worktree remove'), false, 'path probe errors must not cause cleanup')
+fake_repository.inaccessible = false
+
+fake_repository.worktrees = stale_inventory:gsub('prunable gitdir file points to non%-existent location', 'locked keep offline')
+fake_repository.missing_worktree = true
+open_branch_source('existing')
+choose_id('local')
+choose_id('main')
+assert_equal(notification_contains('locked'), true, 'locked missing worktrees must stay protected')
+assert_equal(command_history_contains('worktree remove'), false, 'locked worktrees must not be cleaned')
+
+-- A different branch must not clean unrelated missing registrations.
+fake_repository.worktrees = stale_inventory
+open_branch_source('existing')
+choose_id('local')
+choose_id('local-only')
+assert_equal(current_action.kind, 'workspace', 'unrelated stale worktree must not block checkout')
+assert_equal(command_history_contains('worktree remove'), false, 'cleanup must target only the selected branch or destination')
+
+for _, comparison in ipairs({ '1 0', '1 1' }) do
+  fake_repository.comparison = comparison
+  open_branch_source('existing')
+  choose_id('remote')
+  choose_id('origin/behind')
+  assert_equal(notification_contains('commits absent from the remote'), true, 'ahead and diverged branches must be preserved')
+  assert_equal(command_history_contains('--no-write-fetch-head'), false, 'unsafe remote updates must not run')
+  assert_equal(command_history_contains('branch --force'), false, 'checkout must never force a branch update')
+end
+fake_repository.comparison = nil
+
+fake_repository.branch_error = 'ref database unavailable'
+open_branch_source('existing')
+choose_id('local')
+assert_equal(notification_contains('ref database unavailable'), true, 'branch listing must retain the actual Git failure')
+assert_equal(notification_contains('No local branches'), false, 'a listing failure is not an empty repository')
+fake_repository.branch_error = nil
+
+-- Bare detection must come from Git's inventory, not a directory spelling.
+fake_repository.common_dir = 'D:/code/test-wt/storage.git'
+fake_repository.worktrees = 'worktree D:/code/test-wt/storage.git\nbare\n\n'
+open_branch_source('new')
+choose_id('local')
+choose_id('main')
+current_action.spec.action(fake_window, fake_pane, 'named-storage')
+assert_equal(current_action.kind, 'workspace', 'arbitrarily named bare storage must support creation')
+assert_equal(current_action.spec.spawn.cwd, 'D:/code/test-wt/storage.git', 'Git operations must use the actual common directory')
+assert_equal(current_spawn_contains('--worktree-path D:/code/test-wt/mmgeorge/named-storage'), true,
+  'bare worktree placement must not depend on the storage directory name')
+
+
+-- A bare layout has no protected primary checkout, even for main/master.
+fake_repository = {
+  common_dir = 'D:/code/test-wt/.bare',
+  pane_path = 'D:/code/test-wt/master',
+  worktrees = 'worktree D:/code/test-wt/.bare\nbare\n\nworktree D:/code/test-wt/master\nHEAD abc123\nbranch refs/heads/master\n\n',
+  removal_hides_path = true,
+}
+active_workspace = 'test-wt:master'
+command_history = {}
+worktree.menu()(fake_window, fake_pane)
+assert_equal(choice_by_id('remove-current') ~= nil, true, 'the preferred bare checkout must be removable')
+choose_id('remove')
+assert_equal(choice_by_id('D:/code/test-wt/master') ~= nil, true, 'the general removal picker must include the current checkout')
+choose_id('D:/code/test-wt/master')
+assert_equal(current_action.spec.title, 'Remove current worktree', 'current removal must ask for confirmation')
+assert_equal(command_history_contains('worktree remove'), false, 'selecting a worktree must not remove it before confirmation')
+choose_id('remove-current')
+assert_equal(current_action.kind, 'workspace', 'removal must switch away before deleting')
+assert_equal(current_action.spec.name, 'default', 'current worktree must switch to a different workspace')
+local queued_removal = require('wezterm').GLOBAL.worktree_pending_removals.default
+assert_equal(queued_removal.worktree_workspace_name, 'test-wt:master', 'queued removal must close the actual source workspace')
+assert_equal(queued_removal.repo_git_path, 'D:/code/test-wt/.bare', 'queued removal must retain the common Git directory')
+active_workspace = 'default'
+worktree.handle_update_status(fake_window, fake_pane)
+assert_equal(command_history_contains('git -C D:/code/test-wt/.bare worktree remove --force D:/code/test-wt/master'), true,
+  'removal must execute against bare storage after switching workspaces')
+assert_equal(command_history_contains('branch -D'), false, 'removing a worktree must retain its branch')
+
+-- The actual primary worktree of an ordinary repository stays protected.
+fake_repository = {
+  common_dir = 'D:/repo/.git', pane_path = 'D:/repo',
+  worktrees = 'worktree D:/repo\nHEAD abc123\nbranch refs/heads/main\n\n',
+}
+worktree.menu()(fake_window, fake_pane)
+assert_equal(choice_by_id('remove-current'), nil, 'an ordinary repository primary worktree must stay protected')
+notifications = {}
+choose_id('remove')
+assert_equal(notification_contains('No linked worktrees'), true, 'protected primary worktrees must be excluded from removal')

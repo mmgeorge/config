@@ -84,6 +84,7 @@ impl CheckActivity {
                     |context| context.label(),
                 ),
                 started_at_ms: command.started_at_ms,
+                progress: command.adapter_progress.clone(),
                 output_line: String::from_utf8_lossy(&strip_ansi_escapes::strip(
                     command.preview.as_bytes(),
                 ))
@@ -121,6 +122,8 @@ pub struct CheckCommandActivity {
     pub started_at_ms: Option<i64>,
     /// Latest nonempty output line with terminal escape sequences removed.
     pub output_line: Option<String>,
+    /// Structured progress from the active adapter contract.
+    pub progress: Option<super::adapter::AdapterProgress>,
 }
 
 impl CheckCommandActivity {

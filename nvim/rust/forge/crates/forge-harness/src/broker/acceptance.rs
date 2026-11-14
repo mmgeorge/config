@@ -154,7 +154,11 @@ impl BrokerObserver {
                     )?;
                     Ok((document, checksum, removed_test_edits(tests)))
                 }
-                PlanEditChange::UpdateChecks { enabled, tests } => {
+                PlanEditChange::UpdateChecks {
+                    enabled,
+                    test_scopes,
+                    tests,
+                } => {
                     let (document, _, checksum) = self
                         .plan_file
                         .update_checks(
@@ -164,12 +168,14 @@ impl BrokerObserver {
                             &digest,
                             crate::plan::PlanCheckSelection {
                                 enabled,
+                                test_scopes,
                                 removed_tests: tests,
                             },
                             None,
                         )
                         .await?;
                     let mut edits = check_edits(enabled);
+                    edits.extend(crate::plan::test_scope_edits(test_scopes));
                     edits.extend(removed_test_edits(tests));
                     Ok((document, checksum, edits))
                 }
@@ -577,6 +583,9 @@ impl BrokerObserver {
     {
         let request = selection.normalized_request();
         let captured = self.capture_execution(&request).map_err(|error| {
+            tracing::dispatcher::with_default(&self.trace.dispatch(), || {
+                tracing::warn!(target: "forge::plan", session_id = %self.session_id, error = %format!("{error:#}"), "Plan execution validation failed");
+            });
             self.trace.record(&self.session_id, "exchange.plan_execution.validation_failed", json!({
                 "command_id":command.as_str(),"plan_id":selection.source().id().as_str(),"reason":format!("{error:#}"),
             }));
@@ -754,17 +763,8 @@ impl BrokerObserver {
             .as_ref()
             .context("execution requires a semantic plan")?;
         design.check_workspace(Path::new(&session.workspace))?;
-        let mut checks = crate::checks::ConfigSnapshot::load(Path::new(&session.workspace))?;
-        let scope = session.active_task.as_ref().map(|task| task.id.as_str());
-        let overrides = self.check_runner.overrides(scope)?;
-        for definition in &mut checks.config.definitions {
-            if let Some(enabled) = overrides.enabled.get(&definition.id) {
-                definition.enabled = *enabled;
-            }
-            if let Some(scope) = overrides.scopes.get(&definition.id) {
-                definition.scope = *scope;
-            }
-        }
+        // The reviewed snapshot describes project defaults; task preferences apply at execution admission.
+        let checks = crate::checks::ConfigSnapshot::load(Path::new(&session.workspace))?;
         anyhow::ensure!(
             design.check_configuration.as_ref() == Some(&checks),
             "Configured checks changed. Reopen /plan to review them before acceptance."
@@ -1299,6 +1299,503 @@ mod tests {
         })
     }
 
+    /// Enter Checking with a settled source turn, without starting a scan or a process.
+    async fn checking_execution() -> Result<ResolvingExecution> {
+        let mut fixture = resolving_execution(&[]).await?;
+        let broker = &mut fixture.broker;
+        let task = broker.task_controller.current()?.unwrap();
+        broker
+            .task_controller
+            .update(&mut broker.store, &task.permit(), 3, |task| {
+                let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow
+                else {
+                    anyhow::bail!("expected execution");
+                };
+                execution.record.phase = crate::plan::PlanPhase::Checking;
+                Ok(())
+            })?;
+        let task = broker.task_controller.current()?.unwrap();
+        assert!(broker.task_controller.reserve_checks(
+            &mut broker.store,
+            &task.permit(),
+            crate::task::TaskTurnId {
+                exchange_ordinal: 1,
+                turn_ordinal: 0
+            },
+            4,
+        )?);
+        broker.reconcile_timeline()?;
+        Ok(fixture)
+    }
+
+    /// Collect an empty configured gate after implementing the fixture's accepted declaration.
+    async fn prepared_check_finalization() -> Result<(
+        ResolvingExecution,
+        crate::broker::checks::TaskCheckFinalization,
+    )> {
+        let mut fixture = checking_execution().await?;
+        std::fs::create_dir_all(fixture._workspace.path().join("src"))?;
+        std::fs::write(
+            fixture._workspace.path().join("src/owner.rs"),
+            "/// Own application state.\npub struct Owner;\n",
+        )?;
+        let broker = &mut fixture.broker;
+        let (mut state, scan) = broker.begin_owned_task_checks()?;
+        let scan = scan.run().await?;
+        let run = broker.prepare_owned_task_check_run(&mut state, scan)?;
+        // The fixture has no configured commands or test adapters; this launches no processes.
+        let result = run.run().await?;
+        let scan = broker.prepare_task_check_postscan(&state)?.run().await?;
+        let finalization = broker.prepare_task_check_finalization(state, result, scan)?;
+        Ok((fixture, finalization))
+    }
+
+    /// Keep other writers excluded through report capture and the durable completion transition.
+    #[tokio::test]
+    async fn check_finalization_retains_repository_access_through_commit() -> Result<()> {
+        let (mut fixture, mut finalization) = prepared_check_finalization().await?;
+        let report = finalization.capture_report().await?;
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                fixture._workspace.path(),
+                crate::checks::CheckPurpose::Prepare,
+            )
+            .is_err()
+        );
+        fixture
+            .broker
+            .commit_task_check_finalization(finalization, report)?;
+        let _writer = crate::checks::CheckReservation::acquire(
+            fixture._workspace.path(),
+            crate::checks::CheckPurpose::Prepare,
+        )?;
+        assert!(fixture.broker.task_controller.current()?.is_none());
+        Ok(())
+    }
+
+    /// A failed completion write releases read access without marking the execution complete.
+    #[tokio::test]
+    async fn check_finalization_write_failure_releases_repository_access() -> Result<()> {
+        let (mut fixture, mut finalization) = prepared_check_finalization().await?;
+        let report = finalization.capture_report().await?;
+        let database = crate::storage::test::raw_connection(fixture._data.path())?;
+        database.execute_batch(
+            "CREATE TRIGGER reject_check_completion BEFORE UPDATE ON session_record
+             BEGIN SELECT RAISE(ABORT,'completion fixture write failure'); END;",
+        )?;
+        let error = fixture
+            .broker
+            .commit_task_check_finalization(finalization, report)
+            .err()
+            .context("completion ignored its failed write")?;
+        assert!(format!("{error:#}").contains("completion fixture write failure"));
+        assert_eq!(
+            fixture.broker.current_execution()?.unwrap().phase,
+            crate::plan::PlanPhase::Checking
+        );
+        let _writer = crate::checks::CheckReservation::acquire(
+            fixture._workspace.path(),
+            crate::checks::CheckPurpose::Prepare,
+        )?;
+        Ok(())
+    }
+
+    /// Recheck configuration after report capture instead of publishing stale passing evidence.
+    #[tokio::test]
+    async fn check_finalization_rejects_configuration_changed_during_report() -> Result<()> {
+        let (mut fixture, mut finalization) = prepared_check_finalization().await?;
+        let report = finalization.capture_report().await?;
+        let path = fixture._workspace.path().join(".forge.json");
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        config["checks"]["late-check"] = json!({
+            "trigger": {}, "action": { "category": "custom", "command": "must-not-run" }
+        });
+        std::fs::write(path, serde_json::to_vec(&config)?)?;
+        let error = fixture
+            .broker
+            .commit_task_check_finalization(finalization, report)
+            .err()
+            .context("completion accepted changed configuration")?;
+        assert!(error.to_string().contains("check configuration changed"));
+        assert_eq!(
+            fixture.broker.current_execution()?.unwrap().phase,
+            crate::plan::PlanPhase::Checking
+        );
+        let _writer = crate::checks::CheckReservation::acquire(
+            fixture._workspace.path(),
+            crate::checks::CheckPurpose::Prepare,
+        )?;
+        Ok(())
+    }
+
+    /// Require protected source evidence for ordinary goals and retain it through settlement.
+    #[tokio::test]
+    async fn goal_completion_requires_and_retains_reserved_workspace() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.dispatch_session_command(
+            "session.goal.set",
+            json!({"objective":"Complete with protected evidence"}),
+        )?;
+        let task = broker
+            .task_controller
+            .current()?
+            .context("goal task missing")?;
+        let entry = task.entry.as_ref().context("goal entry missing")?;
+        broker.task_controller.acknowledge_entry(
+            &mut broker.store,
+            &task.revision,
+            &entry.id,
+            1,
+        )?;
+        let task = broker.task_controller.current()?.unwrap();
+        let evidence = || crate::goal::TurnEvidence {
+            structured_complete: true,
+            ..Default::default()
+        };
+        let turn = crate::task::TaskTurnId {
+            exchange_ordinal: 1,
+            turn_ordinal: 1,
+        };
+        let error = broker
+            .apply_goal_evidence_strict(
+                evidence(),
+                Some(task.permit()),
+                turn.clone(),
+                None,
+                None,
+                &mut Vec::new(),
+            )
+            .expect_err("completion accepted unprotected evidence");
+        assert!(error.to_string().contains("reserved workspace evidence"));
+        let snapshot = broker.prepare_workspace_capture().run_reserved().await?;
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                workspace.path(),
+                crate::checks::CheckPurpose::Prepare
+            )
+            .is_err()
+        );
+        assert!(!broker.apply_goal_evidence_strict(
+            evidence(),
+            Some(task.permit()),
+            turn,
+            None,
+            Some((&snapshot, None)),
+            &mut Vec::new()
+        )?);
+        assert!(broker.task_controller.current()?.is_none());
+        drop(snapshot);
+        let _writer = crate::checks::CheckReservation::acquire(
+            workspace.path(),
+            crate::checks::CheckPurpose::Prepare,
+        )?;
+        Ok(())
+    }
+
+    /// Cancellation before the initial scan retains the admitted attempt in both histories.
+    #[tokio::test]
+    async fn check_admission_survives_cancellation_before_initial_scan() -> Result<()> {
+        use super::super::owned_task_checks::{
+            OwnedTaskCheckRun, TaskCheckEvent, TaskCheckProgress,
+        };
+
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let (sink, mut stream) = super::super::publication::channel();
+        let publication = tokio::spawn(async move {
+            while stream.recv().await?.is_some() {}
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut owner = OwnedTaskCheckRun::prepare(broker, sink)?.context("check owner missing")?;
+        let admitted = broker
+            .current_execution()?
+            .unwrap()
+            .check_runs
+            .pop()
+            .unwrap();
+        assert_eq!(admitted.state, crate::checks::CheckState::Running);
+        assert!(admitted.completed_at_ms.is_none());
+        assert!(
+            admitted
+                .commands
+                .iter()
+                .all(|command| command.started_at_ms.is_none())
+        );
+        let event = owner.next().await.context("admission event missing")??;
+        assert!(matches!(event, TaskCheckEvent::Admitted(_)));
+        owner.cancel()?;
+        assert!(matches!(
+            owner.update(broker, event)?,
+            TaskCheckProgress::Pending
+        ));
+        let event = owner.next().await.context("interruption event missing")??;
+        assert!(matches!(
+            owner.update(broker, event)?,
+            TaskCheckProgress::Finished { failure: None, .. }
+        ));
+        let retained = broker
+            .current_execution()?
+            .unwrap()
+            .check_runs
+            .pop()
+            .unwrap();
+        assert_eq!(retained.id, admitted.id);
+        assert_eq!(retained.state, crate::checks::CheckState::Interrupted);
+        assert!(retained.completed_at_ms.is_some());
+        assert!(
+            retained
+                .commands
+                .iter()
+                .all(|command| command.started_at_ms.is_none())
+        );
+        let history = broker.check_runner.history()?;
+        let published = history.iter().find(|run| run.id == admitted.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(published)?,
+            serde_json::to_value(&retained)?
+        );
+        drop(owner);
+        publication.await??;
+        Ok(())
+    }
+
+    /// A changed definition cannot replace the inputs of an already admitted attempt.
+    #[tokio::test]
+    async fn check_admission_rejects_configuration_changed_during_initial_scan() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let (mut state, scan) = broker.begin_owned_task_checks()?;
+        let admitted = state.attempt().clone();
+        let scanned = scan.run().await?;
+        let path = fixture._workspace.path().join(".forge.json");
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        config["checks"]["late-check"] = json!({
+            "trigger": {}, "action": { "category": "custom", "command": "must-not-run" }
+        });
+        std::fs::write(path, serde_json::to_vec(&config)?)?;
+        let error = match broker.prepare_owned_task_check_run(&mut state, scanned) {
+            Ok(_) => anyhow::bail!("changed configuration replaced admitted inputs"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot replace an admitted check attempt")
+        );
+        let retained = broker
+            .current_execution()?
+            .unwrap()
+            .check_runs
+            .pop()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained)?,
+            serde_json::to_value(&admitted)?
+        );
+        Ok(())
+    }
+
+    /// Recovery terminates a pre-scan attempt and pauses execution without losing its identity.
+    #[tokio::test]
+    async fn check_admission_survives_restart_before_initial_scan() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let (state, _scan) = broker.begin_owned_task_checks()?;
+        let admitted = state.attempt().clone();
+        broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)?;
+        let execution = broker
+            .store
+            .load_plan_execution(&broker.current_execution()?.unwrap().id)?
+            .context("recovered execution missing")?;
+        assert_eq!(execution.state, crate::plan::PlanExecutionState::Paused);
+        let retained = execution.check_runs.last().unwrap();
+        assert_eq!(retained.id, admitted.id);
+        assert_eq!(retained.state, crate::checks::CheckState::Interrupted);
+        assert!(retained.completed_at_ms.is_some());
+        assert!(
+            retained
+                .commands
+                .iter()
+                .all(|command| command.started_at_ms.is_none())
+        );
+        assert!(!retained.lifecycle.is_empty());
+        let root = crate::storage::state::directory(fixture._data.path())
+            .join(&broker.session.id)
+            .join("checks");
+        let history = crate::checks::CheckSupervisor::saved_history(&root)?;
+        assert_eq!(
+            serde_json::to_value(&history[0])?,
+            serde_json::to_value(retained)?
+        );
+        Ok(())
+    }
+
+    /// A failed terminal history write cannot commit a successfully paused execution.
+    #[tokio::test]
+    async fn check_recovery_write_failure_rejects_restart_until_retry() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let (state, _scan) = broker.begin_owned_task_checks()?;
+        let root = crate::storage::state::directory(fixture._data.path())
+            .join(&broker.session.id)
+            .join("checks");
+        let directory = root.join(&state.attempt().id);
+        let obstruction = directory.join("record.tmp");
+        std::fs::create_dir_all(&obstruction)?;
+        let error = broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("persist recovered check"));
+        assert!(error.chain().any(|cause| cause.is::<std::io::Error>()));
+        let execution = broker.current_execution()?.unwrap();
+        assert_eq!(execution.state, crate::plan::PlanExecutionState::Active);
+        assert_eq!(
+            execution.check_runs[0].state,
+            crate::checks::CheckState::Running
+        );
+        std::fs::remove_dir(&obstruction)?;
+        broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)?;
+        let recovered = broker.current_execution()?.unwrap();
+        assert_eq!(recovered.state, crate::plan::PlanExecutionState::Paused);
+        assert_eq!(
+            recovered.check_runs[0].state,
+            crate::checks::CheckState::Interrupted
+        );
+        assert_eq!(
+            crate::checks::CheckSupervisor::saved_history(&root)?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    /// A rollback after file publication can safely repeat recovery from the old admission.
+    #[tokio::test]
+    async fn check_recovery_retries_after_sql_commit_failure() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        broker.begin_owned_task_checks()?;
+        let database = crate::storage::state::database(fixture._data.path());
+        let connection = rusqlite::Connection::open(&database)?;
+        connection.execute_batch("CREATE TRIGGER reject_recovery BEFORE UPDATE ON session_record BEGIN SELECT RAISE(FAIL, 'recovery fixture SQL failure'); END;")?;
+        drop(connection);
+        let error = broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("recovery fixture SQL failure"));
+        assert_eq!(
+            broker.current_execution()?.unwrap().check_runs[0].state,
+            crate::checks::CheckState::Running
+        );
+        let root = crate::storage::state::directory(fixture._data.path())
+            .join(&broker.session.id)
+            .join("checks");
+        let history = crate::checks::CheckSupervisor::saved_history(&root)?;
+        assert_eq!(history[0].state, crate::checks::CheckState::Interrupted);
+        let connection = rusqlite::Connection::open(database)?;
+        connection.execute_batch("DROP TRIGGER reject_recovery;")?;
+        drop(connection);
+        broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)?;
+        let execution = broker.current_execution()?.unwrap();
+        assert_eq!(execution.state, crate::plan::PlanExecutionState::Paused);
+        assert_eq!(
+            serde_json::to_value(&history[0])?,
+            serde_json::to_value(&execution.check_runs[0])?
+        );
+        Ok(())
+    }
+
+    /// Invalid referenced history blocks recovery without resetting the record or the task.
+    #[tokio::test]
+    async fn check_recovery_rejects_corrupt_and_mismatched_history() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let (state, _scan) = broker.begin_owned_task_checks()?;
+        broker.check_runner.publish(state.attempt(), None).await?;
+        let path = crate::storage::state::directory(fixture._data.path())
+            .join(&broker.session.id)
+            .join("checks")
+            .join(&state.attempt().id)
+            .join("record.json");
+        let original = std::fs::read(&path)?;
+        let document: serde_json::Value = serde_json::from_slice(&original)?;
+        let mut wrong_version = document.clone();
+        wrong_version["version"] = (document["version"].as_u64().unwrap() + 1).into();
+        let mut wrong_revision = document;
+        wrong_revision["run"]["revision"] = (state.attempt().revision + 1).into();
+        for (bytes, reason) in [
+            (b"malformed history".to_vec(), "decode check history"),
+            (serde_json::to_vec(&wrong_version)?, "incompatible version"),
+            (serde_json::to_vec(&wrong_revision)?, "does not match"),
+        ] {
+            std::fs::write(&path, &bytes)?;
+            let error = broker
+                .store
+                .interrupt_detached_execution(&broker.session.id)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+            assert_eq!(std::fs::read(&path)?, bytes);
+            assert_eq!(
+                broker.current_execution()?.unwrap().state,
+                crate::plan::PlanExecutionState::Active
+            );
+        }
+        std::fs::write(&path, original)?;
+        broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)?;
+        assert_eq!(
+            broker.current_execution()?.unwrap().state,
+            crate::plan::PlanExecutionState::Paused
+        );
+        Ok(())
+    }
+
+    /// Expiring the admission budget before scanning leaves a failed attempt and its cause.
+    #[tokio::test(start_paused = true)]
+    async fn check_admission_timeout_before_initial_scan_retains_failure() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let (state, scan) = broker.begin_owned_task_checks()?;
+        let admitted = state.attempt().clone();
+        tokio::time::advance(crate::session::InputTimeout::default().duration()).await;
+        let error = match scan.run().await {
+            Ok(_) => anyhow::bail!("expired initial scan was admitted"),
+            Err(error) => error,
+        };
+        broker.prepare_task_check_postscan(&state)?.run().await?;
+        broker.prepare_owned_task_check_failure(&state, &error)?;
+        let execution = broker.current_execution()?.unwrap();
+        assert_eq!(execution.state, crate::plan::PlanExecutionState::Blocked);
+        let retained = execution.check_runs.last().unwrap();
+        assert_eq!(retained.id, admitted.id);
+        assert_eq!(retained.state, crate::checks::CheckState::Failed);
+        assert!(retained.completed_at_ms.is_some());
+        assert!(
+            retained
+                .commands
+                .iter()
+                .all(|command| command.started_at_ms.is_none())
+        );
+        assert!(
+            retained
+                .lifecycle
+                .iter()
+                .any(|event| event.text.contains(&error.to_string()))
+        );
+        Ok(())
+    }
+
     /// A phase tool acknowledges a proposal without changing the live execution.
     #[tokio::test]
     async fn phase_completion_remains_pending_without_normal_native_completion() -> Result<()> {
@@ -1360,7 +1857,7 @@ mod tests {
             broker
                 .settle_execution_phase(
                     (*pending).clone(),
-                    &broker.prepare_workspace_capture().run().await?,
+                    &broker.prepare_workspace_capture().run_reserved().await?,
                     &mut fixture.exchange
                 )
                 .is_err()
@@ -1384,7 +1881,14 @@ mod tests {
                 "late writer",
             )?;
         }
-        let checkpoint = broker.prepare_workspace_capture().run().await?;
+        let checkpoint = broker.prepare_workspace_capture().run_reserved().await?;
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                fixture._workspace.path(),
+                crate::checks::CheckPurpose::Prepare,
+            )
+            .is_err()
+        );
         let result =
             broker.settle_execution_phase((*pending).clone(), &checkpoint, &mut fixture.exchange);
         if changed {
@@ -1429,6 +1933,11 @@ mod tests {
             );
             assert_eq!(after.revision, before.revision);
         }
+        drop(checkpoint);
+        let _writer = crate::checks::CheckReservation::acquire(
+            fixture._workspace.path(),
+            crate::checks::CheckPurpose::Prepare,
+        )?;
         Ok(())
     }
 

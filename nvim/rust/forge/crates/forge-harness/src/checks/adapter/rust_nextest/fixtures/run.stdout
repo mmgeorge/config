@@ -1,0 +1,12 @@
+{"type":"suite","event":"started","test_count":4,"nextest":{"crate":"nextest-protocol-fixture","test_binary":"nextest_protocol_fixture","kind":"lib"}}
+{"type":"test","event":"started","name":"nextest-protocol-fixture::nextest_protocol_fixture$ignored"}
+{"type":"test","event":"started","name":"nextest-protocol-fixture::nextest_protocol_fixture$times_out"}
+{"type":"test","event":"started","name":"nextest-protocol-fixture::nextest_protocol_fixture$passes"}
+{"type":"test","event":"started","name":"nextest-protocol-fixture::nextest_protocol_fixture$fails"}
+{"type":"test","event":"ignored","name":"nextest-protocol-fixture::nextest_protocol_fixture$ignored"}
+{"type":"test","event":"failed","name":"nextest-protocol-fixture::nextest_protocol_fixture$fails","exec_time":0.0067251,"stdout":"\nthread 'fails' (15612) panicked at src\\lib.rs:5:14:\nfixture failure\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"}
+{"type":"test","event":"ok","name":"nextest-protocol-fixture::nextest_protocol_fixture$passes","exec_time":0.0117018}
+{"type":"suite","event":"failed","passed":1,"failed":1,"ignored":1,"measured":0,"filtered_out":1,"exec_time":0.0184269,"nextest":{"crate":"nextest-protocol-fixture","test_binary":"nextest_protocol_fixture","kind":"lib"}}
+{"type":"suite","event":"started","test_count":4,"nextest":{"crate":"nextest-protocol-fixture","test_binary":"nextest_protocol_fixture","kind":"lib"}}
+{"type":"test","event":"failed","name":"nextest-protocol-fixture::nextest_protocol_fixture$times_out","exec_time":0.1175368,"reason":"time limit exceeded"}
+{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":1,"measured":0,"filtered_out":3,"exec_time":0.1175368,"nextest":{"crate":"nextest-protocol-fixture","test_binary":"nextest_protocol_fixture","kind":"lib"}}

@@ -64,6 +64,7 @@ pub struct CodexRuntime {
     server: Mutex<Option<CodexAppServer>>,
     start_count: AtomicU64,
     closed: AtomicBool,
+    process_owner: Option<Arc<dyn process::ProcessOwner>>,
 }
 
 impl CodexRuntime {
@@ -74,7 +75,14 @@ impl CodexRuntime {
             server: Mutex::new(None),
             start_count: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            process_owner: None,
         }
+    }
+
+    /// Bind this conversation's process startup to its retained host reservation.
+    pub fn owner_bind(mut self, owner: Option<Arc<dyn process::ProcessOwner>>) -> Self {
+        self.process_owner = owner;
+        self
     }
 
     /// Connect one session channel without starting another app-server.
@@ -163,7 +171,10 @@ impl CodexRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = process::spawn_owned(command).map_err(|error| {
+        let mut child = match &self.process_owner {
+            Some(owner) => owner.spawn(command),
+            None => process::spawn_owned(command),
+        }.map_err(|error| {
             tracing::error!(target: "forge::provider", event_name = "provider.startup.failed",
                 provider = "codex", error = %format_args!("start shared Codex app-server {program}: {error}"));
             ProviderError::RuntimeLaunch {

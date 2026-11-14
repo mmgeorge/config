@@ -356,6 +356,30 @@ local function path_exists(path)
   return run_command({ 'test', '-e', path }) ~= nil
 end
 
+-- Checkout recovery must distinguish absence from an unreadable path. A failed
+-- probe never authorizes removal of a registration.
+local function checkout_path_state(path)
+  if is_windows then
+    local quoted = "'" .. path:gsub("'", "''") .. "'"
+    local output, err = run_command({
+      'powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+      "try { $null = Get-Item -LiteralPath " .. quoted .. " -Force -ErrorAction Stop; 'available' } "
+        .. "catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'missing' } else { throw } }",
+    })
+    if not output then return 'inaccessible', err end
+    local state = trim(output)
+    if state == 'available' or state == 'missing' then return state end
+    return 'inaccessible', 'Unexpected path probe result: ' .. state
+  end
+
+  if run_command({ 'test', '-e', path }) ~= nil or run_command({ 'test', '-L', path }) ~= nil then
+    return 'available'
+  end
+  -- An absent entry is only known to be missing when its parent is searchable.
+  if run_command({ 'test', '-x', dirname(path) }) ~= nil then return 'missing' end
+  return 'inaccessible', 'Parent directory is missing or not searchable'
+end
+
 local function directory_exists(path)
   path = normalize_path(path)
   if not path then
@@ -570,9 +594,9 @@ local function git_common_dir(path)
 end
 
 local function parse_worktrees(path)
-  local stdout = git_output(path, { 'worktree', 'list', '--porcelain' })
+  local stdout, err = git_output(path, { 'worktree', 'list', '--porcelain' })
   if not stdout then
-    return nil
+    return nil, err
   end
 
   local worktrees = {}
@@ -588,6 +612,8 @@ local function parse_worktrees(path)
       current.branch_name = current.branch:gsub('^refs/heads/', '')
     end
 
+    current.state = current.bare and 'bare' or current.locked and 'locked'
+      or current.prunable and 'stale' or 'registered'
     table.insert(worktrees, current)
     current = nil
   end
@@ -626,7 +652,7 @@ local function preferred_worktree_parent(worktrees, fallback)
   local best_count = 0
 
   for _, worktree in ipairs(worktrees) do
-    if not worktree.bare and not worktree.is_main then
+    if not worktree.bare and not worktree.prunable and not worktree.is_main then
       local parent = dirname(worktree.path)
       counts[parent] = (counts[parent] or 0) + 1
       if counts[parent] > best_count then
@@ -651,34 +677,34 @@ end
 
 local function main_worktree_path(worktrees)
   for _, worktree in ipairs(worktrees) do
-    if not worktree.bare and directory_exists(join_path(worktree.path, '.git')) then
+    if not worktree.bare and not worktree.prunable and directory_exists(join_path(worktree.path, '.git')) then
       return worktree.path
     end
   end
 
   for _, worktree in ipairs(worktrees) do
-    if not worktree.bare and worktree.branch_name == 'main' then
+    if not worktree.bare and not worktree.prunable and worktree.branch_name == 'main' then
       return worktree.path
     end
   end
 
   for _, worktree in ipairs(worktrees) do
-    if not worktree.bare and worktree.branch_name == 'master' then
+    if not worktree.bare and not worktree.prunable and worktree.branch_name == 'master' then
       return worktree.path
     end
   end
 
   for _, worktree in ipairs(worktrees) do
-    if not worktree.bare then
+    if not worktree.bare and not worktree.prunable then
       return worktree.path
     end
   end
 
-  return worktrees[1] and worktrees[1].path or nil
+  return nil
 end
 
 local function should_display_worktree(worktree)
-  return worktree ~= nil and not worktree.bare
+  return worktree ~= nil and not worktree.bare and not worktree.prunable
 end
 
 local function build_repo(path, common_dir)
@@ -701,34 +727,43 @@ local function build_repo(path, common_dir)
     return nil
   end
 
-  local worktrees = parse_worktrees(path)
+  local worktrees, inventory_err = parse_worktrees(common_dir)
   if not worktrees or #worktrees == 0 then
     debug_log('repo.build.rejected', {
       common_dir = common_dir,
       path = path,
-      reason = 'worktree inventory unavailable',
+      reason = inventory_err or 'worktree inventory unavailable',
     })
-    return nil
+    return nil, inventory_err or 'Worktree inventory unavailable'
   end
 
-  local is_bare_layout = basename(common_dir) == '.bare'
+  local is_bare_layout = false
+  for _, worktree in ipairs(worktrees) do
+    if worktree.bare then is_bare_layout = true end
+  end
+  local main_path = main_worktree_path(worktrees)
   local repo = {
     id = common_dir,
     name = basename(dirname(common_dir)),
-    main_path = main_worktree_path(worktrees),
+    main_path = main_path,
+    git_path = common_dir,
     root_path = is_bare_layout and dirname(common_dir) or nil,
     worktrees = worktrees,
   }
 
   for _, worktree in ipairs(repo.worktrees) do
-    worktree.is_main = should_display_worktree(worktree) and worktree.path == repo.main_path
+    -- Only a non-bare repository has a protected primary worktree. A preferred
+    -- checkout named main/master in a bare layout is still a removable link.
+    worktree.is_main = not is_bare_layout and should_display_worktree(worktree) and worktree.path == repo.main_path
     worktree.repo_id = repo.id
     worktree.repo_name = repo.name
     worktree.repo_main_path = repo.main_path
+    worktree.repo_git_path = repo.git_path
     worktree.workspace_name = worktree_workspace_name(repo.name, worktree)
   end
 
-  local default_parent = default_worktree_parent(common_dir, repo.main_path)
+  local default_parent = is_bare_layout and dirname(common_dir)
+    or default_worktree_parent(common_dir, repo.main_path)
   if is_bare_layout then
     repo.worktree_parent = default_parent
   else
@@ -739,6 +774,7 @@ local function build_repo(path, common_dir)
   for _, worktree in ipairs(repo.worktrees) do
     table.insert(worktree_records, {
       bare = worktree.bare == true,
+      state = worktree.state,
       branch = worktree.branch_name,
       is_main = worktree.is_main == true,
       path = worktree.path,
@@ -747,6 +783,7 @@ local function build_repo(path, common_dir)
   end
   debug_log('repo.build.resolved', {
     common_dir = repo.id,
+    git_path = repo.git_path,
     main_path = repo.main_path,
     name = repo.name,
     root_path = repo.root_path,
@@ -1420,7 +1457,7 @@ local function current_worktree_for_path(repo, path)
   path = normalize_path(path)
   if repo.root_path and path == repo.root_path then
     for _, worktree in ipairs(repo.worktrees) do
-      if worktree.is_main then
+      if worktree.path == repo.main_path then
         return worktree
       end
     end
@@ -1602,7 +1639,7 @@ local function run_new_worktree_setup(window, repo, worktree)
 end
 
 local function list_remotes(repo)
-  local output, err = git_capture(repo.main_path, { 'remote' })
+  local output, err = git_capture(repo.git_path, { 'remote' })
   if output == nil then
     return nil, err
   end
@@ -1611,7 +1648,7 @@ local function list_remotes(repo)
 end
 
 local function refresh_remote(window, repo, remote)
-  local stdout, stderr = git_output(repo.main_path, branch_source.remote_fetch_args(remote))
+  local stdout, stderr = git_output(repo.git_path, branch_source.remote_fetch_args(remote))
   if not stdout then
     notify(window, 'Could not refresh ' .. remote .. ' for ' .. repo.name .. ': ' .. stderr)
     return false
@@ -1621,7 +1658,7 @@ local function refresh_remote(window, repo, remote)
 end
 
 local function branch_upstream(repo, branch)
-  local upstream = git_capture(repo.main_path, {
+  local upstream = git_capture(repo.git_path, {
     'rev-parse',
     '--abbrev-ref',
     branch .. '@{upstream}',
@@ -1643,7 +1680,7 @@ local function ensure_branch_upstream(repo, branch, upstream)
     return true
   end
 
-  local stdout, stderr = git_output(repo.main_path, {
+  local stdout, stderr = git_output(repo.git_path, {
     'branch',
     '--set-upstream-to=' .. upstream,
     branch,
@@ -1666,18 +1703,19 @@ local function checked_out_worktree(repo, branch)
 end
 
 local function local_branch_exists(repo, branch)
-  local stdout = git_capture(repo.main_path, {
+  local stdout, err = git_capture(repo.git_path, {
     'show-ref',
     '--verify',
     '--quiet',
     'refs/heads/' .. branch,
   })
 
+  if stdout == nil and err ~= '' then return nil, err end
   return stdout ~= nil
 end
 
 local function ref_oid(repo, ref)
-  return git_capture(repo.main_path, { 'rev-parse', '--verify', ref })
+  return git_capture(repo.git_path, { 'rev-parse', '--verify', ref })
 end
 
 local function created_branch(opts)
@@ -1685,7 +1723,7 @@ local function created_branch(opts)
 end
 
 local function finish_created_worktree(window, repo, opts)
-  local updated_repo = build_repo(opts.path) or build_repo(repo.main_path)
+  local updated_repo = build_repo(opts.path) or build_repo(repo.git_path)
   if not updated_repo then
     notify(window, 'Created the worktree, but could not refresh repository metadata')
     return
@@ -1719,7 +1757,7 @@ local function worktree_creation_command(repo, opts, workspace_name)
     'nu',
     M.settings.creation_runner_path,
     '--repository-path',
-    repo.main_path,
+    repo.git_path,
     '--worktree-path',
     opts.path,
     '--start-point',
@@ -1743,6 +1781,7 @@ local function start_visible_worktree_creation(window, pane, repo, opts)
     branch_name = branch,
     path = opts.path,
     repo_main_path = repo.main_path,
+    repo_git_path = repo.git_path,
     repo_name = repo.name,
   }
   worktree.workspace_name = worktree_workspace_name(repo.name, worktree)
@@ -1757,6 +1796,7 @@ local function start_visible_worktree_creation(window, pane, repo, opts)
     new_branch = opts.new_branch,
     path = opts.path,
     repo_main_path = repo.main_path,
+    repo_git_path = repo.git_path,
     start_point = opts.start_point,
     upstream = opts.upstream,
     workspace_name = worktree.workspace_name,
@@ -1767,7 +1807,7 @@ local function start_visible_worktree_creation(window, pane, repo, opts)
       name = worktree.workspace_name,
       spawn = {
         args = worktree_creation_command(repo, opts, worktree.workspace_name),
-        cwd = repo.main_path,
+        cwd = repo.git_path,
         label = worktree.workspace_name,
       },
     }),
@@ -1775,14 +1815,73 @@ local function start_visible_worktree_creation(window, pane, repo, opts)
   )
 end
 
+local prepare_remote_existing_branch
+
+-- Re-read Git state at admission, after the picker has closed. Only the selected
+-- branch and destination may trigger recovery; browsing never mutates Git.
+local function prepare_checkout(window, pane, repo, opts)
+  local refreshed, err = build_repo(repo.git_path)
+  if not refreshed then
+    notify(window, 'Could not refresh repository: ' .. tostring(err))
+    return nil
+  end
+  local changed = false
+  for _, worktree in ipairs(refreshed.worktrees) do
+    local branch_match = not opts.new_branch and worktree.branch_name == opts.branch
+    if not worktree.bare and (branch_match or worktree.path == opts.path) then
+      local access, access_err = checkout_path_state(worktree.path)
+      local exists = access == 'available'
+      if exists and not worktree.prunable and branch_match then
+        switch_to_worktree(window, pane, worktree)
+        return nil
+      end
+      if access == 'inaccessible' then
+        notify(window, 'Worktree is inaccessible at ' .. worktree.path .. ': ' .. tostring(access_err))
+        return nil
+      elseif not exists and not worktree.locked then
+        worktree.state = 'missing'
+      end
+      if exists or worktree.locked or not worktree.prunable then
+        notify(window, 'Worktree is ' .. worktree.state .. ' at ' .. worktree.path
+          .. '; checkout requires an available worktree or a missing, unlocked stale registration')
+        return nil
+      end
+      local output, removal_err = git_output(refreshed.git_path, { 'worktree', 'remove', worktree.path })
+      if not output then
+        notify(window, 'Could not remove stale worktree registration: ' .. removal_err)
+        return nil
+      end
+      changed = true
+    end
+  end
+  if changed then
+    refreshed, err = build_repo(repo.git_path)
+    if not refreshed then notify(window, 'Could not refresh repository: ' .. tostring(err)) end
+  end
+  return refreshed
+end
+
 local function create_worktree(window, pane, repo, opts)
+  repo = prepare_checkout(window, pane, repo, opts)
+  if not repo then return end
+  if opts.remote_record then
+    local prepared = prepare_remote_existing_branch(window, repo, opts.remote_record)
+    if not prepared then return end
+    prepared.path = opts.path
+    opts = prepared
+  end
   if find_worktree(repo, opts.path) then
     notify(window, 'A worktree already exists at ' .. opts.path)
     return
   end
 
   if opts.new_branch then
-    if local_branch_exists(repo, opts.new_branch) then
+    local exists, err = local_branch_exists(repo, opts.new_branch)
+    if exists == nil then
+      notify(window, 'Could not inspect branch: ' .. tostring(err))
+      return
+    end
+    if exists then
       notify(
         window,
         'Branch ' .. opts.new_branch .. ' already exists. Use Check out existing branch, then choose Local branch'
@@ -1832,11 +1931,12 @@ local function branch_records(repo, source, remote, exclude_checked_out)
 
   local ref_records = {}
   local branch_names = {}
-  local output = git_capture(repo.main_path, {
+  local output, err = git_capture(repo.git_path, {
     'for-each-ref',
     '--format=%(refname:short)%09%(committerdate:unix)%09%(symref)%09END',
     branch_source.ref_namespace(source, remote),
-  }) or ''
+  })
+  if output == nil then return nil, err end
 
   for _, line in ipairs(split_lines(output)) do
     local ref, timestamp, symref = line:match('^(.-)\t([0-9]+)\t(.-)\tEND$')
@@ -1965,7 +2065,11 @@ local function choose_branch_source(window, pane, repo, title, callback)
 end
 
 local function choose_branch(window, pane, repo, source, remote, title, exclude_checked_out, callback)
-  local records = branch_records(repo, source, remote, exclude_checked_out)
+  local records, err = branch_records(repo, source, remote, exclude_checked_out)
+  if not records then
+    notify(window, 'Could not list branches: ' .. tostring(err))
+    return
+  end
   if #records == 0 then
     notify(window, 'No ' .. source .. ' branches are available for ' .. repo.name)
     return
@@ -1996,9 +2100,13 @@ local function choose_branch(window, pane, repo, source, remote, title, exclude_
   end)
 end
 
-local function prepare_remote_existing_branch(window, repo, record)
+prepare_remote_existing_branch = function(window, repo, record)
   local branch = record.logical_name
-  local local_exists = local_branch_exists(repo, branch)
+  local local_exists, existence_err = local_branch_exists(repo, branch)
+  if local_exists == nil then
+    notify(window, 'Could not inspect branch: ' .. tostring(existence_err))
+    return nil
+  end
   local checked_out = local_exists and checked_out_worktree(repo, branch) or nil
   local local_oid, local_oid_err
   if local_exists then
@@ -2027,12 +2135,25 @@ local function prepare_remote_existing_branch(window, repo, record)
     return nil
   end
 
-  if action == 'reset_to_remote' then
-    local stdout, stderr = git_output(repo.main_path, {
-      'branch',
-      '--force',
-      branch,
-      record.id,
+  if action == 'fast_forward' then
+    local counts, count_err = git_capture(repo.git_path, {
+      'rev-list', '--left-right', '--count', local_oid .. '...' .. remote_oid,
+    })
+    local ahead, behind
+    if counts then ahead, behind = counts:match('^(%d+)%s+(%d+)$') end
+    if not ahead or not behind then
+      notify(window, 'Could not compare branch tips: ' .. tostring(count_err or counts))
+      return nil
+    end
+    if tonumber(ahead) > 0 then
+      notify(window, 'Local branch ' .. branch .. ' has commits absent from the remote. Choose Local branch to preserve its tip')
+      return nil
+    end
+    -- Fetch enforces a fast-forward ref update and refuses a branch that became
+    -- checked out after admission. Never force a local branch to the remote tip.
+    local stdout, stderr = git_output(repo.git_path, {
+      'fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', '.',
+      'refs/remotes/' .. record.id .. ':refs/heads/' .. branch,
     })
     if not stdout then
       notify(window, 'Could not update ' .. branch .. ' to ' .. record.id .. ': ' .. stderr)
@@ -2061,23 +2182,14 @@ local function choose_existing_branch(window, pane, repo)
       source,
       remote,
       'Existing branch',
-      source == 'local',
+      false,
       function(branch_window, branch_pane, record)
-        local create_opts
-        if source == 'remote' then
-          create_opts = prepare_remote_existing_branch(branch_window, repo, record)
-        else
-          create_opts = {
-            branch = record.logical_name,
-            start_point = record.id,
-          }
-        end
-
-        if not create_opts then
-          return
-        end
-
-        create_opts.path = default_worktree_path(repo, sanitize_name(record.logical_name))
+        local create_opts = {
+          branch = record.logical_name,
+          start_point = record.id,
+          remote_record = source == 'remote' and record or nil,
+          path = default_worktree_path(repo, sanitize_name(record.logical_name)),
+        }
         create_worktree(branch_window, branch_pane, repo, create_opts)
       end
     )
@@ -2253,13 +2365,12 @@ local function choose_repo_for_creation(window, pane, current_repo, repos)
   end)
 end
 
-local function removable_worktrees(repos, current_workspace)
+local function removable_worktrees(repos)
   local removable = {}
   for _, repo in ipairs(repos) do
     for _, worktree in ipairs(repo.worktrees) do
       if should_display_worktree(worktree)
         and not worktree.is_main
-        and worktree.workspace_name ~= current_workspace
       then
         table.insert(removable, worktree)
       end
@@ -2304,7 +2415,7 @@ end
 local finish_remove_worktree
 
 local function worktree_is_registered(worktree)
-  local worktrees = parse_worktrees(worktree.repo_main_path)
+  local worktrees = parse_worktrees(worktree.repo_git_path)
   if not worktrees then
     return nil
   end
@@ -2346,7 +2457,7 @@ finish_remove_worktree = function(window, worktree, attempts_remaining)
   end
 
   if registered then
-    local stdout, stderr = git_output(worktree.repo_main_path, {
+    local stdout, stderr = git_output(worktree.repo_git_path, {
       'worktree',
       'remove',
       '--force',
@@ -2366,7 +2477,7 @@ finish_remove_worktree = function(window, worktree, attempts_remaining)
     end
   end
 
-  git_output(worktree.repo_main_path, { 'worktree', 'prune' })
+  git_output(worktree.repo_git_path, { 'worktree', 'prune' })
 
   if path_exists(worktree.path) then
     local ok, err = remove_directory_tree(worktree.path)
@@ -2412,7 +2523,7 @@ local choose_worktree_to_remove
 
 local function main_worktree(repo)
   for _, worktree in ipairs(repo.worktrees) do
-    if worktree.is_main then
+    if worktree.path == repo.main_path then
       return worktree
     end
   end
@@ -2505,8 +2616,9 @@ local function confirm_and_remove_current(window, pane, worktree, repo)
       pending_removals()[target.name] = {
         path = worktree.path,
         repo_main_path = worktree.repo_main_path,
+        repo_git_path = worktree.repo_git_path,
         target_workspace_name = target.name,
-        worktree_workspace_name = worktree.workspace_name,
+        worktree_workspace_name = current_workspace,
       }
 
       inner_window:perform_action(
@@ -2551,7 +2663,7 @@ function M.remove_current_session()
 end
 
 choose_worktree_to_remove = function(window, pane, repos, current_workspace)
-  local removable = removable_worktrees(repos, current_workspace)
+  local removable = removable_worktrees(repos)
   if #removable == 0 then
     notify(window, 'No linked worktrees are available to remove')
     return
@@ -2574,14 +2686,21 @@ choose_worktree_to_remove = function(window, pane, repos, current_workspace)
       return
     end
 
-    local worktree = find_worktree_by_path(repos, id)
+    local worktree, repo = find_worktree_by_path(repos, id)
     if not worktree then
       notify(inner_window, 'Could not resolve the selected worktree')
       return
     end
 
     after_overlay(function()
-      remove_worktree(inner_window, worktree)
+      local current = current_worktree_for_path(repo, current_pane_path(pane))
+      if worktree.workspace_name == inner_window:active_workspace()
+        or (current and current.path == worktree.path)
+      then
+        confirm_and_remove_current(inner_window, pane, worktree, repo)
+      else
+        remove_worktree(inner_window, worktree)
+      end
     end)
   end)
 end
@@ -2638,6 +2757,7 @@ function M.handle_user_var_changed(window, pane, name, value)
 
   finish_created_worktree(window, {
     main_path = pending.repo_main_path,
+    git_path = pending.repo_git_path,
   }, pending)
 
   -- Apply the completed workspace layout without waiting for a periodic status event.

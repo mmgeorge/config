@@ -230,7 +230,9 @@ pub(crate) fn changed_artifacts(
         PlanArtifact::Flows => old.flows != new.flows,
         PlanArtifact::Tests => old.tests != new.tests,
         PlanArtifact::Checks => {
-            old.checks != new.checks || old.disabled_checks != new.disabled_checks
+            old.checks != new.checks
+                || old.disabled_checks != new.disabled_checks
+                || old.test_scopes != new.test_scopes
         }
         _ => false,
     };
@@ -309,6 +311,22 @@ pub(crate) fn parse_authored(
         .filter(|id| !document.checks.contains(id))
         .cloned()
         .collect();
+    document.test_scopes = design.document.test_scopes.clone();
+    for id in document.test_scopes.keys() {
+        if !config.definitions.iter().any(|check| {
+            &check.id == id
+                && check.category == crate::checks::CheckCategory::Test
+                && matches!(check.runner, crate::checks::CheckRunner::Adapter(_))
+        }) {
+            diagnostic.push(artifact_diagnostic(
+                PlanArtifact::Checks.path(),
+                1,
+                DeclarationDiagnosticKind::PlanCheck,
+                id,
+                format!("test scope requires an existing test adapter check: {id}"),
+            ));
+        }
+    }
     Ok(ParsedArtifacts {
         document,
         diagnostic,
@@ -341,6 +359,7 @@ pub(crate) fn preview_authored(design: &DeclarationDesign) -> DesignDocument {
         overview.tests = std::mem::take(&mut document.tests);
         overview.checks = std::mem::take(&mut document.checks);
         overview.disabled_checks = std::mem::take(&mut document.disabled_checks);
+        overview.test_scopes = std::mem::take(&mut document.test_scopes);
         document = overview;
     }
     if let Some((text, path)) = parse(PlanArtifact::Flows) {
@@ -1094,6 +1113,7 @@ mod test {
             tests: Vec::new(),
             checks: Vec::new(),
             disabled_checks: Vec::new(),
+            test_scopes: BTreeMap::new(),
         }
     }
 
@@ -1243,28 +1263,24 @@ mod test {
     #[test]
     fn checks_report_unknown_ids_and_missing_prerequisites() {
         use crate::checks::{
-            CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckPurpose, CheckScope,
-            CheckTrigger,
+            CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckScope, CheckTrigger,
         };
         let definition = |id: &str, depends_on: &[&str]| CheckDefinition {
             auto: false,
             id: id.into(),
             name: id.into(),
-            category: CheckCategory::Test,
-            purpose: CheckPurpose::Verify,
+            category: CheckCategory::Custom,
             enabled: true,
             area: "Project".into(),
             trigger: CheckTrigger::AnyChange,
             scope: CheckScope::All,
             directory: ".".into(),
-            all: CheckOperation {
-                input: false,
+            runner: crate::checks::CheckRunner::Command(CheckOperation {
+                prepare: false,
                 args: None,
                 inputs: None,
                 command: "true".into(),
-            },
-            files: None,
-            cases: None,
+            }),
             depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(),
         };
         let config = CheckConfig {

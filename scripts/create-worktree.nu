@@ -1,4 +1,4 @@
-use worktree-process.nu run-git-command
+use worktree-process.nu [run-git-command worktree-add-arguments]
 
 def send-wezterm-user-variable [name: string, value: string] {
   let encoded_value = $value | encode base64
@@ -91,11 +91,7 @@ def main [
     $start_point
   }
 
-  mut git_arguments = ['-c' 'core.hooksPath=/dev/null' '-C' $repository_path 'worktree' 'add']
-  if $new_branch != '' {
-    $git_arguments = $git_arguments | append ['--no-track' '-b' $new_branch]
-  }
-  $git_arguments = $git_arguments | append [$worktree_path $resolved_start_point]
+  let git_arguments = worktree-add-arguments $repository_path $worktree_path $resolved_start_point $new_branch
 
   print $"Creating worktree ($worktree_path)"
   print $"git ($git_arguments | str join ' ')"

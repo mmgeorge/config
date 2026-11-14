@@ -5,14 +5,19 @@
         "auto": true
       },
       "action": {
-        "command": [
-          "git",
-          "diff",
-          "--check",
-          "HEAD"
-        ],
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/git-whitespace.nu",
+              "adapter"
+            ]
+          }
+        },
         "label": "Check patch whitespace",
-        "category": "format"
+        "category": "lint"
       }
     },
     "lua-test": {
@@ -36,45 +41,18 @@
         ]
       },
       "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          ".forge/checks/lua-tests.nu",
-          "--affected",
-          "{files}"
-        ],
-        "inputs": {
-          "files": {
-            "type": "array",
-            "description": "Changed repository paths; with none, every test runs",
-            "required": false,
-            "source": "changed_files"
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/lua-tests.nu",
+              "adapter"
+            ]
           }
         },
         "label": "Run affected Lua tests",
-        "category": "test",
-        "after": [
-          "rust-build"
-        ]
-      }
-    },
-    "lua-test-select": {
-      "trigger": {},
-      "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          ".forge/checks/lua-tests.nu",
-          "{tests}"
-        ],
-        "inputs": {
-          "tests": {
-            "type": "array",
-            "description": "Test files, source files, directories, test names, or name::case",
-            "required": true
-          }
-        },
-        "label": "Run selected Lua tests",
         "category": "test",
         "after": [
           "rust-build"
@@ -93,22 +71,19 @@
         ]
       },
       "action": {
-        "command": [
-          "nu",
-          "--no-config-file",
-          ".forge/checks/nushell-syntax.nu",
-          "{files}"
-        ],
-        "inputs": {
-          "files": {
-            "type": "array",
-            "description": "Nushell files to check; with none, every repository Nushell file",
-            "required": false,
-            "source": "changed_files"
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/nushell-syntax.nu",
+              "adapter"
+            ]
           }
         },
         "label": "Check Nushell syntax",
-        "category": "check"
+        "category": "typecheck"
       }
     },
     "rulesync-global-preview": {
@@ -134,7 +109,7 @@
           "--global"
         ],
         "label": "Preview global Rulesync",
-        "category": "check"
+        "category": "custom"
       }
     },
     "rulesync-global-update": {
@@ -150,7 +125,7 @@
           "--global"
         ],
         "label": "Update global Rulesync",
-        "category": "check",
+        "category": "custom",
         "prepare": true,
         "after": [
           "rulesync-global-preview"
@@ -176,7 +151,7 @@
           "--dry-run"
         ],
         "label": "Preview local Rulesync",
-        "category": "check"
+        "category": "custom"
       }
     },
     "rulesync-local-update": {
@@ -187,7 +162,7 @@
           "generate"
         ],
         "label": "Update local Rulesync",
-        "category": "check",
+        "category": "custom",
         "prepare": true,
         "after": [
           "rulesync-local-preview"
@@ -206,15 +181,19 @@
         ]
       },
       "action": {
-        "command": [
-          "cargo",
-          "build",
-          "--profile",
-          "dev",
-          "--locked",
-          "--bin",
-          "forge"
-        ],
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/cargo.nu",
+              "adapter",
+              "--bin",
+              "forge"
+            ]
+          }
+        },
         "directory": "nvim/rust/forge",
         "label": "Build Rust executable",
         "category": "build"
@@ -223,14 +202,20 @@
     "rust-build-release": {
       "trigger": {},
       "action": {
-        "command": [
-          "cargo",
-          "build",
-          "--release",
-          "--locked",
-          "--bin",
-          "forge"
-        ],
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/cargo.nu",
+              "adapter",
+              "--bin",
+              "forge",
+              "--release"
+            ]
+          }
+        },
         "directory": "nvim/rust/forge",
         "label": "Build Rust executable (release)",
         "category": "build"
@@ -248,18 +233,20 @@
         ]
       },
       "action": {
-        "command": [
-          "cargo",
-          "check",
-          "--profile",
-          "dev",
-          "--locked",
-          "--workspace",
-          "--all-targets"
-        ],
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/cargo.nu",
+              "adapter"
+            ]
+          }
+        },
         "directory": "nvim/rust/forge",
         "label": "Type-check Rust workspace",
-        "category": "check"
+        "category": "typecheck"
       }
     },
     "rust-format": {
@@ -274,47 +261,36 @@
         ]
       },
       "action": {
-        "command": [
-          "cargo",
-          "fmt",
-          "--all",
-          "--",
-          "--check"
-        ],
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/cargo.nu",
+              "adapter"
+            ]
+          }
+        },
         "directory": "nvim/rust/forge",
         "label": "Check Rust formatting",
         "category": "format"
       }
     },
-    "rust-format-fix": {
-      "trigger": {},
-      "action": {
-        "command": [
-          "cargo",
-          "fmt",
-          "--all"
-        ],
-        "directory": "nvim/rust/forge",
-        "label": "Apply Rust formatting",
-        "category": "format",
-        "prepare": true
-      }
-    },
     "rust-lint": {
       "trigger": {},
       "action": {
-        "command": [
-          "cargo",
-          "clippy",
-          "--profile",
-          "dev",
-          "--locked",
-          "--workspace",
-          "--all-targets",
-          "--",
-          "-D",
-          "warnings"
-        ],
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/cargo.nu",
+              "adapter"
+            ]
+          }
+        },
         "directory": "nvim/rust/forge",
         "label": "Lint Rust workspace",
         "category": "lint"
@@ -332,23 +308,14 @@
         ]
       },
       "action": {
-        "command": [
-          "cargo",
-          "nextest",
-          "run",
-          "--cargo-profile",
-          "dev",
-          "--locked",
-          "--workspace",
-          "-E",
-          "{filter}"
-        ],
-        "inputs": {
-          "filter": {
-            "type": "string",
-            "description": "Nextest filterset, such as package(forge-git), rdeps(forge-diff), or package(forge-git) & test(=writer::case)",
-            "required": false,
-            "default": "all()"
+        "adapter": {
+          "rust_nextest": {
+            "cargo_profile": "dev",
+            "nextest_profile": "default",
+            "locked": true,
+            "features": [],
+            "all_features": false,
+            "cargo_args": []
           }
         },
         "directory": "nvim/rust/forge",

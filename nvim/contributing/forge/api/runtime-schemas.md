@@ -1243,26 +1243,12 @@ pub enum CheckSelection {
     Files {
         files: Vec<String>,
     },
-    Cases {
-        cases: Vec<CheckCase>,
+    Tests {
+        tests: super::adapter::TestSelection,
     },
-}
-```
-
-## CheckCase
-
-Source: [checks/selection.rs](../../../rust/forge/crates/forge-harness/src/checks/selection.rs).
-
-```rust
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-/// Identifies a runner-resolvable test case and its project-relative source file.
-pub struct CheckCase {
-    pub file: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional executable target, such as lib, bin:cli, or test:gameplay.
-    pub target: Option<String>,
+    Paths {
+        paths: super::adapter::PathSelection,
+    },
 }
 ```
 
@@ -1271,16 +1257,14 @@ pub struct CheckCase {
 Source: [checks/config.rs](../../../rust/forge/crates/forge-harness/src/checks/config.rs).
 
 ```rust
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Selects project-wide or task-derived coverage without changing command text.
 pub enum CheckScope {
     #[default]
     All,
-    ChangedFiles,
-    ChangedCases,
-    /// Runs only tests marked new in the accepted plan.
-    NewCases,
+    Paths,
+    Tests,
 }
 ```
 
@@ -1357,9 +1341,12 @@ pub struct CommandCheck<CommandContext = Option<CheckCommand>> {
     pub output: PathBuf,
     pub output_bytes: u64,
     pub preview: String,
+    /// Validated structured outcome of the adapter's category contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Validated file-level outcomes from a structured runner, separate from this command's status.
-    pub report: Option<super::CheckReport>,
+    pub result: Option<super::adapter::AdapterResult>,
+    /// Accepted live progress from the adapter's category contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_progress: Option<super::adapter::AdapterProgress>,
 }
 ```
 
@@ -1368,11 +1355,8 @@ pub struct CommandCheck<CommandContext = Option<CheckCommand>> {
 Source: [checks/model.rs](../../../rust/forge/crates/forge-harness/src/checks/model.rs).
 
 ```rust
-#[derive(Clone, Debug, Deserialize, Serialize)]
 /// Retains a Harness-owned gate without creating a provider exchange.
-#[serde(bound(
-    deserialize = "RunContext: Deserialize<'de> + Default, CommandContext: Deserialize<'de> + Default"
-))]
+#[derive(Clone, Debug, Serialize)]
 pub struct CheckRun<RunContext = Option<CheckRunContext>, CommandContext = Option<CheckCommand>> {
     pub id: String,
     /// Destination and source position captured before check execution begins.
@@ -1397,13 +1381,88 @@ pub struct CheckRun<RunContext = Option<CheckRunContext>, CommandContext = Optio
     pub cancelled_run_id: Option<String>,
     pub state: CheckState,
     pub progress: SemanticProgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_tests: Option<super::PlannedTestExecution>,
     pub workspace_identity: Option<String>,
     pub workspace_digest: BTreeMap<String, String>,
     pub commands: Vec<CommandCheck<CommandContext>>,
 }
 ```
 
+`planned_tests` is present for plan Check attempts. It retains the authored test
+inventory, the required `test_scopes` map of reviewer choices (`planned` or
+`whole_suite`), and pending, resolved, or invalidated evidence. Resolved entries hold
+an exact case identity, verified removal, or a resolution problem; observed case
+statuses remain separate from removal outcomes. Its validated reader rejects
+mismatched inventories, duplicate required-case mappings, and absence attributed
+to a non-removed entry. Pending and invalidated evidence cannot pass the gate.
+
+Resolved and invalidated states also require `inventories`. Each entry contains a
+check ID, primary discovery result, and supplementary result. Primary results are
+`Available` with a validated exact discovery or `Failed` with its cause.
+Supplementary results additionally allow `NotRequested`. A resolved case's
+`source` is `Exact` or `Static` with a path and optional line, or `Unverified`.
+The reader recomputes resolutions from these inventories and rejects changed
+identities, locations, duplicate checks, non-exact primary inventories, and
+inconsistent removal outcomes.
+
+Each non-null planned `result` contains `command_id` and `status`. The ID names
+the selected test-verification command in this same attempt that last reported
+the exact `(check ID, item ID)` outcome. The complete `CheckRun` reader validates
+this reference and status against `commands`, rejecting missing or duplicate
+command IDs, duplicate case results, different owners or statuses, unstarted or
+skipped commands, preparation commands, and reused outcomes from earlier runs.
+A null result remains unfinished
+and cannot pass the planned-test gate. Invalidated attempts retain the same
+reference validation while remaining unsatisfied. This format uses disposable
+state 45, check history 23, plan schema 24, and verification ledger 5. Removed
+legacy selection fields are not migrated from earlier disposable records.
+
+Once discovery begins, `planned_tests.inputs` retains `source_snapshot`,
+`discovery`, `context`, `test_scopes`, and `verification`. The discovery value
+contains the base configuration and helper identities, task ID, and task
+preferences. The context is the exact enclosing run context, including effective
+reviewer exclusions and task-adjusted configuration. Verification contains the
+captured ledger record and the source identity used to derive pending obligations.
+The reader validates the configuration digest, task namespace, reviewer choices,
+ledger structure and owner, source identity, and complete participating-check set.
+Resolved records require these inputs. Pending or early-invalidated attempts may
+lack them, but cannot satisfy the gate. Live execution rejects a changed ledger
+generation or obligation identity; satisfying a captured obligation does not
+invalidate that same run. Every retry captures a new input in a new check run.
+
+## SubmissionWarnings
+
+Source: [checks/planned/submission.rs](../../../rust/forge/crates/forge-harness/src/checks/planned/submission.rs).
+
+`DeclarationDesign.submission_warnings` is an optional advisory record. When
+present, it requires `document_version`, `plan_inputs`, `source_snapshot`,
+`inputs`, and `warnings`. `inputs` retains the discovery configuration (including
+helper digests), task ID, and task overrides. Each warning requires `file`,
+`name`, `change`, a positive authored `line`, and `message`. Missing record fields,
+empty identities, duplicate entries, and warnings for new tests are rejected.
+The containing plan revision owns the record; `plan_inputs` binds its locations
+to the submitted test artifact and reviewer selections.
+
+The plan-open and plan-update responses expose this record as
+`submission_warnings`, alongside `submission_warning_status`. The transient status
+has `kind: matched`, `kind: stale` with a `reason`, or `kind: unavailable` with a
+`reason`; null means no comparison is available. A matched status describes the
+comparison at review opening or update. It is not execution evidence. Rendering
+also detects edited artifacts before attaching retained line locations.
+
+The submission-warning addition first used disposable state version 40 and plan
+schema version 19; it is also present in the newer versions described above.
+
 ## CheckCommand
+
+`CheckPurpose` is defined in `checks/model.rs` and belongs to each admitted
+command. Definitions have no purpose field. Internal custom-runner records
+require `CheckOperation.prepare`; authored configuration retains its optional
+`action.prepare` flag, defaulting to false. Admission derives custom-command
+purpose from that flag and adapter-command purpose from the selected operation.
+Current-version records with the removed definition field or a missing internal
+preparation flag are rejected.
 
 Source: [checks/model.rs](../../../rust/forge/crates/forge-harness/src/checks/model.rs).
 
@@ -1411,6 +1470,11 @@ Source: [checks/model.rs](../../../rust/forge/crates/forge-harness/src/checks/mo
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Retains configured identity, requested coverage, and the handler's resolved coverage.
 pub struct CheckCommand {
+    /// Record whether this invocation verifies inputs or prepares changed source.
+    pub purpose: super::CheckPurpose,
+    /// Retain source snapshots even when preparation fails or is interrupted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<PreparationSnapshot>,
     #[serde(default)]
     /// Configured operation before named inputs resolve.
     pub operation: Option<super::CheckOperation>,
@@ -1430,7 +1494,6 @@ pub struct CheckCommand {
     pub selection: super::CheckSelection,
     pub resolved: Option<super::CheckSelection>,
     pub depends_on: Vec<String>,
-    pub receipt: PathBuf,
 }
 ```
 
@@ -1439,7 +1502,8 @@ pub struct CheckCommand {
 Source: [checks/model.rs](../../../rust/forge/crates/forge-harness/src/checks/model.rs).
 
 ```rust
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "RawCheckRunContext")]
 /// Freezes project configuration and user overrides independently from the design document.
 pub struct CheckRunContext {
     #[serde(default)]
@@ -1449,13 +1513,17 @@ pub struct CheckRunContext {
     pub task_id: Option<String>,
     pub snapshot: super::ConfigSnapshot,
     pub overrides: BTreeMap<String, bool>,
+    /// Task settings captured before reviewer exclusions are applied.
+    pub(crate) task_overrides: super::CheckOverrides,
     /// Complete task-relative path changes used to evaluate all check triggers.
     pub changed_files: Vec<String>,
-    #[serde(default)]
-    /// Accepted plan cases available independently of explicit input overrides.
-    pub planned_cases: Vec<super::CheckCase>,
 }
 ```
+
+`CheckRunContext` rejects unknown fields, including removed `planned_cases`.
+Decoding validates captured task scopes and reapplies them to the authored
+configuration snapshot. This preserves task choices such as whole-suite coverage
+across history restoration without adding them to project configuration.
 
 ## CheckEvent
 

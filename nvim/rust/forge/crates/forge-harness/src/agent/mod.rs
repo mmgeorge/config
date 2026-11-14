@@ -17,6 +17,7 @@ mod tool_scope;
 
 pub(crate) use activity::status as tool_activity_status;
 pub(crate) use activity::{AgentActivity, AgentToolReference};
+pub(crate) use coordinator::AgentLaunchHold;
 pub use coordinator::AgentTarget;
 pub use coordinator::{
     AgentAdmission, AgentCommand, AgentCommandSender, AgentCommit, AgentCoordinator,

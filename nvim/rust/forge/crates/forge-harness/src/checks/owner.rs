@@ -1,6 +1,6 @@
 //! Deliver scoped check requests to the exchange owner without using the caller-command FIFO.
 
-use super::{CheckRun, CheckSupervisor, PreparedCheckRun, RunRequest};
+use super::{CheckSupervisor, PreparedCheckRun, RunRequest};
 use crate::{broker::publication::SessionUpdateSink, provider::InvocationScope};
 use forge_provider_api::control::ToolCallId;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,48 @@ pub(crate) struct ToolCheckRequest {
     pub(crate) run: PreparedCheckRun,
     pub(crate) sink: Option<SessionUpdateSink>,
     pub(crate) cancelled: tokio::sync::watch::Receiver<bool>,
+    pub(crate) launch_hold: crate::agent::AgentLaunchHold,
     pub(crate) reply: oneshot::Sender<Result<String, CheckOwnerFailure>>,
+}
+
+/// Carry authenticated discovery work without creating a check-history run.
+pub(crate) struct ToolDiscoveryRequest {
+    pub(crate) scope: InvocationScope,
+    pub(crate) authority: Option<crate::tools::TaskAuthority>,
+    pub(crate) request: super::adapter::CheckDiscoverRequest,
+    pub(crate) inputs: super::discovery::DiscoveryInputs,
+    pub(crate) deadline: tokio::time::Instant,
+    pub(crate) quiescence: Option<crate::agent::AgentQuiescence>,
+    pub(crate) cancelled: tokio::sync::watch::Receiver<bool>,
+    pub(crate) reply: oneshot::Sender<Result<super::adapter::Discovery, CheckOwnerFailure>>,
+}
+
+/// Queue check execution and discovery through the same invocation admission boundary.
+pub(crate) enum PendingCheckTool {
+    Run(Box<ToolCheckRequest>),
+    Discover(Box<ToolDiscoveryRequest>),
+}
+
+impl PendingCheckTool {
+    /// Get the host-assigned invocation that must still own this request.
+    pub(crate) fn scope(&self) -> &InvocationScope {
+        match self {
+            Self::Run(request) => &request.scope,
+            Self::Discover(request) => &request.scope,
+        }
+    }
+
+    /// Reject pending work without leaving its requesting tool waiting for a response.
+    pub(crate) fn reject(self, error: CheckOwnerFailure) {
+        match self {
+            Self::Run(request) => {
+                let _ = request.reply.send(Err(error));
+            }
+            Self::Discover(request) => {
+                let _ = request.reply.send(Err(error));
+            }
+        }
+    }
 }
 
 /// Retain an automatic completion response independently of the transport request's lifetime.
@@ -58,6 +99,7 @@ pub(crate) struct CheckCompletionOutcome {
 /// Distinguish scoped tool work from owner-controlled automatic workflow requests.
 pub(crate) enum CheckOwnerEvent {
     StartTool(Box<ToolCheckRequest>),
+    Discover(Box<ToolDiscoveryRequest>),
     CancelTool {
         scope: InvocationScope,
         run_id: String,
@@ -93,6 +135,7 @@ impl CheckOwnerSender {
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
         cancelled: tokio::sync::watch::Receiver<bool>,
+        launch_hold: crate::agent::AgentLaunchHold,
     ) -> Result<String, CheckOwnerFailure> {
         let (reply, receiver) = oneshot::channel();
         self.send(CheckOwnerEvent::StartTool(Box::new(ToolCheckRequest {
@@ -103,6 +146,7 @@ impl CheckOwnerSender {
             run,
             sink,
             cancelled,
+            launch_hold,
             reply,
         })))
         .await?;
@@ -121,6 +165,33 @@ impl CheckOwnerSender {
             run_id,
             reply,
         })
+        .await?;
+        receiver.await.map_err(|_| CheckOwnerFailure::Unavailable)?
+    }
+
+    /// Await discovery while the session owner retains its worker and process lifetime.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn discover(
+        &self,
+        scope: InvocationScope,
+        authority: Option<crate::tools::TaskAuthority>,
+        request: super::adapter::CheckDiscoverRequest,
+        inputs: super::discovery::DiscoveryInputs,
+        deadline: tokio::time::Instant,
+        cancelled: tokio::sync::watch::Receiver<bool>,
+        quiescence: Option<crate::agent::AgentQuiescence>,
+    ) -> Result<super::adapter::Discovery, CheckOwnerFailure> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(CheckOwnerEvent::Discover(Box::new(ToolDiscoveryRequest {
+            scope,
+            authority,
+            request,
+            inputs,
+            deadline,
+            quiescence,
+            cancelled,
+            reply,
+        })))
         .await?;
         receiver.await.map_err(|_| CheckOwnerFailure::Unavailable)?
     }
@@ -194,13 +265,14 @@ pub(crate) struct CheckOwnerRuns {
     scopes: HashMap<String, InvocationScope>,
     admitted: HashMap<(InvocationScope, ToolCallId), (Vec<u8>, String)>,
     workers: tokio::task::JoinSet<CheckOwnerCompletion>,
+    discoveries: HashMap<String, tokio::sync::watch::Sender<bool>>,
 }
 
 /// Report actual process collection with its original invocation identity.
 pub(crate) struct CheckOwnerCompletion {
     pub(crate) scope: InvocationScope,
     pub(crate) run_id: String,
-    pub(crate) outcome: Result<CheckRun, CheckOwnerFailure>,
+    pub(crate) outcome: Result<(), CheckOwnerFailure>,
 }
 
 impl CheckOwnerRuns {
@@ -211,11 +283,96 @@ impl CheckOwnerRuns {
             scopes: HashMap::new(),
             admitted: HashMap::new(),
             workers: tokio::task::JoinSet::new(),
+            discoveries: HashMap::new(),
         }
     }
 
     /// Launch only after the owner has authenticated scope and revalidated its current resource gate.
-    pub(crate) fn start(&mut self, request: ToolCheckRequest) -> Result<(), CheckOwnerFailure> {
+    pub(crate) fn start(&mut self, request: PendingCheckTool) -> Result<(), CheckOwnerFailure> {
+        match request {
+            PendingCheckTool::Run(request) => self.run_start(*request),
+            PendingCheckTool::Discover(request) => self.discovery_start(*request),
+        }
+    }
+
+    /// Admit discovery synchronously, then retain its worker until process collection completes.
+    fn discovery_start(&mut self, request: ToolDiscoveryRequest) -> Result<(), CheckOwnerFailure> {
+        let ToolDiscoveryRequest {
+            scope,
+            authority,
+            request,
+            inputs,
+            deadline,
+            quiescence,
+            mut cancelled,
+            mut reply,
+        } = request;
+        if *cancelled.borrow() || reply.is_closed() {
+            let _ = reply.send(Err(CheckOwnerFailure::StaleScope));
+            return Ok(());
+        }
+        if request.mode == super::adapter::DiscoverMode::Exact
+            && let Some(authority) = authority
+            && let Err(error) = authority
+                .validate_scope()
+                .and_then(|()| authority.admit_mutation())
+        {
+            let _ = reply.send(Err(CheckOwnerFailure::Worker(error)));
+            return Ok(());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let reservation = match self.runner.discovery_reserve(&id, request.mode) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let _ = reply.send(Err(CheckOwnerFailure::Worker(error)));
+                return Ok(());
+            }
+        };
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        self.discoveries.insert(id.clone(), stop.clone());
+        self.scopes.insert(id.clone(), scope.clone());
+        let runner = Arc::clone(&self.runner);
+        self.workers.spawn(async move {
+            let operation = super::discovery::discover(
+                &runner,
+                inputs,
+                request,
+                deadline,
+                stopped,
+                reservation.process_owner(),
+            );
+            tokio::pin!(operation);
+            let result = tokio::select! {
+                biased;
+                _ = reply.closed() => {
+                    let _ = stop.send(true);
+                    operation.await
+                }
+                _ = async { let _ = cancelled.wait_for(|value| *value).await; } => {
+                    let _ = stop.send(true);
+                    operation.await
+                }
+                result = &mut operation => result,
+            };
+            let succeeded = result.is_ok();
+            let _ = reply.send(result.map_err(CheckOwnerFailure::Worker));
+            drop(reservation);
+            drop(quiescence);
+            CheckOwnerCompletion {
+                scope,
+                run_id: id,
+                outcome: if succeeded {
+                    Ok(())
+                } else {
+                    Err(CheckOwnerFailure::Unavailable)
+                },
+            }
+        });
+        Ok(())
+    }
+
+    /// Launch an authenticated run and retain replay evidence until its scope retires.
+    fn run_start(&mut self, request: ToolCheckRequest) -> Result<(), CheckOwnerFailure> {
         let ToolCheckRequest {
             scope,
             authority,
@@ -225,6 +382,7 @@ impl CheckOwnerRuns {
             sink,
             cancelled,
             reply,
+            launch_hold,
         } = request;
         let key = (scope.clone(), call_id.clone());
         let fingerprint = crate::codec::to_vec(&request)
@@ -250,7 +408,9 @@ impl CheckOwnerRuns {
             return Ok(());
         }
         if let Some(authority) = authority
-            && let Err(error) = authority.admit_mutation()
+            && let Err(error) = authority
+                .validate_scope()
+                .and_then(|()| authority.admit_mutation())
         {
             let _ = reply.send(Err(CheckOwnerFailure::Worker(error)));
             return Ok(());
@@ -290,8 +450,11 @@ impl CheckOwnerRuns {
                 .await
                 .map_err(|_| CheckOwnerFailure::Unavailable)
                 .and_then(|result| {
-                    result.map_err(|error| CheckOwnerFailure::Worker(anyhow::anyhow!(error)))
+                    result
+                        .map(|_| ())
+                        .map_err(|error| CheckOwnerFailure::Worker(anyhow::anyhow!(error)))
                 });
+            drop(launch_hold);
             CheckOwnerCompletion {
                 scope,
                 run_id: owned_id,
@@ -338,6 +501,10 @@ impl CheckOwnerRuns {
     /// Interrupt every retained run during owner shutdown without discarding collection futures.
     pub(crate) fn cancel_all(&self) -> Result<(), CheckOwnerFailure> {
         for run_id in self.scopes.keys() {
+            if let Some(stop) = self.discoveries.get(run_id) {
+                let _ = stop.send(true);
+                continue;
+            }
             self.runner
                 .cancel_for_collection(run_id)
                 .map_err(CheckOwnerFailure::Worker)?;
@@ -351,6 +518,13 @@ impl CheckOwnerRuns {
         scope: &InvocationScope,
     ) -> Result<(), CheckOwnerFailure> {
         if self.scopes.values().any(|active| active == scope) {
+            for (id, active) in &self.scopes {
+                if active == scope
+                    && let Some(stop) = self.discoveries.get(id)
+                {
+                    let _ = stop.send(true);
+                }
+            }
             return Err(CheckOwnerFailure::Unavailable);
         }
         self.admitted.retain(|(owner, _), _| owner != scope);
@@ -371,6 +545,7 @@ impl CheckOwnerRuns {
 
     /// Release invocation ownership only after the owner processes actual collection.
     pub(crate) fn settle(&mut self, completion: &CheckOwnerCompletion) {
+        self.discoveries.remove(&completion.run_id);
         if self.scopes.get(&completion.run_id) == Some(&completion.scope) {
             self.scopes.remove(&completion.run_id);
         }

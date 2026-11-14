@@ -1,0 +1,132 @@
+{
+  "recorded_at": "2026-11-13T10:24:43.659417200-08:00",
+  "platform": {
+    "name": "windows",
+    "arch": "x86_64",
+    "family": "windows",
+    "kernel_version": "26300"
+  },
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "normalization": "Only scratch workspace path replaced with /nextest-fixture; all other native output retained.",
+  "environment": {
+    "NEXTEST_EXPERIMENTAL_LIBTEST_JSON": "1"
+  },
+  "recordings": [
+    {
+      "name": "version",
+      "command": [
+        "cargo",
+        "nextest",
+        "--version"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "list",
+      "command": [
+        "cargo",
+        "nextest",
+        "list",
+        "--workspace",
+        "--cargo-profile",
+        "dev",
+        "--profile",
+        "default",
+        "--locked",
+        "--offline",
+        "-E",
+        "all()",
+        "--message-format",
+        "json"
+      ],
+      "exit_code": 0
+    },
+    {
+      "name": "run",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--cargo-profile",
+        "dev",
+        "--profile",
+        "default",
+        "--locked",
+        "--offline",
+        "-E",
+        "all()",
+        "--message-format",
+        "libtest-json-plus",
+        "--message-format-version",
+        "0.1",
+        "--no-fail-fast",
+        "--retries",
+        "0"
+      ],
+      "exit_code": 100
+    },
+    {
+      "name": "format-rejected",
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--workspace",
+        "--cargo-profile",
+        "dev",
+        "--profile",
+        "default",
+        "--locked",
+        "--offline",
+        "-E",
+        "all()",
+        "--message-format",
+        "libtest-json-plus",
+        "--message-format-version",
+        "999.0"
+      ],
+      "exit_code": 96
+    },
+    {
+      "name": "compile-error",
+      "command": [
+        "cargo",
+        "nextest",
+        "list",
+        "--workspace",
+        "--cargo-profile",
+        "dev",
+        "--profile",
+        "default",
+        "--locked",
+        "--offline",
+        "-E",
+        "all()",
+        "--message-format",
+        "json"
+      ],
+      "exit_code": 101
+    },
+    {
+      "name": "version-rejected",
+      "command": [
+        "cargo",
+        "nextest",
+        "list",
+        "--workspace",
+        "--cargo-profile",
+        "dev",
+        "--profile",
+        "default",
+        "--locked",
+        "--offline",
+        "-E",
+        "all()",
+        "--message-format",
+        "json"
+      ],
+      "exit_code": 92
+    }
+  ]
+}

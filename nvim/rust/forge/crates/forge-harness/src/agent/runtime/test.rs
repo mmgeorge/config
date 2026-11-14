@@ -28,6 +28,7 @@ async fn committed_child_file_change_survives_native_error() -> Result<()> {
                 completion
                     .host_file_changes
                     .push(crate::tools::lsp::HostFileChange {
+                        reservation: None,
                         scope: request.scope.clone(),
                         call_id: forge_provider_api::control::ToolCallId::new("committed-call")
                             .unwrap(),
@@ -60,7 +61,8 @@ async fn committed_child_file_change_survives_native_error() -> Result<()> {
     let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
     let coordinator = crate::agent::AgentCoordinator::new("session".into());
     let (_cancel, cancellation) = watch::channel(false);
-    let owner = ThreadOwner::new("session".into(), forge_provider_api::AgentId::new("child")?)?;
+    let admitted = crate::agent::coordinator_test::admit(&coordinator, "child-operation", "child");
+    let owner = admitted.owner().clone();
     AgentRuntime {
         execution_registry: Arc::new(
             crate::provider::session_execution::SessionExecutionRegistry::new(
@@ -96,7 +98,7 @@ async fn committed_child_file_change_survives_native_error() -> Result<()> {
             control_context: Some(context),
             child_agent: None,
         },
-        task_id: "child-task".into(),
+        task_id: admitted.task.id.clone(),
         cancellation,
         sender: coordinator.sender(),
         lsp_lease: None,
@@ -120,7 +122,7 @@ async fn committed_child_file_change_survives_native_error() -> Result<()> {
     assert!(output.is_err());
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].scope.owner(), owner);
-    assert_eq!(changes[0].scope.exchange_id.as_str(), "child-task");
+    assert_eq!(changes[0].scope.exchange_id.as_str(), admitted.task.id);
     assert_eq!(changes[0].call_id.as_str(), "committed-call");
     assert!(changes[0].native_item_id.is_none());
     assert_eq!(std::fs::read_to_string(path)?, "new");

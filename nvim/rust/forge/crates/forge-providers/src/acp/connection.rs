@@ -100,6 +100,7 @@ pub trait AcpHandler: Send + Sync {
 
 /// Supplies resolved launch settings without owning host configuration or permissions.
 pub struct AcpLaunch<'a> {
+    pub process_owner: Option<Arc<dyn forge_shell::process::ProcessOwner>>,
     pub command: &'a [String],
     pub environment: &'a BTreeMap<String, String>,
     pub workspace: &'a str,
@@ -205,7 +206,11 @@ fn spawn_provider_process(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    forge_shell::process::spawn_owned(command).map_err(|source| AcpConnectionError::Process {
+    match &launch.process_owner {
+        Some(owner) => owner.spawn(command),
+        None => forge_shell::process::spawn_owned(command),
+    }
+    .map_err(|source| AcpConnectionError::Process {
         operation: "launch ACP provider",
         source,
     })

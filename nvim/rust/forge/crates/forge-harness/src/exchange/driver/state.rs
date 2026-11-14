@@ -61,7 +61,7 @@ pub(super) struct DriverState {
     /// The invocation whose tool checks the driver currently admits.
     pub(super) check_scope: Option<crate::provider::InvocationScope>,
     /// Tool check requests waiting for admission.
-    pub(super) pending_check_tools: VecDeque<crate::checks::owner::ToolCheckRequest>,
+    pub(super) pending_check_tools: VecDeque<crate::checks::owner::PendingCheckTool>,
     // Tool-started runs outlive the provider turn that requested them, so their progress and
     // configuration errors publish through this owner-lifetime stream rather than the turn sink.
     /// The sink tool-started check runs publish through.

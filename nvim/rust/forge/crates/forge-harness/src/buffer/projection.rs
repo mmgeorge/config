@@ -40,6 +40,12 @@ pub enum TranscriptAction {
     File {
         path: String,
         line: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<usize>,
+    },
+    Quickfix {
+        title: String,
+        items: Vec<QuickfixItem>,
     },
     Declaration {
         plan_id: String,
@@ -62,6 +68,16 @@ pub enum TranscriptAction {
     Url {
         url: String,
     },
+}
+
+/// Preserve diagnostic locations and severity for the editor's quickfix list.
+#[derive(Clone, Debug, Serialize)]
+pub struct QuickfixItem {
+    pub path: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub message: String,
+    pub severity: crate::checks::adapter::events::Severity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -857,6 +873,7 @@ impl TimelineRenderer<'_> {
                             TranscriptAction::Tool { .. }
                                 | TranscriptAction::Diff { .. }
                                 | TranscriptAction::File { .. }
+                                | TranscriptAction::Quickfix { .. }
                                 | TranscriptAction::Url { .. }
                                 | TranscriptAction::Session { .. }
                         )
@@ -2077,6 +2094,7 @@ impl TimelineRenderer<'_> {
                         Some(TranscriptAction::File {
                             path: read.path.clone(),
                             line: 1,
+                            column: None,
                         }),
                     )?;
                 }

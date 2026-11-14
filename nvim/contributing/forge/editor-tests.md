@@ -67,18 +67,18 @@ A file that must reload itself in a fresh editor starts a child with `MiniTest.n
 
 ## Suites
 
-The `lua-test` check passes the changed paths to the runner's `--affected` selection, which maps them to tests. A changed test file runs itself; a changed Lua source file runs its mirrored unit test and its integration area, the nearest mirrored integration directory of the file or an ancestor; a source file with no area runs its plugin's whole test directory; and any other change, including a change under `tests/` or to the runner, runs every test. With no changed paths, such as a run with `all`, it runs every test. The `lua-test-select` check passes its `tests` array to the runner as positional arguments, so it accepts every selection form listed below.
+The `lua-test` adapter accepts discovered test IDs or affected repository paths. A changed test file runs itself; a changed Lua source file selects its mirrored unit test and its integration area, the nearest mirrored integration directory of the file or an ancestor; a source file with no area selects its plugin's whole test directory. Shared runner changes can select every test. An empty or invalid targeted selection does not expand to the whole suite; request `all: true` explicitly when full coverage is needed.
 
 ## Run a fixture
 
-`.forge/checks/lua-tests.nu` is the only way to run Lua tests, both inside Harness, where the `lua-test` and `lua-test-select` checks call it, and outside. The runner clones the pinned mini.test commit once into a commit-named directory beside the Nushell cache. It runs every unit shard and every integration case in its own fresh Neovim from the repository root: `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" --cmd "set rtp^=<mini.test>" -l nvim/lua/forge/tests/support/minitest_shard.lua <file> [case]`. The shard bootstrap arms a five-second deadline for each case as it starts and exits with status 124 naming the hung case, so a timeout ends the shard and later cases in a unit file do not run. The runner kills the whole process tree, including any Forge host, of a single-case process still running one second past that deadline, and of a unit shard still running after one minute. It runs processes in parallel, by default on a sixth of the logical CPUs, because host tests contend for process launches and `git`.
+`.forge/checks/lua-tests.nu` is the only way to run Lua tests, both inside Harness, where the `lua-test` adapter calls it, and outside. The runner clones the pinned mini.test commit once into a commit-named directory beside the Nushell cache. It runs every unit shard and every integration case in its own fresh Neovim from the repository root: `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" --cmd "set rtp^=<mini.test>" -l nvim/lua/forge/tests/support/minitest_shard.lua <file> [case]`. The shard bootstrap arms a five-second deadline for each case as it starts and exits with status 124 naming the hung case, so a timeout ends the shard and later cases in a unit file do not run. The runner kills the whole process tree, including any Forge host, of a single-case process still running one second past that deadline, and of a unit shard still running after one minute. It runs processes in parallel, by default on a sixth of the logical CPUs, because host tests contend for process launches and `git`.
 
 Inside Harness, select tests through the check:
 
 ```text
-check_run({"check":"lua-test-select","inputs":{"tests":["nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"]}})
-check_run({"check":"lua-test-select","inputs":{"tests":["client::admission_queue"]}})
-check_run({"check":"lua-test-select","inputs":{"tests":["nvim/lua/forge/lsp"]}})
+check_discover({"check":"lua-test","mode":"static"})
+check_run({"check":"lua-test","tests":{"ids":["<ID returned by discovery>"]}})
+check_run({"check":"lua-test","tests":{"affected":["nvim/lua/forge/lsp"]}})
 ```
 
 Select a whole source directory only when the area needs full coverage.

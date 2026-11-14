@@ -290,11 +290,21 @@ impl ExchangeDriver {
                     if request.sink.is_some() {
                         request.sink = Some(tool_check_sink.clone());
                     }
-                    pending_check_tools.push_back(request);
+                    pending_check_tools.push_back(crate::checks::owner::PendingCheckTool::Run(
+                        Box::new(request),
+                    ));
                 } else {
                     let _ = request
                         .reply
                         .send(Err(crate::checks::owner::CheckOwnerFailure::Unavailable));
+                }
+            }
+            Some(crate::checks::owner::CheckOwnerEvent::Discover(request)) => {
+                let request = crate::checks::owner::PendingCheckTool::Discover(request);
+                if pending_check_tools.len() < OWNER_QUEUE_CAPACITY {
+                    pending_check_tools.push_back(request);
+                } else {
+                    request.reject(crate::checks::owner::CheckOwnerFailure::Unavailable);
                 }
             }
             Some(crate::checks::owner::CheckOwnerEvent::CancelTool {

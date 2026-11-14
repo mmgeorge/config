@@ -4,6 +4,7 @@ local picker = require("forge.views.picker")
 local field = require("forge.views.picker.field")
 local notifications = require("forge.infra.notifications")
 local owner = "forge-harness-checks"
+local category_priority = { typecheck = 0, test = 1, format = 2, lint = 3, build = 4, custom = 5 }
 
 ---@class ForgeCheckDefinition
 ---@field id string
@@ -14,7 +15,7 @@ local owner = "forge-harness-checks"
 ---@field area string
 ---@field trigger {auto?: boolean, paths?: string[], exclude?: string[]}
 ---@field directory string
----@field action {command: string|string[], inputs?: table<string, {type: string, description: string, required?: boolean, default?: any, source?: string}>, input?: boolean, directory?: string, after?: string[]}
+---@field action {command?: string|string[], adapter?: table, inputs?: table<string, {type: string, description: string, required?: boolean, default?: any, source?: string}>, input?: boolean, directory?: string, after?: string[]}
 ---@field depends_on string[]
 
 ---@class ForgeCheckCatalog
@@ -92,14 +93,24 @@ function Checks.open(state, host)
       local action = specification.action
       local trigger = specification.trigger or {}
       if type(trigger) ~= "table" then return nil, "Invalid check " .. id .. ": expected a trigger object" end
-      if type(action.command) ~= "string" and type(action.command) ~= "table" then
-        return nil, "Invalid check " .. id .. ": expected an action command"
+      local has_command, has_adapter = action.command ~= nil, action.adapter ~= nil
+      if has_command == has_adapter then
+        return nil, "Invalid check " .. id .. ": expected exactly one command or adapter"
       end
-      if type(action.command) == "table" then
+      if has_adapter and (type(action.adapter) ~= "table" or vim.tbl_count(action.adapter) ~= 1) then
+        return nil, "Invalid check " .. id .. ": expected one adapter configuration"
+      end
+      if has_command and type(action.command) ~= "string" and type(action.command) ~= "table" then
+        return nil, "Invalid check " .. id .. ": expected a command string or arguments"
+      end
+      if has_command and type(action.command) == "table" then
         if #action.command == 0 then return nil, "Invalid check " .. id .. ": empty action command" end
         for _, argument in ipairs(action.command) do
           if type(argument) ~= "string" then return nil, "Invalid check " .. id .. ": expected string command arguments" end
         end
+      end
+      if category_priority[action.category] == nil then
+        return nil, "Invalid check " .. id .. ": expected typecheck, test, format, lint, build, or custom category"
       end
       for _, property in ipairs({ "label", "category", "directory" }) do
         if action[property] ~= nil and type(action[property]) ~= "string" then
@@ -116,16 +127,15 @@ function Checks.open(state, host)
         if type(dependency) ~= "string" then return nil, "Invalid check " .. id .. ": expected prerequisite names" end
       end
       source[#source + 1] = {
-        id = id, name = action.label or id, category = action.category or "check",
+        id = id, name = action.label or id, category = action.category,
         directory = action.directory or ".", area = action.directory or ".",
         auto = trigger.auto == true, enabled = true,
         trigger = trigger, action = action, depends_on = action.after or {},
       }
     end
-    local category_priority = { format = 0, lint = 1, check = 1, test = 2, build = 3 }
     table.sort(source, function(left, right)
-      local left_priority = category_priority[left.category] or 1
-      local right_priority = category_priority[right.category] or 1
+      local left_priority = category_priority[left.category]
+      local right_priority = category_priority[right.category]
       if left_priority ~= right_priority then return left_priority < right_priority end
       return left.id < right.id
     end)
@@ -196,8 +206,9 @@ function Checks.open(state, host)
 
   local function details(check)
     local command = check.action.command
-    local result = { "Directory: " .. check.directory,
-      "Action: " .. (type(command) == "table" and table.concat(vim.tbl_map(vim.json.encode, command), " ") or command) }
+    local action = check.action.adapter and ("Adapter: " .. vim.json.encode(check.action.adapter))
+      or ("Action: " .. (type(command) == "table" and table.concat(vim.tbl_map(vim.json.encode, command), " ") or command))
+    local result = { "Directory: " .. check.directory, action }
     result[#result + 1] = "Prerequisites: " .. (#(check.depends_on or {}) > 0 and table.concat(check.depends_on, ", ") or "None")
     result[#result + 1] = "Trigger: " .. vim.json.encode(check.trigger)
     result[#result + 1] = "Area: " .. check.area

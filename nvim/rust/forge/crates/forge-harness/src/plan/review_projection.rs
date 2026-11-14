@@ -47,6 +47,11 @@ pub(super) fn update_tests(
         .as_ref()
         .context("test edit has no design")?;
     let (mut replacement, navigation) = super::design_review::test_inventory(design)?;
+    super::design_review::update_warning_status(
+        &mut replacement,
+        design,
+        source.warning_status.as_ref(),
+    )?;
     for (index, row) in replacement.iter_mut().enumerate() {
         if let Some(anchor) = navigation
             .iter()
@@ -92,6 +97,7 @@ pub(crate) fn project(
             &source.document,
             width,
             crate::plan::design_review::ReviewAnnotationView {
+                warning_status: source.warning_status.as_ref(),
                 annotation,
                 revision,
                 focused,

@@ -183,6 +183,7 @@ pub(super) async fn execute(
     let publication = runtime.context.provider_completion.clone();
     let live = runtime.context.live_host_effects.clone();
     let observed = runtime.context.observed_file_changes.clone();
+    let repository_scope = runtime.context.repository_access.clone();
     let live_scope = original_scope.clone();
     let live_call = call_id.clone();
     // The worker owns both guards: dropping the provider future cannot release buffers during a write.
@@ -192,13 +193,18 @@ pub(super) async fn execute(
             move || -> Result<(String, crate::provider::HostEffectBatch)> {
                 let _guard = guard;
                 let mut hold = hold;
-                let mut transaction =
-                    super::transaction::Transaction::prepare(&scope, &policy, prepared)?;
+                let mut transaction = super::transaction::Transaction::prepare(
+                    &scope,
+                    &policy,
+                    prepared,
+                    repository_scope.as_ref(),
+                )?;
                 scope.check().map_err(MutationError::Service)?;
                 transaction.commit()?;
                 hold.committed = true;
                 let mut completion = crate::provider::ProviderCompletion::default();
                 completion.host_file_changes.push(super::HostFileChange {
+                    reservation: Some(transaction.reservation()),
                     scope: original_scope,
                     call_id,
                     native_item_id: None,

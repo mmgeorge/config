@@ -384,6 +384,35 @@ impl ExchangeDriver {
                         *command = Some(ActiveCommand::Task(run));
                     }
                     Ok(TaskCommandProgress::Finished { outcome, events }) => {
+                        // Check-only resume has no provider-input handoff to reopen the queue.
+                        if matches!(
+                            &outcome,
+                            Ok(crate::exchange::command::TaskCommandOutcome::Resumed { .. })
+                        ) && matches!(
+                            run.checkpoint(),
+                            Some(crate::exchange::command::TaskCommandCheckpoint::Control { .. })
+                        ) {
+                            match services.input.suspend(false, Some(id.as_str())) {
+                                Ok(update) => publish_input_observation(
+                                    update,
+                                    command_messages.as_ref(),
+                                    services,
+                                    trace,
+                                    session_id,
+                                    step,
+                                ),
+                                Err(_) => {
+                                    self.commands.uncommitted(
+                                        run.command,
+                                        CommandJournalError::DomainCommit,
+                                        trace,
+                                        session_id,
+                                        step,
+                                    );
+                                    return WakeEnd::RestartStep;
+                                }
+                            }
+                        }
                         // A failed creation cannot become an implicit readiness retry after releasing its command slot.
                         if outcome.is_err()
                             && matches!(

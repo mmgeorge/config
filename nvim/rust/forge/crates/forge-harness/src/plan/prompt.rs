@@ -240,6 +240,24 @@ pub(crate) fn check_edits(enabled: &std::collections::BTreeMap<String, bool>) ->
         .collect()
 }
 
+/// Record reviewer coverage changes in the next planning or implementation instructions.
+pub(crate) fn test_scope_edits(
+    scopes: &std::collections::BTreeMap<String, super::PlanTestScope>,
+) -> Vec<PlanEdit> {
+    scopes
+        .iter()
+        .map(|(id, scope)| PlanEdit::SetTestScope {
+            id: id.clone(),
+            scope: match scope {
+                super::PlanTestScope::Planned => forge_provider_api::forge::PlanTestScope::Planned,
+                super::PlanTestScope::WholeSuite => {
+                    forge_provider_api::forge::PlanTestScope::WholeSuite
+                }
+            },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

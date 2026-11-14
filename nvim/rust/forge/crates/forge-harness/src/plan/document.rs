@@ -768,7 +768,7 @@ pub struct PlanTask {
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 15;
+pub const PLAN_SCHEMA_VERSION: u32 = 24;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

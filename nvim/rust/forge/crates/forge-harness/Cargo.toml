@@ -17,8 +17,10 @@ forge-protocol = { workspace = true }
 forge-providers = { workspace = true }
 forge-shell = { workspace = true }
 futures-util = { workspace = true }
+glob = { workspace = true }
 hex = { workspace = true }
 jsonschema = { workspace = true }
+nextest-metadata = { workspace = true }
 process-wrap = { workspace = true, features = ["tokio1", "job-object", "kill-on-drop", "process-group", "creation-flags"] }
 regex = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled"] }
@@ -35,12 +37,15 @@ similar = { workspace = true }
 spdx = { workspace = true }
 stacker = { workspace = true }
 strip-ansi-escapes = { workspace = true }
+syn = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { workspace = true, features = ["compat"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 
@@ -49,7 +54,6 @@ forge-git = { workspace = true, features = ["test-fixtures"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
-tree-sitter = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 junction = { workspace = true }

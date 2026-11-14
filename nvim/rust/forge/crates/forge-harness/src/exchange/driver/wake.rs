@@ -70,6 +70,7 @@ impl ExchangeDriver {
                     .await
             }
             DriverWake::Event(wake) => {
+                let wake = *wake;
                 self.event_wake(env, state, step, foreground_status, closed, wake)
                     .await
             }
@@ -314,7 +315,7 @@ impl ExchangeDriver {
                         None => std::future::pending().await,
                     }
                 } => DriverWake::AutomaticRepair(repaired),
-                event = self.receiver.recv(), if !closed && pending.len() < OWNER_QUEUE_CAPACITY => DriverWake::Event(event),
+                event = self.receiver.recv(), if !closed && pending.len() < OWNER_QUEUE_CAPACITY => DriverWake::Event(Box::new(event)),
                 signal = async {
                     match foreground.as_mut() {
                         Some(runtime) => runtime.next().await,

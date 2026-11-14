@@ -17,7 +17,7 @@ pub(crate) struct ForegroundFinalization {
     goal_terminal_pending: bool,
     goal_continuing: bool,
     goal_request_rejected: bool,
-    phase_checkpoint: Option<crate::checkpoint::CheckpointRecord>,
+    phase_checkpoint: Option<execution::ReservedWorkspace>,
     pub(crate) goal_waiting_questions: bool,
     checks: Option<check_admission::AutomaticCheckTransaction>,
     check_result: Option<(Value, Vec<SessionEvent>)>,
@@ -1302,6 +1302,11 @@ impl HarnessBroker {
             }
         }
         transaction.pending_execution_phase = None;
+        transaction
+            .finalization
+            .as_mut()
+            .context("finalization envelope is missing")?
+            .phase_checkpoint = None;
         let finalization = transaction
             .finalization
             .as_mut()
@@ -2393,7 +2398,7 @@ impl HarnessBroker {
     ) -> Result<ForegroundAction> {
         use crate::provider::session_execution::HostEffectOutput;
         let foreground_goal_effect::GoalProgressResult {
-            checkpoint,
+            workspace,
             changed,
             previous_id,
             permit,
@@ -2417,7 +2422,7 @@ impl HarnessBroker {
             evidence_permit,
             turn,
             staged.output.goal_control.as_ref(),
-            Some((checkpoint, previous_id)),
+            Some((&workspace, previous_id)),
             &mut events,
         )?;
         let id = interaction::goal_evidence_id(staged)?;

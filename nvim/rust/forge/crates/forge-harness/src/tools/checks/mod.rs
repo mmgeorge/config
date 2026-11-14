@@ -4,6 +4,7 @@ mod definition_details;
 mod definition_edit;
 mod definition_list;
 mod detail;
+mod discover;
 mod list;
 mod run;
 mod status;

@@ -1,9 +1,6 @@
 use super::model::{CheckCommand, CheckEventKind, CheckRunContext, PreparedCheckRun};
 use super::publication::{CheckNotification, CheckPublication};
-use super::{
-    CheckCase, CheckDefinition, CheckReceipt, CheckRun, CheckSelection, CheckState, CommandCheck,
-    ConfigSnapshot, RunRequest,
-};
+use super::{CheckRun, CheckSelection, CheckState, CommandCheck, ConfigSnapshot, RunRequest};
 use crate::{
     broker::publication::{SessionUpdate, SessionUpdateSink},
     buffer::session::SessionPresentation,
@@ -19,7 +16,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const CHECK_HISTORY_VERSION: u32 = 5;
+const CHECK_HISTORY_VERSION: u32 = 23;
 
 /// Binds check history to one session, workspace, and storage location.
 pub struct CheckSupervisorContext {
@@ -29,9 +26,46 @@ pub struct CheckSupervisorContext {
     pub root: PathBuf,
 }
 
-struct CheckPublicationTarget<'target> {
+#[derive(Clone, Copy)]
+struct CheckExecutionContext<'target> {
     sink: Option<&'target SessionUpdateSink>,
     publication: &'target CheckPublication,
+    deadline: Option<CheckDeadline>,
+    planned_inputs: Option<&'target super::discovery::DiscoveryInputs>,
+    process_owner: &'target Arc<dyn forge_shell::process::ProcessOwner>,
+}
+
+/// Bound a planned run from admission through its final source validation.
+#[derive(Clone, Copy)]
+pub(crate) struct CheckDeadline {
+    at: tokio::time::Instant,
+    timeout: std::time::Duration,
+}
+
+impl CheckDeadline {
+    /// Create an absolute budget that subprocesses cannot renew.
+    fn new(timeout: std::time::Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + timeout,
+            timeout,
+        }
+    }
+
+    /// Get the shared expiration for discovery and adapter processes.
+    pub(super) fn instant(self) -> tokio::time::Instant {
+        self.at
+    }
+
+    /// Reject further work or successful completion after the captured budget expires.
+    pub(crate) fn check(self) -> Result<()> {
+        if tokio::time::Instant::now() >= self.at {
+            return Err(super::failure::CheckFailure::classified(
+                CheckState::Failed,
+                CommandTimeout(self.timeout),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Owns project check admission, durable run history, and process cancellation for one session.
@@ -43,6 +77,7 @@ pub struct CheckSupervisor {
     pub(super) changes: super::changes::CheckChanges,
     presentation: Arc<Mutex<SessionPresentation>>,
     state: Mutex<CheckStateStore>,
+    pub(super) verification: Mutex<super::verification::VerificationRequirements>,
     notification: OnceLock<CheckNotification>,
     owner: OnceLock<super::owner::CheckOwnerSender>,
     trace: Arc<crate::trace::TraceStore>,
@@ -62,6 +97,7 @@ pub(crate) struct CheckSnapshot {
 struct CheckStateStore {
     records: BTreeMap<String, CheckRun>,
     active: Option<ActiveCheck>,
+    discovery: Option<String>,
     task: BTreeMap<String, tokio::task::JoinHandle<()>>,
     notified: std::collections::BTreeSet<String>,
 }
@@ -71,13 +107,42 @@ struct ActiveCheck {
     cancellation: Arc<CheckCancellation>,
 }
 
+/// Release exclusive discovery admission only after its worker has collected every process.
+pub(super) struct DiscoveryReservation {
+    supervisor: Arc<CheckSupervisor>,
+    id: String,
+    _workspace: Option<super::reservation::CheckReservation>,
+}
+
+impl Drop for DiscoveryReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.supervisor.state.lock()
+            && state.discovery.as_ref() == Some(&self.id)
+        {
+            state.discovery = None;
+        }
+    }
+}
+
+impl DiscoveryReservation {
+    /// Keep exact discovery's source reservation alive through native collection.
+    pub(super) fn process_owner(&self) -> Option<Arc<dyn forge_shell::process::ProcessOwner>> {
+        self._workspace
+            .as_ref()
+            .map(super::reservation::CheckReservation::process_owner)
+    }
+}
+
 struct AdmittedCheckRun {
     run: PreparedCheckRun,
     cancellation: Arc<CheckCancellation>,
+    deadline: Option<CheckDeadline>,
+    planned_inputs: Option<super::discovery::DiscoveryInputs>,
     _parent_permit: Option<crate::command::ExecutionPermit>,
+    _workspace: super::reservation::CheckReservation,
 }
 
-struct CheckCancellation {
+pub(super) struct CheckCancellation {
     requested: Arc<AtomicBool>,
     changed: tokio::sync::Notify,
 }
@@ -88,7 +153,7 @@ impl CheckCancellation {
         self.changed.notify_waiters();
     }
 
-    async fn wait(&self, external: Option<tokio::sync::watch::Receiver<bool>>) {
+    pub(super) async fn wait(&self, external: Option<tokio::sync::watch::Receiver<bool>>) {
         let local = async {
             loop {
                 let changed = self.changed.notified();
@@ -130,7 +195,7 @@ struct CheckProcess {
     collected: bool,
 }
 
-/// Stops a check run when a shell command exceeds its captured execution deadline.
+/// Stop a check run when its captured execution deadline expires.
 #[derive(Debug)]
 struct CommandTimeout(std::time::Duration);
 
@@ -138,7 +203,7 @@ impl std::fmt::Display for CommandTimeout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Shell command exceeded its {} second timeout; check execution stopped",
+            "Check execution exceeded its {} second timeout; check execution stopped",
             self.0.as_secs()
         )
     }
@@ -179,12 +244,10 @@ pub(crate) struct CheckAdmission {
     pub owner: crate::timeline::TimelineOwner,
     pub request: RunRequest,
     pub overrides: BTreeMap<String, bool>,
+    /// Task settings before any reviewer exclusions are merged into enabled selections.
+    pub task_overrides: super::CheckOverrides,
     /// None means the task has no complete change inventory.
     pub files: Option<Vec<String>>,
-    /// Distinguishes an accepted empty case inventory from unavailable standalone discovery.
-    pub cases: Option<Vec<CheckCase>>,
-    /// Newly added cases only, distinct from new and modified inventory.
-    pub new_cases: Option<Vec<CheckCase>>,
     pub has_scope: bool,
     pub shell: crate::session::CheckShell,
     pub trigger: String,
@@ -193,6 +256,41 @@ pub(crate) struct CheckAdmission {
 }
 
 impl CheckSupervisor {
+    /// Keep completion scheduling active until existing mutation obligations can be inspected.
+    pub(crate) fn has_verification_requirements(&self) -> Result<bool> {
+        Ok(self
+            .verification
+            .lock()
+            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+            .has_requirements())
+    }
+
+    /// Check mandatory verification against the same source capture used by completion.
+    pub(crate) fn verification_satisfied(
+        &self,
+        snapshot: &crate::checkpoint::CheckpointRecord,
+    ) -> Result<bool> {
+        if !self.has_verification_requirements()? {
+            return Ok(true);
+        }
+        let config = ConfigSnapshot::load(&self.workspace)?;
+        Ok(self
+            .verification
+            .lock()
+            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+            .pending_for_config(snapshot, &config)?
+            .is_empty())
+    }
+
+    /// Recheck mutation obligations against fresh source after a completion check run.
+    pub(crate) async fn completion_verification_satisfied(&self) -> Result<bool> {
+        if !self.has_verification_requirements()? {
+            return Ok(true);
+        }
+        let snapshot = self.changes.capture(&self.session_id).await?;
+        self.verification_satisfied(&snapshot)
+    }
+
     pub(crate) fn session_owner(&self) -> crate::timeline::TimelineOwner {
         crate::timeline::TimelineOwner::session(&self.session_id)
     }
@@ -229,7 +327,15 @@ impl CheckSupervisor {
             root,
         } = scope;
         std::fs::create_dir_all(&root)?;
-        let changes = super::changes::CheckChanges::open(&workspace, &root, objects, repositories)?;
+        let changes = super::changes::CheckChanges::open(
+            &workspace,
+            &data_root,
+            &root,
+            objects,
+            repositories,
+        )?;
+        let verification =
+            super::verification::VerificationRequirements::open(&root, &workspace, &session_id)?;
         let mut records = BTreeMap::new();
         for mut run in Self::saved_history(&root)? {
             ensure!(
@@ -260,10 +366,12 @@ impl CheckSupervisor {
             workspace,
             root,
             changes,
+            verification: Mutex::new(verification),
             presentation,
             state: Mutex::new(CheckStateStore {
                 records,
                 active: None,
+                discovery: None,
                 task: BTreeMap::new(),
                 notified: Default::default(),
             }),
@@ -349,6 +457,37 @@ impl CheckSupervisor {
             .active
             .as_ref()
             .map(|active| active.run_id.clone()))
+    }
+
+    /// Reserve discovery atomically against both other discoveries and check runs.
+    pub(super) fn discovery_reserve(
+        self: &Arc<Self>,
+        id: &str,
+        mode: super::adapter::DiscoverMode,
+    ) -> Result<DiscoveryReservation> {
+        let workspace = match mode {
+            super::adapter::DiscoverMode::Static => None,
+            super::adapter::DiscoverMode::Exact => {
+                Some(super::reservation::CheckReservation::acquire(
+                    &self.workspace,
+                    super::CheckPurpose::Verify,
+                )?)
+            }
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        ensure!(
+            state.active.is_none() && state.discovery.is_none(),
+            "another check operation is already active"
+        );
+        state.discovery = Some(id.to_owned());
+        Ok(DiscoveryReservation {
+            supervisor: Arc::clone(self),
+            id: id.to_owned(),
+            _workspace: workspace,
+        })
     }
 
     /// Reads admission and its current record under one state lock.
@@ -502,9 +641,8 @@ impl CheckSupervisor {
             owner,
             request,
             overrides,
+            task_overrides,
             files,
-            cases,
-            new_cases,
             has_scope,
             shell,
             trigger,
@@ -516,6 +654,30 @@ impl CheckSupervisor {
             "check ownership crosses sessions"
         );
         let mut effective = snapshot.config.clone();
+        if request.purpose == super::CheckPurpose::Prepare {
+            ensure!(
+                !request.ids.is_empty(),
+                "apply requires explicitly named checks"
+            );
+            ensure!(
+                request.include.is_empty(),
+                "apply requires explicitly named checks without automatic inclusions"
+            );
+            for id in &request.ids {
+                let definition = effective
+                    .definitions
+                    .iter()
+                    .find(|definition| &definition.id == id)
+                    .with_context(|| format!("Unknown check: {id}"))?;
+                ensure!(
+                    matches!(
+                        definition.category,
+                        super::CheckCategory::Format | super::CheckCategory::Lint
+                    ) && matches!(definition.runner, super::CheckRunner::Adapter(_)),
+                    "{id} cannot apply fixes; only format and lint adapters support apply"
+                );
+            }
+        }
         for definition in &mut effective.definitions {
             if let Some(enabled) = overrides.get(&definition.id) {
                 definition.enabled = *enabled;
@@ -533,8 +695,8 @@ impl CheckSupervisor {
                 task_id,
                 snapshot,
                 overrides,
+                task_overrides,
                 changed_files: files.clone().unwrap_or_default(),
-                planned_cases: cases.clone().unwrap_or_default(),
             },
             lifecycle: Vec::new(),
             completed_plan: None,
@@ -557,6 +719,7 @@ impl CheckSupervisor {
             cancelled_run_id: None,
             state: CheckState::Running,
             progress: Default::default(),
+            planned_tests: None,
             workspace_identity: None,
             workspace_digest: BTreeMap::new(),
             commands: Vec::new(),
@@ -583,12 +746,32 @@ impl CheckSupervisor {
             effective_request.selections(
                 &effective,
                 files.as_deref().unwrap_or_default(),
-                cases.as_deref(),
-                new_cases.as_deref(),
                 has_scope,
             )?
         };
-        for index in effective.order_selected(&requested)? {
+        let purposes: BTreeMap<_, _> = effective
+            .definitions
+            .iter()
+            .map(|definition| {
+                let purpose = if request.purpose == super::CheckPurpose::Prepare
+                    && request.ids.contains(&definition.id)
+                {
+                    super::CheckPurpose::Prepare
+                } else {
+                    definition
+                        .runner
+                        .command()
+                        .map_or(super::CheckPurpose::Verify, super::CheckOperation::purpose)
+                };
+                (definition.id.clone(), purpose)
+            })
+            .collect();
+        let preparing = requested
+            .iter()
+            .filter(|id| purposes[*id] == super::CheckPurpose::Prepare)
+            .cloned()
+            .collect();
+        for index in effective.order_preparing(&preparing)? {
             let definition = &effective.definitions[index];
             let applicability = &applicability[index];
             ensure!(
@@ -600,7 +783,10 @@ impl CheckSupervisor {
                 definition.id
             );
             let selection = selections.get(&definition.id).cloned().unwrap_or_default();
-            let operation = operation(definition, &selection);
+            let empty_default = !request.is_all()
+                && !request.selections.contains_key(&definition.id)
+                && selection.default_empty();
+            let operation = definition.runner.command();
             let (state, error) = if !definition.enabled {
                 (CheckState::Skipped, Some("Disabled for this task".into()))
             } else if !applicability.selected {
@@ -613,30 +799,13 @@ impl CheckSupervisor {
                             .into(),
                     ),
                 )
-            } else if selection.empty()
-                && matches!(selection, CheckSelection::Cases { .. })
-                && (if definition.scope == super::CheckScope::NewCases {
-                    new_cases.is_none()
-                } else {
-                    cases.is_none()
-                })
-            {
-                (CheckState::ConfigurationError, Some("Plan case inventory is unavailable outside plan execution. Supply declared inputs or explicitly select full context.".into()))
-            } else if selection.empty() && files.is_none() && has_scope {
+            } else if empty_default && files.is_none() && has_scope {
                 (CheckState::ConfigurationError, Some("Task change inventory is unavailable. Supply declared inputs or explicitly select full context.".into()))
-            } else if selection.empty() {
-                (
-                    CheckState::Skipped,
-                    Some(
-                        if definition.scope == super::CheckScope::NewCases {
-                            "No new tests in the accepted plan"
-                        } else {
-                            "No matching task changes"
-                        }
-                        .into(),
-                    ),
-                )
-            } else if operation.is_none() {
+            } else if empty_default {
+                (CheckState::Skipped, Some("No matching task changes".into()))
+            } else if operation.is_none()
+                && matches!(definition.runner, super::CheckRunner::Command(_))
+            {
                 (
                     CheckState::ConfigurationError,
                     Some("Requested scope is unsupported. Enable /checks edit on and request a correction in chat.".into()),
@@ -650,8 +819,10 @@ impl CheckSupervisor {
                 evidence: None,
                 reused_from: None,
                 id: format!("{id}:{position}"),
-                command: operation.unwrap_or(&definition.all).display(),
+                command: definition.runner.display(),
                 context: CheckCommand {
+                    purpose: purposes[&definition.id],
+                    preparation: None,
                     operation: operation.cloned(),
                     invocation: None,
                     definition_id: definition.id.clone(),
@@ -664,7 +835,6 @@ impl CheckSupervisor {
                     selection,
                     resolved: None,
                     depends_on: definition.depends_on.clone(),
-                    receipt: directory.join(format!("{position}.selection.json")),
                 },
                 state,
                 started_at_ms: None,
@@ -676,7 +846,8 @@ impl CheckSupervisor {
                 output: directory.join(format!("{position}.output")),
                 output_bytes: 0,
                 preview: String::new(),
-                report: None,
+                result: None,
+                adapter_progress: None,
             });
         }
         run.record(
@@ -684,13 +855,84 @@ impl CheckSupervisor {
             None,
             format!("Checks started · {} selected", requested.len()),
         );
+        if request.purpose == super::CheckPurpose::Prepare {
+            ensure!(
+                run.commands.iter().all(|command| !command.selected
+                    || request.ids.contains(&command.context.definition_id)
+                    || command.context.purpose == super::CheckPurpose::Verify),
+                "apply cannot launch a source-changing prerequisite"
+            );
+            for command in &run.commands {
+                ensure!(
+                    !command.selected || command.state != CheckState::ConfigurationError,
+                    "{}: {}",
+                    command.context.definition_id,
+                    command
+                        .error
+                        .as_deref()
+                        .unwrap_or("invalid apply selection")
+                );
+            }
+        }
         Ok(run)
+    }
+
+    /// Preserve an admitted plan attempt's identity while resolving its scanned selection.
+    pub(crate) fn continue_attempt(
+        &self,
+        previous: &CheckRun,
+        mut prepared: PreparedCheckRun,
+    ) -> Result<PreparedCheckRun> {
+        let context = previous
+            .context
+            .as_ref()
+            .context("admitted check context is missing")?;
+        ensure!(
+            previous.state == CheckState::Running
+                && previous.planned_tests.is_some()
+                && previous
+                    .commands
+                    .iter()
+                    .all(|command| command.started_at_ms.is_none())
+                && previous.owner == prepared.owner
+                && previous.revision == prepared.revision
+                && context.task_id == prepared.context.task_id
+                && context.snapshot == prepared.context.snapshot
+                && context.overrides == prepared.context.overrides
+                && context.task_overrides == prepared.context.task_overrides
+                && previous.workspace == prepared.workspace
+                && previous.shell == prepared.shell,
+            "initial scan cannot replace an admitted check attempt"
+        );
+        prepared.id = previous.id.clone();
+        prepared.started_at_ms = previous.started_at_ms;
+        prepared.lifecycle = previous.lifecycle.clone();
+        let directory = self.root.join(&prepared.id);
+        for (position, command) in prepared.commands.iter_mut().enumerate() {
+            command.id = format!("{}:{position}", prepared.id);
+            command.stdout = directory.join(format!("{position}.stdout"));
+            command.stderr = directory.join(format!("{position}.stderr"));
+            command.output = directory.join(format!("{position}.output"));
+        }
+        Ok(prepared)
+    }
+
+    /// Capture the configured budget before a plan's first scan begins.
+    pub(crate) fn plan_deadline(&self) -> Result<CheckDeadline> {
+        self.execution_timeout().map(CheckDeadline::new)
     }
 
     /// Freezes declared inputs before review, authorization, or process admission.
     pub(crate) async fn resolve(&self, mut run: PreparedCheckRun) -> Result<PreparedCheckRun> {
+        if run.context.automatic && self.has_verification_requirements()? {
+            let snapshot = self.changes.capture(&self.session_id).await?;
+            super::discovery::DiscoveryInputs::for_run(self, &run)?;
+            self.verification
+                .lock()
+                .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                .require_in_run(&mut run, &snapshot)?;
+        }
         let mut commands = Vec::new();
-        let planned_cases = run.context.planned_cases.clone();
         for mut check in std::mem::take(&mut run.commands) {
             let context = check.context.clone();
             if check.state != CheckState::Pending || context.invocation.is_some() {
@@ -707,7 +949,6 @@ impl CheckSupervisor {
                 operation,
                 &context.selection,
                 &context.matched_files,
-                &planned_cases,
             ) {
                 Ok(invocations) => {
                     ensure!(
@@ -726,17 +967,6 @@ impl CheckSupervisor {
                             context.matched_files = invocation.files.clone();
                             context.reason = format!("Changed: {}", invocation.files.join(", "));
                         }
-                        if !invocation.cases.is_empty() {
-                            context.reason = format!(
-                                "Selected plan tests: {}",
-                                invocation
-                                    .cases
-                                    .iter()
-                                    .map(|case| case.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
                         context.invocation = Some(invocation);
                         commands.push((expanded, context));
                     }
@@ -748,13 +978,12 @@ impl CheckSupervisor {
                 }
             }
         }
-        for (position, (check, context)) in commands.iter_mut().enumerate() {
+        for (position, (check, _)) in commands.iter_mut().enumerate() {
             check.id = format!("{}:{position}", run.id);
             let directory = self.root.join(&run.id);
             check.stdout = directory.join(format!("{position}.stdout"));
             check.stderr = directory.join(format!("{position}.stderr"));
             check.output = directory.join(format!("{position}.output"));
-            context.receipt = directory.join(format!("{position}.selection.json"));
         }
         run.commands = commands
             .into_iter()
@@ -772,8 +1001,11 @@ impl CheckSupervisor {
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
         external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+        deadline: Option<CheckDeadline>,
     ) -> Result<CheckRun> {
-        let (_, completed) = self.launch(run, sink, external_cancelled, None).await?;
+        let (_, completed) = self
+            .launch(run, sink, external_cancelled, None, deadline)
+            .await?;
         completed
             .await
             .context("check worker did not report completion")?
@@ -822,15 +1054,47 @@ impl CheckSupervisor {
         &self,
         run: PreparedCheckRun,
         admission: Option<crate::command::ExecutionPermit>,
+        deadline: Option<CheckDeadline>,
     ) -> Result<AdmittedCheckRun> {
         self.validate_owner(&run.clone().into_record())?;
+        let deadline = match deadline {
+            Some(deadline) => {
+                ensure!(
+                    run.planned_tests.is_some(),
+                    "a captured deadline requires a planned check attempt"
+                );
+                deadline.check()?;
+                Some(deadline)
+            }
+            None => run
+                .planned_tests
+                .as_ref()
+                .map(|_| self.plan_deadline())
+                .transpose()?,
+        };
+        let planned_inputs = run
+            .planned_tests
+            .as_ref()
+            .map(|_| super::discovery::DiscoveryInputs::for_run(self, &run))
+            .transpose()?;
+        let purpose = if run.commands.iter().any(|command| {
+            command.selected && command.context.purpose == super::CheckPurpose::Prepare
+        }) {
+            super::CheckPurpose::Prepare
+        } else {
+            super::CheckPurpose::Verify
+        };
+        let workspace = super::reservation::CheckReservation::acquire(&self.workspace, purpose)?;
+        if purpose == super::CheckPurpose::Prepare {
+            super::discovery::DiscoveryInputs::for_run(self, &run)?;
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
         ensure!(
-            state.active.is_none(),
-            "another check run is already active"
+            state.active.is_none() && state.discovery.is_none(),
+            "another check operation is already active"
         );
         ensure!(
             !state.task.contains_key(&run.id),
@@ -850,7 +1114,10 @@ impl CheckSupervisor {
         Ok(AdmittedCheckRun {
             run,
             cancellation: cancelled,
+            deadline,
+            planned_inputs,
             _parent_permit: admission,
+            _workspace: workspace,
         })
     }
 
@@ -891,7 +1158,7 @@ impl CheckSupervisor {
                 if matches!(command.state, CheckState::Passed | CheckState::Failed)
                     && let Some(evidence) = &command.evidence
                     && let Some(checkpoint) = checkpoint
-                    && evidence.covers(run, check, checkpoint)?
+                    && evidence.matches_inputs(run, check, checkpoint)?
                 {
                     return Ok(None);
                 }
@@ -905,7 +1172,7 @@ impl CheckSupervisor {
                             command,
                             cancelled.clone(),
                             cancelled,
-                        )? && evidence.covers(run, check, checkpoint)?
+                        )? && evidence.matches_inputs(run, check, checkpoint)?
                         {
                             return Ok(Some(previous.id.clone()));
                         }
@@ -933,37 +1200,69 @@ impl CheckSupervisor {
         let AdmittedCheckRun {
             mut run,
             cancellation: cancelled,
+            deadline,
+            planned_inputs,
             _parent_permit,
+            _workspace,
         } = admitted;
         let publication = CheckPublication::new(
             self.root.join(&run.id).join("record.json"),
             &run.clone().into_record(),
         );
+        let process_owner = _workspace.process_owner();
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(self.run_inner(
             &mut run,
-            sink.as_ref(),
-            &publication,
+            CheckExecutionContext {
+                sink: sink.as_ref(),
+                publication: &publication,
+                deadline,
+                planned_inputs: planned_inputs.as_ref(),
+                process_owner: &process_owner,
+            },
             &cancelled,
             external_cancelled.as_ref(),
         ))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("check worker panicked")));
+        if let Some(planned) = &mut run.planned_tests {
+            planned.record_results(&run.commands);
+        }
+        if run.commands.iter().any(|command| {
+            command.selected && command.context.purpose == super::CheckPurpose::Prepare
+        }) {
+            for command in &mut run.commands {
+                if command.state == CheckState::Pending {
+                    command.state = CheckState::Skipped;
+                    command.error = Some(match &result {
+                        Err(error) => format!("Not started: {error:#}"),
+                        Ok(()) => "Not started: source-changing batch stopped".into(),
+                    });
+                }
+            }
+        }
         drop(_parent_permit);
         if let Err(error) = &result {
-            run.state = CheckState::ExecutionError;
+            run.state = super::failure::classify(error, CheckState::ExecutionError);
             for command in &mut run.commands {
                 if command.state == CheckState::Running {
-                    command.state = CheckState::ExecutionError;
+                    command.state = run.state;
                     command.completed_at_ms = Some(now_ms());
                     command.error = Some(format!("{error:#}"));
+                } else if command.state == CheckState::Pending {
+                    command.state = CheckState::Skipped;
+                    command.error = Some(format!("Not started: {error:#}"));
                 }
             }
             run.record(
-                CheckEventKind::ExecutionError,
+                if run.state == CheckState::Failed {
+                    CheckEventKind::Finished
+                } else {
+                    CheckEventKind::ExecutionError
+                },
                 None,
-                format!("Check execution error: {error:#}"),
+                format!("Check execution stopped: {error:#}"),
             );
         }
         if run.state != CheckState::Interrupted {
@@ -973,6 +1272,13 @@ impl CheckSupervisor {
         // Save before publishing the terminal state, so the editor sees one terminal outcome
         // instead of a result that a failed save later replaces.
         let saved = publication.finish(&run.clone().into_record()).await;
+        match &saved {
+            Ok(()) => _workspace.published()?,
+            Err(error) => _workspace.unresolved(format!(
+                "check {} history could not be saved: {error:#}",
+                run.id
+            ))?,
+        }
         if let Err(error) = &saved {
             run.state = CheckState::ExecutionError;
             run.record(
@@ -983,21 +1289,103 @@ impl CheckSupervisor {
         }
         self.update(&run.clone().into_record(), sink.as_ref())?;
         saved?;
-        result?;
+        // A deadline is a retained failed check, so the plan owner must receive its run.
+        if let Err(error) = result
+            && run.state != CheckState::Failed
+        {
+            return Err(error);
+        }
         Ok(run.into_record())
     }
 
     async fn run_inner(
         &self,
         run: &mut PreparedCheckRun,
-        sink: Option<&SessionUpdateSink>,
-        publication: &CheckPublication,
+        execution: CheckExecutionContext<'_>,
         cancelled: &Arc<CheckCancellation>,
         external_cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<()> {
+        let CheckExecutionContext {
+            sink,
+            publication,
+            deadline,
+            planned_inputs,
+            process_owner,
+        } = execution;
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
         self.update(&run.clone().into_record(), sink)?;
         publication.update(&run.clone().into_record());
+        if run.planned_tests.is_some() {
+            super::planned::resolve_run(
+                self,
+                run,
+                deadline.context("planned run deadline missing")?,
+                planned_inputs.context("planned discovery inputs missing")?,
+                cancelled,
+                external_cancelled,
+                process_owner,
+            )
+            .await?;
+            if run.state == CheckState::Interrupted {
+                return Ok(());
+            }
+            if run
+                .planned_tests
+                .as_ref()
+                .is_some_and(|planned| !planned.resolved())
+            {
+                for command in &mut run.commands {
+                    if command.state == CheckState::Pending {
+                        command.state = CheckState::Skipped;
+                        command.error = Some("Not started: planned tests did not resolve".into());
+                    }
+                }
+                run.state = CheckState::Failed;
+                return Ok(());
+            }
+            // Mandatory verification takes precedence over the plan's case selections and exclusions.
+            if self.has_verification_requirements()? {
+                let snapshot = self.changes.capture(&self.session_id).await?;
+                self.verification
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                    .require_in_run(run, &snapshot)?;
+            }
+        }
+        let applying = run.commands.iter().any(|command| {
+            command.selected
+                && command.context.purpose == super::CheckPurpose::Prepare
+                && matches!(
+                    command.context.category,
+                    super::CheckCategory::Format | super::CheckCategory::Lint
+                )
+        });
         for index in 0..run.commands.len() {
+            if let Some(inputs) = planned_inputs {
+                super::planned::validate_inputs(self, run, inputs)?;
+            }
+            if let Some(deadline) = deadline {
+                deadline.check()?;
+            }
+            if applying
+                && let Some(previous) = run.commands[..index]
+                    .iter()
+                    .find(|command| command.selected && command.state != CheckState::Passed)
+            {
+                let reason = format!(
+                    "Not started: earlier operation {} ended {:?}",
+                    previous.context.definition_id, previous.state
+                );
+                for command in run.commands.iter_mut().skip(index) {
+                    if command.state == CheckState::Pending {
+                        command.state = CheckState::Skipped;
+                        command.error = Some(reason.clone());
+                    }
+                }
+                break;
+            }
             if cancelled.requested.load(Ordering::Acquire)
                 || external_cancelled.is_some_and(|value| *value.borrow())
             {
@@ -1060,15 +1448,33 @@ impl CheckSupervisor {
                 CheckState::Passed | CheckState::Failed => continue,
                 _ => {}
             }
+            let preparing = context.purpose == super::CheckPurpose::Prepare;
+            if applying {
+                super::discovery::DiscoveryInputs::for_run(self, run)?;
+            }
+            let verification_capture = self
+                .verification
+                .lock()
+                .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                .capture();
             let Some(before) = cancelled
-                .read(external_cancelled, self.changes.snapshot())
+                .read(external_cancelled, async {
+                    if preparing {
+                        self.changes.capture(&self.session_id).await.map(Some)
+                    } else {
+                        self.changes.snapshot().await
+                    }
+                })
                 .await?
             else {
                 run.interrupt();
                 return Ok(());
             };
             run.cancelled_inputs = before.clone();
+            // A resumed plan Check owns fresh case outcomes; ordinary automatic checks retain
+            // cancellation suppression and evidence reuse for unchanged inputs.
             if run.context.automatic
+                && run.planned_tests.is_none()
                 && let Some(previous) = self.cancelled_attempt(
                     &run.clone().into_record(),
                     &run.commands[index].clone().into_record(),
@@ -1088,6 +1494,7 @@ impl CheckSupervisor {
                 continue;
             }
             if run.context.automatic
+                && run.planned_tests.is_none()
                 && let Some(checkpoint) = before.as_ref()
                 && let Some((run_id, previous)) = self.evidence(
                     &run.clone().into_record(),
@@ -1106,7 +1513,8 @@ impl CheckSupervisor {
                 command.output = previous.output;
                 command.output_bytes = previous.output_bytes;
                 command.preview = previous.preview;
-                command.report = previous.report;
+                command.result = previous.result;
+                command.adapter_progress = previous.adapter_progress;
                 context.resolved = previous.context.and_then(|context| context.resolved);
                 command.context = context.clone();
                 run.record(
@@ -1118,6 +1526,60 @@ impl CheckSupervisor {
                 publication.update(&run.clone().into_record());
                 continue;
             }
+            if let Some(deadline) = deadline {
+                deadline.check()?;
+            }
+            if let Some(inputs) = planned_inputs {
+                super::planned::validate_inputs(self, run, inputs)?;
+            }
+            let mut mutation = None;
+            if preparing {
+                context.preparation = Some(super::model::PreparationSnapshot::Started {
+                    before: Box::new(before.clone().context("preparation snapshot missing")?),
+                });
+                run.commands[index].context = context.clone();
+                if let Err(error) = publication.persist(&run.clone().into_record()).await {
+                    run.commands[index].state = CheckState::ExecutionError;
+                    run.commands[index].error = Some(format!(
+                        "preparation did not start because its source snapshot could not be saved: {error:#}"
+                    ));
+                    return Err(error.context("persist source before preparation"));
+                }
+                if matches!(
+                    context.category,
+                    super::CheckCategory::Format | super::CheckCategory::Lint
+                ) {
+                    mutation = Some(
+                        self.verification
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                            .prepare(
+                                &run.clone().into_record(),
+                                &run.commands[index].clone().into_record(),
+                            )?,
+                    );
+                }
+                if cancelled.requested.load(Ordering::Acquire)
+                    || external_cancelled.is_some_and(|value| *value.borrow())
+                {
+                    if let Some(preparation) = mutation.take() {
+                        self.verification
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                            .retire_unlaunched(preparation)?;
+                    }
+                    run.interrupt();
+                    return Ok(());
+                }
+            }
+            let mutation = mutation
+                .map(|preparation| {
+                    self.verification
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                        .launch(preparation)
+                })
+                .transpose()?;
             run.commands[index].state = CheckState::Running;
             run.commands[index].started_at_ms = Some(now_ms());
             run.record(
@@ -1127,48 +1589,126 @@ impl CheckSupervisor {
             );
             self.update(&run.clone().into_record(), sink)?;
             publication.update(&run.clone().into_record());
-            if let Err(error) = self
+            let execution_result = self
                 .execute(
                     run,
                     index,
                     context.clone(),
-                    CheckPublicationTarget { sink, publication },
+                    execution,
                     cancelled,
                     external_cancelled,
                 )
-                .await
-            {
-                if error.is::<CommandTimeout>() {
-                    return Err(error);
-                }
+                .await;
+            if let Err(error) = &execution_result {
                 run.commands[index].state = if cancelled.requested.load(Ordering::Acquire)
                     || external_cancelled.is_some_and(|value| *value.borrow())
                 {
                     CheckState::Interrupted
                 } else {
-                    super::failure::classify(&error, CheckState::ExecutionError)
+                    super::failure::classify(error, CheckState::ExecutionError)
                 };
                 run.commands[index].error = Some(format!("{error:#}"));
             }
             run.commands[index].completed_at_ms = Some(now_ms());
+            // Collection has finished. Caller cancellation must not erase partial source edits.
+            let preparation_after = if preparing {
+                let before = before.clone().context("preparation snapshot missing")?;
+                match self.changes.capture(&self.session_id).await {
+                    Ok(after) => {
+                        run.commands[index].context.preparation =
+                            Some(super::model::PreparationSnapshot::Captured {
+                                before: Box::new(before),
+                                after: Box::new(after.clone()),
+                            });
+                        Some(after)
+                    }
+                    Err(error) => {
+                        let capture_error = format!("capture source after preparation: {error:#}");
+                        run.commands[index].context.preparation =
+                            Some(super::model::PreparationSnapshot::Unknown {
+                                before: Box::new(before),
+                                error: format!("{error:#}"),
+                            });
+                        let command = &mut run.commands[index];
+                        command.state = CheckState::ExecutionError;
+                        command.error = Some(match command.error.take() {
+                            Some(previous) => format!("{previous}\n{capture_error}"),
+                            None => capture_error,
+                        });
+                        return Err(error.context("capture source after preparation"));
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(mutation) = mutation {
+                // Store the collected result and after-snapshot before retiring its obligation.
+                publication.persist(&run.clone().into_record()).await?;
+                self.verification
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                    .retire_unsupported(
+                        mutation,
+                        &run.commands[index].clone().into_record(),
+                        before.as_ref().context("preparation snapshot missing")?,
+                        preparation_after
+                            .as_ref()
+                            .context("preparation snapshot missing")?,
+                    )?;
+            }
+            if let Err(error) = execution_result
+                && error.is::<CommandTimeout>()
+            {
+                return Err(error);
+            }
+            if let Some(deadline) = deadline {
+                deadline.check()?;
+            }
             if matches!(
                 run.commands[index].state,
                 CheckState::Passed | CheckState::Failed
             ) {
-                let Some(after) = cancelled
-                    .read(external_cancelled, self.changes.snapshot())
-                    .await?
-                else {
-                    run.interrupt();
-                    return Ok(());
+                let after = if let Some(after) = preparation_after {
+                    Some(after)
+                } else {
+                    let Some(after) = cancelled
+                        .read(external_cancelled, self.changes.snapshot())
+                        .await?
+                    else {
+                        run.interrupt();
+                        return Ok(());
+                    };
+                    after
                 };
                 if let (Some(before), Some(after)) = (before, after) {
+                    if let Some(deadline) = deadline {
+                        deadline.check()?;
+                    }
                     run.commands[index].evidence = super::evidence::CheckEvidence::capture(
                         &run.clone().into_record(),
                         &run.commands[index].clone().into_record(),
-                        before,
+                        before.clone(),
                         &after,
                     )?;
+                    if !preparing {
+                        publication.persist(&run.clone().into_record()).await?;
+                        if let Some(deadline) = deadline {
+                            deadline.check()?;
+                        }
+                        if self.has_verification_requirements()? {
+                            super::discovery::DiscoveryInputs::for_run(self, run)?;
+                        }
+                        self.verification
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                            .observe(
+                                verification_capture,
+                                &run.clone().into_record(),
+                                &run.commands[index].clone().into_record(),
+                                &before,
+                                &after,
+                            )?;
+                    }
                 }
             }
             let check = &run.commands[index];
@@ -1195,6 +1735,27 @@ impl CheckSupervisor {
                 run.interrupt();
                 return Ok(());
             }
+            if preparing && run.commands[index].state != CheckState::Passed {
+                for command in run.commands.iter_mut().skip(index + 1) {
+                    if command.state == CheckState::Pending {
+                        command.state = CheckState::Skipped;
+                        command.error =
+                            Some("Not started: an earlier source-changing operation failed".into());
+                    }
+                }
+                break;
+            }
+        }
+        if run.planned_tests.is_some() {
+            super::planned::finish_run(
+                self,
+                run,
+                planned_inputs.context("planned discovery inputs missing")?,
+            )
+            .await?;
+        }
+        if let Some(deadline) = deadline {
+            deadline.check()?;
         }
         run.completed_at_ms = Some(now_ms());
         run.state = if run
@@ -1231,6 +1792,10 @@ impl CheckSupervisor {
             .commands
             .iter()
             .any(|check| check.state == CheckState::Failed)
+            || run
+                .planned_tests
+                .as_ref()
+                .is_some_and(|planned| !planned.satisfied())
         {
             CheckState::Failed
         } else if run
@@ -1254,16 +1819,33 @@ impl CheckSupervisor {
         Ok(())
     }
 
+    /// Load the configured tool budget before admitting or launching execution.
+    fn execution_timeout(&self) -> Result<std::time::Duration> {
+        Ok(crate::settings::SettingsStore::open(&self.data_root)?
+            .get(&self.workspace.to_string_lossy(), &self.session_id, "")?
+            .desired
+            .tool_timeout
+            .unwrap_or_default()
+            .require_expiry()?
+            .duration())
+    }
+
     async fn execute(
         &self,
         run: &mut PreparedCheckRun,
         index: usize,
         context: super::model::CheckCommand,
-        target: CheckPublicationTarget<'_>,
+        target: CheckExecutionContext<'_>,
         cancelled: &Arc<CheckCancellation>,
         external_cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<()> {
-        let CheckPublicationTarget { sink, publication } = target;
+        let CheckExecutionContext {
+            sink,
+            publication,
+            deadline,
+            planned_inputs: _,
+            process_owner: _,
+        } = target;
         let directory = self
             .workspace
             .join(super::config::relative_path(&context.directory)?)
@@ -1273,36 +1855,40 @@ impl CheckSupervisor {
             directory.starts_with(self.workspace.canonicalize()?),
             "check directory escapes the project"
         );
+        let adapter = run
+            .context
+            .snapshot
+            .config
+            .definitions
+            .iter()
+            .find(|definition| definition.id == context.definition_id)
+            .and_then(|definition| match &definition.runner {
+                super::CheckRunner::Adapter(adapter) => Some(adapter.clone()),
+                super::CheckRunner::Command(_) => None,
+            });
+        if let Some(adapter) = adapter {
+            return self
+                .execute_adapter(
+                    run,
+                    index,
+                    context,
+                    &directory,
+                    adapter,
+                    target,
+                    cancelled,
+                    external_cancelled,
+                )
+                .await;
+        }
         let direct = context.invocation.as_ref().filter(|_| {
             context
                 .operation
                 .as_ref()
                 .is_some_and(|operation| operation.args.is_some())
         });
-        let input = super::supervisor::operation(
-            run.context
-                .snapshot
-                .config
-                .definitions
-                .iter()
-                .find(|definition| definition.id == context.definition_id)
-                .context("check definition unavailable")?,
-            &context.selection,
-        )
-        .is_some_and(|operation| operation.input);
-        let scoped = input;
-        let source = if scoped && run.shell == crate::session::CheckShell::Nushell {
-            format!("$in | {}", run.commands[index].command)
-        } else {
-            run.commands[index].command.clone()
-        };
         let mut command = if let Some(invocation) = direct {
             let mut command = crate::process::command(&invocation.program, &invocation.args);
-            command.stdin(if scoped {
-                std::process::Stdio::piped()
-            } else {
-                std::process::Stdio::null()
-            });
+            command.stdin(std::process::Stdio::null());
             command
         } else {
             let executable = run.executable.as_ref().ok_or_else(|| {
@@ -1311,57 +1897,30 @@ impl CheckSupervisor {
                     anyhow::anyhow!("configured check shell is unavailable"),
                 )
             })?;
-            run.shell.command(executable, &source, scoped)?
+            run.shell
+                .command(executable, &run.commands[index].command, false)?
         };
         command
             .current_dir(&directory)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let timeout = crate::settings::SettingsStore::open(&self.data_root)?
-            .get(&self.workspace.to_string_lossy(), &self.session_id, "")?
-            .desired
-            .tool_timeout
-            .unwrap_or_default()
-            .require_expiry()?
-            .duration();
-        let mut child = crate::process::spawn_owned(command)
+        let deadline = match deadline {
+            Some(deadline) => deadline,
+            None => CheckDeadline::new(self.execution_timeout()?),
+        };
+        deadline.check()?;
+        let process_owner = target.process_owner.clone();
+        let mut child = process_owner
+            .spawn(command)
             .map_err(super::failure::CheckFailure::launch)
             .context("start configured check")?;
-        let deadline = tokio::time::Instant::now() + timeout;
-        let input = if scoped {
-            Some(
-                child
-                    .stdin()
-                    .take()
-                    .context("scoped check stdin unavailable")?,
-            )
-        } else {
-            None
-        };
-        let request = serde_json::to_vec(&serde_json::json!({
-            "version":1,
-            "check_id":context.definition_id,
-            "workspace":self.workspace,
-            "inputs":context.invocation.as_ref().map(|invocation| &invocation.inputs),
-            "selection":context.selection,
-            "changed_files":context.matched_files,
-            "receipt_path":context.receipt,
-            "report_path":context.receipt.with_extension("report.json")
-        }))?;
-        let input_delivery = async move {
-            if let Some(mut input) = input {
-                input.write_all(&request).await?;
-                input.shutdown().await?;
-            }
-            Ok::<_, std::io::Error>(())
-        };
-        tokio::pin!(input_delivery);
         let mut stdout = child.stdout().take().context("check stdout unavailable")?;
         let mut stderr = child.stderr().take().context("check stderr unavailable")?;
         let process_cancelled = Arc::clone(cancelled);
         let process_external = external_cancelled.cloned();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(async move {
+            let _process_owner = process_owner;
             let cancelled = async {
                 tokio::select! {
                     _ = process_cancelled.wait(process_external) => {},
@@ -1392,14 +1951,9 @@ impl CheckSupervisor {
             let mut stderr_done = false;
             let mut status = None;
             let mut killed = false;
-            let mut input_done = !scoped;
             let mut publication_deadline = None;
-            while !stdout_done || !stderr_done || status.is_none() || !input_done {
+            while !stdout_done || !stderr_done || status.is_none() {
                 tokio::select! {
-                    result = &mut input_delivery, if !input_done => {
-                        input_done = true;
-                        if !killed {result.context("deliver scoped selectors")?;}
-                    },
                     result = stdout.read(&mut stdout_buffer), if !stdout_done => {
                         let bytes = result?; stdout_done = bytes == 0;
                         if bytes > 0 { stdout_file.write_all(&stdout_buffer[..bytes]).await?; output.write_all(&stdout_buffer[..bytes]).await?;
@@ -1434,21 +1988,32 @@ impl CheckSupervisor {
             stdout_file.flush().await?;
             stderr_file.flush().await?;
             let status = status.context("check process status missing")?;
-            self.finish_command(
-                run,
-                index,
-                context,
-                scoped,
-                status.code(),
-                status.success(),
-                killed,
-            )
-            .await
+            let command = &mut run.commands[index];
+            command.exit_code = status.code();
+            command.state = if killed {
+                CheckState::Interrupted
+            } else if status.success() {
+                CheckState::Passed
+            } else {
+                CheckState::Failed
+            };
+            command.context = context;
+            if !killed && status.success() {
+                command.context.resolved = Some(command.context.selection.clone());
+            }
+            Ok(())
         };
         let result = tokio::select! {
             biased;
             result = result => result,
-            () = tokio::time::sleep_until(deadline) => Err(CommandTimeout(timeout).into()),
+            () = tokio::time::sleep_until(deadline.instant()) => {
+                let timeout = CommandTimeout(deadline.timeout);
+                Err(if target.deadline.is_some() {
+                    super::failure::CheckFailure::classified(CheckState::Failed, timeout)
+                } else {
+                    timeout.into()
+                })
+            },
         };
         if result.is_err() {
             process.stop().await?;
@@ -1456,69 +2021,302 @@ impl CheckSupervisor {
         result
     }
 
-    /// Classify a finished command and collect its selection receipt and result report.
+    /// Execute an adapter with the command's cancellation, deadline, and publication ownership.
     #[allow(clippy::too_many_arguments)]
-    async fn finish_command(
+    async fn execute_adapter(
         &self,
         run: &mut PreparedCheckRun,
         index: usize,
         mut context: super::model::CheckCommand,
-        scoped: bool,
-        exit_code: Option<i32>,
-        success: bool,
-        killed: bool,
+        directory: &Path,
+        config: super::adapter::AdapterConfig,
+        target: CheckExecutionContext<'_>,
+        cancelled: &Arc<CheckCancellation>,
+        external_cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<()> {
-        run.commands[index].exit_code = exit_code;
-        run.commands[index].state = if killed {
-            CheckState::Interrupted
-        } else if success {
-            CheckState::Passed
-        } else {
-            CheckState::Failed
+        use super::adapter::{
+            AdapterContext, AdapterError, AdapterProcesses, AdapterProgress, AdapterResult,
+            CategoryAdapter,
         };
-        if scoped && !killed && success {
-            let receipt = (|| -> Result<CheckReceipt> {
-                let source = std::fs::read(&context.receipt).context(
-                    "scoped check did not produce a selection receipt; fix its definition",
+        let adapter = config.build(context.category)?;
+        let deadline = match target.deadline {
+            Some(deadline) => deadline,
+            None => CheckDeadline::new(self.execution_timeout()?),
+        };
+        deadline.check()?;
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let processes = AdapterProcesses::new(
+            receiver,
+            deadline.instant(),
+            run.commands[index].output.clone(),
+        )
+        .owner_bind(Some(target.process_owner.clone()));
+        let scratch = run.commands[index].output.with_extension("adapter");
+        let workspace = self.workspace.canonicalize()?;
+        let adapter_context = AdapterContext {
+            workspace: &workspace,
+            directory,
+            processes: &processes,
+            scratch: &scratch,
+        };
+        match adapter {
+            CategoryAdapter::Test(adapter) => {
+                let resolved = match &context.selection {
+                    CheckSelection::All => Ok(super::adapter::TestSelection::default()),
+                    CheckSelection::Tests { tests } => Ok(tests.clone()),
+                    CheckSelection::Files { .. }
+                    | CheckSelection::Paths { .. }
+                    | CheckSelection::Inputs { .. } => Err(AdapterError::Selection(
+                        "test adapter requires test IDs, affected paths, or all".into(),
+                    )),
+                };
+                let selection = resolved.as_ref().cloned().unwrap_or_default();
+                let mut events = super::adapter::events::TestEventSink::new(
+                    selection.clone(),
+                    &scratch.join("cases"),
                 )?;
-                let mut receipt: CheckReceipt =
-                    serde_json::from_slice(&source).context("invalid selection receipt")?;
-                receipt.validate_request(&context.selection)?;
-                Ok(receipt)
-            })()
-            .map_err(|error| {
-                super::failure::CheckFailure::classified(CheckState::ConfigurationError, error)
-            })?;
-            context.resolved = Some(receipt.selection);
-        } else if !scoped && !killed && success {
-            context.resolved = Some(context.selection.clone());
+                let mut progress = events.progress_subscribe();
+                let outcome = if let Err(error) = resolved {
+                    Err(error)
+                } else {
+                    let operation = adapter.run(&adapter_context, &selection, &mut events);
+                    tokio::pin!(operation);
+                    let mut interrupted = false;
+                    loop {
+                        tokio::select! {
+                            result = &mut operation => break result,
+                            _ = cancelled.wait(external_cancelled.cloned()), if !interrupted => {
+                                interrupted = true;
+                                stop.send_replace(true);
+                            }
+                            changed = progress.changed() => {
+                                if changed.is_ok() {
+                                    run.commands[index].adapter_progress = Some(super::adapter::AdapterProgress::Tests(progress.borrow_and_update().clone()));
+                                    if let Err(error) = self.update(&run.clone().into_record(), target.sink) {
+                                        stop.send_replace(true);
+                                        let _ = operation.as_mut().await;
+                                        return Err(error);
+                                    }
+                                    target.publication.update(&run.clone().into_record());
+                                }
+                            }
+                        }
+                    }
+                };
+                let interrupted = matches!(outcome, Err(AdapterError::Cancelled));
+                let exit = match outcome {
+                    Ok(exit) => Some(exit),
+                    Err(error) => {
+                        events.failure(&error);
+                        None
+                    }
+                };
+                run.commands[index].adapter_progress =
+                    Some(super::adapter::AdapterProgress::Tests(events.progress()));
+                let result = events.finish(exit, interrupted);
+                run.commands[index].state = result.state();
+                run.commands[index].exit_code = result.exit;
+                run.commands[index].error = result
+                    .protocol_error
+                    .clone()
+                    .or_else(|| result.error.clone())
+                    .or_else(|| {
+                        (!result.not_found.is_empty())
+                            .then(|| "requested test items were not found".into())
+                    })
+                    .or_else(|| {
+                        (result.cases.is_empty()).then(|| "the selection matched no tests".into())
+                    });
+                if run.commands[index].state == CheckState::Passed {
+                    context.resolved = Some(CheckSelection::Tests { tests: selection });
+                }
+                run.commands[index].context = context;
+                run.commands[index].result = Some(super::adapter::AdapterResult::Tests(result));
+            }
+            CategoryAdapter::Diagnostics(adapter) => {
+                let mut selection = match &context.selection {
+                    CheckSelection::All => super::adapter::PathSelection::default(),
+                    CheckSelection::Files { files } => super::adapter::PathSelection {
+                        paths: files.clone(),
+                    },
+                    CheckSelection::Paths { paths } => paths.clone(),
+                    CheckSelection::Tests { .. } | CheckSelection::Inputs { .. } => {
+                        anyhow::bail!("diagnostic adapter requires paths or all")
+                    }
+                };
+                selection.normalize()?;
+                let mut events = super::adapter::events::DiagnosticSink::new(
+                    adapter.category(),
+                    selection.clone(),
+                )?;
+                let mut progress = events.progress_subscribe();
+                let outcome = {
+                    let operation = async {
+                        match context.purpose {
+                            super::CheckPurpose::Verify => {
+                                adapter.run(&adapter_context, &selection, &mut events).await
+                            }
+                            super::CheckPurpose::Prepare => {
+                                adapter.fix(&adapter_context, &selection, &mut events).await
+                            }
+                        }
+                    };
+                    tokio::pin!(operation);
+                    let mut interrupted = false;
+                    loop {
+                        tokio::select! {
+                            result = &mut operation => break result,
+                            _ = cancelled.wait(external_cancelled.cloned()), if !interrupted => {
+                                interrupted = true;
+                                stop.send_replace(true);
+                            }
+                            changed = progress.changed() => {
+                                if changed.is_ok() {
+                                    run.commands[index].adapter_progress = Some(AdapterProgress::Diagnostics(progress.borrow_and_update().clone()));
+                                    if let Err(error) = self.update(&run.clone().into_record(), target.sink) {
+                                        stop.send_replace(true);
+                                        let _ = operation.as_mut().await;
+                                        return Err(error);
+                                    }
+                                    target.publication.update(&run.clone().into_record());
+                                }
+                            }
+                        }
+                    }
+                };
+                let interrupted = matches!(outcome, Err(AdapterError::Cancelled));
+                let exit = match outcome {
+                    Ok(exit) => Some(exit),
+                    Err(error) => {
+                        events.failure(&error);
+                        None
+                    }
+                };
+                run.commands[index].adapter_progress =
+                    Some(AdapterProgress::Diagnostics(events.progress()));
+                let result = events.finish(exit, interrupted);
+                run.commands[index].state = result.state();
+                run.commands[index].exit_code = result.exit;
+                run.commands[index].error = result
+                    .protocol_error
+                    .clone()
+                    .or_else(|| result.error.clone())
+                    .or_else(|| {
+                        result.unsupported.then(|| match context.purpose {
+                            super::CheckPurpose::Prepare => {
+                                "this check's adapter has no fix operation".into()
+                            }
+                            super::CheckPurpose::Verify => {
+                                "this check's adapter does not support the requested operation"
+                                    .into()
+                            }
+                        })
+                    });
+                if run.commands[index].state == CheckState::Passed {
+                    context.resolved = Some(CheckSelection::Paths { paths: selection });
+                }
+                run.commands[index].context = context;
+                run.commands[index].result = Some(AdapterResult::Diagnostics(result));
+            }
+            CategoryAdapter::Format(adapter) => {
+                let mut selection = match &context.selection {
+                    CheckSelection::All => super::adapter::PathSelection::default(),
+                    CheckSelection::Files { files } => super::adapter::PathSelection {
+                        paths: files.clone(),
+                    },
+                    CheckSelection::Paths { paths } => paths.clone(),
+                    CheckSelection::Tests { .. } | CheckSelection::Inputs { .. } => {
+                        anyhow::bail!("format adapter requires paths or all")
+                    }
+                };
+                selection.normalize()?;
+                let mut events = super::adapter::events::FormatSink::new(
+                    match context.purpose {
+                        super::CheckPurpose::Verify => {
+                            super::adapter::events::FormatOperation::Check
+                        }
+                        super::CheckPurpose::Prepare => {
+                            super::adapter::events::FormatOperation::Apply
+                        }
+                    },
+                    selection.clone(),
+                )?;
+                let mut progress = events.progress_subscribe();
+                let outcome = {
+                    let operation = async {
+                        match context.purpose {
+                            super::CheckPurpose::Verify => {
+                                adapter
+                                    .check(&adapter_context, &selection, &mut events)
+                                    .await
+                            }
+                            super::CheckPurpose::Prepare => {
+                                adapter
+                                    .apply(&adapter_context, &selection, &mut events)
+                                    .await
+                            }
+                        }
+                    };
+                    tokio::pin!(operation);
+                    let mut interrupted = false;
+                    loop {
+                        tokio::select! {
+                            result = &mut operation => break result,
+                            _ = cancelled.wait(external_cancelled.cloned()), if !interrupted => {
+                                interrupted = true;
+                                stop.send_replace(true);
+                            }
+                            changed = progress.changed() => {
+                                if changed.is_ok() {
+                                    run.commands[index].adapter_progress = Some(AdapterProgress::Format(progress.borrow_and_update().clone()));
+                                    if let Err(error) = self.update(&run.clone().into_record(), target.sink) {
+                                        stop.send_replace(true);
+                                        let _ = operation.as_mut().await;
+                                        return Err(error);
+                                    }
+                                    target.publication.update(&run.clone().into_record());
+                                }
+                            }
+                        }
+                    }
+                };
+                let interrupted = matches!(outcome, Err(AdapterError::Cancelled));
+                let exit = match outcome {
+                    Ok(exit) => Some(exit),
+                    Err(error) => {
+                        events.failure(&error);
+                        None
+                    }
+                };
+                run.commands[index].adapter_progress =
+                    Some(AdapterProgress::Format(events.progress()));
+                let result = events.finish(exit, interrupted);
+                run.commands[index].state = result.state();
+                run.commands[index].exit_code = result.exit;
+                run.commands[index].error = result
+                    .protocol_error
+                    .clone()
+                    .or_else(|| result.error.clone())
+                    .or_else(|| {
+                        result.unsupported.then(|| match context.purpose {
+                            super::CheckPurpose::Prepare => {
+                                "this check's adapter has no fix operation".into()
+                            }
+                            super::CheckPurpose::Verify => {
+                                "this check's adapter does not support the requested operation"
+                                    .into()
+                            }
+                        })
+                    });
+                if run.commands[index].state == CheckState::Passed {
+                    context.resolved = Some(CheckSelection::Paths { paths: selection });
+                }
+                run.commands[index].context = context;
+                run.commands[index].result = Some(AdapterResult::Format(result));
+            }
         }
-        run.commands[index].context = context;
-        let command = run.commands[index].clone().into_record();
-        run.commands[index].report =
-            tokio::task::spawn_blocking(move || super::report::collect(&command))
-                .await
-                .context("collect check result report")?;
-        if let Some(report) = &run.commands[index].report {
-            if let Some(error) = &report.error {
-                return Err(super::failure::CheckFailure::classified(
-                    CheckState::ConfigurationError,
-                    anyhow::anyhow!("{error}"),
-                ));
-            }
-            if run.commands[index].state == CheckState::Passed
-                && report.result.iter().any(|result| {
-                    !matches!(
-                        result.state,
-                        super::CheckResultState::Passed | super::CheckResultState::Skipped
-                    )
-                })
-            {
-                return Err(super::failure::CheckFailure::classified(
-                    CheckState::Failed,
-                    anyhow::anyhow!("callback reported a failed result"),
-                ));
-            }
+        if let Ok(metadata) = tokio::fs::metadata(&run.commands[index].output).await {
+            run.commands[index].output_bytes = metadata.len();
         }
         Ok(())
     }
@@ -1657,7 +2455,7 @@ impl CheckSupervisor {
         String,
         tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
     )> {
-        self.admit_and_launch(run, sink, external_cancelled, None)
+        self.admit_and_launch(run, sink, external_cancelled, None, None)
     }
 
     async fn launch(
@@ -1666,12 +2464,13 @@ impl CheckSupervisor {
         sink: Option<SessionUpdateSink>,
         external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
         admission: Option<crate::command::ExecutionPermit>,
+        deadline: Option<CheckDeadline>,
     ) -> Result<(
         String,
         tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
     )> {
         let run = self.resolve(run).await?;
-        self.admit_and_launch(run, sink, external_cancelled, admission)
+        self.admit_and_launch(run, sink, external_cancelled, admission, deadline)
     }
 
     fn admit_and_launch(
@@ -1680,12 +2479,13 @@ impl CheckSupervisor {
         sink: Option<SessionUpdateSink>,
         external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
         admission: Option<crate::command::ExecutionPermit>,
+        deadline: Option<CheckDeadline>,
     ) -> Result<(
         String,
         tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
     )> {
         std::fs::create_dir_all(self.root.join(&run.id))?;
-        let admitted = self.admit(run, admission)?;
+        let admitted = self.admit(run, admission, deadline)?;
         let id = admitted.run.id.clone();
         if let Err(error) = self.update(&admitted.run.clone().into_record(), sink.as_ref()) {
             self.state
@@ -1724,36 +2524,19 @@ impl CheckSupervisor {
     }
 }
 
-pub(super) fn operation<'definition>(
-    definition: &'definition CheckDefinition,
-    selection: &CheckSelection,
-) -> Option<&'definition super::CheckOperation> {
-    match selection {
-        CheckSelection::All => Some(&definition.all),
-        CheckSelection::Inputs { .. } => Some(&definition.all),
-        CheckSelection::Files { .. } => definition.files.as_ref(),
-        CheckSelection::Cases { .. } => definition.cases.as_ref(),
-    }
-}
-
 /// Decode one current-format run record, or `None` for a record from another history version.
-fn saved_record(path: &Path, directory_name: &str) -> Result<Option<CheckRun>> {
+pub(super) fn saved_record(path: &Path, directory_name: &str) -> Result<Option<CheckRun>> {
     let value: serde_json::Value = crate::codec::from_slice(&std::fs::read(path)?)
         .with_context(|| format!("decode check history {}", path.display()))?;
     if value["version"] != CHECK_HISTORY_VERSION {
         return Ok(None);
     }
-    let mut run: CheckRun = crate::codec::from_value(value["run"].clone())
+    let run: CheckRun = crate::codec::from_value(value["run"].clone())
         .with_context(|| format!("decode current check history {}", path.display()))?;
     ensure!(
         directory_name == run.id,
         "check history identity differs from its directory"
     );
-    for command in &mut run.commands {
-        if command.report.is_none() {
-            command.report = super::report::collect(command);
-        }
-    }
     Ok(Some(run))
 }
 

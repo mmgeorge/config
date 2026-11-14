@@ -1172,14 +1172,9 @@ function M.open_timeline_entry()
         vim.keymap.set("n", "q", "<Cmd>tabclose<CR>", { buffer = declaration_buffer, silent = true })
       end)
     elseif action.kind == "file" then
-      local path = vim.fs.joinpath(state.session.workspace, action.path)
-      if vim.fn.filereadable(path) ~= 1 then
-        notifications.warn("Changed file is no longer available: " .. path, "ForgeHarness")
-        return
-      end
-      local opened, failure = pcall(vim.api.nvim_cmd, { cmd = "tabedit", args = { path } }, {})
-      if not opened then notifications.error(failure, "ForgeHarness") return end
-      vim.api.nvim_win_set_cursor(0, { math.max(1, math.min(action.line or 1, vim.api.nvim_buf_line_count(0))), 0 })
+      require("forge.views.harness.source_actions").open_file(state.session.workspace, action)
+    elseif action.kind == "quickfix" then
+      require("forge.views.harness.source_actions").quickfix(state.session.workspace, action)
     elseif action.kind == "plan" then
       local session_id, generation = state.session.id, client.host_get_generation()
       client.request({ session_id = session_id, method = "session.plan.get", params = { plan_id = action.plan_id, revision = action.revision } }, function(plan, failure)

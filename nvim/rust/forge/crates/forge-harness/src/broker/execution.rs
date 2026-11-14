@@ -193,7 +193,32 @@ pub(crate) struct WorkspaceCaptureJob {
     captured_at_ms: i64,
 }
 
+/// Keep final source evidence protected until its owning state transition commits.
+pub(crate) struct ReservedWorkspace {
+    checkpoint: crate::checkpoint::CheckpointRecord,
+    _reservation: crate::checks::CheckReservation,
+}
+
+impl ReservedWorkspace {
+    /// Get the snapshot captured while this value retained repository read access.
+    pub(super) fn checkpoint(&self) -> &crate::checkpoint::CheckpointRecord {
+        &self.checkpoint
+    }
+}
+
 impl WorkspaceCaptureJob {
+    /// Acquire repository read access outside broker ownership and retain it with the snapshot.
+    pub(super) async fn run_reserved(self) -> Result<ReservedWorkspace> {
+        let reservation = crate::checks::CheckReservation::acquire(
+            &self.workspace,
+            crate::checks::CheckPurpose::Verify,
+        )?;
+        Ok(ReservedWorkspace {
+            checkpoint: self.run().await?,
+            _reservation: reservation,
+        })
+    }
+
     /// Capture repository or directory state without borrowing the broker.
     pub(super) async fn run(self) -> Result<crate::checkpoint::CheckpointRecord> {
         let Self {
@@ -698,10 +723,12 @@ impl HarnessBroker {
                     pending.request_id(),
                     &pending,
                 )?;
+                let workspace = self.prepare_workspace_capture().run_reserved().await?;
                 self.commit_execution_control(
                     *pending.proposal,
                     pending.report,
                     current_interaction,
+                    Some(&workspace),
                 )
             }
             ExecutionControlStage::Report(job) => {
@@ -713,7 +740,13 @@ impl HarnessBroker {
                         &captured.proposal,
                     )?;
                 }
-                self.commit_execution_control_report(captured, current_interaction)
+                let workspace = self.prepare_workspace_capture().run_reserved().await?;
+                self.commit_execution_control(
+                    *captured.proposal,
+                    Some(captured.report),
+                    current_interaction,
+                    Some(&workspace),
+                )
             }
         }
     }
@@ -1169,7 +1202,7 @@ impl HarnessBroker {
                 },
             ))),
             None => Ok(ExecutionControlStage::Complete(
-                self.commit_execution_control(proposal, None, current_interaction)?,
+                self.commit_execution_control(proposal, None, current_interaction, None)?,
             )),
         }
     }
@@ -1189,7 +1222,7 @@ impl HarnessBroker {
     pub(super) fn settle_execution_phase(
         &mut self,
         mut pending: PendingExecutionPhase,
-        final_checkpoint: &crate::checkpoint::CheckpointRecord,
+        workspace: &ReservedWorkspace,
         interaction: &mut Exchange,
     ) -> Result<Value> {
         if let Some(crate::storage::TerminalDisposition::Committed { result }) = self
@@ -1215,7 +1248,7 @@ impl HarnessBroker {
             .checkpoint
             .as_ref()
             .context("phase request has no workspace evidence")?;
-        if !checkpoint.changed_paths(final_checkpoint)?.is_empty() {
+        if !checkpoint.changed_paths(workspace.checkpoint())?.is_empty() {
             let reason = "workspace changed after phase completion was requested; request a fresh validation";
             self.store
                 .reject_terminal_request(&self.session.id, pending.request_id(), reason)?;
@@ -1229,6 +1262,7 @@ impl HarnessBroker {
             (*pending.proposal).clone(),
             pending.report.clone(),
             interaction,
+            Some(workspace),
         )?;
         self.reconcile_phase_continuation(&pending, interaction)?;
         Ok(result)
@@ -1264,6 +1298,7 @@ impl HarnessBroker {
             *captured.proposal,
             Some(captured.report),
             current_interaction,
+            None,
         )
     }
 
@@ -1272,6 +1307,7 @@ impl HarnessBroker {
         proposal: ExecutionControlProposal,
         report: Option<ImplementationReportResult>,
         current_interaction: &mut Exchange,
+        workspace: Option<&ReservedWorkspace>,
     ) -> Result<Value> {
         let ExecutionControlProposal {
             request_id,
@@ -1286,7 +1322,7 @@ impl HarnessBroker {
             revised_manual,
             title,
             phase_completion,
-            checkpoint: _,
+            checkpoint,
             checks_current,
             now_ms,
         } = proposal;
@@ -1317,6 +1353,15 @@ impl HarnessBroker {
             "execution authority changed during control validation"
         );
         if phase_completion {
+            let workspace =
+                workspace.context("phase completion requires reserved workspace evidence")?;
+            let checkpoint = checkpoint
+                .as_ref()
+                .context("phase completion has no workspace evidence")?;
+            anyhow::ensure!(
+                checkpoint.changed_paths(workspace.checkpoint())?.is_empty(),
+                "workspace changed after phase validation; request a fresh validation"
+            );
             anyhow::ensure!(
                 self.agent_coordinator.active_count() == 0,
                 "child execution must settle before completing a plan phase"
@@ -1333,6 +1378,11 @@ impl HarnessBroker {
                 "accepted plan revision changed during control validation"
             );
             if checks_current {
+                anyhow::ensure!(
+                    self.check_runner
+                        .verification_satisfied(workspace.checkpoint())?,
+                    "required whole-check verification changed before phase completion"
+                );
                 let design = document
                     .design
                     .as_ref()

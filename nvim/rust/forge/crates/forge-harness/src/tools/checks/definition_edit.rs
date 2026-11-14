@@ -10,8 +10,9 @@ pub(super) fn definition() -> ControlToolDefinition {
         description: "Publish saved check definitions and managed helper changes when check editing is enabled. Read \
                 check_definition_list for expected_revision and check_definition_details for definitions to \
                 preserve, then supply the complete config map and optional captured helpers. Declare typed \
-                action.inputs for fixed argv substitution or input:true JSON callbacks. Commands remain opaque, \
-                without runner discovery or rewriting. Get the new revision, changed check/helper names, and \
+                action.category explicitly. Read the compiled adapter catalog before choosing an adapter. \
+                Adapter checks reject action.inputs, input, and prepare; command checks retain typed inputs \
+                during the staged migration. Get the new revision, changed check/helper names, and \
                 checks_executed:false. Every submission requires review outside YOLO. Does not run commands or \
                 validate helper syntax. Use check_run separately for execution.",
         input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks))

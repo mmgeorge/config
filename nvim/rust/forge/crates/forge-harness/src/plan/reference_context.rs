@@ -107,6 +107,7 @@ impl ReferenceContext {
                 &document,
                 &WidthProfile::default(),
                 crate::plan::design_review::ReviewAnnotationView {
+                    warning_status: source.warning_status.as_ref(),
                     annotation: &[],
                     revision: &HashMap::new(),
                     focused: None,

@@ -1,6 +1,18 @@
 use crate::plan::execution::{SemanticProgress, VerificationStatus};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
+
+/// Classify one admitted command as verification or source preparation.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckPurpose {
+    /// Certify unchanged inputs after successful execution.
+    #[default]
+    Verify,
+    /// Permit source edits and retain the resulting inputs for later verification.
+    Prepare,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,12 +67,87 @@ pub struct CommandCheck<CommandContext = Option<CheckCommand>> {
     pub output: PathBuf,
     pub output_bytes: u64,
     pub preview: String,
+    /// Validated structured outcome of the adapter's category contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Validated file-level outcomes from a structured runner, separate from this command's status.
-    pub report: Option<super::CheckReport>,
+    pub result: Option<super::adapter::AdapterResult>,
+    /// Accepted live progress from the adapter's category contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_progress: Option<super::adapter::AdapterProgress>,
 }
 
 impl<CommandContext> CommandCheck<CommandContext> {
+    /// Preserve the command failure and expose located error diagnostics to plan repair.
+    pub(crate) fn findings(&self) -> Vec<String> {
+        if !matches!(
+            self.state,
+            CheckState::Failed
+                | CheckState::Blocked
+                | CheckState::ConfigurationError
+                | CheckState::ExecutionError
+                | CheckState::Stale
+        ) {
+            return Vec::new();
+        }
+        let mut summary = format!(
+            "{}: {:?}, exit {:?}. {}\nSaved output: {}",
+            self.command,
+            self.state,
+            self.exit_code,
+            self.error.as_deref().unwrap_or(""),
+            self.output.display()
+        );
+        let mut located = Vec::new();
+        if let Some(super::adapter::AdapterResult::Diagnostics(result)) = &self.result {
+            for diagnostic in result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == super::adapter::events::Severity::Error)
+            {
+                let message = diagnostic
+                    .code
+                    .as_ref()
+                    .filter(|code| !code.is_empty())
+                    .map_or_else(
+                        || diagnostic.message.clone(),
+                        |code| format!("{} [{code}]", diagnostic.message),
+                    );
+                if let (Some(path), Some(range)) = (&diagnostic.path, diagnostic.range) {
+                    located.push(format!(
+                        "{path}:{}:{}: {message}",
+                        range.start().line(),
+                        range.start().column()
+                    ));
+                } else {
+                    summary.push_str("\nError: ");
+                    if let Some(path) = &diagnostic.path {
+                        summary.push_str(path);
+                        summary.push_str(": ");
+                    }
+                    summary.push_str(&message);
+                }
+            }
+            let omitted = result
+                .truncated
+                .get(&super::adapter::events::Severity::Error)
+                .copied()
+                .unwrap_or_default();
+            if omitted > 0 {
+                summary.push_str(&format!(
+                    "\n{omitted} additional error diagnostics omitted; inspect saved output."
+                ));
+            }
+            if result.truncated_bytes > 0 {
+                summary.push_str(&format!(
+                    "\n{} bytes of diagnostic text omitted; inspect saved output.",
+                    result.truncated_bytes
+                ));
+            }
+        }
+        let mut findings = vec![summary];
+        findings.extend(located);
+        findings
+    }
+
     /// Advances only running commands and retains recorded completion timestamps.
     pub(crate) fn elapsed_ms(&self, now_ms: i64) -> Option<u64> {
         let started_at_ms = self.started_at_ms?;
@@ -71,11 +158,8 @@ impl<CommandContext> CommandCheck<CommandContext> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
 /// Retains a Harness-owned gate without creating a provider exchange.
-#[serde(bound(
-    deserialize = "RunContext: Deserialize<'de> + Default, CommandContext: Deserialize<'de> + Default"
-))]
+#[derive(Clone, Debug, Serialize)]
 pub struct CheckRun<RunContext = Option<CheckRunContext>, CommandContext = Option<CheckCommand>> {
     pub id: String,
     /// Destination and source position captured before check execution begins.
@@ -100,12 +184,120 @@ pub struct CheckRun<RunContext = Option<CheckRunContext>, CommandContext = Optio
     pub cancelled_run_id: Option<String>,
     pub state: CheckState,
     pub progress: SemanticProgress,
+    /// Exact planned-test requirements and per-case evidence retained with this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_tests: Option<super::PlannedTestExecution>,
     pub workspace_identity: Option<String>,
     pub workspace_digest: BTreeMap<String, String>,
     pub commands: Vec<CommandCheck<CommandContext>>,
 }
 
+/// Decode the complete run before validating references across planned and command evidence.
+#[derive(Deserialize)]
+#[serde(bound(
+    deserialize = "RunContext: Deserialize<'de> + Default, CommandContext: Deserialize<'de> + Default"
+))]
+struct RawCheckRun<RunContext, CommandContext> {
+    id: String,
+    owner: Box<crate::timeline::TimelineOwner>,
+    revision: u32,
+    #[serde(default)]
+    context: RunContext,
+    #[serde(default)]
+    lifecycle: Vec<CheckEvent>,
+    completed_plan: Option<String>,
+    shell: crate::session::CheckShell,
+    executable: Option<PathBuf>,
+    workspace: String,
+    environment_digest: String,
+    started_at_ms: i64,
+    completed_at_ms: Option<i64>,
+    #[serde(default)]
+    cancelled_inputs: Option<crate::checkpoint::CheckpointRecord>,
+    #[serde(default)]
+    cancelled_run_id: Option<String>,
+    state: CheckState,
+    progress: SemanticProgress,
+    #[serde(default)]
+    planned_tests: Option<super::PlannedTestExecution>,
+    workspace_identity: Option<String>,
+    workspace_digest: BTreeMap<String, String>,
+    commands: Vec<CommandCheck<CommandContext>>,
+}
+
+impl<'de, RunContext, CommandContext> Deserialize<'de> for CheckRun<RunContext, CommandContext>
+where
+    RunContext: Deserialize<'de> + Default + Clone + Into<Option<CheckRunContext>>,
+    CommandContext: Deserialize<'de> + Default + Clone + Into<Option<CheckCommand>>,
+{
+    /// Reject planned results detached from the verification command that reported them.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let RawCheckRun {
+            id,
+            owner,
+            revision,
+            context,
+            lifecycle,
+            completed_plan,
+            shell,
+            executable,
+            workspace,
+            environment_digest,
+            started_at_ms,
+            completed_at_ms,
+            cancelled_inputs,
+            cancelled_run_id,
+            state,
+            progress,
+            planned_tests,
+            workspace_identity,
+            workspace_digest,
+            commands,
+        } = RawCheckRun::<RunContext, CommandContext>::deserialize(deserializer)?;
+        if let Some(planned) = &planned_tests {
+            planned
+                .validate_context(context.clone().into().as_ref(), &owner, &workspace)
+                .map_err(serde::de::Error::custom)?;
+            planned
+                .validate_commands(&commands)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(Self {
+            id,
+            owner,
+            revision,
+            context,
+            lifecycle,
+            completed_plan,
+            shell,
+            executable,
+            workspace,
+            environment_digest,
+            started_at_ms,
+            completed_at_ms,
+            cancelled_inputs,
+            cancelled_run_id,
+            state,
+            progress,
+            planned_tests,
+            workspace_identity,
+            workspace_digest,
+            commands,
+        })
+    }
+}
+
 impl<RunContext, CommandContext> CheckRun<RunContext, CommandContext> {
+    /// Collect declaration and check findings without converting warnings into repair work.
+    pub(crate) fn findings(&self) -> Vec<String> {
+        let mut findings = self.progress.findings();
+        if let Some(planned) = &self.planned_tests {
+            findings.extend(planned.findings());
+        }
+        findings.extend(self.commands.iter().flat_map(CommandCheck::findings));
+        findings
+    }
+
     /// Ends an interrupted run once, including cancellation during check preparation.
     pub(crate) fn interrupt(&mut self) {
         if self.state == CheckState::Interrupted {
@@ -130,7 +322,11 @@ impl<RunContext, CommandContext> CheckRun<RunContext, CommandContext> {
         }) {
             return VerificationStatus::Blocked;
         }
-        if !self.progress.missing.is_empty()
+        if self
+            .planned_tests
+            .as_ref()
+            .is_some_and(|planned| !planned.satisfied())
+            || !self.progress.missing.is_empty()
             || !self.progress.different.is_empty()
             || self
                 .commands
@@ -154,6 +350,11 @@ impl<RunContext, CommandContext> CheckRun<RunContext, CommandContext> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Retains configured identity, requested coverage, and the handler's resolved coverage.
 pub struct CheckCommand {
+    /// Record whether this invocation verifies inputs or prepares changed source.
+    pub purpose: super::CheckPurpose,
+    /// Retain source snapshots even when preparation fails or is interrupted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<PreparationSnapshot>,
     #[serde(default)]
     /// Configured operation before named inputs resolve.
     pub operation: Option<super::CheckOperation>,
@@ -173,30 +374,37 @@ pub struct CheckCommand {
     pub selection: super::CheckSelection,
     pub resolved: Option<super::CheckSelection>,
     pub depends_on: Vec<String>,
-    pub receipt: PathBuf,
+}
+
+/// Distinguish an unfinished preparation capture from known edits or capture failure.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PreparationSnapshot {
+    /// The command may have started, but no after-snapshot was recorded yet.
+    Started {
+        before: Box<crate::checkpoint::CheckpointRecord>,
+    },
+    /// Both snapshots are available for inspecting all source changes.
+    Captured {
+        before: Box<crate::checkpoint::CheckpointRecord>,
+        after: Box<crate::checkpoint::CheckpointRecord>,
+    },
+    /// Source may have changed, but the capture failure prevents claiming a known diff.
+    Unknown {
+        before: Box<crate::checkpoint::CheckpointRecord>,
+        error: String,
+    },
 }
 
 impl CheckCommand {
     /// Includes this invocation's exact tests or its single selected file.
     pub(crate) fn label(&self) -> String {
-        let names: Vec<&str> = if let Some(invocation) = &self.invocation
-            && !invocation.cases.is_empty()
-        {
-            invocation
-                .cases
-                .iter()
-                .map(|case| case.name.as_str())
-                .collect()
-        } else {
-            match &self.selection {
-                super::CheckSelection::Cases { cases } if cases.len() == 1 => {
-                    vec![cases[0].name.as_str()]
-                }
-                super::CheckSelection::Files { files } if files.len() == 1 => {
-                    vec![files[0].as_str()]
-                }
-                _ => Vec::new(),
+        let names: Vec<&str> = match &self.selection {
+            super::CheckSelection::Files { files } if files.len() == 1 => vec![files[0].as_str()],
+            super::CheckSelection::Tests { tests } if tests.ids.len() == 1 => {
+                vec![tests.ids[0].as_str()]
             }
+            _ => Vec::new(),
         };
         if names.is_empty() {
             self.name.clone()
@@ -206,8 +414,9 @@ impl CheckCommand {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
 /// Freezes project configuration and user overrides independently from the design document.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "RawCheckRunContext")]
 pub struct CheckRunContext {
     #[serde(default)]
     /// Permits automatic execution to reuse current recorded coverage.
@@ -216,11 +425,63 @@ pub struct CheckRunContext {
     pub task_id: Option<String>,
     pub snapshot: super::ConfigSnapshot,
     pub overrides: BTreeMap<String, bool>,
+    /// Task settings captured before reviewer exclusions are applied.
+    pub(crate) task_overrides: super::CheckOverrides,
     /// Complete task-relative path changes used to evaluate all check triggers.
     pub changed_files: Vec<String>,
+}
+
+/// Restore task-owned scope choices after decoding the authored configuration shape.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCheckRunContext {
     #[serde(default)]
-    /// Accepted plan cases available independently of explicit input overrides.
-    pub planned_cases: Vec<super::CheckCase>,
+    automatic: bool,
+    trigger: String,
+    task_id: Option<String>,
+    snapshot: super::ConfigSnapshot,
+    overrides: BTreeMap<String, bool>,
+    task_overrides: super::CheckOverrides,
+    changed_files: Vec<String>,
+}
+
+impl TryFrom<RawCheckRunContext> for CheckRunContext {
+    type Error = anyhow::Error;
+
+    /// Preserve effective scopes without adding task preferences to authored check definitions.
+    fn try_from(raw: RawCheckRunContext) -> anyhow::Result<Self> {
+        let RawCheckRunContext {
+            automatic,
+            trigger,
+            task_id,
+            mut snapshot,
+            overrides,
+            task_overrides,
+            changed_files,
+        } = raw;
+        for (id, scope) in &task_overrides.scopes {
+            let definition = snapshot
+                .config
+                .definitions
+                .iter_mut()
+                .find(|definition| &definition.id == id)
+                .ok_or_else(|| anyhow::anyhow!("task scope names an unknown check: {id}"))?;
+            anyhow::ensure!(
+                scope.supports(definition.category),
+                "task scope is incompatible with check {id}"
+            );
+            definition.scope = *scope;
+        }
+        Ok(Self {
+            automatic,
+            trigger,
+            task_id,
+            snapshot,
+            overrides,
+            task_overrides,
+            changed_files,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -336,7 +597,8 @@ impl<CommandContext> CommandCheck<CommandContext> {
             output: self.output,
             output_bytes: self.output_bytes,
             preview: self.preview,
-            report: self.report,
+            result: self.result,
+            adapter_progress: self.adapter_progress,
         }
     }
 }
@@ -363,6 +625,7 @@ impl<RunContext, CommandContext> CheckRun<RunContext, CommandContext> {
             cancelled_run_id: self.cancelled_run_id,
             state: self.state,
             progress: self.progress,
+            planned_tests: self.planned_tests,
             workspace_identity: self.workspace_identity,
             workspace_digest: self.workspace_digest,
             commands: self
@@ -419,9 +682,125 @@ impl TryFrom<CheckRun> for PreparedCheckRun {
             cancelled_run_id: run.cancelled_run_id,
             state: run.state,
             progress: run.progress,
+            planned_tests: run.planned_tests,
             workspace_identity: run.workspace_identity,
             workspace_digest: run.workspace_digest,
             commands,
         })
+    }
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Preserve task coverage policy when authored definitions omit their derived scope.
+    #[test]
+    fn restored_context_preserves_task_scopes_and_rejects_invalid_scopes() {
+        let source = json!({
+            "trigger":"test", "task_id":"task",
+            "snapshot":{"digest":"digest", "helper_digest":{}, "config":{
+                "unit":{"action":{"category":"test","adapter":{"script":{"command":["unused"]}}}}
+            }},
+            "overrides":{}, "task_overrides":{"scopes":{"unit":"all"}},
+            "changed_files":[]
+        });
+        let context: CheckRunContext = serde_json::from_value(source.clone()).unwrap();
+        assert_eq!(
+            context.snapshot.config.definitions[0].scope,
+            super::super::CheckScope::All
+        );
+        let restored: CheckRunContext =
+            serde_json::from_value(serde_json::to_value(&context).unwrap()).unwrap();
+        assert_eq!(restored, context);
+        for (id, scope, expected) in [
+            ("unit", "paths", "incompatible"),
+            ("unknown", "tests", "unknown check"),
+            ("unit", "changed_cases", "removed"),
+            ("unit", "new_cases", "removed"),
+            ("unit", "changed_files", "removed"),
+        ] {
+            let mut invalid = source.clone();
+            invalid["task_overrides"]["scopes"] = json!({id:scope});
+            let error = serde_json::from_value::<CheckRunContext>(invalid).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let mut legacy = source;
+        legacy["planned_cases"] = json!([]);
+        assert!(
+            serde_json::from_value::<CheckRunContext>(legacy)
+                .unwrap_err()
+                .to_string()
+                .contains("planned_cases")
+        );
+    }
+
+    /// Restore diagnostic results to exercise the same typed boundary as plan recovery.
+    fn command(state: CheckState) -> CommandCheck {
+        serde_json::from_value(json!({
+            "selected":true,"id":"compiler","command":"cargo check","state":state,
+            "started_at_ms":1,"completed_at_ms":2,"exit_code":1,"error":"compiler failed",
+            "stdout":"stdout","stderr":"stderr","output":"compiler.log","output_bytes":0,"preview":"",
+            "result":{"category":"diagnostics","selection":{"paths":[]},"widened":null,"targets":[],
+                "diagnostics":[
+                    {"severity":"error","message":"wrong type","path":"src/π.rs","range":{"start":{"line":3,"column":5}},"code":"E0308"},
+                    {"severity":"error","message":"linker unavailable"},
+                    {"severity":"error","message":"cannot parse file","path":"src/bad.rs"},
+                    {"severity":"warning","message":"unused value","path":"src/π.rs","range":{"start":{"line":2,"column":1}}},
+                    {"severity":"info","message":"additional context"}],
+                "truncated":{"error":2,"warning":1},"truncated_bytes":9,"artifacts":[],
+                "error":"compiler failed","protocol_error":null,"exit":1,"cancelled":false,"unsupported":false}
+        })).unwrap()
+    }
+
+    /// Preserve failures and unknown locations without promoting advisory diagnostics.
+    #[test]
+    fn diagnostic_findings_preserve_locations_unlocated_errors_and_omissions() {
+        let check = command(CheckState::Failed);
+        let findings = check.findings();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[1], "src/π.rs:3:5: wrong type [E0308]");
+        for expected in [
+            "cargo check: Failed",
+            "compiler failed",
+            "compiler.log",
+            "Error: linker unavailable",
+            "Error: src/bad.rs: cannot parse file",
+            "2 additional error diagnostics omitted",
+            "9 bytes of diagnostic text omitted",
+        ] {
+            assert!(findings[0].contains(expected), "{}", findings[0]);
+        }
+        assert!(!findings.join("\n").contains("unused value"));
+        assert!(!findings.join("\n").contains("additional context"));
+        for state in [
+            CheckState::Passed,
+            CheckState::Skipped,
+            CheckState::Interrupted,
+            CheckState::Pending,
+            CheckState::Running,
+            CheckState::Stopped,
+        ] {
+            assert!(command(state).findings().is_empty(), "{state:?}");
+        }
+    }
+
+    /// Keep declaration findings before each failed command's summary and located diagnostics.
+    #[test]
+    fn run_findings_keep_declaration_and_command_failure_order() {
+        let mut run: CheckRun = serde_json::from_value(json!({
+            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
+            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+            "started_at_ms":1,"completed_at_ms":2,"state":"failed",
+            "progress":crate::plan::execution::SemanticProgress::default(),"workspace_identity":null,"workspace_digest":{},
+            "commands":[command(CheckState::Failed),command(CheckState::Passed)]
+        })).unwrap();
+        run.progress.missing.push("missing.rs".into());
+        let findings = run.findings();
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0], "missing.rs: missing planned file");
+        assert!(findings[1].starts_with("cargo check: Failed"));
+        assert_eq!(findings[2], "src/π.rs:3:5: wrong type [E0308]");
     }
 }

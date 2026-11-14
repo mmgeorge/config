@@ -10,8 +10,11 @@ pub(super) fn definition() -> ControlToolDefinition {
         description: "Inspect execution details after check_status reports completion. Supply run_id from check_run, \
                 optional stream (combined by default, stdout, or stderr), and optional cursor, for example \
                 {run_id:\"run-123\",stream:\"stderr\"}. Get exact executable/argv, working directory, resolved \
-                inputs, exit status, timing, reuse provenance, and a log page. Follow next_cursor with the same \
-                run_id and stream until null to read every selected command's complete log. Running jobs return \
+                inputs, exit status, timing, reuse provenance, and a log page. Use results:true for paged test \
+                cases, diagnostics, targets, artifacts, or format files, or case:\"item ID\" for one test case's output. \
+                Result pages name their collection, include whole-result counts, and bound free-form text to 64 KiB \
+                with preview_omitted_bytes. Follow next_cursor unchanged with the same run_id, results, case, and stream \
+                until null. Result cursors are bound to their run and command. Running jobs return \
                 only a message to wait with check_status. Unknown IDs, invalid cursors, and log I/O or decoding \
                 failures report errors. Use check_definition_details with check_id instead for saved \
                 configuration.",

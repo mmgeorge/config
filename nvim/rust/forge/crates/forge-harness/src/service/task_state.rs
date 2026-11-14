@@ -670,6 +670,8 @@ fn decode_plan_edit(request: &Request) -> Result<crate::exchange::command::PlanE
         tests: Vec<crate::plan::DesignTestSelection>,
         #[serde(default)]
         enabled: std::collections::BTreeMap<String, bool>,
+        #[serde(default)]
+        test_scopes: std::collections::BTreeMap<String, crate::plan::PlanTestScope>,
     }
     let Fields {
         plan_id,
@@ -680,6 +682,7 @@ fn decode_plan_edit(request: &Request) -> Result<crate::exchange::command::PlanE
         name,
         tests,
         enabled,
+        test_scopes,
     } = serde_json::from_value(request.params.clone())?;
     let change = match request.method.as_str() {
         "session.plan.entity.rename" => PlanEditChange::RenameEntity {
@@ -692,7 +695,11 @@ fn decode_plan_edit(request: &Request) -> Result<crate::exchange::command::PlanE
             name: name.context("new entity name is required")?,
         },
         "session.plan.test.delete" => PlanEditChange::DeleteTests { tests },
-        "session.plan.check.update" => PlanEditChange::UpdateChecks { enabled, tests },
+        "session.plan.check.update" => PlanEditChange::UpdateChecks {
+            enabled,
+            test_scopes,
+            tests,
+        },
         _ => anyhow::bail!("unsupported plan edit method"),
     };
     Ok(PlanEditRequest {
@@ -757,8 +764,13 @@ pub(super) async fn normalize_review_retry(
                     original["tests"] = json!(tests);
                     "session.plan.test.delete"
                 }
-                PlanEditChange::UpdateChecks { enabled, tests } => {
+                PlanEditChange::UpdateChecks {
+                    enabled,
+                    test_scopes,
+                    tests,
+                } => {
                     original["enabled"] = json!(enabled);
+                    original["test_scopes"] = json!(test_scopes);
                     original["tests"] = json!(tests);
                     "session.plan.check.update"
                 }
@@ -829,6 +841,9 @@ async fn refresh_edited_review(
             .context("edited plan has no review digest")?,
     )?;
     let mut source = crate::plan::review_source::EditableReviewSource::try_from(source)?;
+    if let Some(design) = &source.document.design {
+        source.warning_status = controller.checks.submission_warning_status(design).await;
+    }
     let expected_version = controller
         .plan_review
         .prepare_update(document, &mut source)?;

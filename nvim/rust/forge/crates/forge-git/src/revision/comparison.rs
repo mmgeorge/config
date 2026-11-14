@@ -121,6 +121,7 @@ pub async fn observe(
             }
             let mut command = Command::new("git");
             command
+                .args(["-c", "core.fsmonitor=false"])
                 .args([
                     "--no-pager",
                     "--no-optional-locks",
@@ -227,6 +228,7 @@ fn ensure_mergeable(
 ) -> Result<()> {
     let output = read_command(
         Command::new("git")
+            .args(["-c", "core.fsmonitor=false"])
             .args(["--no-pager", "--no-optional-locks", "-C"])
             .arg(root)
             .args(["merge-tree", "--write-tree", "--quiet"])

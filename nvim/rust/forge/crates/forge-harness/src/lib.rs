@@ -30,6 +30,7 @@ pub(crate) mod process;
 pub mod protocol;
 pub mod provider;
 pub(crate) mod question;
+pub(crate) mod repository_access;
 pub mod service;
 pub mod session;
 pub mod settings;

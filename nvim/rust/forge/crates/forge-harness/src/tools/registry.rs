@@ -21,6 +21,7 @@ pub(crate) fn is_read_only(name: &str) -> bool {
                 | "check_status"
                 | "check_list"
                 | "check_detail"
+                | "check_discover"
                 | "check_definition_list"
                 | "check_definition_details"
         )

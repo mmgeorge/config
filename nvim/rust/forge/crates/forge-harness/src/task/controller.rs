@@ -530,44 +530,6 @@ impl SessionTaskController {
             .context("task update unexpectedly reused a command")
     }
 
-    /// Publishes a terminal outcome and removes its live owner in the same commit.
-    pub(crate) fn finish(
-        &self,
-        store: &mut SqliteStore,
-        permit: &TaskPermit,
-        state: super::TaskOutcomeState,
-        summary: String,
-        now_ms: i64,
-    ) -> Result<super::TaskOutcome> {
-        store
-            .commit_task_effects(
-                &self.session_id,
-                Some(permit.revision()),
-                now_ms,
-                |active| {
-                    let task = active.as_ref().context("session has no active task")?;
-                    permit.validate(Some(task))?;
-                    ensure!(
-                        !matches!(state, super::TaskOutcomeState::Complete)
-                            || task.kind() == TaskKind::Goal
-                            || task.status() == TaskStatus::Completed,
-                        "workflow completion requires its terminal gate state"
-                    );
-                    let outcome = super::TaskOutcome {
-                        id: task.id.clone(),
-                        kind: task.kind(),
-                        title: task.title().into(),
-                        state,
-                        summary,
-                    };
-                    let effects = outcome_effect(&self.session_id, task, outcome.clone(), now_ms);
-                    *active = None;
-                    Ok((outcome, effects))
-                },
-            )?
-            .context("task completion unexpectedly reused a command")
-    }
-
     /// Exercise strict unscoped admission independently of dispatched callback authority.
     #[cfg(test)]
     pub(crate) fn admit(&self, kind: TaskKind) -> Result<TaskPermit> {

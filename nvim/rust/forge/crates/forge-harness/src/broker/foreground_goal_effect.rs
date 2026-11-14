@@ -10,7 +10,7 @@ pub(crate) struct GoalProgressJob {
 }
 
 pub(crate) struct GoalProgressResult {
-    pub(crate) checkpoint: crate::checkpoint::CheckpointRecord,
+    pub(crate) workspace: execution::ReservedWorkspace,
     pub(crate) changed: bool,
     pub(crate) previous_id: Option<String>,
     pub(crate) permit: crate::task::TaskPermit,
@@ -26,14 +26,14 @@ impl GoalProgressJob {
             permit,
             guard,
         } = self;
-        let checkpoint = capture.run().await?;
+        let workspace = capture.run_reserved().await?;
         let changed = previous
             .as_ref()
-            .map(|before| before.changed_paths(&checkpoint))
+            .map(|before| before.changed_paths(workspace.checkpoint()))
             .transpose()?
             .is_some_and(|paths| !paths.is_empty());
         Ok(GoalProgressResult {
-            checkpoint,
+            workspace,
             changed,
             previous_id,
             permit,

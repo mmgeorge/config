@@ -4,6 +4,13 @@
 ---@class ForgeCommandSpecsModule
 local M = {}
 
+-- Descriptions shared by plan-check controls and the picker's effective-binding help.
+M.plan_check_actions = {
+  toggle = "Enable or disable this plan check",
+  previous_scope = "Change tests between Planned and Whole suite for this plan",
+  next_scope = "Change tests between Planned and Whole suite for this plan",
+}
+
 ---@type ForgeStatusCommandSpec[]
 M.specs = {
   { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = false, views = { status = true, pr = true, diff = true, review = true } },
@@ -144,7 +151,7 @@ M.view_specs = {
     { id = "sessions", label = "sessions", desc = "Search and preview durable Harness sessions", modes = "n", pinned = false },
     { id = "background", label = "terminals", desc = "Open running background terminals", modes = "n", pinned = false,
       hints = { terminal_status = function() return "open" end } },
-    { id = "open_timeline", label = "open", desc = "Open the item linked by this timeline row", modes = "n", pinned = false },
+    { id = "open_timeline", label = "open", desc = "Open the linked item or load its diagnostics into quickfix", modes = "n", pinned = false },
     { id = "reopen_question", label = "feedback", desc = "Reopen pending Harness questions", modes = "n", pinned = false,
       hints = { question_status = function() return "open question" end,
         pending_question_status = function() return "answer questions" end,

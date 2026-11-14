@@ -901,6 +901,14 @@ impl BrokerObserver {
                 report.push_str(&format!("- {finding}\n"));
             }
         }
+        for run in &execution.check_runs {
+            if let Some(planned) = &run.planned_tests {
+                report.push_str(&format!("\n### Planned test results · {}\n\n", run.id));
+                for line in planned.review_lines() {
+                    report.push_str(&format!("- {line}\n"));
+                }
+            }
+        }
         report.push_str("\n### Verification assessments\n\n");
         for evidence in &execution.verification {
             report.push_str(&format!(

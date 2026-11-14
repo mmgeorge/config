@@ -9,6 +9,7 @@ pub(crate) struct PlanChecksUpdateJob {
     expected_version: u64,
     expected_digest: String,
     changes: BTreeMap<String, bool>,
+    test_scopes: BTreeMap<String, crate::plan::PlanTestScope>,
     tests: Vec<crate::plan::DesignTestSelection>,
     trace: crate::plan::edit_trace::PlanEditTrace,
 }
@@ -25,6 +26,7 @@ impl PlanChecksUpdateJob {
                 &self.expected_digest,
                 crate::plan::PlanCheckSelection {
                     enabled: &self.changes,
+                    test_scopes: &self.test_scopes,
                     removed_tests: &self.tests,
                 },
                 Some(&self.trace),
@@ -36,6 +38,7 @@ impl PlanChecksUpdateJob {
             markdown: rendered.markdown,
             checksum,
             changes: self.changes,
+            test_scopes: self.test_scopes,
         })
     }
 }
@@ -47,6 +50,7 @@ pub(crate) struct PlanChecksUpdateResult {
     markdown: String,
     checksum: String,
     changes: BTreeMap<String, bool>,
+    test_scopes: BTreeMap<String, crate::plan::PlanTestScope>,
 }
 
 impl HarnessBroker {
@@ -64,11 +68,13 @@ impl HarnessBroker {
             .get("expected_version")
             .and_then(Value::as_u64)
             .context("check selection requires the reviewed plan version")?;
-        let changes = serde_json::from_value(
+        let changes =
+            serde_json::from_value(params.get("enabled").cloned().unwrap_or_else(|| json!({})))?;
+        let test_scopes = serde_json::from_value(
             params
-                .get("enabled")
+                .get("test_scopes")
                 .cloned()
-                .context("check selection is missing")?,
+                .unwrap_or_else(|| json!({})),
         )?;
         let tests =
             serde_json::from_value(params.get("tests").cloned().unwrap_or_else(|| json!([])))?;
@@ -95,6 +101,7 @@ impl HarnessBroker {
             expected_version,
             expected_digest,
             changes,
+            test_scopes,
             tests,
             trace,
         })
@@ -111,6 +118,7 @@ impl HarnessBroker {
             markdown,
             checksum,
             changes,
+            test_scopes,
         } = result;
         anyhow::ensure!(
             source.session_id == self.session.id,
@@ -142,6 +150,8 @@ impl HarnessBroker {
         plan.review = None;
         plan.manual_changes
             .extend(crate::plan::check_edits(&changes));
+        plan.manual_changes
+            .extend(crate::plan::test_scope_edits(&test_scopes));
         plan.updated_at_ms = self.clock.now_ms();
         self.publish_plan(&plan)?;
         self.save_session()?;

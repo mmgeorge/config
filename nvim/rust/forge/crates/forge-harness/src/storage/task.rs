@@ -585,6 +585,7 @@ impl SqliteStore {
 pub(super) fn recover_active_task(
     connection: &rusqlite::Connection,
     session_id: &str,
+    check_root: &std::path::Path,
 ) -> Result<()> {
     let payload: Option<String> = connection.query_row(
         "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1",
@@ -618,18 +619,8 @@ pub(super) fn recover_active_task(
                 execution.record.state = crate::plan::PlanExecutionState::Paused;
                 execution.record.generation += 1;
             }
-            for run in &mut execution.record.check_runs {
-                if run.state == crate::checks::CheckState::Running {
-                    run.state = crate::checks::CheckState::Interrupted;
-                    for command in &mut run.commands {
-                        if command.state == crate::checks::CheckState::Running {
-                            command.state = crate::checks::CheckState::Interrupted;
-                            command.output_bytes = std::fs::metadata(&command.output)
-                                .map_or(0, |metadata| metadata.len());
-                        }
-                    }
-                }
-            }
+            execution.record.check_runs =
+                crate::checks::recover_runs(check_root, session_id, &execution.record.check_runs)?;
         }
     }
     draft.renew(draft.updated_at_ms);

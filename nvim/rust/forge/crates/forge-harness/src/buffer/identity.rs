@@ -48,7 +48,13 @@ struct DisplayKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum DisplaySource {
     Tool(ToolAddress),
-    Check { id: String, result: Option<usize> },
+    Check {
+        id: String,
+    },
+    TestCase {
+        command: String,
+        item: crate::checks::adapter::TestItemId,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -98,6 +104,24 @@ impl DisplayRegistry {
 }
 
 impl DisplayProjection<'_> {
+    /// Keep a test row's identity stable when discovery or failure ordering changes.
+    pub(super) fn test_case(
+        &mut self,
+        command: &str,
+        item: &crate::checks::adapter::TestItemId,
+    ) -> DisplayId {
+        let key = DisplayKey {
+            owner: self.owner.clone(),
+            source: DisplaySource::TestCase {
+                command: command.to_owned(),
+                item: item.clone(),
+            },
+            scope: None,
+            occurrence: 0,
+        };
+        let next = DisplayId(self.registry.id.len());
+        *self.registry.id.entry(key).or_insert(next)
+    }
     pub(super) fn tool(&mut self, source: ToolAddress, scope: Option<&str>) -> DisplayId {
         let scope = scope.map(str::to_owned);
         let occurrence = self
@@ -115,13 +139,10 @@ impl DisplayProjection<'_> {
         *self.registry.id.entry(key).or_insert(next)
     }
 
-    pub(super) fn check(&mut self, id: &str, result: Option<usize>) -> DisplayId {
+    pub(super) fn check(&mut self, id: &str) -> DisplayId {
         let key = DisplayKey {
             owner: self.owner.clone(),
-            source: DisplaySource::Check {
-                id: id.to_owned(),
-                result,
-            },
+            source: DisplaySource::Check { id: id.to_owned() },
             scope: None,
             occurrence: 0,
         };

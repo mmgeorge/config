@@ -1,0 +1,35 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+────────────
+ Nextest run ID fd64c39e-e886-43e7-9a25-0385da3795e5 with nextest profile: default
+    Starting 3 tests across 1 binary (2 tests skipped, including 1 test via profile.default.default-filter)
+        FAIL [   0.007s] (1/3) nextest-protocol-fixture fails
+  output ───
+
+    running 1 test
+
+    thread 'fails' (15612) panicked at src\lib.rs:5:14:
+    fixture failure
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    test fails ... FAILED
+
+    failures:
+
+    failures:
+        fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+        PASS [   0.012s] (2/3) nextest-protocol-fixture passes
+     TIMEOUT [   0.118s] (3/3) nextest-protocol-fixture times_out
+  output ───
+
+    running 1 test
+
+    (test timed out)
+
+────────────
+     Summary [   0.118s] 3 tests run: 1 passed, 1 failed, 1 timed out, 2 skipped
+        FAIL [   0.007s] (1/3) nextest-protocol-fixture fails
+     TIMEOUT [   0.118s] (3/3) nextest-protocol-fixture times_out
+error: test run failed

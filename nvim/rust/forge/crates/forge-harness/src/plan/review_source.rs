@@ -18,6 +18,7 @@ pub(crate) enum PlanReviewSource {
 }
 
 pub(crate) struct ReviewSourceData {
+    pub warning_status: Option<crate::checks::SubmissionWarningStatus>,
     pub execution_review: Option<String>,
     pub trace: Option<ReviewTrace>,
     pub resolver: std::sync::Arc<
@@ -169,6 +170,7 @@ impl PlanFileStore {
             (saved, None)
         };
         Ok(PlanReviewSource::Historical(ReviewSourceData {
+            warning_status: None,
             trace: None,
             execution_review: None,
             resolver: Default::default(),
@@ -251,6 +253,7 @@ impl PlanFileStore {
         };
         Ok(PlanReviewSource::Working(EditableReviewSource(
             ReviewSourceData {
+                warning_status: None,
                 trace: None,
                 execution_review: None,
                 resolver: Default::default(),

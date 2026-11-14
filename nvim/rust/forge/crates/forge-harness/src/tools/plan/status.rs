@@ -289,3 +289,40 @@ fn evidence(state: &Value) -> Vec<verification::VerificationEvidenceEntry> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Carry generated check findings into the same read-only artifact that Resolve reads.
+    #[test]
+    fn findings_artifact_preserves_check_diagnostics_and_log_reference() -> anyhow::Result<()> {
+        let document: PlanDocument = serde_json::from_value(json!({
+            "schema_version":crate::plan::PLAN_SCHEMA_VERSION,"version":1,"plan_id":"plan",
+            "title":"Fixture","overview":"Fixture","usage":null
+        }))?;
+        let run: crate::checks::CheckRun = serde_json::from_value(json!({
+            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
+            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+            "started_at_ms":1,"completed_at_ms":2,"state":"failed",
+            "progress":crate::plan::execution::SemanticProgress::default(),"workspace_identity":null,"workspace_digest":{},
+            "commands":[{"selected":true,"id":"compiler","command":"typecheck","state":"failed",
+                "started_at_ms":1,"completed_at_ms":2,"exit_code":1,"error":null,
+                "stdout":"unused","stderr":"unused","output":"saved.log","output_bytes":0,"preview":"",
+                "result":{"category":"diagnostics","selection":{"paths":[]},"widened":null,"targets":[],
+                    "diagnostics":[{"severity":"error","message":"expected string","path":"src/main.rs","range":{"start":{"line":8,"column":4}},"code":"E0308"},
+                        {"severity":"error","message":"linker failed"}],
+                    "truncated":{},"truncated_bytes":0,"artifacts":[],"error":null,"protocol_error":null,"exit":1,"cancelled":false,"unsupported":false}}]
+        }))?;
+        let text = execution_artifact_text(
+            PlanArtifact::Findings,
+            &document,
+            &json!({"findings":run.findings()}),
+        )?;
+        assert!(text.starts_with("# Findings\n\n- typecheck: Failed"));
+        assert!(text.contains("\n  Saved output: saved.log\n  Error: linker failed\n"));
+        assert!(text.contains("\n- src/main.rs:8:4: expected string [E0308]\n"));
+        Ok(())
+    }
+}

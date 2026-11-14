@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+#[cfg(not(windows))]
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -246,9 +247,8 @@ async fn collect_async(
         destination,
     } = streams;
     let started = Instant::now();
-    let mut wrapped = CommandWrap::from(tokio::process::Command::from(command));
-    wrapped
-        .command_mut()
+    let mut command = tokio::process::Command::from(command);
+    command
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -256,18 +256,19 @@ async fn collect_async(
         })
         .stdout(destination.map(Stdio::from).unwrap_or_else(Stdio::piped))
         .stderr(Stdio::piped());
-    wrapped.wrap(KillOnDrop);
     #[cfg(windows)]
-    {
-        wrapped.wrap(process_wrap::tokio::JobObject);
-        wrapped.wrap(process_wrap::tokio::CreationFlags(
-            windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0x0800_0000),
-        ));
-    }
-    #[cfg(unix)]
-    wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
-
-    let mut child = wrapped.spawn().context("start bounded command")?;
+    let mut child = {
+        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+        process_wrap::tokio::JobObject::spawn(&mut command).context("start bounded command")?
+    };
+    #[cfg(not(windows))]
+    let mut child = {
+        let mut wrapped = CommandWrap::from(command);
+        wrapped.wrap(KillOnDrop);
+        #[cfg(unix)]
+        wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
+        wrapped.spawn().context("start bounded command")?
+    };
     let stdout = child.stdout().take();
     let stderr = child.stderr().take().context("command stderr is missing")?;
     let failed = Arc::new(AtomicBool::new(false));

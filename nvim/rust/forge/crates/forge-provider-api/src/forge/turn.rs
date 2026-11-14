@@ -207,6 +207,24 @@ impl ReviewFeedback {
     }
 }
 
+/// Test coverage chosen by a reviewer for one plan check.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanTestScope {
+    Planned,
+    WholeSuite,
+}
+
+impl PlanTestScope {
+    /// Get the stable protocol spelling used in review instructions.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::WholeSuite => "whole_suite",
+        }
+    }
+}
+
 /// One edit the user applied with the review tools.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -214,6 +232,7 @@ pub enum PlanEdit {
     Rename { from: String, to: String },
     RemoveTest { file: String, name: String },
     SetCheck { id: String, enabled: bool },
+    SetTestScope { id: String, scope: PlanTestScope },
 }
 
 impl std::fmt::Display for PlanEdit {
@@ -229,6 +248,9 @@ impl std::fmt::Display for PlanEdit {
                 "{} plan check {id}",
                 if *enabled { "Enabled" } else { "Disabled" }
             ),
+            Self::SetTestScope { id, scope } => {
+                write!(formatter, "Set plan check {id} tests to {}", scope.as_str())
+            }
         }
     }
 }
@@ -630,6 +652,10 @@ impl PlanReview {
                     PlanEdit::SetCheck { id, enabled } => writer.empty(
                         "set_check",
                         &[("id", id.clone()), ("enabled", enabled.to_string())],
+                    ),
+                    PlanEdit::SetTestScope { id, scope } => writer.empty(
+                        "set_test_scope",
+                        &[("id", id.clone()), ("scope", scope.as_str().to_owned())],
                     ),
                 }
             }

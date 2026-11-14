@@ -278,7 +278,14 @@ impl CodexProvider {
             .map_err(|error| error.into_provider_error(ProviderOperation::ThreadOpen))?;
         let profile_root = profile.path().to_path_buf();
         let resources = CodexResources::new(request.configuration.resources.clone(), profile_root);
-        let runtime = Arc::new(CodexRuntime::new(self.command.clone()));
+        let runtime = Arc::new(
+            CodexRuntime::new(self.command.clone()).owner_bind(
+                request
+                    .resource_lease
+                    .as_ref()
+                    .and_then(|lease| lease.process_owner()),
+            ),
+        );
         let pending = Arc::new(PendingOpen {
             operation_id: operation_id.clone(),
             runtime: runtime.clone(),

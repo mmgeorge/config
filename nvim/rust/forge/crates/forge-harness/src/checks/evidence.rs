@@ -15,36 +15,53 @@ struct PreparedCheck<'run> {
     command: &'run CommandCheck,
     context: &'run super::model::CheckRunContext,
     selected: &'run super::model::CheckCommand,
+    definition: &'run super::CheckDefinition,
 }
 
 impl<'run> PreparedCheck<'run> {
     fn new(run: &'run CheckRun, command: &'run CommandCheck) -> Result<Self> {
-        Ok(Self {
-            run,
-            command,
-            context: run
-                .context
-                .as_ref()
-                .context("legacy check run has no execution context")?,
-            selected: command
-                .context
-                .as_ref()
-                .context("legacy command has no execution context")?,
-        })
-    }
-
-    fn signature(&self) -> Result<String> {
-        let definition = self
+        let context = run
             .context
+            .as_ref()
+            .context("legacy check run has no execution context")?;
+        let selected = command
+            .context
+            .as_ref()
+            .context("legacy command has no execution context")?;
+        let definition = context
             .snapshot
             .config
             .definitions
             .iter()
-            .find(|definition| definition.id == self.selected.definition_id);
-        Ok(crate::plan::digest(&serde_json::to_vec(&(
+            .find(|definition| definition.id == selected.definition_id)
+            .context("check evidence has no captured definition")?;
+        Ok(Self {
+            run,
+            command,
+            context,
+            selected,
             definition,
+        })
+    }
+
+    /// Preserve command reuse while adapters await a complete dependency identity.
+    fn reusable(&self) -> bool {
+        match &self.definition.runner {
+            super::CheckRunner::Command(_) => true,
+            // Script argv does not identify tools launched from inside the script.
+            super::CheckRunner::Adapter(
+                super::adapter::AdapterConfig::Script(_)
+                | super::adapter::AdapterConfig::RustNextest(_),
+            ) => false,
+        }
+    }
+
+    fn signature(&self) -> Result<String> {
+        Ok(crate::plan::digest(&serde_json::to_vec(&(
+            self.definition,
             &self.context.snapshot.helper_digest,
             &self.command.command,
+            self.selected.purpose,
             &self.selected.directory,
             &self.selected.selection,
             self.selected
@@ -65,16 +82,7 @@ impl CheckEvidence {
         after: &CheckpointRecord,
     ) -> Result<Option<Self>> {
         let prepared = PreparedCheck::new(run, command)?;
-        let preparation = prepared
-            .context
-            .snapshot
-            .config
-            .definitions
-            .iter()
-            .any(|definition| {
-                prepared.selected.definition_id == definition.id
-                    && definition.purpose == super::config::CheckPurpose::Prepare
-            });
+        let preparation = prepared.selected.purpose == super::CheckPurpose::Prepare;
         let checkpoint = if preparation { after.clone() } else { before };
         let source_identity = checkpoint.check_identity(None, &[])?;
         Ok(Some(Self {
@@ -85,6 +93,17 @@ impl CheckEvidence {
     }
 
     pub(super) fn covers(
+        &self,
+        run: &CheckRun,
+        current: &CommandCheck,
+        checkpoint: &CheckpointRecord,
+    ) -> Result<bool> {
+        let prepared = PreparedCheck::new(run, current)?;
+        Ok(prepared.reusable() && self.matches_inputs(run, current, checkpoint)?)
+    }
+
+    /// Match the captured inputs for cancellation suppression, independently of result reuse.
+    pub(super) fn matches_inputs(
         &self,
         run: &CheckRun,
         current: &CommandCheck,

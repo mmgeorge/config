@@ -161,6 +161,73 @@ pub struct AgentCommandSender {
 }
 
 impl AgentCommandSender {
+    /// Admit only the still-current queued task before it starts a provider process.
+    pub(crate) async fn repository_admit(
+        &self,
+        owner: &ThreadOwner,
+        task_id: &str,
+        workspace: &std::path::Path,
+        mut cancelled: watch::Receiver<bool>,
+    ) -> Result<Arc<crate::repository_access::RepositoryReservation>> {
+        loop {
+            ensure!(
+                !*cancelled.borrow(),
+                "child task cancelled before repository admission"
+            );
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
+                let execution = state
+                    .execution_by_agent
+                    .get(owner.agent_id().as_str())
+                    .context("child execution was retired")?;
+                ensure!(
+                    execution.active_task_id == task_id,
+                    "child repository admission is stale"
+                );
+                if let Some(repository) = &execution.repository {
+                    return Ok(repository.clone());
+                }
+            }
+            // No coordinator or broker lock is held while inspecting repository ownership.
+            match crate::repository_access::RepositoryReservation::acquire(
+                workspace,
+                crate::repository_access::RepositoryAccess::Write,
+            ) {
+                Ok(repository) => {
+                    let repository = Arc::new(repository);
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
+                    let execution = state
+                        .execution_by_agent
+                        .get_mut(owner.agent_id().as_str())
+                        .context("child execution was retired")?;
+                    ensure!(
+                        execution.active_task_id == task_id && !*execution.cancellation.borrow(),
+                        "child repository admission was cancelled or replaced"
+                    );
+                    ensure!(
+                        execution.repository.is_none(),
+                        "child repository ownership was already admitted"
+                    );
+                    execution.repository = Some(repository.clone());
+                    return Ok(repository);
+                }
+                Err(crate::repository_access::RepositoryAccessError::Busy(_)) => {
+                    tokio::select! {
+                        _ = cancelled.wait_for(|cancelled| *cancelled) => anyhow::bail!("child task cancelled while waiting for repository ownership"),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     /// Reserve child task capacity before a public command enters its parent's FIFO.
     /// Existing operation identities retain immediate observation. Dropping this await or its
     /// acquired permit before command admission releases capacity without creating child work.
@@ -427,7 +494,8 @@ impl AgentAdmission {
             })
             && state.pending_launches.is_empty()
             && state.execution_by_agent.len() < MAX_ACTIVE_CHILDREN
-            && state.quiescence_count == 0;
+            && state.quiescence_count == 0
+            && state.launch_hold_count == 0;
         if launch {
             let (cancellation, _) = watch::channel(false);
             state.execution_by_agent.insert(
@@ -437,6 +505,7 @@ impl AgentAdmission {
                     pending: VecDeque::new(),
                     cancellation,
                     cleanup_failed: false,
+                    repository: None,
                 },
             );
         } else if let Some(execution) = state.execution_by_agent.get_mut(&admission.agent.id) {
@@ -492,11 +561,13 @@ struct ChildExecution {
     pending: VecDeque<String>,
     cancellation: watch::Sender<bool>,
     cleanup_failed: bool,
+    repository: Option<Arc<crate::repository_access::RepositoryReservation>>,
 }
 
 #[derive(Default)]
 struct AgentStateStore {
     quiescence_count: usize,
+    launch_hold_count: usize,
     foreground_claim_count: usize,
     agent_by_id: HashMap<String, Agent>,
     task_by_id: HashMap<String, AgentTask>,
@@ -531,6 +602,26 @@ pub struct AgentCollectionCount {
 /// Rejects new child work until its owning cancellation or policy transition finishes.
 pub struct AgentQuiescence {
     coordinator: Arc<AgentCoordinator>,
+}
+
+/// Prevent child launches while an idle root runs checks, without parking its response.
+#[must_use]
+pub(crate) struct AgentLaunchHold {
+    coordinator: Arc<AgentCoordinator>,
+}
+
+impl Drop for AgentLaunchHold {
+    fn drop(&mut self) {
+        self.coordinator
+            .state
+            .lock()
+            .expect("agent state poisoned")
+            .launch_hold_count -= 1;
+        self.coordinator
+            .sender
+            .revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
 }
 
 impl Drop for AgentQuiescence {
@@ -712,6 +803,19 @@ impl AgentCoordinator {
         }
     }
 
+    /// Atomically require idle children and fence launches until the returned hold drops.
+    pub(crate) fn hold_launches(self: &Arc<Self>) -> Result<AgentLaunchHold> {
+        let mut state = self.state.lock().expect("agent state poisoned");
+        ensure!(
+            state.execution_by_agent.is_empty(),
+            "checks cannot start while delegated agents are active"
+        );
+        state.launch_hold_count += 1;
+        Ok(AgentLaunchHold {
+            coordinator: Arc::clone(self),
+        })
+    }
+
     /// Routes queued commands to the active root turn until the returned claim drops.
     pub(crate) fn claim_foreground(self: &Arc<Self>) -> AgentForegroundClaim {
         self.state
@@ -815,8 +919,8 @@ impl AgentCoordinator {
             });
         }
         ensure!(
-            state.quiescence_count == 0,
-            "child admission is closed during cancellation or a policy transition"
+            state.quiescence_count == 0 && state.launch_hold_count == 0,
+            "child admission is closed during checks, cancellation, or a policy transition"
         );
         let reservation_count = state
             .admission_by_operation
@@ -922,8 +1026,8 @@ impl AgentCoordinator {
             });
         }
         ensure!(
-            state.quiescence_count == 0,
-            "child admission is closed during cancellation or a policy transition"
+            state.quiescence_count == 0 && state.launch_hold_count == 0,
+            "child admission is closed during checks, cancellation, or a policy transition"
         );
         let reserved_active = state.admission_by_operation.values().any(|admission| {
             admission.agent.id == agent.id
@@ -1320,6 +1424,10 @@ impl AgentCoordinator {
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
             return Ok(None);
         }
+        if let Some(repository) = &execution.repository {
+            repository.published()?;
+        }
+        execution.repository.take();
         if authorization_required {
             let pending = std::mem::take(&mut execution.pending);
             state.execution_by_agent.remove(agent_id);
@@ -1404,7 +1512,10 @@ impl AgentCoordinator {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
-        if state.quiescence_count > 0 || state.execution_by_agent.len() >= MAX_ACTIVE_CHILDREN {
+        if state.quiescence_count > 0
+            || state.launch_hold_count > 0
+            || state.execution_by_agent.len() >= MAX_ACTIVE_CHILDREN
+        {
             return Ok(None);
         }
         let Some(index) = state.pending_launches.iter().position(|id| {
@@ -1454,6 +1565,7 @@ impl AgentCoordinator {
                 pending,
                 cancellation,
                 cleanup_failed: false,
+                repository: None,
             },
         );
         Ok(Some(AgentWork {

@@ -393,6 +393,43 @@ fn append_checks(
             |elapsed| format!("{}s", elapsed / 1000),
         );
         lines.push(format!("  {} · {elapsed}", command.title));
+        if let Some(crate::checks::adapter::AdapterProgress::Tests(tests)) = &command.progress {
+            let detail = if let Some(total) = tests.total {
+                format!(
+                    "{}/{} tests · {} failed",
+                    tests.finished, total, tests.failed
+                )
+            } else {
+                match tests.phase {
+                    Some(crate::checks::adapter::events::TestPhase::Build) => "Building".into(),
+                    Some(crate::checks::adapter::events::TestPhase::Discover) => {
+                        "Discovering tests".into()
+                    }
+                    Some(crate::checks::adapter::events::TestPhase::Run) => "Running tests".into(),
+                    None => "Preparing tests".into(),
+                }
+            };
+            lines.push(format!("    {detail}"));
+        }
+        if let Some(crate::checks::adapter::AdapterProgress::Diagnostics(diagnostics)) =
+            &command.progress
+        {
+            let targets = diagnostics.targets_total.map_or_else(
+                || format!("{} targets", diagnostics.targets_finished),
+                |total| format!("{}/{total} targets", diagnostics.targets_finished),
+            );
+            lines.push(format!(
+                "    {targets} · {} errors · {} warnings",
+                diagnostics.errors, diagnostics.warnings
+            ));
+        }
+        if let Some(crate::checks::adapter::AdapterProgress::Format(format)) = &command.progress {
+            let files = format.total.map_or_else(
+                || format!("{} file outcomes", format.reported),
+                |total| format!("{}/{total} files", format.reported),
+            );
+            lines.push(format!("    {files} · {} unformatted", format.unformatted));
+        }
         if let Some(output_line) = &command.output_line {
             lines.push(format!("    {output_line}"));
         }

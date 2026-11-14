@@ -16,7 +16,7 @@ use std::{
     },
 };
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, schemars::JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Retains user-selected check states independently of the project configuration.
 pub(crate) struct CheckOverrides {
@@ -60,7 +60,7 @@ pub(crate) struct CheckToolScope {
     permissions: Arc<crate::provider::approval::PermissionCoordinator>,
     scope: crate::provider::InvocationScope,
     editing: Arc<AtomicBool>,
-    can_run: bool,
+    operations: CheckToolOperations,
     agent: Arc<crate::agent::AgentCoordinator>,
     cancelled: tokio::sync::watch::Receiver<bool>,
     delivery: Mutex<Option<CheckDelivery>>,
@@ -86,7 +86,7 @@ pub(crate) struct CheckAuthority {
     pub scope: crate::provider::InvocationScope,
     pub authorization_sink: HarnessEventSink,
     pub editing: Arc<AtomicBool>,
-    pub can_run: bool,
+    pub operations: CheckToolOperations,
     pub agent: Arc<crate::agent::AgentCoordinator>,
     pub cancelled: tokio::sync::watch::Receiver<bool>,
     pub sink: Option<crate::broker::publication::SessionUpdateSink>,
@@ -94,18 +94,48 @@ pub(crate) struct CheckAuthority {
 
 /// Decide whether a foreground model may start `check_run` itself.
 ///
-/// Harness owns checks while writing can race them: during check setup, while delegated agents
-/// run, and in every plan-execution phase except Verify. Verify forbids source edits, so a check
-/// its manual actions require cannot race a writer, and its instructions direct the model to run
-/// such checks with `check_run`.
-pub(crate) fn model_may_run_checks(
+/// Verify permits read-only checks, Resolve permits explicit fixes, and ordinary chat permits
+/// both. Check setup and active delegated agents exclude model-owned check operations.
+pub(crate) fn model_check_operations(
     check_setup_active: bool,
     active_agent_count: usize,
     execution_phase: Option<crate::plan::execution::PlanPhase>,
-) -> bool {
-    !check_setup_active
-        && active_agent_count == 0
-        && execution_phase.is_none_or(|phase| phase == crate::plan::execution::PlanPhase::Verify)
+) -> CheckToolOperations {
+    if check_setup_active || active_agent_count != 0 {
+        return CheckToolOperations::Unavailable;
+    }
+    match execution_phase {
+        None => CheckToolOperations::Both,
+        Some(crate::plan::execution::PlanPhase::Verify) => CheckToolOperations::Verify,
+        Some(crate::plan::execution::PlanPhase::Resolve) => CheckToolOperations::Apply,
+        Some(
+            crate::plan::execution::PlanPhase::Implement
+            | crate::plan::execution::PlanPhase::Checking,
+        ) => CheckToolOperations::Unavailable,
+    }
+}
+
+/// Restrict verification and source-changing operations independently by execution phase.
+#[derive(Clone, Copy)]
+pub(crate) enum CheckToolOperations {
+    Unavailable,
+    Verify,
+    Apply,
+    Both,
+}
+
+impl CheckToolOperations {
+    /// Check the requested command purpose without granting another operation's authority.
+    fn allows(self, purpose: super::CheckPurpose) -> bool {
+        match (self, purpose) {
+            (Self::Both, _)
+            | (Self::Verify, super::CheckPurpose::Verify)
+            | (Self::Apply, super::CheckPurpose::Prepare) => true,
+            (Self::Unavailable, _)
+            | (Self::Verify, super::CheckPurpose::Prepare)
+            | (Self::Apply, super::CheckPurpose::Verify) => false,
+        }
+    }
 }
 
 pub(crate) struct CheckToolLease(Arc<CheckToolScope>);
@@ -140,9 +170,143 @@ impl Drop for CheckToolLease {
 }
 
 impl CheckToolScope {
+    /// Resolve existing planned tests through static owner-managed discovery at one source snapshot.
+    pub(crate) async fn planned_warnings(
+        &self,
+        design: &crate::plan::DeclarationDesign,
+        document_version: u64,
+    ) -> Result<Option<super::SubmissionWarnings>> {
+        use super::adapter::{CheckDiscoverRequest, DiscoverMode};
+        let files = design
+            .document
+            .tests
+            .iter()
+            .filter(|file| {
+                file.cases
+                    .iter()
+                    .any(|case| case.change != crate::plan::DesignTestChange::New)
+            })
+            .map(|file| file.file.clone())
+            .collect::<Vec<_>>();
+        if files.is_empty() {
+            return Ok(None);
+        }
+        // Validate the submitted configuration before collecting any check inventory.
+        self.validate_live()?;
+        let expected = design
+            .check_configuration
+            .as_ref()
+            .context("planned discovery requires the validated check configuration")?;
+        let inputs =
+            super::discovery::DiscoveryInputs::capture(&self.runner, self.task_id.as_deref())?;
+        let config = inputs.snapshot();
+        ensure!(
+            expected == config,
+            "check configuration changed before planned discovery; submit again"
+        );
+        let overrides = inputs.overrides();
+        let timeout = crate::settings::SettingsStore::open(&self.data_root)?
+            .get(
+                &self.runner.workspace.to_string_lossy(),
+                self.scope.owner().session_id().as_str(),
+                &self.provider,
+            )?
+            .desired
+            .tool_timeout
+            .unwrap_or_default()
+            .require_expiry()?
+            .duration();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let before = tokio::time::timeout_at(
+            deadline,
+            self.runner.changes.capture(&self.runner.session_id),
+        )
+        .await
+        .context("planned discovery source capture exceeded its tool timeout")??;
+        // Share one deadline across every owner-managed static discovery.
+        let mut inventories = Vec::new();
+        for definition in config.config.definitions.iter().filter(|definition| {
+            definition.category == super::CheckCategory::Test
+                && overrides
+                    .enabled
+                    .get(&definition.id)
+                    .copied()
+                    .unwrap_or(definition.enabled)
+                && !design.document.disabled_checks.contains(&definition.id)
+        }) {
+            self.validate_live()?;
+            let discovery = if tokio::time::Instant::now() >= deadline {
+                Err(super::owner::CheckOwnerFailure::Worker(anyhow::anyhow!(
+                    "planned discovery exceeded its tool timeout"
+                )))
+            } else {
+                self.runner
+                    .owner_sender()?
+                    .discover(
+                        self.scope.clone(),
+                        self.task_authority.clone(),
+                        CheckDiscoverRequest {
+                            check: definition.id.clone(),
+                            files: files.clone(),
+                            within: Vec::new(),
+                            mode: DiscoverMode::Static,
+                        },
+                        inputs.clone(),
+                        deadline,
+                        self.cancelled.clone(),
+                        None,
+                    )
+                    .await
+            };
+            inventories.push(super::planned::PlannedInventory::new(
+                definition.id.clone(),
+                discovery,
+            )?);
+        }
+        // Reject mixed snapshots and revoked selections before publishing warnings.
+        self.validate_live()?;
+        let after = tokio::time::timeout_at(
+            deadline,
+            self.runner.changes.capture(&self.runner.session_id),
+        )
+        .await
+        .context("planned discovery validation exceeded its tool timeout")??;
+        let current = ConfigSnapshot::load(&self.runner.workspace)?;
+        ensure!(
+            before.id == after.id
+                && config == &current
+                && overrides == &self.runner.overrides(self.task_id.as_deref())?,
+            "check configuration, selection, helpers, or workspace changed during planned discovery; submit again"
+        );
+        Ok(Some(super::SubmissionWarnings::new(
+            design,
+            document_version,
+            before.id,
+            inputs,
+            super::planned::submission_warnings(design, &inventories)?,
+        )?))
+    }
+
     /// Reads live permission so an existing turn observes user revocation.
     pub(crate) fn editing_enabled(&self) -> bool {
         self.editing.load(Ordering::Acquire)
+    }
+
+    /// Reject discovery after its requesting invocation loses ownership or is cancelled.
+    fn validate_live(&self) -> Result<()> {
+        if let Some(authority) = &self.task_authority {
+            authority.validate_scope()?;
+        }
+        ensure!(
+            !*self.cancelled.borrow()
+                && self
+                    .delivery
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("check delivery lock poisoned"))?
+                    .is_some(),
+            "check tools belong to an inactive interaction"
+        );
+        Ok(())
     }
 
     pub(crate) fn open(
@@ -161,7 +325,7 @@ impl CheckToolScope {
             scope,
             authorization_sink,
             editing,
-            can_run,
+            operations,
             agent,
             cancelled,
             sink,
@@ -177,7 +341,7 @@ impl CheckToolScope {
             permissions,
             scope,
             editing,
-            can_run,
+            operations,
             agent,
             cancelled,
             delivery: Mutex::new(Some(CheckDelivery {
@@ -362,9 +526,61 @@ impl CheckToolScope {
                     "changed_helpers":changed_helpers,"checks_executed":false
                 })
             }
+            "check_discover" => {
+                use super::adapter::{CheckDiscoverRequest, DiscoverMode};
+                let request: CheckDiscoverRequest = serde_json::from_value(arguments)?;
+                let inputs = super::discovery::DiscoveryInputs::capture(
+                    &self.runner,
+                    self.task_id.as_deref(),
+                )?;
+                let exact = request.mode == DiscoverMode::Exact;
+                let quiescence = exact.then(|| self.agent.begin_quiescence());
+                if exact {
+                    ensure!(
+                        self.operations.allows(super::CheckPurpose::Verify)
+                            && self.agent.active_count() == 0
+                            && !matches!(
+                                self.mode,
+                                PromptMode::Plan
+                                    | PromptMode::PlanDiscussion
+                                    | PromptMode::PlanQuestion
+                            ),
+                        "exact discovery requires check execution authority and no active writers"
+                    );
+                }
+                let timeout = crate::settings::SettingsStore::open(&self.data_root)?
+                    .get(
+                        &self.runner.workspace.to_string_lossy(),
+                        self.scope.owner().session_id().as_str(),
+                        &self.provider,
+                    )?
+                    .desired
+                    .tool_timeout
+                    .unwrap_or_default()
+                    .require_expiry()?
+                    .duration();
+                let deadline = tokio::time::Instant::now() + timeout;
+                let discovered = self
+                    .runner
+                    .owner_sender()?
+                    .discover(
+                        self.scope.clone(),
+                        self.task_authority.clone(),
+                        request,
+                        inputs,
+                        deadline,
+                        self.cancelled.clone(),
+                        quiescence,
+                    )
+                    .await?;
+                serde_json::to_value(discovered)?
+            }
             "check_run" => {
+                let request = RunRequest::try_from(serde_json::from_value::<
+                    super::CheckRunRequest,
+                >(arguments)?)?;
                 ensure!(
-                    self.can_run
+                    self.operations.allows(request.purpose)
                         && self.agent.active_count() == 0
                         && !matches!(
                             self.mode,
@@ -372,14 +588,12 @@ impl CheckToolScope {
                                 | PromptMode::PlanDiscussion
                                 | PromptMode::PlanQuestion
                         ),
-                    "automated checks are owned by Harness outside plan verification and cannot race active writing agents"
+                    "this check operation is unavailable: plan Verify permits read-only checks, Resolve permits fixes, and check setup or active delegated agents exclude both"
                 );
-                let request = RunRequest::try_from(serde_json::from_value::<
-                    super::CheckRunRequest,
-                >(arguments)?)?;
                 let call_id = identity
                     .clone()
                     .context("check_run requires authenticated tool-call identity")?;
+                let launch_hold = self.agent.hold_launches()?;
                 let retained_request = request.clone();
                 let run = self.runner.prepare_request(
                     self.runner
@@ -395,7 +609,7 @@ impl CheckToolScope {
                     "an agent started during check resolution"
                 );
                 json!({"run_id":self.runner.owner_sender()?.start(
-                    self.scope.clone(), self.task_authority.clone(), call_id, retained_request, run, delivery.lifecycle, self.cancelled.clone(),
+                    self.scope.clone(), self.task_authority.clone(), call_id, retained_request, run, delivery.lifecycle, self.cancelled.clone(), launch_hold,
                 ).await?})
             }
             "check_status" => {
@@ -563,8 +777,7 @@ impl CheckSupervisor {
             }
             if let Some(files) = self.changes.files()? {
                 catalog["preview"] = serde_json::to_value(
-                    super::preview::resolve(&self.workspace, &config, &files, None, None, &[])
-                        .await?,
+                    super::preview::resolve(&self.workspace, &config, &files, &[], None).await?,
                 )?;
                 if let Some(checkpoint) = self.changes.snapshot().await? {
                     let run = self
@@ -597,6 +810,13 @@ impl CheckSupervisor {
             catalog["automatic"] =
                 serde_json::to_value(super::automatic::AutomaticChecks::open(&self.root, &owner)?)?;
         }
+        let checkpoint = self.changes.snapshot().await?;
+        catalog["pending_verification"] = serde_json::to_value(
+            self.verification
+                .lock()
+                .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
+                .pending(checkpoint.as_ref())?,
+        )?;
         Ok(catalog)
     }
     /// Projects saved configuration, task controls, and history without inventing defaults.
@@ -682,15 +902,8 @@ impl CheckSupervisor {
                 .context("unknown check id")?;
             if let Some(scope) = overrides.scopes.get(id) {
                 ensure!(
-                    !matches!(scope, super::CheckScope::ChangedFiles) || definition.files.is_some(),
-                    "file selection is unsupported"
-                );
-                ensure!(
-                    !matches!(
-                        scope,
-                        super::CheckScope::ChangedCases | super::CheckScope::NewCases
-                    ) || definition.cases.is_some(),
-                    "case selection is unsupported"
+                    scope.supports(definition.category),
+                    "scope is incompatible with the check category"
                 );
             }
         }
@@ -725,14 +938,13 @@ impl CheckSupervisor {
             super::CheckAdmission {
                 owner,
                 request,
-                overrides: overrides.enabled,
+                overrides: overrides.enabled.clone(),
+                task_overrides: overrides,
                 files: changes.clone(),
-                cases: None,
-                new_cases: None,
                 has_scope: changes.is_some(),
                 shell,
                 trigger,
-                task_id: task_id.or(self.changes.owner()?),
+                task_id,
                 revision: 0,
             },
         )
@@ -892,9 +1104,8 @@ impl CheckSupervisor {
                 owner,
                 request: Default::default(),
                 overrides: BTreeMap::new(),
+                task_overrides: Default::default(),
                 files: Some(Vec::new()),
-                cases: None,
-                new_cases: None,
                 has_scope: true,
                 shell: CheckShell::default(),
                 trigger: "Configuration saved".into(),

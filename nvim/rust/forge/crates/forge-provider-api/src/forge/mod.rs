@@ -30,8 +30,8 @@ pub use standing::{
 pub use turn::{
     AgentMessage, AgentResult, AgentTask, AnswerValue, CheckFailure, CheckRepair, Notice,
     PendingQuestion, PendingQuestions, PendingScope, PlanEdit, PlanFeedback, PlanReview,
-    QuestionOption, RecordedAnswer, ResolvedQuestions, ReviewFeedback, SessionMessage, TaskStep,
-    TurnInput, TurnKind,
+    PlanTestScope, QuestionOption, RecordedAnswer, ResolvedQuestions, ReviewFeedback,
+    SessionMessage, TaskStep, TurnInput, TurnKind,
 };
 
 use writer::Writer;

@@ -36,6 +36,21 @@ impl AgentRuntime {
             !owner.is_root(),
             "child runtime cannot own the root conversation"
         );
+        let repository = self
+            .sender
+            .repository_admit(
+                &owner,
+                &self.task_id,
+                std::path::Path::new(&self.request.workspace),
+                self.cancellation.clone(),
+            )
+            .await?;
+        let context = self
+            .request
+            .control_context
+            .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(self.request.mode));
+        context.repository_access = Some(repository.scope());
+        context.repository_process = Some(repository.process_owner());
         // Subscribe before dispatch so retained child observations keep their original owner.
         let scope = crate::provider::InvocationScope::new(owner.clone(), self.task_id.clone());
         let engine = self.execution_registry.owner(owner.clone()).await?;

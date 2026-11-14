@@ -27,6 +27,8 @@ pub(crate) enum MutationError {
     Json(#[from] serde_json::Error),
     #[error("editor or permission service failed: {0}")]
     Service(#[source] anyhow::Error),
+    #[error("repository mutation admission failed: {0}")]
+    Reservation(#[source] anyhow::Error),
     #[error("rename worker failed: {0}")]
     Worker(#[from] tokio::task::JoinError),
     #[error("rollback_failed: {path}: {rollback}; original failure: {cause}")]

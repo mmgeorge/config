@@ -154,7 +154,7 @@ impl HarnessBroker {
                 scope: scope.clone(),
                 authorization_sink: provider_event_sink.clone(),
                 editing: self.observer.check_editing.clone(),
-                can_run: crate::checks::model_may_run_checks(
+                operations: crate::checks::model_check_operations(
                     staged.exchange.check_setup.is_some(),
                     self.agent_coordinator.active_count(),
                     execution.as_ref().map(|execution| execution.phase),

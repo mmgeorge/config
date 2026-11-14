@@ -102,6 +102,7 @@ impl FrameHandler for ProcessFrames {
 /// Native configuration a conversation applies at every launch.
 #[derive(Clone)]
 pub(crate) struct ConversationOptions {
+    pub process_owner: Option<Arc<dyn forge_shell::process::ProcessOwner>>,
     pub workspace: String,
     pub system_instructions: String,
     pub mcp_servers: Map<String, Value>,
@@ -563,6 +564,7 @@ fn launch_spec(
         }
     };
     Ok(LaunchSpec {
+        process_owner: options.process_owner.clone(),
         workspace: options.workspace.clone(),
         start,
         model: options.model.clone().filter(|model| model != "default"),
@@ -632,6 +634,7 @@ pub(crate) async fn workspace_models(
         std::sync::atomic::AtomicBool::new(true),
     )));
     let options = ConversationOptions {
+        process_owner: None,
         workspace: workspace.to_owned(),
         system_instructions: String::new(),
         mcp_servers: Map::new(),

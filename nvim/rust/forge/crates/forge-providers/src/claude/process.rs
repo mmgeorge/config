@@ -44,8 +44,9 @@ pub(crate) enum SessionStart {
 }
 
 /// Every launch-time choice of one CLI process.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct LaunchSpec {
+    pub process_owner: Option<std::sync::Arc<dyn forge_shell::process::ProcessOwner>>,
     pub workspace: String,
     pub start: SessionStart,
     pub model: Option<String>,
@@ -301,8 +302,11 @@ impl ClaudeLauncher for ProcessLauncher {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        let mut process = forge_shell::process::spawn_owned(command)
-            .map_err(|_| launch_failure(ProviderFailureKind::Runtime))?;
+        let mut process = match &spec.process_owner {
+            Some(owner) => owner.spawn(command),
+            None => forge_shell::process::spawn_owned(command),
+        }
+        .map_err(|_| launch_failure(ProviderFailureKind::Runtime))?;
         let stdin = process
             .stdin()
             .take()
@@ -344,6 +348,7 @@ mod tests {
 
     fn spec(start: SessionStart) -> LaunchSpec {
         LaunchSpec {
+            process_owner: None,
             workspace: ".".into(),
             start,
             model: Some("haiku".into()),

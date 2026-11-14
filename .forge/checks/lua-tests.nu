@@ -344,7 +344,7 @@ def terminate_owned_tree [pid: int] {
 #
 # The shard bootstrap enforces the per-case deadline itself. A whole-file shard is killed at
 # `minitest_shard_timeout`; a single-case process at the per-case deadline plus the report grace.
-def run_fixture [test: string, setup_list: list<string>, minitest_directory: string] {
+def run_fixture [test: string, setup_list: list<string>, minitest_directory: string, events_path: string = "", collect_path: string = ""] {
   let scratch_directory = mktemp -d
   let spec_path = $scratch_directory | path join "spec.json"
   let result_path = $scratch_directory | path join "result.json"
@@ -358,7 +358,7 @@ def run_fixture [test: string, setup_list: list<string>, minitest_directory: str
   ]
   let command = ["nvim"] | append $startup_argument_list | append $setup_argument_list | append $script_argument_list | append $case_argument_list
   let deadline = if $fixture.case == null { $minitest_shard_timeout } else { $per_case_timeout + $minitest_report_grace }
-  {command: $command, output_path: $output_path} | to json --raw | save --force $spec_path
+  {command: $command, output_path: $output_path, events_path: $events_path, collect_path: $collect_path} | to json --raw | save --force $spec_path
   let started = date now
   let worker_job = job spawn {
     try {
@@ -495,10 +495,249 @@ def "main worker" [spec_path: path, result_path: path, pid_path: path] {
   let program = $spec.command | first
   let argument_list = $spec.command | skip 1
   let worker_result = try {
-    run-external $program ...$argument_list o+e> $spec.output_path
+    mut variables = {}
+    if ($spec.events_path? | default "") != "" { $variables = $variables | insert FORGE_TEST_EVENTS $spec.events_path }
+    if ($spec.collect_path? | default "") != "" { $variables = $variables | insert FORGE_TEST_COLLECT $spec.collect_path }
+    with-env $variables { run-external $program ...$argument_list o+e> $spec.output_path }
     {exit_code: 0}
   } catch {|failure|
     {exit_code: ($env.LAST_EXIT_CODE? | default 127), failure: (if ($env.LAST_EXIT_CODE? | default 0) == 0 { $failure.msg } else { "" })}
   }
   publish_record $worker_result $result_path
+}
+
+# Append one flushed event through the adapter's single main-thread writer.
+def adapter_emit [target: path, event: record] {
+  ($event | to json --raw) + "\n" | save --append $target
+}
+
+# Approximate source metadata; only runtime collection establishes exact membership.
+def adapter_cases [file: string] {
+  open --raw ($repository_root | path join $file) | lines | enumerate | each {|row|
+    let parsed = $row.item | parse --regex '^T\["(?<name>[^"]+)"\] = '
+    if ($parsed | is-empty) { null } else {
+      {id: $"($file)::($parsed.0.name)", parent: $file, label: $parsed.0.name, case: true, name: $parsed.0.name, path: $file, line: ($row.index + 1)}
+    }
+  } | compact
+}
+
+# Include every ancestor so opaque group IDs round-trip through Harness coverage validation.
+def adapter_items [cases: list, files: list<string> = []] {
+  mut items = $cases
+  for file in ($cases | get path | append $files | uniq) {
+    let parent = $file | path dirname | str replace --all '\' '/'
+    $items = $items | append {id: $file, parent: $parent, label: ($file | path basename), case: false, path: $file}
+    mut directory = $parent
+    loop {
+      let root = $directory =~ '^nvim/lua/[^/]+/tests$'
+      let next = $directory | path dirname | str replace --all '\' '/'
+      let node = {id: $directory, label: ($directory | path basename), case: false}
+      $items = $items | append (if $root { $node } else { $node | insert parent $next })
+      if $root { break }
+      $directory = $next
+    }
+  }
+  $items | uniq-by id
+}
+
+# Adapter IDs are file/directory paths or file::entry; names are resolved by collection,
+# never by the approximate source scanner used by the people-facing CLI.
+def adapter_files [ids: list<string>] {
+  let defaults = fixture_file_list
+  if ($ids | is-empty) { return $defaults }
+  $ids | each {|id|
+    let file = (split_fixture_entry $id).path
+    if ($file =~ '^nvim/lua/[^/]+/tests/.+\.test\.lua$') and not ($file | split row '/' | any {|part| $part == '..' }) and ($file | path type) == 'file' {
+      [$file]
+    } else {
+      $defaults | where {|candidate| $candidate | str starts-with $"($file)/" }
+    }
+  } | flatten | uniq | sort
+}
+
+# The same affected-file policy as the human runner, without expanding names statically.
+def adapter_affected_files [paths: list<string>] {
+  let defaults = fixture_file_list
+  $paths | each {|file|
+    if (is_fixture_path $file) {
+      if ($file | path type) == 'file' { [$file] } else { [] }
+    } else if (is_test_tree_path $file) or not ($file =~ '^nvim/lua/[^/]+/.+\.lua$') {
+      $defaults
+    } else {
+      let unit = unit_test_for_source $file
+      let units = if $unit != null and ($unit | path type) == 'file' { [$unit] } else { [] }
+      let area = integration_area_for_source $file
+      let directory = if $area != null { $area } else { $file | str replace --regex '^(nvim/lua/[^/]+)/.*$' '$1/tests' }
+      $defaults | where {|candidate| $candidate | str starts-with $"($directory)/" } | append $units
+    }
+  } | flatten | uniq | sort
+}
+
+# Collection uses the ordinary owned/deadlined worker but exits before test execution.
+def adapter_collect [files: list<string>, jobs: int] {
+  if ($files | is-empty) { return [] }
+  let minitest = minitest_checkout
+  let scratch = mktemp -d
+  let collected = try {
+    $files | enumerate | par-each --threads $jobs {|entry|
+      let result = $scratch | path join $"($entry.index).json"
+      let outcome = run_fixture $entry.item [] $minitest "" $result
+      if $outcome.state != 'passed' {
+        error make {msg: $"Collection failed for ($entry.item): ($outcome.output)"}
+      }
+      let locations = adapter_cases $entry.item
+      open $result | each {|item|
+        let location = $locations | where name == $item.name
+        if ($location | length) == 1 { $item | insert line $location.0.line } else { $item }
+      }
+    } | flatten | sort-by id
+  } catch {|failure|
+    rm -rf $scratch
+    error make {msg: $failure.msg}
+  }
+  rm -rf $scratch
+  $collected
+}
+
+def adapter_matches [item: record, ids: list<string>] {
+  let file = $item.path? | default ''
+  $ids | any {|id| $item.id == $id or $file == $id or ($file | str starts-with $"($id)/") }
+}
+
+# Forward only complete shard records; a later poll retains any partial final line.
+def adapter_drain [worker: record, target: path] {
+  let records = if ($worker.events | path exists) {
+    let content = open --raw $worker.events
+    let rows = $content | split row "\n"
+    if ($content | str ends-with "\n") { $rows | where {|line| $line != "" } } else { $rows | drop 1 }
+  } else { [] }
+  mut updated = $worker
+  for line in ($records | skip $worker.seen) {
+    let event = $line | from json
+    adapter_emit $target $event
+    if $event.event == "started" { $updated.running = $updated.running | append $event.id | uniq }
+    if $event.event == "finished" { $updated.running = $updated.running | where {|id| $id != $event.id } }
+  }
+  $updated.seen = $records | length
+  $updated
+}
+
+# Run ordinary shard workers while the main thread alone publishes adapter events.
+def adapter_run [request: record, jobs: int] {
+  let ids = $request.select.ids? | default []
+  let affected = $request.select.affected? | default []
+  let all = ($ids | is-empty) and ($affected | is-empty)
+  let changed = adapter_affected_files $affected
+  let files = if $all { fixture_file_list } else {
+    let explicit = if ($ids | is-empty) { [] } else { adapter_files $ids }
+    $explicit | append $changed | uniq | sort
+  }
+  let collected = try { adapter_collect $files $jobs } catch {|failure|
+    adapter_emit $request.events {event: "error", message: $failure.msg}
+    return 1
+  }
+  let cases = $collected | where {|item| $all or $item.path in $changed or (adapter_matches $item $ids) }
+  let fixtures = $cases | group-by path | transpose file cases | each {|group|
+    let whole_file = ($group.cases | length) == ($collected | where path == $group.file | length)
+    if (is_unit_test_path $group.file) and $whole_file { [$group.file] } else { $group.cases | get id }
+  } | flatten | sort
+  let widened = $affected | where {|file| (is_test_tree_path $file) and not (is_fixture_path $file) or not ($file =~ '^nvim/lua/[^/]+/.+\.lua$') }
+  mut plan = {event: "plan", cases: ($cases | get id), items: (adapter_items $cases)}
+  if not ($widened | is-empty) { $plan = $plan | insert widened $"Shared test infrastructure changed: ($widened | str join ', ')" }
+  adapter_emit $request.events $plan
+  if ($fixtures | is-empty) {
+    adapter_emit $request.events {event: "complete"}
+    return 0
+  }
+  let minitest = minitest_checkout
+  let scratch = mktemp -d
+  mut pending = $fixtures
+  mut workers = []
+  mut failed = false
+  mut ordinal = 0
+  while not ($pending | is-empty) or not ($workers | is-empty) {
+    while ($workers | length) < $jobs and not ($pending | is-empty) {
+      let fixture = $pending | first
+      $pending = $pending | skip 1
+      let events = $scratch | path join $"($ordinal).events"
+      let result = $scratch | path join $"($ordinal).json"
+      $ordinal += 1
+      let job = job spawn {
+        let outcome = run_fixture $fixture [] $minitest $events
+        publish_record $outcome $result
+      }
+      $workers = $workers | append {fixture: $fixture, events: $events, result: $result, job: $job, seen: 0, running: []}
+    }
+    mut active = []
+    for worker in $workers {
+      mut current = adapter_drain $worker $request.events
+      if ($current.result | path exists) {
+        let outcome = open $current.result
+        $current = adapter_drain $current $request.events
+        if $outcome.output != "" { adapter_emit $request.events {event: "output", text: $outcome.output} }
+        if $outcome.state != "passed" {
+          $failed = true
+          if $outcome.state == "timed_out" {
+            for id in $current.running { adapter_emit $request.events {event: "finished", id: $id, status: "timed_out"} }
+          }
+          adapter_emit $request.events {event: "error", message: $"($current.fixture): ($outcome.state), exit ($outcome.exit_status)"}
+        }
+        try { job kill $current.job } catch { null }
+      } else { $active = $active | append $current }
+    }
+    $workers = $active
+    if not ($workers | is-empty) { sleep 20ms }
+  }
+  adapter_emit $request.events {event: "complete"}
+  rm -rf $scratch
+  if $failed { 1 } else { 0 }
+}
+
+# Protocol mode requires `nu --stdin` so $in contains the request until EOF.
+def "main adapter" [--jobs: int] {
+  let request = $in | from json
+  if $request.version != 1 { error make {msg: "Unsupported check adapter protocol version"} }
+  let concurrency = $jobs | default (default_jobs)
+  if $concurrency < 1 { error make {msg: "Adapter jobs must be positive"} }
+  cd $repository_root
+  match $request.op {
+    "discover" => {
+      let within = $request.within? | default []
+      let paths = $request.files? | default []
+      let candidates = if ($within | is-empty) {
+        fixture_file_list | append (if ($paths | is-empty) { [] } else { adapter_files $paths }) | uniq
+      } else { adapter_files $within }
+      let mode = $request.mode? | default 'static'
+      # Resolve item identity before intersecting source files. Otherwise a known
+      # group with no matching files is indistinguishable from an unknown ID.
+      let cases = if $mode == 'exact' { adapter_collect $candidates $concurrency } else if $mode == 'static' {
+        $candidates | each {|file| adapter_cases $file } | flatten
+      } else { error make {msg: $"Unknown discovery mode: ($mode)"} }
+      let items = adapter_items $cases $candidates
+      for id in $within {
+        if not ($id in ($items | get id)) { error make {msg: $"Unknown discovery item: ($id)"} }
+      }
+      let selected = $items | where {|item|
+        (($within | is-empty) or (adapter_matches $item $within)) and (($paths | is-empty) or ($item.path? in $paths))
+      }
+      # Retain requested anchors for Harness to validate even when the intersection
+      # is empty; its final scope pass removes these nonmatching metadata nodes.
+      mut pending = $selected | get id | append $within | uniq
+      mut included = []
+      while not ($pending | is-empty) {
+        let id = $pending | first
+        $pending = $pending | skip 1
+        if $id in $included { continue }
+        $included = $included | append $id
+        let item = $items | where id == $id | first
+        if $item.parent? != null { $pending = $pending | append $item.parent }
+      }
+      {items: ($items | where {|item| $item.id in $included }), mode: $mode} | to json --raw | save --force $request.result
+    }
+    "run" => {
+      let code = adapter_run $request $concurrency
+      if $code != 0 { exit $code }
+    }
+    _ => { adapter_emit $request.events {event: "unsupported"} }
+  }
 }

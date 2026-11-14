@@ -1,0 +1,15 @@
+#[test]
+fn passes() { println!("fixture output"); }
+
+#[test]
+fn fails() { panic!("fixture failure"); }
+
+#[test]
+#[ignore]
+fn ignored() {}
+
+#[test]
+fn excluded() {}
+
+#[test]
+fn times_out() { std::thread::sleep(std::time::Duration::from_secs(10)); }

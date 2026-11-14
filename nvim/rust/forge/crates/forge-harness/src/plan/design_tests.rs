@@ -109,7 +109,7 @@ pub(crate) fn remove(
 }
 
 /// Validate unique file and test identities before committing a plan edit.
-pub(super) fn validate(files: &[DesignTestFile]) -> Result<()> {
+pub(crate) fn validate(files: &[DesignTestFile]) -> Result<()> {
     let mut paths = BTreeSet::new();
     for file in files {
         super::design::validate_relative_path(&file.file)?;

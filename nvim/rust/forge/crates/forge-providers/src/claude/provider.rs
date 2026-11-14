@@ -837,12 +837,17 @@ impl ClaudeProvider {
             &self.runtime_root,
             &request.configuration.resources.skills,
         )?);
+        let process_owner = request
+            .resource_lease
+            .as_ref()
+            .and_then(|lease| lease.process_owner());
         cleanup.retain_lease(request.resource_lease.take());
         let selection = request.configuration.resources.clone();
         let state = Arc::new(ClaudeSessionState::new(self.admission.clone()));
         state.replace_host_tools(request.tools.clone());
         let requested_model = request.configuration.model.clone();
         let options = ConversationOptions {
+            process_owner,
             workspace: request.workspace.clone(),
             system_instructions: request.system_instructions.clone(),
             mcp_servers,
@@ -1054,6 +1059,7 @@ impl ClaudeProvider {
             &request.target.configuration.resources.skills,
         )?);
         let options = ConversationOptions {
+            process_owner: None,
             workspace: request.target.workspace.clone(),
             system_instructions: request.target.system_instructions.clone(),
             mcp_servers: mcp,

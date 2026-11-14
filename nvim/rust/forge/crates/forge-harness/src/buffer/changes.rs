@@ -49,6 +49,7 @@ fn file_action(
         None => TranscriptAction::File {
             path: path.into(),
             line,
+            column: None,
         },
     }
 }
@@ -485,7 +486,7 @@ mod tests {
                 .iter()
                 .any(|decoration| decoration.capture == "ForgeDeleteBg")
         );
-        assert!(tree.action.values().any(|action| matches!(action, TranscriptAction::File { path, line: 20 } if path == "test.rs")));
+        assert!(tree.action.values().any(|action| matches!(action, TranscriptAction::File { path, line: 20, .. } if path == "test.rs")));
         assert!(
             !tree.action.values().any(
                 |action| matches!(action, TranscriptAction::File { path, .. } if path == "gone")

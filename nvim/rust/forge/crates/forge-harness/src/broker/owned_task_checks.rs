@@ -1,7 +1,7 @@
 //! Advance task verification only in the exchange owner between detached worker results.
 use super::checks::{
     OwnedTaskChecks, TaskCheckAcknowledgment, TaskCheckFinalization, TaskCheckReport,
-    TaskCheckScanResult,
+    TaskCheckScan, TaskCheckScanResult,
 };
 use super::*;
 use crate::checks::owner::CheckOwnerFailure;
@@ -12,6 +12,7 @@ type TaskCheckFailurePublicationResult =
 
 /// Carry one immutable worker result back to the owning update step.
 pub(crate) enum TaskCheckEvent {
+    Admitted(Box<(OwnedTaskChecks, TaskCheckScan, Result<()>)>),
     Scanned(Box<(OwnedTaskChecks, Result<TaskCheckScanResult>)>),
     Checked(Box<(OwnedTaskChecks, Result<check_admission::TaskCheckResult>)>),
     Postscanned(
@@ -23,6 +24,7 @@ pub(crate) enum TaskCheckEvent {
     ),
     Reported(Box<(TaskCheckFinalization, Result<TaskCheckReport>)>),
     Published(Box<Result<(Vec<SessionEvent>, TaskCheckAcknowledgment)>>),
+    InterruptionPublished(Result<()>),
     FailurePublished(Box<(anyhow::Error, TaskCheckFailurePublicationResult)>),
     UnpublishedFailure(anyhow::Error),
 }
@@ -83,12 +85,18 @@ impl OwnedTaskCheckRun {
         event: TaskCheckEvent,
     ) -> Result<TaskCheckProgress> {
         if self.stopping {
-            return Ok(TaskCheckProgress::Finished {
-                events: Vec::new(),
-                failure: None,
-            });
+            return self.collect_interrupted(broker, event);
         }
         match event {
+            TaskCheckEvent::Admitted(payload) => {
+                let (state, scan, result) = *payload;
+                if let Err(error) = result {
+                    return self.fail_state(broker, &state, error);
+                }
+                self.worker = Some(tokio::spawn(async move {
+                    TaskCheckEvent::Scanned(Box::new((state, scan.run().await)))
+                }));
+            }
             TaskCheckEvent::UnpublishedFailure(error) => {
                 return Ok(TaskCheckProgress::Finished {
                     events: Vec::new(),
@@ -174,6 +182,9 @@ impl OwnedTaskCheckRun {
                     failure: None,
                 });
             }
+            TaskCheckEvent::InterruptionPublished(_) => {
+                anyhow::bail!("interruption publication requires a stopped check owner");
+            }
             TaskCheckEvent::FailurePublished(payload) => {
                 let (error, result) = *payload;
                 let (handled, mut events, acknowledgment) = result?;
@@ -206,6 +217,77 @@ impl OwnedTaskCheckRun {
         self.worker.is_some()
     }
 
+    /// Retain collected results after cancellation without restoring retired task authority.
+    fn collect_interrupted(
+        &mut self,
+        broker: &mut HarnessBroker,
+        event: TaskCheckEvent,
+    ) -> Result<TaskCheckProgress> {
+        let retained = match event {
+            TaskCheckEvent::Admitted(payload) => {
+                let (state, _, result) = *payload;
+                result?;
+                Some(state.into_interrupted())
+            }
+            TaskCheckEvent::Checked(payload) => {
+                let (state, result) = *payload;
+                self.cancellation = None;
+                Some((state, result?.into_interrupted()))
+            }
+            TaskCheckEvent::Postscanned(payload) => {
+                let (state, checked, _) = *payload;
+                Some((state, checked.into_interrupted()))
+            }
+            TaskCheckEvent::Reported(payload) => {
+                let (finalization, _) = *payload;
+                Some(finalization.into_interrupted())
+            }
+            TaskCheckEvent::Scanned(payload) => {
+                let (state, _) = *payload;
+                Some(state.into_interrupted())
+            }
+            TaskCheckEvent::InterruptionPublished(result) => {
+                result?;
+                None
+            }
+            TaskCheckEvent::Published(result) => {
+                let (mut events, _) = (*result)?;
+                events.push(Self::session_changed(broker)?);
+                return Ok(TaskCheckProgress::Finished {
+                    events,
+                    failure: None,
+                });
+            }
+            TaskCheckEvent::FailurePublished(payload) => {
+                let (error, result) = *payload;
+                let (handled, mut events, _) = result?;
+                events.push(Self::session_changed(broker)?);
+                return Ok(TaskCheckProgress::Finished {
+                    events,
+                    failure: (!handled).then_some(CheckOwnerFailure::Worker(error)),
+                });
+            }
+            TaskCheckEvent::UnpublishedFailure(error) => {
+                return Ok(TaskCheckProgress::Finished {
+                    events: Vec::new(),
+                    failure: Some(CheckOwnerFailure::Worker(error)),
+                });
+            }
+        };
+        if let Some((state, run)) = retained {
+            let publication =
+                broker.retain_interrupted_task_check(state, run, self.sink.clone())?;
+            self.worker = Some(tokio::spawn(async move {
+                TaskCheckEvent::InterruptionPublished(publication.run().await)
+            }));
+            return Ok(TaskCheckProgress::Pending);
+        }
+        Ok(TaskCheckProgress::Finished {
+            events: vec![Self::session_changed(broker)?],
+            failure: None,
+        })
+    }
+
     /// Check task continuation authority without consulting a transient service caller.
     fn eligible(broker: &HarnessBroker, task: &crate::task::Task) -> Result<bool> {
         let Some((turn, work)) = task
@@ -227,8 +309,11 @@ impl OwnedTaskCheckRun {
     fn begin(&mut self, broker: &mut HarnessBroker) -> Result<()> {
         match broker.begin_owned_task_checks() {
             Ok((state, scan)) => {
+                let supervisor = broker.check_runner.clone();
+                let sink = self.sink.clone();
                 self.worker = Some(tokio::spawn(async move {
-                    TaskCheckEvent::Scanned(Box::new((state, scan.run().await)))
+                    let published = supervisor.publish(state.attempt(), Some(&sink)).await;
+                    TaskCheckEvent::Admitted(Box::new((state, scan, published)))
                 }));
                 Ok(())
             }

@@ -330,7 +330,12 @@ pub struct ResourceSelection {
 /// Keep host-owned temporary resources alive for the binding or invocation which received the lease.
 /// Native owners release strong lease copies after that scope is collected. Replay keys retain
 /// weak identity only; cached operation metadata must not keep temporary resources alive.
-pub trait ResourceLease: Send + Sync {}
+pub trait ResourceLease: Send + Sync {
+    /// Get the host's launch authority, retained through native process collection.
+    fn process_owner(&self) -> Option<std::sync::Arc<dyn forge_shell::process::ProcessOwner>> {
+        None
+    }
+}
 
 /// Describe a normalized MCP launch configuration with ephemeral credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]

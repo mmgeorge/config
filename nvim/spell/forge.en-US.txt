@@ -50,3 +50,9 @@ libtess
 gpt
 
 nushell
+
+xyz
+
+juint
+
+nextest

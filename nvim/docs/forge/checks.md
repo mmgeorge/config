@@ -7,7 +7,8 @@ repository settings and presents the proposed configuration and helper changes
 for approval before saving.
 
 Saved results from an older check-history format remain on disk but are excluded from
-the current session history. Plans containing the older check configuration must be recreated.
+the current session history. Preserve authored plans when updating unsupported check
+configuration; disposable execution records do not migrate between state versions.
 
 `/checks edit on` enables check-editing permission without sending a prompt.
 `/checks edit off` disables it without sending a prompt, including during active work.
@@ -38,7 +39,11 @@ conversation-level setting until you disable it.
 
 Compiler/type checks run before tests, followed by read-only formatting, linting,
 and build. Configure `cargo check` and TypeScript's project type-check command in
-category `check`. Source-changing preparation and explicit prerequisites run
+category `typecheck`. Every action declares its category; the old `check` spelling
+is rejected. Typecheck, test, format, lint, and build require adapters. Only
+`custom` accepts a plain command; it rejects adapters. Invalid combinations name
+the check and point to the adapter catalog in `check_definition_list`.
+Source-changing preparation and explicit prerequisites run
 before checks that require their results. Formatting validation does not modify
 the source that was tested.
 
@@ -59,7 +64,7 @@ The completion counter includes only selected checks and their required prerequi
 Unselected catalog entries do not count as finished work or increase the total.
 Selected checks that finish with a skip, failure, or configuration error still count
 toward progress.
-A callback can run several packages, but Harness records its configured invocation
+A custom command can run several packages, but Harness records its configured invocation
 once and waits for that process to settle.
 Submitting a new message during checks stops the previous execution and collects
 its running checks before starting the message. The composer retains newer drafts
@@ -69,14 +74,28 @@ preserving passed, failed, interrupted, stale, and other error counts.
 
 The transcript groups completed results under **Checks**, then by category and
 source file or configured definition. Repeated executions appear as separate
-Run rows in their original order. Repository callbacks can report individual
-files through the generic result protocol. The Checks
-summary counts command executions even when one command reports several files.
+Run rows in their original order. Adapters report category-specific results.
+The Checks summary counts command executions independently of their result rows.
 Expand an execution to inspect its diagnostics. Its output action opens the full
-command log. Invalid file reports keep the command result and show the report error.
+command log.
 
-`trigger.auto` controls automatic selection and defaults to `false`. Every configured
-check remains available for explicit runs and explicit plan selection. Prerequisites
+Test checks configured with an adapter report individual cases. Their live status
+shows the finished and planned case counts, failed cases, and the current phase.
+Completed cases are grouped by the parent labels supplied by the adapter; Harness
+does not interpret test IDs as paths. Failures, not-found items, and cases that did
+not finish appear before a collapsed **Passed and skipped** group. Cases retain
+their own status even when a later runner error fails the whole check.
+
+A case's output action opens only that case's captured output. Failure locations
+open the reported source line, and truncated output shows the omitted byte count.
+If a retained output file is no longer available, the case remains visible and
+its output explains the read failure. Runner errors have a separate result row
+whose output action opens the complete command log.
+
+`enabled` beside `trigger` and `action` defaults to `true`. Set it to `false` to
+disable a check by default; a task can explicitly enable it through `/checks`.
+`trigger.auto` controls automatic selection and defaults to `false`. Enabled
+checks remain available for explicit runs and explicit plan selection. Prerequisites
 run when required by a selected check, including checks with automatic selection off.
 
 In `/checks`, `●` marks an enabled check and `○` marks a disabled check. Space
@@ -94,24 +113,64 @@ While viewing a plan, press `oc` to open its checks picker. `●` marks an enabl
 check and `○` marks a disabled check. Press Space or Enter to toggle the selected
 check. These choices apply only to that plan. Enabling a check also enables its
 prerequisites, and disabling a prerequisite disables its dependent checks.
+For test checks, use the left and right arrows to switch the Tests field between
+Planned and Whole suite. Planned runs only the required cases owned by that
+check; Whole suite runs all its tests. The choice is saved with this plan and
+does not enable a disabled check. Press `?` for picker controls.
 
 To remove checks from the plan view, select their rows visually and press `j`,
 the same action used to delete planned tests. Confirming disables those checks
 for this plan. Re-enable them through `oc`. Historical and accepted plans remain
 read-only.
 
+During execution, Check resolves the plan's new, modified, and reused tests to
+exact case IDs and runs those cases. Every required case must pass; a skipped
+case does not satisfy the plan even if its check passes. Removed tests require
+exact discovery to confirm their absence. Missing or ambiguous tests enter
+Resolve. With Planned selected, a test check owning no required cases is excluded
+after resolution. Whole suite still runs an enabled check with no planned cases,
+and every required planned case must pass even when the whole suite runs.
+Each Check retry resolves the tests again and records a new attempt. Results from
+an interrupted attempt remain in history and do not satisfy the retry.
+
+When exact discovery omits a source location, Check may supplement it through
+static discovery. It matches the same item ID within the same check, preserves
+exact locations, and never adds static-only cases to the executable inventory.
+Unavailable static locations leave ownership unverified and retain a diagnostic.
+The execution report in plan review shows each resolved check and case, its
+source provenance, and its result. Verified removals display “Removal verified.”
+
 During planning, agents select existing checks by listing their IDs, one per line,
 in the planning directory's `docs/checks.md` with their file-editing tool. A listed ID adds that check to the
 plan without changing repository settings or executing commands, and Harness
-adds each listed check's prerequisites itself. Automatic checks run whether or
-not they are listed. `plan_submit` reports a listed ID that names no configured
-check or a disabled check, each at its line. An empty artifact clears additions
-while automatic checks still apply. Editing is available during plan authoring and
+adds each listed check's prerequisites itself. Non-test checks also follow their
+automatic triggers; test checks follow the planned inventory or Whole suite.
+`plan_submit` reports a listed ID that names no configured check at its line.
+An empty artifact clears additions while automatic non-test checks still apply.
+Editing is available during plan authoring and
 Resolve; Resolve retains `plan:checks.md` and `plan_edit`.
+
+`plan_submit` uses static discovery to check modified, reused, and removed test
+entries against enabled test adapters. Warnings identify the line in
+`plan:tests.md`, including ambiguous names across checks, missing tests, unsupported
+target selectors, and unavailable discovery. New tests wait for implementation.
+Static discovery does not verify removal or create passing test evidence; these
+warnings permit submission and do not replace execution-time checking.
+
+The Tests section retains these warnings when you reopen the review. Each warning
+keeps its submitted file, test name, change kind, and `docs/tests.md` line. Opening
+the review compares the captured source, configuration, helper content, task
+preferences, and reviewer choices. Changed inputs mark the warnings stale; a
+comparison failure is shown without discarding them. The comparison describes
+the inputs when that review opened. Resubmission replaces the warnings, and an
+empty test inventory clears them.
+
 `check_run` accepts `check` as a name or a list of names. Supply `inputs` as an
 object matching each check's declared input contract, or omit it to use defaults
-and automatic context bindings. `all: true` requests full context and cannot be
-combined with `inputs`. Explicit runs execute even when earlier evidence remains current.
+and automatic context bindings. Test adapters accept `tests` with item IDs or
+affected paths. Typecheck, lint, and build adapters accept `paths`, a list of
+repository-relative paths. `all: true` requests full context; `inputs`, `tests`,
+`paths`, and `all` are mutually exclusive. Explicit runs execute even when earlier evidence remains current.
 Configured checks run without executable approval prompts, whether started by an
 agent, the checks picker, or an automatic gate. Agents select saved check IDs and
 coverage rather than supplying commands. Editing check definitions still requires
@@ -120,6 +179,17 @@ check-editing permission and write authorization.
 Agents can stop a running check with `check_cancel`, supplying its `run_id`
 from `check_run` or `check_list`. Cancellation preserves output and check
 history. It stops that run without disabling future automatic checks.
+
+`check_discover` lists a test adapter's item IDs without executing test cases.
+It honors task enable/disable choices, including enabling a definition whose
+configured default is disabled. Changing task preferences during discovery
+invalidates its result.
+Static discovery is the default; exact discovery may build and list test binaries
+and requires the same execution authority as verification. Discovery occupies the
+session's check-operation slot until all its processes are collected, including
+on cancellation or timeout. It creates no check-run history or passing evidence.
+If source files, check configuration, or managed helpers change during discovery,
+the result is rejected and the request must be repeated against the new workspace.
 
 `check_definition_list` returns the live `automatic_checks` boolean and `check_timing`
 (`after_queue` or `between_work`) alongside the catalog. Agents read these fields
@@ -133,10 +203,16 @@ resolution, agents finish the phase and let Harness Checking run validation.
 
 ## Execution order
 
+Planned Check runs share one tool timeout from admission through discovery,
+prerequisites, execution, and final validation. Expiration fails the run and stops
+further launches. Harness collects running processes before releasing ownership
+and keeps completed case results; cleanup may extend beyond the timeout.
+Other check runs use a separate timeout for each command.
+
 Harness runs selected source preparation and its transitive prerequisites before
 unrelated verification. Among checks whose prerequisites have been ordered, the
-default priority is **check → test → format → lint → build**. Compiler/type
-checks belong to `check`, and formatting validation is read-only. Definition
+default priority is **typecheck → test → format → lint → build → custom**. Compiler/type
+checks belong to `typecheck`, and formatting validation is read-only. Definition
 order breaks ties within each category.
 
 Explicit `action.after` prerequisites take precedence over category priority.
@@ -174,7 +250,9 @@ does. Questions, pending approvals, cancellation, and paused work do not start
 automatic checks.
 
 Harness retains the inputs and coverage of completed runs. A current recorded
-result is reused instead of executing the same check again. Different input maps
+command result is reused instead of executing the same check again. Script-adapter
+results are not reused across runs until downstream tool identities can be verified;
+they still count for the workspace snapshot they checked. Different input maps
 and selections require different evidence. Any workspace edit, changed command,
 or changed configuration requires new evidence.
 
@@ -188,8 +266,9 @@ repeating the unchanged command. If repair ends with the same failures and no
 relevant changes, automatic repair stops with the failure unresolved.
 Configuration errors require correction through the authorized setup workflow.
 
-Actions verify their inputs by default. Use `action.prepare: true` for commands
-that intentionally change source, such as a formatter in fix mode. A successful
+Actions verify their inputs by default. Use `action.prepare: true` for custom commands
+that intentionally change source, such as configuration generation. Format and
+lint adapters use their explicit apply operation. A successful
 preparation records its resulting source as the baseline. Dependent checks run
 against that source. Source changes during verification produce `Stale`, and
 automatic checking verifies the current inputs again without asking the model
@@ -211,7 +290,7 @@ separate scope, or `all`/`files`/`cases` command templates are required.
 ```json
 {
   "checks": {
-    "rust-tests": {
+    "artifact-preview": {
       "trigger": {
         "auto": false,
         "paths": ["rust/**/*.rs"],
@@ -219,20 +298,19 @@ separate scope, or `all`/`files`/`cases` command templates are required.
       },
       "action": {
         "directory": "rust",
-        "category": "test",
-        "command": ["cargo", "test", "--package", "{package}", "--lib", "--", "{test}", "--exact"],
+        "category": "custom",
+        "command": ["cargo", "package", "--list", "--package", "{package}"],
         "inputs": {
-          "package": {"type": "string", "description": "Package name", "required": true},
-          "test": {"type": "string", "description": "Exact test name", "required": true}
+          "package": {"type": "string", "description": "Package name", "required": true}
         }
       }
     },
-    "web-tests": {
+    "web-package-preview": {
       "trigger": {"paths": ["web/**/*.ts"]},
       "action": {
         "directory": "web",
-        "category": "test",
-        "command": ["npm", "test", "--workspace", "{package}"],
+        "category": "custom",
+        "command": ["npm", "pack", "--dry-run", "--workspace", "{package}"],
         "inputs": {
           "package": {"type": "string", "description": "Workspace package", "required": true}
         }
@@ -244,64 +322,66 @@ separate scope, or `all`/`files`/`cases` command templates are required.
 
 Each action runs once. An argv element equal to `{name}` substitutes a declared
 scalar input or expands an array into separate scalar arguments. Embedded text
-such as `prefix-{name}` is literal. Object inputs are available to callbacks,
-not argv templates. Input names have no reserved language or runner meaning.
+such as `prefix-{name}` is literal. Arguments accept scalar values or arrays of
+scalars; objects cannot be bound to argv. Input names have no reserved language or runner meaning.
 The executable remains fixed, and input values never become interpolated shell
-source. Shell-string actions with declared inputs must use `input: true`.
+source. Shell-string actions cannot declare named inputs; use an argv command
+when inputs are needed. Custom commands receive closed stdin.
 
 Input declarations require `type` and `description`. Supported types are `string`,
 `integer`, `number`, `boolean`, `array`, and `object`. `required` defaults to false.
 Optional `default` values must match the declared type. Optional `source` binds
-automatic context through `changed_files`, `planned_cases`, or `workspace`.
+automatic context through `changed_files` or `workspace`.
 Explicit values override context bindings and defaults. Missing required inputs,
 unknown names, and incompatible types fail before starting the command.
 
+The removed `planned_cases` source reports a migration error. Planned tests use
+test adapter IDs; custom commands cannot consume the plan's test inventory.
+
 Harness treats every command as opaque. It does not recognize package managers,
-discover tests, infer arguments, or interpret runner stdout. Repository callbacks
-own file-to-package mapping, executable selection, and zero-match detection.
+discover tests, infer arguments, or interpret runner stdout. A custom command's
+exit status determines its result; structured results require an adapter.
 
 Triggers use repository-relative paths. The action directory is also relative
 to the repository. Substitution preserves input values unchanged. The configured
-command or callback resolves repository-relative paths from its working directory.
+command resolves repository-relative paths from its working directory.
 An omitted `trigger.auto` is false. An omitted path list imposes no path filter.
 
-Optional action fields are `label` for display, `category` for custom command
-ordering, `prepare` for source mutation, and `after` for prerequisites. The default
-category is `check` for every executable. `input: true` sends a JSON request to
-stdin for a callback, which must return a matching selection receipt on success.
+Every action requires `category`. Optional fields are `label` for display,
+`prepare` for custom source mutation, and `after` for prerequisites.
+The removed `input: true` callback mode fails with a named migration error.
+Custom commands do not produce selection receipts or generic file reports.
 
 ## Explicit coverage
 
 A check name alone uses current changes:
 
 ```json
-{"check": "rust-tests"}
+{"check": "artifact-preview"}
 ```
 
 Named values can be supplied together according to the check's declaration:
 
 ```json
-{"check": "rust-tests", "inputs": {"package": "engine", "test": "tests::updates_scene"}}
-{"check": "rust-tests", "all": true}
+{"check": "artifact-preview", "inputs": {"package": "engine"}}
 ```
 
-The example template still needs its required values when `all` is selected.
-Full coverage is not an alternative command synthesized by Harness. Use a
-callback or a separate configured action when full and targeted commands differ.
+The example template needs its required `package` value for every invocation.
+Custom inputs follow the saved declaration; they do not acquire the adapter's
+test-selection semantics.
 
-This repository runs Lua tests through two plain templates. `lua-test` splices
-the changed files into the runner's `--affected` selection, and
-`lua-test-select` splices an explicit `tests` array of files, directories,
-test names, or `name::case` entries:
+The repository migration replaces the two Lua templates with one `lua-test`
+adapter. Its request uses the common test-selection contract:
 
 ```json
 {"check":"lua-test"}
-{"check":"lua-test-select","inputs":{"tests":["nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"]}}
-{"check":"lua-test-select","inputs":{"tests":["nvim/lua/forge/tests/integration/walkthrough"]}}
+{"check":"lua-test","tests":{"ids":["nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"]}}
+{"check":"lua-test","tests":{"affected":["nvim/lua/forge/views/plan_review/checks.lua"]}}
 ```
 
-Both declare `rust-build` with `after`, so Harness builds the Forge host first
-and skips the Lua tests when the build fails.
+The migrated definition retains `after: ["rust-build"]`, so Harness builds the
+Forge host first and skips the Lua tests when the build fails. Existing saved
+templates require reviewed publication of this migration before they can load.
 
 Check IDs use language/tool-first names, while display labels name the action.
 `rulesync-local-preview` and `rulesync-global-preview` only preview generation.
@@ -309,30 +389,10 @@ Their manual `rulesync-local-update` and `rulesync-global-update` counterparts
 write generated files and declare source preparation. Each update requires its
 matching preview to pass. Updates never run automatically.
 
-Definition lists group check, test, format, lint, and build categories, with IDs
+Definition lists group typecheck, test, format, lint, build, and custom categories, with IDs
 breaking ties. Execution retains prerequisite ordering and runs selected source
 preparation before unrelated verification. A required build can therefore run
 before its host-integration test.
-
-## Callback request and result
-
-Callbacks receive `version: 1`, `check_id`, `workspace`, resolved `inputs`,
-`changed_files`, `selection`, `receipt_path`, and `report_path` on stdin.
-`selection` records full, changed-file, planned-case, or explicit-input context.
-On success, write `{"version":1,"selection":<request.selection>}` to `receipt_path`.
-Helpers may narrow changed-file coverage to planned cases under the existing
-receipt contract, but cannot claim broader coverage or change explicit inputs.
-
-An optional generic report at `report_path` has `version: 1` and a `result` array.
-Each result contains `file` (repository-relative), terminal `state`, optional
-`duration_ms`, `command`, and complete `output`. Harness reads this explicit report,
-not stdout. Malformed reports fail, and a callback cannot report failures while
-claiming an overall successful result. Ordinary command output remains preserved.
-
-The Rust callback streams Cargo stdout and stderr while retaining both for the
-final report. A running check displays the latest nonempty output line beneath
-its title, including compiler progress before the test executable starts. Earlier
-output remains in the log rather than accumulating in the status area.
 
 ## Preview and execution
 
@@ -362,9 +422,37 @@ Use `check_definition_list` to choose a saved check and
 Definition `check_id` values identify saved configuration. Execution `run_id`
 values identify admitted jobs and are not interchangeable with definition IDs.
 
+For format and lint adapters, `check_run` accepts `apply: true` to run the tool's
+fix operation. Name each check explicitly; `all: true` selects all source work
+for those checks. A batch containing any other category is rejected before launch.
+Only named checks run fixes; adapter prerequisites run read-only. A failed
+prerequisite or fix stops later operations, retaining any partial edits and the
+results already recorded. Apply is available in ordinary chat and plan Resolve;
+plan Verify permits read-only checks. Apply records preparation rather than
+verification, and creates a whole-check verification requirement that survives
+restart and remains mandatory when automatic checks are disabled.
+Configured or task disabling leaves that requirement unresolved. Re-enable the
+check and run it again with whole-check coverage. Changes to automatic selection,
+scope, trigger, or display labels do not change the required tool identity;
+changes to the ID, category, directory, runner, prerequisite IDs, or
+helpers require restoring the original execution definition before verification
+can satisfy the obligation.
+Each admitted command records its own purpose. The fix prepares source; only a
+successful read-only verification command can satisfy its requirement. A custom
+command's configured `prepare` flag belongs to its runner and is retained across
+configuration and history round trips.
+An unsupported fix still reports an error. When Harness proves it left source
+unchanged, it removes that operation's provisional verification requirement;
+earlier verification keeps its original source identity.
+
 `check_status` includes `state`, `completed`, `total`, `elapsed_ms`, `exit_code`,
 `latest_output`, `error`, and `executed`/`reused` counts. `latest_output` is one
 nonempty line with terminal escapes removed, or null before output arrives.
+Adapter `progress` includes a `category`: `tests` reports case counts and running
+IDs; `diagnostics` reports finished targets and error/warning counts; `format`
+reports file outcomes and unformatted counts. Target and file totals are absent
+when the tool did not declare its processed set. A formatter that lists only
+changed files reports outcomes, not a count of all files checked.
 The aggregate exit code is null for multiple selected commands. Waiting ignores
 progress updates and ends on completion or the original deadline. A deadline
 returns the current summary without cancelling work.
@@ -377,9 +465,34 @@ without opening log files. Unknown run IDs fail explicitly.
 Completed detail pages contain a command's executable and argv, working directory,
 resolved inputs, exit status, duration, and reuse origin. The returned `text` uses
 the requested stream. Pages use a 16 KiB read budget and preserve UTF-8 boundaries.
-Follow `next_cursor` with the same `run_id` and `stream` until null. The cursor's
+Use `results: true` to page test cases, diagnostics, or formatting files instead of log text.
+Each page names its `collection` and includes at most 100 entries. Missing test
+IDs, diagnostic targets, and build artifacts have their own pages; they are not
+repeated on every case or diagnostic page. `counts` reports whole-result totals;
+`counts.diagnostics` includes diagnostics omitted by retention limits, while
+`counts.retained_diagnostics` counts the available diagnostic entries.
+Free-form text previews share a 64 KiB budget per response;
+`preview_omitted_bytes` distinguishes preview shortening from retained-result
+truncation. Identifiers and source paths remain intact. The timeline groups diagnostics by
+severity and file; located entries navigate to their source line. Format results
+retain per-file status, messages, and proposed diffs, including completed file
+outcomes from interrupted runs. Read-only format streams reject `changed` results.
+The **Load diagnostics into quickfix** row loads that command's retained,
+file-located diagnostics and opens Neovim's quickfix window. Activate it with
+the configured timeline-open key (Enter or `.` by default). Errors use `E`,
+warnings `W`, and information and hints `I`. Known line and byte-column values
+are preserved; a file-only diagnostic leaves its position unspecified. Source
+links also preserve byte columns and clamp stale positions to the current file.
+During plan execution, failed typecheck, lint, and build checks also add their
+located error diagnostics to `plan:findings.md` for Resolve. The command's failure
+summary retains its log path, errors without complete locations, and diagnostic
+truncation counts. Warnings remain available in the result without becoming
+repair findings.
+Follow `next_cursor` unchanged with the same `run_id`, `results`, `case`, and
+`stream` until null. Result cursors bind the run, command, collection, and entry
+offset; using one with another run or command fails. For log cursors,
 `command_index` identifies a selected command in the frozen run, and `offset`
-counts bytes within that command's log. Pagination traverses every selected
+counts bytes within that command's log. Log pagination traverses every selected
 command and preserves the complete log without imposing a total-content limit.
 Missing logs for started commands, invalid cursors, and decoding failures report
 errors. Unstarted commands with no log return empty text.

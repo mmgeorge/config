@@ -110,12 +110,7 @@ fn commit_configuration(
                             ConfigurationRejection::CheckUnknown,
                         ))?;
                     if let Some(scope) = values.scopes.get(id) {
-                        let supported = match scope {
-                            crate::checks::CheckScope::All => true,
-                            crate::checks::CheckScope::ChangedFiles => definition.files.is_some(),
-                            crate::checks::CheckScope::ChangedCases
-                            | crate::checks::CheckScope::NewCases => definition.cases.is_some(),
-                        };
+                        let supported = scope.supports(definition.category);
                         if !supported {
                             return Err(ConfigurationCommitError::Rejected(
                                 ConfigurationRejection::CheckCoverageUnavailable,

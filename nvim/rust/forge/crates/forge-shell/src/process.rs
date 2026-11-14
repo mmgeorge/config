@@ -2,6 +2,15 @@ use tokio::process::Command;
 
 use std::path::{Path, PathBuf};
 
+/// Admit native process creation while retaining the caller's repository ownership.
+pub trait ProcessOwner: Send + Sync {
+    /// Spawn only while the original operation still permits execution.
+    fn spawn(
+        &self,
+        command: Command,
+    ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>>;
+}
+
 /// Resolve platform launch shims without changing process ownership.
 pub fn command(program: &str, args: &[String]) -> Command {
     #[cfg(not(windows))]
@@ -89,24 +98,25 @@ pub fn executable_at(
     None
 }
 
+/// Spawn a command with descendant containment retained through collection.
 pub fn spawn_owned(
     command: Command,
 ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
-    use process_wrap::tokio::{CommandWrap, KillOnDrop};
-    let mut command = CommandWrap::from(command);
-    command.wrap(KillOnDrop);
     #[cfg(windows)]
     {
-        use process_wrap::tokio::{CreationFlags, JobObject};
-        command
-            .wrap(CreationFlags(
-                windows::Win32::System::Threading::CREATE_NO_WINDOW,
-            ))
-            .wrap(JobObject);
+        let mut command = command;
+        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+        process_wrap::tokio::JobObject::spawn(&mut command)
     }
-    #[cfg(unix)]
-    command.wrap(process_wrap::tokio::ProcessGroup::leader());
-    command.spawn()
+    #[cfg(not(windows))]
+    {
+        use process_wrap::tokio::{CommandWrap, KillOnDrop};
+        let mut command = CommandWrap::from(command);
+        command.wrap(KillOnDrop);
+        #[cfg(unix)]
+        command.wrap(process_wrap::tokio::ProcessGroup::leader());
+        command.spawn()
+    }
 }
 
 #[cfg(all(test, windows))]

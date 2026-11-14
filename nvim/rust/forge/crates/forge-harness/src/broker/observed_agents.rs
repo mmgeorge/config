@@ -150,6 +150,7 @@ impl HarnessBroker {
         )?;
         self.store
             .observe_native_agent_file_change(&proof, change, self.clock.now_ms())?;
+        change.recorded()?;
         Ok(())
     }
 

@@ -24,11 +24,14 @@ pub(crate) use design_artifact::{
     preview_authored,
 };
 mod design_document;
+pub use design_document::PlanTestScope;
 mod design_flows;
 pub(crate) use design_flows::count as flow_count;
 mod design_tests;
 pub use design_tests::DesignTestChange;
+pub(crate) use design_tests::DesignTestFile;
 pub(crate) use design_tests::DesignTestSelection;
+pub(crate) use design_tests::validate as validate_design_tests;
 pub(crate) mod calls;
 use crate::codec;
 mod references;
@@ -98,7 +101,9 @@ pub use edit::{
 };
 pub use graph::{PlanGraph, ResolvedPlanEntity};
 pub use prompt::{PlanExecutionPromptKind, PlanPrompt};
-pub(crate) use prompt::{check_edits, removed_test_edits, resolved_questions, step as task_step};
+pub(crate) use prompt::{
+    check_edits, removed_test_edits, resolved_questions, step as task_step, test_scope_edits,
+};
 pub use render::{
     PlanNavigationAnchor, PlanNavigationIndex, PlanReviewReferenceKind, PlanReviewTarget,
     PlanSection, RenderedPlan, render_plan, render_plan_at, render_plan_delta,
@@ -987,6 +992,7 @@ pub struct PlanAnnotation {
 /// Selects enabled checks and removed test declarations in one plan edit.
 pub(crate) struct PlanCheckSelection<'selection> {
     pub enabled: &'selection std::collections::BTreeMap<String, bool>,
+    pub test_scopes: &'selection std::collections::BTreeMap<String, PlanTestScope>,
     pub removed_tests: &'selection [DesignTestSelection],
 }
 
@@ -1795,6 +1801,7 @@ impl PlanFileStore {
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let PlanCheckSelection {
             enabled: changes,
+            test_scopes,
             removed_tests: tests,
         } = selection;
         let mut document = self.read_working_document(session_id, plan_id)?;
@@ -1822,7 +1829,7 @@ impl PlanFileStore {
             .as_ref()
             .context("plan has no configured checks")?
             .config;
-        design.document.set_checks(config, changes)?;
+        design.document.set_checks(config, changes, test_scopes)?;
         design_artifact::revert_authored(PlanArtifact::Checks, design);
         if !tests.is_empty() {
             design_tests::remove(&mut design.document.tests, tests)?;

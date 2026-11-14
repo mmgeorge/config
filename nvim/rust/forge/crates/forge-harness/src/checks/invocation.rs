@@ -1,4 +1,4 @@
-use super::{CheckCase, CheckInputValues, CheckOperation, CheckSelection};
+use super::{CheckInputValues, CheckOperation, CheckSelection};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -10,7 +10,6 @@ pub struct CheckInvocation {
     pub args: Vec<String>,
     pub directory: String,
     pub files: Vec<String>,
-    pub cases: Vec<CheckCase>,
 }
 
 impl CheckInvocation {
@@ -39,8 +38,8 @@ pub(super) fn validate(operation: &CheckOperation) -> Result<()> {
         }
     } else {
         ensure!(
-            schema.is_empty() || operation.input,
-            "shell commands with declared inputs must receive JSON on stdin"
+            schema.is_empty(),
+            "shell commands cannot bind named inputs; use an argv command with complete {{name}} arguments"
         );
     }
     Ok(())
@@ -79,7 +78,6 @@ pub(super) fn resolve(
     operation: &CheckOperation,
     selection: &CheckSelection,
     changed_files: &[String],
-    planned_cases: &[CheckCase],
 ) -> Result<Vec<CheckInvocation>> {
     validate(operation)?;
     super::config::relative_path(directory)?;
@@ -92,17 +90,12 @@ pub(super) fn resolve(
         CheckSelection::Files { files } => files.as_slice(),
         _ => changed_files,
     };
-    let cases = match selection {
-        CheckSelection::Cases { cases } => cases.as_slice(),
-        _ => planned_cases,
-    };
     let schema = BTreeMap::new();
     let inputs = super::inputs::resolve(
         operation.inputs.as_ref().unwrap_or(&schema),
         explicit,
         workspace,
         files,
-        cases,
     )?;
     let mut args = Vec::new();
     for argument in operation.args.as_deref().unwrap_or_default() {
@@ -132,10 +125,53 @@ pub(super) fn resolve(
         } else {
             Vec::new()
         },
-        cases: if matches!(selection, CheckSelection::Cases { .. }) {
-            cases.to_vec()
-        } else {
-            Vec::new()
-        },
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Expand complete argv bindings while preserving shell metacharacters as literal values.
+    #[test]
+    fn custom_inputs_preserve_argument_boundaries_and_reject_shell_bindings() -> Result<()> {
+        let config: super::super::CheckConfig = serde_json::from_value(serde_json::json!({
+            "custom": {"action": {
+                "category": "custom", "command": ["tool", "{values}", "prefix-{values}"],
+                "inputs": {"values": {"type": "array", "description": "Literal values", "required": true}}
+            }}
+        }))?;
+        let mut operation = config.definitions[0].runner.command().unwrap().clone();
+        let selection = CheckSelection::Inputs {
+            inputs: BTreeMap::from([(
+                "values".into(),
+                serde_json::json!([
+                    "with spaces",
+                    "$(never-execute); \"quoted\" & literal",
+                    42,
+                    true
+                ]),
+            )]),
+        };
+        let resolved = resolve(Path::new("."), ".", &operation, &selection, &[])?;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].args,
+            [
+                "with spaces",
+                "$(never-execute); \"quoted\" & literal",
+                "42",
+                "true",
+                "prefix-{values}"
+            ]
+        );
+        operation.args = None;
+        let error = validate(&operation).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shell commands cannot bind named inputs")
+        );
+        Ok(())
+    }
 }

@@ -840,7 +840,7 @@ enum DriverWake {
     InputDelivery(InputDeliveryTarget, InputDeliveryEvent),
     InputCollected(Option<Result<CollectedInput, tokio::task::JoinError>>),
     InputReceipt(InputReceiptWake),
-    Event(Option<OwnerEvent>),
+    Event(Box<Option<OwnerEvent>>),
     Foreground(ForegroundInput),
     InternalCompleted(InternalCompletion),
     Dispatched(

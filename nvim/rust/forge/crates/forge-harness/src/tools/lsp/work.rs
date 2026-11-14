@@ -116,6 +116,7 @@ mod tests {
             "original",
         );
         let change = crate::tools::lsp::HostFileChange {
+            reservation: None,
             scope,
             call_id: forge_provider_api::control::ToolCallId::new("rename")?,
             native_item_id: None,
@@ -133,9 +134,14 @@ mod tests {
         let worker_owner = owner.clone();
         let worker_archive = archive.clone();
         let expected = change.clone();
+        let reservation = crate::checks::CheckReservation::acquire(
+            directory.path(),
+            crate::checks::CheckPurpose::Prepare,
+        )?;
         let waiter = tokio::spawn(async move {
             worker_owner
                 .run(move || {
+                    let _reservation = reservation;
                     std::fs::rename(source, destination)?;
                     entered.send(()).expect("test observes physical commit");
                     held.recv().expect("test releases worker");
@@ -156,6 +162,13 @@ mod tests {
         tokio::pin!(collection);
         assert!(futures_util::poll!(collection.as_mut()).is_pending());
         assert!(archive.collected_file_changes().is_empty());
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                directory.path(),
+                crate::checks::CheckPurpose::Verify,
+            )
+            .is_err()
+        );
         release.send(())?;
         assert!(collection.await.is_none());
         assert_eq!(
@@ -163,6 +176,13 @@ mod tests {
             "retained"
         );
         assert_eq!(archive.collected_file_changes(), vec![expected]);
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                directory.path(),
+                crate::checks::CheckPurpose::Verify,
+            )
+            .is_ok()
+        );
         assert!(owner.finish().await.is_none());
         assert!(owner.run(|| Ok(())).await.is_err());
         Ok(())

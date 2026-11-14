@@ -1,0 +1,5 @@
+cargo-nextest 0.9.151 (6b3f99457 2026-11-02)
+release: 0.9.151
+commit-hash: 6b3f994577a98874a2e0ea5bef77fbbab3434044
+commit-date: 2026-11-02
+host: x86_64-pc-windows-msvc

@@ -20,6 +20,7 @@ use super::{
 };
 
 pub(super) struct ReviewAnnotationView<'view> {
+    pub(super) warning_status: Option<&'view crate::checks::SubmissionWarningStatus>,
     pub(super) annotation: &'view [ReviewAnnotation],
     pub(super) revision: &'view HashMap<String, (RegionRevision, EditSequence)>,
     pub(super) focused: Option<&'view str>,
@@ -138,16 +139,20 @@ pub(super) fn project(
     revealed: &HashSet<(String, String, u32)>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     let ReviewAnnotationView {
+        warning_status,
         annotation,
         revision,
         focused,
     } = annotations;
     let DesignReviewRows {
-        block: source,
+        block: mut source,
         navigation,
         hidden,
         contextual,
     } = rows(document, syntax, public_only, true, trace, revealed)?;
+    if let Some(design) = &document.design {
+        update_warning_status(&mut source, design, warning_status)?;
+    }
     // Render the complete flows section once so each row keeps its Mermaid fence context.
     let flow_text = document
         .design
@@ -1011,22 +1016,15 @@ fn configured_checks(
     let snapshot = snapshot.context("configured checks have no snapshot")?;
     let mut commands = HashMap::new();
     for check in &snapshot.config.definitions {
-        let operation = match check.scope {
-            CheckScope::All => Some(&check.all),
-            CheckScope::ChangedFiles => check.files.as_ref(),
-            CheckScope::ChangedCases | CheckScope::NewCases => check.cases.as_ref(),
-        }
-        .with_context(|| format!("{} has no command for its configured scope", check.name))?;
-        commands.insert(check.id.as_str(), operation.display());
+        commands.insert(check.id.as_str(), check.runner.display());
     }
     let mut table = vec![["Stage", "Command", "Scope", "Triggers", "Requires"].map(str::to_owned)];
     for index in snapshot.config.order()? {
         let check = &snapshot.config.definitions[index];
         let scope = match check.scope {
             CheckScope::All => "All",
-            CheckScope::ChangedFiles => "Changed files",
-            CheckScope::ChangedCases => "Changed cases",
-            CheckScope::NewCases => "New cases",
+            CheckScope::Paths => "Changed paths",
+            CheckScope::Tests => "Affected tests",
         };
         let trigger = if !check.auto {
             "Explicit runs only".into()
@@ -1227,6 +1225,52 @@ pub(super) fn test_inventory(
         text: BufferText::from_rows([""])?,
         metadata: BlockMetadata::default(),
     });
+    if let Some(report) = &design.submission_warnings
+        && !report.warnings().is_empty()
+    {
+        let warning_start = block.len();
+        block.push(BufferBlock {
+            id: BlockId("plan:tests:warnings:status".into()),
+            text: BufferText::from_rows([
+                "Submission warnings — captured observations; live inputs not revalidated",
+            ])?,
+            metadata: BlockMetadata::default(),
+        });
+        let matches = report.matches_plan(design)?;
+        for (index, warning) in report.warnings().iter().enumerate() {
+            let location = if matches {
+                format!("docs/tests.md:{}", warning.line)
+            } else {
+                "previous submission".into()
+            };
+            block.push(BufferBlock {
+                id: BlockId(format!("plan:tests:warnings:{index}")),
+                text: BufferText::from_rows([format!(
+                    "{location}: warning: {}",
+                    warning
+                        .message
+                        .lines()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .replace('\0', "�")
+                )])?,
+                metadata: BlockMetadata::default(),
+            });
+        }
+        update_warning_status(&mut block, design, None)?;
+        for line in warning_start + 1..=block.len() {
+            anchors.push(PlanNavigationAnchor {
+                columns: None,
+                line: u32::try_from(line)?,
+                target: PlanReviewTarget::Section {
+                    section: super::PlanSection::Tests,
+                },
+                json_path: "/design/submission_warnings".into(),
+                path: None,
+                label: "Submission warning".into(),
+            });
+        }
+    }
     for (file_index, file) in files.iter().enumerate() {
         let original_path = design
             .moved
@@ -1378,6 +1422,36 @@ pub(super) fn test_inventory(
     }
     fold(&mut block, 0, "plan:section:tests")?;
     Ok((block, anchors))
+}
+
+/// Keep retained warnings visible while distinguishing stale or unchecked input identities.
+pub(super) fn update_warning_status(
+    blocks: &mut [BufferBlock],
+    design: &super::DeclarationDesign,
+    status: Option<&crate::checks::SubmissionWarningStatus>,
+) -> Result<()> {
+    let Some(report) = &design.submission_warnings else {
+        return Ok(());
+    };
+    let Some(block) = blocks
+        .iter_mut()
+        .find(|block| block.id.0 == "plan:tests:warnings:status")
+    else {
+        return Ok(());
+    };
+    let label = if !report.matches_plan(design)? {
+        "Stale submission warnings — authored tests or reviewer choices changed; resubmit to replace them".into()
+    } else {
+        status.map(|status| status.label()).unwrap_or_else(|| {
+            "Submission warnings — captured observations; live inputs not revalidated".into()
+        })
+    };
+    block.text = BufferText::from_rows([label
+        .lines()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('\0', "�")])?;
+    Ok(())
 }
 
 /// Recolor a value or construction reference by the narrative symbol it names, so types and

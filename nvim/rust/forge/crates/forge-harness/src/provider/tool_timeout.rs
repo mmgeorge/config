@@ -37,6 +37,8 @@ enum ToolDeadline {
         background: bool,
     },
     UserInput,
+    /// Discovery's check owner enforces its deadline and collects children before replying.
+    CheckDiscovery,
     Finished,
 }
 
@@ -182,6 +184,8 @@ impl ToolWatchdog {
                         && descriptor.arguments.value()["wait"].as_bool() == Some(true)
                     {
                         ToolDeadline::UserInput
+                    } else if descriptor.name == "check_discover" {
+                        ToolDeadline::CheckDiscovery
                     } else {
                         ToolDeadline::Running {
                             deadline: Instant::now() + self.duration,
@@ -386,7 +390,9 @@ impl ToolWatchdog {
                         ToolDeadline::Running {
                             deadline, title, ..
                         } => Some((*deadline, address.clone(), title.clone())),
-                        ToolDeadline::UserInput | ToolDeadline::Finished => None,
+                        ToolDeadline::UserInput
+                        | ToolDeadline::CheckDiscovery
+                        | ToolDeadline::Finished => None,
                     })
                     .min_by_key(|(deadline, _, _)| *deadline);
                 (next, state.foreground_finished)
@@ -529,22 +535,23 @@ mod tests {
         )
     }
 
-    /// Questions remain unbounded without disabling unrelated tool deadlines.
+    /// User waits and owner-timed discovery do not disable unrelated tool deadlines.
     #[tokio::test(start_paused = true)]
     async fn waiting_questions_do_not_expire_but_other_tools_do() -> Result<()> {
         let watchdog = watchdog()?;
-        let question = address("question_ask");
-        watchdog.observe(&requested(
-            &question,
-            TestTool::Tool,
-            serde_json::json!({"wait":true}),
-        ))?;
-        watchdog.observe(&item(
-            &question,
-            ItemEvent::Tool {
-                event: ToolItemEvent::ExecutionStarted,
-            },
-        ))?;
+        for (name, arguments) in [
+            ("question_ask", serde_json::json!({"wait":true})),
+            ("check_discover", serde_json::json!({"check":"unit"})),
+        ] {
+            let managed = address(name);
+            watchdog.observe(&requested(&managed, TestTool::Tool, arguments))?;
+            watchdog.observe(&item(
+                &managed,
+                ItemEvent::Tool {
+                    event: ToolItemEvent::ExecutionStarted,
+                },
+            ))?;
+        }
         tokio::time::advance(Duration::from_secs(10)).await;
         let mut pending = Box::pin(watchdog.expired());
         assert!(futures_util::poll!(pending.as_mut()).is_pending());

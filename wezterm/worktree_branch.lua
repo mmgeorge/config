@@ -60,7 +60,7 @@ function M.logical_name(ref, source)
 end
 
 ---@param state WorktreeRemoteState
----@return 'create_tracking'|'blocked_checked_out'|'use_local'|'reset_to_remote'
+---@return 'create_tracking'|'blocked_checked_out'|'use_local'|'fast_forward'
 function M.existing_remote_action(state)
   if not state.local_exists then
     return 'create_tracking'
@@ -74,7 +74,7 @@ function M.existing_remote_action(state)
     return 'use_local'
   end
 
-  return 'reset_to_remote'
+  return 'fast_forward'
 end
 
 return M

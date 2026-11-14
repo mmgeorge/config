@@ -36,7 +36,8 @@ impl std::fmt::Display for CheckFailure {
 
 impl std::error::Error for CheckFailure {}
 
-pub(super) fn classify(error: &anyhow::Error, fallback: CheckState) -> CheckState {
+/// Preserve an assigned check failure state or classify the receiving boundary's fallback.
+pub(crate) fn classify(error: &anyhow::Error, fallback: CheckState) -> CheckState {
     if let Some(failure) = error.downcast_ref::<CheckFailure>() {
         failure.state
     } else if error.is::<std::io::Error>() {

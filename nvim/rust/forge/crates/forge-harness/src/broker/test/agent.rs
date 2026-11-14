@@ -1282,3 +1282,89 @@ async fn idle_drain_launches_children_queued_for_capacity() -> Result<()> {
     );
     Ok(())
 }
+
+/// A failed child outcome still records committed edits before releasing writer exclusion.
+#[tokio::test]
+async fn child_file_change_reservation_requires_durable_completion() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let work = admit_child_fixture(&mut broker, "rename-child")?;
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(work.agent.id.clone())?,
+    )?;
+    let address = child_address(&owner, &work.task.id);
+    broker
+        .observe_child_fixture(
+            owner.clone(),
+            &work.task.id,
+            child_event(
+                &address,
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 100,
+                }),
+            ),
+            &mut Vec::new(),
+        )
+        .await?;
+    let change = crate::tools::lsp::HostFileChange {
+        reservation: Some(crate::checks::MutationReservation::acquire(
+            repository.path(),
+        )?),
+        scope: address.scope,
+        call_id: forge_provider_api::control::ToolCallId::new("child-rename")?,
+        native_item_id: None,
+        changes: Default::default(),
+    };
+    let database = crate::storage::test::raw_connection(data.path())?;
+    database.execute_batch(
+        "CREATE TRIGGER refuse_child_change BEFORE UPDATE ON exchange_record
+         BEGIN SELECT RAISE(ABORT,'child change refused'); END;",
+    )?;
+    let error = broker
+        .apply_managed_agent_completion(
+            owner.clone(),
+            work.task.id.clone(),
+            Err(anyhow::anyhow!("native turn failed")),
+            vec![change.clone()],
+            None,
+        )
+        .err()
+        .context("failed child storage acknowledged the mutation")?;
+    assert!(format!("{error:#}").contains("child change refused"));
+    assert!(
+        broker
+            .store
+            .load_exchange(&work.task.id)?
+            .context("child exchange disappeared")?
+            .host_file_changes
+            .is_empty()
+    );
+    assert!(
+        crate::checks::CheckReservation::acquire(
+            repository.path(),
+            crate::checks::CheckPurpose::Verify
+        )
+        .is_err()
+    );
+    database.execute_batch("DROP TRIGGER refuse_child_change;")?;
+    broker.apply_managed_agent_completion(
+        owner,
+        work.task.id.clone(),
+        Err(anyhow::anyhow!("native turn failed")),
+        vec![change.clone()],
+        None,
+    )?;
+    let recorded = broker
+        .store
+        .load_exchange(&work.task.id)?
+        .context("child completion disappeared")?;
+    assert_eq!(recorded.host_file_changes, vec![change]);
+    assert_eq!(recorded.state(), ExchangeState::Failed);
+    let _verification = crate::checks::CheckReservation::acquire(
+        repository.path(),
+        crate::checks::CheckPurpose::Verify,
+    )?;
+    Ok(())
+}

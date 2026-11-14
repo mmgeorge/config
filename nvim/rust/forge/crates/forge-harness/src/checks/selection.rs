@@ -4,17 +4,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-/// Identifies a runner-resolvable test case and its project-relative source file.
-pub struct CheckCase {
-    pub file: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional executable target, such as lib, bin:cli, or test:gameplay.
-    pub target: Option<String>,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 /// Selects coverage without allowing the caller to replace configured commands.
@@ -27,8 +16,11 @@ pub enum CheckSelection {
     Files {
         files: Vec<String>,
     },
-    Cases {
-        cases: Vec<CheckCase>,
+    Tests {
+        tests: super::adapter::TestSelection,
+    },
+    Paths {
+        paths: super::adapter::PathSelection,
     },
 }
 
@@ -38,30 +30,14 @@ impl CheckSelection {
         match self {
             Self::All => {}
             Self::Inputs { .. } => {}
+            Self::Tests { tests } => tests.normalize()?,
+            Self::Paths { paths } => paths.normalize()?,
             Self::Files { files } => {
                 for file in files.iter() {
                     super::config::relative_path(file)?;
                 }
                 files.sort();
                 files.dedup();
-            }
-            Self::Cases { cases } => {
-                for case in cases.iter() {
-                    super::config::relative_path(&case.file)?;
-                    ensure!(
-                        !case.name.is_empty() && !case.name.contains('\0'),
-                        "invalid test case name"
-                    );
-                    ensure!(
-                        case.target
-                            .as_ref()
-                            .is_none_or(|target| !target.is_empty()
-                                && !target.chars().any(char::is_control)),
-                        "invalid test target"
-                    );
-                }
-                cases.sort();
-                cases.dedup();
             }
         }
         Ok(())
@@ -72,7 +48,17 @@ impl CheckSelection {
             Self::All => false,
             Self::Inputs { .. } => false,
             Self::Files { files } => files.is_empty(),
-            Self::Cases { cases } => cases.is_empty(),
+            Self::Tests { .. } => false,
+            Self::Paths { .. } => false,
+        }
+    }
+
+    /// Recognize no applicable work in an implicit default without changing explicit all semantics.
+    pub(super) fn default_empty(&self) -> bool {
+        match self {
+            Self::Tests { tests } => tests.is_all(),
+            Self::Paths { paths } => paths.paths.is_empty(),
+            Self::All | Self::Inputs { .. } | Self::Files { .. } => self.empty(),
         }
     }
 }
@@ -84,6 +70,15 @@ pub struct CheckRunRequest {
     pub check: CheckNames,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<super::CheckInputValues>,
+    /// Explicit adapter item IDs and affected paths; empty arrays select all tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<super::adapter::TestSelection>,
+    /// Explicit paths for a diagnostic or formatting adapter; empty selects all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Request format apply or lint fix instead of read-only verification.
+    #[serde(default)]
+    pub apply: bool,
     #[serde(default)]
     pub all: bool,
 }
@@ -108,11 +103,21 @@ impl TryFrom<CheckRunRequest> for RunRequest {
             "check is required"
         );
         ensure!(
-            !(request.inputs.is_some() && request.all),
-            "choose inputs or all, not both"
+            usize::from(request.inputs.is_some())
+                + usize::from(request.tests.is_some())
+                + usize::from(request.paths.is_some())
+                + usize::from(request.all)
+                <= 1,
+            "choose inputs, tests, paths, or all, not more than one"
         );
         let selection = if let Some(inputs) = request.inputs {
             Some(CheckSelection::Inputs { inputs })
+        } else if let Some(tests) = request.tests {
+            Some(CheckSelection::Tests { tests })
+        } else if let Some(paths) = request.paths {
+            Some(CheckSelection::Paths {
+                paths: super::adapter::PathSelection { paths },
+            })
         } else if request.all {
             Some(CheckSelection::All)
         } else {
@@ -120,6 +125,11 @@ impl TryFrom<CheckRunRequest> for RunRequest {
         };
         let mut result = SelectedChecks {
             ids: names.clone(),
+            purpose: if request.apply {
+                super::CheckPurpose::Prepare
+            } else {
+                super::CheckPurpose::Verify
+            },
             ..SelectedChecks::default()
         };
         if let Some(mut selection) = selection {
@@ -148,6 +158,8 @@ pub enum RunRequest {
 #[serde(deny_unknown_fields)]
 pub struct SelectedChecks {
     #[serde(default)]
+    pub purpose: super::CheckPurpose,
+    #[serde(default)]
     pub ids: Vec<String>,
     #[serde(default)]
     /// Adds explicit suites without excluding automatically applicable suites.
@@ -159,6 +171,8 @@ pub struct SelectedChecks {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RunRequestWire {
+    #[serde(default)]
+    apply: bool,
     #[serde(default)]
     all: bool,
     #[serde(default)]
@@ -177,12 +191,22 @@ impl TryFrom<RunRequestWire> for RunRequest {
             ensure!(
                 request.ids.is_empty()
                     && request.include.is_empty()
-                    && request.selections.is_empty(),
+                    && request.selections.is_empty()
+                    && !request.apply,
                 "choose all checks or explicit selections, not both"
             );
             Ok(Self::All)
         } else {
+            ensure!(
+                !request.apply || (!request.ids.is_empty() && request.include.is_empty()),
+                "apply requires explicitly named checks"
+            );
             Ok(Self::Selected(SelectedChecks {
+                purpose: if request.apply {
+                    super::CheckPurpose::Prepare
+                } else {
+                    super::CheckPurpose::Verify
+                },
                 ids: request.ids,
                 include: request.include,
                 selections: request.selections,
@@ -199,6 +223,7 @@ impl From<RunRequest> for RunRequestWire {
                 ..Self::default()
             },
             RunRequest::Selected(selection) => Self {
+                apply: selection.purpose == super::CheckPurpose::Prepare,
                 all: false,
                 ids: selection.ids,
                 include: selection.include,
@@ -219,6 +244,7 @@ impl std::ops::Deref for RunRequest {
 
     fn deref(&self) -> &Self::Target {
         static EMPTY: SelectedChecks = SelectedChecks {
+            purpose: super::CheckPurpose::Verify,
             ids: Vec::new(),
             include: Vec::new(),
             selections: BTreeMap::new(),
@@ -234,13 +260,11 @@ impl RunRequest {
     pub(crate) fn is_all(&self) -> bool {
         matches!(self, Self::All)
     }
-    /// Resolves configured defaults from the task's actual files and accepted changed-case inventory.
+    /// Resolve category defaults from the task's changed paths and explicit adapter selectors.
     pub(crate) fn selections(
         &self,
         config: &CheckConfig,
         files: &[String],
-        cases: Option<&[CheckCase]>,
-        new_cases: Option<&[CheckCase]>,
         has_scope: bool,
     ) -> Result<BTreeMap<String, CheckSelection>> {
         let known: BTreeSet<_> = config
@@ -275,95 +299,213 @@ impl RunRequest {
             } else {
                 match definition.scope {
                     CheckScope::All => CheckSelection::All,
-                    CheckScope::ChangedFiles => {
+                    CheckScope::Paths | CheckScope::Tests => {
                         ensure!(
                             has_scope,
                             "{} requires declared inputs or full context outside a task execution",
                             definition.id
                         );
-                        CheckSelection::Files {
-                            files: files
-                                .iter()
-                                .filter(|file| definition.trigger.matches_path(file))
-                                .cloned()
-                                .collect(),
-                        }
-                    }
-                    CheckScope::ChangedCases | CheckScope::NewCases => {
-                        ensure!(
-                            has_scope,
-                            "{} requires declared inputs or full context outside plan execution",
-                            definition.id
-                        );
-                        CheckSelection::Cases {
-                            cases: (if definition.scope == CheckScope::NewCases {
-                                new_cases
-                            } else {
-                                cases
-                            })
-                            .unwrap_or_default()
+                        let paths = files
                             .iter()
-                            .filter(|case| definition.trigger.matches_path(&case.file))
+                            .filter(|file| definition.trigger.matches_path(file))
                             .cloned()
-                            .collect(),
+                            .collect();
+                        match definition.scope {
+                            CheckScope::Tests => CheckSelection::Tests {
+                                tests: super::adapter::TestSelection {
+                                    ids: Vec::new(),
+                                    affected: paths,
+                                },
+                            },
+                            CheckScope::Paths if definition.runner.command().is_some() => {
+                                CheckSelection::Files { files: paths }
+                            }
+                            CheckScope::Paths => CheckSelection::Paths {
+                                paths: super::adapter::PathSelection { paths },
+                            },
+                            CheckScope::All => {
+                                unreachable!("all scope is handled before path selection")
+                            }
                         }
                     }
                 }
             };
             selection.normalize()?;
+            match (&definition.runner, &selection) {
+                (
+                    super::CheckRunner::Command(_),
+                    CheckSelection::Tests { .. } | CheckSelection::Paths { .. },
+                ) => {
+                    anyhow::bail!(
+                        "{}: structured selection requires an adapter",
+                        definition.id
+                    )
+                }
+                (super::CheckRunner::Adapter(_), CheckSelection::Inputs { .. }) => anyhow::bail!(
+                    "{}: adapter checks require tests or all, not custom inputs",
+                    definition.id
+                ),
+                (super::CheckRunner::Adapter(_), CheckSelection::Files { .. }) => anyhow::bail!(
+                    "{}: adapter checks require tests, paths, or all",
+                    definition.id
+                ),
+                _ => {}
+            }
+            match (&selection, definition.category) {
+                (CheckSelection::Tests { .. }, category)
+                    if matches!(definition.runner, super::CheckRunner::Adapter(_))
+                        && category != super::CheckCategory::Test =>
+                {
+                    anyhow::bail!(
+                        "{}: test selection requires the test category",
+                        definition.id
+                    )
+                }
+                (
+                    CheckSelection::Paths { .. },
+                    super::CheckCategory::Test | super::CheckCategory::Custom,
+                ) => anyhow::bail!(
+                    "{}: paths selection requires a path-category adapter",
+                    definition.id
+                ),
+                _ => {}
+            }
             result.insert(definition.id.clone(), selection);
         }
         Ok(result)
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-/// Proves the scoped handler resolved real coverage rather than accepting an empty test filter.
-pub struct CheckReceipt {
-    pub version: u32,
-    pub selection: CheckSelection,
-}
+#[cfg(test)]
+mod adapter_selection_tests {
+    use super::*;
 
-impl CheckReceipt {
-    /// Validates a handler receipt before its successful process status can count as coverage.
-    pub(crate) fn validate(&mut self) -> Result<()> {
-        ensure!(self.version == 1, "unsupported selection receipt version");
-        self.selection.normalize()?;
-        ensure!(
-            !self.selection.empty(),
-            "requested scope resolved to no tests or a broader suite"
+    /// Preserve the requested operation through public selection and owner receipt encoding.
+    #[test]
+    fn apply_round_trips_without_selecting_every_check() {
+        let request: CheckRunRequest = serde_json::from_value(serde_json::json!({
+            "check":["format","lint"], "apply":true, "all":true
+        }))
+        .unwrap();
+        let request = RunRequest::try_from(request).unwrap();
+        assert!(!request.is_all());
+        assert_eq!(request.purpose, super::super::CheckPurpose::Prepare);
+        assert_eq!(request.selections.len(), 2);
+        assert!(
+            request
+                .selections
+                .values()
+                .all(|selection| *selection == CheckSelection::All)
         );
-        Ok(())
+        let encoded = serde_json::to_value(&request).unwrap();
+        let restored: RunRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.purpose, super::super::CheckPurpose::Prepare);
+        assert_eq!(restored.ids, request.ids);
+        assert_eq!(restored.selections, request.selections);
+        for invalid in [
+            serde_json::json!({"apply":true,"all":true}),
+            serde_json::json!({"apply":true,"include":["format"]}),
+            serde_json::json!({"apply":true,"ids":["format"],"include":["lint"]}),
+        ] {
+            assert!(serde_json::from_value::<RunRequest>(invalid).is_err());
+        }
     }
 
-    /// Rejects receipts that widen requested files or replace requested cases with file-wide coverage.
-    pub(crate) fn validate_request(&mut self, requested: &CheckSelection) -> Result<()> {
-        self.validate()?;
-        let contained = match (requested, &self.selection) {
-            (
-                CheckSelection::Inputs { inputs: requested },
-                CheckSelection::Inputs { inputs: resolved },
-            ) => requested == resolved,
-            (CheckSelection::All, _) => true,
-            (
-                CheckSelection::Files { files: requested },
-                CheckSelection::Files { files: resolved },
-            ) => resolved.iter().all(|file| requested.contains(file)),
-            (
-                CheckSelection::Files { files: requested },
-                CheckSelection::Cases { cases: resolved },
-            ) => resolved.iter().all(|case| requested.contains(&case.file)),
-            (
-                CheckSelection::Cases { cases: requested },
-                CheckSelection::Cases { cases: resolved },
-            ) => resolved.iter().all(|case| requested.contains(case)),
-            _ => false,
-        };
-        ensure!(
-            contained,
-            "selection receipt broadens the requested coverage; fix the scoped handler"
+    /// Validate the entire selected set before any adapter receives incompatible selectors.
+    #[test]
+    fn paths_are_normalized_and_category_checked_for_every_selected_check() {
+        let config: CheckConfig = serde_json::from_value(serde_json::json!({
+            "compiler":{"action":{"category":"typecheck","adapter":{"script":{"command":["nu","compiler.nu"]}}}},
+            "unit":{"action":{"category":"test","adapter":{"script":{"command":["nu","test.nu"]}}}}
+        })).unwrap();
+        let request: CheckRunRequest = serde_json::from_value(
+            serde_json::json!({"check":"compiler","paths":["src/b.rs","src/a.rs","src/a.rs"]}),
+        )
+        .unwrap();
+        let request = RunRequest::try_from(request).unwrap();
+        let selected = request.selections(&config, &[], false).unwrap();
+        assert_eq!(
+            selected["compiler"],
+            CheckSelection::Paths {
+                paths: super::super::adapter::PathSelection {
+                    paths: vec!["src/a.rs".into(), "src/b.rs".into()]
+                }
+            }
         );
-        Ok(())
+        for value in [
+            serde_json::json!({"check":["compiler","unit"],"paths":["src/a.rs"]}),
+            serde_json::json!({"check":"compiler","tests":{}}),
+        ] {
+            let request =
+                RunRequest::try_from(serde_json::from_value::<CheckRunRequest>(value).unwrap())
+                    .unwrap();
+            assert!(request.selections(&config, &[], false).is_err());
+        }
+        let request = RunRequest::try_from(
+            serde_json::from_value::<CheckRunRequest>(
+                serde_json::json!({"check":"compiler","paths":[],"all":true}),
+            )
+            .unwrap(),
+        );
+        assert!(request.is_err());
+    }
+
+    /// Preserve opaque IDs while deriving implicit affected-path selections without widening emptiness.
+    #[test]
+    fn adapter_ids_and_implicit_affected_paths_keep_distinct_empty_semantics() {
+        let config: CheckConfig = serde_json::from_value(serde_json::json!({
+            "unit":{"action":{"category":"test","adapter":{"script":{"command":["nu","tests.nu"]}}}}
+        }))
+        .unwrap();
+        let selection = CheckSelection::Tests {
+            tests: super::super::adapter::TestSelection {
+                ids: vec!["opaque ID".to_owned().try_into().unwrap()],
+                affected: Vec::new(),
+            },
+        };
+        let request = RunRequest::Selected(SelectedChecks {
+            ids: vec!["unit".into()],
+            selections: [("unit".into(), selection.clone())].into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            request.selections(&config, &[], true).unwrap()["unit"],
+            selection
+        );
+        let request = RunRequest::default();
+        let empty = request.selections(&config, &[], true).unwrap();
+        assert!(empty["unit"].default_empty());
+        let selected = request
+            .selections(&config, &["tests/unit.lua".into()], true)
+            .unwrap();
+        assert_eq!(
+            selected["unit"],
+            CheckSelection::Tests {
+                tests: super::super::adapter::TestSelection {
+                    ids: Vec::new(),
+                    affected: vec!["tests/unit.lua".into()]
+                }
+            }
+        );
+        assert!(!selected["unit"].default_empty());
+    }
+
+    #[test]
+    fn empty_explicit_test_arrays_mean_all_and_conflicts_are_rejected() {
+        let request: CheckRunRequest =
+            serde_json::from_value(serde_json::json!({"check":"unit","tests":{}})).unwrap();
+        let resolved = RunRequest::try_from(request).unwrap();
+        let CheckSelection::Tests { tests } = &resolved.selections["unit"] else {
+            panic!("missing explicit test selection")
+        };
+        assert!(tests.is_all());
+        assert!(!resolved.selections["unit"].empty());
+        for conflicting in [
+            serde_json::json!({"check":"unit","tests":{},"all":true}),
+            serde_json::json!({"check":"unit","tests":{},"inputs":{}}),
+        ] {
+            let request: CheckRunRequest = serde_json::from_value(conflicting).unwrap();
+            assert!(RunRequest::try_from(request).is_err());
+        }
     }
 }

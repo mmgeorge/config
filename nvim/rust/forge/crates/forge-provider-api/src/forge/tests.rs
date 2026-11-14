@@ -130,6 +130,15 @@ fn plan_review_renders_decision_comments_and_edits() {
     }));
     assert!(accepted.contains("The user accepted the plan"));
     assert!(!accepted.contains("user's edits"));
+    let scoped = input_block(&TurnInput::new(TurnKind::PlanReview {
+        review: PlanReview::Accepted {
+            edits: vec![PlanEdit::SetTestScope {
+                id: "tests".into(),
+                scope: PlanTestScope::WholeSuite,
+            }],
+        },
+    }));
+    assert!(scoped.contains("<set_test_scope id=\"tests\" scope=\"whole_suite\"/>"));
 }
 
 /// Reject containers that would render an element without content.

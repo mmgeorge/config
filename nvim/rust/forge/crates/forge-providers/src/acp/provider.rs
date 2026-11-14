@@ -813,6 +813,10 @@ impl AcpProvider {
             &self.runtime_root,
             &request.configuration.resources.skills,
         )?);
+        let process_owner = request
+            .resource_lease
+            .as_ref()
+            .and_then(|lease| lease.process_owner());
         cleanup.retain_lease(request.resource_lease.take());
         let selection = request.configuration.resources.clone();
         let state = Arc::new(AcpSessionState::new_binding(
@@ -821,6 +825,7 @@ impl AcpProvider {
         ));
         let conversation = AcpConversation::open(
             super::AcpLaunch {
+                process_owner,
                 command: &runtime.command,
                 environment: &runtime.environment,
                 workspace: &request.workspace,
@@ -1536,6 +1541,7 @@ impl AcpProvider {
             cleanup.retain_profile(super::profile::create(self.kind, &self.runtime_root, &[])?);
         let connection = super::AcpConnection::launch_retained(
             super::AcpLaunch {
+                process_owner: None,
                 command: &runtime.command,
                 environment: &runtime.environment,
                 workspace,

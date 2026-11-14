@@ -64,6 +64,7 @@ struct Node {
 
 /// Own all prepared mutations and their recovery image until commit settles.
 pub(super) struct Transaction {
+    repository: crate::checks::MutationReservation,
     before: BTreeMap<String, Node>,
     after: BTreeMap<String, Node>,
     roots: Vec<PathBuf>,
@@ -137,6 +138,7 @@ impl Transaction {
         scope: &LspScope,
         policy: &DirectoryPolicy,
         prepared: Prepared,
+        repository_scope: Option<&crate::repository_access::RepositoryScope>,
     ) -> Result<Self> {
         let mut roots = Vec::new();
         for operation in &prepared.operations {
@@ -297,7 +299,17 @@ impl Transaction {
         for node in after.values() {
             authorize(scope, policy, &node.path.to_string_lossy(), true)?;
         }
+        // Acquire before exposing a committable transaction; the worker retains it through publication.
+        let repository = match repository_scope {
+            Some(owner) => {
+                crate::checks::MutationReservation::acquire_scoped(&scope.workspace, Some(owner))
+            }
+            None => crate::checks::MutationReservation::acquire(&scope.workspace),
+        }
+        .map_err(MutationError::Reservation)?;
+        scope.check().map_err(MutationError::Service)?;
         Ok(Self {
+            repository,
             before,
             after,
             roots: distinct,
@@ -306,8 +318,16 @@ impl Transaction {
         })
     }
 
+    /// Transfer shared reservation ownership into the physical change's completion record.
+    pub(super) fn reservation(&self) -> crate::checks::MutationReservation {
+        self.repository.clone()
+    }
+
     /// Commit staged content after a final disk freshness check, rolling back every write on failure.
     pub(super) fn commit(&mut self) -> Result<()> {
+        self.repository
+            .validate()
+            .map_err(MutationError::Reservation)?;
         let mut current = BTreeMap::new();
         for root in &self.roots {
             capture(root, &mut current, &mut |_| Ok(()))?;
@@ -699,6 +719,96 @@ mod tests {
         serde_json::from_value(serde_json::json!({"operations": value})).unwrap()
     }
 
+    /// Keep checks excluded until the owning transaction is collected, including after commit.
+    #[test]
+    fn repository_reservation_covers_transaction_commit_and_collection() {
+        use crate::checks::{CheckPurpose, CheckReservation};
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a"), b"old").unwrap();
+        let (scope, _lease, policy) = fixture(root.path());
+        let edits =
+            serde_json::json!([{"kind":"text","path":"a","before":"old","after":"new","edits":1}]);
+        let reader = CheckReservation::acquire(root.path(), CheckPurpose::Verify).unwrap();
+        assert!(matches!(
+            Transaction::prepare(&scope, &policy, prepared(edits.clone()), None),
+            Err(MutationError::Reservation(_))
+        ));
+        assert_eq!(fs::read(root.path().join("a")).unwrap(), b"old");
+        drop(reader);
+        let mut transaction = Transaction::prepare(&scope, &policy, prepared(edits), None).unwrap();
+        assert!(CheckReservation::acquire(root.path(), CheckPurpose::Verify).is_err());
+        transaction.commit().unwrap();
+        assert_eq!(fs::read(root.path().join("a")).unwrap(), b"new");
+        assert!(CheckReservation::acquire(root.path(), CheckPurpose::Verify).is_err());
+        drop(transaction);
+        assert!(CheckReservation::acquire(root.path(), CheckPurpose::Verify).is_ok());
+    }
+
+    /// Commit under the caller's reservation and return its slot only after durable publication.
+    #[test]
+    fn borrowed_mutation_suspends_parent_until_recording() -> anyhow::Result<()> {
+        use crate::repository_access::{RepositoryAccess, RepositoryReservation};
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("a"), b"old")?;
+        let owner = RepositoryReservation::acquire(root.path(), RepositoryAccess::Write)?;
+        let parent = owner.scope();
+        let (scope, _lease, policy) = fixture(root.path());
+        let edits = prepared(serde_json::json!([
+            {"kind":"text","path":"a","before":"old","after":"new","edits":1}
+        ]));
+        let mut transaction = Transaction::prepare(&scope, &policy, edits, Some(&parent))?;
+        let publication = transaction.reservation();
+        assert!(parent.enter(root.path(), RepositoryAccess::Write).is_err());
+        transaction.commit()?;
+        drop(transaction);
+        assert_eq!(fs::read(root.path().join("a"))?, b"new");
+        assert!(parent.enter(root.path(), RepositoryAccess::Write).is_err());
+        publication.recorded()?;
+        let _resumed = parent.enter(root.path(), RepositoryAccess::Write)?;
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                root.path(),
+                crate::checks::CheckPurpose::Verify
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    /// Parent revocation prevents a prepared descendant from applying its first disk change.
+    #[test]
+    fn revoked_borrow_rejects_commit_without_releasing_uncollected_work() -> anyhow::Result<()> {
+        use crate::repository_access::{RepositoryAccess, RepositoryReservation};
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("a"), b"old")?;
+        let owner = RepositoryReservation::acquire(root.path(), RepositoryAccess::Write)?;
+        let parent = owner.scope();
+        let (scope, _lease, policy) = fixture(root.path());
+        let edits = prepared(serde_json::json!([
+            {"kind":"text","path":"a","before":"old","after":"new","edits":1}
+        ]));
+        let mut transaction = Transaction::prepare(&scope, &policy, edits, Some(&parent))?;
+        drop(owner);
+        assert!(matches!(
+            transaction.commit(),
+            Err(MutationError::Reservation(_))
+        ));
+        assert_eq!(fs::read(root.path().join("a"))?, b"old");
+        assert!(
+            crate::checks::CheckReservation::acquire(
+                root.path(),
+                crate::checks::CheckPurpose::Verify
+            )
+            .is_err()
+        );
+        drop(transaction);
+        let _reader = crate::checks::CheckReservation::acquire(
+            root.path(),
+            crate::checks::CheckPurpose::Verify,
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn denied_destination_leaves_prior_text_edit_untouched() {
         let root = tempfile::tempdir().unwrap();
@@ -712,6 +822,7 @@ mod tests {
                 {"kind":"text","path":"a","before":"old","after":"new","edits":1},
                 {"kind":"rename","old_path":"a","new_path":other.path().join("a")}
             ])),
+            None,
         );
         assert!(matches!(result, Err(MutationError::PathDenied(_))));
         assert_eq!(fs::read(root.path().join("a")).unwrap(), b"old");
@@ -725,7 +836,7 @@ mod tests {
         let edits =
             serde_json::json!([{"kind":"text","path":"a","before":"old","after":"new","edits":1}]);
         let mut transaction =
-            Transaction::prepare(&scope, &policy, prepared(edits.clone())).unwrap();
+            Transaction::prepare(&scope, &policy, prepared(edits.clone()), None).unwrap();
         fs::write(root.path().join("a"), b"user").unwrap();
         assert!(matches!(
             transaction.commit(),
@@ -734,7 +845,7 @@ mod tests {
         assert_eq!(fs::read(root.path().join("a")).unwrap(), b"user");
         policy.access.write_access = crate::session::WriteScope::Off;
         assert!(matches!(
-            Transaction::prepare(&scope, &policy, prepared(edits)),
+            Transaction::prepare(&scope, &policy, prepared(edits), None),
             Err(MutationError::PathDenied(_))
         ));
     }
@@ -751,6 +862,7 @@ mod tests {
                 {"kind":"text","path":"a","before":"old","after":"new","edits":1},
                 {"kind":"create","path":"z"}
             ])),
+            None,
         )
         .unwrap();
         // Inject an impossible final destination after validation, exercising recovery after a writes.

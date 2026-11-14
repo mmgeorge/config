@@ -81,6 +81,8 @@ pub fn signature(
         std::fs::copy(repository.index_path(), &temporary_index)?;
     }
     let mut status = std::process::Command::new("git");
+    // A background monitor would outlive this read and prevent process collection.
+    status.args(["-c", "core.fsmonitor=false"]);
     #[cfg(windows)]
     status.args(["-c", "core.ignoreCase=false"]);
     status
@@ -107,6 +109,7 @@ pub fn signature(
             ":(exclude,attr:filter=lfs)",
         ]);
     let mut names = std::process::Command::new("git");
+    names.args(["-c", "core.fsmonitor=false"]);
     #[cfg(windows)]
     names.args(["-c", "core.ignoreCase=false"]);
     names.current_dir(root).args([
@@ -425,6 +428,7 @@ pub fn write_blob(root: &Path, file: &BaseFile, output: &mut impl Write) -> Resu
     let mut command = std::process::Command::new("git");
     command
         .current_dir(root)
+        .args(["-c", "core.fsmonitor=false"])
         .args(["cat-file", "blob", &file.object_id]);
     let result = crate::command::file_command(
         &mut command,

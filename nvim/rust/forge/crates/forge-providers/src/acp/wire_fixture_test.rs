@@ -259,6 +259,7 @@ impl WireFixture {
         let workspace = directory.path().to_string_lossy().into_owned();
         let connection = AcpConnection::launch(
             AcpLaunch {
+                process_owner: None,
                 command: &command,
                 environment: &environment,
                 workspace: &workspace,

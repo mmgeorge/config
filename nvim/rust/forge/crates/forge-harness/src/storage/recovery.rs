@@ -14,6 +14,9 @@ impl SqliteStore {
 
     /// Recover task state without allowing an admitted plan write to cross the recovery boundary.
     fn interrupt_detached_execution_locked(&mut self, session_id: &str) -> Result<()> {
+        let check_root = super::state::directory(&self.data_root)
+            .join(session_id)
+            .join("checks");
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -198,6 +201,14 @@ impl SqliteStore {
                 params![task.id, serde_json::to_string(&task)?],
             )?;
         }
+        let active_execution: Option<String> = transaction.query_row(
+            "SELECT json_extract(payload,'$.session.active_task.execution.record') FROM session_record WHERE id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let active_execution = active_execution
+            .map(|payload| serde_json::from_str::<crate::plan::PlanExecutionRecord>(&payload))
+            .transpose()?;
         let executions = {
             let mut statement = transaction
                 .prepare("SELECT payload FROM plan_execution_record WHERE session_id=?1")?;
@@ -207,25 +218,16 @@ impl SqliteStore {
         };
         for payload in executions {
             let mut execution: crate::plan::PlanExecutionRecord = serde_json::from_str(&payload)?;
-            let mut changed = false;
-            for run in &mut execution.check_runs {
-                if run.state == crate::checks::CheckState::Running {
-                    run.state = crate::checks::CheckState::Interrupted;
-                    for command in &mut run.commands {
-                        if command.state == crate::checks::CheckState::Running {
-                            command.state = crate::checks::CheckState::Interrupted;
-                            command.output_bytes = std::fs::metadata(&command.output)
-                                .map_or(0, |metadata| metadata.len());
-                        }
-                    }
-                    changed = true;
-                }
+            if let Some(active) = &active_execution
+                && active.id == execution.id
+            {
+                execution = active.clone();
             }
-            if changed {
-                transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.check_runs',json(?2)) WHERE id=?1", params![execution.id,serde_json::to_string(&execution.check_runs)?])?;
-            }
+            execution.check_runs =
+                crate::checks::recover_runs(&check_root, session_id, &execution.check_runs)?;
+            transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.check_runs',json(?2)) WHERE id=?1", params![execution.id,serde_json::to_string(&execution.check_runs)?])?;
         }
-        super::task::recover_active_task(&transaction, session_id)?;
+        super::task::recover_active_task(&transaction, session_id, &check_root)?;
         transaction.commit()?;
         self.refresh_admission_membership(session_id)
     }

@@ -31,6 +31,7 @@ pub(crate) enum PlanEditChange {
     /// Update enabled checks and remove selected planned tests.
     UpdateChecks {
         enabled: BTreeMap<String, bool>,
+        test_scopes: BTreeMap<String, crate::plan::PlanTestScope>,
         tests: Vec<crate::plan::DesignTestSelection>,
     },
 }
@@ -139,11 +140,19 @@ impl TryFrom<StoredPlanEdit> for PlanEdit {
                 }
                 tests.as_slice()
             }
-            PlanEditChange::UpdateChecks { enabled, tests } => {
+            PlanEditChange::UpdateChecks {
+                enabled,
+                test_scopes,
+                tests,
+            } => {
                 if request.expected_version.is_none() || request.digest.is_none() {
                     return Err(TaskCommandFailure::InvalidPlanSelection);
                 }
-                if enabled.keys().any(|id| id.trim().is_empty()) {
+                if enabled
+                    .keys()
+                    .chain(test_scopes.keys())
+                    .any(|id| id.trim().is_empty())
+                {
                     return Err(TaskCommandFailure::InvalidPlanSelection);
                 }
                 tests.as_slice()

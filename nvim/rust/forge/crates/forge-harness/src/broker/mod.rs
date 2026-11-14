@@ -653,7 +653,7 @@ pub(crate) enum ForegroundSignal {
     AdmissionRequested,
     AdmissionPrepared,
     FinalizeEffectsRequested,
-    TerminalWorkspaceCompleted(Result<Box<crate::checkpoint::CheckpointRecord>>),
+    TerminalWorkspaceCompleted(Result<Box<execution::ReservedWorkspace>>),
     PublicationDrained,
     QuestionCatalog(Result<Vec<crate::provider::ProviderModel>>),
     ProviderPrepared(Result<Arc<crate::provider::session_execution::SessionExecution>>),
@@ -1241,7 +1241,7 @@ impl ForegroundJob {
                 ))
             }
             Self::TerminalWorkspace(job) => Ok(ForegroundSignal::TerminalWorkspaceCompleted(
-                job.run().await.map(Box::new),
+                job.run_reserved().await.map(Box::new),
             )),
             Self::AdmissionWorkspace(job) => Ok(ForegroundSignal::AdmissionWorkspaceCompleted(
                 Box::new(job.run().await),
@@ -2999,6 +2999,8 @@ impl HarnessBroker {
             }),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
             repository: None,
+            repository_access: None,
+            repository_process: None,
             harness: None,
             lsp: None,
             aside: crate::tools::AsideToolScope::open(&self.session, &self.session_messages),
@@ -5203,6 +5205,9 @@ impl HarnessBroker {
             };
         }
         self.store.complete_agent_task(&agent, &task, &exchange)?;
+        for change in &exchange.host_file_changes {
+            change.recorded()?;
+        }
         self.agent_registry.insert(agent.clone());
         self.agent_coordinator.retain(agent.clone(), task.clone())?;
         let next = self.agent_coordinator.settled(
@@ -6176,6 +6181,7 @@ impl HarnessBroker {
                     run,
                     self.event_sink.clone(),
                     Some(self.turn_cancellation.subscribe()),
+                    None,
                 )
                 .await?;
             if let Some(scope) = &check_scope {
@@ -9723,7 +9729,7 @@ impl HarnessBroker {
         permit: Option<crate::task::TaskPermit>,
         completed_turn: crate::task::TaskTurnId,
         control: Option<&crate::goal::GoalControl>,
-        workspace: Option<(crate::checkpoint::CheckpointRecord, Option<String>)>,
+        workspace: Option<(&execution::ReservedWorkspace, Option<String>)>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
         if let Some(control) = control
@@ -9753,6 +9759,23 @@ impl HarnessBroker {
         if task.kind() == crate::task::TaskKind::Plan {
             return Err(crate::task::StaleTask.into());
         }
+        if task.kind() == crate::task::TaskKind::Goal
+            && (evidence.structured_complete
+                || control.is_some_and(|control| {
+                    control.termination == crate::goal::GoalTermination::Complete
+                }))
+        {
+            let (workspace, _) = workspace
+                .as_ref()
+                .context("goal completion requires reserved workspace evidence")?;
+            anyhow::ensure!(
+                self.check_runner
+                    .verification_satisfied(workspace.checkpoint())?,
+                "required whole-check verification remains pending; run the originating checks before completing the goal"
+            );
+        }
+        let workspace =
+            workspace.map(|(workspace, previous)| (workspace.checkpoint().clone(), previous));
         let observed = match control {
             Some(control) => self.task_controller.observe_goal_control(
                 &mut self.store,

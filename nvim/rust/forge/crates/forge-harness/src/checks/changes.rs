@@ -12,6 +12,8 @@ use std::{
 /// Compares the current worktree with the task's captured state, including pre-existing edits.
 pub(super) struct CheckChanges {
     path: PathBuf,
+    workspace: PathBuf,
+    data_root: PathBuf,
     checkpoint: GitCheckpoint,
     objects: ObjectStore,
     repositories: Arc<forge_git::store::RepositoryStore>,
@@ -40,21 +42,48 @@ impl CheckChanges {
         let Some(baseline) = baseline else {
             return Ok(None);
         };
-        Ok(Some(
-            self.checkpoint
+        Ok(Some(self.capture(&baseline.checkpoint.session_id).await?))
+    }
+
+    /// Capture discovery inputs even before a task has established its change baseline.
+    pub(super) async fn capture(&self, session_id: &str) -> Result<CheckpointRecord> {
+        let captured_at_ms = super::supervisor::now_ms();
+        if self
+            .repositories
+            .open(self.workspace.clone())
+            .await?
+            .is_some()
+        {
+            return self
+                .checkpoint
                 .capture(
                     &self.objects,
                     &self.repositories,
-                    &baseline.checkpoint.session_id,
-                    super::supervisor::now_ms(),
+                    session_id,
+                    captured_at_ms,
                 )
-                .await?,
-        ))
+                .await;
+        }
+        let workspace = self.workspace.clone();
+        let data_root = self.data_root.clone();
+        let objects = self.objects.clone();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::checkpoint::capture_directory(
+                &workspace,
+                &data_root,
+                &objects,
+                session_id,
+                captured_at_ms,
+            )
+        })
+        .await?
     }
 
     /// Restores the exact task baseline without substituting the Git index or HEAD.
     pub(super) fn open(
         workspace: &Path,
+        data_root: &Path,
         root: &Path,
         objects: ObjectStore,
         repositories: Arc<forge_git::store::RepositoryStore>,
@@ -67,6 +96,8 @@ impl CheckChanges {
         };
         Ok(Self {
             path,
+            workspace: workspace.to_owned(),
+            data_root: data_root.to_owned(),
             checkpoint: GitCheckpoint::new(workspace),
             objects,
             repositories,
@@ -112,15 +143,7 @@ impl CheckChanges {
         let Some(baseline) = baseline else {
             return Ok(());
         };
-        let current = self
-            .checkpoint
-            .capture(
-                &self.objects,
-                &self.repositories,
-                &baseline.checkpoint.session_id,
-                super::supervisor::now_ms(),
-            )
-            .await?;
+        let current = self.capture(&baseline.checkpoint.session_id).await?;
         let files = baseline.checkpoint.changed_paths(&current)?;
         let active = self
             .baseline

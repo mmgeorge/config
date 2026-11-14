@@ -103,4 +103,42 @@ T["plan_check_selection"] = function()
   eq(pending, nil, { fail_reason = "accepted plan allowed a check mutation" })
 end
 
+T["whole_suite_scope"] = function()
+  local picker = require("forge.views.picker")
+  local review = {
+    win = vim.api.nvim_get_current_win(), plan = { state = "awaiting_review" },
+    owner = { document = "scope-review", checks = {
+      { id = "tests", name = "Disabled tests", stage = "test", enabled = false, available = false, test_scope = "planned" },
+      { id = "build", name = "Build", stage = "build", enabled = true, available = true },
+    } },
+  }
+  local requests, pending = {}, nil
+  require("forge.views.plan_review.checks").open(review, function(changes, receive)
+    requests[#requests + 1] = changes
+    pending = receive
+  end)
+  assert(buffer.text(0):find("Planned", 1, true))
+  keymap.invoke("<Right>")
+  eq(requests[1], { test_scopes = { tests = "whole_suite" } })
+  keymap.invoke("<Left>")
+  eq(#requests, 1, { fail_reason = "scope edits must serialize with enablement edits" })
+  review.owner.checks[1].test_scope = "whole_suite"
+  pending(true)
+  assert(buffer.text(0):find("Whole suite", 1, true))
+  eq(review.owner.checks[1].enabled, false, { fail_reason = "scope choice enabled a disabled check" })
+  keymap.invoke("<Space>")
+  eq(#requests, 1)
+  keymap.invoke("<Left>")
+  eq(requests[2], { test_scopes = { tests = "planned" } })
+  pending(false)
+  assert(buffer.text(0):find("Whole suite", 1, true), "failed update changed canonical scope")
+  keymap.invoke("?")
+  assert(buffer.text(0):find(require("forge.shared.command_specs").plan_check_actions.next_scope, 1, true), "help lost the shared scope description")
+  vim.cmd.close()
+  review.plan.state = "accepted"
+  keymap.invoke("<Right>")
+  eq(#requests, 2, { fail_reason = "accepted plan permitted a scope edit" })
+  picker.close()
+end
+
 return T

@@ -15,7 +15,8 @@ pub(super) fn definition() -> ControlToolDefinition {
                 proposed file, reporting each structure problem by line, and automatically validate \
                 Rust and TypeScript imports and signature references against the proposed declarations and \
                 available sources. Proven invalid references return actionable errors and remain editable. \
-                Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success \
+                Unavailable or unsupported evidence remains in saved diagnostics and permits submission. \
+                Existing planned tests receive static discovery warnings without building or running tests. Success \
                 confirms submission and the current version. No implementation build or second model review runs. \
                 Harness accepts full submissions automatically only when the task's auto-accept policy is \
                 enabled; the user controls it with /plan accept on or /plan accept off. Wait for Harness \
@@ -78,8 +79,12 @@ pub(super) async fn execute(
             .context("submission requires semantic structure")?
             .validated(workspace, &document.title)
             .await?;
-        let warnings = grouped_warnings(validated.warnings());
-        document.design = Some(validated.into_design());
+        let mut warnings = validated.warnings();
+        let mut design = validated.into_design();
+        warnings
+            .extend(planned_test_warnings(&runtime.context, &mut design, document.version).await?);
+        let warnings = grouped_warnings(warnings);
+        document.design = Some(design);
         document.validate_for_submission()?;
         let snapshot = authoring.snapshot_save(&document)?;
         invocation.arguments["expected_version"] = json!(original.version);
@@ -127,9 +132,13 @@ pub(super) async fn execute(
         } else {
             design.validated(workspace, &document.title).await?
         };
-        let warnings = grouped_warnings(design.warnings());
+        let mut warnings = design.warnings();
+        let mut design = design.into_design();
+        warnings
+            .extend(planned_test_warnings(&runtime.context, &mut design, document.version).await?);
         let mut submitted = document.clone();
-        submitted.design = Some(design.into_design());
+        let warnings = grouped_warnings(warnings);
+        submitted.design = Some(design);
         submitted.validate_for_submission()?;
         if let Some(execution) = &runtime.context.execution {
             let reason = invocation
@@ -159,8 +168,11 @@ pub(super) async fn execute(
             runtime.context.execution.as_mut().unwrap().generation = generation;
             runtime.context.plan_state = Some(plan_state);
             runtime.plan_document = Some(document);
-            let message =
+            let mut message =
                 super::phase_done::execution_response_text("Revision reviewed.", &response);
+            if !warnings.is_empty() {
+                message.push_str(&format!("\n{}", warnings.join("\n")));
+            }
             return Ok(crate::tools::ControlToolResult {
                 invocation: None,
                 message,
@@ -171,7 +183,7 @@ pub(super) async fn execute(
         let mut message = runtime.plan_version_message("Declaration design submitted for review");
         if !warnings.is_empty() {
             message.push_str(&format!(
-                "\nUnverified reference warnings do not block review:\n{}",
+                "\nSubmission warnings do not block review:\n{}",
                 warnings.join("\n")
             ));
         }
@@ -194,6 +206,41 @@ pub(super) async fn execute(
         invocation: Some(invocation),
         message: runtime.plan_version_message("Plan passed canonical submission validation"),
     })
+}
+
+/// Keep static test inventory warnings distinct from declaration validation and execution evidence.
+async fn planned_test_warnings(
+    context: &crate::tools::ControlTurnContext,
+    design: &mut crate::plan::DeclarationDesign,
+    document_version: u64,
+) -> crate::tools::ToolResult<Vec<crate::plan::PlanViolation>> {
+    design.submission_warnings = None;
+    if let Some(checks) = &context.checks {
+        let report = checks.planned_warnings(design, document_version).await?;
+        let warnings = report
+            .as_ref()
+            .map(|report| {
+                report
+                    .warnings()
+                    .iter()
+                    .map(|warning| warning.violation())
+                    .collect()
+            })
+            .unwrap_or_default();
+        design.submission_warnings = report;
+        return Ok(warnings);
+    }
+    if design.document.tests.iter().any(|file| {
+        file.cases
+            .iter()
+            .any(|case| case.change != crate::plan::DesignTestChange::New)
+    }) {
+        return Ok(vec![crate::plan::PlanViolation {
+            path: "plan:tests.md".into(),
+            message: "static planned-test discovery is unavailable without an authenticated check owner; execution must resolve these entries".into(),
+        }]);
+    }
+    Ok(Vec::new())
 }
 
 /// Print one line per file and warning message, so a file with many unchecked dependency

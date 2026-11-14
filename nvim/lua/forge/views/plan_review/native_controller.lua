@@ -247,13 +247,13 @@ local function submit(review, method, params)
   if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end
 end
 
-local function update_checks(review, enabled, tests, receive)
+local function update_checks(review, enabled, tests, receive, test_scopes)
   if review.plan.historical_revision or review.plan.state ~= "awaiting_review" then
     notice("Only plans awaiting review can change checks")
     if receive then receive(false) end
     return
   end
-  local queued = review.owner.submit("session.plan.check.update", { enabled = enabled, tests = tests or {}, expected_version = review.owner.version }, function(result, failure)
+  local queued = review.owner.submit("session.plan.check.update", { enabled = enabled, tests = tests or {}, test_scopes = test_scopes or {}, expected_version = review.owner.version }, function(result, failure)
     local applied = false
     if failure then notice(failure) else applied = adopt_revision(review, result) end
     if receive then receive(applied) end
@@ -332,7 +332,7 @@ local function commands(review)
   command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
   command_set.register(set, "delete_tests", function() delete_tests(review) end)
   command_set.register(set, "checks", function()
-    require("forge.views.plan_review.checks").open(review, function(enabled, receive) update_checks(review, enabled, nil, receive) end)
+    require("forge.views.plan_review.checks").open(review, function(changes, receive) update_checks(review, changes.enabled or {}, nil, receive, changes.test_scopes) end)
   end)
   for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
