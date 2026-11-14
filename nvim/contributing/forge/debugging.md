@@ -32,6 +32,22 @@ file starts over at its 100 MiB threshold without keeping an older segment.
 `:ForgeStartupLog` opens `stdpath("cache")/rust-sidecar/forge/startup-<pid>.jsonl`, and `:ForgeStartupLog harness` opens `harness-startup-<pid>.jsonl`. They record executable selection, host spawn, request dispatch, snapshot application, and the first redraw. Entries use monotonic microsecond timestamps and exclude prompts and source content. Queue waits overlap across frames, so do not add them together. The per-request events `host.request.send`, `host.response.received`, and `host.result.decoded` are written only at the Trace logging level, because a streaming session issues several requests per rendered frame; lifecycle events are written at every level.
 
 Both writers rotate at a 2 MiB threshold and retain the previous segment as `.1`.
+`ForgeHarnessNew` also records layout, creation dispatch and response, snapshot
+application, and the first redraw in the Harness startup stream. Its response
+duration includes shared-service initialization when the host is cold.
+
+At Info and Trace, the host records `session.startup.milestone` for local broker
+initialization and `session.startup.phase` for model validation, controller setup,
+and the response snapshot. Milestones are cumulative from broker initialization;
+phase durations are independent and nested phases must not be added together.
+Codex records `provider.startup.started` and `provider.startup.phase` for process
+spawn, WebSocket connection, initialization, and model listing. Connection records
+include `cached`, `retry_attempt`, and the measured `retry_wait_ms`; Trace adds
+`provider.startup.connect_attempt` for each attempt. These records retain session,
+request, and provider-operation correlation when available, without request bodies
+or server endpoints. A started phase without completion identifies an interrupted
+or failed boundary; existing error records retain the cause.
+
 The general startup stream also includes host stderr excerpts. Rotation happens
 between write batches and preserves complete records, so a large batch can exceed
 the threshold.

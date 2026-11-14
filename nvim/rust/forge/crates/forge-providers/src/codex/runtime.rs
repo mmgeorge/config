@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -87,7 +87,10 @@ impl CodexRuntime {
 
     /// Connect one session channel without starting another app-server.
     pub async fn connect(&self) -> Result<CodexConnection> {
+        let started = Instant::now();
         let mut server = self.server.lock().await;
+        tracing::info!(target: "forge::provider", event_name = "provider.startup.phase",
+            provider = "codex", phase = "runtime_lock", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         anyhow::ensure!(
             !self.closed.load(Ordering::Acquire),
             "shared Codex runtime is shut down"
@@ -100,19 +103,41 @@ impl CodexRuntime {
             if let Some(previous) = server.as_mut() {
                 previous.collect().await?;
             }
-            *server = Some(self.start()?);
+            let started = Instant::now();
+            tracing::info!(target: "forge::provider", event_name = "provider.startup.started",
+                provider = "codex", phase = "process_spawn");
+            let result = self.start();
+            tracing::info!(target: "forge::provider", event_name = "provider.startup.phase",
+                provider = "codex", phase = "process_spawn", success = result.is_ok(),
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
+            *server = Some(result?);
         }
         let endpoint = server
             .as_ref()
             .map(|server| server.endpoint.clone())
             .context("shared Codex app-server did not retain its endpoint")?;
+        let connection_started = Instant::now();
+        let mut retry_attempt = 0_u64;
+        let mut retry_wait = Duration::ZERO;
+        tracing::info!(target: "forge::provider", event_name = "provider.startup.started",
+            provider = "codex", phase = "websocket_connect", cached = running);
         loop {
             super::operations::check().map_err(anyhow::Error::from)?;
-            match CodexConnection::connect(&endpoint)
+            let attempt_started = Instant::now();
+            let result = CodexConnection::connect(&endpoint)
                 .await
-                .map_err(anyhow::Error::from)
-            {
-                Ok(connection) => return Ok(connection),
+                .map_err(anyhow::Error::from);
+            tracing::trace!(target: "forge::provider", event_name = "provider.startup.connect_attempt",
+                provider = "codex", retry_attempt, success = result.is_ok(),
+                elapsed_ms = attempt_started.elapsed().as_secs_f64() * 1000.0);
+            match result {
+                Ok(connection) => {
+                    tracing::info!(target: "forge::provider", event_name = "provider.startup.phase",
+                        provider = "codex", phase = "websocket_connect", success = true, cached = running,
+                        retry_attempt, retry_wait_ms = retry_wait.as_secs_f64() * 1000.0,
+                        elapsed_ms = connection_started.elapsed().as_secs_f64() * 1000.0);
+                    return Ok(connection);
+                }
                 Err(error) => {
                     if let Some(running) = server.as_mut()
                         && let Some(status) = running
@@ -127,7 +152,10 @@ impl CodexRuntime {
                     }
                     // The websocket is not listening yet. Retry a failed connection inside
                     // the adapter; established sessions use pushed native observations.
+                    let wait_started = Instant::now();
                     tokio::time::sleep(Duration::from_millis(25)).await;
+                    retry_wait += wait_started.elapsed();
+                    retry_attempt += 1;
                 }
             }
         }

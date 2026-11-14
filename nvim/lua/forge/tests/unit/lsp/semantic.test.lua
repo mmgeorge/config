@@ -19,7 +19,7 @@ T["lsp_query"] = function()
   buffer_support.set(buffer, { "😀 value", "function sample() end" })
   vim.bo[buffer].filetype = "lua"
   local handler, calls, pending_callback = nil, {}, nil
-  local client = { id = 981, name = "fixture", config = { root_dir = directory, filetypes = { "lua" } }, offset_encoding = "utf-16" }
+  local client = { initialized = true, id = 981, name = "fixture", config = { root_dir = directory, filetypes = { "lua" } }, offset_encoding = "utf-16" }
   function client:is_stopped() return false end
   function client:supports_method() return true end
   function client:cancel_request() end
@@ -135,6 +135,10 @@ T["lsp_query"] = function()
   assert(#result.rows == 1 and result.rows[1].path == require("forge.lsp.source").canonical(path), "symbol search escaped its file")
   assert(result.rows[1].text == "Function sample" and not result.next_offset, "filtering happened after pagination")
   client.server_info = { name = "rust-analyzer" }
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  stub(vim.lsp, "get_client_by_id", function() return client end)
+  require("forge.lsp.server_status").setup()
+  vim.lsp.handlers["experimental/serverStatus"](nil, { health = "ok", quiescent = true }, { client_id = client.id })
   for _, scope in ipairs({ "workspace", "all" }) do
     handler = function(_, arguments, callback)
       assert(arguments.query == (scope == "all" and "sample#*" or "sample#"), "Rust lookup excluded non-type symbols or dependencies")
@@ -177,6 +181,64 @@ T["workspace_search_never_fans_out"] = function()
   wait_until(function() return done end, "search did not finish")
   eq(failure, nil)
   eq(calls, { 1 })
+end
+
+T["all_semantic_operations_wait_for_the_selected_client"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local await_ready, calls
+  stub(require("forge.lsp.startup"), "ready", function(_, receive)
+    await_ready = receive
+    return function() end
+  end)
+  local directory = temp.directory("semantic-readiness")
+  local path = directory .. "/source.rs"
+  vim.fn.writefile({ "fn sample() {}" }, path)
+  local client = { id = 300, initialized = true, name = "rust", root_dir = directory,
+    config = { root_dir = directory, filetypes = { "rust" } }, offset_encoding = "utf-16",
+    server_capabilities = { diagnosticProvider = { workspaceDiagnostics = true } },
+    is_stopped = function() return false end, supports_method = function() return true end,
+    cancel_request = function() end }
+  function client:request(method, _, receive)
+    calls = calls + 1
+    receive(nil, method == "workspace/diagnostic" and { items = {} } or method == "textDocument/hover" and { contents = "ready" } or {})
+    return true, calls
+  end
+  stub(vim.lsp, "buf_is_attached", function() return true end)
+  for _, operation in ipairs({ "definition", "type_definition", "implementation", "references", "calls", "hover", "document_symbols", "workspace_symbols", "diagnostics" }) do
+    calls = 0
+    local done, failure
+    require("forge.lsp.semantic").request(directory, {
+      operation = operation, path = operation ~= "workspace_symbols" and operation ~= "diagnostics" and path or nil,
+      line = 1, column = 1, query = "sample", direction = "outgoing",
+    }, function(paths, receive)
+      local allowed = {} for _, target in ipairs(paths) do allowed[target] = true end receive(allowed)
+    end, function(_, message) done, failure = true, message end, nil, { client = client })
+    eq(calls, 0)
+    eq(done, nil)
+    await_ready(client)
+    wait_until(function() return done end, operation .. " did not settle")
+    eq(failure, nil)
+    eq(calls > 0, true)
+  end
+end
+
+T["workspace_warning_is_returned_with_symbol_results"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local client = { id = 990, name = "rust_analyzer", initialized = true, root_dir = "/project",
+    config = {}, is_stopped = function() return false end,
+    supports_method = function() return true end, cancel_request = function() end,
+    request = function(_, _, _, receive) receive(nil, {}) return true, 1 end }
+  stub(vim.lsp, "get_client_by_id", function() return client end)
+  require("forge.lsp.server_status").setup()
+  vim.lsp.handlers["experimental/serverStatus"](nil,
+    { health = "warning", quiescent = true, message = "build scripts failed" }, { client_id = client.id })
+  local reply, failure
+  require("forge.lsp.semantic").request("/project", {operation = "workspace_symbols", query = "Session"},
+    function(_, receive) receive({}) end, function(value, message) reply, failure = value, message end,
+    nil, {client = client})
+  wait_until(function() return reply or failure end, "warning-state search did not finish")
+  eq(failure, nil)
+  eq(reply.warnings[1]:find("build scripts failed", 1, true) ~= nil, true)
 end
 
 return T

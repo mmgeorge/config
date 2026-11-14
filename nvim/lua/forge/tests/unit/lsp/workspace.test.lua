@@ -39,4 +39,19 @@ T["configured_preference_resolves_ambiguity"] = function()
   eq(workspace.config("/project/package.json").name, "second")
 end
 
+T["resolve_keeps_caller_pending_until_startup_answers"] = function()
+  local root = temp.directory("pending-startup")
+  local manifest = root .. "/Cargo.toml"
+  vim.fn.writefile({ "[package]" }, manifest)
+  stub(vim.lsp, "get_configs", function() return { { name = "rust", filetypes = { "rust" } } } end)
+  local answer
+  stub(require("forge.lsp.startup"), "selected", function(_, _, receive) answer = receive return function() end end)
+  local completed = false
+  require("forge.lsp.workspace").resolve(manifest, function(paths, receive) receive({ [paths[1]] = true }) end,
+    function(value, failure) eq(failure, nil) eq(value.client.id, 12) completed = true end)
+  eq(completed, false)
+  answer({ id = 12 })
+  eq(completed, true)
+end
+
 return T

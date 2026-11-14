@@ -94,7 +94,10 @@ impl CodexProvider {
                 ProviderFailureKind::BindingClosed,
             ));
         }
+        let started = std::time::Instant::now();
         let mut catalog = self.catalog.lock().await;
+        tracing::info!(target: "forge::provider", event_name = "provider.startup.phase",
+            provider = "codex", phase = "catalog_lock", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         super::operations::check()?;
         if catalog.is_none() {
             let runtime = self.runtime.clone();
@@ -2141,10 +2144,22 @@ impl CodexProvider {
         &self,
         context: QueryContext,
     ) -> Result<Vec<ProviderModel>, ProviderError> {
-        let (rpc, _, _) = self.query_connection(context).await?;
+        let started = std::time::Instant::now();
+        let connection = self.query_connection(context).await;
+        tracing::info!(target: "forge::provider", event_name = "provider.startup.phase",
+            provider = "codex", phase = "catalog_connection", success = connection.is_ok(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
+        let (rpc, _, _) = connection?;
+        let started = std::time::Instant::now();
+        tracing::info!(target: "forge::provider", event_name = "provider.startup.started",
+            provider = "codex", phase = "model_list");
         let catalog = rpc
             .request("model/list", json!({}), ProviderOperation::ModelList)
-            .await?;
+            .await;
+        tracing::info!(target: "forge::provider", event_name = "provider.startup.phase",
+            provider = "codex", phase = "model_list", success = catalog.is_ok(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
+        let catalog = catalog?;
         Ok(crate::codex::catalog::parse_model_catalog(&catalog))
     }
 
@@ -4249,7 +4264,11 @@ async fn initialize_connection(
     command: &[String],
     operation: ProviderOperation,
 ) -> Result<forge_provider_api::version::ValidatedRuntime, ProviderError> {
-    let initialized = rpc
+    let started = std::time::Instant::now();
+    tracing::info!(target: "forge::provider", event_name = "provider.startup.started",
+        provider = "codex", phase = "initialize");
+    let result = async {
+        let initialized = rpc
         .request(
             "initialize",
             json!({
@@ -4259,22 +4278,28 @@ async fn initialize_connection(
             operation,
         )
         .await?;
-    let reported = initialized
-        .get("userAgent")
-        .and_then(Value::as_str)
-        .and_then(|agent| agent.split_whitespace().next())
-        .and_then(|product| product.split_once('/').map(|(_, version)| version));
-    let requirement = forge_provider_api::version::RuntimeRequirement::new(
-        crate::registry::select("codex").expect("Codex is registered"),
-        command
-            .first()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "app-server".into()),
-        semver::Version::new(0, 164, 0),
-    );
-    let validated = requirement.validate(reported)?;
-    rpc.notify("initialized", Value::Null).await?;
-    Ok(validated)
+        let reported = initialized
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .and_then(|agent| agent.split_whitespace().next())
+            .and_then(|product| product.split_once('/').map(|(_, version)| version));
+        let requirement = forge_provider_api::version::RuntimeRequirement::new(
+            crate::registry::select("codex").expect("Codex is registered"),
+            command
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "app-server".into()),
+            semver::Version::new(0, 164, 0),
+        );
+        let validated = requirement.validate(reported)?;
+        rpc.notify("initialized", Value::Null).await?;
+        Ok(validated)
+    }
+    .await;
+    tracing::info!(target: "forge::provider", event_name = "provider.startup.phase",
+        provider = "codex", phase = "initialize", success = result.is_ok(),
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
+    result
 }
 
 /// Get the adapter's capabilities independently of the installed CLI version.

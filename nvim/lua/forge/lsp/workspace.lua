@@ -35,7 +35,7 @@ function M.list(root, authorize, active, receive)
                 text = name == "Cargo.toml" and "Rust" or "TypeScript / JavaScript" }
             end
           end
-          vim.defer_fn(next_directory, 1)
+          next_directory()
         end))
       end))
     end)
@@ -67,18 +67,23 @@ end
 ---Resolve and initialize only the selected manifest configuration.
 function M.resolve(manifest, authorize, receive)
   if type(manifest) ~= "string" then receive(nil, "invalid_workspace: manifest is required") return function() end end
-  local cancelled = false
+  local cancelled, completed = false, false
   local cancel_wait
+  local function finish(value, failure)
+    if cancelled or completed then return end
+    completed = true
+    receive(value, failure)
+  end
   authorize({ manifest }, function(allowed, failure)
     if cancelled then return end
-    if failure or not allowed[manifest] then receive(nil, failure or "access_denied: " .. manifest) return end
+    if failure or not allowed[manifest] then finish(nil, failure or "access_denied: " .. manifest) return end
     local stat = vim.uv.fs_stat(manifest)
-    if not stat or stat.type ~= "file" then receive(nil, "invalid_workspace: manifest file does not exist") return end
+    if not stat or stat.type ~= "file" then finish(nil, "invalid_workspace: manifest file does not exist") return end
     local config, config_error = M.config(manifest)
-    if not config then receive(nil, config_error) return end
+    if not config then finish(nil, config_error) return end
     local startup = require("forge.lsp.startup")
     cancel_wait = startup.selected(manifest, config, function(client, startup_error)
-      if not cancelled then receive(client and { client = client, manifest = manifest } or nil, startup_error) end
+      finish(client and { client = client, manifest = manifest } or nil, startup_error)
     end)
   end)
   return function() cancelled = true if cancel_wait then cancel_wait() end end

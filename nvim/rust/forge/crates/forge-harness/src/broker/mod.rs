@@ -2849,6 +2849,11 @@ impl HarnessBroker {
             "presentation_initialized_ms",
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
+        // These milestones share one origin; their differences isolate local startup work.
+        for (phase, elapsed_ms) in &broker.startup_timing {
+            tracing::info!(target: "forge::harness", event_name = "session.startup.milestone",
+                session_id = broker.session.id, phase, elapsed_ms);
+        }
         Ok(broker)
     }
 

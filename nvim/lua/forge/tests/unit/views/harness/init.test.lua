@@ -154,4 +154,39 @@ T["replace_session_preserves_requesting_tab_and_handles_failure"] = function()
   eq(activation.options.focus, false)
 end
 
+T["new_session_traces_response_and_watches_the_created_view"] = function()
+  local session = require("forge.session")
+  local navigation = require("forge.views.harness.session_navigation")
+  local startup_log = require("forge.harness_startup_log")
+  local events, watched, reply = {}, nil, nil
+  local state = session.new_harness_state()
+  state.transcript_buf = vim.api.nvim_get_current_buf()
+  state.timeline_tab = vim.api.nvim_get_current_tabpage()
+  startup_log.begin = function(fields)
+    eq(fields.operation, "new")
+    return {
+      mark = function(phase) events[#events + 1] = phase end,
+      finish = function(phase) events[#events + 1] = phase end,
+      watch = function(buffer) watched = buffer end,
+    }
+  end
+  navigation.begin_new = function() return { state = state } end
+  navigation.complete_pending = function() events[#events + 1] = "activated" end
+  navigation.render_pending = function() end
+  require("forge.infra.notifications").error = function() end
+  require("forge.client").session_create = function(_, callback) reply = callback end
+  local harness = require("forge.views.harness")
+  harness.new_session()
+  eq(events, { "layout.ready", "session.new.dispatch" })
+  reply({ session = { id = "created" } })
+  eq(events, { "layout.ready", "session.new.dispatch", "session.new.received",
+    "snapshot.apply.begin", "activated", "snapshot.apply.end" })
+  eq(watched, state.transcript_buf)
+  events, watched = {}, nil
+  harness.new_session()
+  reply(nil, "creation failed")
+  eq(events, { "layout.ready", "session.new.dispatch", "session.new.received", "failed" })
+  eq(watched, nil)
+end
+
 return T

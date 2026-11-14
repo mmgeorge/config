@@ -99,24 +99,27 @@ local function launch(state, config, path, filetype, accept_root, on_resolved)
     job.buffer = buffer
     source.retain(buffer, owned)
     local resolved = vim.deepcopy(config)
+    require("forge.lsp.server_status").observe(resolved)
     resolved.capabilities = vim.tbl_deep_extend("force", resolved.capabilities or {}, require("forge.lsp.rename").capabilities())
     local start = vim.schedule_wrap(function(root)
       if state.closed or job.done then return end
       if not job.resolving_since then return end
-      if vim.uv.now() - job.resolving_since >= 2000 then
+      if vim.uv.now() - job.resolving_since >= 60000 then
         job.rejected = true
-        settle(job)
+        settle(job, "timeout: selected LSP root resolution exceeded 60 seconds")
         return
       end
       job.resolving_since = nil
       job.root = root
       if accept_root and not accept_root(root) then
         job.rejected = true
-        settle(job)
+        settle(job, "timeout: selected LSP root resolution exceeded 60 seconds")
         return
       end
       resolved.root_dir = root
-      if not root and resolved.workspace_required then settle(job) return end
+      -- Rustup and other project-local launchers select toolchains from the process directory.
+      resolved.cmd_cwd = resolved.cmd_cwd or root
+      if not root and resolved.workspace_required then settle(job, "unavailable: selected LSP did not resolve a workspace root") return end
       local options = { bufnr = buffer, reuse_client = resolved.reuse_client }
       if project_manifest(config) == vim.fs.basename(path) then options.attach = false end
       for _, client in ipairs(vim.lsp.get_clients({ _uninitialized = true })) do
@@ -154,9 +157,9 @@ local function poll(state)
   for _, job in pairs(state.jobs) do
     if not job.done then
       local client = job.client and vim.lsp.get_client_by_id(job.client)
-      if job.resolving_since and vim.uv.now() - job.resolving_since >= 2000 then
+      if job.resolving_since and vim.uv.now() - job.resolving_since >= 60000 then
         job.rejected = true
-        settle(job)
+        settle(job, "timeout: selected LSP root resolution exceeded 60 seconds")
       elseif client and client.initialized and not client:is_stopped() and not (client.progress and next(client.progress.pending or {})) then settle(job)
       elseif job.client and (not client or client:is_stopped()) then settle(job, "startup_failed: " .. job.name .. " stopped during initialization.")
       elseif vim.uv.now() - job.started >= 60000 then
@@ -193,28 +196,78 @@ function M.close()
   source.close()
 end
 
----Start one configured server for the explicit manifest, sharing existing jobs.
+---Await one editor-owned client's readiness without changing its identity or ownership.
+---@param client vim.lsp.Client
+---@param receive fun(client?: vim.lsp.Client, failure?: string)
+---@return fun() cancel
+function M.ready(client, receive)
+  require("forge.lsp.server_status").observe(client)
+  local finished, timer = false, nil
+  local started = vim.uv.now()
+  local function finish(value, failure)
+    if finished then return end
+    finished = true
+    if timer and not timer:is_closing() then timer:stop() timer:close() end
+    timer = nil
+    receive(value, failure)
+  end
+  local function inspect()
+    if finished then return end
+    local workspace_ready, workspace_failure = require("forge.lsp.server_status").ready(client)
+    if client:is_stopped() then finish(nil, "disconnected: selected LSP stopped")
+    elseif workspace_failure then finish(nil, workspace_failure)
+    elseif client.initialized and workspace_ready and not (client.progress and next(client.progress.pending or {})) then finish(client)
+    elseif vim.uv.now() - started >= 60000 then finish(nil, "timeout: selected LSP readiness exceeded 60 seconds") end
+  end
+  inspect()
+  if not finished then
+    timer = assert(vim.uv.new_timer())
+    timer:start(0, 20, vim.schedule_wrap(inspect))
+  end
+  return function()
+    if finished then return end
+    finished = true
+    if timer and not timer:is_closing() then timer:stop() timer:close() end
+    timer = nil
+  end
+end
+
+---Acquire the matching editor client, starting only when none exists, then await readiness.
 function M.selected(manifest, config, receive)
   local matching = {}
   for _, client in ipairs(vim.lsp.get_clients({ name = config.name, _uninitialized = true })) do
     if client.name == config.name and source.covers(client, manifest) and not client:is_stopped() then matching[#matching + 1] = client end
   end
   if #matching > 1 then receive(nil, "ambiguous_server: multiple matching clients") return function() end end
+  if matching[1] then return M.ready(matching[1], receive) end
   local state = workspace_state(vim.fs.dirname(manifest))
-  local cancelled = false
-  launch(state, config, manifest, config.filetypes and config.filetypes[1] or "")
+  local cancelled, cancel_ready = false, nil
+  local timer
   local function inspect()
     if cancelled then return end
     local job = state.jobs[config.name .. ":" .. manifest]
     local client = job and job.client and vim.lsp.get_client_by_id(job.client)
-    if state.closed then receive(nil, "cancelled: LSP startup closed")
-    elseif job and job.failure then receive(nil, job.failure)
-    elseif client and client.initialized and not (client.progress and next(client.progress.pending or {})) then receive(client)
-    elseif job and job.done then receive(nil, "unavailable: selected configuration did not start a server")
-    else vim.defer_fn(inspect, 20) end
+    if client or state.closed or job and (job.failure or job.done) then
+      if timer and not timer:is_closing() then timer:stop() timer:close() end
+      timer = nil
+      if state.closed then cancelled = true receive(nil, "cancelled: LSP startup closed")
+      elseif job.failure then cancelled = true receive(nil, job.failure)
+      elseif client then cancel_ready = M.ready(client, receive)
+      else cancelled = true receive(nil, "unavailable: selected configuration did not start a server") end
+    end
   end
+  launch(state, config, manifest, config.filetypes and config.filetypes[1] or "")
   inspect()
-  return function() cancelled = true end
+  if not cancelled and not cancel_ready then
+    timer = assert(vim.uv.new_timer())
+    timer:start(0, 20, vim.schedule_wrap(inspect))
+  end
+  return function()
+    cancelled = true
+    if timer and not timer:is_closing() then timer:stop() timer:close() end
+    timer = nil
+    if cancel_ready then cancel_ready() end
+  end
 end
 
 return M

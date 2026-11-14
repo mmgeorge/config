@@ -1484,10 +1484,27 @@ impl SessionController {
 
     /// Build one independently serialized controller from a durable broker session.
     async fn new(mut broker: HarnessBroker) -> Result<Arc<Self>> {
-        broker.resolve_inherited_model_settings().await?;
-        broker.snapshot()?;
-        let catalog_request = broker.provider_catalog_request()?;
         let observer = broker.observer();
+        let session_id = observer.session_id().to_owned();
+        let started = Instant::now();
+        tracing::info!(target: "forge::harness", event_name = "session.startup.started",
+            session_id, phase = "model_validation");
+        let result = tracing::Instrument::instrument(
+            broker.resolve_inherited_model_settings(),
+            tracing::info_span!("session_startup", session_id = session_id.as_str()),
+        )
+        .await;
+        tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
+            session_id, phase = "model_validation", success = result.is_ok(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
+        result?;
+        let started = Instant::now();
+        broker.snapshot()?;
+        tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
+            session_id, phase = "controller_snapshot",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
+        let started = Instant::now();
+        let catalog_request = broker.provider_catalog_request()?;
         let store = crate::storage::HistoryReader::current(&broker.data_root)?;
         for plan in store.list_plan(observer.session_id())? {
             observer.plan_file.reconcile_plan_artifacts(&plan)?;
@@ -1574,6 +1591,9 @@ impl SessionController {
             .exchange_task
             .try_lock()
             .expect("new controller has no exchange-task waiter") = Some(task);
+        tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
+            session_id, phase = "controller_services",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         Ok(controller)
     }
 
@@ -2822,6 +2842,7 @@ async fn route_new_session(
     request: Request,
     message_sink: &MessageSender,
 ) -> Result<()> {
+    let started = Instant::now();
     let child = prepare_new_session(
         PathBuf::from(&registry.initialize.data_root).as_path(),
         &registry.initialize.client_id,
@@ -2839,8 +2860,15 @@ async fn route_new_session(
             .unwrap_or_default()
             .as_millis() as i64,
     )?;
+    tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
+        session_id = child.id, phase = "persist_new_session",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
     let child_controller = registry.resolve(&child.id).await?;
+    let started = Instant::now();
     let snapshot = child_controller.broker.lock().await.snapshot()?;
+    tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
+        session_id = child.id, phase = "response_snapshot",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
     message_sink
         .send_response(Response::success(request.id, snapshot)?)
         .await?;

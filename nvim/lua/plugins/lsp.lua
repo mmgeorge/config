@@ -193,7 +193,13 @@ return {
       vim.lsp.enable("wgsl_analyzer")
 
       vim.lsp.config('rust_analyzer', {
-        cmd = { "rust-analyzer" },
+        cmd = function(dispatchers, config)
+          return vim.lsp.rpc.start({ "rust-analyzer" }, dispatchers, {
+            cwd = config.cmd_cwd or config.root_dir,
+            env = config.cmd_env,
+            detached = config.detached,
+          })
+        end,
         capabilities = capabilities,
         before_init = function(_, config)
           local root = config.root_dir

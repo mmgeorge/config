@@ -132,6 +132,7 @@ pub(super) fn diagnostic_field(key: &str) -> bool {
             | "received_at_ms"
             | "count"
             | "retry_attempt"
+            | "retry_wait_ms"
             | "max_retries"
             | "rows"
             | "bytes"

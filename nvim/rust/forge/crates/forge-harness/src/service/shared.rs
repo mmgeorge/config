@@ -601,8 +601,12 @@ async fn create_session(
     .await
     .context("new session initialization worker failed")??;
     let controller = SessionController::new(broker).await?;
+    let started = std::time::Instant::now();
     let snapshot = controller.observer.snapshot()?;
     let session = snapshot.session.clone();
+    tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
+        session_id = session.id, phase = "response_snapshot",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
     registry
         .controller_by_id
         .write()

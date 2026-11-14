@@ -227,6 +227,7 @@ highlights.setup()
 --- Initializes plugin configuration, highlights, and performance options.
 ---@param opts? ForgeConfig User configuration overrides merged into defaults.
 function M.setup(opts)
+  require("forge.lsp.server_status").setup()
   M.config = config.setup(opts)
   perf.configure_from_forge_options(M.config)
   highlights.setup()

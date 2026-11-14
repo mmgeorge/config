@@ -222,13 +222,19 @@ end
 ---@param options? {open_mode?: "current"|"tab"}
 function M.new_session(name, options)
   local source_state = session.harness
+  local startup = require("forge.harness_startup_log").begin({ workspace = vim.fn.getcwd(), operation = "new" })
   local source_session_id = source_state.session and source_state.session.id or nil
   local replace_current = options and options.open_mode == "current"
     and source_state.timeline_tab and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab)
     and valid_window(source_state.transcript_win) and valid_window(source_state.composer_win)
   local pending = not replace_current and session_navigation.begin_new(name, options and options.open_mode) or nil
+  startup.mark("layout.ready")
+  startup.mark("session.new.dispatch")
   client.session_create({ source_session_id = source_session_id, name = name }, function(result, request_error)
+    startup.mark("session.new.received", { session_id = result and result.session and result.session.id,
+      success = request_error == nil })
     if request_error then
+      startup.finish("failed")
       if pending then
         pending.error = request_error
         session_navigation.render_pending(pending)
@@ -236,6 +242,14 @@ function M.new_session(name, options)
       notifications.error(request_error, "ForgeHarness")
       return
     end
+    local target_state = pending and pending.state or source_state
+    local target_buffer = target_state.transcript_buf
+    if not target_buffer or not vim.api.nvim_buf_is_valid(target_buffer)
+      or not target_state.timeline_tab or not vim.api.nvim_tabpage_is_valid(target_state.timeline_tab) then
+      startup.finish("closed_before_ready")
+      return
+    end
+    startup.mark("snapshot.apply.begin")
     if pending then
       session_navigation.complete_pending(pending, result)
     elseif source_state.timeline_tab and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab) then
@@ -243,6 +257,8 @@ function M.new_session(name, options)
         state = source_state, open_mode = "current", focus = session.harness == source_state,
       })
     end
+    startup.mark("snapshot.apply.end")
+    startup.watch(target_state.transcript_buf)
   end)
 end
 

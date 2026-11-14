@@ -85,9 +85,11 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   local deadline = assert(vim.uv.new_timer())
   local guard = assert(vim.uv.new_timer())
   local send
+  local cancel_ready
   local function finish(failure)
     if finished then return end
     finished = true
+    if cancel_ready then cancel_ready() end
     deadline:stop() deadline:close()
     guard:stop() guard:close()
     for _, request in ipairs(requests) do
@@ -461,6 +463,8 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   local function ready(startup_error, issues)
     if finished then return end
     if startup_error then finish(startup_error) return end
+    local _, _, warning = require("forge.lsp.server_status").ready(selected_client)
+    if warning then warnings[#warnings + 1] = warning end
     for _, issue in ipairs(issues or {}) do
       warnings[#warnings + 1] = issue.message
       if workspace_query then result.coverage[#result.coverage + 1] = issue end
@@ -469,7 +473,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
     local success, failure = pcall(start)
     if not success then finish(tostring(failure)) end
   end
-  if selected_client then ready()
+  if selected_client then cancel_ready = require("forge.lsp.startup").ready(selected_client, function(_, failure) ready(failure) end)
   else finish("invalid_workspace: semantic request has no selected client") end
   return function() finish("cancelled: LSP request cancelled.") end, expire
 end

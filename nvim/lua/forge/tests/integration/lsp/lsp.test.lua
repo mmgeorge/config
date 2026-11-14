@@ -10,7 +10,7 @@ local state_fixture = dofile("nvim/lua/forge/tests/support/state.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-T["rename_tool_applies_edits_and_respects_write_access"] = function()
+T["semantic_tools_wait_for_rust_workspace_and_preserve_write_access"] = function()
   local root = vim.fn.getcwd()
   -- Release the workspace, stop the host, and leave the workspace directory before the
   -- temporary directories registered below are deleted.
@@ -66,6 +66,7 @@ T["rename_tool_applies_edits_and_respects_write_access"] = function()
     return buffer.text(state.transcript_buf)
   end
   local startup = require("forge.lsp.startup")
+  local selected_startup = startup.selected
   local mock = { id = 8901, name = "rename-fixture", initialized = true, root_dir = workspace,
     config = { root_dir = workspace, filetypes = { "rust" } }, offset_encoding = "utf-16",
     server_capabilities = {} }
@@ -101,10 +102,53 @@ T["rename_tool_applies_edits_and_respects_write_access"] = function()
   local unrelated_calls = 0
   local unrelated = vim.deepcopy(mock)
   unrelated.id = 8902
+  unrelated.name = "unrelated"
   unrelated.request = function() unrelated_calls = unrelated_calls + 1 error("unrelated LSP contacted") end
   vim.lsp.get_clients = function() return { mock, unrelated } end
   query("lsp_workspace_list", {})
   assert(unrelated_calls == 0, "inventory contacted an LSP")
+  -- Replay the first-query race: initialized and progress-idle does not mean Rust is loaded.
+  local loaded, symbol_requests = false, 0
+  mock.server_info = { name = "rust-analyzer" }
+  local rename_request = mock.request
+  function mock:request(method, params, callback)
+    if method ~= "workspace/symbol" then return rename_request(self, method, params, callback) end
+    symbol_requests = symbol_requests + 1
+    assert(loaded, "workspace/symbol reached rust-analyzer before its quiescent notification")
+    vim.schedule(function() callback(nil, { { name = "value", kind = 12, location = {
+      uri = vim.uri_from_fname(workspace .. "/src/item.rs"),
+      range = { start = { line = 0, character = 7 }, ["end"] = { line = 0, character = 12 } },
+    } } }) end)
+    return true, symbol_requests
+  end
+  local original_timer = vim.uv.new_timer
+  vim.uv.new_timer = function()
+    local timer = assert(original_timer())
+    return {
+      start = function(_, delay, interval, callback)
+        if interval == 20 then
+          vim.schedule(function()
+            assert(symbol_requests == 0, "provider queried before readiness")
+            assert(not buffer.text(state.transcript_buf):find("rename-completed-2", 1, true), "provider resumed before readiness")
+            loaded = true
+            vim.lsp.handlers["experimental/serverStatus"](nil, { health = "warning", quiescent = true, message = "build scripts failed" }, { client_id = mock.id })
+            callback()
+          end)
+          return 0
+        end
+        return timer:start(delay, interval, callback)
+      end,
+      stop = function() return timer:stop() end,
+      close = function() return timer:close() end,
+      is_closing = function() return timer:is_closing() end,
+    }
+  end
+  startup.selected = selected_startup
+  query("lsp_symbols", { workspace = "Cargo.toml", query = "value" })
+  vim.uv.new_timer = original_timer
+  startup.selected = function(_, _, callback) callback(mock) return function() end end
+  assert(loaded and symbol_requests == 1, "first symbol request did not wait for loaded workspace")
+  vim.lsp.handlers["experimental/serverStatus"](nil, { health = "ok", quiescent = true }, { client_id = mock.id })
   local result = query("lsp_rename_symbol", { workspace = "Cargo.toml", path = "src/item.rs", line = 1, column = 8, new_name = "count" })
   assert(table.concat(vim.fn.readfile(workspace .. "/src/item.rs"), "\n"):find("fn count", 1, true), result)
   assert(table.concat(vim.fn.readfile(workspace .. "/src/lib.rs"), "\n"):find("item::count()", 1, true), result)

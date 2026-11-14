@@ -217,14 +217,22 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
     end))
   end
   local function send(client, method, params, buffer, callback)
-    local accepted, request_id = client:request(method, params, guard(function(error, result)
-      active_cancel = nil
-      if error then finish(method .. ": " .. (error.message or tostring(error))) return end
-      if client:is_stopped() then finish("disconnected: " .. client.name) return end
-      callback(result == vim.NIL and nil or result)
-    end), buffer)
-    if not accepted then finish("disconnected: " .. client.name) return end
-    if not finished then active_cancel = function() client:cancel_request(request_id) end end
+    local dispatched = false
+    local cancel = require("forge.lsp.startup").ready(client, guard(function(_, failure)
+      if failure then finish(failure) return end
+      local _, _, warning = require("forge.lsp.server_status").ready(client)
+      if warning then finish("incomplete_workspace: " .. warning) return end
+      dispatched = true
+      local accepted, request_id = client:request(method, params, guard(function(error, result)
+        active_cancel = nil
+        if error then finish(method .. ": " .. (error.message or tostring(error))) return end
+        if client:is_stopped() then finish("disconnected: " .. client.name) return end
+        callback(result == vim.NIL and nil or result)
+      end), buffer)
+      if not accepted then finish("disconnected: " .. client.name) return end
+      if not finished then active_cancel = function() client:cancel_request(request_id) end end
+    end))
+    if not dispatched and not finished then active_cancel = cancel end
   end
   local function offset(contents, position, encoding)
     assert(type(position) == "table" and position.line >= 0 and position.character >= 0, "invalid edit position")
@@ -470,6 +478,8 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
     active_cancel = nil
     if failure then finish(failure) return end
     readiness = selected
+    local _, _, warning = require("forge.lsp.server_status").ready(selected.client)
+    if warning then finish("incomplete_workspace: " .. warning) return end
     timer:start(10000, 0, vim.schedule_wrap(function() finish("timeout: Rename preparation exceeded 10 seconds.") end))
     if request.kind == "symbol" then symbol() else file() end
   end))
