@@ -2253,8 +2253,9 @@ impl std::fmt::Display for TurnRetracted {
 
 impl std::error::Error for TurnRetracted {}
 
+#[derive(Clone)]
 struct ExchangeAdmission {
-    origin: crate::exchange::ExchangeOrigin,
+    opening: crate::exchange::ExchangeOpening,
     check_owner: Option<String>,
     automatic_owner: Option<String>,
     plan_event_id: Option<String>,
@@ -2280,8 +2281,8 @@ impl ExchangeAdmission {
             plan_event_id: None,
             check_owner: None,
             automatic_owner: None,
-            prompt,
-            origin: crate::exchange::ExchangeOrigin::User,
+            prompt: prompt.clone(),
+            opening: crate::exchange::ExchangeOpening::user_text(prompt),
             agent_run_id: None,
         }
     }
@@ -8816,7 +8817,9 @@ impl HarnessBroker {
                     &displayed,
                 )?);
             }
-            InputPresentation::Message { content } => {
+            InputPresentation::Message { turn, text } => {
+                let content =
+                    crate::question::input_content(turn, text, &self.questions.snapshot()?)?;
                 let (intent, text) = content.exchange_input();
                 // Accepted steering joins the native history, so retraction is no longer safe.
                 runtime.retraction_eligibility.consume();
@@ -8881,7 +8884,9 @@ impl HarnessBroker {
             .unwrap_or_else(|| receipt.receipt_id().as_str().to_owned());
         let now_ms = self.clock.now_ms();
         match presentation {
-            InputPresentation::Message { content } => {
+            InputPresentation::Message { turn, text } => {
+                let content =
+                    crate::question::input_content(turn, text, &self.questions.snapshot()?)?;
                 let (intent, text) = content.exchange_input();
                 if !interaction.node_list.iter().any(|node| matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == id)) {
                     interaction.append_acknowledged_input(scope, Some(id), Some(receipt.receipt_id().clone()), intent, text, now_ms)?;
@@ -9551,7 +9556,7 @@ impl HarnessBroker {
                 session_id: self.session.id.clone(),
                 ordinal: self.store.next_exchange_ordinal(&self.session.id)?,
                 prompt: text.to_owned(),
-                origin: crate::exchange::ExchangeOrigin::User,
+                opening: crate::exchange::ExchangeOpening::user_text(text.to_owned()),
                 approval_mode: Some(self.session.approval_mode),
                 phase: crate::exchange::ExchangePhase::Running,
                 checkpoint_before: None,

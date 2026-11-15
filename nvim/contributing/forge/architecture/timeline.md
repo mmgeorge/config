@@ -64,17 +64,29 @@ The exchange metrics header shows input summed across every request in the excha
 
 ## Transcript window and pickers
 
-Answered questions use retained input admission identities to render one blue
-**Answered N questions** fold from acceptance onward. `QuestionHistory` merges
-adjacent answered groups in an exchange regardless of batching or delivery through a
-waiting tool. Visible intervening activity and pending or withdrawn groups end the
-run. Each branch retains its original question-set action, and each answer appears
-once. The originating exchange receives no duplicate questions summary. This
-preserves provider routing. Active-turn acceptance carries `DeliveredInput::QuestionResponse`
-into `InputIntent::QuestionResponse`, retaining the structured replies instead of
-converting them to steering text. The transcript renders answers on acceptance,
-even while provider consumption is pending. Typed question staging never enters
-the steering status section. Disposable state version 53 records this distinction;
+`ExchangeOpening::User` and `InputIntent::User` carry `UserInputContent`.
+The broker resolves each structured reply against its submitted question revision
+before persisting it, retaining the original wording, choices, selected or freeform
+value, and reply identity. A user opening renders before the Thought fold; a reply
+delivered during existing work keeps its chronological position. Admission selects
+that position independently of provider delivery, so a required-question continuation
+keeps its original exchange even when the provider starts another turn.
+
+Rust owns transcript rendering; Lua uses `exchange_opening.notice` only to identify
+task notices for composer actions. One shared question-group renderer produces the blue **Answered N questions** fold.
+`QuestionHistory` merges consecutive answered groups under the same parent regardless
+of submission batching or delivery through a waiting tool. Intervening visible activity,
+pending questions, withdrawals, and exchange boundaries end the run. Each branch retains
+its original question action. Canonical question projection checks question and reply
+message identities before adding an occurrence, so an admitted answer has one transcript
+owner and a later correction remains distinct.
+
+Provider acceptance carries the typed turn into the broker; delivery through steering
+never changes the content category. Answers render on acceptance while consumption
+tracking remains independent. Lua staging sends an explicit content discriminator; the host resolves it into
+`UserInputContent` before retaining staging. Malformed structured replies fail decoding rather than becoming text. Pending or failed
+question replies use their own status section, and admission removes the staged copy by
+input identity. Disposable state version 57 stores the opening and reply snapshots;
 persistent settings remain outside that namespace.
 
 The Harness controller binds a native transcript document, a native status document, and a Lua-owned composer buffer, all owned by `OpenPresentation`. The status document has its own revision, so status-only updates leave transcript rows unchanged. `HarnessStatusView` owns the split above the composer and a separate display buffer, so local notices never modify the native replica. Lua fills unused transcript space with virtual rows, so the live tail ends at the bottom without changing native text.

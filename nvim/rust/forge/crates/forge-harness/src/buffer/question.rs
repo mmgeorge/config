@@ -44,46 +44,10 @@ impl<'exchange> QuestionHistory<'exchange> {
         let mut occurrence = Vec::new();
         for (position, node) in exchange.node_list.iter().enumerate() {
             if let ExchangeNode::ExchangeInput { prompt } = node
-                && let InputIntent::QuestionResponse { responses } = &prompt.intent
+                && let InputIntent::User { content } = &prompt.intent
             {
-                let mut branches = Vec::new();
-                for response in responses {
-                    if let forge_provider_api::QuestionReplyResponse::Answer { answer, .. } =
-                        &response.response
-                    {
-                        branches.push(QuestionBranch {
-                            question_set_id: response.question_id.clone(),
-                            question: std::borrow::Cow::Owned(PlanQuestion {
-                                id: response.question_id.clone(),
-                                header: String::new(),
-                                question: response.question.clone(),
-                                options: Vec::new(),
-                                allow_freeform: true,
-                            }),
-                            clarification: Vec::new(),
-                            answer: Some(answer.clone()),
-                            source: crate::session::ResolutionSource::User,
-                        });
-                    }
-                }
-                if let Some(first) = branches.first() {
-                    occurrence.push((
-                        position,
-                        QuestionGroup {
-                            id: &prompt.id,
-                            set: std::borrow::Cow::Owned(PlanQuestionSet {
-                                id: first.question_set_id.clone(),
-                                questions: branches
-                                    .iter()
-                                    .map(|branch| branch.question.as_ref().clone())
-                                    .collect(),
-                            }),
-                            branch: branches,
-                            clarification: Vec::new(),
-                            resolved: true,
-                            withdrawal: None,
-                        },
-                    ));
+                if let Some(group) = QuestionGroup::from_content(&prompt.id, content) {
+                    occurrence.push((position, group));
                 }
                 continue;
             }
@@ -188,10 +152,7 @@ impl<'exchange> QuestionHistory<'exchange> {
             let ExchangeNode::ExchangeInput { prompt } = node else {
                 continue;
             };
-            if matches!(
-                prompt.intent,
-                InputIntent::Steering | InputIntent::QuestionResponse { .. }
-            ) {
+            if matches!(prompt.intent, InputIntent::User { .. }) {
                 continue;
             }
             let Some((_, group)) = occurrence.iter_mut().rev().find(|(start, group)| {
@@ -328,7 +289,49 @@ impl<'exchange> QuestionHistory<'exchange> {
     }
 }
 
-impl QuestionGroup<'_> {
+impl<'content> QuestionGroup<'content> {
+    pub(super) fn from_content(
+        id: &'content str,
+        content: &'content crate::input::UserInputContent,
+    ) -> Option<Self> {
+        let crate::input::UserInputContent::QuestionResponse { responses } = content else {
+            return None;
+        };
+        if !responses.iter().all(|response| {
+            matches!(
+                response.reply.response,
+                forge_provider_api::QuestionReplyResponse::Answer { .. }
+            )
+        }) {
+            return None;
+        }
+        let branch = responses
+            .iter()
+            .map(|response| QuestionBranch {
+                question_set_id: response.reply.question_id.clone(),
+                question: std::borrow::Cow::Borrowed(&response.question),
+                clarification: Vec::new(),
+                answer: Some(response_text(&response.value)),
+                source: crate::session::ResolutionSource::User,
+            })
+            .collect::<Vec<_>>();
+        let first = branch.first()?;
+        Some(Self {
+            id,
+            set: std::borrow::Cow::Owned(PlanQuestionSet {
+                id: first.question_set_id.clone(),
+                questions: branch
+                    .iter()
+                    .map(|branch| branch.question.as_ref().clone())
+                    .collect(),
+            }),
+            branch,
+            clarification: Vec::new(),
+            resolved: true,
+            withdrawal: None,
+        })
+    }
+
     /// Identify completed answer groups independently of their submission mechanism.
     fn answered(&self) -> bool {
         self.resolved
@@ -418,5 +421,44 @@ mod tests {
                 assert!(history.nested.contains("scope"));
             }
         }
+    }
+    #[test]
+    fn visible_user_input_ends_an_answer_group() {
+        let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"preferences", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        for identity in ["layout", "color"] {
+            if identity == "color" {
+                exchange.node_list.push(ExchangeNode::ExchangeInput {
+                    prompt: ExchangeInput {
+                        id: "intervening-input".into(),
+                        question: None,
+                        intent: InputIntent::user_text("Keep researching".into()),
+                        text: "Keep researching".into(),
+                        created_at_ms: 1,
+                        submission_id: None,
+                        consumption: crate::exchange::InputConsumption::Consumed,
+                    },
+                });
+            }
+            exchange.node_list.push(ExchangeNode::QuestionPresented {
+                id: identity.into(),
+                question: PlanQuestionSet {
+                    id: identity.into(),
+                    questions: vec![PlanQuestion {
+                        id: identity.into(),
+                        header: identity.into(),
+                        question: identity.into(),
+                        options: Vec::new(),
+                        allow_freeform: true,
+                    }],
+                },
+                answer: Some("Selected".into()),
+            });
+        }
+        assert_eq!(QuestionHistory::new(&exchange).group.len(), 2);
     }
 }

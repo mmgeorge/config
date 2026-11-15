@@ -499,11 +499,19 @@ impl HarnessService {
                 .export_tool(&document, &directory, controller.trace.clone(), &session_id)?;
             return Ok(json!({"path":path}));
         }
+        let questions = if matches!(
+            &request,
+            crate::buffer::session::PresentationRequest::Staging { .. }
+        ) {
+            controller.questions.snapshot()?
+        } else {
+            Default::default()
+        };
         controller
             .presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .dispatch(request)
+            .dispatch(request, &questions)
     }
 
     /// Construct the owner without discovering repositories, opening stores, or launching providers.

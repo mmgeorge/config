@@ -1888,59 +1888,104 @@ pub(crate) fn retire_task(
     Ok(())
 }
 
-/// Capture answer submissions as exchange openers with their original question content.
-pub(crate) fn answer_origin(
+/// Freeze structured user content before admission or delivery chooses its transcript position.
+pub(crate) fn input_content(
     input: &forge_provider_api::forge::TurnInput,
+    text: &str,
     snapshot: &QuestionSnapshot,
-) -> Result<Option<crate::exchange::ExchangeOrigin>> {
+) -> Result<crate::input::UserInputContent> {
+    use crate::input::{QuestionReplyContent, UserInputContent};
     use forge_provider_api::{QuestionReplyResponse, forge::TurnKind};
     let responses = match input.kind() {
         TurnKind::QuestionResponse { response } => std::slice::from_ref(response),
         TurnKind::QuestionBatch { responses } => responses.as_slice(),
-        _ => return Ok(None),
+        TurnKind::UserMessage { .. }
+        | TurnKind::PlanDiscussion { .. }
+        | TurnKind::ChecksSetup { .. }
+        | TurnKind::PendingQuestions { .. }
+        | TurnKind::PlanReviewQuestion { .. }
+        | TurnKind::QuestionsResolved { .. }
+        | TurnKind::PlanFeedback { .. }
+        | TurnKind::WorkflowAnswers { .. }
+        | TurnKind::PlanReview { .. }
+        | TurnKind::CheckRepair { .. }
+        | TurnKind::ChildResults
+        | TurnKind::AgentTask { .. }
+        | TurnKind::SessionMessage { .. }
+        | TurnKind::PermissionTimeout { .. }
+        | TurnKind::TaskStep { .. }
+        | TurnKind::Background { .. } => {
+            return Ok(UserInputContent::UserText {
+                text: text.to_owned(),
+            });
+        }
     };
-    if responses.is_empty()
-        || responses
-            .iter()
-            .any(|reply| !matches!(reply.response, QuestionReplyResponse::Answer { .. }))
-    {
-        return Ok(None);
-    }
-    let mut answers = Vec::new();
-    for reply in responses {
-        let source = snapshot
-            .questions
-            .iter()
-            .find(|question| question.id.as_str() == reply.question_id)
-            .context("answer opener references a missing question")?;
-        let QuestionReplyResponse::Answer { answer, .. } = &reply.response else {
-            unreachable!()
-        };
-        answers.push(crate::exchange::AnsweredQuestion {
-            question: crate::plan::PlanQuestion {
-                id: source.id.as_str().to_owned(),
-                header: source.content.header.clone(),
-                question: source.content.question.clone(),
-                allow_freeform: true,
-                options: source
-                    .content
-                    .options
-                    .iter()
-                    .map(|option| crate::plan::PlanQuestionOption {
-                        recommended: option.recommended,
-                        label: option.label.clone(),
-                        description: option.description.clone(),
-                    })
-                    .collect(),
-            },
-            answer: crate::plan::PlanQuestionResponse::Other {
-                text: answer.clone(),
-            },
-        });
-    }
-    Ok(Some(crate::exchange::ExchangeOrigin::QuestionAnswers {
-        answers,
-    }))
+    let responses = responses
+        .iter()
+        .map(|reply| {
+            let source = snapshot
+                .questions
+                .iter()
+                .find(|question| question.id.as_str() == reply.question_id)
+                .context("input references a missing question")?;
+            let content = std::iter::once(&source.content)
+                .chain(source.previous.iter())
+                .find(|content| content.revision == reply.revision)
+                .context("input references a missing question revision")?;
+            let text = match &reply.response {
+                QuestionReplyResponse::Answer { answer, .. }
+                | QuestionReplyResponse::Correction { answer, .. } => answer,
+                QuestionReplyResponse::Clarification { text, .. } => text,
+            };
+            let value = match &source.resolution {
+                QuestionResolution::Answered {
+                    message_id,
+                    answer:
+                        QuestionAnswer::Selected {
+                            option_id,
+                            feedback,
+                        },
+                } if *message_id == reply.message_id => {
+                    let option = content
+                        .options
+                        .iter()
+                        .find(|option| option.id == *option_id)
+                        .context("saved answer references a missing option")?;
+                    crate::plan::PlanQuestionResponse::Selected {
+                        option: option.label.clone(),
+                        feedback: feedback.clone(),
+                    }
+                }
+                QuestionResolution::Answered { .. }
+                | QuestionResolution::Pending
+                | QuestionResolution::Dismissed
+                | QuestionResolution::Withdrawn { .. }
+                | QuestionResolution::Retired { .. } => {
+                    crate::plan::PlanQuestionResponse::Other { text: text.clone() }
+                }
+            };
+            Ok(QuestionReplyContent {
+                reply: reply.clone(),
+                question: crate::plan::PlanQuestion {
+                    id: source.id.as_str().to_owned(),
+                    header: content.header.clone(),
+                    question: content.question.clone(),
+                    allow_freeform: true,
+                    options: content
+                        .options
+                        .iter()
+                        .map(|option| crate::plan::PlanQuestionOption {
+                            recommended: option.recommended,
+                            label: option.label.clone(),
+                            description: option.description.clone(),
+                        })
+                        .collect(),
+                },
+                value,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(UserInputContent::QuestionResponse { responses })
 }
 
 /// Project retained questions into their originating exchange without changing stored exchanges.
@@ -1949,14 +1994,27 @@ pub(crate) fn project(
     snapshot: &QuestionSnapshot,
 ) -> Result<()> {
     for question in &snapshot.questions {
-        if exchanges.iter().any(|exchange| match &exchange.origin {
-            crate::exchange::ExchangeOrigin::QuestionAnswers { answers } => answers.iter().any(|answer| answer.question.id == question.id.as_str()),
-            _ => exchange.node_list.iter().any(|node| matches!(node,
-                crate::exchange::ExchangeNode::ExchangeInput { prompt }
-                if matches!(&prompt.intent, crate::exchange::InputIntent::QuestionResponse { responses }
-                    if responses.iter().any(|reply| reply.question_id == question.id.as_str() && matches!(reply.response, forge_provider_api::QuestionReplyResponse::Answer { .. })))
-            )),
-        }) { continue; }
+        if let QuestionResolution::Answered { message_id, .. } = &question.resolution
+            && exchanges.iter().any(|exchange| {
+                let opening_owns_reply = match &exchange.opening {
+                    crate::exchange::ExchangeOpening::User { content } => {
+                        content.owns_reply(question.id.as_str(), message_id)
+                    }
+                    crate::exchange::ExchangeOpening::NativeAgent
+                    | crate::exchange::ExchangeOpening::TaskStarted { .. }
+                    | crate::exchange::ExchangeOpening::TaskContinuation { .. } => false,
+                };
+                opening_owns_reply || exchange.node_list.iter().any(|node| {
+                    matches!(node,
+                        crate::exchange::ExchangeNode::ExchangeInput { prompt }
+                        if matches!(&prompt.intent, crate::exchange::InputIntent::User { content }
+                            if content.owns_reply(question.id.as_str(), message_id))
+                    )
+                })
+            })
+        {
+            continue;
+        }
         let Some(exchange) = exchanges
             .iter_mut()
             .find(|exchange| exchange.id == question.exchange_id)
@@ -2311,6 +2369,107 @@ mod tests {
             restored.ready_chat_continuations()?.is_empty(),
             "late optional answer must not resume completed work"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn input_snapshot_retains_answered_revision_choice_and_reply_identity() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let id = controller
+            .ask(
+                "ask",
+                "exchange",
+                QuestionOrigin::Chat,
+                vec![draft(QuestionRequirement::Optional)],
+            )?
+            .remove(0);
+        controller.apply(command(
+            &id,
+            "answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Selected {
+                    option_id: "1:0".into(),
+                    feedback: Some("Keep existing layout".into()),
+                },
+            },
+        ))?;
+        let reply = controller.outbox()?.remove(0).reply;
+        let mut snapshot = controller.snapshot()?;
+        let original = snapshot.questions[0].content.clone();
+        snapshot.questions[0].previous.push(original.clone());
+        snapshot.questions[0].content.revision += 1;
+        snapshot.questions[0].content.options[0].label = "Changed later".into();
+        let turn = forge_provider_api::forge::TurnInput::new(
+            forge_provider_api::forge::TurnKind::QuestionResponse {
+                response: reply.clone(),
+            },
+        );
+        let content = input_content(&turn, "ignored display label", &snapshot)?;
+        assert!(content.owns_reply(id.as_str(), "answer"));
+        assert!(!content.owns_reply(id.as_str(), "correction"));
+        let crate::input::UserInputContent::QuestionResponse { responses } = &content else {
+            panic!("lost question category");
+        };
+        assert_eq!(responses[0].reply, reply);
+        assert_eq!(
+            responses[0].question.options[0].label,
+            original.options[0].label
+        );
+        assert_eq!(
+            responses[0].value,
+            crate::plan::PlanQuestionResponse::Selected {
+                option: original.options[0].label.clone(),
+                feedback: Some("Keep existing layout".into()),
+            }
+        );
+        let encoded = serde_json::to_value(&content)?;
+        assert_eq!(
+            serde_json::from_value::<crate::input::UserInputContent>(encoded)?,
+            content
+        );
+        let mut correction = reply.clone();
+        correction.message_id = "correction".into();
+        correction.response = forge_provider_api::QuestionReplyResponse::Correction {
+            answer: "Use a compact layout".into(),
+            required_questions_remain: false,
+        };
+        let correction = input_content(
+            &forge_provider_api::forge::TurnInput::new(
+                forge_provider_api::forge::TurnKind::QuestionResponse {
+                    response: correction,
+                },
+            ),
+            "ignored",
+            &snapshot,
+        )?;
+        assert!(correction.owns_reply(id.as_str(), "correction"));
+        assert!(!correction.owns_reply(id.as_str(), "answer"));
+        let mut exchanges = vec![serde_json::from_value::<crate::exchange::Exchange>(
+            serde_json::json!({
+                "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"question source", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[],
+                "opening":{"kind":"user", "content":correction}
+            }),
+        )?];
+        project(&mut exchanges, &snapshot)?;
+        assert_eq!(
+            exchanges[0].node_list.len(),
+            1,
+            "a correction claimed the original answer"
+        );
+        exchanges[0].node_list.clear();
+        exchanges[0].opening = crate::exchange::ExchangeOpening::User {
+            content: content.clone(),
+        };
+        project(&mut exchanges, &snapshot)?;
+        assert!(
+            exchanges[0].node_list.is_empty(),
+            "the admitted answer was projected twice"
+        );
+        snapshot.questions[0].previous.clear();
+        assert!(input_content(&turn, "ignored", &snapshot).is_err());
         Ok(())
     }
 

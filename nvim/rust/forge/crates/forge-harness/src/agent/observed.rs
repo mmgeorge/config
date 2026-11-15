@@ -1,7 +1,7 @@
 //! Persist provider-observed children without granting managed task authority.
 use crate::provider::ScopeOwner;
 
-use crate::exchange::{Exchange, ExchangeOrigin, ExchangeOutcome};
+use crate::exchange::{Exchange, ExchangeOpening, ExchangeOutcome};
 use crate::provider::events::NativeEventSource;
 use crate::provider::{
     EventScope, InvocationScope, ObservedAgentAssociation, ThreadOwner, TurnAddress,
@@ -598,7 +598,7 @@ impl ObservedAgent {
             }
         }
         for exchange in &self.exchanges {
-            if exchange.origin != ExchangeOrigin::NativeAgent
+            if exchange.opening != ExchangeOpening::NativeAgent
                 || exchange.session_id != self.parent_scope.owner().session_id().as_str()
                 || self
                     .owner

@@ -103,7 +103,7 @@ impl ExchangeCollection {
 #[derive(Clone, Debug, Serialize)]
 pub struct Exchange {
     #[serde(default)]
-    pub origin: super::ExchangeOrigin,
+    pub opening: super::ExchangeOpening,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_message_id: Option<String>,
     /// Runtime-only source for deferred tool output. Durable records keep output in their chunk table.
@@ -182,7 +182,7 @@ pub struct Exchange {
 #[serde(remote = "Exchange")]
 struct ExchangeRecord {
     #[serde(default)]
-    pub origin: super::ExchangeOrigin,
+    pub opening: super::ExchangeOpening,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_message_id: Option<String>,
     /// Runtime-only source for deferred tool output. Durable records keep output in their chunk table.
@@ -413,7 +413,7 @@ impl Exchange {
             agent_id: delegation.child_agent_id.clone(),
             ordinal,
             prompt: delegation.task.clone(),
-            origin: crate::exchange::ExchangeOrigin::User,
+            opening: crate::exchange::ExchangeOpening::user_text(delegation.task.clone()),
             approval_mode: None,
             phase: crate::exchange::ExchangePhase::Queued,
             finalization_error: None,
@@ -469,7 +469,7 @@ impl Exchange {
             agent_id: address.scope.owner().agent_id().as_str().to_owned(),
             ordinal,
             prompt: String::new(),
-            origin: crate::exchange::ExchangeOrigin::NativeAgent,
+            opening: crate::exchange::ExchangeOpening::NativeAgent,
             approval_mode: None,
             phase: crate::exchange::ExchangePhase::Running,
             finalization_error: None,
@@ -833,9 +833,9 @@ impl Exchange {
                 // Harness authors task-start and continuation input, and its notice row stands in
                 // for that text; the provider's echo of it must not render as a user prompt.
                 let host_input = matches!(
-                    self.origin,
-                    super::ExchangeOrigin::TaskStarted { .. }
-                        | super::ExchangeOrigin::TaskContinuation { .. }
+                    self.opening,
+                    super::ExchangeOpening::TaskStarted { .. }
+                        | super::ExchangeOpening::TaskContinuation { .. }
                 )
                 .then(|| self.prompt.trim().to_owned())
                 .filter(|prompt| !prompt.is_empty());
@@ -1534,10 +1534,7 @@ impl Exchange {
         // exchange as soon as Harness records it.
         let steering = match (&admission, &submission_id) {
             (InputAppend::Acknowledged(invocation), Some(submission))
-                if matches!(
-                    intent,
-                    InputIntent::Steering | InputIntent::QuestionResponse { .. }
-                ) =>
+                if matches!(intent, InputIntent::User { .. }) =>
             {
                 Some((invocation, submission))
             }
@@ -1636,7 +1633,7 @@ impl Exchange {
     pub(crate) fn displays_node(&self, node: &ExchangeNode) -> bool {
         match node {
             ExchangeNode::ExchangeInput { prompt } => {
-                matches!(prompt.intent, InputIntent::QuestionResponse { .. })
+                matches!(&prompt.intent, InputIntent::User { content } if content.is_question_reply())
                     || !prompt.is_awaiting_consumption()
             }
             ExchangeNode::TurnContent { .. } => self.consumption_anchor_submission(node).is_none(),
@@ -1876,7 +1873,7 @@ mod test {
             session_id: "session-one".into(),
             ordinal: 1,
             prompt: "inspect the repository".into(),
-            origin: crate::exchange::ExchangeOrigin::User,
+            opening: crate::exchange::ExchangeOpening::user_text("inspect the repository".into()),
             approval_mode: None,
             phase: crate::exchange::ExchangePhase::Running,
             checkpoint_before: None,
@@ -1923,7 +1920,7 @@ mod test {
         assert!(exchange.observe_event(&event, 10).unwrap());
         exchange
             .append_input(
-                crate::exchange::InputIntent::Steering,
+                crate::exchange::InputIntent::user_text("include enterprise URLs".into()),
                 "include enterprise URLs".into(),
                 11,
             )
@@ -2055,7 +2052,7 @@ mod test {
                 &invocation,
                 Some("late-steering".into()),
                 None,
-                InputIntent::Steering,
+                InputIntent::user_text("accepted".into()),
                 "accepted".into(),
                 40,
             )
@@ -2065,7 +2062,7 @@ mod test {
         assert_eq!(exchange.elapsed(100), 20);
         assert!(
             exchange
-                .append_input(InputIntent::Steering, "new".into(), 50)
+                .append_input(InputIntent::user_text("new".into()), "new".into(), 50)
                 .is_err()
         );
         exchange.finish(ExchangeOutcome::Complete, 60).unwrap();
@@ -2076,7 +2073,7 @@ mod test {
                     &invocation,
                     Some("late-steering".into()),
                     None,
-                    InputIntent::Steering,
+                    InputIntent::user_text("accepted".into()),
                     "accepted".into(),
                     70,
                 )
@@ -2089,7 +2086,7 @@ mod test {
                     &invocation,
                     Some("after-terminal".into()),
                     None,
-                    InputIntent::Steering,
+                    InputIntent::user_text("late".into()),
                     "late".into(),
                     70,
                 )
@@ -2157,7 +2154,7 @@ mod test {
                 &address.scope,
                 Some(format!("input:{}", submission_id.as_str())),
                 Some(submission_id.clone()),
-                InputIntent::Steering,
+                InputIntent::user_text("prefer the short form".into()),
                 "prefer the short form".into(),
                 now_ms,
             )

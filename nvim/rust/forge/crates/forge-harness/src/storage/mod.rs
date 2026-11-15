@@ -1462,7 +1462,7 @@ pub(crate) mod test {
             session_id: "session".into(),
             ordinal: 1,
             prompt: "work".into(),
-            origin: crate::exchange::ExchangeOrigin::User,
+            opening: crate::exchange::ExchangeOpening::user_text("work".into()),
             approval_mode: None,
             phase: crate::exchange::ExchangePhase::Running,
             checkpoint_before: None,
@@ -1568,7 +1568,7 @@ pub(crate) mod test {
                         forge_provider_api::SubmissionId::try_from(format!("{id}:submission"))
                             .unwrap(),
                     ),
-                    InputIntent::Steering,
+                    InputIntent::user_text("prefer the short form".into()),
                     "prefer the short form".into(),
                     40,
                 )
@@ -1627,7 +1627,7 @@ pub(crate) mod test {
                 &settled_address.scope,
                 Some("late".into()),
                 Some(forge_provider_api::SubmissionId::try_from("late".to_owned()).unwrap()),
-                InputIntent::Steering,
+                InputIntent::user_text("accepted while detached".into()),
                 "accepted while detached".into(),
                 60,
             )

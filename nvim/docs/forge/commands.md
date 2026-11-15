@@ -705,6 +705,9 @@ after work finishes or chat execution is cancelled; late answers do not restart 
 cancelled work. The agent can retract a pending question with `question_withdraw`
 and a reason. `H` in the picker includes answered history and allows explicit corrections.
 Submitted answers appear as a blue, collapsed **Answered N questions** transcript row.
+When an answer starts a new exchange, that row opens the exchange before its Thought
+fold. Answers delivered during existing work stay in that exchange. Queued or failed
+question replies retain their category in a separate status section.
 Adjacent answered entries share one row, including answers submitted separately.
 Answers retain this presentation while being delivered to an active turn; they do
 not appear briefly as steering messages.

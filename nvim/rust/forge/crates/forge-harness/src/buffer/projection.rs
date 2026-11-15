@@ -1457,61 +1457,34 @@ impl TimelineRenderer<'_> {
             Some(&layout.questions),
             MarkdownRole::Response,
         )?;
-        if let crate::exchange::ExchangeOrigin::QuestionAnswers { answers } = &interaction.origin {
+        if let crate::exchange::ExchangeOpening::User { content } = &interaction.opening {
             let id = format!("{}:prompt", interaction.id);
-            let set = crate::plan::PlanQuestionSet {
-                id: answers
-                    .first()
-                    .map(|answer| answer.question.id.clone())
-                    .unwrap_or_default(),
-                questions: answers
-                    .iter()
-                    .map(|answer| answer.question.clone())
-                    .collect(),
-            };
-            let group = super::question::QuestionGroup {
-                id: &id,
-                set: std::borrow::Cow::Borrowed(&set),
-                branch: answers
-                    .iter()
-                    .map(|answer| super::question::QuestionBranch {
-                        question_set_id: answer.question.id.clone(),
-                        question: std::borrow::Cow::Borrowed(&answer.question),
-                        clarification: Vec::new(),
-                        answer: Some(super::question::response_text(&answer.answer)),
-                        source: crate::session::ResolutionSource::User,
-                    })
-                    .collect(),
-                clarification: Vec::new(),
-                resolved: true,
-                withdrawal: None,
-            };
-            self.question_group(&group, interaction, agents, depth)?;
-        } else if let crate::exchange::ExchangeOrigin::TaskStarted { start } = &interaction.origin {
+            if let Some(group) = super::question::QuestionGroup::from_content(&id, content) {
+                self.question_group(&group, interaction, agents, depth)?;
+            } else {
+                let text = content.label();
+                if !text.is_empty() {
+                    let prompt = TranscriptRenderer::new(&self.content_width())?
+                        .prompt(BlockId(id), &text)?;
+                    self.prompt.push(prompt.id.clone());
+                    self.push(prompt)?;
+                }
+            }
+        } else if let crate::exchange::ExchangeOpening::TaskStarted { start } = &interaction.opening
+        {
             self.task_notice(
                 &format!("{}:start", interaction.id),
                 &start.heading(),
                 &interaction.prompt,
             )?;
-        } else if let crate::exchange::ExchangeOrigin::TaskContinuation { reason } =
-            &interaction.origin
+        } else if let crate::exchange::ExchangeOpening::TaskContinuation { reason } =
+            &interaction.opening
         {
             self.task_notice(
                 &format!("{}:origin", interaction.id),
                 reason,
                 &interaction.prompt,
             )?;
-        } else if !matches!(
-            interaction.origin,
-            crate::exchange::ExchangeOrigin::NativeAgent
-        ) && !interaction.prompt.is_empty()
-        {
-            let prompt = TranscriptRenderer::new(&self.content_width())?.prompt(
-                BlockId(format!("{}:prompt", interaction.id)),
-                &interaction.prompt,
-            )?;
-            self.prompt.push(prompt.id.clone());
-            self.push(prompt)?;
         }
         let summary = exchange_activity_summary(interaction, self.now_ms);
         let mut heading = TranscriptRenderer::new(&self.content_width())?.literal(
@@ -2173,14 +2146,16 @@ impl TimelineRenderer<'_> {
                     // it, so its row keeps the text and states that limit.
                     let unconfirmed =
                         prompt.consumption == crate::exchange::InputConsumption::Unconfirmed;
-                    let label = match prompt.intent {
-                        crate::exchange::InputIntent::Steering if unconfirmed => {
-                            "Steering (not confirmed read)"
-                        }
-                        crate::exchange::InputIntent::Steering => "Steering",
-                        crate::exchange::InputIntent::QuestionResponse { .. } => {
-                            "Question response"
-                        }
+                    let label = match &prompt.intent {
+                        crate::exchange::InputIntent::User { content } => match content {
+                            crate::input::UserInputContent::UserText { .. } if unconfirmed => {
+                                "Steering (not confirmed read)"
+                            }
+                            crate::input::UserInputContent::UserText { .. } => "Steering",
+                            crate::input::UserInputContent::QuestionResponse { .. } => {
+                                "Question response"
+                            }
+                        },
                         crate::exchange::InputIntent::Clarification => "You asked",
                         crate::exchange::InputIntent::Answer => "You answered",
                     };
@@ -4235,7 +4210,7 @@ mod tests {
     fn native_echo_of_a_submission_renders_one_prompt_row() -> anyhow::Result<()> {
         let mut exchange: Exchange = serde_json::from_value(json!({
             "id":"echo", "session_id":"session", "agent_id":"primary", "ordinal":1,
-            "prompt":"What is this repo?", "state":"running", "created_at_ms":0,
+            "prompt":"What is this repo?", "opening":{"kind":"user","content":{"kind":"user_text","text":"What is this repo?"}}, "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
         exchange.resume(0)?;
@@ -4319,7 +4294,7 @@ mod tests {
             Some(forge_provider_api::SubmissionId::try_from(
                 "waiting".to_owned(),
             )?),
-            crate::exchange::InputIntent::Steering,
+            crate::exchange::InputIntent::user_text("Prefer the short form".into()),
             "Prefer the short form".into(),
             2,
         )?;

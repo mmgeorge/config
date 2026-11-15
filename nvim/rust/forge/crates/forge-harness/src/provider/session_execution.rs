@@ -109,38 +109,14 @@ impl OwnerObservation {
         }
     }
 }
-/// Preserve message meaning independently of active-turn delivery.
-#[derive(Clone, Debug)]
-pub enum DeliveredInput {
-    UserText(String),
-    QuestionResponse(Vec<forge_provider_api::QuestionReply>),
-}
-
-impl DeliveredInput {
-    /// Preserve semantic input content when recording an active-turn delivery.
-    pub(crate) fn exchange_input(&self) -> (crate::exchange::InputIntent, String) {
-        match self {
-            Self::UserText(text) => (crate::exchange::InputIntent::Steering, text.clone()),
-            Self::QuestionResponse(responses) => (
-                crate::exchange::InputIntent::QuestionResponse {
-                    responses: responses.clone(),
-                },
-                forge_provider_api::forge::TurnInput::new(
-                    forge_provider_api::forge::TurnKind::QuestionBatch {
-                        responses: responses.clone(),
-                    },
-                )
-                .label(),
-            ),
-        }
-    }
-}
-
 /// Preserve the user-visible role of an accepted input independently of provider notifications.
 #[derive(Clone, Debug)]
 pub enum InputPresentation {
     /// Append typed input delivered to the original active exchange.
-    Message { content: DeliveredInput },
+    Message {
+        turn: forge_provider_api::forge::TurnInput,
+        text: String,
+    },
     /// Append the accepted workflow entry and its original instruction.
     TaskStarted {
         start: crate::exchange::TaskStart,

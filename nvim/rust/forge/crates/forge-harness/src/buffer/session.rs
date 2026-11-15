@@ -40,7 +40,7 @@ struct OpenPresentation {
     display: super::identity::DisplayRegistry,
     history_input_id: HashSet<String>,
     /// Acknowledged steering whose provider has not reported consumption, in timeline order.
-    awaiting_steering: Vec<StagedInput>,
+    awaiting_steering: Vec<PresentedInput>,
     unsettled_exchange: Vec<String>,
     syntax_done: HashSet<TargetId>,
     /// Targets captured for analysis whose highlight has not been applied yet.
@@ -68,15 +68,63 @@ struct OpenPresentation {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct StagingContent {
-    queue: Vec<StagedInput>,
-    steering: Vec<StagedInput>,
+    queue: Vec<PresentedInput>,
+    steering: Vec<PresentedInput>,
+}
+
+/// Keep staging semantics identical to admitted input after decoding the editor payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PresentedInput {
+    id: Option<String>,
+    text: String,
+    failed: bool,
+    content: crate::input::UserInputContent,
+}
+
+impl PresentedInput {
+    fn resolve(input: StagedInput, questions: &crate::question::QuestionSnapshot) -> Result<Self> {
+        match input {
+            StagedInput::Text(text) => Ok(Self {
+                id: None,
+                content: crate::input::UserInputContent::UserText { text: text.clone() },
+                text,
+                failed: false,
+            }),
+            StagedInput::Message {
+                id,
+                text,
+                failed,
+                content,
+            } => {
+                let content = match content {
+                    StagedContent::Message => {
+                        crate::input::UserInputContent::UserText { text: text.clone() }
+                    }
+                    StagedContent::QuestionResponse { responses } => {
+                        crate::question::input_content(
+                            &forge_provider_api::forge::TurnInput::new(
+                                forge_provider_api::forge::TurnKind::QuestionBatch { responses },
+                            ),
+                            &text,
+                            questions,
+                        )?
+                    }
+                };
+                Ok(Self {
+                    id: Some(id),
+                    text,
+                    failed,
+                    content,
+                })
+            }
+        }
+    }
 }
 
 /// Preserve input meaning separately from queue or steering delivery.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StagedContent {
-    #[default]
     Message,
     QuestionResponse {
         responses: Vec<forge_provider_api::QuestionReply>,
@@ -90,7 +138,6 @@ pub enum StagedInput {
     Message {
         id: String,
         text: String,
-        #[serde(default)]
         content: StagedContent,
         #[serde(default)]
         failed: bool,
@@ -318,7 +365,11 @@ impl SessionPresentation {
     pub(crate) fn conversation_history(&self) -> Result<String> {
         crate::provider::text_generation::history(self.timeline.entry_list())
     }
-    pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
+    pub(crate) fn dispatch(
+        &mut self,
+        request: PresentationRequest,
+        questions: &crate::question::QuestionSnapshot,
+    ) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
         let now_ms = self.clock.now_ms();
         match request {
@@ -524,7 +575,7 @@ impl SessionPresentation {
                 queue,
                 steering,
             } => {
-                self.set_staging(&document, sequence, queue, steering)?;
+                self.set_staging(&document, sequence, queue, steering, questions)?;
                 Ok(json!({"updated":true}))
             }
             PresentationRequest::Snapshot { document } => {
@@ -867,6 +918,7 @@ impl SessionPresentation {
         sequence: u64,
         queue: Vec<StagedInput>,
         steering: Vec<StagedInput>,
+        questions: &crate::question::QuestionSnapshot,
     ) -> Result<()> {
         let open = self
             .open
@@ -879,6 +931,14 @@ impl SessionPresentation {
         if sequence <= open.staging_sequence {
             return Ok(());
         }
+        let queue = queue
+            .into_iter()
+            .map(|input| PresentedInput::resolve(input, questions))
+            .collect::<Result<Vec<_>>>()?;
+        let steering = steering
+            .into_iter()
+            .map(|input| PresentedInput::resolve(input, questions))
+            .collect::<Result<Vec<_>>>()?;
         let staging = StagingContent { queue, steering };
         if open.staging.as_ref() == Some(&staging) {
             open.staging_sequence = sequence;
@@ -2199,14 +2259,8 @@ fn history_input_ids(entries: &[TimelineEntry]) -> HashSet<String> {
         if let TimelineEntry::Exchange { exchange, .. } = entry {
             ids.extend(exchange.input_message_id.iter().cloned());
             for node in &exchange.node_list {
-                match node {
-                    crate::exchange::ExchangeNode::ExchangeInput { prompt } => {
-                        ids.insert(prompt.id.clone());
-                    }
-                    crate::exchange::ExchangeNode::QuestionPresented { id, .. } => {
-                        ids.insert(id.clone());
-                    }
-                    _ => {}
+                if let crate::exchange::ExchangeNode::ExchangeInput { prompt } = node {
+                    ids.insert(prompt.id.clone());
                 }
             }
         }
@@ -2215,7 +2269,7 @@ fn history_input_ids(entries: &[TimelineEntry]) -> HashSet<String> {
 }
 
 /// Collect acknowledged steering that waits for consumption in open top-level exchanges.
-fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<StagedInput> {
+fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<PresentedInput> {
     entries
         .iter()
         .filter_map(|entry| match entry {
@@ -2225,13 +2279,15 @@ fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<StagedInput> {
         .flat_map(|exchange| exchange.awaiting_inputs())
         .filter(|prompt| {
             !matches!(
-                prompt.intent,
-                crate::exchange::InputIntent::QuestionResponse { .. }
+                &prompt.intent,
+                crate::exchange::InputIntent::User { content } if content.is_question_reply()
             )
         })
-        .map(|prompt| StagedInput::Message {
-            content: StagedContent::Message,
-            id: prompt.id.clone(),
+        .map(|prompt| PresentedInput {
+            content: crate::input::UserInputContent::UserText {
+                text: prompt.text.clone(),
+            },
+            id: Some(prompt.id.clone()),
             text: prompt.text.clone(),
             failed: false,
         })
@@ -2246,40 +2302,38 @@ fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<StagedInput> {
 fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     use forge_buffer::identity::BlockId;
     let block_id = BlockId("harness:staging".into());
-    let staged = |values: &[StagedInput]| {
+    let staged = |values: &[PresentedInput]| {
         values
             .iter()
-            .filter(|value| match value {
-                StagedInput::Text(_) => true,
-                StagedInput::Message {
-                    content: StagedContent::QuestionResponse { responses },
-                    ..
-                } if responses.iter().all(|response| {
-                    matches!(
-                        response.response,
-                        forge_provider_api::QuestionReplyResponse::Answer { .. }
-                    )
-                }) =>
-                {
-                    false
-                }
-                StagedInput::Message { id, .. } => !open.history_input_id.contains(id),
+            .filter(|value| {
+                value
+                    .id
+                    .as_ref()
+                    .is_none_or(|id| !open.history_input_id.contains(id))
             })
             .cloned()
             .collect::<Vec<_>>()
     };
-    let (staged_steering, staged_queue) = open
+    let (mut staged_steering, mut staged_queue) = open
         .staging
         .as_ref()
         .map(|staging| (staged(&staging.steering), staged(&staging.queue)))
         .unwrap_or_default();
+    let questions = staged_steering
+        .iter()
+        .chain(staged_queue.iter())
+        .filter(|value| value.content.is_question_reply())
+        .cloned()
+        .collect::<Vec<_>>();
+    staged_steering.retain(|value| !value.content.is_question_reply());
+    staged_queue.retain(|value| !value.content.is_question_reply());
     let steering = open
         .awaiting_steering
         .iter()
         .cloned()
         .chain(staged_steering)
         .collect::<Vec<_>>();
-    if !steering.is_empty() || !staged_queue.is_empty() {
+    if !steering.is_empty() || !staged_queue.is_empty() || !questions.is_empty() {
         let width = open.transcript.views.profile().unwrap_or(&open.last_width);
         let mut rows = Vec::new();
         let mut decoration = Vec::new();
@@ -2297,6 +2351,14 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
             &staged_queue,
             width,
             true,
+            &mut decoration,
+        )?;
+        append_staging_section(
+            &mut rows,
+            "Question replies",
+            &questions,
+            width,
+            false,
             &mut decoration,
         )?;
         let mut block = forge_buffer::block::BufferBlock {
@@ -2329,7 +2391,7 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
 fn append_staging_section(
     rows: &mut Vec<String>,
     label: &str,
-    values: &[StagedInput],
+    values: &[PresentedInput],
     width: &WidthProfile,
     preview: bool,
     decoration: &mut Vec<forge_buffer::block::Decoration>,
@@ -2344,10 +2406,8 @@ fn append_staging_section(
         rows.extend(width.wrap_plain(label, 0)?);
     }
     for value in values {
-        let (value, failed) = match value {
-            StagedInput::Text(text) => (text, false),
-            StagedInput::Message { text, failed, .. } => (text, *failed),
-        };
+        let failed = value.failed;
+        let value = &value.text;
         let start = rows.len();
         if preview {
             let first = value.split(['\r', '\n']).next().unwrap_or_default();
@@ -2589,14 +2649,17 @@ mod tests {
         {
             let mut owner = presentation.lock().unwrap();
             owner.snapshot(&document)?;
-            owner.dispatch(PresentationRequest::Resize {
-                document: document.clone(),
-                view: view.clone(),
-                width: WidthProfile {
-                    columns: 120,
-                    ..Default::default()
+            owner.dispatch(
+                PresentationRequest::Resize {
+                    document: document.clone(),
+                    view: view.clone(),
+                    width: WidthProfile {
+                        columns: 120,
+                        ..Default::default()
+                    },
                 },
-            })?;
+                &Default::default(),
+            )?;
             assert_eq!(
                 owner.open.as_ref().unwrap().diff.view.committed(),
                 forge_diff::view::DiffViewOptions::default()
@@ -2608,7 +2671,10 @@ mod tests {
                     .row(0)
                     .is_some_and(|text| text.contains("updated();"))
             }));
-            let recovered = owner.dispatch(PresentationRequest::Snapshot { document })?;
+            let recovered = owner.dispatch(
+                PresentationRequest::Snapshot { document },
+                &Default::default(),
+            )?;
             assert_eq!(
                 recovered["diff_view"],
                 serde_json::json!({"presentation":"full","visibility":"all"})
@@ -2931,7 +2997,7 @@ mod tests {
             session_id: "session".into(),
             ordinal: 1,
             prompt: format!("Prompt {identity}"),
-            origin: crate::exchange::ExchangeOrigin::User,
+            opening: crate::exchange::ExchangeOpening::user_text(format!("Prompt {identity}")),
 
             approval_mode: None,
 
@@ -3067,14 +3133,14 @@ mod tests {
             }]
         };
 
-        owner.set_staging(&document, 1, Vec::new(), staged())?;
+        owner.set_staging(&document, 1, Vec::new(), staged(), &Default::default())?;
         assert_eq!(visible(&owner)?, (1, 0));
         let submission = forge_provider_api::SubmissionId::try_from("steer-submission".to_owned())?;
         exchange.append_acknowledged_input(
             &address.scope,
             Some("steer".into()),
             Some(submission.clone()),
-            crate::exchange::InputIntent::Steering,
+            crate::exchange::InputIntent::user_text(steer.into()),
             steer.into(),
             1,
         )?;
@@ -3084,7 +3150,7 @@ mod tests {
             (1, 0),
             "acknowledgement duplicated or dropped"
         );
-        owner.set_staging(&document, 2, Vec::new(), Vec::new())?;
+        owner.set_staging(&document, 2, Vec::new(), Vec::new(), &Default::default())?;
         assert_eq!(
             visible(&owner)?,
             (1, 0),
@@ -3127,6 +3193,62 @@ mod tests {
         let transcript = text(owner.snapshot(&document)?);
         assert_eq!(status.matches(steer).count(), 0, "{status}");
         assert_eq!(transcript.matches(steer).count(), 1, "{transcript}");
+        Ok(())
+    }
+
+    #[test]
+    fn question_staging_requires_category_and_preserves_failed_delivery() -> Result<()> {
+        assert!(
+            serde_json::from_value::<StagedInput>(serde_json::json!({
+                "id":"answer", "text":"Tabs", "failed":false,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StagedInput>(serde_json::json!({
+                "id":"answer", "text":"Tabs", "content":{"kind":"question_response"},
+            }))
+            .is_err()
+        );
+        let mut owner = SessionPresentation::new("session".into());
+        let document = DocumentId("question-staging".into());
+        owner.open(
+            document.clone(),
+            ViewId("question-view".into()),
+            WidthProfile::default(),
+        )?;
+        let staged: StagedInput = serde_json::from_value(serde_json::json!({
+            "id":"answer", "text":"Delivery failed: Tabs", "failed":true,
+            "content":{"kind":"question_response", "responses":[{
+                "question_id":"layout", "revision":1, "message_id":"answer-layout", "question":"Which layout?",
+                "response":{"kind":"answer", "answer":"Tabs", "required_questions_remain":false}
+            }]}
+        }))?;
+        let questions = serde_json::from_value(serde_json::json!({
+            "revision":1, "questions":[{
+                "id":"layout", "exchange_id":"source", "task_id":null, "phase":null,
+                "requirement":"optional", "content":{"revision":1,"header":"Layout","question":"Which layout?","options":[]},
+                "previous":[], "resolution":{"kind":"pending"}, "discussion":[]
+            }]
+        }))?;
+        owner.set_staging(&document, 1, Vec::new(), vec![staged], &questions)?;
+        let snapshot = owner.open.as_ref().context("open")?.status.snapshot();
+        let text = snapshot
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Question replies"), "{text}");
+        assert!(text.contains("Delivery failed: Tabs"), "{text}");
+        assert!(!text.contains("Steering active turn"), "{text}");
+        assert!(snapshot.block.iter().any(|block| {
+            block
+                .metadata
+                .decoration
+                .iter()
+                .any(|decoration| decoration.capture == "DiagnosticError")
+        }));
         Ok(())
     }
 

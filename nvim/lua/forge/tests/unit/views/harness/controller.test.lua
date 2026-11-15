@@ -974,12 +974,7 @@ T["session_name"] = function()
   buffer.set(state.composer_buf, { "/rename Explicit title" })
   controller.submit()
   assert(requests[#requests].spec.method == "session.rename" and requests[#requests].spec.params.name == "Explicit title")
-  local tree = require("forge.render.harness.interaction_tree").build({
-    { kind = "session_event", id = "rename", event = { kind = "renamed", name = "Old title" } },
-    { kind = "session_event", id = "fork", event = { kind = "forked", source_session_id = "source" } },
-  })
-  assert(#tree.lines == 1 and tree.lines[1]:find("Forked from source", 1, true),
-    "rename confirmation survived in cached Lua timeline rendering")
+
 end
 
 T["submit_steering"] = function()

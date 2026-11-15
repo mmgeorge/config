@@ -7,6 +7,9 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod content;
+pub use content::{QuestionReplyContent, UserInputContent};
+
 mod authority;
 mod journal;
 mod message;

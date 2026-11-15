@@ -463,8 +463,8 @@ impl HarnessBroker {
             previous.repair_checks(now_ms)?;
             self.store.save_exchange(&previous)?;
         }
-        let session_title = match admission.map(|value| &value.origin) {
-            Some(crate::exchange::ExchangeOrigin::TaskStarted { start }) => start.title.as_str(),
+        let session_title = match admission.map(|value| &value.opening) {
+            Some(crate::exchange::ExchangeOpening::TaskStarted { start }) => start.title.as_str(),
             _ => admitted_prompt,
         };
         let (mut interaction, new_interaction, events, mut effects) = self
@@ -480,7 +480,7 @@ impl HarnessBroker {
         interaction.input_message_id = input_message_id.or(interaction.input_message_id);
         interaction.approval_mode = Some(self.session.approval_mode);
         if new_interaction && let Some(admission) = admission {
-            interaction.origin = admission.origin.clone();
+            interaction.opening = admission.opening.clone();
             if self.check_setup {
                 interaction.check_setup = Some(crate::checks::CheckSetupState::Discovery);
             } else if mode == PromptMode::Chat {

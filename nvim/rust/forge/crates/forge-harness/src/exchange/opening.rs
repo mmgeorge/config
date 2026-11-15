@@ -1,17 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-/// Identifies who requested an exchange without retaining task ownership.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+/// Own the semantic input that begins an exchange independently of its provider turns.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ExchangeOrigin {
-    #[default]
-    User,
+pub enum ExchangeOpening {
+    User {
+        content: crate::input::UserInputContent,
+    },
     /// Observe provider-native child work without claiming a Harness task or user submission.
     NativeAgent,
-    /// The submitted answer batch is the user input that opens this exchange.
-    QuestionAnswers {
-        answers: Vec<AnsweredQuestion>,
-    },
     TaskStarted {
         start: TaskStart,
     },
@@ -20,14 +17,19 @@ pub enum ExchangeOrigin {
     },
 }
 
-/// Keep each submitted answer attached to its original question and choices.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AnsweredQuestion {
-    pub question: crate::plan::PlanQuestion,
-    pub answer: crate::plan::PlanQuestionResponse,
+impl Default for ExchangeOpening {
+    fn default() -> Self {
+        Self::user_text(String::new())
+    }
 }
 
-impl ExchangeOrigin {
+impl ExchangeOpening {
+    pub fn user_text(text: String) -> Self {
+        Self::User {
+            content: crate::input::UserInputContent::UserText { text },
+        }
+    }
+
     pub fn task_continuation(reason: impl Into<String>) -> Self {
         Self::TaskContinuation {
             reason: reason.into(),

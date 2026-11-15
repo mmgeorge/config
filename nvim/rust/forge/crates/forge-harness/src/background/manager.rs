@@ -1022,7 +1022,7 @@ impl BackgroundManager {
                     presentation
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Background presentation lock poisoned"))?
-                        .dispatch(request)?,
+                        .dispatch(request, &Default::default())?,
                 )
             }
         } else {

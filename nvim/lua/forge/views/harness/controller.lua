@@ -1240,7 +1240,7 @@ end
 ---@field id string
 ---@field ordinal integer
 ---@field prompt string
----@field origin? table
+---@field opening? ForgeExchangeOpening
 ---@field state "complete"|"failed"|"cancelled"
 ---@field checkpoint_before string
 
@@ -1353,7 +1353,7 @@ end
 ---@param interaction ForgeRollbackInteraction
 ---@param composer_free? fun(): boolean
 function M.restore_rolled_back_prompt(interaction, composer_free)
-  if require("forge.render.harness.interaction_tree").host_authored_notice(interaction) then return end
+  if require("forge.render.harness.exchange_opening").notice(interaction.opening) then return end
   if not restore_composer_prompt(interaction.prompt or "", composer_free) and composer_free
     and (interaction.prompt or "") ~= "" then
     notifications.warn("The rolled-back prompt was not restored because the composer holds newer text",
@@ -1432,7 +1432,7 @@ local function open_exchange_undo_picker(recovery)
       if rollback_state[interaction.state]
         and interaction.disposition == "current"
       then
-        local host_notice = require("forge.render.harness.interaction_tree").host_authored_notice(interaction)
+        local host_notice = require("forge.render.harness.exchange_opening").notice(interaction.opening)
         local prompt = host_notice or vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
         option_list[#option_list + 1] = {
           id = interaction.id,

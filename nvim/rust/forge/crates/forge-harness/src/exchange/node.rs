@@ -139,13 +139,20 @@ pub struct DeclarationRevision {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputIntent {
-    Steering,
     /// Preserve structured question content independently of its active-turn delivery route.
-    QuestionResponse {
-        responses: Vec<forge_provider_api::QuestionReply>,
+    User {
+        content: crate::input::UserInputContent,
     },
     Clarification,
     Answer,
+}
+
+impl InputIntent {
+    pub(crate) fn user_text(text: String) -> Self {
+        Self::User {
+            content: crate::input::UserInputContent::UserText { text },
+        }
+    }
 }
 
 /// Retains acknowledged user input in exchange order.

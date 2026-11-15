@@ -804,17 +804,25 @@ impl HarnessBroker {
             )?,
         };
         let input_message_id = submission.record()?.input_message_id;
-        let answer_origin =
-            crate::question::answer_origin(input.turn(), &self.questions.snapshot()?)?;
-        let answer_admission = answer_origin.map(|origin| ExchangeAdmission {
-            origin,
-            check_owner: None,
-            automatic_owner: None,
-            plan_event_id: None,
-            prompt: text.to_owned(),
-            agent_run_id: None,
-        });
-        let admission = answer_admission.as_ref().or(admission);
+        let user_admission = match admission {
+            Some(admission)
+                if matches!(
+                    admission.opening,
+                    crate::exchange::ExchangeOpening::User { .. }
+                ) =>
+            {
+                let content = crate::question::input_content(
+                    input.turn(),
+                    text,
+                    &self.questions.snapshot()?,
+                )?;
+                let mut admission = admission.clone();
+                admission.opening = crate::exchange::ExchangeOpening::User { content };
+                Some(admission)
+            }
+            Some(_) | None => None,
+        };
+        let admission = user_admission.as_ref().or(admission);
         let (exchange, new_runtime, events, effects) =
             self.stage_admit_interaction(text, mode, admission, input_message_id, selected)?;
         Ok(StagedInteraction {
@@ -1546,11 +1554,11 @@ impl HarnessBroker {
             } => Some((
                 revision,
                 match start {
-                    Some(start) => crate::exchange::ExchangeOrigin::TaskStarted {
+                    Some(start) => crate::exchange::ExchangeOpening::TaskStarted {
                         start: start.clone(),
                     },
                     None => {
-                        crate::exchange::ExchangeOrigin::task_continuation("The task was resumed")
+                        crate::exchange::ExchangeOpening::task_continuation("The task was resumed")
                     }
                 },
             )),
@@ -1558,7 +1566,7 @@ impl HarnessBroker {
                 revision, reason, ..
             } => Some((
                 revision,
-                crate::exchange::ExchangeOrigin::task_continuation(reason.clone()),
+                crate::exchange::ExchangeOpening::task_continuation(reason.clone()),
             )),
             _ => None,
         };
@@ -1594,7 +1602,7 @@ impl HarnessBroker {
                 self.store.save_exchange(&exchange)?;
             }
             let mut exchange_admission = ExchangeAdmission::chat(text.clone());
-            exchange_admission.origin = origin;
+            exchange_admission.opening = origin;
             let mode = match &task.workflow {
                 crate::task::WorkflowSnapshot::Plan { plan }
                     if plan.artifact.state == PlanState::ConfiguringChecks =>
@@ -2337,8 +2345,9 @@ impl HarnessBroker {
                     };
                     let mut owned = self.begin_foreground_dispatch(request, sink.clone())?;
                     let mut admission = ExchangeAdmission::chat(feedback.clone());
-                    admission.origin =
-                        crate::exchange::ExchangeOrigin::task_continuation("An approval timed out");
+                    admission.opening = crate::exchange::ExchangeOpening::task_continuation(
+                        "An approval timed out",
+                    );
                     let interaction = self.stage_foreground_interaction(
                         &feedback,
                         PromptMode::Chat,

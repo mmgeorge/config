@@ -22,7 +22,7 @@ pub(super) async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionControlle
         session_id: session.into(),
         ordinal: 1,
         prompt: "Clarify the workspace".into(),
-        origin: crate::exchange::ExchangeOrigin::User,
+        opening: crate::exchange::ExchangeOpening::user_text("Clarify the workspace".into()),
         approval_mode: None,
         phase: crate::exchange::ExchangePhase::Running,
         checkpoint_before: None,

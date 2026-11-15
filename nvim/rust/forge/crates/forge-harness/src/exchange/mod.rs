@@ -39,7 +39,7 @@ mod live_effect_queue;
 mod metrics;
 mod native_command;
 mod node;
-mod origin;
+mod opening;
 mod owner;
 mod plan_question;
 mod publication;
@@ -79,7 +79,7 @@ pub use node::{
     ActiveWait, ArtifactChange, DeclarationRevision, ExchangeInput, ExchangeNode, InputConsumption,
     InputIntent, PlanCommentResolution, QuestionInput, VerificationResult,
 };
-pub use origin::{AnsweredQuestion, ExchangeOrigin, TaskStart};
+pub use opening::{ExchangeOpening, TaskStart};
 pub(crate) use record::ExchangeActivity;
 pub use record::{
     Exchange, ExchangeCollection, ExchangeComment, ExchangeOutcome, ExchangeState,

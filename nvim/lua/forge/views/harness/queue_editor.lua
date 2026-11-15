@@ -2,12 +2,38 @@ local M = {}
 local attachment = require("forge.views.harness.attachment")
 local input_state = require("forge.views.harness.input_state")
 
+---@class ForgeQuestionReplyOption
+---@field id string
+---@field label string
+---@field description string
+---@field recommended boolean
+
+---@class ForgeQuestionReplyDecision
+---@field kind 'answer'|'correction'
+---@field answer string
+---@field required_questions_remain boolean
+
+---@class ForgeQuestionReplyClarification
+---@field kind 'clarification'
+---@field options ForgeQuestionReplyOption[]
+---@field text string
+---@field reply_to? string
+
+---@alias ForgeQuestionReplyResponse ForgeQuestionReplyDecision|ForgeQuestionReplyClarification
+
+---@class ForgeQuestionReply
+---@field question_id string
+---@field revision integer
+---@field message_id string
+---@field question string
+---@field response ForgeQuestionReplyResponse
+
 ---@class ForgeStagedMessageContent
 ---@field kind 'message'
 
 ---@class ForgeStagedQuestionContent
 ---@field kind 'question_response'
----@field responses table[] Original structured replies from the host input purpose.
+---@field responses ForgeQuestionReply[] Original structured replies from the host input purpose.
 
 ---@alias ForgeStagedContent ForgeStagedMessageContent|ForgeStagedQuestionContent
 

@@ -203,7 +203,9 @@ return {
         capabilities = capabilities,
         before_init = function(_, config)
           local root = config.root_dir
-          if root and vim.fs.basename(vim.fs.normalize(root)) == "librust" then
+          local normalized_root = root and vim.fs.normalize(root)
+          if normalized_root and (vim.fs.basename(normalized_root) == "librust"
+              or normalized_root:match("/zellij/sessions$")) then
             local settings = config.settings["rust-analyzer"]
             settings.cargo.target = "wasm32-unknown-unknown"
             settings.check.targets = { "wasm32-unknown-unknown", "host-tuple" }
@@ -212,6 +214,7 @@ return {
         settings = {
           ["rust-analyzer"] = {
             cargo = {
+              allTargets = true,
               features = "all",
               targetDir = true,
             },

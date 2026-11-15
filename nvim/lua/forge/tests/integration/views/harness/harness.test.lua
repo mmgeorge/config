@@ -3279,6 +3279,28 @@ T["question_answers_never_become_steering"] = function()
     eq(failure, nil)
     return result
   end
+  local function poll(method, params, ready, message)
+    local result, failure, done
+    local active = true
+    MiniTest.finally(function() active = false end)
+    local function send()
+      if not active then return end
+      client.request({ session_id = session_id, method = method, params = params or {} }, function(value, error)
+        if not active then return end
+        result, failure = value, error
+        if failure then done = true return end
+        local checked, accepted = pcall(ready, value)
+        if not checked then failure, done = accepted, true return end
+        done = accepted
+        if not done then vim.defer_fn(send, 5) end
+      end)
+    end
+    send()
+    wait_until(function() return done end, message, { context = function() return vim.inspect(result) end })
+    active = false
+    eq(failure, nil)
+    return result
+  end
   local initialized
   client.session_initialize(function(result, failure) eq(failure, nil) initialized = result end)
   wait_until(function() return initialized end, "Harness did not initialize")
@@ -3289,13 +3311,14 @@ T["question_answers_never_become_steering"] = function()
     } } } }, terminal = "completed",
   } })
   request("session.prompt.submit", { text = "Ask about layout." })
-  local current
-  wait_until(function()
-    current = request("session.state.get")
-    return current.status.kind == "idle" and current.questions and #current.questions.questions == 1
+  local current = poll("session.state.get", {}, function(value)
+    return value.status.kind == "idle" and value.questions and #value.questions.questions == 1
   end, "question did not settle")
   local question = current.questions.questions[1]
   local held = request("session.provider.mock_response", { operation = "hold" })
+  MiniTest.finally(function()
+    pcall(request, "session.provider.mock_response", { operation = "release", id = held.id })
+  end)
   request("session.prompt.submit", { text = "Continue researching." })
   request("session.provider.mock_response", { operation = "wait", id = held.id })
   request("session.document", { operation = "open", document = "answer-stage", view = "answer-view",
@@ -3305,8 +3328,7 @@ T["question_answers_never_become_steering"] = function()
     action = { kind = "answer", answer = { kind = "other", text = "Tabs" } },
   } })
   local message
-  wait_until(function()
-    local input = request("session.input.get")
+  poll("session.input.get", {}, function(input)
     for _, candidate in ipairs(input.messages) do
       if candidate.purpose.kind == "question" then message = candidate end
     end
@@ -3316,11 +3338,8 @@ T["question_answers_never_become_steering"] = function()
   request("session.document", { operation = "staging", document = "answer-stage", sequence = 1,
     queue = {}, steering = { { id = message.id, text = message.text, failed = false,
       content = { kind = "question_response", responses = { message.purpose.reply } } } } })
-  wait_until(function()
-    local document = request("session.document", { operation = "snapshot", document = "answer-stage" })
+  poll("session.document", { operation = "snapshot", document = "answer-stage" }, function(document)
     eq(vim.json.encode(document):find("Steering", 1, true), nil)
-    local status = request("session.document", { operation = "snapshot", document = "answer-stage:status" })
-    eq(vim.json.encode(status):find("Steering active turn", 1, true), nil)
     local answer_count = 0
     for _, block in ipairs(document.block) do
       for _, row in ipairs(block.text) do
@@ -3329,8 +3348,10 @@ T["question_answers_never_become_steering"] = function()
     end
     return answer_count == 1
   end, "accepted answer did not retain its question category")
+  local status = request("session.document", { operation = "snapshot", document = "answer-stage:status" })
+  eq(vim.json.encode(status):find("Steering active turn", 1, true), nil)
   request("session.provider.mock_response", { operation = "release", id = held.id })
-  wait_until(function() return request("session.state.get").status.kind == "idle" end, "held turn did not settle")
+  poll("session.state.get", {}, function(current_state) return current_state.status.kind == "idle" end, "held turn did not settle")
   eq(host.stop(), true)
 end
 
@@ -3376,7 +3397,20 @@ T["question_answer_opens_new_exchange_once"] = function()
   request("session.provider.mock_response", { operation = "wait", id = held.id })
   local document = request("session.document", { operation = "open", document = "opener", view = "opener-view",
     width = { columns = 120, tabstop = 4 } }).transcript
-  local function assert_opener(snapshot)
+  local expansion_sequence = 0
+  local function assert_opener(snapshot, document_id)
+    for _, block in ipairs(snapshot.block) do
+      local node = block.metadata.node
+      if node and node ~= vim.NIL and node.kind == "exchange" then
+        expansion_sequence = expansion_sequence + 1
+        request("session.document", { operation = "node", document = document_id,
+          view = document_id == "opener" and "opener-view" or "reopened-view",
+          sequence = expansion_sequence, node = node.id, generation = node.generation,
+          action = "set_expansion", expanded = true, rows = 100,
+          width = { columns = 120, tabstop = 4 } })
+      end
+    end
+    snapshot = request("session.document", { operation = "snapshot", document = document_id })
     local heading, thought, count = nil, nil, 0
     for index, block in ipairs(snapshot.block) do
       for _, row in ipairs(block.text) do
@@ -3390,16 +3424,16 @@ T["question_answer_opens_new_exchange_once"] = function()
     eq(count, 1)
     eq(heading < thought, true)
   end
-  assert_opener(document)
+  assert_opener(document, "opener")
   request("session.provider.mock_response", { operation = "release", id = held.id })
   wait_until(function() return request("session.state.get").status.kind == "idle" end, "answer exchange did not settle")
   request("session.state.get")
   document = request("session.document", { operation = "snapshot", document = "opener" })
-  assert_opener(document)
+  assert_opener(document, "opener")
   request("session.document", { operation = "close", document = "opener" })
   document = request("session.document", { operation = "open", document = "reopened-opener", view = "reopened-view",
     width = { columns = 120, tabstop = 4 } }).transcript
-  assert_opener(document)
+  assert_opener(document, "reopened-opener")
   eq(host.stop(), true)
 end
 

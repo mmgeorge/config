@@ -266,10 +266,7 @@ impl Exchange {
                 }
                 ExchangeNode::TurnContent { .. } => continue,
                 ExchangeNode::ExchangeInput { prompt }
-                    if matches!(
-                        prompt.intent,
-                        InputIntent::Steering | InputIntent::QuestionResponse { .. }
-                    ) =>
+                    if matches!(prompt.intent, InputIntent::User { .. }) =>
                 {
                     ExchangeEntry::Steering {
                         id: prompt.id.clone(),

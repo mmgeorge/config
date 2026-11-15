@@ -684,7 +684,7 @@ pub(super) fn completed_interaction(
         session_id: session_id.into(),
         ordinal: 1,
         prompt: "test interaction".into(),
-        origin: crate::exchange::ExchangeOrigin::User,
+        opening: crate::exchange::ExchangeOpening::user_text("test interaction".into()),
 
         phase: crate::exchange::ExchangePhase::fixture(ExchangeState::Complete, Some(2), None),
         checkpoint_before: None,
