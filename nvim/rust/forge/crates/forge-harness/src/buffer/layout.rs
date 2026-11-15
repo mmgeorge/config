@@ -172,7 +172,26 @@ pub(super) fn is_outer_message(exchange: &Exchange, node: &ExchangeNode) -> Resu
     Ok(matches!(
         message.delivery(),
         MessageDelivery::Final | MessageDelivery::Unknown
-    ))
+    ) && !response_continues_with_checks(exchange, node))
+}
+
+/// Keep a response followed by internal check evidence inside the continuing activity.
+pub(super) fn response_continues_with_checks(exchange: &Exchange, node: &ExchangeNode) -> bool {
+    exchange
+        .node_list
+        .iter()
+        .skip_while(|candidate| candidate.id() != node.id())
+        .skip(1)
+        .find_map(|candidate| match candidate {
+            ExchangeNode::ExchangeInput { prompt } => Some(matches!(
+                &prompt.intent,
+                crate::exchange::InputIntent::User {
+                    content: crate::input::UserInputContent::CheckResult { .. }
+                }
+            )),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// Materializes Markdown padding once so native wrapping shares the parser's content origin.

@@ -231,6 +231,10 @@ async fn check_result_replay_preserves_receipts_and_delivers_later_runs() -> Res
 #[tokio::test]
 async fn check_result_reaches_mock_provider_while_user_queue_is_paused() -> Result<()> {
     use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let broker = HarnessBroker::initialize(serde_json::from_value(json!({
@@ -241,6 +245,36 @@ async fn check_result_reaches_mock_provider_while_user_queue_is_paused() -> Resu
     let mut exchange = crate::storage::test::running_exchange("check-owner");
     exchange.session_id = session.id.clone();
     exchange.agent_id = session.primary_agent_id;
+    let address = crate::turn::test_support::address(&exchange, "initial");
+    exchange.start_turn(address.clone(), 1)?;
+    exchange.observe_event(
+        &crate::turn::test_support::message(
+            &address,
+            "initial-commentary",
+            Some(forge_provider_api::AgentMessageRole::Commentary),
+            "Starting checks.",
+        ),
+        1,
+    )?;
+    exchange.observe_event(
+        &crate::turn::test_support::message(
+            &address,
+            "pending-response",
+            Some(forge_provider_api::AgentMessageRole::Response),
+            "Checks are pending.",
+        ),
+        2,
+    )?;
+    exchange.observe_event(
+        &crate::turn::test_support::completed_event(
+            &address,
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            3,
+        ),
+        3,
+    )?;
     exchange.finish(crate::exchange::ExchangeOutcome::Complete, 100)?;
     SqliteStore::open(&broker.data_root)?.save_exchange(&exchange)?;
     seed_completed_check(
@@ -265,6 +299,27 @@ async fn check_result_reaches_mock_provider_while_user_queue_is_paused() -> Resu
             MockResponseCommand::Hold {
                 mode: None,
                 any_session: false,
+            },
+        )
+        .await?;
+    control
+        .dispatch(
+            &session.id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        TestPromptStep::Message {
+                            content: TestMessageContent::Commentary,
+                            text: "Reviewing the check result.".into(),
+                        },
+                        TestPromptStep::Message {
+                            content: TestMessageContent::Response,
+                            text: "Checks passed.".into(),
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
             },
         )
         .await?;
@@ -301,6 +356,49 @@ async fn check_result_reaches_mock_provider_while_user_queue_is_paused() -> Resu
         )
         .await?;
     controller.finish_exchange_owner().await?;
+    let completed = crate::storage::HistoryReader::current(&controller.data_root)?
+        .latest_exchange(&session.id)?
+        .context("completed exchange")?;
+    let projected = crate::buffer::projection::project(
+        crate::buffer::projection::ProjectionSource::Exchange(&completed),
+        &forge_buffer::width::WidthProfile::default(),
+        100,
+        false,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &mut crate::buffer::identity::DisplayRegistry::default(),
+    )?;
+    let blocks = &projected.entry.block;
+    let summary = blocks
+        .iter()
+        .find(|block| block.id.0 == "check-owner:summary")
+        .context("activity summary")?;
+    let activity_end = blocks
+        .iter()
+        .position(|block| block.id == summary.metadata.fold[0].end.block)
+        .context("activity fold end")?;
+    for text in [
+        "Checks are pending.",
+        "Reviewing the check result.",
+        "Checks passed.",
+    ] {
+        let position = blocks
+            .iter()
+            .position(|block| block.text.wire_rows().join("\n").contains(text))
+            .with_context(|| format!("missing rendered message: {text}"))?;
+        if text == "Checks passed." {
+            assert!(
+                position > activity_end,
+                "final response belongs outside the activity fold"
+            );
+        } else {
+            assert!(
+                position <= activity_end,
+                "continued activity escaped the Thought fold: {text}"
+            );
+            assert_eq!(blocks[position].metadata.layout.as_ref().unwrap().indent, 4);
+        }
+    }
     drop(sink);
     drop(controller);
     reader.abort();

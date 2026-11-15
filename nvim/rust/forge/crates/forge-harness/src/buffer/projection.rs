@@ -1959,6 +1959,13 @@ impl TimelineRenderer<'_> {
                                 message.text(),
                                 if message.role().is_none() {
                                     MarkdownRole::Message
+                                } else if message.delivery() == crate::turn::MessageDelivery::Final
+                                    && super::layout::response_continues_with_checks(
+                                        interaction,
+                                        nodes[0],
+                                    )
+                                {
+                                    MarkdownRole::Commentary
                                 } else {
                                     response_role
                                 },

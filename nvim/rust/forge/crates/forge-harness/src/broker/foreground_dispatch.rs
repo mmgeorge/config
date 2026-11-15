@@ -1517,6 +1517,10 @@ impl HarnessBroker {
                 .load_exchange(exchange_id)?
                 .context("check result exchange is missing")?;
             exchange.continue_check_result(self.clock.now_ms())?;
+            let content =
+                crate::question::input_content(&turn, &text, &self.questions.snapshot()?)?;
+            let (intent, label) = content.exchange_input();
+            exchange.append_input(intent, label, self.clock.now_ms())?;
             self.store.save_exchange(&exchange)?;
             let mode = self.task_prompt_mode()?;
             if let Some(task) = self.task_controller.current()? {
