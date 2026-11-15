@@ -1168,6 +1168,24 @@ impl Exchange {
         self.resume(now_ms)
     }
 
+    /// Resume collected check evidence without replacing the request or reviving cancellation.
+    pub(crate) fn continue_check_result(&mut self, now_ms: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(
+                self.state(),
+                ExchangeState::Complete | ExchangeState::Running
+            ) && self.disposition() == HistoryDisposition::Current
+                && self
+                    .turn
+                    .iter()
+                    .all(|turn| turn.state() != crate::turn::TurnState::Running),
+            "check completion requires its current settled exchange"
+        );
+        self.phase = super::ExchangePhase::Running;
+        self.finalization_error = None;
+        self.resume(now_ms)
+    }
+
     /// Continue explicit review feedback under the original exchange and checkpoint.
     pub(crate) fn revise_plan(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(

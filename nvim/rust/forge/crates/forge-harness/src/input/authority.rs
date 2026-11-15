@@ -12,6 +12,24 @@ pub(crate) fn input_purpose_is_current(
 ) -> Result<bool, InputAuthorityError> {
     let (revision, may_wait) = match purpose {
         InputPurpose::User => return Ok(true),
+        InputPurpose::CheckResult { exchange_id, .. } => {
+            return crate::storage::HistoryReader::current(root)
+                .and_then(|reader| reader.load_exchange(exchange_id))
+                .map(|exchange| {
+                    exchange.is_some_and(|exchange| {
+                        exchange.session_id == session
+                            && matches!(
+                                exchange.state(),
+                                crate::exchange::ExchangeState::Running
+                                    | crate::exchange::ExchangeState::Finalizing
+                                    | crate::exchange::ExchangeState::Complete
+                            )
+                            && exchange.disposition()
+                                == crate::exchange::HistoryDisposition::Current
+                    })
+                })
+                .map_err(InputAuthorityError::Questions);
+        }
         InputPurpose::Clarification { target } => {
             return crate::exchange::input_target::is_current(root, session, target, true)
                 .map_err(InputAuthorityError::Questions);
@@ -106,6 +124,7 @@ pub(crate) fn input_purpose_is_current(
                     InputPurpose::TaskEntry { .. } => true,
                     InputPurpose::Clarification { .. }
                     | InputPurpose::User
+                    | InputPurpose::CheckResult { .. }
                     | InputPurpose::Question { .. }
                     | InputPurpose::QuestionContinuation { .. }
                     | InputPurpose::WorkflowContinuation { .. } => {

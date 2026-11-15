@@ -151,6 +151,7 @@ impl ExchangeDriver {
             DriverWake::PublicationStoreRetry => WakeEnd::Finished,
             DriverWake::HistoryWriteFailed => WakeEnd::Finished,
             DriverWake::QuestionInput => WakeEnd::Finished,
+            DriverWake::CheckResult => WakeEnd::Finished,
             DriverWake::QuestionTool => WakeEnd::Finished,
             DriverWake::QuestionWait => WakeEnd::Finished,
         }
@@ -265,6 +266,7 @@ impl ExchangeDriver {
                 } => DriverWake::PublicationRetry,
                 _ = async { drop(broker.lock().await); }, if broker_deferred => DriverWake::BrokerAvailable,
                 _ = self.question_inputs.next(question_changes), if !closed && !self.commands.storage_unavailable() => DriverWake::QuestionInput,
+                _ = self.check_results.next(), if !closed && !self.commands.storage_unavailable() => DriverWake::CheckResult,
                 _ = async {
                     tokio::select! {
                         _ = publication_delivery.next() => {},

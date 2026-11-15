@@ -357,6 +357,7 @@ fn same_input(saved: &InputMessage, expected: &InputMessage) -> bool {
         (
             InputPurpose::Clarification { .. }
             | InputPurpose::User
+            | InputPurpose::CheckResult { .. }
             | InputPurpose::WorkflowContinuation { .. }
             | InputPurpose::TaskEntry { .. }
             | InputPurpose::TaskContinuation { .. },
@@ -366,6 +367,7 @@ fn same_input(saved: &InputMessage, expected: &InputMessage) -> bool {
             InputPurpose::Question { .. },
             InputPurpose::Clarification { .. }
             | InputPurpose::User
+            | InputPurpose::CheckResult { .. }
             | InputPurpose::QuestionContinuation { .. }
             | InputPurpose::WorkflowContinuation { .. }
             | InputPurpose::TaskEntry { .. }
@@ -375,6 +377,7 @@ fn same_input(saved: &InputMessage, expected: &InputMessage) -> bool {
             InputPurpose::QuestionContinuation { .. },
             InputPurpose::Clarification { .. }
             | InputPurpose::User
+            | InputPurpose::CheckResult { .. }
             | InputPurpose::WorkflowContinuation { .. }
             | InputPurpose::Question { .. }
             | InputPurpose::TaskEntry { .. }

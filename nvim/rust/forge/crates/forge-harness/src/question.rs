@@ -1897,6 +1897,11 @@ pub(crate) fn input_content(
     use crate::input::{QuestionReplyContent, UserInputContent};
     use forge_provider_api::{QuestionReplyResponse, forge::TurnKind};
     let responses = match input.kind() {
+        TurnKind::CheckResult { result } => {
+            return Ok(UserInputContent::CheckResult {
+                result: Box::new(result.clone()),
+            });
+        }
         TurnKind::QuestionResponse { response } => std::slice::from_ref(response),
         TurnKind::QuestionBatch { responses } => responses.as_slice(),
         TurnKind::UserMessage { .. }

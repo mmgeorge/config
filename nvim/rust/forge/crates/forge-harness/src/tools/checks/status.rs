@@ -10,7 +10,9 @@ pub(super) const NAME: &str = "check_status";
 pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
-        description: "Poll or wait for a run identified by check_run or check_list. Supply run_id and optional wait_ms \
+        description: "Inspect or wait for a run identified by check_run or check_list when status is explicitly needed, \
+                recovering delivery, or confirming cancellation. Normal completion arrives as a check_result message; \
+                do not poll routinely. Supply run_id and optional wait_ms \
                 from 0 to 60000, default 0, for example {run_id:\"run-123\",wait_ms:60000}. Waiting ends on \
                 completion or the original deadline without cancelling execution. Get compact state, exit code, \
                 progress, elapsed time, latest nonempty output line, failure reason, and executed/reused counts, \

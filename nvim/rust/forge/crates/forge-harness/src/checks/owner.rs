@@ -276,6 +276,31 @@ pub(crate) struct CheckOwnerCompletion {
 }
 
 impl CheckOwnerRuns {
+    /// Recover admitted tool runs; automatic and plan checks have no tool receipt.
+    pub(crate) fn result_sources(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let directory = self.runner.root.join("owner-receipts");
+        if !directory.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let receipt: CheckToolReceipt = crate::codec::from_slice(&std::fs::read(path)?)?;
+            if matches!(receipt.state, CheckToolReceiptState::Admitted)
+                && !self.scopes.contains_key(&receipt.run_id)
+            {
+                sources.push((
+                    receipt.run_id,
+                    receipt.scope.exchange_id.as_str().to_owned(),
+                ));
+            }
+        }
+        Ok(sources)
+    }
+
     /// Create process ownership for one session's check supervisor.
     pub(crate) fn new(runner: Arc<CheckSupervisor>) -> Self {
         Self {
@@ -578,6 +603,44 @@ fn write_receipt(path: &std::path::Path, receipt: &CheckToolReceipt) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A saved terminal result cannot become a notification before its worker is collected.
+    #[test]
+    fn result_sources_wait_for_owner_collection() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::checks::configure_fixture(root.path());
+        let broker = crate::broker::HarnessBroker::initialize(serde_json::from_value(
+            serde_json::json!({
+                "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"collection",
+                "provider":{"kind":"mock","command":[]}
+            }),
+        )?)?;
+        let mut owner = CheckOwnerRuns::new(broker.checks());
+        let scope = InvocationScope::new(crate::provider::ThreadOwner::root("session"), "exchange");
+        let call = ToolCallId::new("call")?;
+        write_receipt(
+            &owner.receipt_path(&scope, &call)?,
+            &CheckToolReceipt {
+                scope: scope.clone(),
+                call_id: call,
+                request: RunRequest::default(),
+                run_id: "run".into(),
+                state: CheckToolReceiptState::Admitted,
+            },
+        )?;
+        owner.scopes.insert("run".into(), scope.clone());
+        assert!(owner.result_sources()?.is_empty());
+        owner.settle(&CheckOwnerCompletion {
+            scope,
+            run_id: "run".into(),
+            outcome: Ok(()),
+        });
+        assert_eq!(
+            owner.result_sources()?,
+            vec![("run".into(), "exchange".into())]
+        );
+        Ok(())
+    }
 
     /// Reopening a receipt replays admitted work, rejects conflicting intent, and never replays uncertainty.
     #[test]

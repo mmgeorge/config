@@ -93,6 +93,7 @@ pub(crate) struct ExchangeDriver {
     input_receipts: InputReceipts,
     input_delivery: Option<InputDeliveryRun>,
     question_inputs: super::question_input::QuestionInputs,
+    check_results: super::check_result::CheckResults,
     question_waits: super::question_wait::QuestionWaits,
     question_tools: VecDeque<super::question_tool::QuestionTool>,
     pending_approval_timeout: Option<u64>,
@@ -164,6 +165,7 @@ impl ExchangeDriver {
             input_receipts: InputReceipts::default(),
             input_delivery: None,
             question_inputs: super::question_input::QuestionInputs::default(),
+            check_results: super::check_result::CheckResults::default(),
             question_waits: super::question_wait::QuestionWaits::default(),
             question_tools: VecDeque::new(),
             pending_approval_timeout: None,
@@ -857,6 +859,7 @@ enum DriverWake {
     QuestionWait,
     BrokerAvailable,
     QuestionInput,
+    CheckResult,
     Publication,
     InputDelivery(InputDeliveryTarget, InputDeliveryEvent),
     InputCollected(Option<Result<CollectedInput, tokio::task::JoinError>>),
@@ -963,6 +966,10 @@ fn steering_input_eligible(
     let task = services.tasks.current().map_err(InputOfferError::Queue)?;
     Ok(match &message.purpose {
         InputPurpose::User => true,
+        InputPurpose::CheckResult { .. } => services
+            .observer
+            .native_steer_supported()
+            .map_err(InputOfferError::Queue)?,
         InputPurpose::Clarification { .. } => false,
         InputPurpose::TaskEntry { .. } => {
             services
@@ -1143,6 +1150,10 @@ fn interrupt_checks_for_direct_input(
     step: u64,
 ) -> bool {
     if message.intent != crate::input::InputIntent::Auto
+        || matches!(
+            message.purpose,
+            crate::input::InputPurpose::CheckResult { .. }
+        )
         || !crate::input::input_purpose_is_current(
             &services.tasks,
             &services.questions,

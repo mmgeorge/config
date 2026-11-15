@@ -574,6 +574,7 @@ impl InputDeliveryRun {
                     }
                     crate::input::InputPurpose::Clarification { .. }
                     | crate::input::InputPurpose::User
+                    | crate::input::InputPurpose::CheckResult { .. }
                     | crate::input::InputPurpose::QuestionContinuation { .. }
                     | crate::input::InputPurpose::WorkflowContinuation { .. }
                     | crate::input::InputPurpose::TaskEntry { .. }
@@ -593,6 +594,7 @@ impl InputDeliveryRun {
                     }
                     crate::input::InputPurpose::Clarification { .. }
                     | crate::input::InputPurpose::User
+                    | crate::input::InputPurpose::CheckResult { .. }
                     | crate::input::InputPurpose::Question { .. }
                     | crate::input::InputPurpose::QuestionContinuation { .. }
                     | crate::input::InputPurpose::WorkflowContinuation { .. } => {
@@ -712,6 +714,7 @@ impl InputDeliveryRun {
                         }
                         crate::input::InputPurpose::Clarification { .. }
                         | crate::input::InputPurpose::User
+                        | crate::input::InputPurpose::CheckResult { .. }
                         | crate::input::InputPurpose::Question { .. }
                         | crate::input::InputPurpose::QuestionContinuation { .. }
                         | crate::input::InputPurpose::WorkflowContinuation { .. }
@@ -1158,6 +1161,14 @@ impl InputDeliveryRun {
             .input
             .snapshot()
             .map_err(OperationFailure::Domain)?;
+        if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &self.message.purpose {
+            let active = crate::storage::HistoryReader::current(&services.root)
+                .and_then(|reader| reader.latest_exchange(services.observer.session_id()))
+                .map_err(OperationFailure::Domain)?;
+            if active.is_none_or(|exchange| exchange.id != *exchange_id) {
+                return Ok(Some(InputAbandonment::Paused));
+            }
+        }
         let ready = services
             .observer
             .input_readiness()

@@ -16,8 +16,10 @@ pub(super) fn definition() -> ControlToolDefinition {
                 Omit selection for defaults/context sources, or use all:true for full context. Never combine \
                 inputs, tests, paths, and all. \
                 Commands remain opaque and callers cannot replace them. Every admitted request immediately \
-                returns only run_id, even if execution finishes immediately. Never waits. Use check_status to \
-                wait or poll, check_detail after completion for logs, and check_cancel to stop work. Unavailable \
+                returns only run_id, even if execution finishes immediately. Harness delivers a check_result \
+                message after collection; continue independent work or end the turn to wait, without polling. \
+                Use check_status for explicit inspection, recovery, or cancellation confirmation, check_detail \
+                for additional diagnostics and logs, and check_cancel to stop work. Unavailable \
                 while writing agents are active. During plan execution, verification requires Verify \
                 and apply requires Resolve.",
         input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::CheckRunRequest))

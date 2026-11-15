@@ -53,6 +53,8 @@ pub enum TurnKind {
     PlanReview { review: PlanReview },
     /// Saved checks block task completion.
     CheckRepair { repair: CheckRepair },
+    /// A requested check completed and its collected result is ready.
+    CheckResult { result: super::CheckResult },
     /// Settled child results continue the parent's unfinished request.
     ChildResults,
     /// A parent assigned a child agent one task.
@@ -419,6 +421,7 @@ impl TurnInput {
             | TurnKind::WorkflowAnswers { .. }
             | TurnKind::PlanReview { .. }
             | TurnKind::CheckRepair { .. }
+            | TurnKind::CheckResult { .. }
             | TurnKind::ChildResults
             | TurnKind::AgentTask { .. }
             | TurnKind::SessionMessage { .. }
@@ -493,6 +496,9 @@ impl TurnInput {
                 review: PlanReview::ChangesRequested { .. },
             } => "Revision requested".into(),
             TurnKind::CheckRepair { .. } => "Automatic check repair".into(),
+            TurnKind::CheckResult { result } => {
+                format!("Check {} {}", result.run_id, result.state.as_str())
+            }
             TurnKind::ChildResults => "Child results".into(),
             TurnKind::AgentTask { task } => task.text.clone(),
             TurnKind::SessionMessage { message } => format!(
@@ -550,6 +556,7 @@ impl TurnInput {
             TurnKind::WorkflowAnswers { answers } => answers.write(writer),
             TurnKind::PlanReview { review } => review.write(writer),
             TurnKind::CheckRepair { repair } => repair.write(writer),
+            TurnKind::CheckResult { result } => result.write(writer),
             TurnKind::AgentTask { task } => task.write(writer),
             TurnKind::SessionMessage { message } => message.write(writer),
             TurnKind::UserMessage { .. }

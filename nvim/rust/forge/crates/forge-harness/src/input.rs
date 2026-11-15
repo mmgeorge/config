@@ -68,6 +68,11 @@ pub enum InputDelivery {
 pub enum InputPurpose {
     #[default]
     User,
+    /// Deliver a collected result only to the exchange that requested its run.
+    CheckResult {
+        exchange_id: String,
+        run_id: String,
+    },
     /// Preserve the exact legacy planning/exchange question selected by the caller.
     Clarification {
         target: crate::exchange::command::InputSubmissionTarget,
@@ -372,6 +377,7 @@ impl SessionInputQueue {
             }
             InputPurpose::Clarification { .. }
             | InputPurpose::User
+            | InputPurpose::CheckResult { .. }
             | InputPurpose::Question { .. }
             | InputPurpose::QuestionContinuation { .. }
             | InputPurpose::WorkflowContinuation { .. } => {
@@ -394,6 +400,7 @@ impl SessionInputQueue {
                 | InputPurpose::TaskContinuation { revision, .. } => revision,
                 InputPurpose::Clarification { .. }
                 | InputPurpose::User
+                | InputPurpose::CheckResult { .. }
                 | InputPurpose::Question { .. }
                 | InputPurpose::QuestionContinuation { .. }
                 | InputPurpose::WorkflowContinuation { .. } => {
@@ -435,9 +442,9 @@ impl SessionInputQueue {
         Ok(Some(update))
     }
 
-    /// Remove queued task inputs whose task authority can never become current again.
+    /// Remove internal task or check inputs whose originating authority is no longer current.
     /// Only unreserved revisions outside delivery are removed; see [`task_input_retirable`].
-    pub(crate) fn retire_task_input(
+    pub(crate) fn retire_internal_input(
         &self,
         retired: &[(String, u64)],
     ) -> Result<Option<InputUpdate>> {
@@ -450,7 +457,9 @@ impl SessionInputQueue {
         state.snapshot.messages.retain(|message| {
             let remove = matches!(
                 message.purpose,
-                InputPurpose::TaskEntry { .. } | InputPurpose::TaskContinuation { .. }
+                InputPurpose::TaskEntry { .. }
+                    | InputPurpose::TaskContinuation { .. }
+                    | InputPurpose::CheckResult { .. }
             ) && task_input_retirable(message)
                 && message.reservation().is_none()
                 && retired
@@ -745,6 +754,7 @@ impl SessionInputQueue {
                 message.revision = 1;
                 message.queue();
                 let resume = message.intent == InputIntent::Auto
+                    && !matches!(message.purpose, InputPurpose::CheckResult { .. })
                     && (control_revision == snapshot.control_revision
                         || after_control.is_some()
                             && after_control == snapshot.control_operation_id.as_deref());
@@ -926,6 +936,13 @@ impl SessionInputQueue {
             let user_precedes_continuation =
                 matches!(previous.purpose, InputPurpose::TaskContinuation { .. })
                     && !matches!(message.purpose, InputPurpose::TaskContinuation { .. });
+            let user_precedes_result = matches!(previous.purpose, InputPurpose::CheckResult { .. })
+                && matches!(
+                    message.purpose,
+                    InputPurpose::User
+                        | InputPurpose::Question { .. }
+                        | InputPurpose::Clarification { .. }
+                );
             let steering_precedes_queue = route == InputRoute::Steering
                 && previous.intent == InputIntent::Queue
                 && previous.delivery() == InputDelivery::Queued;
@@ -938,7 +955,10 @@ impl SessionInputQueue {
                     previous.purpose,
                     InputPurpose::Question { .. } | InputPurpose::Clarification { .. }
                 );
-            if user_precedes_continuation || steering_precedes_queue || question_precedes_suspended
+            if user_precedes_continuation
+                || user_precedes_result
+                || steering_precedes_queue
+                || question_precedes_suspended
             {
                 return false;
             }

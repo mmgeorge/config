@@ -1,5 +1,34 @@
 use super::*;
 
+/// Explicit queued input can pass a completion without resuming a suspended queue.
+#[test]
+fn user_input_precedes_check_result_and_completion_preserves_pause() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.suspend(true, None)?;
+    let mut result = submit("result");
+    if let InputAction::Submit { message } = &mut result.action {
+        message.purpose = InputPurpose::CheckResult {
+            exchange_id: "exchange".into(),
+            run_id: "run".into(),
+        };
+        message.intent = InputIntent::Auto;
+    }
+    let before = input.snapshot()?;
+    result.control_revision = before.control_revision;
+    result.after_control = before.control_operation_id;
+    input.apply(result)?;
+    assert!(input.snapshot()?.suspended);
+    assert!(input.claim("result", 1, InputRoute::Turn)?.is_none());
+    let mut user = submit("user");
+    let before = input.snapshot()?;
+    user.control_revision = before.control_revision;
+    user.after_control = before.control_operation_id;
+    input.apply(user)?;
+    input.suspend(false, None)?;
+    assert!(input.claim("user", 1, InputRoute::Turn)?.is_some());
+    Ok(())
+}
+
 fn submit(id: &str) -> InputOperation {
     InputOperation {
         id: format!("submit-{id}"),

@@ -44,7 +44,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                 .map(|message| (message.id.clone(), message.revision))
                 .collect();
             if !retired.is_empty()
-                && let Some(update) = services.input.retire_task_input(&retired)?
+                && let Some(update) = services.input.retire_internal_input(&retired)?
             {
                 updates.push(update);
             }
@@ -192,6 +192,7 @@ fn task_input_retired(task: Option<&crate::task::Task>, purpose: &InputPurpose) 
         | InputPurpose::TaskContinuation { revision, id, .. } => (revision, id),
         InputPurpose::Clarification { .. }
         | InputPurpose::User
+        | InputPurpose::CheckResult { .. }
         | InputPurpose::Question { .. }
         | InputPurpose::QuestionContinuation { .. }
         | InputPurpose::WorkflowContinuation { .. } => return false,
@@ -214,6 +215,7 @@ fn task_input_retired(task: Option<&crate::task::Task>, purpose: &InputPurpose) 
         }),
         InputPurpose::Clarification { .. }
         | InputPurpose::User
+        | InputPurpose::CheckResult { .. }
         | InputPurpose::Question { .. }
         | InputPurpose::QuestionContinuation { .. }
         | InputPurpose::WorkflowContinuation { .. } => false,

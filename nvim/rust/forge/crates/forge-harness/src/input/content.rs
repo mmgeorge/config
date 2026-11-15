@@ -5,6 +5,10 @@ pub enum UserInputContent {
     UserText {
         text: String,
     },
+    /// Preserve host check evidence through steering and transcript replay.
+    CheckResult {
+        result: Box<forge_provider_api::forge::CheckResult>,
+    },
     QuestionResponse {
         responses: Vec<QuestionReplyContent>,
     },
@@ -14,6 +18,12 @@ impl UserInputContent {
     pub(crate) fn label(&self) -> String {
         match self {
             Self::UserText { text } => text.clone(),
+            Self::CheckResult { result } => forge_provider_api::forge::TurnInput::new(
+                forge_provider_api::forge::TurnKind::CheckResult {
+                    result: result.as_ref().clone(),
+                },
+            )
+            .label(),
             Self::QuestionResponse { responses } => forge_provider_api::forge::TurnInput::new(
                 forge_provider_api::forge::TurnKind::QuestionBatch {
                     responses: responses
@@ -28,7 +38,7 @@ impl UserInputContent {
 
     pub(crate) fn owns_reply(&self, question_id: &str, message_id: &str) -> bool {
         match self {
-            Self::UserText { .. } => false,
+            Self::UserText { .. } | Self::CheckResult { .. } => false,
             Self::QuestionResponse { responses } => responses.iter().any(|response| {
                 response.reply.question_id == question_id && response.reply.message_id == message_id
             }),
@@ -42,7 +52,7 @@ impl UserInputContent {
                 crate::exchange::InputIntent::user_text(text.clone()),
                 text.clone(),
             ),
-            Self::QuestionResponse { .. } => (
+            Self::QuestionResponse { .. } | Self::CheckResult { .. } => (
                 crate::exchange::InputIntent::User {
                     content: self.clone(),
                 },

@@ -344,6 +344,12 @@ impl ExchangeDriver {
                     let ready = services.observer.input_readiness().map_err(InputOfferError::Queue)?;
                     if ready.has_approval || ready.checks_running { return Ok(false); }
                     let mut broker = broker.lock().await;
+                    if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &message.purpose {
+                        let current = crate::storage::HistoryReader::current(&services.root)
+                            .and_then(|reader| reader.latest_exchange(session))
+                            .map_err(InputOfferError::Queue)?;
+                        if current.is_none_or(|exchange| exchange.id != *exchange_id) { return Ok(false); }
+                    }
                     let view = broker.owner_control_view().map_err(InputOfferError::Queue)?;
                     publish_input_events(view.events, Some(&output), services, trace, session, &input, step);
                     let registry = broker.execution_registry();

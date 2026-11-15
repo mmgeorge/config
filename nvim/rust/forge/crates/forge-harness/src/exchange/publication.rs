@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 pub(super) enum PublicationOrigin {
     /// The canonical admission receipt for this question reply or chat-continuation message.
     QuestionInput(super::command::InputId),
+    /// The canonical admission receipt for one collected check run.
+    CheckResult(super::command::InputId),
     /// The committed question snapshot at this session-local revision.
     Questions(u64),
     /// The immutable result of this revision-scoped answer, independently of caller observation.

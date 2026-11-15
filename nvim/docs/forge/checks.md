@@ -437,7 +437,12 @@ in `tools/checks/`, with shared execution and result models in `checks/`.
 
 Use `check_definition_list` to choose a saved check and
 `check_definition_details` to inspect its caller contract. Normal execution uses
-`check_run` followed by `check_status`. Use `check_list` to recover running IDs,
+`check_run`, followed by independent work or ending the turn. Harness delivers a
+`<check_result>` message after process collection and result persistence. It
+identifies the original exchange and captured source, reports each outcome and
+retained diagnostic, and refers to `check_detail` for complete logs.
+Use `check_status` for explicit inspection or cancellation confirmation, and
+`check_list` to recover running IDs,
 `check_cancel` to request cancellation, and `check_detail` for completed logs.
 Definition `check_id` values identify saved configuration. Execution `run_id`
 values identify admitted jobs and are not interchangeable with definition IDs.

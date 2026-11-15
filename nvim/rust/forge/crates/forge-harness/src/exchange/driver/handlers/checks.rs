@@ -356,6 +356,7 @@ impl ExchangeDriver {
                         "run_id":completion.run_id,"succeeded":completion.outcome.is_ok(),"update_step":step,
                     }));
                 check_runs.settle(&completion);
+                self.check_results.request();
                 if check_scope.as_ref() != Some(&completion.scope) {
                     let _ = check_runs.retire_scope(&completion.scope);
                 }

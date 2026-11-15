@@ -1506,6 +1506,30 @@ impl HarnessBroker {
         admission: &mut ForegroundAdmission,
     ) -> Result<StagedInteraction> {
         let text = admission.text.clone();
+        if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &admission.purpose {
+            let target = crate::provider::ExchangeId::from(exchange_id.clone());
+            let turn = admission
+                .turn
+                .clone()
+                .context("check completion lost its typed result")?;
+            let mut exchange = self
+                .store
+                .load_exchange(exchange_id)?
+                .context("check result exchange is missing")?;
+            exchange.continue_check_result(self.clock.now_ms())?;
+            self.store.save_exchange(&exchange)?;
+            let mode = self.task_prompt_mode()?;
+            if let Some(task) = self.task_controller.current()? {
+                admission.planning = self.planning_context(&task, mode)?;
+            }
+            return self.stage_selected_foreground_interaction(
+                &text,
+                mode,
+                None,
+                ProviderInput::new(turn),
+                Some(&target),
+            );
+        }
         if let Some(staged) = self.prepare_selected_clarification(admission)? {
             return Ok(staged);
         }
@@ -2388,6 +2412,65 @@ impl HarnessBroker {
 mod tests {
     use super::*;
     use crate::session::SessionStore;
+
+    /// Resume the requesting exchange even after a newer user exchange exists.
+    #[test]
+    fn check_result_keeps_its_original_exchange_and_typed_input() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.checkpoint = None;
+        let original =
+            super::super::test::completed_interaction("original", &broker.session.id, Vec::new());
+        let mut newer =
+            super::super::test::completed_interaction("newer", &broker.session.id, Vec::new());
+        newer.ordinal = 2;
+        broker.store.save_exchange(&original)?;
+        broker.store.save_exchange(&newer)?;
+        let turn = forge_provider_api::forge::TurnInput::new(
+            forge_provider_api::forge::TurnKind::CheckResult {
+                result: forge_provider_api::forge::CheckResult {
+                    run_id: "run".into(),
+                    exchange_id: original.id.clone(),
+                    state: forge_provider_api::forge::CheckResultState::Passed,
+                    checks: Vec::new(),
+                },
+            },
+        );
+        broker.input_purpose = crate::input::InputPurpose::CheckResult {
+            exchange_id: original.id.clone(),
+            run_id: "run".into(),
+        };
+        let (sink, _stream) = publication::channel();
+        let TurnTransaction::Admitting(mut admission) = broker.begin_foreground_dispatch(
+            Request {
+                id: 1,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":turn.label()}),
+            },
+            sink,
+        )?
+        else {
+            unreachable!()
+        };
+        admission.turn = Some(turn.clone());
+        let staged = broker.normalize_foreground_interaction(&mut admission)?;
+        assert_eq!(staged.exchange.id, original.id);
+        assert_eq!(staged.exchange.prompt, original.prompt);
+        assert_eq!(staged.input.turn(), &turn);
+        assert!(!staged.new_runtime);
+        assert_eq!(
+            broker.store.load_exchange("newer")?.unwrap().state(),
+            ExchangeState::Complete
+        );
+        let mut cancelled =
+            super::super::test::completed_interaction("cancelled", &broker.session.id, Vec::new());
+        cancelled.phase =
+            crate::exchange::ExchangePhase::fixture(ExchangeState::Interrupted, Some(2), None);
+        assert!(cancelled.continue_check_result(3).is_err());
+        Ok(())
+    }
 
     /// The executor model affects one invocation and cannot replace ordinary or reloaded defaults.
     #[test]

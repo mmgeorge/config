@@ -2168,6 +2168,7 @@ impl TimelineRenderer<'_> {
                             crate::input::UserInputContent::QuestionResponse { .. } => {
                                 "Question response"
                             }
+                            crate::input::UserInputContent::CheckResult { .. } => "Check result",
                         },
                         crate::exchange::InputIntent::Clarification => "You asked",
                         crate::exchange::InputIntent::Answer => "You answered",

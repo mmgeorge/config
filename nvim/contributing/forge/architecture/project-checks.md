@@ -1,5 +1,11 @@
 # Project checks
 
+Tool-started checks report completion through the session input queue. `CheckOwnerRuns` retains each admitted run's original invocation receipt; after process collection, `CheckResults` reads the committed result and admits one typed `check_result` input addressed to the original exchange. The input carries command outcomes, captured source identities when available, diagnostic locations and severities, test counts, and a reference to complete logs. Evidence from one source snapshot does not validate later edits.
+
+The input operation `check-result:<run-id>` and its publication receipt survive host restart and queue removal within the current disposable-state version. Recovery retries a missing admission or publication without submitting a second input. Collection remains the boundary even if a terminal result was saved earlier. The scheduler preserves explicit user-input priority and queue suspension; cancelled or retired exchanges do not resume. Native steering targets only the original exchange, otherwise delivery waits for an idle provider and continues that exchange through the ordinary submission journal. Automatic completion and plan verification retain their existing completion gates and do not emit a second tool-result message.
+
+Agents normally start a check and continue independent work or end their turn while waiting. `check_status` remains available for explicit inspection, recovery, and cancellation confirmation; `check_detail` supplies logs and further result pages. The fixed Harness instructions classify check output as evidence rather than execution authority.
+
 A check result that no longer matches the code, or a gate that passes because nothing ran, gives false confidence that a change works. Harness therefore records what ran against which inputs, reuses a result only when those inputs are unchanged, and reports skipped checks as Not run rather than Passed.
 
 [Extending project checks](../extending-project-checks.md) covers adding adapters and custom inputs, and [Timeline](timeline.md#check-results) covers how results appear.

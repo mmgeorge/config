@@ -6,6 +6,7 @@ pub use cancellation::{CancellationBlockers, CancellationPhase, CancellationProg
 pub(crate) mod agent_command;
 mod change;
 mod change_result;
+mod check_result;
 mod checklist;
 pub(crate) mod command;
 mod compaction;

@@ -143,7 +143,19 @@ pub(crate) fn select_pending_input(
     // Preserve question authority and explicit input priority over automatic task continuations.
     let selected = pending
         .iter()
-        .position(|message| !matches!(message.purpose, InputPurpose::TaskContinuation { .. }))
+        .position(|message| {
+            matches!(
+                message.purpose,
+                InputPurpose::User
+                    | InputPurpose::Clarification { .. }
+                    | InputPurpose::Question { .. }
+            )
+        })
+        .or_else(|| {
+            pending.iter().position(|message| {
+                !matches!(message.purpose, InputPurpose::TaskContinuation { .. })
+            })
+        })
         .unwrap_or(0);
     let mut message = pending.remove(selected);
     if matches!(message.purpose, InputPurpose::QuestionContinuation { .. })
@@ -173,13 +185,17 @@ pub(crate) fn select_pending_input(
     if questions_block_work
         && matches!(
             message.purpose,
-            InputPurpose::TaskEntry { .. } | InputPurpose::TaskContinuation { .. }
+            InputPurpose::TaskEntry { .. }
+                | InputPurpose::TaskContinuation { .. }
+                | InputPurpose::CheckResult { .. }
         )
     {
         let Some(position) = pending.iter().position(|message| {
             !matches!(
                 message.purpose,
-                InputPurpose::TaskEntry { .. } | InputPurpose::TaskContinuation { .. }
+                InputPurpose::TaskEntry { .. }
+                    | InputPurpose::TaskContinuation { .. }
+                    | InputPurpose::CheckResult { .. }
             )
         }) else {
             return Ok(PendingInput::Waiting);

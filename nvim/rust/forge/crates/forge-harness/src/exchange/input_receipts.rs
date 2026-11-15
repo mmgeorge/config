@@ -699,6 +699,7 @@ impl TrackedInput {
             }
             InputPurpose::Clarification { .. }
             | InputPurpose::User
+            | InputPurpose::CheckResult { .. }
             | InputPurpose::Question { .. }
             | InputPurpose::QuestionContinuation { .. }
             | InputPurpose::WorkflowContinuation { .. } => None,
@@ -734,6 +735,7 @@ impl TrackedInput {
             | InputPurpose::TaskContinuation { revision, .. } => revision,
             InputPurpose::Clarification { .. }
             | InputPurpose::User
+            | InputPurpose::CheckResult { .. }
             | InputPurpose::Question { .. }
             | InputPurpose::QuestionContinuation { .. }
             | InputPurpose::WorkflowContinuation { .. } => return Ok(()),

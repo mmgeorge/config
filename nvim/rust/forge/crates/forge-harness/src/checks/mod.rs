@@ -3,6 +3,7 @@ pub mod adapter;
 mod applicability;
 mod automatic;
 mod changes;
+pub(crate) mod completion;
 mod config;
 mod discovery;
 mod evidence;

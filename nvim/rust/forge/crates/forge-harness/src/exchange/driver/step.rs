@@ -650,6 +650,16 @@ impl ExchangeDriver {
             ..
         } = state;
         if !closed && !self.commands.storage_unavailable() {
+            if let Err(error) =
+                self.check_results
+                    .update(services, &state.check_runs, command_messages.as_ref())
+            {
+                trace.record(
+                    session_id,
+                    "exchange.check_result.failed",
+                    serde_json::json!({"error":format!("{error:#}"),"update_step":step}),
+                );
+            }
             match self
                 .question_inputs
                 .update(services, command_messages.as_ref())

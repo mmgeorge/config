@@ -1,5 +1,127 @@
 use super::*;
 
+/// Recover a completed tool check into durable input without launching check commands.
+#[tokio::test]
+async fn completed_check_is_delivered_once_after_owner_restart() -> Result<()> {
+    use crate::input::{InputAction, InputOperation};
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"check-results",
+        "provider":{"kind":"mock","command":[]},
+    }))?)?;
+    let session_record = broker.snapshot()?.session;
+    let session = session_record.id.clone();
+    let mut exchange = crate::storage::test::running_exchange("check-owner");
+    exchange.session_id = session.clone();
+    exchange.agent_id = session_record.primary_agent_id;
+    exchange.finish(crate::exchange::ExchangeOutcome::Complete, 100)?;
+    SqliteStore::open(&broker.data_root)?.save_exchange(&exchange)?;
+    let checks = broker.checks();
+    let run: crate::checks::CheckRun = serde_json::from_value(json!({
+        "id":"completed-check","owner":{"kind":"session","session_id":session},"revision":0,
+        "shell":"system","executable":null,"workspace":root.path(),"environment_digest":"fixture",
+        "started_at_ms":1,"completed_at_ms":2,"state":"failed",
+        "progress":crate::plan::execution::SemanticProgress::default(),"workspace_identity":null,"workspace_digest":{},
+        "commands":[{"id":"command","command":"fixture","state":"failed","selected":true,
+            "started_at_ms":1,"completed_at_ms":2,"exit_code":1,"error":"fixture failure",
+            "stdout":"unused","stderr":"unused","output":"unused","output_bytes":0,"preview":""}]
+    }))?;
+    let record = checks.root.join("completed-check");
+    std::fs::create_dir_all(&record)?;
+    std::fs::write(
+        record.join("record.json"),
+        serde_json::to_vec(&json!({"version":crate::storage::state::VERSION,"run":run}))?,
+    )?;
+    let receipts = checks.root.join("owner-receipts");
+    std::fs::create_dir_all(&receipts)?;
+    let scope = crate::provider::InvocationScope::new(
+        crate::provider::ThreadOwner::root(&session),
+        exchange.id.as_str(),
+    );
+    std::fs::write(
+        receipts.join("fixture.json"),
+        serde_json::to_vec(&json!({
+            "scope":scope,"call_id":"fixture-call","request":crate::checks::RunRequest::default(),
+            "run_id":run.id,"state":"admitted"
+        }))?,
+    )?;
+    drop(checks);
+    broker.observer().input.suspend(true, None)?;
+    drop(broker);
+    let controller = receipt_test_controller_with_session(root.path(), &session).await?;
+    let input = &controller.coordinator.submissions;
+    loop {
+        let changed = input.changed.notified();
+        if input
+            .admission_receipt("check-result:completed-check")?
+            .is_some()
+        {
+            break;
+        }
+        changed.await;
+    }
+    let snapshot = input.snapshot()?;
+    let message = snapshot
+        .messages
+        .iter()
+        .find(|message| message.id == "check-result:completed-check")
+        .context("result input")?;
+    assert!(snapshot.suspended, "completion resumed a paused queue");
+    assert!(
+        matches!(&message.purpose, crate::input::InputPurpose::CheckResult { exchange_id, run_id } if exchange_id == "check-owner" && run_id == "completed-check")
+    );
+    assert!(
+        matches!(message.turn().unwrap().kind(), forge_provider_api::forge::TurnKind::CheckResult { result } if result.checks[0].error.as_deref() == Some("fixture failure"))
+    );
+    input.apply(InputOperation {
+        id: "remove-result".into(),
+        control_revision: snapshot.control_revision,
+        after_control: snapshot.control_operation_id,
+        action: InputAction::Remove {
+            id: message.id.clone(),
+            revision: message.revision,
+        },
+    })?;
+    controller.finish_exchange_owner().await?;
+    drop(controller);
+    let reopened = receipt_test_controller_with_session(root.path(), &session).await?;
+    reopened
+        .exchange_owner
+        .command_status(crate::exchange::command::CommandId::new(
+            "recovery-barrier",
+        )?)
+        .await?;
+    assert!(
+        reopened
+            .coordinator
+            .submissions
+            .admission_receipt("check-result:completed-check")?
+            .is_some()
+    );
+    assert!(
+        reopened
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .is_empty()
+    );
+    reopened.finish_exchange_owner().await?;
+    Ok(())
+}
+
+/// Reopen the same mock session so the real owner recovers its persisted check result.
+async fn receipt_test_controller_with_session(
+    root: &std::path::Path,
+    session: &str,
+) -> Result<Arc<SessionController>> {
+    SessionController::new(HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":root,"data_root":root.join("data"),"client_id":"check-results","session_id":session,
+        "provider":{"kind":"mock","command":[]},
+    }))?)?).await
+}
+
 /// Answer admission must remain automatic when no UI exists and legacy control/broker resources are held.
 #[tokio::test]
 async fn question_input_owner_admits_headlessly_without_waiting_for_legacy_locks() -> Result<()> {
@@ -541,6 +663,7 @@ async fn registered_receipt(
             .prepare_task_input(&catalog, input, provider, &id)?,
         crate::input::InputPurpose::Clarification { .. }
         | crate::input::InputPurpose::User
+        | crate::input::InputPurpose::CheckResult { .. }
         | crate::input::InputPurpose::Question { .. }
         | crate::input::InputPurpose::QuestionContinuation { .. }
         | crate::input::InputPurpose::WorkflowContinuation { .. } => controller
