@@ -18,6 +18,10 @@ While an exchange runs, active commentary stays expanded and its tool group stay
 
 Tool groups report failed and denied counts separately. `Edits` headings count reported edit operations, and folded `Checks` headings retain result counts, attempts, and durations. Denied calls, including approval timeouts, use orange markers without changing their retained `Denied` lifecycle. Expanding a denied tool shows its host approval reason instead of output, falling back to the provider diagnostic when no matching host decision exists.
 
+Skill-read events remain siblings of commentary. `TranscriptRenderer::heading_marker` places their `≡` icon in the shared marker column, so the skill row aligns with commentary while tool groups remain nested beneath their owning commentary. Wrapped skill labels use the same event-fold handling as other timeline notices.
+
+Live check headings keep the configured check title separate from explicit test selection. A single selected test appears on a child row using only its name; multiple IDs show a selected-test count. The complete IDs remain unchanged in execution and check details, and progress and failure output remain sibling detail rows.
+
 File writes in one activity section share a `Changed N files` node that composes reported hunks into an original-to-final diff, without reading the workspace. Failed and interrupted edits keep their diagnostic but never count as changes. Commands, formatters, and generators stay ordinary tools, because their filesystem effects come only from checkpoint comparison.
 
 ## Node state and paging

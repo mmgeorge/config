@@ -81,8 +81,21 @@ impl CheckActivity {
                         )
                         .source
                     },
-                    |context| context.label(),
+                    |context| match &context.selection {
+                        super::CheckSelection::Tests { .. } => context.name.clone(),
+                        _ => context.label(),
+                    },
                 ),
+                selection: command.context.as_ref().and_then(|context| {
+                    let super::CheckSelection::Tests { tests } = &context.selection else {
+                        return None;
+                    };
+                    match tests.ids.as_slice() {
+                        [] => None,
+                        [test] => Some(test.display_name().to_owned()),
+                        selected => Some(format!("{} tests selected", selected.len())),
+                    }
+                }),
                 started_at_ms: command.started_at_ms,
                 completed_at_ms: command.completed_at_ms,
                 state: command.state,
@@ -115,8 +128,11 @@ impl CheckActivity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 /// One selected command within the current check run.
 pub struct CheckCommandActivity {
-    /// Configured check name and exact test identity, or normalized command text.
+    /// Configured check name, file selection, or normalized command text.
     pub title: String,
+    /// Compact selected test name or count, independent of its execution identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
     /// Command execution interval used by the status timer.
     pub started_at_ms: Option<i64>,
     /// Terminal execution boundary, which freezes the displayed duration.

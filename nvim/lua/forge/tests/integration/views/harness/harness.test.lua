@@ -69,6 +69,58 @@ T["live_tool_groups_stay_folded_until_opened"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
+T["skill_marker_aligns_with_commentary"] = function()
+  local workspace = temp.directory("skill-marker")
+  local skill_path = workspace .. "/.rulesync/skills/fixture/SKILL.md"
+  vim.fn.mkdir(vim.fn.fnamemodify(skill_path, ":h"), "p")
+  vim.fn.writefile({ "---", "name: fixture", "description: Marker fixture", "targets: ['*']", "---", "Fixture instructions." }, skill_path)
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local function request(method, params)
+    local result, failure, done
+    client.request({ session_id = state.session.id, method = method, params = params }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "message", content = "commentary", text = "Inspecting instructions" },
+    { kind = "file_read", path = skill_path },
+    { kind = "barrier", id = "skill-visible" },
+    { kind = "message", content = "response", text = "Inspection complete" },
+  }, terminal = "completed" } })
+  request("session.prompt.submit", { text = "Inspect instructions" })
+  request("session.provider.mock_response", { operation = "wait", id = "skill-visible" })
+  local skill_entry, commentary_entry, tool_entry
+  wait_until(function()
+    local transcript = state.presentation.transcript
+    for index = 0, transcript.sequence:count() - 1 do
+      local node = transcript.sequence:at(index)
+      local entry = node.entry
+      local _, row = transcript.sequence:position(node.id)
+      local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, row, row + entry.row_count, false), "\n")
+      if text:find("Skill · fixture", 1, true) then skill_entry = entry end
+      if text:find("Inspecting instructions", 1, true) then commentary_entry = entry end
+      if text:find("Tools · 1/1", 1, true) then tool_entry = entry end
+    end
+    return skill_entry and commentary_entry and tool_entry
+  end, "skill and commentary did not render", { context = function() return buffer.text(state.transcript_buf) end })
+  eq(skill_entry.metadata.layout.marker and skill_entry.metadata.layout.marker.text, "≡")
+  eq(skill_entry.metadata.layout.indent, commentary_entry.metadata.layout.indent)
+  eq(tool_entry.metadata.layout.indent, skill_entry.metadata.layout.indent + 2)
+  request("session.provider.mock_response", { operation = "release", id = "skill-visible" })
+  eq(host.stop(), true)
+end
+
 T["status_tree_preserves_controls_and_question_branch"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   local current_time, tick = 0, nil
@@ -97,6 +149,9 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   eq(status.content.lines[1]:find("<C-c> interrupt · oe answer questions │ ", 1, true) ~= nil, true)
   eq(status.content.lines[2], "  ├─ Checking · 2/4 finished · 18s")
   eq(status.content.lines[3], "  │  ├─ ✓ format · passed · 1s")
+  eq(status.content.lines[10], "  │  └─ ○ Lua host tests · queued")
+  eq(status.content.lines[11], "  │     └─ skill_marker_aligns_with_commentary")
+  eq(table.concat(status.content.lines, "\n"):find("nvim/lua/forge/tests", 1, true), nil)
   eq(status.content.lines[#status.content.lines], "  └─ Should this apply to all sessions?")
   eq(table.concat(status.content.lines, "\n"):find("unknown field", 1, true) ~= nil, true)
   eq(vim.api.nvim_get_current_win(), composer_window)

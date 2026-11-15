@@ -176,6 +176,8 @@ hold:release()
 
 This fragment assumes an initialized mock session and the existing Harness `state` and `controller` objects. The mode selects which prompt to hold, such as `"chat"` or `"plan_question"`, and omitting it holds the session's next prompt of any mode.
 
+Scripted responses can report a successful native read with `{ kind = "file_read", path = skill_path }`. The mock emits normalized read and completion events without launching a shell; the host's selected-skill observer recognizes the path and publishes the skill row. Use this step to test skill presentation through the real host.
+
 `wait()` returns the held request's ID, session, mode, and full prompt. `release()` resumes only that request and does not wait for rendering, so afterward wait for the specific buffer or state change under test. `cancel()` discards an unused hold, or fails a response waiting on it. Unknown IDs, early release, and IDs from another session fail explicitly. The helper's ten-second deadline detects a stuck test, and cancellation or provider shutdown clears holds.
 
 Approval timeouts follow the same rule. Configure an approval timeout long enough that the real clock never reaches it, wait for the approval to appear, then call `mock.expire_approval(session_id)`. The host resolves the pending approval through its deadline path, so the fixture observes the same `Timeout` resolution, rejection feedback, and continuation as an elapsed timer.

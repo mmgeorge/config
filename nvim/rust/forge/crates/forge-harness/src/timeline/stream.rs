@@ -840,6 +840,7 @@ mod test {
                     .into_iter()
                     .map(|(title, state)| CheckCommandActivity {
                         title: title.into(),
+                        selection: None,
                         state,
                         started_at_ms: Some(0),
                         completed_at_ms: None,

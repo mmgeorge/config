@@ -3041,6 +3041,39 @@ async fn run_prompt_inner(
             TestPromptStep::FileWrite { path, text } => {
                 run_file_write(&session, request, &sink, &turn, path, text).await?;
             }
+            TestPromptStep::FileRead { path } => {
+                ensure_open(&session, ProviderOperation::TurnStart)?;
+                let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())
+                    .expect("allocated identity is nonempty");
+                let descriptor = ToolDescriptor {
+                    semantics: tool::ToolSemantics::Read {
+                        paths: vec![path.clone()],
+                        directory: None,
+                    },
+                    name: "read_file".into(),
+                    title: format!("Read {path}"),
+                    arguments: InspectableArguments::new(serde_json::json!({"path": path})),
+                };
+                sink.send_wait(AdapterActivity::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id: item_id.clone(),
+                    event: ItemEvent::Started(ItemStart::ToolCall(descriptor)),
+                })
+                .await?;
+                sink.send_wait(AdapterActivity::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id,
+                    event: ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
+                        outcome: ToolOutcome::Succeeded,
+                        descriptor: None,
+                        output: None,
+                        changes: ProviderChangeSet::default(),
+                    })),
+                })
+                .await?;
+            }
         }
     }
     let terminal = script.terminal.clone();

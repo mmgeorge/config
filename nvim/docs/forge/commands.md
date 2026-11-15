@@ -357,7 +357,9 @@ then expand an individual call to read its output. Completion folds the group ag
 The group duration counts overlapping calls once and excludes gaps between calls.
 Individual rows show each call's duration, so their sum can exceed the group duration.
 
-Loaded skills appear as `≡ Skill · name`; opening a skill entry opens its instruction file.
+Loaded skills appear as `≡ Skill · name`, aligned with commentary rather than nested beneath its tool group; opening a skill entry opens its instruction file.
+
+The live check status shows a single selected test by name on a child row beneath its check. Multiple selected tests show a count; full paths and IDs remain available in check details.
 
 Thoughts with activity start collapsed and preserve the assistant's text in their heading.
 Expanding a thought shows its events first, then its tool summary, then its file changes,

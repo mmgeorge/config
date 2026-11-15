@@ -13,7 +13,8 @@
         "   ├─ ⠋ tests · running · 15s",
         "   │  ├─ Building · Built test targets",
         "   │  └─ Running session tests",
-        "   └─ ○ build · queued",
+        "   └─ ○ Lua host tests · queued",
+        "      └─ skill_marker_aligns_with_commentary",
         "Reviewing the remaining diagnostics and checking 界界界 for a complete result"
       ],
       "metadata": {
@@ -43,15 +44,15 @@
           {
             "range": {
               "start": { "row": 1, "column": 0 },
-              "end": { "row": 9, "column": 0 }
+              "end": { "row": 10, "column": 0 }
             },
             "capture": "ForgeStatusHint",
             "priority": 100
           },
           {
             "range": {
-              "start": { "row": 9, "column": 0 },
-              "end": { "row": 10, "column": 0 }
+              "start": { "row": 10, "column": 0 },
+              "end": { "row": 11, "column": 0 }
             },
             "capture": "ForgeHarnessCommentary",
             "priority": 100

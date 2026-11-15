@@ -13,6 +13,9 @@ use super::duration::tool_duration;
 use super::markdown_math;
 use super::tool::{ToolOutputPreview, ToolOutputView};
 
+/// Recognize source icons that occupy the shared transcript marker column.
+const HEADING_MARKERS: [&str; 4] = ["▸", "◇", "●", "≡"];
+
 pub struct TranscriptRenderer<'profile> {
     profile: &'profile WidthProfile,
 }
@@ -270,8 +273,9 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn heading_marker(block: &mut BufferBlock, capture: &str) {
         if let Some(marker) = block.text.row(0).and_then(|row| {
-            ["▸", "◇", "●"]
-                .into_iter()
+            HEADING_MARKERS
+                .iter()
+                .copied()
                 .find(|marker| row.starts_with(&format!("{marker} ")))
         }) {
             block.metadata.layout = Some(ContentLayout {
@@ -287,7 +291,7 @@ impl<'profile> TranscriptRenderer<'profile> {
                     start: TextPosition { row: 0, column: 0 },
                     end: TextPosition {
                         row: 0,
-                        column: "▸ ".len(),
+                        column: marker.len() + 1,
                     },
                 },
                 replacement: String::new(),
@@ -336,7 +340,7 @@ impl<'profile> TranscriptRenderer<'profile> {
                 .layout
                 .as_ref()
                 .and_then(|layout| layout.marker.as_ref())
-                .is_none_or(|marker| marker.text != "◇")
+                .is_none_or(|marker| !matches!(marker.text.as_str(), "◇" | "≡"))
         {
             return;
         }
@@ -385,9 +389,9 @@ impl<'profile> TranscriptRenderer<'profile> {
         let Some(first) = block.text.row(0) else {
             return Ok(());
         };
-        if ["▸ ", "◇ ", "● "]
+        if let Some(source_marker) = HEADING_MARKERS
             .iter()
-            .any(|prefix| first.starts_with(prefix))
+            .find(|prefix| first.starts_with(&format!("{prefix} ")))
             && !first.starts_with(&marker.text)
         {
             let mut rows = block
@@ -396,7 +400,7 @@ impl<'profile> TranscriptRenderer<'profile> {
                 .iter()
                 .map(|row| (*row).to_owned())
                 .collect::<Vec<_>>();
-            rows[0].replace_range(.."▸".len(), &marker.text);
+            rows[0].replace_range(..source_marker.len(), &marker.text);
             block.text = BufferText::from_rows(rows)?;
         }
         Ok(())
@@ -763,4 +767,47 @@ fn append_decoration(block: &mut BufferBlock, row: usize, start: usize, end: usi
         capture: capture.into(),
         priority: 110,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keep skill icons in the marker column and preserve folding for wrapped labels.
+    #[test]
+    fn skill_heading_uses_shared_marker_layout() -> Result<()> {
+        for columns in [80, 16] {
+            let profile = WidthProfile {
+                columns,
+                ..WidthProfile::default()
+            };
+            let mut block = TranscriptRenderer::new(&profile)?.literal(
+                BlockId("skill-heading".into()),
+                "≡ Skill · technical-writing",
+                2,
+            )?;
+            TranscriptRenderer::heading_marker(&mut block, "Normal");
+            let layout = block.metadata.layout.as_ref().unwrap();
+            assert_eq!(layout.indent, 2);
+            assert_eq!(layout.marker.as_ref().unwrap().text, "≡");
+            assert_eq!(block.metadata.conceal[0].range.end.column, "≡ ".len());
+
+            TranscriptRenderer::prepare_event(&mut block);
+            TranscriptRenderer::resolve_marker(&mut block)?;
+            let wrapped = columns == 16;
+            assert_eq!(!block.metadata.fold.is_empty(), wrapped);
+            let marker = &block
+                .metadata
+                .layout
+                .as_ref()
+                .unwrap()
+                .marker
+                .as_ref()
+                .unwrap()
+                .text;
+            assert_eq!(marker, if wrapped { "▸" } else { "≡" });
+            assert!(block.text.row(0).unwrap().starts_with(marker));
+        }
+        Ok(())
+    }
 }

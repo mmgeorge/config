@@ -109,6 +109,8 @@ pub enum TestPromptStep {
     },
     /// Exercise ordinary authorized file editing rather than a host plan patch.
     FileWrite { path: String, text: String },
+    /// Report a successful native file read without launching a shell.
+    FileRead { path: String },
     /// Publish one complete native checklist replacement for the scripted turn.
     Checklist {
         update: crate::ProviderChecklistUpdate,

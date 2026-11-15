@@ -428,6 +428,9 @@ fn append_checks(
             command.title
         ));
         let mut details = Vec::new();
+        if let Some(selection) = &command.selection {
+            details.push(selection.clone());
+        }
         if command.state == CheckState::Running {
             if let Some(crate::checks::adapter::AdapterProgress::Tests(tests)) = &command.progress {
                 let detail = if let Some(total) = tests.total.filter(|_| {
@@ -659,6 +662,7 @@ mod tests {
                 total_count: 1,
                 command_list: vec![CheckCommandActivity {
                     title: "Formatting".into(),
+                    selection: None,
                     started_at_ms: Some(0),
                     completed_at_ms: None,
                     state: CheckState::Running,
@@ -706,6 +710,7 @@ mod tests {
             total_count: 1,
             command_list: vec![CheckCommandActivity {
                 title: "Run Rust tests".into(),
+                selection: None,
                 started_at_ms: Some(0),
                 completed_at_ms: None,
                 state: CheckState::Running,
@@ -799,10 +804,23 @@ mod tests {
             message: Some("Built test targets".into()),
         })?;
         run.commands[2].adapter_progress = Some(AdapterProgress::Tests(events.progress()));
+        run.commands[3].context = Some(serde_json::from_value(serde_json::json!({
+            "purpose":"verify", "definition_id":"lua-host-test", "name":"Lua host tests",
+            "area":"tests", "reason":"explicit selection", "matched_files":[],
+            "category":"test", "directory":".", "depends_on":[], "resolved":null,
+            "selection":{"kind":"tests", "tests":{"ids":[
+                "nvim/lua/forge/tests/integration/views/harness/harness.test.lua::skill_marker_aligns_with_commentary"
+            ], "affected":[]}}
+        }))?);
         let checks = CheckActivity::from_run(&run).unwrap();
         assert_eq!(checks.total_count, 4);
         assert_eq!(checks.completed_count, 2);
         assert_eq!(checks.command_list.len(), 4);
+        assert_eq!(checks.command_list[3].title, "Lua host tests");
+        assert_eq!(
+            checks.command_list[3].selection.as_deref(),
+            Some("skill_marker_aligns_with_commentary")
+        );
         assert_eq!(checks.command_list[0].elapsed_ms(18_000), Some(1000));
         let status = SessionPhase::Working {
             duration_ms: 0,
@@ -864,6 +882,8 @@ mod tests {
         .block
         .unwrap();
         let rows = block.text.wire_rows();
+        assert!(rows.contains(&"└─ ⠋ Lua host tests · running · 3s"));
+        assert!(rows.contains(&"   ├─ skill_marker_aligns_with_commentary"));
         assert!(rows.contains(&"│  └─ Running session tests"));
         assert!(rows.contains(&"   └─ Compiling forge"));
         let markers = block
@@ -879,6 +899,19 @@ mod tests {
                 "⠋"
             );
         }
+        let context = run.commands[3].context.as_mut().unwrap();
+        let crate::checks::CheckSelection::Tests { tests } = &mut context.selection else {
+            unreachable!("fixture selects tests")
+        };
+        tests
+            .ids
+            .push("other.test.lua::another_case".to_owned().try_into()?);
+        let checks = CheckActivity::from_run(&run).unwrap();
+        assert_eq!(checks.command_list[3].title, "Lua host tests");
+        assert_eq!(
+            checks.command_list[3].selection.as_deref(),
+            Some("2 tests selected")
+        );
         Ok(())
     }
 }

@@ -61,6 +61,18 @@ impl TestItemId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Get a compact display suffix without changing the opaque execution identity.
+    pub(crate) fn display_name(&self) -> &str {
+        self.0
+            .trim_end_matches("::")
+            .rsplit("::")
+            .next()
+            .unwrap_or(&self.0)
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&self.0)
+    }
 }
 
 impl TryFrom<String> for TestItemId {
@@ -378,6 +390,28 @@ mod tests {
     fn invalid_ids_are_rejected_during_deserialization() {
         for value in [String::new(), "a\nb".into(), "x".repeat(1025)] {
             assert!(serde_json::from_value::<TestItemId>(value.into()).is_err());
+        }
+    }
+
+    /// Strip source and module prefixes only in display labels, retaining the executable ID.
+    #[test]
+    fn display_names_preserve_execution_ids() {
+        for (source, expected) in [
+            (
+                "nvim/lua/forge/tests/integration/views/harness/harness.test.lua::skill_marker_aligns_with_commentary",
+                "skill_marker_aligns_with_commentary",
+            ),
+            (
+                "forge-harness buffer::status::tests::selected_check_tree",
+                "selected_check_tree",
+            ),
+            ("tests/nested/example.test.lua", "example.test.lua"),
+            ("tests\\nested\\example.test.lua", "example.test.lua"),
+            ("plain_case", "plain_case"),
+        ] {
+            let id = TestItemId::try_from(source.to_owned()).unwrap();
+            assert_eq!(id.display_name(), expected);
+            assert_eq!(id.as_str(), source);
         }
     }
 
