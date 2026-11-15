@@ -106,9 +106,9 @@ local function launch(state, config, path, filetype, accept_root, on_resolved)
     local start = vim.schedule_wrap(function(root)
       if state.closed or job.done then return end
       if not job.resolving_since then return end
-      if vim.uv.now() - job.resolving_since >= 60000 then
+      if vim.uv.now() - job.resolving_since >= 300000 then
         job.rejected = true
-        settle(job, "timeout: selected LSP root resolution exceeded 60 seconds")
+        settle(job, "timeout: selected LSP root resolution exceeded 300 seconds")
         return
       end
       job.resolving_since = nil
@@ -157,13 +157,13 @@ local function poll(state)
   for _, job in pairs(state.jobs) do
     if not job.done then
       local client = job.client and vim.lsp.get_client_by_id(job.client)
-      if job.resolving_since and vim.uv.now() - job.resolving_since >= 60000 then
+      if job.resolving_since and vim.uv.now() - job.resolving_since >= 300000 then
         job.rejected = true
-        settle(job, "timeout: selected LSP root resolution exceeded 60 seconds")
+        settle(job, "timeout: selected LSP root resolution exceeded 300 seconds")
       elseif client and client.initialized and not client:is_stopped() and not (client.progress and next(client.progress.pending or {})) then settle(job)
       elseif job.client and (not client or client:is_stopped()) then settle(job, "startup_failed: " .. job.name .. " stopped during initialization.")
-      elseif vim.uv.now() - job.started >= 60000 then
-        if job.client then settle(job, "timeout: " .. job.name .. " initialization exceeded 60 seconds.")
+      elseif vim.uv.now() - job.started >= 300000 then
+        if job.client then settle(job, "timeout: " .. job.name .. " initialization exceeded 300 seconds.")
         else settle(job) end
       end
       pending = pending or not job.done
@@ -218,7 +218,7 @@ function M.ready(client, receive)
     if client:is_stopped() then finish(nil, "disconnected: selected LSP stopped")
     elseif workspace_failure then finish(nil, workspace_failure)
     elseif client.initialized and workspace_ready and not (client.progress and next(client.progress.pending or {})) then finish(client)
-    elseif vim.uv.now() - started >= 60000 then finish(nil, "timeout: selected LSP readiness exceeded 60 seconds") end
+    elseif vim.uv.now() - started >= 300000 then finish(nil, "timeout: selected LSP readiness exceeded 300 seconds") end
   end
   inspect()
   if not finished then

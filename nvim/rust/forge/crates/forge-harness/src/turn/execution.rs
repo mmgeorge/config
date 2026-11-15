@@ -319,9 +319,10 @@ impl Turn {
         self.message
             .iter()
             .rev()
-            .find(|message| message.kind() == MessageKind::ReasoningSummary)
+            .find(|message| {
+                message.kind() == MessageKind::ReasoningSummary && !message.text().trim().is_empty()
+            })
             .map(Message::text)
-            .filter(|text| !text.trim().is_empty())
     }
 
     /// Close presentation grouping without altering any item's native lifecycle.
@@ -670,6 +671,29 @@ mod tests {
         ItemId, ItemStart, MessageClassification, MessageCompletion, MessageItemEvent,
         MessageOutcome, ToolCompletion, ToolDescriptor, ToolOutcome, TurnUsageReport,
     };
+
+    /// Keep a readable preview through empty starts and whitespace-only deltas.
+    #[test]
+    fn reasoning_preview_keeps_latest_nonempty_summary() -> Result<()> {
+        let mut turn = super::Turn::new("preview".into(), address(), 0);
+        let first = ItemId::new("first")?;
+        let second = ItemId::new("second")?;
+        let summary = |text: &str| {
+            ItemEvent::Started(ItemStart::Reasoning(forge_provider_api::ReasoningStart {
+                text: text.into(),
+                kind: forge_provider_api::ReasoningKind::Summary,
+            }))
+        };
+        assert_eq!(turn.latest_reasoning_summary(), None);
+        turn.record_item_message(&first, &summary("Existing thought"))?;
+        turn.record_item_message(&second, &summary(""))?;
+        assert_eq!(turn.latest_reasoning_summary(), Some("Existing thought"));
+        turn.record_item_message(&second, &delta(" \n\t"))?;
+        assert_eq!(turn.latest_reasoning_summary(), Some("Existing thought"));
+        turn.record_item_message(&second, &delta("Next thought"))?;
+        assert_eq!(turn.latest_reasoning_summary(), Some(" \n\tNext thought"));
+        Ok(())
+    }
 
     /// Allocate normalized host identities before each native fixture begins.
     fn address() -> TurnAddress {

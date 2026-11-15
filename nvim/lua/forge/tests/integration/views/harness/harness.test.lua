@@ -41,6 +41,14 @@ T["live_tool_groups_stay_folded_until_opened"] = function()
     { kind = "barrier", id = "tools-visible" },
     { kind = "tool_call", name = "check_definition_list", arguments = {} },
     { kind = "barrier", id = "tools-updated" },
+    { kind = "tool_event", id = "native-third", event = { kind = "announced",
+      descriptor = { name = "inspect", title = "Inspect", semantics = { kind = "other" }, arguments = {} },
+    } },
+    { kind = "barrier", id = "tool-announced" },
+    { kind = "tool_event", id = "native-third", event = { kind = "execution_started" } },
+    { kind = "barrier", id = "tool-running" },
+    { kind = "tool_event", id = "native-third", event = { kind = "completed", outcome = { kind = "succeeded" } } },
+    { kind = "barrier", id = "tool-complete" },
     { kind = "message", content = "response", text = "Inspection complete" },
   }, terminal = "completed" } })
   request("session.prompt.submit", { text = "Inspect checks" })
@@ -65,6 +73,18 @@ T["live_tool_groups_stay_folded_until_opened"] = function()
     "updated tool count did not arrive")
   eq(tool_group().display, "heading")
   request("session.provider.mock_response", { operation = "release", id = "tools-updated" })
+  for _, stage in ipairs({
+    { id = "tool-announced", count = "2/3" },
+    { id = "tool-running", count = "2/3" },
+    { id = "tool-complete", count = "3/3" },
+  }) do
+    request("session.provider.mock_response", { operation = "wait", id = stage.id })
+    wait_until(function() return buffer.text(state.transcript_buf):find("Tools · " .. stage.count, 1, true) ~= nil end,
+      "native tool stage did not arrive")
+    local text = buffer.text(state.transcript_buf)
+    eq(text:find("Tools · " .. stage.count .. " · %d+%.?%d*[smhd]") ~= nil, true)
+    request("session.provider.mock_response", { operation = "release", id = stage.id })
+  end
   wait_until(function() return not require("forge.views.harness.activity").busy(state) end, "inspection did not settle")
   eq(host.stop(), true)
 end
@@ -121,6 +141,61 @@ T["skill_marker_aligns_with_commentary"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
+T["status_thought_survives_empty_summary"] = function()
+  local workspace = temp.directory("thought-preview")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local function request(method, params)
+    local failure, done
+    client.request({ session_id = state.session.id, method = method, params = params }, function(_, error)
+      failure, done = error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+  end
+  local function status_text()
+    local status = state.presentation.status_view
+    return table.concat(status and status.content and status.content.lines or {}, "\n")
+  end
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "message", content = { reasoning = "summary" }, text = "Inspecting the current implementation" },
+    { kind = "barrier", id = "first-thought" },
+    { kind = "message", content = { reasoning = "summary" }, text = "" },
+    { kind = "message", content = { reasoning = "summary" }, text = " \n\t" },
+    { kind = "message", content = "commentary", text = "Checking the next step" },
+    { kind = "barrier", id = "empty-thought" },
+    { kind = "message", content = { reasoning = "summary" }, text = "Verifying the replacement" },
+    { kind = "barrier", id = "next-thought" },
+    { kind = "message", content = "response", text = "Done" },
+  }, terminal = "completed" } })
+  request("session.prompt.submit", { text = "Inspect the preview" })
+  request("session.provider.mock_response", { operation = "wait", id = "first-thought" })
+  wait_until(function() return status_text():find("Inspecting the current implementation", 1, true) ~= nil end,
+    "first thought did not render")
+  request("session.provider.mock_response", { operation = "release", id = "first-thought" })
+  request("session.provider.mock_response", { operation = "wait", id = "empty-thought" })
+  wait_until(function() return buffer.text(state.transcript_buf):find("Checking the next step", 1, true) ~= nil end,
+    "empty summaries did not reach the editor")
+  eq(status_text():find("Inspecting the current implementation", 1, true) ~= nil, true)
+  request("session.provider.mock_response", { operation = "release", id = "empty-thought" })
+  request("session.provider.mock_response", { operation = "wait", id = "next-thought" })
+  wait_until(function() return status_text():find("Verifying the replacement", 1, true) ~= nil end,
+    "next thought did not replace the previous preview")
+  eq(status_text():find("Inspecting the current implementation", 1, true), nil)
+  request("session.provider.mock_response", { operation = "release", id = "next-thought" })
+  wait_until(function() return not require("forge.views.harness.activity").busy(state) end, "turn did not finish")
+  eq(status_text():find("Verifying the replacement", 1, true), nil)
+  eq(host.stop(), true)
+end
+
 T["status_tree_preserves_controls_and_question_branch"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   local current_time, tick = 0, nil
@@ -149,8 +224,8 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   eq(status.content.lines[1]:find("<C-c> interrupt · oe answer questions │ ", 1, true) ~= nil, true)
   eq(status.content.lines[2], "  ├─ Checking · 2/4 finished · 18s")
   eq(status.content.lines[3], "  │  ├─ ✓ format · passed · 1s")
-  eq(status.content.lines[10], "  │  └─ ○ Lua host tests · queued")
-  eq(status.content.lines[11], "  │     └─ skill_marker_aligns_with_commentary")
+  eq(status.content.lines[9], "  │  └─ ○ Lua host tests · queued")
+  eq(status.content.lines[10], "  │     └─ skill_marker_aligns_with_commentary")
   eq(table.concat(status.content.lines, "\n"):find("nvim/lua/forge/tests", 1, true), nil)
   eq(status.content.lines[#status.content.lines], "  └─ Should this apply to all sessions?")
   eq(table.concat(status.content.lines, "\n"):find("unknown field", 1, true) ~= nil, true)
@@ -4092,9 +4167,10 @@ T["steering_waits_for_consumption"] = function()
   hold:release()
   mock_response({ operation = "wait", id = "after-consumption" })
   wait_until(function()
-    return transcript_text():find("Steering: " .. steer_text, 1, true) ~= nil
+    return transcript_text():find(steer_text, 1, true) ~= nil
       and not status_text():find("Steering active turn", 1, true)
   end, "consumption did not move the steer from status into the transcript", wait_options)
+  eq(transcript_text():find("Steering: " .. steer_text, 1, true), nil)
   assert(not transcript_text():find("Short answer", 1, true), "the response preceded its consumed steering")
   mock_response({ operation = "release", id = "after-consumption" })
   wait_until(function() return not activity.busy(session.harness) end, "the steered turn did not settle", wait_options)

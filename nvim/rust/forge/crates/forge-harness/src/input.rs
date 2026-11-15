@@ -363,6 +363,31 @@ impl SessionInputQueue {
         Ok(state.operation.get(id).map(|(_, receipt)| receipt.clone()))
     }
 
+    /// Get immutable successful check admissions, including removed and delivered messages.
+    pub(crate) fn check_result_receipts(&self) -> Result<Vec<InputUpdate>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        state
+            .operation
+            .values()
+            .filter(|(_, receipt)| receipt.error.is_none())
+            .filter_map(|(request, receipt)| {
+                match serde_json::from_str::<InputOperation>(request) {
+                    Ok(InputOperation {
+                        action: InputAction::Submit { message },
+                        ..
+                    }) if matches!(message.purpose, InputPurpose::CheckResult { .. }) => {
+                        Some(Ok(receipt.clone()))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error.into())),
+                }
+            })
+            .collect()
+    }
+
     /// Reconcile canonical pending task work after recovery or a revision change.
     /// Provider submission receipts retain delivery authority for the stable message identity.
     pub(crate) fn reconcile_task_input(

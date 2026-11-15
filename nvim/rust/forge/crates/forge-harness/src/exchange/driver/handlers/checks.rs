@@ -118,6 +118,7 @@ impl ExchangeDriver {
         } = state;
         match wake {
             Ok(Some(update)) => {
+                self.check_results.request();
                 publish_updates(
                     deferred_publications,
                     &mut self.commands,
@@ -287,9 +288,7 @@ impl ExchangeDriver {
             Some(crate::checks::owner::CheckOwnerEvent::StartTool(request)) => {
                 if pending_check_tools.len() < OWNER_QUEUE_CAPACITY {
                     let mut request = *request;
-                    if request.sink.is_some() {
-                        request.sink = Some(tool_check_sink.clone());
-                    }
+                    request.sink = Some(tool_check_sink.clone());
                     pending_check_tools.push_back(crate::checks::owner::PendingCheckTool::Run(
                         Box::new(request),
                     ));

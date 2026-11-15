@@ -107,6 +107,13 @@ pub enum TestPromptStep {
         name: String,
         arguments: serde_json::Value,
     },
+    /// Emit a native tool lifecycle event independently of host-tool execution.
+    ToolEvent {
+        /// Identify the tool across announcement, execution, and completion steps.
+        id: crate::ItemId,
+        /// Carry the normalized lifecycle event to the host.
+        event: TestToolEvent,
+    },
     /// Exercise ordinary authorized file editing rather than a host plan patch.
     FileWrite { path: String, text: String },
     /// Report a successful native file read without launching a shell.
@@ -114,6 +121,24 @@ pub enum TestPromptStep {
     /// Publish one complete native checklist replacement for the scripted turn.
     Checklist {
         update: crate::ProviderChecklistUpdate,
+    },
+}
+
+/// Control announcement and execution independently for a scripted native tool.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TestToolEvent {
+    /// Announce a tool before execution begins.
+    Announced {
+        /// Describe the native tool to display.
+        descriptor: crate::ToolDescriptor,
+    },
+    /// Report positive evidence that the announced tool started executing.
+    ExecutionStarted,
+    /// Settle the announced tool with its actual outcome.
+    Completed {
+        /// Preserve success, failure, denial, or interruption.
+        outcome: crate::ToolOutcome,
     },
 }
 

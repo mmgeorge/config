@@ -130,6 +130,19 @@ impl InputJournal {
         for (id, (request, outcome)) in &next.operation {
             if !previous.operation.contains_key(id) {
                 transaction.execute("INSERT INTO input_operation(session_id,id,request,payload) VALUES(?1,?2,?3,?4)",params![self.session_id,id,request,serde_json::to_string(outcome)?])?;
+                if outcome.error.is_none()
+                    && matches!(
+                        serde_json::from_str::<super::InputOperation>(request)?.action,
+                        super::InputAction::Submit { message }
+                            if matches!(message.purpose, super::InputPurpose::CheckResult { .. })
+                    )
+                {
+                    crate::exchange::publication::SessionPublications::retain_check_result(
+                        &transaction,
+                        &self.session_id,
+                        outcome,
+                    )?;
+                }
                 crate::exchange::journal::commit_input_command(
                     &transaction,
                     &self.session_id,

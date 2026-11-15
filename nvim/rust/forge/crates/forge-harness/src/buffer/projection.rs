@@ -298,21 +298,13 @@ fn tool_group_label<'tool>(
         .iter()
         .filter(|tool| tool.state() == crate::turn::ToolState::Completed && !tool.failed)
         .count();
-    let failed = calls.iter().filter(|tool| tool.failed).count();
     let denied = calls
         .iter()
         .filter(|tool| tool.state() == crate::turn::ToolState::Denied)
         .count();
     let mut label = format!("▸ Tools · {successful}/{count}");
-    let mut outcomes = Vec::new();
-    if failed > 0 {
-        outcomes.push(format!("{failed} failed"));
-    }
     if denied > 0 {
-        outcomes.push(format!("{denied} denied"));
-    }
-    if !outcomes.is_empty() {
-        label.push_str(&format!(" · ({})", outcomes.join(", ")));
+        label.push_str(&format!(" · ({denied} denied)"));
     }
     if let Some(elapsed) = tool_group_elapsed(&calls, now) {
         label.push_str(&format!(
@@ -328,6 +320,15 @@ fn tool_group_elapsed(
     calls: &[&crate::turn::ToolCall],
     now: crate::turn::ToolInstant,
 ) -> Option<u64> {
+    // Announced tools have no execution interval yet; they cannot invalidate known timing.
+    let calls: Vec<_> = calls
+        .iter()
+        .copied()
+        .filter(|tool| tool.started_active_ms.is_some() || tool.started_at_ms.is_some())
+        .collect();
+    if calls.is_empty() {
+        return None;
+    }
     let active_intervals = calls
         .iter()
         .map(|tool| {
@@ -2142,16 +2143,18 @@ impl TimelineRenderer<'_> {
                     let label = match &prompt.intent {
                         crate::exchange::InputIntent::User { content } => match content {
                             crate::input::UserInputContent::UserText { .. } if unconfirmed => {
-                                "Steering (not confirmed read)"
+                                Some("Steering (not confirmed read)")
                             }
-                            crate::input::UserInputContent::UserText { .. } => "Steering",
+                            crate::input::UserInputContent::UserText { .. } => None,
                             crate::input::UserInputContent::QuestionResponse { .. } => {
-                                "Question response"
+                                Some("Question response")
                             }
-                            crate::input::UserInputContent::CheckResult { .. } => "Check result",
+                            crate::input::UserInputContent::CheckResult { .. } => {
+                                Some("Check result")
+                            }
                         },
-                        crate::exchange::InputIntent::Clarification => "You asked",
-                        crate::exchange::InputIntent::Answer => "You answered",
+                        crate::exchange::InputIntent::Clarification => Some("You asked"),
+                        crate::exchange::InputIntent::Answer => Some("You answered"),
                     };
                     let text = if prompt.intent == crate::exchange::InputIntent::Answer {
                         prompt
@@ -2168,7 +2171,10 @@ impl TimelineRenderer<'_> {
                     let width = self.content_width();
                     let renderer = TranscriptRenderer::new(&width)?;
                     let id = BlockId(format!("{}:prompt", prompt.id));
-                    let text = format!("{label}: {text}");
+                    let text = match label {
+                        Some(label) => format!("{label}: {text}"),
+                        None => text,
+                    };
                     let block = if unconfirmed {
                         renderer.unconfirmed_prompt(id, &text)?
                     } else {
@@ -3633,6 +3639,62 @@ mod tests {
 
     use crate::{exchange::Exchange, timeline::TimelineEntry};
 
+    /// Retain internal evidence for replay without duplicating the visible check categories.
+    #[test]
+    fn check_result_inputs_do_not_add_timeline_rows() -> anyhow::Result<()> {
+        let mut exchange = crate::storage::test::running_exchange("check-timeline");
+        let result = forge_provider_api::forge::CheckResult {
+            run_id: "run".into(),
+            exchange_id: exchange.id.to_string(),
+            state: forge_provider_api::forge::CheckResultState::Passed,
+            complete: true,
+            checks: Vec::new(),
+        };
+        exchange.append_input(
+            crate::exchange::InputIntent::User {
+                content: crate::input::UserInputContent::CheckResult {
+                    result: Box::new(result),
+                    additional_results: Vec::new(),
+                },
+            },
+            "Check run passed".into(),
+            1,
+        )?;
+        exchange.append_input(
+            crate::exchange::InputIntent::user_text("Keep this steering message".into()),
+            "Keep this steering message".into(),
+            2,
+        )?;
+        let mut display = crate::buffer::identity::DisplayRegistry::default();
+        let projected = super::project(
+            super::ProjectionSource::Exchange(&exchange),
+            &WidthProfile::default(),
+            3,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut display,
+        )?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("Check run passed"), "{text}");
+        assert!(text.contains("Keep this steering message"), "{text}");
+        assert_eq!(
+            exchange
+                .node_list
+                .iter()
+                .filter(|node| matches!(node, crate::exchange::ExchangeNode::ExchangeInput { .. }))
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
     /// Keep live output behind each tool's expansion across updates and reflow.
     #[test]
     fn live_tool_output_requires_individual_expansion() -> anyhow::Result<()> {
@@ -3865,7 +3927,7 @@ mod tests {
             .collect();
         assert_eq!(
             super::tool_group_label(&calls, ToolInstant::wall(0)),
-            "▸ Tools · 1/3 · (1 failed, 1 denied)",
+            "▸ Tools · 1/3 · (1 denied)",
         );
         assert!(calls[1].failed);
         assert_eq!(calls[2].state(), ToolState::Denied);
@@ -3909,7 +3971,7 @@ mod tests {
         );
     }
 
-    /// Use one wall clock for mixed records and retain failure counts and unknown timing.
+    /// Use one wall clock for mixed records without adding failure labels.
     #[test]
     fn tool_group_duration_handles_wall_fallback_and_missing_endpoints() {
         use crate::turn::{ToolCall, ToolInstant, ToolState};
@@ -3937,14 +3999,38 @@ mod tests {
             wall_ms: 10_000,
             active_ms: Some(5_000),
         };
-        assert_eq!(
-            super::tool_group_label(&calls, now),
-            "▸ Tools · 1/2 · (1 failed) · 3s",
-        );
+        assert_eq!(super::tool_group_label(&calls, now), "▸ Tools · 1/2 · 3s",);
         calls[1].started_at_ms = None;
+        assert_eq!(super::tool_group_label(&calls, now), "▸ Tools · 1/2 · 0.1s",);
+    }
+
+    /// Announcing a tool cannot erase elapsed execution from the rest of its group.
+    #[test]
+    fn tool_group_duration_survives_unstarted_calls() {
+        use crate::turn::{ToolCall, ToolInstant, ToolState};
+        let finished = ToolCall::projection(
+            "finished".into(),
+            "tool".into(),
+            "Inspect".into(),
+            ToolState::Completed,
+            Some(100),
+            Some(1_100),
+        );
+        let waiting = ToolCall::projection(
+            "waiting".into(),
+            "tool".into(),
+            "Inspect".into(),
+            ToolState::Running,
+            None,
+            None,
+        );
         assert_eq!(
-            super::tool_group_label(&calls, now),
-            "▸ Tools · 1/2 · (1 failed)",
+            super::tool_group_label([&finished, &waiting], ToolInstant::wall(2_000)),
+            "▸ Tools · 1/2 · 1s"
+        );
+        assert_eq!(
+            super::tool_group_label([&waiting], ToolInstant::wall(2_000)),
+            "▸ Tools · 0/1"
         );
     }
 
@@ -4347,6 +4433,33 @@ mod tests {
             text(&live)
         );
         assert!(!text(&live).contains("Anchored before"), "{}", text(&live));
+
+        exchange.append_input(
+            crate::exchange::InputIntent::user_text("Use a short title".into()),
+            "Use a short title".into(),
+            3,
+        )?;
+        let consumed = render(&exchange)?;
+        assert!(text(&consumed).contains("Use a short title"));
+        assert!(!text(&consumed).contains("Steering: Use a short title"));
+        let row = consumed
+            .entry
+            .block
+            .iter()
+            .find(|block| {
+                block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .any(|row| row.contains("Use a short title"))
+            })
+            .context("consumed steering row")?;
+        assert!(
+            row.metadata
+                .decoration
+                .iter()
+                .any(|decoration| decoration.capture == "ForgeHarnessPrompt")
+        );
 
         exchange.finish(crate::exchange::ExchangeOutcome::Interrupted, 4)?;
         let settled = render(&exchange)?;

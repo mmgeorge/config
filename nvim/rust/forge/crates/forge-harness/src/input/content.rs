@@ -8,6 +8,8 @@ pub enum UserInputContent {
     /// Preserve host check evidence through steering and transcript replay.
     CheckResult {
         result: Box<forge_provider_api::forge::CheckResult>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        additional_results: Vec<forge_provider_api::forge::CheckResult>,
     },
     QuestionResponse {
         responses: Vec<QuestionReplyContent>,
@@ -18,12 +20,18 @@ impl UserInputContent {
     pub(crate) fn label(&self) -> String {
         match self {
             Self::UserText { text } => text.clone(),
-            Self::CheckResult { result } => forge_provider_api::forge::TurnInput::new(
-                forge_provider_api::forge::TurnKind::CheckResult {
-                    result: result.as_ref().clone(),
-                },
-            )
-            .label(),
+            Self::CheckResult {
+                result,
+                additional_results,
+            } => {
+                let mut input = forge_provider_api::forge::TurnInput::new(
+                    forge_provider_api::forge::TurnKind::CheckResult {
+                        result: result.as_ref().clone(),
+                    },
+                );
+                input.push_check_results(additional_results.clone());
+                input.label()
+            }
             Self::QuestionResponse { responses } => forge_provider_api::forge::TurnInput::new(
                 forge_provider_api::forge::TurnKind::QuestionBatch {
                     responses: responses

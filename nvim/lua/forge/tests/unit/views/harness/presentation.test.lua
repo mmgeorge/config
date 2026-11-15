@@ -1480,11 +1480,11 @@ T["transcript_follow"] = function()
   -- from its steering row rather than return the reader to the original prompt.
   begin_response("steered", long_response)
   local steering_row = #line_list + 1 + 1 + #long_response + 1
-  table.insert(completion_blocks, { id = "steered:steering", text = { "Steering: make it short" }, metadata = {
+  table.insert(completion_blocks, { id = "steered:steering", text = { "make it short" }, metadata = {
     target = {}, decoration = {}, editable_region = {},
     node = { id = "steered:steering", kind = "message", lifecycle = "settled", display = "full",
       default_display = "full", generation = 1, more = false, content_revision = 1,
-      loaded_rows = 1, loaded_bytes = 23, order = 2 },
+      loaded_rows = 1, loaded_bytes = 13, order = 2 },
     layout = { indent = 2, marker = { text = "*", capture = "ForgeHarnessPrompt" } },
   } })
   table.insert(completion_blocks, { id = "steered:reply", text = { "Short reply" }, metadata = {

@@ -72,7 +72,7 @@ Workspace listing excludes nested Git repositories and linked worktrees. List a
 nested checkout explicitly to discover its projects. Cargo.toml and package.json
 identify Rust and TypeScript/JavaScript project directories. Lua discovery uses
 authorized Lua files and the enabled Lua configuration's `root_dir` or
-`root_markers`, then deduplicates resolved roots. Root callbacks use a 60-second
+`root_markers`, then deduplicates resolved roots. Root callbacks use a five-minute
 deadline. Missing roots and unavailable or ambiguous configurations appear as
 explicit discovery warnings. A semantic request starts only the selected configuration.
 For static root markers, discovery resolves each source directory once; custom
@@ -285,8 +285,8 @@ Queries reuse editor clients already serving the same root, including clients
 started by opening a source file. A client for an unrelated sibling project does
 not receive a file request.
 A server that declines a project root does not produce an initialization-timeout
-notification. Source queries wait up to 60 seconds for initialization and any work-done progress
-reported by the server, then have a ten-second operation deadline, or 30 seconds for path searches. Status reports
+notification. Source queries wait up to five minutes for initialization and any work-done progress
+reported by the server, then have a 30-second semantic-query deadline. Status reports
 starting or indexing while those states are visible. Servers can index silently,
 so readiness still cannot guarantee that every workspace result is complete.
 Content-modified replies retry twice within the operation deadline when captured

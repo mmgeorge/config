@@ -607,7 +607,7 @@ impl LspScope {
             event: "lsp.mutation".into(),
             payload: json!({"id":id,"workspace":self.workspace,"mutation":mutation}),
         };
-        let received = tokio::time::timeout(Duration::from_secs(75), async {
+        let received = tokio::time::timeout(Duration::from_secs(335), async {
             sender.send_event(event).await?;
             tokio::select! {
                 result = result => result.context("disconnected: Editor closed during rename.")?,
@@ -706,9 +706,9 @@ impl LspScope {
             payload: json!({"id":id,"workspace":self.workspace,"arguments":arguments}),
         };
         let timeout = if arguments.operation == crate::tools::lsp::request::Operation::Paths {
-            105
+            345
         } else {
-            75
+            335
         };
         let received = tokio::time::timeout(Duration::from_secs(timeout), async {
             sender.send_event(event).await?;

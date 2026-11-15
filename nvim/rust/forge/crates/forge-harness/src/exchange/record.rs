@@ -1647,9 +1647,20 @@ impl Exchange {
     /// Report whether the transcript shows this node at its exchange position.
     ///
     /// Ordinary steering awaiting consumption belongs to status. Typed question responses
-    /// stay visible on acceptance; consumption anchors reserve their eventual position.
+    /// stay visible on acceptance; check inputs use the existing check categories instead.
+    /// Consumption anchors reserve their eventual position.
     pub(crate) fn displays_node(&self, node: &ExchangeNode) -> bool {
         match node {
+            ExchangeNode::ExchangeInput { prompt }
+                if matches!(
+                    &prompt.intent,
+                    InputIntent::User {
+                        content: crate::input::UserInputContent::CheckResult { .. }
+                    }
+                ) =>
+            {
+                false
+            }
             ExchangeNode::ExchangeInput { prompt } => {
                 matches!(&prompt.intent, InputIntent::User { content } if content.is_question_reply())
                     || !prompt.is_awaiting_consumption()

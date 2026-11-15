@@ -11,6 +11,9 @@ pub struct CheckResult {
     pub exchange_id: String,
     /// Terminal outcome of the collected run.
     pub state: CheckResultState,
+    /// Whether this run has finished; false reports a settled failure while other commands remain.
+    #[serde(default = "completed_default")]
+    pub complete: bool,
     /// Per-command outcomes and captured source identities.
     pub checks: Vec<CheckOutcome>,
 }
@@ -125,6 +128,7 @@ impl CheckResult {
                 ("run_id", self.run_id.clone()),
                 ("exchange_id", self.exchange_id.clone()),
                 ("state", self.state.as_str().into()),
+                ("complete", self.complete.to_string()),
             ],
         );
         for check in &self.checks {
@@ -191,6 +195,11 @@ impl CheckResult {
         ));
         writer.close();
     }
+}
+
+/// Treat records from before partial failure reporting as terminal results.
+fn completed_default() -> bool {
+    true
 }
 
 impl CheckResultState {

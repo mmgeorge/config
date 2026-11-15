@@ -1,6 +1,7 @@
 local source = require("forge.lsp.source")
 local diagnostics = require("forge.lsp.diagnostics")
 local M = {}
+local query_timeout_ms = 30000
 
 local methods = {
   definition = "textDocument/definition", type_definition = "textDocument/typeDefinition",
@@ -489,7 +490,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   end
   local function expire()
     if finished then return end
-    if not workspace_query or collecting then finish("timeout: " .. arguments.operation .. " lookup exceeded 10 seconds.") return end
+    if not workspace_query or collecting then finish("timeout: " .. arguments.operation .. " lookup exceeded " .. query_timeout_ms / 1000 .. " seconds.") return end
     for _, request in ipairs(requests) do if request.expire then request.expire() end end
     if not finished and outstanding == 0 then collect() end
   end
@@ -503,7 +504,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       warnings[#warnings + 1] = issue.message
       if workspace_query then result.coverage[#result.coverage + 1] = issue end
     end
-    deadline:start(10000, 0, vim.schedule_wrap(expire))
+    deadline:start(query_timeout_ms, 0, vim.schedule_wrap(expire))
     local success, failure = pcall(start)
     if not success then finish(tostring(failure)) end
   end

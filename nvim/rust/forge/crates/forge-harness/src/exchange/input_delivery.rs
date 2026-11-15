@@ -1165,7 +1165,14 @@ impl InputDeliveryRun {
             let active = crate::storage::HistoryReader::current(&services.root)
                 .and_then(|reader| reader.latest_exchange(services.observer.session_id()))
                 .map_err(OperationFailure::Domain)?;
-            if active.is_none_or(|exchange| exchange.id != *exchange_id) {
+            if active.is_none_or(|exchange| {
+                exchange.id != *exchange_id
+                    && matches!(
+                        exchange.state(),
+                        crate::exchange::ExchangeState::Running
+                            | crate::exchange::ExchangeState::Finalizing
+                    )
+            }) {
                 return Ok(Some(InputAbandonment::Paused));
             }
         }
@@ -1180,7 +1187,7 @@ impl InputDeliveryRun {
             )
             || *services.cancellation.subscribe().borrow()
             || ready.has_approval
-            || ready.checks_running
+            || ready.checks_running && !self.message.reports_check_failure()
             || services.tasks.configuration_is_uncertain())
         .then_some(InputAbandonment::Paused))
     }

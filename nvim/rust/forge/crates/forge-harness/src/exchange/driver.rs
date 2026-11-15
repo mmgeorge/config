@@ -704,7 +704,7 @@ impl ExchangeDriver {
             services.observer.session_id(),
         )
         .map_err(InputOfferError::Authority)?
-            || ready.checks_running
+            || ready.checks_running && !message.reports_check_failure()
             || ready.has_approval
             || message.intent == crate::input::InputIntent::Queue && ready.has_elicitation
         {

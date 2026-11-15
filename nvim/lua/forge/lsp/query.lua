@@ -411,7 +411,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
     end
   end
   local function resolved_start()
-    local duration = source_listing and 10 or arguments.operation == "paths" and 90 or 70
+    local duration = source_listing and 10 or 330
     timer:start(duration * 1000, 0, vim.schedule_wrap(function()
       if active_expire then draining = true active_expire()
       else finish("timeout: " .. arguments.operation .. " lookup exceeded " .. duration .. " seconds.") end

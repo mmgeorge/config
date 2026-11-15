@@ -34,6 +34,61 @@ fn submission_store(root: &std::path::Path) -> Result<Arc<SubmissionStore>> {
     SubmissionStore::open(root, Arc::new(crate::trace::TraceStore::open(root)?))
 }
 
+/// Roll back queue admission if its durable notification cannot commit.
+#[test]
+fn check_admission_and_publication_commit_together() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    use crate::session::SessionStore;
+    crate::storage::SqliteStore::open(root.path())?
+        .save_session(&crate::storage::test::session("session", "."))?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let mut operation = queued_operation("check");
+    if let InputAction::Submit { message } = &mut operation.action {
+        message.purpose = InputPurpose::CheckResult {
+            exchange_id: "exchange".into(),
+            run_id: "run".into(),
+        };
+    }
+    let database = crate::storage::test::raw_connection(root.path())?;
+    database.execute_batch(
+        "CREATE TRIGGER reject_check_publication BEFORE INSERT ON owner_publication BEGIN SELECT RAISE(ABORT,'publication unavailable'); END;"
+    )?;
+    assert!(queue.apply(operation.clone()).is_err());
+    assert!(queue.snapshot()?.messages.is_empty());
+    assert!(queue.admission_receipt("operation-check")?.is_none());
+    database.execute_batch("DROP TRIGGER reject_check_publication;")?;
+    queue.apply(operation.clone())?;
+    queue.apply(operation)?;
+    let publications =
+        crate::exchange::publication::SessionPublications::open(root.path(), "session")?;
+    assert_eq!(
+        publications
+            .after(None, std::num::NonZeroU16::new(10).unwrap())?
+            .len(),
+        1
+    );
+    assert_eq!(queue.check_result_receipts()?.len(), 1);
+    let revision = queue.snapshot()?.messages[0].revision;
+    queue.apply(InputOperation {
+        id: "remove-check".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Remove {
+            id: "check".into(),
+            revision,
+        },
+    })?;
+    assert_eq!(queue.check_result_receipts()?.len(), 1);
+    assert_eq!(
+        publications
+            .after(None, std::num::NonZeroU16::new(10).unwrap())?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
 /// Preserve drafts and receipts while releasing edit locks owned by a dead editor.
 #[test]
 fn accepted_queue_reopens_suspended_with_order_and_idempotency() -> Result<()> {

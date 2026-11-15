@@ -8,6 +8,42 @@ local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["query_deadline_starts_after_readiness_and_allows_thirty_seconds"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local ready, delay, expiry, failure, requested
+  stub(vim.uv, "new_timer", function()
+    return { start = function(_, milliseconds, repeat_ms, callback)
+      if repeat_ms == 0 then delay, expiry = milliseconds, callback end
+    end, stop = function() end, close = function() end }
+  end)
+  stub(require("forge.lsp.startup"), "ready", function(_, receive)
+    ready = receive
+    return function() end
+  end)
+  local directory = temp.directory("query-deadline")
+  local path = directory .. "/source.lua"
+  local buffer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(buffer, path)
+  vim.bo[buffer].filetype = "lua"
+  buffer_support.set(buffer, { "return {}" })
+  MiniTest.finally(function() pcall(vim.api.nvim_buf_delete, buffer, { force = true }) end)
+  local client = { id = 997, name = "fixture", config = { root_dir = directory, filetypes = { "lua" } },
+    is_stopped = function() return false end, supports_method = function() return true end,
+    request = function() requested = true return true, 1 end, cancel_request = function() end }
+  stub(vim.lsp, "buf_is_attached", function() return true end)
+  local _, force_expiry = require("forge.lsp.semantic").request(directory, {
+    operation = "hover", path = path, line = 1, column = 1,
+  }, function(_, receive) receive({}) end, function(_, message) failure = message end,
+    nil, { client = client })
+  eq(delay, nil)
+  ready(client)
+  wait_until(function() return requested end, "query did not start")
+  eq(delay, 30000)
+  eq(type(expiry), "function")
+  force_expiry()
+  eq(failure, "timeout: hover lookup exceeded 30 seconds.")
+end
+
 T["lsp_query"] = function()
   local startup = require("forge.lsp.startup")
   local query = require("forge.lsp.semantic")

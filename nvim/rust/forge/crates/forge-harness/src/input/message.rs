@@ -137,6 +137,20 @@ impl InputMessage {
         self.turn.as_deref()
     }
 
+    /// Permit unsuccessful check evidence through the check-running input gate.
+    pub(crate) fn reports_check_failure(&self) -> bool {
+        matches!(self.purpose, InputPurpose::CheckResult { .. })
+            && self.turn().is_some_and(|input| {
+                input.check_results().any(|result| {
+                    matches!(
+                        result.state,
+                        forge_provider_api::forge::CheckResultState::Failed
+                            | forge_provider_api::forge::CheckResultState::Blocked
+                    )
+                })
+            })
+    }
+
     /// Create the first committed revision for input reserved in a workflow transaction.
     pub(crate) fn admitted(draft: InputDraft) -> Self {
         let mut message = Self::queued(draft);

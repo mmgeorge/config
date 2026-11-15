@@ -43,7 +43,7 @@ mod node;
 mod opening;
 mod owner;
 mod plan_question;
-mod publication;
+pub(crate) mod publication;
 pub(crate) use publication::SessionPublications;
 mod question_input;
 #[cfg(test)]

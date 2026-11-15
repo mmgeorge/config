@@ -111,6 +111,132 @@ async fn completed_check_is_delivered_once_after_owner_restart() -> Result<()> {
     Ok(())
 }
 
+/// Replaying an admitted result must not prevent a later completed run from reaching the queue.
+#[tokio::test]
+async fn check_result_replay_preserves_publication_and_delivers_later_runs() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"check-replay",
+        "provider":{"kind":"mock","command":[]},
+    }))?)?;
+    let session = broker.snapshot()?.session;
+    let mut exchange = crate::storage::test::running_exchange("check-owner");
+    exchange.session_id = session.id.clone();
+    exchange.agent_id = session.primary_agent_id;
+    exchange.finish(crate::exchange::ExchangeOutcome::Complete, 100)?;
+    SqliteStore::open(&broker.data_root)?.save_exchange(&exchange)?;
+    let checks_root = broker.checks().root.clone();
+    let scope = crate::provider::InvocationScope::new(
+        crate::provider::ThreadOwner::root(&session.id),
+        exchange.id.as_str(),
+    );
+    seed_completed_check(&checks_root, &session.id, &scope, "first")?;
+    broker.observer().input.suspend(true, None)?;
+    drop(broker);
+    let controller = receipt_test_controller_with_session(root.path(), &session.id).await?;
+    let input = &controller.coordinator.submissions;
+    loop {
+        let changed = input.changed.notified();
+        if input.admission_receipt("check-result:first")?.is_some() {
+            break;
+        }
+        changed.await;
+    }
+    controller.finish_exchange_owner().await?;
+    drop(controller);
+    seed_completed_check(&checks_root, &session.id, &scope, "second")?;
+    seed_completed_check(&checks_root, &session.id, &scope, "third")?;
+    let reopened = receipt_test_controller_with_session(root.path(), &session.id).await?;
+    let input = &reopened.coordinator.submissions;
+    reopened
+        .exchange_owner
+        .command_status(crate::exchange::command::CommandId::new("replay-barrier")?)
+        .await?;
+    assert!(
+        input.admission_receipt("check-result:second")?.is_some(),
+        "replayed first result blocked the second result"
+    );
+    let messages = input.snapshot()?.messages;
+    assert_eq!(messages.len(), 2);
+    for id in ["first", "second"] {
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.id == format!("check-result:{id}"))
+                .count(),
+            1
+        );
+    }
+    let grouped = messages
+        .iter()
+        .find(|message| message.id == "check-result:second")
+        .unwrap();
+    assert_eq!(
+        grouped
+            .turn()
+            .unwrap()
+            .check_results()
+            .map(|result| result.run_id.as_str())
+            .collect::<Vec<_>>(),
+        ["second", "third"]
+    );
+    let publications = reopened
+        .publications
+        .after(None, std::num::NonZeroU16::new(u16::MAX).unwrap())?;
+    let check_publications = publications
+        .iter()
+        .filter(|publication| {
+            publication.event().event == "input_changed"
+                && publication.event().payload["operation_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("check-result:"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(check_publications.len(), 2);
+    assert!(
+        check_publications
+            .iter()
+            .all(|publication| publication.event().payload["snapshot"].is_null())
+    );
+    reopened.finish_exchange_owner().await?;
+    Ok(())
+}
+
+/// Seed collected check evidence and its admission receipt without running a command.
+fn seed_completed_check(
+    root: &std::path::Path,
+    session: &str,
+    scope: &crate::provider::InvocationScope,
+    id: &str,
+) -> Result<()> {
+    let record = root.join(id);
+    std::fs::create_dir_all(&record)?;
+    let run: crate::checks::CheckRun = serde_json::from_value(json!({
+        "id":id,"owner":{"kind":"session","session_id":session},"revision":0,
+        "shell":"system","executable":null,"workspace":".","environment_digest":"fixture",
+        "started_at_ms":1,"completed_at_ms":2,"state":"passed",
+        "progress":crate::plan::execution::SemanticProgress::default(),"workspace_identity":null,"workspace_digest":{},
+        "commands":[]
+    }))?;
+    std::fs::write(
+        record.join("record.json"),
+        serde_json::to_vec(&json!({
+            "version":crate::storage::state::VERSION,"run":run
+        }))?,
+    )?;
+    let receipts = root.join("owner-receipts");
+    std::fs::create_dir_all(&receipts)?;
+    std::fs::write(
+        receipts.join(format!("{id}.json")),
+        serde_json::to_vec(&json!({
+            "scope":scope,"call_id":id,"request":crate::checks::RunRequest::default(),
+            "run_id":id,"state":"admitted"
+        }))?,
+    )?;
+    Ok(())
+}
+
 /// Reopen the same mock session so the real owner recovers its persisted check result.
 async fn receipt_test_controller_with_session(
     root: &std::path::Path,

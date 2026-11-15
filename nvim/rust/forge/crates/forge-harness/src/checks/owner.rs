@@ -289,9 +289,7 @@ impl CheckOwnerRuns {
                 continue;
             }
             let receipt: CheckToolReceipt = crate::codec::from_slice(&std::fs::read(path)?)?;
-            if matches!(receipt.state, CheckToolReceiptState::Admitted)
-                && !self.scopes.contains_key(&receipt.run_id)
-            {
+            if matches!(receipt.state, CheckToolReceiptState::Admitted) {
                 sources.push((
                     receipt.run_id,
                     receipt.scope.exchange_id.as_str().to_owned(),
@@ -299,6 +297,11 @@ impl CheckOwnerRuns {
             }
         }
         Ok(sources)
+    }
+
+    /// Require observed worker collection before publishing terminal run evidence.
+    pub(crate) fn is_collected(&self, run_id: &str) -> bool {
+        !self.scopes.contains_key(run_id)
     }
 
     /// Create process ownership for one session's check supervisor.
@@ -629,12 +632,17 @@ mod tests {
             },
         )?;
         owner.scopes.insert("run".into(), scope.clone());
-        assert!(owner.result_sources()?.is_empty());
+        assert_eq!(
+            owner.result_sources()?,
+            vec![("run".into(), "exchange".into())]
+        );
+        assert!(!owner.is_collected("run"));
         owner.settle(&CheckOwnerCompletion {
             scope,
             run_id: "run".into(),
             outcome: Ok(()),
         });
+        assert!(owner.is_collected("run"));
         assert_eq!(
             owner.result_sources()?,
             vec![("run".into(), "exchange".into())]

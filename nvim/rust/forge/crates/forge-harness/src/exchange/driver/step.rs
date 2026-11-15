@@ -659,6 +659,8 @@ impl ExchangeDriver {
                     "exchange.check_result.failed",
                     serde_json::json!({"error":format!("{error:#}"),"update_step":step}),
                 );
+                tracing::error!(target: "forge::harness", event_name = "exchange.check_result.delivery_failed",
+                    session_id, error = %format!("{error:#}"), "Check result delivery failed");
             }
             match self
                 .question_inputs

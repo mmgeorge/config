@@ -1900,6 +1900,7 @@ pub(crate) fn input_content(
         TurnKind::CheckResult { result } => {
             return Ok(UserInputContent::CheckResult {
                 result: Box::new(result.clone()),
+                additional_results: input.check_results().skip(1).cloned().collect(),
             });
         }
         TurnKind::QuestionResponse { response } => std::slice::from_ref(response),

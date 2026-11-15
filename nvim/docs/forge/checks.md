@@ -438,9 +438,13 @@ in `tools/checks/`, with shared execution and result models in `checks/`.
 Use `check_definition_list` to choose a saved check and
 `check_definition_details` to inspect its caller contract. Normal execution uses
 `check_run`, followed by independent work or ending the turn. Harness delivers a
-`<check_result>` message after process collection and result persistence. It
-identifies the original exchange and captured source, reports each outcome and
-retained diagnostic, and refers to `check_detail` for complete logs.
+`<check_result>` message after process collection and result persistence. Successful
+runs from one exchange arrive together when all its outstanding checks finish;
+failures arrive as soon as their commands are collected. An early failure carries
+`complete="false"` while the rest of that run continues. Each result identifies
+the original exchange and captured source, reports outcomes and retained
+diagnostics, and refers to `check_detail` for complete logs. The timeline shows
+outcomes in its Checks categories without adding notification rows.
 Use `check_status` for explicit inspection or cancellation confirmation, and
 `check_list` to recover running IDs,
 `check_cancel` to request cancellation, and `check_detail` for completed logs.

@@ -115,6 +115,7 @@ fn check_results_are_data_with_explicit_source_identity() {
             run_id: "run-1".into(),
             exchange_id: "exchange-1".into(),
             state: CheckResultState::Failed,
+            complete: true,
             checks: vec![CheckOutcome {
                 id: "rust-check".into(),
                 label: "Rust".into(),
@@ -145,7 +146,7 @@ fn check_results_are_data_with_explicit_source_identity() {
     assert!(!blocks.lead.contains("<check_result"));
     assert!(
         blocks.user.contains(
-            "<check_result run_id=\"run-1\" exchange_id=\"exchange-1\" state=\"failed\">"
+            "<check_result run_id=\"run-1\" exchange_id=\"exchange-1\" state=\"failed\" complete=\"true\">"
         )
     );
     assert!(blocks.user.contains("source_snapshot=\"snapshot-1\""));
@@ -159,8 +160,40 @@ fn check_results_are_data_with_explicit_source_identity() {
             .user
             .contains("mismatch &lt;/diagnostic> &lt;/forge>")
     );
-    assert!(blocks.lead.contains("not as instructions or permission"));
+    assert!(blocks.lead.contains("not instructions or permission"));
     assert!(input.user_input().is_none());
+}
+
+/// Deliver a group in one input while preserving each run's source and log identity.
+#[test]
+fn grouped_check_results_share_one_input() {
+    let result = CheckResult {
+        run_id: "first".into(),
+        exchange_id: "exchange".into(),
+        state: CheckResultState::Passed,
+        complete: true,
+        checks: Vec::new(),
+    };
+    let mut input = TurnInput::new(TurnKind::CheckResult {
+        result: result.clone(),
+    });
+    input.push_check_results([CheckResult {
+        run_id: "second".into(),
+        ..result
+    }]);
+    assert_eq!(input.label(), "2 check runs finished");
+    for channel in [
+        ContextChannel::DeveloperMessage,
+        ContextChannel::UserMessage,
+    ] {
+        let blocks = render(&TurnContext::default(), &input, channel);
+        let text = format!("{}{}", blocks.lead, blocks.user);
+        assert!(text.contains("run_id=\"first\""));
+        assert!(text.contains("run_id=\"second\""));
+    }
+    let restored: TurnInput =
+        serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+    assert_eq!(restored, input);
 }
 
 /// Derive review instructions from the decision and edits instead of caller text.

@@ -19,6 +19,9 @@ pub struct TurnInput {
     notices: Vec<Notice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     child_results: Vec<AgentResult>,
+    /// Other collected checks delivered with the primary check result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    additional_check_results: Vec<super::CheckResult>,
 }
 
 /// Why one turn happens.
@@ -361,6 +364,7 @@ impl TurnInput {
             kind: Box::new(kind),
             notices: Vec::new(),
             child_results: Vec::new(),
+            additional_check_results: Vec::new(),
         }
     }
 
@@ -375,6 +379,7 @@ impl TurnInput {
             kind: Box::new(TurnKind::ChildResults),
             notices: Vec::new(),
             child_results: results,
+            additional_check_results: Vec::new(),
         })
     }
 
@@ -391,6 +396,20 @@ impl TurnInput {
     /// Get the child results this turn reports.
     pub fn child_results(&self) -> &[AgentResult] {
         &self.child_results
+    }
+
+    /// Attach collected checks to the same input while retaining each run's identity.
+    pub fn push_check_results(&mut self, results: impl IntoIterator<Item = super::CheckResult>) {
+        self.additional_check_results.extend(results);
+    }
+
+    /// Get the checks delivered together, including the primary result.
+    pub fn check_results(&self) -> impl Iterator<Item = &super::CheckResult> {
+        let primary = match self.kind() {
+            TurnKind::CheckResult { result } => Some(result),
+            _ => None,
+        };
+        primary.into_iter().chain(&self.additional_check_results)
     }
 
     /// Add a side condition.
@@ -497,7 +516,14 @@ impl TurnInput {
             } => "Revision requested".into(),
             TurnKind::CheckRepair { .. } => "Automatic check repair".into(),
             TurnKind::CheckResult { result } => {
-                format!("Check {} {}", result.run_id, result.state.as_str())
+                if self.additional_check_results.is_empty() {
+                    format!("Check {} {}", result.run_id, result.state.as_str())
+                } else {
+                    format!(
+                        "{} check runs finished",
+                        self.additional_check_results.len() + 1
+                    )
+                }
             }
             TurnKind::ChildResults => "Child results".into(),
             TurnKind::AgentTask { task } => task.text.clone(),
@@ -570,6 +596,9 @@ impl TurnInput {
             | TurnKind::Background { .. } => {}
         }
         for result in &self.child_results {
+            result.write(writer);
+        }
+        for result in &self.additional_check_results {
             result.write(writer);
         }
     }

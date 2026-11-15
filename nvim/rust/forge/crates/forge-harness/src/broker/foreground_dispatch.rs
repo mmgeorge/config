@@ -2434,6 +2434,7 @@ mod tests {
                     run_id: "run".into(),
                     exchange_id: original.id.clone(),
                     state: forge_provider_api::forge::CheckResultState::Passed,
+                    complete: true,
                     checks: Vec::new(),
                 },
             },

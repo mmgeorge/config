@@ -3074,6 +3074,34 @@ async fn run_prompt_inner(
                 })
                 .await?;
             }
+            TestPromptStep::ToolEvent { id, event } => {
+                ensure_open(&session, ProviderOperation::TurnStart)?;
+                let event = match event {
+                    forge_provider_api::testing::TestToolEvent::Announced { descriptor } => {
+                        ItemEvent::Started(ItemStart::ToolCall(descriptor))
+                    }
+                    forge_provider_api::testing::TestToolEvent::ExecutionStarted => {
+                        ItemEvent::Tool {
+                            event: ToolItemEvent::ExecutionStarted,
+                        }
+                    }
+                    forge_provider_api::testing::TestToolEvent::Completed { outcome } => {
+                        ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
+                            outcome,
+                            descriptor: None,
+                            output: None,
+                            changes: ProviderChangeSet::default(),
+                        }))
+                    }
+                };
+                sink.send_wait(AdapterActivity::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id: id,
+                    event,
+                })
+                .await?;
+            }
         }
     }
     let terminal = script.terminal.clone();

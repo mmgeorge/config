@@ -342,13 +342,13 @@ impl ExchangeDriver {
                     }
                     if !crate::input::input_purpose_is_current(&services.tasks, &services.questions, &message.purpose, &services.root, services.observer.session_id()).map_err(InputOfferError::Authority)? { return Ok(false); }
                     let ready = services.observer.input_readiness().map_err(InputOfferError::Queue)?;
-                    if ready.has_approval || ready.checks_running { return Ok(false); }
+                    if ready.has_approval || ready.checks_running && !message.reports_check_failure() { return Ok(false); }
                     let mut broker = broker.lock().await;
                     if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &message.purpose {
                         let current = crate::storage::HistoryReader::current(&services.root)
                             .and_then(|reader| reader.latest_exchange(session))
                             .map_err(InputOfferError::Queue)?;
-                        if current.is_none_or(|exchange| exchange.id != *exchange_id) { return Ok(false); }
+                        if current.is_none_or(|exchange| exchange.id != *exchange_id && matches!(exchange.state(), crate::exchange::ExchangeState::Running | crate::exchange::ExchangeState::Finalizing)) { return Ok(false); }
                     }
                     let view = broker.owner_control_view().map_err(InputOfferError::Queue)?;
                     publish_input_events(view.events, Some(&output), services, trace, session, &input, step);
@@ -421,7 +421,7 @@ impl ExchangeDriver {
                             .observer
                             .input_readiness()
                             .map_err(InputOfferError::Queue)?;
-                        if ready.checks_running
+                        if ready.checks_running && !message.reports_check_failure()
                             || ready.has_approval
                             || message.intent == crate::input::InputIntent::Queue
                                 && ready.has_elicitation

@@ -37,8 +37,8 @@ function M.resolve(config, path, buffer, receive)
   end
   if type(config.root_dir) == "function" then
     timer = assert(vim.uv.new_timer())
-    timer:start(60000, 0, vim.schedule_wrap(function()
-      finish(nil, "timeout: selected LSP root resolution exceeded 60 seconds")
+    timer:start(300000, 0, vim.schedule_wrap(function()
+      finish(nil, "timeout: selected LSP root resolution exceeded 300 seconds")
     end))
     buffer = buffer or source.loaded(path)
     if buffer then resolve(buffer)

@@ -106,10 +106,13 @@ T["readiness_reports_timeout_and_disconnect_once"] = function()
   local client = { initialized = false, is_stopped = function() return stopped end }
   local function receive(_, message) count = count + 1 failure = message end
   require("forge.lsp.startup").ready(client, receive)
-  clock = 60000
+  clock = 299999
+  callback()
+  eq(count, 0)
+  clock = 300000
   callback()
   wait_until(function() return count == 1 end, "readiness timeout did not finish")
-  eq(failure:match("^timeout:") ~= nil, true)
+  eq(failure, "timeout: selected LSP readiness exceeded 300 seconds")
   callback()
   vim.wait(0, function() return false end)
   eq(count, 1)

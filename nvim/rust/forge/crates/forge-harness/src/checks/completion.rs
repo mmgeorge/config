@@ -10,6 +10,7 @@ pub(crate) fn result(run: &CheckRun, exchange_id: &str) -> CheckResult {
         run_id: run.id.clone(),
         exchange_id: exchange_id.into(),
         state: state(run.state),
+        complete: run.completed_at_ms.is_some(),
         checks: run
             .commands
             .iter()

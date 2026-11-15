@@ -33,7 +33,7 @@ T["root_timeout_is_explicit_and_deterministic"] = function()
   local expire, failure
   stub(vim.uv, "new_timer", function()
     local closed = false
-    return { start = function(_, _, _, callback) expire = callback end, stop = function() end,
+    return { start = function(_, delay, _, callback) eq(delay, 300000) expire = callback end, stop = function() end,
       close = function() closed = true end, is_closing = function() return closed end }
   end)
   local buffer = vim.api.nvim_create_buf(false, true)
@@ -42,7 +42,7 @@ T["root_timeout_is_explicit_and_deterministic"] = function()
     function(_, message) failure = message end)
   expire()
   vim.wait(0, function() return failure ~= nil end)
-  eq(failure, "timeout: selected LSP root resolution exceeded 60 seconds")
+  eq(failure, "timeout: selected LSP root resolution exceeded 300 seconds")
 end
 
 return T

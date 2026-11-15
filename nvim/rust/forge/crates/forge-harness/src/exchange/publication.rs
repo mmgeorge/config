@@ -710,6 +710,33 @@ impl SessionPublications {
         self.mark_ready();
     }
 
+    /// Commit a check input's immutable notification with its queue admission receipt.
+    pub(crate) fn retain_check_result(
+        transaction: &rusqlite::Transaction<'_>,
+        session: &str,
+        update: &crate::input::InputUpdate,
+    ) -> Result<(), PublicationError> {
+        let id = update
+            .operation_id
+            .as_deref()
+            .ok_or(PublicationError::InvalidEvent)?;
+        let mut receipt = update.clone();
+        receipt.snapshot = None;
+        Self::append_transaction(
+            transaction,
+            session,
+            SessionEvent {
+                session_id: session.into(),
+                event: "input_changed".into(),
+                payload: serde_json::to_value(receipt)?,
+            },
+            Some(PublicationOrigin::CheckResult(
+                super::command::InputId::new(id).map_err(|_| PublicationError::InvalidEvent)?,
+            )),
+        )?;
+        Ok(())
+    }
+
     /// Allocate or recover one producer fact within the caller's existing SQLite transaction.
     fn append_transaction(
         transaction: &rusqlite::Transaction<'_>,
