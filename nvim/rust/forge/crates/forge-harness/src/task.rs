@@ -10,13 +10,13 @@ mod installation;
 pub(crate) use execution::{ExecutionSettlement, ExecutionSettlementKind};
 pub(crate) use installation::{TaskInstallation, TaskInstallationWork};
 mod state;
-pub(crate) use active::StaleTask;
 pub use active::{
     ExecutionEntry, ExecutionSnapshot, GoalSnapshot, PlanExecutionChoice, PlanSnapshot, Task,
     TaskContinuation, TaskDecision, TaskEntry, TaskId, TaskInputDelivery, TaskInputId,
     TaskInputIdentityError, TaskOutcome, TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn,
     TaskTurnId, TaskWork, WorkflowSnapshot,
 };
+pub(crate) use active::{StaleTask, TaskContinuationNotice};
 pub(crate) use active::{TaskReceiptInput, TaskReceiptPermit, TaskSnapshot};
 pub(crate) use controller::TaskChange;
 pub(crate) use controller::{

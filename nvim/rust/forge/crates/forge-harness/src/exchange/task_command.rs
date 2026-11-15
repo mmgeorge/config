@@ -2012,6 +2012,7 @@ fn prepare_workflow_continuation(
                         turn_ordinal: completed.turn.len(),
                     },
                     continuation: Some(crate::task::TaskContinuation {
+                        display: None,
                         id: crate::task::TaskInputId::fresh(),
                         reason: "The planning questions were answered".into(),
                         delivery: crate::task::TaskInputDelivery::Pending,
@@ -2205,6 +2206,7 @@ fn continuation_task_change(
     task.turn = Some(crate::task::TaskTurn {
         id: completed.clone(),
         continuation: Some(crate::task::TaskContinuation {
+            display: None,
             id: crate::task::TaskInputId::fresh(),
             reason: "The selected workflow was continued".into(),
             delivery: crate::task::TaskInputDelivery::Pending,

@@ -60,7 +60,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
             {
                 return Ok(PreparedProduction::Idle);
             }
-            let (id, text, purpose) = if let Some(entry) = task
+            let (id, text, display, purpose) = if let Some(entry) = task
                 .entry
                 .as_ref()
                 .filter(|entry| entry.delivery == TaskInputDelivery::Pending)
@@ -68,6 +68,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                 (
                     &entry.id,
                     &entry.instruction,
+                    None,
                     InputPurpose::TaskEntry {
                         revision: task.revision.clone(),
                         id: entry.id.clone(),
@@ -108,6 +109,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                 (
                     &continuation.id,
                     text,
+                    continuation.display.as_deref(),
                     InputPurpose::TaskContinuation {
                         revision: task.revision.clone(),
                         id: continuation.id.clone(),
@@ -122,7 +124,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
             let changed = services.input.reconcile_task_input(
                 InputMessage::queued(crate::input::InputDraft {
                     id: id.as_str().into(),
-                    text: text.label(),
+                    text: display.map(str::to_owned).unwrap_or_else(|| text.label()),
                     purpose,
                     attachments: Vec::new(),
                     config: None,

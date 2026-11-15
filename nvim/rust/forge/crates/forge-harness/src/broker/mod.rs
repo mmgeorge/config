@@ -3790,7 +3790,10 @@ impl HarnessBroker {
                 &task.permit(),
                 completed,
                 prompt,
-                "The accepted plan requires another execution phase".into(),
+                crate::task::TaskContinuationNotice {
+                    reason: "The accepted plan requires another execution phase".into(),
+                    display: None,
+                },
                 now_ms,
             )?;
         }

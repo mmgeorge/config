@@ -1331,7 +1331,9 @@ impl HarnessBroker {
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
             request
                 .input
-                .push_notice(forge_provider_api::forge::Notice::PermissionTimeout { feedback });
+                .push_notice(forge_provider_api::forge::Notice::PermissionTimeout {
+                    feedback: feedback.feedback().to_owned(),
+                });
         }
         let policy = request
             .control_context
@@ -2304,6 +2306,8 @@ impl HarnessBroker {
         let feedback = self.permission_coordinator.take_timeout_feedback(&owner)?;
         let mut dispatch = None;
         if let Some(feedback) = feedback {
+            let display = feedback.display(&self.store.list_exchange(&self.session.id)?)?;
+            let feedback = feedback.feedback().to_owned();
             if let Some(task) = self.task_controller.current()? {
                 if matches!(
                     task.status(),
@@ -2326,7 +2330,10 @@ impl HarnessBroker {
                             },
                         )
                         .normalized(),
-                        "An approval timed out".into(),
+                        crate::task::TaskContinuationNotice {
+                            reason: "An approval timed out".into(),
+                            display: Some(display),
+                        },
                         self.clock.now_ms(),
                     )?;
                 }
@@ -2344,12 +2351,12 @@ impl HarnessBroker {
                         params: json!({"text":feedback.clone()}),
                     };
                     let mut owned = self.begin_foreground_dispatch(request, sink.clone())?;
-                    let mut admission = ExchangeAdmission::chat(feedback.clone());
+                    let mut admission = ExchangeAdmission::chat(display.clone());
                     admission.opening = crate::exchange::ExchangeOpening::task_continuation(
                         "An approval timed out",
                     );
                     let interaction = self.stage_foreground_interaction(
-                        &feedback,
+                        &display,
                         PromptMode::Chat,
                         Some(&admission),
                         ProviderInput::kind(

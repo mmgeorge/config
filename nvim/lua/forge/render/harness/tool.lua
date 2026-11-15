@@ -97,7 +97,7 @@ end
 ---@param tool table Tool descriptor table.
 ---@return boolean failed True if tool execution failed or was denied/cancelled.
 function M.failed(tool)
-  if tool.failed ~= nil then return tool.failed == true end
+  if tool.failed == true then return true end
   local status = tostring(tool.status or ""):lower()
   return status == "failed" or status == "error" or status == "denied" or status == "rejected"
     or status == "cancelled" or status == "canceled"

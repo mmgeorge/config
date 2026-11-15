@@ -298,6 +298,10 @@ fn tool_group_label<'tool>(
     let calls: Vec<_> = calls.into_iter().collect();
     let count = calls.len();
     let failed = calls.iter().filter(|tool| tool.failed).count();
+    let denied = calls
+        .iter()
+        .filter(|tool| tool.state() == crate::turn::ToolState::Denied)
+        .count();
     let mut label = format!(
         "▸ {} {count} {}",
         if lifecycle == NodeLifecycle::Live {
@@ -307,8 +311,15 @@ fn tool_group_label<'tool>(
         },
         if count == 1 { "tool" } else { "tools" }
     );
+    let mut outcomes = Vec::new();
     if failed > 0 {
-        label.push_str(&format!(" ({failed} failed)"));
+        outcomes.push(format!("{failed} failed"));
+    }
+    if denied > 0 {
+        outcomes.push(format!("{denied} denied"));
+    }
+    if !outcomes.is_empty() {
+        label.push_str(&format!(" ({})", outcomes.join(", ")));
     }
     if let Some(elapsed) = tool_group_elapsed(&calls, now) {
         label.push_str(&format!(
@@ -561,7 +572,7 @@ pub(super) fn timing_blocks(
                                 crate::buffer::transcript::ToolHeading {
                                     kind: &tool.kind,
                                     elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
-                                    failed: tool.failed,
+                                    failed: tool.failure_style(),
                                     title: &tool.title,
                                     expanded: false,
                                     shell: tool.command_shell.as_deref(),
@@ -612,7 +623,7 @@ pub(super) fn timing_blocks(
                     crate::buffer::transcript::ToolHeading {
                         kind: &tool.kind,
                         elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
-                        failed: tool.failed,
+                        failed: tool.failure_style(),
                         title: &tool.title,
                         expanded: expanded.get(&format!("{call_id}:tool")) == Some(&true),
                         shell: tool.command_shell.as_deref(),
@@ -2055,6 +2066,24 @@ impl TimelineRenderer<'_> {
                 node.more = more;
             }
             node.resolve(expansion);
+            if let Some(reason) = super::tool_outcome::rejection(exchange, call) {
+                let width = self.content_width();
+                let renderer = TranscriptRenderer::new(&width)?;
+                let mut block =
+                    renderer.literal(BlockId(format!("{call_id}:rejection")), &reason, 2)?;
+                block.metadata.decoration.push(Decoration {
+                    range: TextRange {
+                        start: TextPosition { row: 0, column: 0 },
+                        end: TextPosition {
+                            row: block.text.row_count(),
+                            column: 0,
+                        },
+                    },
+                    capture: "ForgeHarnessToolFailure".into(),
+                    priority: 100,
+                });
+                self.push(block)?;
+            }
         }
         let expansion = self.expansion.get(&group_id).copied();
         let node = self.fold(start, &group_id, settled, NodeKind::ToolGroup);
@@ -3082,7 +3111,7 @@ impl TimelineRenderer<'_> {
                 shell: tool.command_shell.as_deref(),
                 kind: &tool.kind,
                 elapsed_ms: tool.elapsed_ms(exchange.tool_instant(self.now_ms)),
-                failed: tool.failed,
+                failed: tool.failure_style(),
                 title: &label,
                 expanded,
             },
@@ -3848,6 +3877,32 @@ mod tests {
                 format!("▸ Ran {} tools · {expected}", calls.len()),
             );
         }
+    }
+
+    #[test]
+    fn tool_group_summary_distinguishes_failed_and_denied() {
+        use crate::turn::{ToolCall, ToolInstant, ToolState};
+        let calls: Vec<_> = [ToolState::Completed, ToolState::Failed, ToolState::Denied]
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| {
+                ToolCall::projection(
+                    index.to_string(),
+                    "command".into(),
+                    "Inspect".into(),
+                    state,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        assert_eq!(
+            super::tool_group_label(&calls, super::NodeLifecycle::Settled, ToolInstant::wall(0)),
+            "▸ Ran 3 tools (1 failed, 1 denied)",
+        );
+        assert!(calls[1].failure_style());
+        assert!(calls[2].failure_style());
+        assert!(!calls[0].failure_style());
     }
 
     /// Freeze completed intervals and measure live overlap on the approval-paused clock.

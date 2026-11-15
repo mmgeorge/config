@@ -133,7 +133,10 @@ impl HarnessBroker {
                 turn_ordinal: exchange.turn.len(),
             },
             instruction,
-            "Project check setup completed".into(),
+            crate::task::TaskContinuationNotice {
+                reason: "Project check setup completed".into(),
+                display: None,
+            },
             now_ms,
         )?;
         Ok(result)

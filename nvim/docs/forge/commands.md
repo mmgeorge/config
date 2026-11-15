@@ -285,6 +285,10 @@ Approval expiry dismisses its popup automatically and sends timeout feedback,
 without saving a deny rule. A final response after that denial settles the turn
 without scheduling another timeout-driven continuation.
 
+Expand **An approval timed out** to inspect the original request, action details,
+complete commands and reported tool arguments, and the automatic timeout outcome.
+The entry distinguishes expiry from a user rejection.
+
 Copilot can read and write its current session's notes directory without approval,
 when writes are enabled. Write-off also rejects session-note writes. Harness gets
 that directory from the native CLI, so the

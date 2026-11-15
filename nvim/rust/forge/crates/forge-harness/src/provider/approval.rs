@@ -1,3 +1,4 @@
+use super::approval_timeout::ApprovalTimeoutFeedback;
 use crate::permissions::command::{
     broad_command_pattern, exact_command_pattern, normalize_command_in,
 };
@@ -129,7 +130,7 @@ pub struct PermissionCoordinator {
     pending_map: Mutex<BTreeMap<String, PendingApproval>>,
     store: Arc<RwLock<PermissionStore>>,
     timeout_by_session: Mutex<BTreeMap<String, InputTimeout>>,
-    feedback_by_owner: Mutex<HashMap<crate::provider::ThreadOwner, String>>,
+    feedback_by_owner: Mutex<HashMap<crate::provider::ThreadOwner, ApprovalTimeoutFeedback>>,
     feedback_watch: Mutex<HashMap<crate::provider::ThreadOwner, tokio::sync::watch::Sender<bool>>>,
     skill_by_owner: Mutex<HashMap<crate::provider::ThreadOwner, Arc<crate::skill::SkillAccess>>>,
     directory_by_scope: Mutex<HashMap<crate::provider::InvocationScope, Arc<DirectoryPolicy>>>,
@@ -347,10 +348,10 @@ impl PermissionCoordinator {
     }
 
     /// Consume one owner's automatic-rejection guidance at its next continuation boundary.
-    pub fn take_timeout_feedback(
+    pub(crate) fn take_timeout_feedback(
         &self,
         owner: &crate::provider::ThreadOwner,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<ApprovalTimeoutFeedback>> {
         let feedback = self
             .feedback_by_owner
             .lock()
@@ -969,8 +970,11 @@ impl PermissionCoordinator {
                     if let Some(pending) = &mut pending {
                         pending.view.resolution_source = ResolutionSource::Timeout;
                         if let Some(owner) = &pending.view.execution_owner {
-                            self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
-                                .insert(owner.clone(), format!("Approval {} was automatically rejected because its timeout expired. This was not an explicit user rejection. The existing user instruction and permissions remain in effect. Continue authorized work, avoid repeating the expired request, and do not ask whether to continue work the user already requested.", pending.view.id));
+                            {
+                                let mut feedback_by_owner = self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?;
+                                let feedback = feedback_by_owner.entry(owner.clone()).or_default();
+                                feedback.request_push(pending.presentation.clone());
+                            }
                             self.publish_timeout_feedback(owner)?;
                         }
                     }

@@ -1,4 +1,5 @@
 pub mod approval;
+mod approval_timeout;
 mod approval_view;
 mod catalog;
 pub(crate) use catalog::{parse_user_input, select_model_settings};

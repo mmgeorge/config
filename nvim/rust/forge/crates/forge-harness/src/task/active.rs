@@ -306,11 +306,19 @@ pub struct TaskTurn {
     pub continuation: Option<TaskContinuation>,
 }
 
+/// Keep a continuation's human heading and optional body independent of its provider instruction.
+pub(crate) struct TaskContinuationNotice {
+    pub reason: String,
+    pub display: Option<String>,
+}
+
 /// Owns the exact instruction and provider acknowledgement for one continuation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskContinuation {
     pub id: TaskInputId,
     pub reason: String,
+    /// Human-facing input body when the provider instruction is internal guidance.
+    pub display: Option<String>,
     pub delivery: TaskInputDelivery,
     pub work: TaskWork,
 }

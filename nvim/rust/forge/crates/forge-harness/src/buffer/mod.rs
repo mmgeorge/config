@@ -14,6 +14,7 @@ pub mod session;
 mod status;
 mod syntax;
 pub mod tool;
+mod tool_outcome;
 pub mod transcript;
 
 pub use failure::TranscriptProjectionFailure;

@@ -179,7 +179,9 @@ impl AgentRuntime {
                 // The same typed kind a root session uses, so the child receives the fixed
                 // timeout preface rather than bare feedback that reads as user text.
                 request.input = crate::provider::ProviderInput::kind(
-                    forge_provider_api::forge::TurnKind::PermissionTimeout { feedback },
+                    forge_provider_api::forge::TurnKind::PermissionTimeout {
+                        feedback: feedback.feedback().to_owned(),
+                    },
                 );
                 request.submission = None;
                 request.recovered_input.clear();

@@ -310,6 +310,7 @@ impl BrokerObserver {
         task.turn = Some(crate::task::TaskTurn {
             id: completed,
             continuation: Some(crate::task::TaskContinuation {
+                display: None,
                 id: crate::task::TaskInputId::fresh(),
                 reason: "The active task requires another turn".into(),
                 delivery: crate::task::TaskInputDelivery::Pending,

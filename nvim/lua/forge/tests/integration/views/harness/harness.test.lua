@@ -14,6 +14,134 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["rejected_tool_shows_reason_and_red_marker"] = function()
+  local approval = dofile("nvim/lua/forge/tests/support/approval.lua")
+  local workspace = temp.directory("approval-rejection")
+  local config = temp.directory("approval-rejection-config")
+  vim.fn.mkdir(config .. "/forge", "p")
+  vim.fn.writefile({ vim.json.encode({ permission = { tool = { check_definition_edit = "ask" } } }) },
+    config .. "/forge/permissions.json")
+  local client = host.start({ config = config }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  stub(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local completed, failure
+  client.request({ session_id = state.session.id, method = "session.provider.mock_response", params = {
+    operation = "script", script = {
+      steps = { { kind = "tool_call", name = "check_definition_edit", arguments = { operation = "inspect-rejection" } } },
+      terminal = "completed",
+    },
+  } }, function(_, error) completed, failure = true, error end)
+  wait_until(function() return completed end, "script did not register")
+  eq(failure, nil)
+  buffer.set(state.composer_buf, { "Inspect project checks" })
+  require("forge.views.harness.controller").submit()
+  local responder = approval.responder("deny_once")
+  wait_until(function()
+    approval.answer_pending(responder)
+    return not require("forge.views.harness.activity").busy(state) and next(responder.answered) ~= nil
+  end, "rejected call did not settle")
+  local transcript = state.presentation.transcript
+  for index = 0, transcript.sequence:count() - 1 do
+    local entry = transcript.sequence:at(index).entry
+    local node = entry.metadata.node
+    if node and node ~= vim.NIL and node.kind == "exchange" then
+      state.presentation.set_section(node.id, true, false)
+    end
+  end
+  wait_until(function()
+    for index = 0, transcript.sequence:count() - 1 do
+      local node = transcript.sequence:at(index).entry.metadata.node
+      if node and node ~= vim.NIL and node.kind ~= "tool" and node.display == "heading" then
+        state.presentation.set_section(node.id, true, false)
+      end
+    end
+    return buffer.text(state.transcript_buf):find("Rejected by user", 1, true)
+  end,
+    "the rejected tool lost its approval reason", { context = function() return buffer.text(state.transcript_buf) end })
+  eq(buffer.text(state.transcript_buf):find("1 denied", 1, true) ~= nil, true)
+  local red = false
+  for index = 0, transcript.sequence:count() - 1 do
+    local entry = transcript.sequence:at(index).entry
+    local node = entry.metadata.node
+    if node and node ~= vim.NIL and node.kind == "tool" then
+      for _, decoration in ipairs(entry.metadata.decoration or {}) do
+        red = red or decoration.capture == "ForgeHarnessToolFailure"
+      end
+    end
+  end
+  eq(red, true)
+  eq(host.stop(), true)
+end
+
+T["approval_timeout_shows_original_request"] = function()
+  local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
+  local workspace = temp.directory("approval-timeout")
+  local config = temp.directory("approval-timeout-config")
+  vim.fn.mkdir(config .. "/forge", "p")
+  vim.fn.writefile({ vim.json.encode({ permission = { tool = { check_definition_edit = "ask" } } }) },
+    config .. "/forge/permissions.json")
+  local client = host.start({ config = config }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  stub(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local function call(method, params)
+    local result, failure, completed
+    client.request({ session_id = state.session.id, method = method, params = params or {} }, function(value, error)
+      result, failure, completed = value, error, true
+    end)
+    wait_until(function() return completed end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  call("session.check.editing.set", { enabled = true })
+  call("session.provider.mock_response", { operation = "script", script = {
+    steps = { { kind = "tool_call", name = "check_definition_edit", arguments = { operation = "inspect-timeout" } } },
+    terminal = "completed",
+  } })
+  buffer.set(state.composer_buf, { "Configure project checks" })
+  require("forge.views.harness.controller").submit()
+  wait_until(function() return require("forge.views.harness.approval").is_open() end, "approval did not open",
+    { context = function() return buffer.text(state.transcript_buf) .. vim.inspect(state.approval) end })
+  eq(mock_provider.expire_approval(state.session.id), 1)
+  wait_until(function() return buffer.text(state.transcript_buf):find("An approval timed out", 1, true) end,
+    "timeout notice did not arrive")
+  eq(buffer.text(state.transcript_buf):find("No user decision was recorded.", 1, true), nil)
+  local transcript = state.presentation.transcript
+  for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
+    if line:find("An approval timed out", 1, true) then
+      local location = require("forge.buffer").locate(transcript, row - 1, 0)
+      local node = transcript.sequence.node[location.block].entry.metadata.node
+      eq(node.display, "heading")
+      state.presentation.set_section(node.id, true, false)
+      break
+    end
+  end
+  wait_until(function() return buffer.text(state.transcript_buf):find("No user decision was recorded.", 1, true) end,
+    "expanded timeout details did not arrive")
+  local text = buffer.text(state.transcript_buf)
+  eq(text:find("Request", 1, true) ~= nil, true)
+  eq(text:find("Action", 1, true) ~= nil, true)
+  eq(text:find("check_definition_edit", 1, true) ~= nil, true)
+  eq(text:find('"operation": "inspect-timeout"', 1, true) ~= nil, true)
+  eq(text:find("No user decision was recorded.", 1, true) ~= nil, true)
+  eq(text:find("Continue authorized work", 1, true), nil)
+  local exchanges = call("session.exchange.list")
+  eq(exchanges[#exchanges].prompt:find("No user decision was recorded.", 1, true) ~= nil, true)
+  eq(exchanges[#exchanges].prompt:find("Continue authorized work", 1, true), nil)
+  eq(host.stop(), true)
+end
+
 T["opening_commands_use_tabs_and_clear_replaces_session"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   vim.o.columns, vim.o.lines = 140, 55

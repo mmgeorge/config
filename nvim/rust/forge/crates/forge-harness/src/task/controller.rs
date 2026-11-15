@@ -389,7 +389,7 @@ impl SessionTaskController {
         permit: &TaskPermit,
         completed_turn: super::TaskTurnId,
         instruction: forge_provider_api::forge::TurnInput,
-        reason: String,
+        notice: super::TaskContinuationNotice,
         now_ms: i64,
     ) -> Result<bool> {
         ensure!(
@@ -419,7 +419,8 @@ impl SessionTaskController {
                 id: completed_turn,
                 continuation: Some(super::TaskContinuation {
                     id: super::TaskInputId::fresh(),
-                    reason,
+                    reason: notice.reason,
+                    display: notice.display,
                     delivery: super::TaskInputDelivery::Pending,
                     work: super::TaskWork::Provider { instruction },
                 }),
@@ -455,6 +456,7 @@ impl SessionTaskController {
             task.turn = Some(super::TaskTurn {
                 id: completed_turn,
                 continuation: Some(super::TaskContinuation {
+                    display: None,
                     id: super::TaskInputId::fresh(),
                     reason: "Run the accepted plan's verification checks".into(),
                     delivery: super::TaskInputDelivery::Pending,
@@ -822,6 +824,7 @@ impl SessionTaskController {
                         crate::goal::ContinuationDecision::Continue
                         | crate::goal::ContinuationDecision::RetryNoProgress,
                     ) => Some(super::TaskContinuation {
+                        display: None,
                         id: super::TaskInputId::fresh(),
                         // The goal's objective travels in the `<task>` section.
                         work: super::TaskWork::Provider {
@@ -979,6 +982,7 @@ impl SessionTaskController {
                         continuation: if continuing {
                             reserved.or_else(|| {
                                 Some(super::TaskContinuation {
+                                    display: None,
                                     id: super::TaskInputId::fresh(),
                                     work: super::TaskWork::Provider {
                                         instruction: if artifact.state
@@ -2051,6 +2055,7 @@ impl SessionTaskController {
                 task.turn = Some(super::TaskTurn {
                     id: completed_turn,
                     continuation: Some(super::TaskContinuation {
+                        display: None,
                         id: super::TaskInputId::fresh(),
                         reason: "Resume required execution checks".into(),
                         delivery: super::TaskInputDelivery::Pending,
@@ -2327,6 +2332,44 @@ mod tests {
     use super::*;
 
     use crate::session::{HarnessSession, SessionStore, continuation::ContinuationBudget};
+
+    #[test]
+    fn approval_timeout_continuation_retains_display_separately_after_reload() -> Result<()> {
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let task = controller.current()?.unwrap();
+        let instruction = forge_provider_api::forge::TurnInput::new(
+            forge_provider_api::forge::TurnKind::PermissionTimeout {
+                feedback: "Continue authorized work".into(),
+            },
+        );
+        let display = "Request\n  Inspect files\n\nAction\n  Read path\n    /workspace";
+        assert!(controller.reserve_continuation(
+            &mut store,
+            &task.permit(),
+            super::super::TaskTurnId {
+                exchange_ordinal: 1,
+                turn_ordinal: 1
+            },
+            instruction.clone(),
+            super::super::TaskContinuationNotice {
+                reason: "An approval timed out".into(),
+                display: Some(display.into()),
+            },
+            2,
+        )?);
+        let reloaded = store.load_session("session")?.unwrap().active_task.unwrap();
+        let continuation = reloaded
+            .turn
+            .as_ref()
+            .unwrap()
+            .continuation
+            .as_ref()
+            .unwrap();
+        assert_eq!(continuation.display.as_deref(), Some(display));
+        assert_eq!(continuation.work.instruction(), Some(&instruction));
+        assert_eq!(continuation.reason, "An approval timed out");
+        Ok(())
+    }
 
     /// Reject task and artifact publication when an equal-version working document changed.
     #[test]

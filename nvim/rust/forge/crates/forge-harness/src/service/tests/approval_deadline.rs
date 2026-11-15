@@ -110,7 +110,9 @@ async fn approval_outlasting_the_tool_timeout_continues_instead_of_failing_the_t
                 } else {
                     let _ = continued.send(matches!(
                         request.input.kind(),
-                        forge_provider_api::forge::TurnKind::PermissionTimeout { .. }
+                        forge_provider_api::forge::TurnKind::PermissionTimeout { feedback }
+                            if feedback.contains("Continue authorized work")
+                                && !feedback.contains("\nRequest\n")
                     ));
                 }
                 forge_provider_api::TurnResult::new(

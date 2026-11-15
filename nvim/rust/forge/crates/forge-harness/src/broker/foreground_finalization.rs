@@ -2149,7 +2149,10 @@ impl HarnessBroker {
                     &task.permit(),
                     turn,
                     crate::plan::task_step(forge_provider_api::forge::TaskStep::AnswersResolved),
-                    "Continue after required questions are resolved".into(),
+                    crate::task::TaskContinuationNotice {
+                        reason: "Continue after required questions are resolved".into(),
+                        display: None,
+                    },
                     self.clock.now_ms(),
                 )?;
             }

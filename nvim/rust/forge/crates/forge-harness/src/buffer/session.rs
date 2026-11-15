@@ -1649,7 +1649,7 @@ fn toggle_inline_output(
                 wall_ms: now_ms,
                 active_ms: captured.active_ms,
             }),
-            failed: call.failed,
+            failed: call.failure_style(),
             title: &call.title,
             expanded,
         },
