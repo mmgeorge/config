@@ -14,7 +14,7 @@ pub struct CheckActivity {
     pub completed_count: usize,
     /// Check definitions selected for this run, including required prerequisites.
     pub total_count: usize,
-    /// Running command labels, timers, and latest output lines.
+    /// Selected command states, timers, and latest output lines in execution order.
     pub command_list: Vec<CheckCommandActivity>,
 }
 
@@ -71,7 +71,7 @@ impl CheckActivity {
         let command_list = run
             .commands
             .iter()
-            .filter(|command| command.state == CheckState::Running)
+            .filter(|command| command.selected)
             .map(|command| CheckCommandActivity {
                 title: command.context.as_ref().map_or_else(
                     || {
@@ -84,8 +84,13 @@ impl CheckActivity {
                     |context| context.label(),
                 ),
                 started_at_ms: command.started_at_ms,
+                completed_at_ms: command.completed_at_ms,
+                state: command.state,
                 progress: command.adapter_progress.clone(),
-                output_line: super::output::latest_line(&command.preview),
+                output_line: command
+                    .error
+                    .clone()
+                    .or_else(|| super::output::latest_line(&command.preview)),
             })
             .collect();
         Some(Self {
@@ -108,12 +113,16 @@ impl CheckActivity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-/// One live command within the current check run.
+/// One selected command within the current check run.
 pub struct CheckCommandActivity {
     /// Configured check name and exact test identity, or normalized command text.
     pub title: String,
     /// Command execution interval used by the status timer.
     pub started_at_ms: Option<i64>,
+    /// Terminal execution boundary, which freezes the displayed duration.
+    pub completed_at_ms: Option<i64>,
+    /// Recorded lifecycle, including queued, completed, and unsuccessful commands.
+    pub state: CheckState,
     /// Latest message with terminal escapes, diagnostic borders, and source excerpts removed.
     pub output_line: Option<String>,
     /// Structured progress from the active adapter contract.
@@ -123,7 +132,11 @@ pub struct CheckCommandActivity {
 impl CheckCommandActivity {
     /// Return elapsed execution time when the command has started.
     pub(crate) fn elapsed_ms(&self, now_ms: i64) -> Option<u64> {
-        self.started_at_ms
-            .map(|started| now_ms.saturating_sub(started).max(0) as u64)
+        self.started_at_ms.map(|started| {
+            self.completed_at_ms
+                .unwrap_or(now_ms)
+                .saturating_sub(started)
+                .max(0) as u64
+        })
     }
 }

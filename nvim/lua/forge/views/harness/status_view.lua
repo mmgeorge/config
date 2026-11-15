@@ -125,8 +125,10 @@ function StatusView:render(context, commands)
   vim.bo[self.buffer].modifiable = false
   vim.api.nvim_buf_clear_namespace(self.buffer, self.namespace, 0, -1)
   for _, highlight in ipairs(content.highlights) do
-    vim.api.nvim_buf_set_extmark(self.buffer, self.namespace, highlight.row, 0,
-      { end_row = highlight.row + 1, hl_group = highlight.capture, hl_eol = true })
+    vim.api.nvim_buf_set_extmark(self.buffer, self.namespace, highlight.row, highlight.column or 0,
+      { end_row = highlight.end_column and highlight.row or highlight.row + 1,
+        end_col = highlight.end_column, hl_group = highlight.capture, hl_eol = highlight.end_column == nil,
+        priority = highlight.column and 110 or 100 })
   end
   self:update_animation()
   self:resize()

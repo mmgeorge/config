@@ -14,6 +14,34 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["status_tree_preserves_controls_and_question_branch"] = function()
+  local snapshot = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/status-layout.json"), "\n"))
+  local commands = require("forge.shared.view_command_set").new()
+  require("forge.shared.view_command_set").register(commands, "cancel", function() end)
+  require("forge.shared.view_command_set").register(commands, "reopen_question", function() end)
+  local transcript_buffer, transcript_window, composer_buffer, composer_window = require("forge.views.harness.layout").open("status-layout")
+  local transcript = require("forge.buffer").open("status-layout", { buffer = transcript_buffer, generated = true,
+    expected_changedtick = vim.api.nvim_buf_get_changedtick(transcript_buffer), preserve_view = true })
+  local status = require("forge.views.harness.status_view").new({ transcript = transcript,
+    transcript_window = transcript_window, composer_window = composer_window, alive = function() return true end,
+    notice = function(message) error(message) end, recover = function() error("unexpected recovery") end })
+  MiniTest.finally(function() pcall(status.close, status) pcall(require("forge.buffer").close, transcript) end)
+  status:render({ questions = { questions = {
+    { content = { question = "Should this apply to all sessions?" }, resolution = { kind = "pending" } },
+  } } }, commands)
+  local applied
+  status:apply(snapshot, function(result) applied = result end)
+  wait_until(function() return applied ~= nil end, "status snapshot did not apply")
+  eq(applied, true)
+  eq(status.content.lines[1]:find("<C-c> interrupt · oe answer questions │ ", 1, true) ~= nil, true)
+  eq(status.content.lines[2], "  ├─ Checking · 2/4 finished · 18s")
+  eq(status.content.lines[3], "  │  ├─ ✓ format · passed · 1s")
+  eq(status.content.lines[#status.content.lines], "  └─ Should this apply to all sessions?")
+  eq(table.concat(status.content.lines, "\n"):find("unknown field", 1, true) ~= nil, true)
+  eq(vim.api.nvim_get_current_win(), composer_window)
+  eq(vim.api.nvim_buf_line_count(composer_buffer) > 0, true)
+end
+
 -- requires-forge-host
 T["rejected_tool_expands_reason_with_orange_marker"] = function()
   local approval = dofile("nvim/lua/forge/tests/support/approval.lua")

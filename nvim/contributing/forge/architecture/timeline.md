@@ -52,7 +52,9 @@ An active check is status, not history. `TimelineStream::update_checks` replaces
 
 ## Status
 
-`SessionPhase` projects exactly one visible phase, and `buffer/status.rs` combines it with optional `CheckActivity`. The primary label takes its own row, followed by check progress, then the latest reasoning preview when the `status_thoughts` preference is on. Rust derives elapsed time from its own start timestamp, and Lua supplies only the one-second sync cadence.
+`SessionPhase` projects exactly one visible phase, and `buffer/status.rs` combines it with optional `CheckActivity`. Rust publishes the complete normalized reasoning preview with its commentary decoration when `status_thoughts` is on. Lua places it after the primary label and command hints, separated by `│`, and clips only the displayed thought to the remaining window columns. The controls keep their space, and a row with no remaining space omits the thought. Rust derives elapsed time from its own start timestamp, and Lua supplies only the one-second sync cadence.
+
+`CheckActivity` captures every selected command in execution order, including queued and terminal states, from the existing run records. This activity is reconstructed for presentation and is not a persisted state format. The check tree expands each running command into its structured progress and latest output, collapses successful commands to their result, and retains unsuccessful commands' reported causes. Completed timestamps freeze command durations. During preparation between commands, the timeline retains the preceding tree for the same run until its successor starts. Checks form a root while the model is idle or a branch beneath its active phase; Lua appends pending questions as sibling branches and preserves the connecting stems.
 
 Test progress keeps the current phase message on the same row as its phase, such as `Building · Built forge-diff`. A known test inventory does not replace the Building label before execution starts. The adapter clears the build message when the phase changes to Run, and the status then displays finished and failed test counts.
 

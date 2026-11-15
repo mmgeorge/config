@@ -492,9 +492,10 @@ other sessions using that runtime.
 Thought headers show successful/total tools and append changed-file counts when
 nonzero. Repeated successful edits to one file count once. Individual tool errors
 and compaction details remain available in the expanded timeline.
-Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
-italics, aligned with the phase label and wrapped to the available width. The option
-defaults to Off, persists across sessions, and applies without interrupting an
+Enable **Thoughts** in `/config` under **Display** to show the latest thought beside the
+phase and its controls, after a `│` separator. The thought uses the remaining width,
+with an ellipsis when it does not fit, and disappears when the controls need the whole
+row. The option defaults to On, persists across sessions, and applies without interrupting an
 active response. Thoughts never appear as commentary in the timeline. Only the latest
 readable reasoning summary appears in status when this option is On.
 Copilot supplies these summaries through its concise reasoning stream, independently of
@@ -503,6 +504,13 @@ Reasoning completion updates the existing summary without restarting Thinking,
 even when its snapshot arrives after response text. Received-byte progress and
 tool-argument streaming do not count as reasoning text. Copilot remains active
 until its session becomes idle, including native background work.
+
+Active checks appear as a tree showing selected checks as queued, running, or completed.
+Each running check expands to show its progress and latest output; successful checks
+collapse to their result and elapsed time, while unsuccessful checks retain their reported
+cause. Concurrent checks each show their own progress. Pending questions appear after
+the check tree, with their answer control beside the phase label.
+
 While the prompt buffer is focused, new activity in the current live exchange
 automatically scrolls the transcript to its end, exposing running tools and progress.
 While the transcript is focused, updates preserve the cursor and reading position,

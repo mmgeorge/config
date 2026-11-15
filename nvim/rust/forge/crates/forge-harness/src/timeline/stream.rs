@@ -634,19 +634,33 @@ impl TimelineStream {
         let TimelineEntry::Status { id, checks, .. } = entry else {
             return;
         };
-        if !checks
-            .as_ref()
-            .is_some_and(|activity| activity.command_list.is_empty())
-        {
+        if !checks.as_ref().is_some_and(|activity| {
+            activity.command_list.is_empty()
+                || activity
+                    .command_list
+                    .iter()
+                    .any(|command| command.state == crate::checks::CheckState::Pending)
+                    && !activity
+                        .command_list
+                        .iter()
+                        .any(|command| command.state == crate::checks::CheckState::Running)
+        }) {
             return;
         }
-        *checks = self
+        let previous = self
             .entry_index
             .get(id)
             .and_then(|index| match &self.entry_list[*index] {
                 TimelineEntry::Status { checks, .. } => checks.clone(),
                 _ => None,
             });
+        if previous.as_ref().is_some_and(|previous| {
+            checks
+                .as_ref()
+                .is_some_and(|current| current.run_id == previous.run_id)
+        }) {
+            *checks = previous;
+        }
     }
 
     pub fn reconcile(&mut self, mut next_entry_list: Vec<TimelineEntry>) -> Result<TimelinePatch> {
@@ -805,6 +819,85 @@ fn serialize_entry_list(entry_list: &[TimelineEntry]) -> Result<Vec<Value>> {
 mod test {
     use super::{TimelineOperation, TimelineStream};
     use crate::timeline::TimelineEntry;
+
+    /// Keep same-run progress through handoff without lending it to another run.
+    #[test]
+    fn check_tree_survives_handoff_until_successor_starts() {
+        use crate::checks::{CheckActivity, CheckCommandActivity, CheckState};
+        let entry = |run: &str, first: CheckState, second: CheckState| TimelineEntry::Status {
+            id: "status".into(),
+            created_at_ms: 0,
+            status: crate::session::state_machine::SessionPhase::Idle,
+            status_thoughts: false,
+            agent_count: 0,
+            checks: Some(CheckActivity {
+                run_id: run.into(),
+                duration_ms: 0,
+                started_at_ms: Some(0),
+                completed_count: usize::from(first == CheckState::Passed),
+                total_count: 2,
+                command_list: [("first", first), ("second", second)]
+                    .into_iter()
+                    .map(|(title, state)| CheckCommandActivity {
+                        title: title.into(),
+                        state,
+                        started_at_ms: Some(0),
+                        completed_at_ms: None,
+                        output_line: Some("Retained output".into()),
+                        progress: None,
+                    })
+                    .collect(),
+            }),
+        };
+        let mut stream = TimelineStream::new("session".into());
+        stream
+            .initialize(vec![entry(
+                "first-run",
+                CheckState::Running,
+                CheckState::Pending,
+            )])
+            .unwrap();
+        assert!(
+            stream
+                .reconcile(vec![entry(
+                    "first-run",
+                    CheckState::Passed,
+                    CheckState::Pending
+                )])
+                .unwrap()
+                .is_empty()
+        );
+        let patch = stream
+            .reconcile(vec![entry(
+                "first-run",
+                CheckState::Passed,
+                CheckState::Running,
+            )])
+            .unwrap();
+        assert!(!patch.is_empty());
+        let patch = stream
+            .reconcile(vec![entry(
+                "second-run",
+                CheckState::Pending,
+                CheckState::Pending,
+            )])
+            .unwrap();
+        assert!(!patch.is_empty());
+        let TimelineEntry::Status {
+            checks: Some(checks),
+            ..
+        } = &stream.entry_list[0]
+        else {
+            panic!("missing status")
+        };
+        assert_eq!(checks.run_id, "second-run");
+        assert!(
+            checks
+                .command_list
+                .iter()
+                .all(|command| command.state == CheckState::Pending)
+        );
+    }
 
     #[test]
     fn reconciliation_preserves_patch_order_across_moves_removals_and_replacements() {

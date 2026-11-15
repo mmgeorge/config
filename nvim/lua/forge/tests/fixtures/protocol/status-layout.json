@@ -1,0 +1,56 @@
+{
+  "document": "status-layout:status",
+  "revision": 0,
+  "block": [
+    {
+      "id": "status",
+      "text": [
+        "Working · 18s",
+        "└─ Checking · 2/4 finished · 18s",
+        "   ├─ ✓ format · passed · 1s",
+        "   ├─ ✗ lint · failed · 2s",
+        "   │  └─ unknown field",
+        "   ├─ ⠋ tests · running · 15s",
+        "   │  ├─ Building · Built test targets",
+        "   │  └─ Running session tests",
+        "   └─ ○ build · queued",
+        "Reviewing the remaining diagnostics and checking 界界界 for a complete result"
+      ],
+      "metadata": {
+        "status": {
+          "row": 0,
+          "animated": true,
+          "hint": "working"
+        },
+        "target": [
+          {
+            "id": "status:working",
+            "range": {
+              "start": { "row": 0, "column": 0 },
+              "end": { "row": 1, "column": 0 }
+            }
+          }
+        ],
+        "decoration": [
+          {
+            "range": {
+              "start": { "row": 1, "column": 0 },
+              "end": { "row": 9, "column": 0 }
+            },
+            "capture": "ForgeStatusHint",
+            "priority": 100
+          },
+          {
+            "range": {
+              "start": { "row": 9, "column": 0 },
+              "end": { "row": 10, "column": 0 }
+            },
+            "capture": "ForgeHarnessCommentary",
+            "priority": 100
+          }
+        ],
+        "editable_region": []
+      }
+    }
+  ]
+}

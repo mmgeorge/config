@@ -154,6 +154,7 @@ Any change to a payload the host sends to Lua must keep its recordings current i
 | `review-commit-semantic.json` | `forge-review` `commit_diff_controls_isolate_immutable_sources_and_preserve_them_on_refresh` | `unit/review_document.test.lua` |
 | `notification.json` | none | `unit/notifications.test.lua` |
 | `cancellation-progress.json` | `forge-harness` `cancellation_progress_is_durable_and_recorded` | `unit/views/harness/cleanup_progress.test.lua`, `unit/views/harness/snapshot.test.lua` |
+| `status-layout.json` | `forge-harness` `selected_check_tree_matches_editor_recording` | `integration/views/harness/harness.test.lua` |
 | `lsp-lua-selection.json` | `forge-harness` `lua_selection_matches_editor_recording` | `integration/lsp/lsp.test.lua` |
 
 `notification.json` has no Rust check, because its producing test was removed. When the notification document snapshot changes, record a new snapshot from the host by hand and update the recording in the same change, or add a Rust check that produces it.

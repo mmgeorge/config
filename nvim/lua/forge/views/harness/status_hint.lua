@@ -57,27 +57,73 @@ function M.compose(snapshot, context, commands, width)
     local metadata = block.metadata or {}
     local status = metadata.status
     local rendered_rows = {}
-    for index, line in ipairs(block.text) do
-      local row = #content.lines
-      rendered_rows[index] = row
-      append(line, "ForgeTimelineStatus")
-      if type(status) == "table" and index == status.row + 1 then
-        if status.animated then content.animated = row else content.waiting = row end
-        local surface = status.hint
-        if surface == "question" and #pending_questions > 0 then surface = "pending_question" end
-        local suffix = type(surface) == "string" and hints(surface .. "_status") or ""
-        if not questions_drawn and #pending_questions > 0 and surface ~= "pending_question" and surface ~= "permission" then
-          local question_hint = hints("pending_question_status")
-          if question_hint ~= "" then suffix = suffix .. (suffix ~= "" and " · " or "") .. question_hint end
+    local thought_rows, thought = {}, {}
+    if type(status) == "table" then
+      for _, decoration in ipairs(metadata.decoration or {}) do
+        if decoration.capture == "ForgeHarnessCommentary" then
+          for row = decoration.range.start.row, decoration.range["end"].row - 1 do
+            thought_rows[row + 1] = true
+            thought[#thought + 1] = block.text[row + 1]
+          end
         end
-        if suffix ~= "" then content.lines[row + 1] = content.lines[row + 1] .. " · " .. suffix end
-        append_questions()
       end
+    end
+    for index, line in ipairs(block.text) do
+      if not thought_rows[index] then
+        local row = #content.lines
+        rendered_rows[index] = row
+        append(line, "ForgeTimelineStatus")
+        if type(status) == "table" and index == status.row + 1 then
+          if status.animated then content.animated = row else content.waiting = row end
+          local surface = status.hint
+          if surface == "question" and #pending_questions > 0 then surface = "pending_question" end
+          local suffix = type(surface) == "string" and hints(surface .. "_status") or ""
+          if not questions_drawn and #pending_questions > 0 and surface ~= "pending_question" and surface ~= "permission" then
+            local question_hint = hints("pending_question_status")
+            if question_hint ~= "" then suffix = suffix .. (suffix ~= "" and " · " or "") .. question_hint end
+          end
+          if suffix ~= "" then content.lines[row + 1] = content.lines[row + 1] .. " · " .. suffix end
+          local preview = table.concat(thought, " ")
+          local available = (width or vim.o.columns) - vim.fn.strdisplaywidth(content.lines[row + 1] .. " │ ")
+          if preview ~= "" and available > 0 then
+            local split = display_text.take_prefix(preview, available)
+            if split.remainder ~= "" then
+              preview = display_text.take_prefix(preview, available - vim.fn.strdisplaywidth("…")).prefix .. "…"
+            end
+            local column = #content.lines[row + 1]
+            content.lines[row + 1] = content.lines[row + 1] .. " │ " .. preview
+            content.highlights[#content.highlights + 1] = {
+              row = row, column = column, end_column = #content.lines[row + 1], capture = "ForgeHarnessCommentary",
+            }
+          end
+        end
+      end
+    end
+    if type(status) == "table" and #pending_questions > 0 and not questions_drawn then
+      local final_branch
+      for index, line in ipairs(block.text) do
+        if rendered_rows[index] and line:sub(1, #"└─ ") == "└─ " then final_branch = index end
+      end
+      if final_branch then
+        local row = rendered_rows[final_branch]
+        content.lines[row + 1] = content.lines[row + 1]:gsub("^  └─ ", "  ├─ ", 1)
+        for index = final_branch + 1, #block.text do
+          local child_row = rendered_rows[index]
+          if child_row and block.text[index]:sub(1, 3) == "   " then
+            content.lines[child_row + 1] = content.lines[child_row + 1]:gsub("^     ", "  │  ", 1)
+          end
+        end
+      end
+      append_questions()
     end
     for _, decoration in ipairs(metadata.decoration or {}) do
       for row = decoration.range.start.row, decoration.range["end"].row - 1 do
         local rendered_row = rendered_rows[row + 1]
-        content.highlights[rendered_row + 1] = { row = rendered_row, capture = decoration.capture }
+        if rendered_row then
+          for _, highlight in ipairs(content.highlights) do
+            if highlight.row == rendered_row and highlight.column == nil then highlight.capture = decoration.capture break end
+          end
+        end
       end
     end
   end
