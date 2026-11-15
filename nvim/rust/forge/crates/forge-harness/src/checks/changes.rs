@@ -22,6 +22,11 @@ pub(super) struct CheckChanges {
 }
 
 impl CheckChanges {
+    /// Get the immutable content store shared by capture and verification.
+    pub(super) fn objects(&self) -> &ObjectStore {
+        &self.objects
+    }
+
     /// Returns the identity whose initial checkpoint owns current changes.
     pub(super) fn owner(&self) -> Result<Option<String>> {
         Ok(self

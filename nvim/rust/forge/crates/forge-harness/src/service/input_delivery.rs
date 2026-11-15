@@ -179,6 +179,10 @@ impl SessionController {
         sink: &MessageSender,
         jobs: &mut JoinSet<()>,
     ) -> Result<InputProgress> {
+        if self.observer.check_inbox.has_pending()?.1 {
+            // Supply the current transport; the exchange owner schedules internal results itself.
+            self.exchange_owner.input_ready(sink.clone()).await?;
+        }
         if let Some(progress) = self.exchange_owner.task_checks_ready(sink.clone()).await? {
             return Ok(match progress {
                 crate::exchange::InputReadiness::Started => InputProgress::Started,

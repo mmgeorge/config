@@ -331,11 +331,15 @@ impl CheckSupervisor {
             &workspace,
             &data_root,
             &root,
-            objects,
+            objects.clone(),
             repositories,
         )?;
-        let verification =
-            super::verification::VerificationRequirements::open(&root, &workspace, &session_id)?;
+        let verification = super::verification::VerificationRequirements::open(
+            &root,
+            &workspace,
+            &session_id,
+            objects,
+        )?;
         let mut records = BTreeMap::new();
         for mut run in Self::saved_history(&root)? {
             ensure!(
@@ -1173,6 +1177,7 @@ impl CheckSupervisor {
                         (&previous.cancelled_inputs, checkpoint)
                     {
                         if let Some(evidence) = super::evidence::CheckEvidence::capture(
+                            self.changes.objects(),
                             &previous,
                             command,
                             cancelled.clone(),
@@ -1690,6 +1695,7 @@ impl CheckSupervisor {
                         deadline.check()?;
                     }
                     run.commands[index].evidence = super::evidence::CheckEvidence::capture(
+                        self.changes.objects(),
                         &run.clone().into_record(),
                         &run.commands[index].clone().into_record(),
                         before.clone(),

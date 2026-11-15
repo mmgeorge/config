@@ -20,6 +20,16 @@ pub use message::InputMessage;
 mod rejection;
 pub(crate) use rejection::InputRejection;
 
+/// Separate caller-controlled input from host-owned diagnostic delivery.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum InputChannel {
+    /// Accept editable user input and respect explicit queue controls.
+    #[default]
+    User,
+    /// Retain immutable check evidence independently of user queue controls.
+    CheckResults,
+}
+
 /// Distinguish an unavailable retained journal from a missing operation receipt.
 #[derive(Debug, thiserror::Error)]
 #[error("input operation journal is unavailable")]
@@ -193,6 +203,7 @@ struct InputState {
 /// Own one session's accepted input and commit mutations before publishing them.
 #[derive(Default)]
 pub(crate) struct SessionInputQueue {
+    channel: InputChannel,
     state: Mutex<InputState>,
     journal: Option<Mutex<journal::InputJournal>>,
     /// Provider journal whose records an explicit discard of uncertain input retires.
@@ -207,8 +218,18 @@ impl SessionInputQueue {
         session_id: &str,
         submissions: &Arc<crate::provider::submission::SubmissionStore>,
     ) -> Result<Self> {
+        Self::open_channel(root, session_id, submissions, InputChannel::User)
+    }
+
+    /// Restore one delivery channel without sharing its control or idempotency state.
+    pub(crate) fn open_channel(
+        root: &std::path::Path,
+        session_id: &str,
+        submissions: &Arc<crate::provider::submission::SubmissionStore>,
+        channel: InputChannel,
+    ) -> Result<Self> {
         // Load active input independently of completed interaction history.
-        let mut journal = journal::InputJournal::open(root, session_id)?;
+        let mut journal = journal::InputJournal::open_channel(root, session_id, channel)?;
         let (mut state, restored) = journal.load()?;
         if restored {
             let previous = state.clone();
@@ -250,18 +271,30 @@ impl SessionInputQueue {
                             )?;
                         }
                         crate::provider::submission::SubmissionState::Prepared => {
-                            message.set_delivery(
-                                InputDelivery::Failed,
-                                None,
-                                Some(
-                                    "Interrupted before provider dispatch; retry explicitly".into(),
-                                ),
-                            )?;
+                            if channel == InputChannel::CheckResults {
+                                submissions.submission(id)?.retire_prepared()?;
+                                message.queue();
+                            } else {
+                                message.set_delivery(
+                                    InputDelivery::Failed,
+                                    None,
+                                    Some(
+                                        "Interrupted before provider dispatch; retry explicitly"
+                                            .into(),
+                                    ),
+                                )?;
+                            }
                         }
                         // Settlement retires every unsent failure to Cancelled while the queue
                         // keeps the entry Failed, so the entry stays visible and keeps blocking
                         // later follow-ups. A user retraction removes the entry instead, so only
                         // an entry interrupted mid-settlement reaches here in another phase.
+                        crate::provider::submission::SubmissionState::Cancelled
+                            if channel == InputChannel::CheckResults
+                                && message.delivery() != InputDelivery::Failed =>
+                        {
+                            message.queue();
+                        }
                         crate::provider::submission::SubmissionState::Cancelled
                             if message.delivery() == InputDelivery::Failed => {}
                         crate::provider::submission::SubmissionState::Cancelled
@@ -284,13 +317,14 @@ impl SessionInputQueue {
             state.snapshot.messages.retain(|message| {
                 message.delivery() != InputDelivery::Accepted && !cancelled.contains(&message.id)
             });
-            if !state.snapshot.messages.is_empty() {
+            if channel == InputChannel::User && !state.snapshot.messages.is_empty() {
                 state.snapshot.suspended = true;
             }
             // Publish recovered revisions only after the suspended state is durable.
             journal.save(&previous, &state)?;
         }
         Ok(Self {
+            channel,
             state: Mutex::new(state),
             journal: Some(Mutex::new(journal)),
             submissions: Some(submissions.clone()),
@@ -337,6 +371,16 @@ impl SessionInputQueue {
             .lock()
             .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
         Ok(state.snapshot.clone())
+    }
+
+    /// Recognize an admitted identity after its active delivery has been removed.
+    pub(crate) fn owns(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?
+            .submitted
+            .contains(id))
     }
 
     pub fn operation(&self, id: &str) -> Result<Option<InputUpdate>> {
@@ -569,7 +613,22 @@ impl SessionInputQueue {
         };
         // Validate the complete edit before changing any message in the queue.
         let mut candidate = state.snapshot.clone();
-        let validation = if let InputAction::Submit { message } = &operation.action
+        let channel_valid = match (&self.channel, &operation.action) {
+            (InputChannel::User, InputAction::Submit { message }) => {
+                !matches!(message.purpose, InputPurpose::CheckResult { .. })
+            }
+            (InputChannel::CheckResults, InputAction::Submit { message }) => {
+                matches!(message.purpose, InputPurpose::CheckResult { .. })
+                    && message.turn().is_some()
+                    && message.config.is_none()
+                    && message.attachments.is_empty()
+            }
+            (InputChannel::CheckResults, _) => false,
+            (InputChannel::User, _) => true,
+        };
+        let validation = if !channel_valid {
+            Err(InputRejection::WrongChannel)
+        } else if let InputAction::Submit { message } = &operation.action
             && state.submitted.contains(&message.id)
         {
             Err(InputRejection::AlreadySubmitted)
@@ -856,6 +915,10 @@ impl SessionInputQueue {
     }
 
     pub fn suspend(&self, suspended: bool, operation_id: Option<&str>) -> Result<InputUpdate> {
+        ensure!(
+            self.channel == InputChannel::User,
+            "internal results have no user pause control"
+        );
         let mut retained = self
             .state
             .lock()

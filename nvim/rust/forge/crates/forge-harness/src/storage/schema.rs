@@ -45,6 +45,9 @@ const REQUIRED_TABLES: &[&str] = &[
     "input_session",
     "input_operation",
     "input_submitted",
+    "check_inbox_session",
+    "check_inbox_operation",
+    "check_inbox_submitted",
 ];
 
 /// Serializes bootstrap pragmas across processes before SQLite can acquire its own write lock.
@@ -429,6 +432,9 @@ fn initialize_owner_commands(connection: &Connection) -> Result<()> {
             FOREIGN KEY(session_id,sequence) REFERENCES owner_publication(session_id,sequence) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS input_session(session_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS check_inbox_session(session_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS check_inbox_operation(session_id TEXT NOT NULL,id TEXT NOT NULL,request TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session_id,id));
+        CREATE TABLE IF NOT EXISTS check_inbox_submitted(session_id TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(session_id,id));
         CREATE TABLE IF NOT EXISTS input_operation(
             session_id TEXT NOT NULL,id TEXT NOT NULL,request TEXT NOT NULL,payload TEXT NOT NULL,
             PRIMARY KEY(session_id,id)

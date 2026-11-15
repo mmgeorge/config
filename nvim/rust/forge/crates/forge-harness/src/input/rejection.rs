@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum InputRejection {
+    /// Host results and caller mutations cannot cross their delivery channels.
+    #[error("input does not belong to this delivery channel")]
+    WrongChannel,
     /// Input identity was submitted previously, including after removal or delivery.
     #[error("message identity was already submitted")]
     AlreadySubmitted,

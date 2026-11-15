@@ -149,7 +149,8 @@ impl InputReceipts {
             return Err(InputReceiptError::DispatchUnavailable);
         }
         let message = services
-            .input
+            .input_store(input.id.as_str())
+            .map_err(InputReceiptError::Queue)?
             .snapshot()
             .map_err(InputReceiptError::Queue)?
             .messages
@@ -180,10 +181,17 @@ impl InputReceipts {
         services: &OwnerServices,
     ) -> Result<Vec<InputUpdate>, InputReceiptError> {
         let mut updates = Vec::new();
-        let snapshot = services
+        let mut snapshot = services
             .input
             .snapshot()
             .map_err(InputReceiptError::Queue)?;
+        snapshot.messages.extend(
+            services
+                .check_inbox
+                .snapshot()
+                .map_err(InputReceiptError::Queue)?
+                .messages,
+        );
         for message in snapshot.messages {
             let Some(id) = &message.submission_id() else {
                 continue;
@@ -293,7 +301,8 @@ impl InputReceipts {
                     );
                 }
                 services
-                    .input
+                    .input_store(input.id.as_str())
+                    .map_err(InputReceiptError::Queue)?
                     .delivery_if_current(
                         input.id.as_str(),
                         InputDeliveryGuard::Claimed(input.revision),
@@ -495,7 +504,8 @@ impl InputReceipts {
             return Err(InputReceiptError::AlreadyRegistered);
         }
         let message = services
-            .input
+            .input_store(input.id.as_str())
+            .map_err(InputReceiptError::Queue)?
             .snapshot()
             .map_err(InputReceiptError::Queue)?
             .messages
@@ -545,10 +555,17 @@ impl InputReceipts {
 
     /// Retire uncertain-worker watches only after receipt proof and an explicit queue transition.
     fn release_reconciled(&mut self, services: &OwnerServices) -> Result<(), InputReceiptError> {
-        let snapshot = services
+        let mut snapshot = services
             .input
             .snapshot()
             .map_err(InputReceiptError::Queue)?;
+        snapshot.messages.extend(
+            services
+                .check_inbox
+                .snapshot()
+                .map_err(InputReceiptError::Queue)?
+                .messages,
+        );
         let mut retired = Vec::new();
         for (id, tracked) in &mut self.pending {
             if !matches!(tracked.work, ReceiptWork::DeliveryUncertain) {
@@ -663,7 +680,8 @@ impl TrackedInput {
             ReceiptBinding::Bound => InputDeliveryGuard::Receipt(self.submission.receipt_id()),
         };
         let update = services
-            .input
+            .input_store(self.input.id.as_str())
+            .map_err(InputReceiptError::Queue)?
             .delivery_if_current(
                 self.input.id.as_str(),
                 guard,
@@ -689,6 +707,16 @@ impl TrackedInput {
             )
         {
             return Ok(());
+        }
+        if let InputPurpose::CheckResult {
+            exchange_id,
+            run_id,
+        } = &self.purpose
+        {
+            tracing::info!(target: "forge::harness", event_name = "check_result.accepted",
+                session_id = services.observer.session_id(), exchange_id, run_id,
+                input_id = self.input.id.as_str(), submission_id = self.submission.receipt_id().as_str(),
+                "Provider accepted check result");
         }
         let acknowledgement = match &self.purpose {
             InputPurpose::TaskEntry { revision, id, .. } => {

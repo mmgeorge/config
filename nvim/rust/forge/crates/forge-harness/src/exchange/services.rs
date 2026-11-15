@@ -13,6 +13,8 @@ pub(crate) struct OwnerServices {
     pub(crate) publications: Arc<super::publication::SessionPublications>,
     /// Session input journal; only the owner applies caller mutations.
     pub(crate) input: Arc<SessionInputQueue>,
+    /// Immutable host results, isolated from caller input and editor queue controls.
+    pub(crate) check_inbox: Arc<SessionInputQueue>,
     /// Independent native receipt journal used to prove safe retry.
     pub(crate) submissions: Arc<SubmissionStore>,
     /// Current provider generation, selected only while its retirement permit is held.
@@ -52,6 +54,14 @@ pub(crate) struct OwnerServices {
 }
 
 impl OwnerServices {
+    /// Resolve an admitted delivery identity without exposing the internal inbox to callers.
+    pub(super) fn input_store(&self, id: &str) -> Result<&SessionInputQueue, anyhow::Error> {
+        if self.check_inbox.owns(id)? {
+            Ok(&self.check_inbox)
+        } else {
+            Ok(&self.input)
+        }
+    }
     /// Replace the provider catalog and advance the resource revision its readers watch.
     pub(crate) async fn catalog_publish(&self, catalog: crate::provider::ProviderCatalogRequest) {
         *self.catalog.write().await = catalog;

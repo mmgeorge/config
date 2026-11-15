@@ -34,29 +34,43 @@ fn submission_store(root: &std::path::Path) -> Result<Arc<SubmissionStore>> {
     SubmissionStore::open(root, Arc::new(crate::trace::TraceStore::open(root)?))
 }
 
-/// Roll back queue admission if its durable notification cannot commit.
+/// Commit internal evidence independently of user publication and retain its receipt after delivery.
 #[test]
-fn check_admission_and_publication_commit_together() -> Result<()> {
+fn check_inbox_commits_without_user_publication_and_preserves_receipt() -> Result<()> {
     let root = tempfile::tempdir()?;
     use crate::session::SessionStore;
     crate::storage::SqliteStore::open(root.path())?
         .save_session(&crate::storage::test::session("session", "."))?;
     let submissions = submission_store(root.path())?;
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let queue = SessionInputQueue::open_channel(
+        root.path(),
+        "session",
+        &submissions,
+        InputChannel::CheckResults,
+    )?;
     let mut operation = queued_operation("check");
     if let InputAction::Submit { message } = &mut operation.action {
         message.purpose = InputPurpose::CheckResult {
             exchange_id: "exchange".into(),
             run_id: "run".into(),
         };
+        message.config = None;
+        message.attachments.clear();
+        let result = serde_json::from_value(serde_json::json!({
+            "run_id":"run","exchange_id":"exchange","state":"passed","complete":true,"checks":[]
+        }))?;
+        **message = message
+            .as_ref()
+            .clone()
+            .with_turn(forge_provider_api::forge::TurnInput::new(
+                forge_provider_api::forge::TurnKind::CheckResult { result },
+            ));
     }
     let database = crate::storage::test::raw_connection(root.path())?;
     database.execute_batch(
         "CREATE TRIGGER reject_check_publication BEFORE INSERT ON owner_publication BEGIN SELECT RAISE(ABORT,'publication unavailable'); END;"
     )?;
-    assert!(queue.apply(operation.clone()).is_err());
-    assert!(queue.snapshot()?.messages.is_empty());
-    assert!(queue.admission_receipt("operation-check")?.is_none());
+    assert!(queue.apply(operation.clone())?.error.is_none());
     database.execute_batch("DROP TRIGGER reject_check_publication;")?;
     queue.apply(operation.clone())?;
     queue.apply(operation)?;
@@ -66,11 +80,11 @@ fn check_admission_and_publication_commit_together() -> Result<()> {
         publications
             .after(None, std::num::NonZeroU16::new(10).unwrap())?
             .len(),
-        1
+        0
     );
     assert_eq!(queue.check_result_receipts()?.len(), 1);
     let revision = queue.snapshot()?.messages[0].revision;
-    queue.apply(InputOperation {
+    let rejected = queue.apply(InputOperation {
         id: "remove-check".into(),
         control_revision: 0,
         after_control: None,
@@ -79,13 +93,152 @@ fn check_admission_and_publication_commit_together() -> Result<()> {
             revision,
         },
     })?;
+    assert_eq!(rejected.error_code, Some(InputRejection::WrongChannel));
+    let claimed = queue
+        .claim("check", revision, InputRoute::Turn)?
+        .context("claim internal result")?;
+    queue.delivery_if_current(
+        "check",
+        InputDeliveryGuard::Claimed(claimed.revision),
+        None,
+        None,
+        None,
+    )?;
     assert_eq!(queue.check_result_receipts()?.len(), 1);
     assert_eq!(
         publications
             .after(None, std::num::NonZeroU16::new(10).unwrap())?
             .len(),
-        1
+        0
     );
+    Ok(())
+}
+
+/// Recover an unclaimed provider handoff without changing the result identity.
+#[test]
+fn check_inbox_recovers_unsubmitted_delivery() -> Result<()> {
+    check_inbox_restart_case(DispatchCut::NoSubmission)
+}
+
+/// Retry only the prepared delivery whose journal proves no native send occurred.
+#[test]
+fn check_inbox_recovers_prepared_delivery() -> Result<()> {
+    check_inbox_restart_case(DispatchCut::Prepared)
+}
+
+/// Keep a potentially sent result fenced instead of replaying it after restart.
+#[test]
+fn check_inbox_retains_uncertain_delivery() -> Result<()> {
+    check_inbox_restart_case(DispatchCut::Sending)
+}
+
+/// Remove already accepted delivery while retaining its deduplication receipt.
+#[test]
+fn check_inbox_retires_accepted_delivery() -> Result<()> {
+    check_inbox_restart_case(DispatchCut::Accepted)
+}
+
+/// Recover a cancelled preparation whose native send never started.
+#[test]
+fn check_inbox_recovers_cancelled_preparation() -> Result<()> {
+    check_inbox_restart_case(DispatchCut::Cancelled)
+}
+
+/// Reopen ordinary production state at one explicit provider-delivery boundary.
+fn check_inbox_restart_case(boundary: DispatchCut) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open_channel(
+        root.path(),
+        "session",
+        &submissions,
+        InputChannel::CheckResults,
+    )?;
+    let result = serde_json::from_value(serde_json::json!({
+        "run_id":"run","exchange_id":"exchange","state":"passed","complete":true,"checks":[]
+    }))?;
+    let turn = forge_provider_api::forge::TurnInput::new(
+        forge_provider_api::forge::TurnKind::CheckResult { result },
+    );
+    let message = InputMessage::queued(InputDraft {
+        id: "result".into(),
+        text: turn.label(),
+        purpose: InputPurpose::CheckResult {
+            exchange_id: "exchange".into(),
+            run_id: "run".into(),
+        },
+        attachments: Vec::new(),
+        config: None,
+        intent: InputIntent::Auto,
+    })
+    .with_turn(turn);
+    queue.apply(InputOperation {
+        id: "result".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Submit {
+            message: Box::new(message.clone()),
+        },
+    })?;
+    queue
+        .claim("result", 1, InputRoute::Turn)?
+        .context("claim result")?;
+    if !matches!(boundary, DispatchCut::NoSubmission) {
+        let mut request = fixture_request();
+        request.input = crate::provider::ProviderInput::from_message(&message);
+        let submission = submissions.prepare_input_request(
+            &request,
+            forge_providers::registry::default_id(),
+            crate::provider::submission::SubmissionOrigin::QueuedInput(
+                crate::exchange::command::InputId::new("result")?,
+            ),
+        )?;
+        match boundary {
+            DispatchCut::Sending => submission.sending(None)?,
+            DispatchCut::Accepted => {
+                submission.sending(None)?;
+                submission.accepted(None)?;
+            }
+            DispatchCut::Cancelled => submission.cancel()?,
+            DispatchCut::Prepared | DispatchCut::NoSubmission => {}
+        }
+        queue.delivery(
+            "result",
+            Some(InputDelivery::Delivering),
+            Some(submission.id().into()),
+            None,
+        )?;
+    }
+    drop(queue);
+    let recovered = SessionInputQueue::open_channel(
+        root.path(),
+        "session",
+        &submissions,
+        InputChannel::CheckResults,
+    )?;
+    let snapshot = recovered.snapshot()?;
+    assert!(!snapshot.suspended);
+    assert_eq!(recovered.check_result_receipts()?.len(), 1);
+    match boundary {
+        DispatchCut::Accepted => assert!(snapshot.messages.is_empty()),
+        DispatchCut::Sending => {
+            assert_eq!(snapshot.messages[0].delivery(), InputDelivery::Unknown);
+            assert!(
+                recovered
+                    .claim("result", snapshot.messages[0].revision, InputRoute::Turn)?
+                    .is_none()
+            );
+        }
+        DispatchCut::NoSubmission | DispatchCut::Prepared | DispatchCut::Cancelled => {
+            assert_eq!(snapshot.messages[0].delivery(), InputDelivery::Queued);
+            assert!(snapshot.messages[0].submission_id().is_none());
+            assert!(
+                recovered
+                    .claim("result", snapshot.messages[0].revision, InputRoute::Turn)?
+                    .is_some()
+            );
+        }
+    }
     Ok(())
 }
 

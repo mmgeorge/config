@@ -50,6 +50,7 @@ impl<'a> From<&'a CheckDefinition> for VerificationIdentity<'a> {
 pub(super) struct VerificationRequirements {
     directory: PathBuf,
     record: RequirementsRecord,
+    objects: crate::storage::objects::ObjectStore,
 }
 
 /// Bind verification to the obligations present before its source snapshot.
@@ -287,7 +288,7 @@ impl VerificationRequirements {
         );
         Ok(ResolutionRequirements {
             record: self.record.clone(),
-            source_identity: snapshot.check_identity(None, &[])?,
+            source_identity: snapshot.check_identity(&self.objects, None, &[])?,
         })
     }
 
@@ -405,7 +406,12 @@ impl VerificationRequirements {
     }
 
     /// Open this session's ledger, rejecting damaged or mismatched state explicitly.
-    pub(super) fn open(root: &Path, workspace: &Path, session_id: &str) -> Result<Self> {
+    pub(super) fn open(
+        root: &Path,
+        workspace: &Path,
+        session_id: &str,
+        objects: crate::storage::objects::ObjectStore,
+    ) -> Result<Self> {
         let directory = root.join("verification");
         let workspace = workspace
             .canonicalize()
@@ -414,6 +420,7 @@ impl VerificationRequirements {
             std::fs::create_dir(&directory).context("create verification ledger directory")?;
             let store = Self {
                 directory,
+                objects,
                 record: RequirementsRecord {
                     version: VERSION,
                     session_id: session_id.to_owned(),
@@ -440,7 +447,11 @@ impl VerificationRequirements {
             "verification ledger belongs to another session or workspace"
         );
         record.validate()?;
-        Ok(Self { directory, record })
+        Ok(Self {
+            directory,
+            record,
+            objects,
+        })
     }
 
     /// Capture the generation before acquiring the read-only source snapshot.
@@ -581,7 +592,8 @@ impl VerificationRequirements {
             || command.id != launch.0.command
             || Path::new(&before.workspace).canonicalize()? != self.record.workspace
             || Path::new(&after.workspace).canonicalize()? != self.record.workspace
-            || before.check_identity(None, &[])? != after.check_identity(None, &[])?
+            || before.check_identity(&self.objects, None, &[])?
+                != after.check_identity(&self.objects, None, &[])?
         {
             return Ok(());
         }
@@ -674,7 +686,7 @@ impl VerificationRequirements {
         if !definition.enabled || enabled.get(&definition.id) == Some(&false) {
             return Ok(());
         }
-        let source_identity = after.check_identity(None, &[])?;
+        let source_identity = after.check_identity(&self.objects, None, &[])?;
         let mut next = self.record.clone();
         let mut changed = false;
         for requirement in next.requirements.values_mut() {
@@ -709,7 +721,7 @@ impl VerificationRequirements {
             );
         }
         let identity = snapshot
-            .map(|snapshot| snapshot.check_identity(None, &[]))
+            .map(|snapshot| snapshot.check_identity(&self.objects, None, &[]))
             .transpose()?;
         Ok(self.record.pending(identity.as_deref(), None))
     }
@@ -724,7 +736,7 @@ impl VerificationRequirements {
             Path::new(&snapshot.workspace).canonicalize()? == self.record.workspace,
             "verification snapshot belongs to another workspace"
         );
-        let identity = snapshot.check_identity(None, &[])?;
+        let identity = snapshot.check_identity(&self.objects, None, &[])?;
         Ok(self.record.pending(Some(&identity), Some(config)))
     }
 

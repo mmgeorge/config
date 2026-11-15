@@ -102,12 +102,6 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       source.release(buffer)
     end
     result.warnings = #warnings > 0 and warnings or nil
-    if workspace_query and arguments.operation == "diagnostics" then
-      result.freshness = #result.coverage > 0 and "current" or "unknown"
-      for _, coverage in ipairs(result.coverage) do
-        if coverage.state ~= "complete" then result.freshness = "unknown" end
-      end
-    end
     receive(not failure and result or nil, failure)
   end
   local function valid()
@@ -298,6 +292,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       if failure then
         local unsupported = failure.code == -32601
         local message = (unsupported and "unsupported: " or "server_error: ") .. client.name .. " — " .. shorten(failure.message or "Request failed.", 160)
+        if arguments.operation == "diagnostics" then finish(message) return end
         warnings[#warnings + 1] = message
         if coverage then coverage.state, coverage.message = unsupported and "unsupported" or "failed", message end
       else
@@ -305,16 +300,11 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
         local success, callback_error = pcall(callback, value == vim.NIL and nil or value, acquisition)
         if not success then
           local message = "invalid_response: " .. client.name .. " — " .. tostring(callback_error)
-          if not coverage then finish(message) return end
+          if not coverage or arguments.operation == "diagnostics" then finish(message) return end
           coverage.state, coverage.message = "failed", message
           warnings[#warnings + 1] = message
         elseif coverage then
-          coverage.state = acquisition == "published" and "partial" or "complete"
-          if acquisition == "published" then
-            coverage.message = #raw == 0
-              and "No published diagnostics in the selected workspace snapshot; coverage is partial and freshness is unknown."
-              or "Published diagnostic snapshot; workspace coverage is partial and freshness is unknown."
-          end
+          coverage.state = "complete"
         end
       end
       collect()
@@ -338,6 +328,20 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       finish("unavailable: Could not attach " .. client.name .. " to " .. arguments.path) return
     end
     local params = { textDocument = { uri = vim.uri_from_bufnr(buffer) } }
+    local function stored_diagnostics()
+      for _, report in ipairs(diagnostics.stored_reports(client)) do
+        if source.canonical(vim.uri_to_fname(report.uri)) == source.canonical(arguments.path) then
+          for _, diagnostic in ipairs(report.items) do
+            local severity = ({ "error", "warning", "information", "hint" })[diagnostic.severity or 1] or "error"
+            if not arguments.severity or arguments.severity == "all" or arguments.severity == severity then
+              location({ uri = report.uri, range = diagnostic.range }, client,
+                severity .. (diagnostic.code and "[" .. tostring(diagnostic.code) .. "]" or "") .. ": " .. diagnostic.message,
+                nil, nil, report.encoding)
+            end
+          end
+        end
+      end
+    end
     if arguments.line then
       local line = vim.api.nvim_buf_get_lines(buffer, arguments.line - 1, arguments.line, false)[1]
       if not line then finish("invalid_position: " .. arguments.path .. ":" .. arguments.line .. " is outside the source.") return end
@@ -347,22 +351,14 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
     end
     if arguments.operation == "references" then params.context = { includeDeclaration = arguments.include_declaration == true } end
     if arguments.operation == "diagnostics" and not client:supports_method(methods.diagnostics, buffer) then
-      result.freshness = "unknown"
-      local namespace = vim.lsp.diagnostic.get_namespace(client.id, false)
-      for _, diagnostic in ipairs(vim.diagnostic.get(buffer, { namespace = namespace })) do
-        if not arguments.severity or arguments.severity == "all" or ({ "error", "warning", "information", "hint" })[diagnostic.severity] == arguments.severity then
-          raw[#raw + 1] = { path = source.canonical(arguments.path), encoding = "utf-8",
-            position = { line = diagnostic.lnum, character = diagnostic.col },
-            text = (({ "error", "warning", "information", "hint" })[diagnostic.severity] or "error") .. (diagnostic.code and "[" .. tostring(diagnostic.code) .. "]" or "") .. ": " .. diagnostic.message }
-        end
-      end
+      stored_diagnostics()
       collect() return
     end
     send(client, methods[arguments.operation], params, buffer, function(value)
       if arguments.operation == "hover" then result.hover = hover_text(value and value.contents)
       elseif arguments.operation == "document_symbols" then symbols(value, client, arguments.path)
       elseif arguments.operation == "diagnostics" then
-        result.freshness = "current"
+        stored_diagnostics()
         for _, diagnostic in ipairs(value and value.items or {}) do
           if not arguments.severity or arguments.severity == "all" or ({ "error", "warning", "information", "hint" })[diagnostic.severity or 1] == arguments.severity then
             location({ uri = params.textDocument.uri, range = diagnostic.range }, client,

@@ -650,10 +650,7 @@ impl ExchangeDriver {
             ..
         } = state;
         if !closed && !self.commands.storage_unavailable() {
-            if let Err(error) =
-                self.check_results
-                    .update(services, &state.check_runs, command_messages.as_ref())
-            {
+            if let Err(error) = self.check_results.update(services, &state.check_runs) {
                 trace.record(
                     session_id,
                     "exchange.check_result.failed",

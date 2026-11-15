@@ -43,48 +43,38 @@ def 'main adapter' [--bin: string, --release] {
   exit $result
 }
 
-# Stream stdout while Cargo runs; send stderr through Harness's bounded log sink.
+# Capture Cargo's exit status with its output instead of an ambient shell exit code.
 def run-cargo [input: record, directory: path, args: list<string>, --mutation] {
-  let stderr = $input.events + '.cargo-stderr'
-  let result = try {
-    ^cargo ...$args err> $stderr | lines | reduce --fold [] {|line, seen|
-      if $mutation {
-        emit $input.events {event: 'output', text: ($line + "\n")}
-      } else {
-        let record = $line | from json
-        if $record.reason == 'compiler-message' {
-          let diagnostic = translate-diagnostic $record $input.workspace $directory
-          if $diagnostic != null { emit $input.events $diagnostic }
-        } else if $record.reason == 'compiler-artifact' {
-          # A package can compile multiple targets and test/non-test units.
-          let identity = $record | select package_id target profile features | to json --raw | hash sha256
-          if $identity not-in $seen {
-            emit $input.events {event: 'target_finished', id: $"cargo:($identity)", status: 'passed'}
-            if $input.op == 'build' and $record.executable? != null {
-              let path = repository-path $record.executable $input.workspace $directory
-              if $path != null {
-                emit $input.events {event: 'artifact', path: $path, kind: 'executable'}
-              } else { emit $input.events {event: 'output', text: ($line + "\n")} }
-            }
-            return ($seen | append $identity)
+  let output = ^cargo ...$args | complete
+  $output.stdout | lines | reduce --fold [] {|line, seen|
+    if $mutation {
+      emit $input.events {event: 'output', text: ($line + "\n")}
+    } else {
+      let record = $line | from json
+      if $record.reason == 'compiler-message' {
+        let diagnostic = translate-diagnostic $record $input.workspace $directory
+        if $diagnostic != null { emit $input.events $diagnostic }
+      } else if $record.reason == 'compiler-artifact' {
+        let identity = $record | select package_id target profile features | to json --raw | hash sha256
+        if $identity not-in $seen {
+          emit $input.events {event: 'target_finished', id: $"cargo:($identity)", status: 'passed'}
+          if $input.op == 'build' and $record.executable? != null {
+            let path = repository-path $record.executable $input.workspace $directory
+            if $path != null {
+              emit $input.events {event: 'artifact', path: $path, kind: 'executable'}
+            } else { emit $input.events {event: 'output', text: ($line + "\n")} }
           }
+          return ($seen | append $identity)
         }
       }
-      $seen
-    } | ignore
-    $env.LAST_EXIT_CODE | into int
-  } catch {|failure|
-    if $failure.msg == 'External command had a non-zero exit code' {
-      $env.LAST_EXIT_CODE | into int
-    } else {
-      emit $input.events {event: 'error', message: $failure.msg}
-      1
     }
+    $seen
+  } | ignore
+  for line in ($output.stderr | lines) { emit $input.events {event: 'output', text: ($line + "\n")} }
+  if $output.exit_code != 0 {
+    emit $input.events {event: 'error', message: $"cargo ($args.0) exited with status ($output.exit_code); see command output"}
   }
-  for line in (open --raw $stderr | lines) { emit $input.events {event: 'output', text: ($line + "\n")} }
-  rm $stderr
-  if $result != 0 { emit $input.events {event: 'error', message: $"cargo ($args.0) exited with status ($result); see command output"} }
-  $result
+  $output.exit_code
 }
 
 def run-format [input: record, directory: path] {

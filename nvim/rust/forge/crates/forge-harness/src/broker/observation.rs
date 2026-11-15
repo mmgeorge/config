@@ -11,6 +11,7 @@ pub(crate) struct InputReadiness {
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
     pub(crate) input: Arc<crate::input::SessionInputQueue>,
+    pub(crate) check_inbox: Arc<crate::input::SessionInputQueue>,
     pub(crate) activity: RwLock<crate::exchange::ActivitySnapshot>,
     pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) admission: Arc<crate::storage::admission::SessionAdmission>,

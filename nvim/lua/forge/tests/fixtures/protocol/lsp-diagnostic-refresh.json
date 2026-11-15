@@ -1,0 +1,8 @@
+{
+  "diagnostic_paths": ["<workspace>/lib.rs"],
+  "operation": "diagnostics",
+  "workspace": {
+    "language": "rust",
+    "path": "<workspace>"
+  }
+}

@@ -1,8 +1,8 @@
 use super::*;
 
-/// Explicit queued input can pass a completion without resuming a suspended queue.
+/// Check results cannot be admitted to the caller-controlled input queue.
 #[test]
-fn user_input_precedes_check_result_and_completion_preserves_pause() -> Result<()> {
+fn user_queue_rejects_check_results_without_changing_pause() -> Result<()> {
     let input = SessionInputQueue::default();
     input.suspend(true, None)?;
     let mut result = submit("result");
@@ -16,8 +16,12 @@ fn user_input_precedes_check_result_and_completion_preserves_pause() -> Result<(
     let before = input.snapshot()?;
     result.control_revision = before.control_revision;
     result.after_control = before.control_operation_id;
-    input.apply(result)?;
+    assert_eq!(
+        input.apply(result)?.error_code,
+        Some(InputRejection::WrongChannel)
+    );
     assert!(input.snapshot()?.suspended);
+    assert!(input.snapshot()?.messages.is_empty());
     assert!(input.claim("result", 1, InputRoute::Turn)?.is_none());
     let mut user = submit("user");
     let before = input.snapshot()?;

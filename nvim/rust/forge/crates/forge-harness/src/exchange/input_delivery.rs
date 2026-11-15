@@ -993,7 +993,8 @@ impl InputDeliveryRun {
                         confirmed: true, ..
                     } => {
                         let input = services
-                            .input
+                            .input_store(self.input.id.as_str())
+                            .map_err(OperationFailure::Domain)?
                             .delivery_if_current(
                                 self.input.id.as_str(),
                                 InputDeliveryGuard::Claimed(self.input.revision),
@@ -1158,7 +1159,8 @@ impl InputDeliveryRun {
             return Ok(Some(InputAbandonment::Superseded));
         }
         let queue = services
-            .input
+            .input_store(self.input.id.as_str())
+            .map_err(OperationFailure::Domain)?
             .snapshot()
             .map_err(OperationFailure::Domain)?;
         if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &self.message.purpose {
@@ -1187,7 +1189,11 @@ impl InputDeliveryRun {
             )
             || *services.cancellation.subscribe().borrow()
             || ready.has_approval
-            || ready.checks_running && !self.message.reports_check_failure()
+            || ready.checks_running
+                && !matches!(
+                    self.message.purpose,
+                    crate::input::InputPurpose::CheckResult { .. }
+                )
             || services.tasks.configuration_is_uncertain())
         .then_some(InputAbandonment::Paused))
     }
@@ -1205,7 +1211,8 @@ impl InputDeliveryRun {
             InputAbandonment::Cancelled | InputAbandonment::Superseded => None,
         };
         let input = services
-            .input
+            .input_store(self.input.id.as_str())
+            .map_err(OperationFailure::Domain)?
             .delivery_if_current(
                 self.input.id.as_str(),
                 InputDeliveryGuard::Claimed(self.input.revision),
@@ -1250,7 +1257,8 @@ impl InputDeliveryRun {
                 | InputAbandonment::Retracted => None,
             };
             let mut input = services
-                .input
+                .input_store(self.input.id.as_str())
+                .map_err(OperationFailure::Domain)?
                 .delivery_if_current(
                     self.input.id.as_str(),
                     InputDeliveryGuard::Claimed(self.input.revision),
@@ -1283,7 +1291,8 @@ impl InputDeliveryRun {
         services: &OwnerServices,
     ) -> Result<Option<InputAbandonment>, OperationFailure> {
         let snapshot = services
-            .input
+            .input_store(self.input.id.as_str())
+            .map_err(OperationFailure::Domain)?
             .snapshot()
             .map_err(OperationFailure::Domain)?;
         let current = snapshot

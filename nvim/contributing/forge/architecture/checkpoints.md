@@ -26,6 +26,8 @@ At terminal capture, `ProviderChangeIndex` collects paths from successful struct
 
 Checkpoint comparisons run on the runtime `DiffEngine`. `forge-diff::raw` uses histogram comparison with `imara-diff`, and its hunk identities include both source hashes, representations, and exact byte ranges. `SourceVersion` keeps complete bytes with a lazy SHA-256 identity. Saved patch presentation compares LF and CRLF lines by text and reports line-ending conversions separately, while the raw patch and restore keep the original bytes.
 
+Check source identities hash each selected path's working-content digest and file mode. Git-backed files use the object store's cached digest after applying the captured checkout conversion; captured overrides already carry the same content digest. Committing unchanged bytes therefore preserves verification, while content or mode changes invalidate it. These identities never include the storage variant or commit identity.
+
 Finalization commits the terminal checkpoint and exchange together, and only a successful commit replaces live comparison state. A failure keeps the earlier evidence and records the error. An empty patch shows no Edits row, and missing evidence shows **Edits unavailable**.
 
 An in-progress finalization may change its intended outcome to Failed when capture or cleanup fails. Other outcome changes remain rejected, and a finished exchange cannot re-enter finalization. This lets failure handling retry capture or retain the original capture error instead of repeatedly failing on an outcome conflict.

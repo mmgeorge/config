@@ -2281,7 +2281,8 @@ fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<PresentedInput> {
         .filter(|prompt| {
             !matches!(
                 &prompt.intent,
-                crate::exchange::InputIntent::User { content } if content.is_question_reply()
+                crate::exchange::InputIntent::User { content }
+                    if content.is_question_reply() || matches!(content, crate::input::UserInputContent::CheckResult { .. })
             )
         })
         .map(|prompt| PresentedInput {

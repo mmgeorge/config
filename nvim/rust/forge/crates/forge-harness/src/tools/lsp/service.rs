@@ -632,7 +632,16 @@ impl LspScope {
     }
 
     /// Run a decoded query under the live editor scope and read policy.
-    pub(super) async fn query(self: &Arc<Self>, mut arguments: Arguments) -> Result<String> {
+    pub(super) async fn query(self: &Arc<Self>, arguments: Arguments) -> Result<String> {
+        self.query_with_diagnostics(arguments, Vec::new()).await
+    }
+
+    /// Refresh authorized changed documents before collecting workspace diagnostics.
+    pub(super) async fn query_with_diagnostics(
+        self: &Arc<Self>,
+        mut arguments: Arguments,
+        diagnostic_paths: Vec<PathBuf>,
+    ) -> Result<String> {
         self.check()?;
         if let Some(selection) = &mut arguments.workspace {
             let path = self.authorize(selection.path()).await?;
@@ -700,10 +709,20 @@ impl LspScope {
             id: id.clone(),
             sender: sender.clone(),
         };
+        let mut paths = Vec::new();
+        if arguments.operation == crate::tools::lsp::request::Operation::Diagnostics {
+            for path in diagnostic_paths {
+                paths.push(
+                    self.authorize(path.to_str().context("diagnostic path is not UTF-8")?)
+                        .await?,
+                );
+            }
+        }
+        let editor_arguments = diagnostic_arguments(&arguments, paths)?;
         let event = SessionEvent {
             session_id: self.session.clone(),
             event: "lsp.request".into(),
-            payload: json!({"id":id,"workspace":self.workspace,"arguments":arguments}),
+            payload: json!({"id":id,"workspace":self.workspace,"arguments":editor_arguments}),
         };
         let timeout = if arguments.operation == crate::tools::lsp::request::Operation::Paths {
             345
@@ -753,6 +772,15 @@ impl Drop for LspLease {
     }
 }
 
+/// Include host-authorized refresh paths only in diagnostic editor requests.
+fn diagnostic_arguments(arguments: &Arguments, paths: Vec<PathBuf>) -> Result<Value> {
+    let mut value = serde_json::to_value(arguments)?;
+    if arguments.operation == super::request::Operation::Diagnostics {
+        value["diagnostic_paths"] = json!(paths);
+    }
+    Ok(value)
+}
+
 pub(super) fn display_path(path: &str, workspace: &Path) -> String {
     let path = path.trim_start_matches("\\\\?\\").replace('\\', "/");
     let root = workspace
@@ -782,4 +810,26 @@ pub(super) fn single_line(text: &str, maximum: usize) -> String {
         .chars()
         .take(maximum)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arguments, diagnostic_arguments};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    /// Keep diagnostic refresh paths aligned with the editor's protocol replay.
+    #[test]
+    fn diagnostic_refresh_matches_editor_recording() {
+        let arguments = Arguments::parse(
+            "lsp_diagnostics",
+            json!({
+                "workspace": {"path": "<workspace>", "language": "rust"}
+            }),
+        )
+        .expect("valid diagnostic selector");
+        let value = diagnostic_arguments(&arguments, vec![PathBuf::from("<workspace>/lib.rs")])
+            .expect("diagnostic arguments serialize");
+        forge_recorded_fixtures::assert_matches_recording("lsp-diagnostic-refresh.json", &value);
+    }
 }

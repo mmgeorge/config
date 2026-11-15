@@ -4,6 +4,7 @@ use rusqlite::{OptionalExtension, params};
 
 /// Persist active input separately from immutable idempotency receipts.
 pub(super) struct InputJournal {
+    channel: super::InputChannel,
     /// The state root's history writer; every queue statement runs on its connection.
     writer: crate::storage::writer::HistoryWriter,
     session_id: String,
@@ -19,6 +20,9 @@ impl InputJournal {
             "input_session",
             "input_operation",
             "input_submitted",
+            "check_inbox_session",
+            "check_inbox_operation",
+            "check_inbox_submitted",
             "owner_command",
         ] {
             transaction.execute(
@@ -32,11 +36,30 @@ impl InputJournal {
 
     /// Open the queue journal using the same durable SQLite policy as provider submissions.
     pub(super) fn open(root: &std::path::Path, session_id: &str) -> Result<Self> {
+        Self::open_channel(root, session_id, super::InputChannel::User)
+    }
+
+    /// Select independent tables while reusing the delivery receipt contract.
+    pub(super) fn open_channel(
+        root: &std::path::Path,
+        session_id: &str,
+        channel: super::InputChannel,
+    ) -> Result<Self> {
         let writer = crate::storage::writer::HistoryWriter::for_root(root)?;
         Ok(Self {
+            channel,
             writer,
             session_id: session_id.into(),
         })
+    }
+
+    /// Get a table belonging only to this channel; names never contain caller input.
+    fn table(&self, suffix: &str) -> String {
+        let prefix = match self.channel {
+            super::InputChannel::User => "input",
+            super::InputChannel::CheckResults => "check_inbox",
+        };
+        format!("{prefix}_{suffix}")
     }
 
     /// Load active queue metadata and durable duplicate-detection records for one owner.
@@ -44,7 +67,10 @@ impl InputJournal {
         let connection = self.writer.connection()?;
         let snapshot: Option<String> = connection
             .query_row(
-                "SELECT payload FROM input_session WHERE session_id=?1",
+                &format!(
+                    "SELECT payload FROM {} WHERE session_id=?1",
+                    self.table("session")
+                ),
                 [&self.session_id],
                 |row| row.get(0),
             )
@@ -57,8 +83,10 @@ impl InputJournal {
                 .unwrap_or_default(),
             ..Default::default()
         };
-        let mut query = connection
-            .prepare("SELECT id,request,payload FROM input_operation WHERE session_id=?1")?;
+        let mut query = connection.prepare(&format!(
+            "SELECT id,request,payload FROM {} WHERE session_id=?1",
+            self.table("operation")
+        ))?;
         for row in query.query_map([&self.session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -81,7 +109,10 @@ impl InputJournal {
             );
             state.operation.insert(id, (request, receipt));
         }
-        let mut query = connection.prepare("SELECT id FROM input_submitted WHERE session_id=?1")?;
+        let mut query = connection.prepare(&format!(
+            "SELECT id FROM {} WHERE session_id=?1",
+            self.table("submitted")
+        ))?;
         for id in query.query_map([&self.session_id], |row| row.get::<_, String>(0))? {
             let id = id?;
             ensure!(!id.is_empty(), "input message identity is corrupt");
@@ -93,6 +124,19 @@ impl InputJournal {
         );
         let mut identities = std::collections::HashSet::new();
         for message in &state.snapshot.messages {
+            ensure!(
+                matches!(message.purpose, super::InputPurpose::CheckResult { .. })
+                    == (self.channel == super::InputChannel::CheckResults),
+                "stored input belongs to another delivery channel"
+            );
+            if self.channel == super::InputChannel::CheckResults {
+                ensure!(
+                    message.turn().is_some()
+                        && message.config.is_none()
+                        && message.attachments.is_empty(),
+                    "stored check result is missing typed evidence or contains user settings"
+                );
+            }
             ensure!(
                 !message.id.is_empty() && identities.insert(&message.id),
                 "input queue identities are corrupt"
@@ -126,34 +170,37 @@ impl InputJournal {
         let snapshot = serde_json::to_string(&next.snapshot)?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        transaction.execute("INSERT INTO input_session(session_id,payload) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",params![self.session_id,snapshot])?;
+        transaction.execute(&format!("INSERT INTO {}(session_id,payload) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload", self.table("session")),params![self.session_id,snapshot])?;
         for (id, (request, outcome)) in &next.operation {
             if !previous.operation.contains_key(id) {
-                transaction.execute("INSERT INTO input_operation(session_id,id,request,payload) VALUES(?1,?2,?3,?4)",params![self.session_id,id,request,serde_json::to_string(outcome)?])?;
-                if outcome.error.is_none()
-                    && matches!(
-                        serde_json::from_str::<super::InputOperation>(request)?.action,
-                        super::InputAction::Submit { message }
-                            if matches!(message.purpose, super::InputPurpose::CheckResult { .. })
-                    )
-                {
-                    crate::exchange::publication::SessionPublications::retain_check_result(
+                transaction.execute(
+                    &format!(
+                        "INSERT INTO {}(session_id,id,request,payload) VALUES(?1,?2,?3,?4)",
+                        self.table("operation")
+                    ),
+                    params![
+                        self.session_id,
+                        id,
+                        request,
+                        serde_json::to_string(outcome)?
+                    ],
+                )?;
+                if self.channel == super::InputChannel::User {
+                    crate::exchange::journal::commit_input_command(
                         &transaction,
                         &self.session_id,
+                        id,
                         outcome,
                     )?;
                 }
-                crate::exchange::journal::commit_input_command(
-                    &transaction,
-                    &self.session_id,
-                    id,
-                    outcome,
-                )?;
             }
         }
         for id in next.submitted.difference(&previous.submitted) {
             transaction.execute(
-                "INSERT INTO input_submitted(session_id,id) VALUES(?1,?2)",
+                &format!(
+                    "INSERT INTO {}(session_id,id) VALUES(?1,?2)",
+                    self.table("submitted")
+                ),
                 params![self.session_id, id],
             )?;
         }

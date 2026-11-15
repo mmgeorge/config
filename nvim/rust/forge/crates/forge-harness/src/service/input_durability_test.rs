@@ -3,7 +3,6 @@ use super::*;
 /// Recover a completed tool check into durable input without launching check commands.
 #[tokio::test]
 async fn completed_check_is_delivered_once_after_owner_restart() -> Result<()> {
-    use crate::input::{InputAction, InputOperation};
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let broker = HarnessBroker::initialize(serde_json::from_value(json!({
@@ -50,7 +49,7 @@ async fn completed_check_is_delivered_once_after_owner_restart() -> Result<()> {
     broker.observer().input.suspend(true, None)?;
     drop(broker);
     let controller = receipt_test_controller_with_session(root.path(), &session).await?;
-    let input = &controller.coordinator.submissions;
+    let input = &controller.observer.check_inbox;
     loop {
         let changed = input.changed.notified();
         if input
@@ -62,27 +61,45 @@ async fn completed_check_is_delivered_once_after_owner_restart() -> Result<()> {
         changed.await;
     }
     let snapshot = input.snapshot()?;
+    assert!(
+        controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .is_empty(),
+        "check completion leaked into the user queue"
+    );
     let message = snapshot
         .messages
         .iter()
         .find(|message| message.id == "check-result:completed-check")
         .context("result input")?;
-    assert!(snapshot.suspended, "completion resumed a paused queue");
+    assert!(
+        controller.coordinator.submissions.snapshot()?.suspended,
+        "completion resumed a paused queue"
+    );
+    assert!(!snapshot.suspended, "user pause reached the internal inbox");
     assert!(
         matches!(&message.purpose, crate::input::InputPurpose::CheckResult { exchange_id, run_id } if exchange_id == "check-owner" && run_id == "completed-check")
     );
     assert!(
         matches!(message.turn().unwrap().kind(), forge_provider_api::forge::TurnKind::CheckResult { result } if result.checks[0].error.as_deref() == Some("fixture failure"))
     );
-    input.apply(InputOperation {
-        id: "remove-result".into(),
-        control_revision: snapshot.control_revision,
-        after_control: snapshot.control_operation_id,
-        action: InputAction::Remove {
-            id: message.id.clone(),
-            revision: message.revision,
-        },
-    })?;
+    let claimed = input
+        .claim(
+            &message.id,
+            message.revision,
+            crate::input::InputRoute::Turn,
+        )?
+        .context("internal claim")?;
+    input.delivery_if_current(
+        &claimed.id,
+        crate::input::InputDeliveryGuard::Claimed(claimed.revision),
+        None,
+        None,
+        None,
+    )?;
     controller.finish_exchange_owner().await?;
     drop(controller);
     let reopened = receipt_test_controller_with_session(root.path(), &session).await?;
@@ -94,15 +111,15 @@ async fn completed_check_is_delivered_once_after_owner_restart() -> Result<()> {
         .await?;
     assert!(
         reopened
-            .coordinator
-            .submissions
+            .observer
+            .check_inbox
             .admission_receipt("check-result:completed-check")?
             .is_some()
     );
     assert!(
         reopened
-            .coordinator
-            .submissions
+            .observer
+            .check_inbox
             .snapshot()?
             .messages
             .is_empty()
@@ -111,9 +128,9 @@ async fn completed_check_is_delivered_once_after_owner_restart() -> Result<()> {
     Ok(())
 }
 
-/// Replaying an admitted result must not prevent a later completed run from reaching the queue.
+/// Recovered receipts deduplicate completed runs without publishing them as user input.
 #[tokio::test]
-async fn check_result_replay_preserves_publication_and_delivers_later_runs() -> Result<()> {
+async fn check_result_replay_preserves_receipts_and_delivers_later_runs() -> Result<()> {
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let broker = HarnessBroker::initialize(serde_json::from_value(json!({
@@ -135,7 +152,7 @@ async fn check_result_replay_preserves_publication_and_delivers_later_runs() -> 
     broker.observer().input.suspend(true, None)?;
     drop(broker);
     let controller = receipt_test_controller_with_session(root.path(), &session.id).await?;
-    let input = &controller.coordinator.submissions;
+    let input = &controller.observer.check_inbox;
     loop {
         let changed = input.changed.notified();
         if input.admission_receipt("check-result:first")?.is_some() {
@@ -148,7 +165,7 @@ async fn check_result_replay_preserves_publication_and_delivers_later_runs() -> 
     seed_completed_check(&checks_root, &session.id, &scope, "second")?;
     seed_completed_check(&checks_root, &session.id, &scope, "third")?;
     let reopened = receipt_test_controller_with_session(root.path(), &session.id).await?;
-    let input = &reopened.coordinator.submissions;
+    let input = &reopened.observer.check_inbox;
     reopened
         .exchange_owner
         .command_status(crate::exchange::command::CommandId::new("replay-barrier")?)
@@ -193,13 +210,211 @@ async fn check_result_replay_preserves_publication_and_delivers_later_runs() -> 
                     .is_some_and(|id| id.starts_with("check-result:"))
         })
         .collect::<Vec<_>>();
-    assert_eq!(check_publications.len(), 2);
+    assert_eq!(
+        check_publications.len(),
+        0,
+        "internal results were published as user input"
+    );
     assert!(
-        check_publications
-            .iter()
-            .all(|publication| publication.event().payload["snapshot"].is_null())
+        reopened
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .is_empty()
     );
     reopened.finish_exchange_owner().await?;
+    Ok(())
+}
+
+/// Deliver recovered evidence through MockProvider even while user follow-ups remain paused.
+#[tokio::test]
+async fn check_result_reaches_mock_provider_while_user_queue_is_paused() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"internal-result",
+        "provider":{"kind":"mock","command":[]},
+    }))?)?;
+    let session = broker.snapshot()?.session;
+    let mut exchange = crate::storage::test::running_exchange("check-owner");
+    exchange.session_id = session.id.clone();
+    exchange.agent_id = session.primary_agent_id;
+    exchange.finish(crate::exchange::ExchangeOutcome::Complete, 100)?;
+    SqliteStore::open(&broker.data_root)?.save_exchange(&exchange)?;
+    seed_completed_check(
+        &broker.checks().root,
+        &session.id,
+        &crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root(&session.id),
+            "check-owner",
+        ),
+        "recovered",
+    )?;
+    broker.observer().input.suspend(true, None)?;
+    drop(broker);
+    let controller = receipt_test_controller_with_session(root.path(), &session.id).await?;
+    let control = controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock control")?;
+    let hold = control
+        .dispatch(
+            &session.id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<_, anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let delivered = control
+        .dispatch(
+            &session.id,
+            MockResponseCommand::Wait {
+                id: hold["id"].as_str().unwrap().into(),
+            },
+        )
+        .await?;
+    assert!(delivered["prompt"].as_str().unwrap().contains("recovered"));
+    assert!(controller.coordinator.submissions.snapshot()?.suspended);
+    assert!(
+        controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .is_empty()
+    );
+    control
+        .dispatch(
+            &session.id,
+            MockResponseCommand::Release {
+                id: hold["id"].as_str().unwrap().into(),
+            },
+        )
+        .await?;
+    controller.finish_exchange_owner().await?;
+    drop(sink);
+    drop(controller);
+    reader.abort();
+    Ok(())
+}
+
+/// Keep active-turn check evidence independent of paused user input and await provider consumption.
+#[tokio::test]
+async fn check_result_steers_active_mock_with_paused_user_queue() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    let controller = receipt_test_controller(root.path()).await?;
+    let session = controller.observer.session_id();
+    let control = controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock control")?;
+    let hold = control
+        .dispatch(
+            session,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<_, anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    queued_offer_input(&controller, "user", "Start the task", None)?;
+    control
+        .dispatch(
+            session,
+            MockResponseCommand::Wait {
+                id: hold["id"].as_str().unwrap().into(),
+            },
+        )
+        .await?;
+    let exchange = crate::storage::HistoryReader::current(&controller.data_root)?
+        .latest_exchange(session)?
+        .context("active exchange")?;
+    controller.coordinator.submissions.suspend(true, None)?;
+    let result: forge_provider_api::forge::CheckResult = serde_json::from_value(json!({
+        "run_id":"active-result","exchange_id":exchange.id,"state":"passed","complete":true,"checks":[]
+    }))?;
+    let turn = forge_provider_api::forge::TurnInput::new(
+        forge_provider_api::forge::TurnKind::CheckResult { result },
+    );
+    let message = crate::input::InputMessage::queued(crate::input::InputDraft {
+        id: "active-result".into(),
+        text: turn.label(),
+        purpose: crate::input::InputPurpose::CheckResult {
+            exchange_id: exchange.id,
+            run_id: "active-result".into(),
+        },
+        attachments: Vec::new(),
+        config: None,
+        intent: crate::input::InputIntent::Auto,
+    })
+    .with_turn(turn);
+    controller
+        .observer
+        .check_inbox
+        .apply(crate::input::InputOperation {
+            id: "active-result".into(),
+            control_revision: 0,
+            after_control: None,
+            action: crate::input::InputAction::Submit {
+                message: Box::new(message),
+            },
+        })?;
+    controller.exchange_owner.input_ready(sink.clone()).await?;
+    loop {
+        let changed = controller.observer.check_inbox.changed.notified();
+        if controller
+            .observer
+            .check_inbox
+            .snapshot()?
+            .messages
+            .iter()
+            .any(|message| message.delivery() == crate::input::InputDelivery::Accepted)
+        {
+            break;
+        }
+        changed.await;
+    }
+    assert!(controller.coordinator.submissions.snapshot()?.suspended);
+    assert!(
+        controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .iter()
+            .all(|message| !matches!(
+                message.purpose,
+                crate::input::InputPurpose::CheckResult { .. }
+            ))
+    );
+    control
+        .dispatch(
+            session,
+            MockResponseCommand::Release {
+                id: hold["id"].as_str().unwrap().into(),
+            },
+        )
+        .await?;
+    controller.finish_exchange_owner().await?;
+    drop(sink);
+    drop(controller);
+    reader.abort();
     Ok(())
 }
 

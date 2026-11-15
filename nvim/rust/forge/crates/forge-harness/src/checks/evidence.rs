@@ -76,6 +76,7 @@ impl<'run> PreparedCheck<'run> {
 
 impl CheckEvidence {
     pub(super) fn capture(
+        objects: &crate::storage::objects::ObjectStore,
         run: &CheckRun,
         command: &CommandCheck,
         before: CheckpointRecord,
@@ -84,7 +85,7 @@ impl CheckEvidence {
         let prepared = PreparedCheck::new(run, command)?;
         let preparation = prepared.selected.purpose == super::CheckPurpose::Prepare;
         let checkpoint = if preparation { after.clone() } else { before };
-        let source_identity = checkpoint.check_identity(None, &[])?;
+        let source_identity = checkpoint.check_identity(objects, None, &[])?;
         Ok(Some(Self {
             checkpoint,
             signature: prepared.signature()?,

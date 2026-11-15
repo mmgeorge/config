@@ -2726,6 +2726,12 @@ impl HarnessBroker {
             &submission_store,
         )?);
         let observer = Arc::new(observation::BrokerObserver {
+            check_inbox: Arc::new(crate::input::SessionInputQueue::open_channel(
+                &data_root,
+                &session.id,
+                &submission_store,
+                crate::input::InputChannel::CheckResults,
+            )?),
             input: input.clone(),
             activity: RwLock::new(Default::default()),
             questions: questions.clone(),

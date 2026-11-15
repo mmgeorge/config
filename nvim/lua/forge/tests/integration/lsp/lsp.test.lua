@@ -167,7 +167,7 @@ T["semantic_tools_wait_for_rust_workspace_and_preserve_write_access"] = function
 end
 
 -- requires-forge-host
-T["workspace_published_diagnostics_are_partial_even_when_empty"] = function()
+T["workspace_diagnostics_include_pull_reports"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   local original_directory = vim.fn.getcwd()
   MiniTest.finally(function()
@@ -225,7 +225,7 @@ T["workspace_published_diagnostics_are_partial_even_when_empty"] = function()
         end
       end
       return buffer.text(state.transcript_buf):find(marker == "empty-result-complete"
-        and "No results returned." or "published workspace warning", 1, true)
+        and "No diagnostics." or "published workspace warning", 1, true)
     end, "published tool output did not expand", { context = function() return buffer.text(state.transcript_buf) end })
     return buffer.text(state.transcript_buf)
   end
@@ -233,17 +233,100 @@ T["workspace_published_diagnostics_are_partial_even_when_empty"] = function()
     { range = { start = { line = 0, character = 3 }, ["end"] = { line = 0, character = 9 } },
       severity = 2, message = "published workspace warning" },
   } }
+  local pull_namespace = vim.lsp.diagnostic.get_namespace(mock.id, true, "fixture")
+  mock.server_capabilities.diagnosticProvider.identifier = "fixture"
+  local source_buffer = vim.fn.bufadd(path)
+  vim.diagnostic.set(pull_namespace, source_buffer, {
+    { lnum = 0, col = 3, severity = 1, message = "pull workspace error" },
+  })
   vim.lsp.diagnostic.on_publish_diagnostics(nil, publication, { client_id = mock.id })
   local output = query("published-result-complete")
-  MiniTest.expect.equality(output:find("coverage: partial", 1, true) ~= nil, true, { fail_reason = output })
-  MiniTest.expect.equality(output:find("freshness: unknown", 1, true) ~= nil, true)
+  MiniTest.expect.equality(output:find("pull workspace error", 1, true) ~= nil, true)
+  MiniTest.expect.equality(output:find("coverage:", 1, true), nil)
+  MiniTest.expect.equality(output:find("freshness:", 1, true), nil)
   MiniTest.expect.equality(output:find("published workspace warning", 1, true) ~= nil, true)
   publication.diagnostics = {}
+  vim.diagnostic.reset(pull_namespace)
   vim.lsp.diagnostic.on_publish_diagnostics(nil, publication, { client_id = mock.id })
   output = query("empty-result-complete")
-  MiniTest.expect.equality(output:find("No published diagnostics in the", 1, true) ~= nil, true)
-  MiniTest.expect.equality(output:find("workspace has no diagnostics", 1, true), nil)
+  MiniTest.expect.equality(output:find("No diagnostics.", 1, true) ~= nil, true)
   vim.diagnostic.reset(vim.lsp.diagnostic.get_namespace(mock.id, false))
+end
+
+-- requires-forge-host
+T["editor_diagnostic_replacement_reaches_agent"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local original_directory = vim.fn.getcwd()
+  MiniTest.finally(function()
+    pcall(function() require("forge.lsp.bridge").close() end)
+    pcall(function() require("forge.views.harness.workspace").release(require("forge.session").harness) end)
+    pcall(host.stop)
+    pcall(vim.api.nvim_set_current_dir, original_directory)
+  end)
+  local workspace = temp.directory("diagnostic-replacement")
+  vim.fn.writefile({ '[package]', 'name="replacement"', 'version="0.1.0"' }, workspace .. "/Cargo.toml")
+  local path = workspace .. "/lib.rs"
+  vim.fn.writefile({ "const VALUE: bool = 1;" }, path)
+  local client = host.start().client
+  local state = require("forge.session").harness
+  local mock = { id = 8911, name = "replacement-fixture", initialized = true, root_dir = workspace,
+    config = { root_dir = workspace, filetypes = { "rust" } }, offset_encoding = "utf-8",
+    handlers = { ["textDocument/diagnostic"] = function() end }, requests = {},
+    server_capabilities = { diagnosticProvider = { identifier = "fixture", workspaceDiagnostics = false } },
+    is_stopped = function() return false end, supports_method = function() return true end,
+    cancel_request = function() end }
+  function mock:request(method, params, _, source_buffer)
+    MiniTest.expect.equality(method, "textDocument/diagnostic")
+    vim.schedule(function()
+      self.requests[42] = { type = "pending", bufnr = source_buffer, method = method }
+      for _, event in ipairs({ { 41, "cancel" }, { 42, "pending" } }) do
+        vim.api.nvim_exec_autocmds("LspRequest", { data = { client_id = self.id, request_id = event[1],
+          request = { method = method, type = event[2], bufnr = source_buffer } } })
+      end
+      self.handlers[method](nil, { kind = "full", items = {
+        { range = { start = { line = 0, character = 20 }, ["end"] = { line = 0, character = 21 } },
+          severity = 1, code = "E0308", message = "expected bool, found integer" },
+      } }, { request_id = 42, bufnr = source_buffer, params = params })
+      self.requests[42] = nil
+    end)
+    return true, 41
+  end
+  stub(require("forge.text.harper"), "attach", function() end)
+  stub(vim.lsp, "get_client_by_id", function(identity) return identity == mock.id and mock or nil end)
+  stub(vim.lsp, "get_clients", function() return { mock } end)
+  stub(vim.lsp, "buf_is_attached", function() return true end)
+  stub(require("forge.lsp.startup"), "selected", function(_, _, receive) receive(mock) return function() end end)
+  stub(vim.lsp, "get_configs", function() return { { name = mock.name, filetypes = { "rust" } } } end)
+  vim.api.nvim_set_current_dir(workspace)
+  require("forge").setup({ diff_logging = false, harness_logging = false,
+    harness = { provider = "mock", providers = { mock = { selectable = true } } } })
+  require("forge.views.harness").open()
+  wait_until(function() return state.session ~= nil end, "Harness did not start")
+  local function request(method, params)
+    local done, failure
+    client.request({ method = method, params = params, session_id = state.session.id },
+      function(_, message) done, failure = true, message end)
+    wait_until(function() return done end, method .. " did not answer")
+    MiniTest.expect.equality(failure, nil)
+  end
+  request("session.configure", { lsp_tools = true })
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "tool_call", name = "lsp_diagnostics", arguments = {
+      workspace = { path = ".", language = "rust" }, path = "lib.rs" } },
+    { kind = "message", content = "response", text = "diagnostic-replacement-complete" },
+  }, terminal = "completed" } })
+  request("session.prompt.submit", { text = "Check the edited Rust file" })
+  wait_until(function() return state.transcript_buf
+    and buffer.text(state.transcript_buf):find("diagnostic-replacement-complete", 1, true) end,
+    "replacement response did not reach the agent")
+  wait_until(function()
+    local transcript = state.presentation.transcript
+    for index = 0, transcript.sequence:count() - 1 do
+      local node = transcript.sequence:at(index).entry.metadata.node
+      if node and node ~= vim.NIL and node.display == "heading" then state.presentation.set_section(node.id, true, false) end
+    end
+    return buffer.text(state.transcript_buf):find("expected bool, found integer", 1, true)
+  end, "replacement diagnostic missing from tool output")
 end
 
 -- requires-forge-host

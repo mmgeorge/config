@@ -198,9 +198,7 @@ impl HarnessBroker {
                 &self.session.provider,
             )?
             .desired;
-        if !desired.automatic_checks_enabled()
-            && !self.check_runner.has_verification_requirements()?
-        {
+        if !desired.automatic_checks_enabled() {
             self.observer.completion_queue.finish()?;
             return Ok((None, AutomaticCheckAction::Finish(result)));
         }
@@ -261,9 +259,7 @@ impl HarnessBroker {
                 &self.session.provider,
             )?
             .desired;
-        if !desired.automatic_checks_enabled()
-            && !self.check_runner.has_verification_requirements()?
-        {
+        if !desired.automatic_checks_enabled() {
             tx.automatic.pending = false;
             tx.automatic.blocked = None;
             tx.automatic.delivered.clear();
@@ -324,17 +320,6 @@ impl HarnessBroker {
         if run.state == CheckState::Interrupted {
             return Err(TurnCancelled.into());
         }
-        if matches!(run.state, CheckState::Passed | CheckState::Skipped) && !verification_satisfied
-        {
-            return Ok(AutomaticCheckAction::Refresh(
-                self.capture_automatic_check(&tx.interaction)?,
-            ));
-        }
-        if run.state == CheckState::Stale {
-            return Ok(AutomaticCheckAction::Refresh(
-                self.capture_automatic_check(&tx.interaction)?,
-            ));
-        }
         let desired = crate::settings::SettingsStore::open(&self.data_root)?
             .get(
                 &self.session.workspace,
@@ -342,9 +327,7 @@ impl HarnessBroker {
                 &self.session.provider,
             )?
             .desired;
-        if !desired.automatic_checks_enabled()
-            && !self.check_runner.has_verification_requirements()?
-        {
+        if !desired.automatic_checks_enabled() {
             tx.automatic.pending = false;
             tx.automatic.blocked = None;
             tx.automatic.delivered.clear();
@@ -353,6 +336,14 @@ impl HarnessBroker {
             tx.automatic.save()?;
             self.observer.completion_queue.finish()?;
             return Ok(AutomaticCheckAction::Finish(std::mem::take(&mut tx.result)));
+        }
+        if run.state == CheckState::Stale
+            || matches!(run.state, CheckState::Passed | CheckState::Skipped)
+                && !verification_satisfied
+        {
+            return Ok(AutomaticCheckAction::Refresh(
+                self.capture_automatic_check(&tx.interaction)?,
+            ));
         }
         let repair = tx.automatic.observe(&run)?;
         if matches!(run.state, CheckState::Stopped | CheckState::ExecutionError) {
@@ -431,6 +422,23 @@ impl HarnessBroker {
         &self,
         tx: &mut AutomaticCheckTransaction,
     ) -> Result<AutomaticCheckAction> {
+        let desired = crate::settings::SettingsStore::open(&self.data_root)?
+            .get(
+                &self.session.workspace,
+                &self.session.id,
+                &self.session.provider,
+            )?
+            .desired;
+        if !desired.automatic_checks_enabled() {
+            tx.automatic.pending = false;
+            tx.automatic.blocked = None;
+            tx.automatic.delivered.clear();
+            tx.automatic.repair_prompt = None;
+            tx.automatic.repair_exchange = None;
+            tx.automatic.save()?;
+            self.observer.completion_queue.finish()?;
+            return Ok(AutomaticCheckAction::Finish(std::mem::take(&mut tx.result)));
+        }
         let interaction = self
             .store
             .load_exchange(&tx.interaction.id)?
@@ -491,13 +499,6 @@ impl HarnessBroker {
         if capture.cancelled.requested.load(Ordering::Acquire) {
             return Err(TurnCancelled.into());
         }
-        let mut run = capture.supervisor.prepare_request(
-            capture.owner.clone(),
-            RunRequest::default(),
-            None,
-            capture.shell,
-            "Automatic completion checks".into(),
-        )?;
         let desired = crate::settings::SettingsStore::open(&self.data_root)?
             .get(
                 &self.session.workspace,
@@ -506,12 +507,15 @@ impl HarnessBroker {
             )?
             .desired;
         if !desired.automatic_checks_enabled() {
-            for command in &mut run.commands {
-                command.selected = false;
-                command.state = CheckState::Skipped;
-                command.error = Some("Automatic checks are disabled".into());
-            }
+            return Ok(AutomaticCheckAdmission::Empty);
         }
+        let mut run = capture.supervisor.prepare_request(
+            capture.owner.clone(),
+            RunRequest::default(),
+            None,
+            capture.shell,
+            "Automatic completion checks".into(),
+        )?;
         if !run
             .commands
             .iter()
@@ -659,5 +663,183 @@ impl TaskCheckRun {
             permit: self.permit,
             run,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Restore a pending format obligation without executing a formatter.
+    fn pending_format_fixture() -> Result<(
+        tempfile::TempDir,
+        tempfile::TempDir,
+        HarnessBroker,
+        Exchange,
+    )> {
+        let workspace = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            serde_json::to_vec(&json!({"checks":{"format":{
+                "trigger":{"auto":true},
+                "action":{"category":"format","adapter":{"script":{"command":["unused-formatter"]}}}
+            }}}))?,
+        )?;
+        let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+            "workspace":workspace.path(),"data_root":data.path(),"client_id":"disabled-checks",
+            "provider":{"kind":"mock","command":[]}
+        }))?)?;
+        let mut exchange =
+            super::super::test::completed_interaction("read-only", &broker.session.id, Vec::new());
+        exchange.check_owner = Some(exchange.id.clone());
+        broker.store.save_exchange(&exchange)?;
+        let snapshot = crate::checks::ConfigSnapshot::load(workspace.path())?;
+        let definition = snapshot
+            .config
+            .definitions
+            .iter()
+            .find(|definition| definition.id == "format")
+            .unwrap();
+        let root = broker.check_runner.root.clone();
+        std::fs::write(
+            root.join("verification/requirements.json"),
+            serde_json::to_vec(&json!({
+                "version":crate::storage::state::VERSION,"session_id":broker.session.id,
+                "workspace":workspace.path().canonicalize()?,"generation":1,
+                "requirements":{"earlier-format-fix":{
+                    "generation":1,"task_id":null,"definition":definition,
+                    "helper_digest":snapshot.helper_digest,"requested":{"kind":"all"},
+                    "state":{"state":"pending"}
+                }}
+            }))?,
+        )?;
+        broker.check_runner = CheckSupervisor::open(
+            crate::checks::CheckSupervisorContext {
+                session_id: broker.session.id.clone(),
+                data_root: data.path().into(),
+                workspace: workspace.path().into(),
+                root,
+            },
+            broker.presentation(),
+            broker.store.objects.clone(),
+            broker.repositories.clone(),
+            broker.trace.clone(),
+        )?;
+        assert!(broker.check_runner.has_verification_requirements()?);
+        Ok((workspace, data, broker, exchange))
+    }
+
+    /// Disabled completion checks cannot be revived by an earlier format mutation.
+    #[test]
+    fn disabled_checks_skip_pending_format_verification() -> Result<()> {
+        let (_workspace, _data, mut broker, _exchange) = pending_format_fixture()?;
+        let (transaction, action) = broker
+            .begin_automatic_checks((json!({}), Vec::new()), crate::provider::PromptMode::Chat)?;
+        assert!(
+            transaction.is_none(),
+            "disabled checks created a completion transaction"
+        );
+        assert!(matches!(action, AutomaticCheckAction::Finish(_)));
+        assert!(broker.check_runner.history()?.is_empty());
+        assert!(broker.check_runner.has_verification_requirements()?);
+        crate::settings::SettingsStore::open(&broker.data_root)?.patch(
+            crate::settings::SettingTarget {
+                scope: crate::settings::SettingScope::Global,
+                workspace: &broker.session.workspace,
+                session: &broker.session.id,
+            },
+            &crate::settings::PortableSettings {
+                automatic_checks: Some(true),
+                ..Default::default()
+            },
+        )?;
+        let (transaction, action) = broker
+            .begin_automatic_checks((json!({}), Vec::new()), crate::provider::PromptMode::Chat)?;
+        assert!(transaction.is_some());
+        assert!(matches!(action, AutomaticCheckAction::Refresh(_)));
+        Ok(())
+    }
+
+    /// A read-only mock-provider turn finishes without running a saved format obligation.
+    #[tokio::test]
+    async fn read_only_mock_turn_does_not_schedule_format_verification() -> Result<()> {
+        let (_workspace, _data, mut broker, _exchange) = pending_format_fixture()?;
+        let result = broker
+            .run_interaction(
+                crate::provider::ProviderInput::from_user_text("Explain the providers"),
+                crate::provider::PromptMode::Chat,
+                Some(super::super::ExchangeAdmission::chat(
+                    "Explain the providers".into(),
+                )),
+            )
+            .await;
+        assert!(result.is_ok(), "read-only mock turn failed: {result:?}");
+        assert!(
+            broker.check_runner.history()?.is_empty(),
+            "read-only turn scheduled a check"
+        );
+        assert!(broker.check_runner.has_verification_requirements()?);
+        Ok(())
+    }
+
+    /// Disabling between capture and admission prevents both refresh and process launch.
+    #[test]
+    fn disabled_checks_stop_captured_format_verification() -> Result<()> {
+        let (_workspace, _data, mut broker, exchange) = pending_format_fixture()?;
+        let capture = broker.capture_automatic_check(&exchange)?;
+        assert!(matches!(
+            broker.admit_automatic_check(&exchange, capture)?,
+            AutomaticCheckAdmission::Empty
+        ));
+        let mut transaction = AutomaticCheckTransaction {
+            automatic: AutomaticChecks::open(&broker.check_runner.root, &exchange.id)?,
+            change_owner: exchange.id.clone(),
+            interaction: exchange.clone(),
+            result: (json!({}), Vec::new()),
+        };
+        let capture = broker.capture_automatic_check(&exchange)?;
+        let action = broker.apply_automatic_check_refresh(
+            &mut transaction,
+            AutomaticCheckRefreshResult::Ready(capture),
+        )?;
+        assert!(matches!(action, AutomaticCheckAction::Finish(_)));
+        let action = broker.revalidate_automatic_checks(&mut transaction)?;
+        assert!(matches!(action, AutomaticCheckAction::Finish(_)));
+        assert!(broker.check_runner.history()?.is_empty());
+        Ok(())
+    }
+
+    /// A collected result cannot schedule a retry after automatic checks are disabled.
+    #[test]
+    fn disabled_checks_do_not_retry_unsatisfied_format_verification() -> Result<()> {
+        let (_workspace, _data, mut broker, exchange) = pending_format_fixture()?;
+        let capture = broker.capture_automatic_check(&exchange)?;
+        let mut run = broker
+            .check_runner
+            .prepare_request(
+                capture.owner.clone(),
+                RunRequest::default(),
+                None,
+                capture.shell,
+                "fixture".into(),
+            )?
+            .into_record();
+        run.state = CheckState::Passed;
+        let result = AutomaticCheckResult {
+            capture,
+            run,
+            verification_satisfied: false,
+        };
+        let mut transaction = AutomaticCheckTransaction {
+            automatic: AutomaticChecks::open(&broker.check_runner.root, &exchange.id)?,
+            change_owner: exchange.id.clone(),
+            interaction: exchange,
+            result: (json!({}), Vec::new()),
+        };
+        let action = broker.apply_automatic_check_result(&mut transaction, result)?;
+        assert!(matches!(action, AutomaticCheckAction::Finish(_)));
+        assert!(broker.check_runner.history()?.is_empty());
+        Ok(())
     }
 }

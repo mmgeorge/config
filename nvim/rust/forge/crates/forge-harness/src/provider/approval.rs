@@ -503,7 +503,7 @@ impl PermissionCoordinator {
             })
             .transpose()?
             .flatten();
-        let evaluated = (async {
+        let mut evaluation = (async {
             let (workspace, evaluation) = {
                 let store = self
                     .store
@@ -542,28 +542,7 @@ impl PermissionCoordinator {
             }
             Ok::<_, anyhow::Error>(evaluation)
         })
-        .await;
-        let mut evaluation = match evaluated {
-            Ok(evaluation) => evaluation,
-            Err(error) => {
-                if let Some(sink) = event_sink {
-                    sink.send_host(HostEvent::Failure {
-                        failure: forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::TurnStart,
-                            forge_provider_api::ProviderFailureKind::Authorization,
-                        ),
-                        // Evaluation errors originate in Harness policy code rather than
-                        // provider payloads, so the cause is safe and necessary to show.
-                        message: forge_provider_api::SanitizedMessage::new(format!(
-                            "Permission evaluation failed: {error:#}"
-                        ))
-                        .expect("diagnostic has a static prefix"),
-                    })
-                    .await?;
-                }
-                return Err(error);
-            }
-        };
+        .await?;
         if evaluation.decision != PermissionDecision::Deny {
             let scopes = self
                 .skill_by_owner
@@ -2417,11 +2396,7 @@ mod test {
             .await
             .unwrap_err();
         assert!(failure.to_string().contains("empty"));
-        let event = stream.recv().await.unwrap().unwrap();
-        assert!(matches!(
-            event,
-            OwnerObservation::Event(HarnessEvent::Host { event: HostEvent::Failure { failure, message }, .. }) if failure.kind() == forge_provider_api::ProviderFailureKind::Authorization && message.as_str().starts_with("Permission evaluation failed: ") && message.as_str().contains("empty")
-        ));
+        assert!(stream.try_recv().is_err());
         Ok(())
     }
 
@@ -2458,12 +2433,6 @@ mod test {
                 assert!(failure.to_string().contains("shell_command_parse_error"));
                 assert!(failure.to_string().contains("split independent operations"));
                 assert!(coordinator.pending_list().unwrap().is_empty());
-                let event = stream.try_recv().unwrap();
-                assert!(matches!(
-                    event,
-                    OwnerObservation::Event(HarnessEvent::Host { event: HostEvent::Failure { failure, .. }, .. })
-                        if failure.kind() == forge_provider_api::ProviderFailureKind::Authorization
-                ));
                 assert!(stream.try_recv().is_err());
             }
             let corrected = PermissionRequest {

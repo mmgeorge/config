@@ -96,7 +96,7 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
     let mut previous_signature = None;
     let mut next_offset = reply.next_offset;
     let mut next_line = reply.next_line;
-    if !reply.coverage.is_empty() {
+    if arguments.operation != Operation::Diagnostics && !reply.coverage.is_empty() {
         let complete = reply
             .coverage
             .iter()
@@ -121,7 +121,9 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
         }
         output.push('\n');
     }
-    if let Some(freshness) = &reply.freshness {
+    if let Some(freshness) = &reply.freshness
+        && arguments.operation != Operation::Diagnostics
+    {
         ensure!(
             matches!(freshness.as_str(), "current" | "stale" | "unknown"),
             "invalid diagnostics freshness"
@@ -294,7 +296,11 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
                 .coverage
                 .iter()
                 .any(|coverage| coverage.state != CoverageState::Complete);
-        let message = if partial {
+        let message = if arguments.operation == Operation::Diagnostics
+            && reply.warnings.as_ref().is_none_or(Vec::is_empty)
+        {
+            "No diagnostics.\n"
+        } else if partial {
             "No results returned.\n"
         } else {
             match arguments.operation {
@@ -468,9 +474,9 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
 
-    /// Preserve partial coverage and unknown freshness for an empty published snapshot.
+    /// Keep successful diagnostic output free of coverage and freshness boilerplate.
     #[test]
-    fn published_diagnostics_do_not_certify_an_empty_workspace() {
+    fn diagnostics_omit_coverage_and_freshness_headers() {
         let arguments = Arguments::parse(
             "lsp_diagnostics",
             json!({"workspace":{"path":".","language":"rust"}}),
@@ -483,11 +489,7 @@ mod tests {
         }))
         .expect("published coverage is supported");
         let output = render(reply, &arguments, Path::new("/project")).expect("render snapshot");
-        assert!(output.contains("coverage: partial"));
-        assert!(output.contains("publisher [.]: partial"));
-        assert!(output.contains("freshness: unknown"));
-        assert!(output.contains("No results returned."));
-        assert!(!output.contains("coverage: complete"));
+        assert_eq!(output, "No diagnostics.\n");
     }
 
     /// Reject unknown coverage states at the editor response boundary.

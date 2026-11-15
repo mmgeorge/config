@@ -1575,6 +1575,7 @@ impl SessionController {
                 provider_lifecycle: controller.provider_lifecycle(),
                 publications: controller.publications.clone(),
                 input: controller.coordinator.submissions.clone(),
+                check_inbox: controller.observer.check_inbox.clone(),
                 submissions: controller.submission_store.clone(),
                 provider: controller.provider.clone(),
                 provider_lane: controller.provider_lane.clone(),

@@ -30,6 +30,7 @@ local M = {}
 ---@field start_line? integer
 ---@field include_declaration? boolean
 ---@field severity? string
+---@field diagnostic_paths? string[]
 
 local function declaration_row(snapshot, declaration)
   return { path = snapshot.path, line = declaration.line, column = declaration.column,
@@ -429,6 +430,41 @@ function M.request(workspace, arguments, authorize, analyze, receive)
         arguments.path, arguments.line, arguments.column = resolved.path, resolved.line, resolved.column
         start()
       end)
+    elseif arguments.operation == "diagnostics" and arguments.diagnostic_paths then
+      local selected = {}
+      local root = readiness.client.root_dir or readiness.client.config.root_dir or workspace
+      local scope = arguments.path or root
+      local scope_stat = vim.uv.fs_stat(scope)
+      if scope_stat and scope_stat.type == "file" then start() return end
+      local candidates, seen = vim.deepcopy(arguments.diagnostic_paths), {}
+      for source_buffer in pairs(readiness.client.attached_buffers or {}) do
+        if vim.api.nvim_buf_is_valid(source_buffer) and vim.bo[source_buffer].modified then
+          candidates[#candidates + 1] = vim.api.nvim_buf_get_name(source_buffer)
+        end
+      end
+      for _, path in ipairs(candidates) do
+        local filetype = vim.filetype.match({ filename = path })
+        local identity = source.canonical(path)
+        if not seen[identity] and source.inside(path, root) and source.inside(path, scope)
+          and vim.tbl_contains(readiness.client.config.filetypes or {}, filetype)
+          and (source.loaded(path) or vim.uv.fs_stat(path)) then
+          selected[#selected + 1] = path
+          seen[identity] = true
+        end
+      end
+      local index = 1
+      local function refresh_next()
+        if finished then return end
+        local path = selected[index]
+        if not path then start() return end
+        index = index + 1
+        authorize({ path }, function(allowed, failure)
+          if finished then return end
+          if failure or not allowed[path] then finish(failure or ("access_denied: " .. path)) return end
+          query({ operation = "diagnostics", path = path, severity = arguments.severity or "all" }, refresh_next)
+        end)
+      end
+      refresh_next()
     else start() end
   end
   if arguments.operation == "workspace_list" then

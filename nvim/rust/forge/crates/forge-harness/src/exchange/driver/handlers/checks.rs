@@ -3,6 +3,154 @@
 use super::super::*;
 
 impl ExchangeDriver {
+    /// Deliver retained results directly from the owner loop, independent of caller queue controls.
+    pub(in crate::exchange::driver) async fn check_results_advance(
+        &mut self,
+        env: &DriverEnv,
+        state: &mut DriverState,
+        step: u64,
+        closed: bool,
+    ) {
+        if let Err(error) = self.check_result_dispatch(env, state, step, closed).await {
+            tracing::error!(target: "forge::harness", event_name = "check_result.dispatch_failed",
+                session_id = env.session_id, error = %format!("{error:#}"), "Check result dispatch failed");
+        }
+    }
+
+    /// Claim a result only after its original exchange and provider destination remain eligible.
+    async fn check_result_dispatch(
+        &mut self,
+        env: &DriverEnv,
+        state: &mut DriverState,
+        step: u64,
+        closed: bool,
+    ) -> Result<()> {
+        use crate::exchange::check_result::DeliveryDeferral;
+        let services = &env.services;
+        let Some(message) = services
+            .check_inbox
+            .snapshot()?
+            .messages
+            .into_iter()
+            .find(|message| {
+                !matches!(
+                    message.delivery(),
+                    crate::input::InputDelivery::Delivering | crate::input::InputDelivery::Accepted
+                )
+            })
+        else {
+            return Ok(());
+        };
+        let reason = if message.delivery() != crate::input::InputDelivery::Queued {
+            Some(DeliveryDeferral::DeliveryUnresolved)
+        } else if closed
+            || self.commands.has_pending()
+            || self.commands.storage_unavailable()
+            || state.command.is_some()
+            || !state.pending.is_empty()
+            || self
+                .input_delivery
+                .as_ref()
+                .is_some_and(InputDeliveryRun::blocks_input_admission)
+            || !matches!(self.execution_state, ExecutionState::Ready)
+            || services.tasks.configuration_is_uncertain()
+        {
+            Some(DeliveryDeferral::OwnerBusy)
+        } else if services.observer.input_readiness()?.has_approval {
+            Some(DeliveryDeferral::ApprovalPending)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.check_results.defer(&env.session_id, &message, reason);
+            return Ok(());
+        }
+        let Some(output) = state.command_messages.clone() else {
+            return Ok(());
+        };
+        let Ok(control) = services.control.clone().try_acquire_owned() else {
+            self.check_results
+                .defer(&env.session_id, &message, DeliveryDeferral::ControlBusy);
+            return Ok(());
+        };
+        let input = super::super::super::command::InputRevision {
+            id: super::super::super::command::InputId::new(message.id.clone())?,
+            revision: message.revision,
+        };
+        let (reply, _response) = oneshot::channel();
+        let reply = InputOfferReply::Ready {
+            id: InputReadinessId(uuid::Uuid::new_v4()),
+            reply,
+        };
+        let event = match services.execution.clone().try_acquire_owned() {
+            Ok(execution) => OwnerEvent::InputOffer {
+                offer: InputDeliveryOffer {
+                    input,
+                    execution,
+                    control,
+                },
+                messages: output,
+                reply,
+            },
+            Err(_) => {
+                let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &message.purpose
+                else {
+                    anyhow::bail!("internal inbox contains non-check input");
+                };
+                let active = crate::storage::HistoryReader::current(&services.root)?
+                    .latest_exchange(&env.session_id)?;
+                if active.is_none_or(|active| active.id != *exchange_id) {
+                    self.check_results.defer(
+                        &env.session_id,
+                        &message,
+                        DeliveryDeferral::OtherExchange,
+                    );
+                    return Ok(());
+                }
+                if !services.observer.native_steer_supported()?
+                    || self.steering.len() >= crate::provider::SteeringLane::CAPACITY
+                {
+                    self.check_results.defer(
+                        &env.session_id,
+                        &message,
+                        DeliveryDeferral::ProviderBusy,
+                    );
+                    return Ok(());
+                }
+                let Ok(order) = self.steering_order.clone().try_acquire_owned() else {
+                    self.check_results.defer(
+                        &env.session_id,
+                        &message,
+                        DeliveryDeferral::ProviderBusy,
+                    );
+                    return Ok(());
+                };
+                OwnerEvent::SteeringOffer {
+                    offer: SteeringDeliveryOffer {
+                        input,
+                        control,
+                        order,
+                    },
+                    messages: output,
+                    reply,
+                }
+            }
+        };
+        self.receive(
+            event,
+            &mut state.pending,
+            OwnerIntake {
+                active: state.command.as_mut(),
+                steering: SteeringAdmission::from(state.foreground.as_ref()),
+            },
+            &mut state.command_messages,
+            &env.broker,
+            env.context(step),
+        )
+        .await;
+        Ok(())
+    }
+
     /// Apply one task check event.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::exchange::driver) async fn task_check_wake(
@@ -355,6 +503,9 @@ impl ExchangeDriver {
                         "run_id":completion.run_id,"succeeded":completion.outcome.is_ok(),"update_step":step,
                     }));
                 check_runs.settle(&completion);
+                tracing::info!(target: "forge::harness", event_name = "check_result.collected",
+                    session_id, run_id = completion.run_id, succeeded = completion.outcome.is_ok(),
+                    "Collected check run for result delivery");
                 self.check_results.request();
                 if check_scope.as_ref() != Some(&completion.scope) {
                     let _ = check_runs.retire_scope(&completion.scope);

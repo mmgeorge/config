@@ -59,9 +59,10 @@ pub(super) struct ResolvedFile {
 }
 
 impl CheckpointRecord {
-    /// Identifies selected package inputs without invalidating them for unrelated packages.
+    /// Identify selected working contents independently of Git and snapshot storage.
     pub(crate) fn check_identity(
         &self,
+        objects: &ObjectStore,
         directory: Option<&str>,
         extra: &[String],
     ) -> Result<String> {
@@ -76,7 +77,16 @@ impl CheckpointRecord {
                         || extra.contains(path)
                 })
             })
-            .collect::<BTreeMap<_, _>>();
+            .map(|(path, file)| {
+                let identity = match file.source {
+                    Content::Stored(identity) => identity,
+                    Content::Git(baseline) => {
+                        objects.baseline_identity(Path::new(&self.workspace), &baseline)?
+                    }
+                };
+                Ok((path, (identity, file.mode)))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(crate::plan::digest(&serde_json::to_vec(&files)?))
     }
 

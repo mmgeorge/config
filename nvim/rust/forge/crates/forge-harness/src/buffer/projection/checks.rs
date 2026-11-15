@@ -176,61 +176,59 @@ fn category_label(category: CheckCategory) -> &'static str {
 }
 
 pub(super) fn check_summary(run: &CheckRun) -> String {
-    let leaves = [
-        CheckCategory::TypeCheck,
-        CheckCategory::Test,
-        CheckCategory::Format,
-        CheckCategory::Lint,
-        CheckCategory::Build,
-        CheckCategory::Custom,
-    ]
-    .into_iter()
-    .flat_map(|category| check_leaves(run, category))
-    .collect::<Vec<_>>();
-    summarize_check_leaves(&leaves)
+    summarize_checks(run.commands.iter())
 }
 
-fn summarize_check_leaves(leaves: &[CheckLeaf<'_>]) -> String {
+/// Count each definition and test identity once while retaining every command execution.
+fn summarize_checks<'check>(commands: impl Iterator<Item = &'check CommandCheck>) -> String {
     let mut latest = BTreeMap::new();
-    for leaf in leaves {
-        let state = leaf.state();
-        let category = leaf
-            .check
+    let mut tests = BTreeMap::new();
+    let mut runs = 0;
+    for command in commands {
+        if matches!(command.state, CheckState::Pending | CheckState::Skipped) {
+            continue;
+        }
+        let definition = command
             .context
             .as_ref()
-            .map_or(CheckCategory::TypeCheck, |context| context.category);
-        let definition = leaf
-            .check
-            .context
-            .as_ref()
-            .map_or(leaf.check.command.as_str(), |context| {
+            .map_or(command.command.as_str(), |context| {
                 context.definition_id.as_str()
             });
-        let key = (
-            category_key(category),
-            definition,
-            leaf.scope.as_str(),
-            leaf.identity(),
-        );
-        let result = latest.entry(key).or_insert((state, 0_usize));
-        result.0 = state;
-        result.1 += 1;
+        latest.insert(definition, command.state);
+        runs += 1;
+        if let Some(result) = command
+            .result
+            .as_ref()
+            .and_then(crate::checks::adapter::AdapterResult::tests)
+        {
+            for case in &result.cases {
+                tests.insert(
+                    (definition, case.id.as_str()),
+                    case.status == Some(CaseStatus::Passed),
+                );
+            }
+            for id in &result.not_found {
+                tests.insert((definition, id.as_str()), false);
+            }
+        }
     }
-    // Pending and skipped commands produce no leaves; a run with none executed no check,
+    // Pending and skipped commands never executed a check,
     // and a vacuous `0/0 passed` reads as success.
     if latest.is_empty() {
         return "No automatic checks ran".into();
     }
-    let attempts = latest
+    let passed = latest
         .values()
-        .map(|(_, attempts)| *attempts)
-        .max()
-        .unwrap_or(0);
-    let summary =
-        CheckRun::summarize_states(latest.values().map(|(state, _)| *state), Some(latest.len()));
+        .filter(|state| **state == CheckState::Passed)
+        .count();
+    let mut summary = format!("{passed}/{} passed", latest.len());
+    if !tests.is_empty() {
+        let passed = tests.values().filter(|passed| **passed).count();
+        summary.push_str(&format!(" · {passed}/{} tests passed", tests.len()));
+    }
     format!(
-        "{summary} · {attempts} {}",
-        if attempts == 1 { "attempt" } else { "attempts" }
+        "{summary} · {runs} {}",
+        if runs == 1 { "run" } else { "runs" }
     )
 }
 
@@ -341,7 +339,13 @@ impl TimelineRenderer<'_> {
                 &format!(
                     "{} · {} · {:.1}s",
                     category_label(category),
-                    summarize_check_leaves(&leaves),
+                    summarize_checks(run.commands.iter().filter(|command| {
+                        command
+                            .context
+                            .as_ref()
+                            .map_or(CheckCategory::TypeCheck, |context| context.category)
+                            == category
+                    })),
                     duration as f64 / 1000.0
                 ),
                 None,
@@ -933,6 +937,106 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Summaries distinguish latest definition outcomes, unique cases, and all executions.
+    #[test]
+    fn summaries_count_definitions_cases_and_runs_independently() -> Result<()> {
+        let mut commands = Vec::new();
+        for (index, definition, category, state, cases) in [
+            (0, "typecheck", "typecheck", "passed", vec![]),
+            (
+                1,
+                "tests",
+                "test",
+                "failed",
+                vec![("first", "passed"), ("second", "failed")],
+            ),
+            (2, "format", "format", "passed", vec![]),
+            (3, "lint", "lint", "passed", vec![]),
+            (4, "build", "build", "failed", vec![]),
+            (
+                5,
+                "tests",
+                "test",
+                "passed",
+                vec![("second", "passed"), ("third", "passed")],
+            ),
+            (6, "build", "build", "passed", vec![]),
+        ] {
+            let result = (category == "test").then(|| {
+                json!({
+                    "category":"tests", "selection":{"ids":[],"affected":[]}, "items":[],
+                    "cases":cases.into_iter().map(|(id, status)| json!({
+                        "id":id,"status":status,"failures":[],"output_truncated_bytes":0
+                    })).collect::<Vec<_>>(),
+                    "not_found":[],"error":null,"protocol_error":null,"exit":0,
+                    "cancelled":false,"unsupported":false,"output_truncated_bytes":0
+                })
+            });
+            commands.push(json!({
+                "id":format!("command-{index}"),"command":"fixture","state":state,
+                "started_at_ms":index * 100,"completed_at_ms":(index + 1) * 100,
+                "exit_code":0,"error":null,"stdout":"unused","stderr":"unused",
+                "output":"unused","output_bytes":0,"preview":"","result":result,
+                "context":{"purpose":"verify","definition_id":definition,"name":definition,
+                    "area":".","reason":"selected","matched_files":[],"category":category,
+                    "directory":".","selection":{"kind":"files","files":[format!("scope-{index}")]},
+                    "resolved":null,"depends_on":[]}
+            }));
+        }
+        let mut run: CheckRun = serde_json::from_value(json!({
+            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
+            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+            "started_at_ms":0,"completed_at_ms":700,"state":"passed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":commands
+        }))?;
+        assert_eq!(
+            check_summary(&run),
+            "5/5 passed · 3/3 tests passed · 7 runs"
+        );
+        let projected = project(
+            &TimelineEntry::Checks {
+                id: "run".into(),
+                created_at_ms: 0,
+                run: run.clone().into(),
+            },
+            &WidthProfile::default(),
+            FIXTURE_NOW_MS,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
+        )?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Checks · 5/5 passed · 3/3 tests passed · 7 runs"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Tests · 1/1 passed · 3/3 tests passed · 2 runs"),
+            "{text}"
+        );
+        assert!(text.contains("Builds · 1/1 passed · 2 runs"), "{text}");
+        assert!(!text.contains("attempt"), "{text}");
+        run.commands[5].state = CheckState::Failed;
+        if let Some(crate::checks::adapter::AdapterResult::Tests(result)) =
+            &mut run.commands[5].result
+        {
+            result.cases[0].status = Some(CaseStatus::Failed);
+        }
+        assert_eq!(
+            check_summary(&run),
+            "4/5 passed · 2/3 tests passed · 7 runs"
+        );
+        Ok(())
+    }
+
     /// Render restored diagnostics with precise source links, severity groups, and artifacts.
     #[test]
     fn diagnostics_keep_source_actions_and_severity_after_restore() -> Result<()> {
@@ -1341,10 +1445,7 @@ mod tests {
             .flat_map(|block| block.text.wire_rows())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            text.contains("3/4 passed · 1 failed · 2 attempts"),
-            "{text}"
-        );
+        assert!(text.contains("3/4 passed · 5 runs"), "{text}");
         for category in ["Formatting", "Lint", "Tests", "Builds"] {
             assert!(text.contains(category));
         }
@@ -1356,13 +1457,10 @@ mod tests {
         assert!(text.contains("Run 1 · Passed · 0.1s"), "{text}");
         assert!(text.contains("Run 2 · Failed · 0.2s"), "{text}");
         assert!(
-            text.contains("Formatting · 0/1 passed · 1 failed · 2 attempts · 0.3s"),
+            text.contains("Formatting · 0/1 passed · 2 runs · 0.3s"),
             "{text}"
         );
-        assert!(
-            text.contains("Tests · 1/1 passed · 1 attempt · 0.3s"),
-            "{text}"
-        );
+        assert!(text.contains("Tests · 1/1 passed · 1 run · 0.3s"), "{text}");
         assert!(!text.contains("format check"), "{text}");
         assert!(text.contains("Failed"));
         for category in ["format", "lint", "test", "build"] {
@@ -1406,21 +1504,15 @@ mod tests {
         independent.id = "independent".into();
         independent.context.as_mut().unwrap().definition_id = "other-format".into();
         retried.commands.push(independent);
-        assert_eq!(check_summary(&retried), "5/5 passed · 5 attempts");
+        assert_eq!(check_summary(&retried), "5/5 passed · 9 runs");
         let mut regression = run.commands[1].clone();
         regression.id = "regression".into();
         retried.commands.push(regression.clone());
-        assert_eq!(
-            check_summary(&retried),
-            "4/5 passed · 1 failed · 6 attempts"
-        );
+        assert_eq!(check_summary(&retried), "4/5 passed · 10 runs");
         regression.id = "excluded".into();
         regression.state = CheckState::Skipped;
         retried.commands.push(regression);
-        assert_eq!(
-            check_summary(&retried),
-            "4/5 passed · 1 failed · 6 attempts"
-        );
+        assert_eq!(check_summary(&retried), "4/5 passed · 10 runs");
 
         let mut failed_run = run;
         failed_run.commands[0].state = CheckState::Failed;

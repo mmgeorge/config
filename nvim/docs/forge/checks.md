@@ -72,13 +72,17 @@ once and waits for that process to settle.
 Submitting a new message during checks stops the previous execution and collects
 its running checks before starting the message. The composer retains newer drafts
 while that interruption finishes.
-Completed runs retain the full details. Result summaries omit not-run counts while
-preserving passed, failed, interrupted, stale, and other error counts.
+Completed runs retain the full details, including failed, interrupted, stale,
+and other outcomes in their expandable history.
 
 The transcript groups completed results under **Checks**, then by category and
 source file or configured definition. Repeated executions appear as separate
 Run rows in their original order. Adapters report category-specific results.
-The Checks summary counts command executions independently of their result rows.
+The Checks headline and category summaries count distinct check definitions using
+each definition's latest executed result. They also show unique test cases using
+each case's latest result within its definition, and total command executions as
+`runs`. Retries increase runs without duplicating definitions or test cases.
+These summaries omit separate failed counts and attempt labels.
 Expand an execution to inspect its diagnostics. Its output action opens the full
 command log.
 
@@ -242,7 +246,8 @@ changes source. Keep those dependencies only when the prerequisite is required.
 
 In `/config` under **Workflow → Checks → Automatic**, **Enabled** starts off. Space toggles
 it using `●` for enabled and `○` for disabled. Turning it off suppresses automatic
-completion checks. Explicit runs and plan Checking remain available. An already
+completion checks, including verification left over from format or lint fixes.
+Explicit runs and plan Checking remain available. An already
 running check finishes unless stopped explicitly.
 
 The **Timing** field selects **After queue** by default and retains its value
@@ -459,7 +464,9 @@ prerequisite or fix stops later operations, retaining any partial edits and the
 results already recorded. Apply is available in ordinary chat and plan Resolve;
 plan Verify permits read-only checks. Apply records preparation rather than
 verification, and creates a whole-check verification requirement that survives
-restart and remains mandatory when automatic checks are disabled.
+restart. With automatic checks disabled, the requirement stays pending until
+an explicit verification run or plan Checking satisfies it; it never starts
+a background check by itself.
 Configured or task disabling leaves that requirement unresolved. Re-enable the
 check and run it again with whole-check coverage. Changes to automatic selection,
 scope, trigger, or display labels do not change the required tool identity;
@@ -485,6 +492,13 @@ changed files reports outcomes, not a count of all files checked.
 The aggregate exit code is null for multiple selected commands. Waiting ignores
 progress updates and ends on completion or the original deadline. A deadline
 returns the current summary without cancelling work.
+
+Tool-started check results reach the agent through a host-owned inbox. Pausing or
+editing queued user messages does not pause result delivery. Pending deliveries
+remain internal; the Checks display shows check progress and outcomes.
+Results still wait for a usable provider and any active approval;
+they never resume a cancelled exchange. Info-level `check_result.*` logs record
+admission, deferral reasons, dispatch, acceptance, recovery, and settlement.
 
 Definition details are available before execution. Execution details remain
 unavailable until the run finishes, including failed, interrupted, and blocked

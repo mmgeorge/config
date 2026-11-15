@@ -79,6 +79,67 @@ T["lsp_diagnostics"] = function()
   assert(cancelled[5], "unowned diagnostic request was not cancelled")
 end
 
+T["editor_replacement_completes_agent_request"] = function()
+  local diagnostics = require("forge.lsp.diagnostics")
+  local source_buffer = buffer_support.scratch({ "const VALUE: bool = 1;" })
+  local client = { id = 983, server_capabilities = { diagnosticProvider = { identifier = "fixture" } },
+    handlers = { ["textDocument/diagnostic"] = function() end }, requests = {} }
+  function client:request(_, _, _) return true, 41 end
+  function client:cancel_request() end
+  local response
+  diagnostics.request(client, source_buffer, { textDocument = { uri = vim.uri_from_bufnr(source_buffer) } },
+    function(failure, result) response = { failure = failure, result = result } end)
+  client.requests[42] = { type = "pending", bufnr = source_buffer, method = "textDocument/diagnostic" }
+  for _, event in ipairs({ { 41, "cancel" }, { 42, "pending" } }) do
+    vim.api.nvim_exec_autocmds("LspRequest", { data = { client_id = client.id, request_id = event[1],
+      request = { method = "textDocument/diagnostic", type = event[2], bufnr = source_buffer } } })
+  end
+  client.requests[42] = nil
+  vim.api.nvim_exec_autocmds("LspRequest", { data = { client_id = client.id, request_id = 42,
+    request = { method = "textDocument/diagnostic", type = "complete", bufnr = source_buffer } } })
+  local items = { { message = "expected bool", severity = 1 } }
+  client.handlers["textDocument/diagnostic"](nil, { kind = "full", items = items },
+    { request_id = 42, bufnr = source_buffer, params = { identifier = "fixture" } })
+  eq(response, { result = { items = items } })
+end
+
+T["cancel_without_replacement_settles_agent_request"] = function()
+  local diagnostics = require("forge.lsp.diagnostics")
+  local source_buffer = buffer_support.scratch({ "const VALUE: bool = true;" })
+  local client = { id = 982, server_capabilities = {}, handlers = {}, requests = {} }
+  function client:request() return true, 41 end
+  function client:cancel_request() end
+  local response
+  diagnostics.request(client, source_buffer, {}, function(failure) response = failure end)
+  vim.api.nvim_exec_autocmds("LspRequest", { data = { client_id = client.id, request_id = 41,
+    request = { method = "textDocument/diagnostic", type = "cancel", bufnr = source_buffer } } })
+  wait_until(function() return response ~= nil end, "cancelled diagnostic request did not settle")
+  eq(response.code, -32801)
+end
+
+T["native_empty_report_replaces_pull_cache_without_hiding_push_errors"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local path = dofile("nvim/lua/forge/tests/support/temp.lua").file("native.rs", { "fn main() {}" })
+  local source_buffer = vim.fn.bufadd(path)
+  local client = { id = 981, server_capabilities = {
+    diagnosticProvider = { identifier = "native", workspaceDiagnostics = true },
+  } }
+  function client:request(_, _, receive)
+    receive(nil, { items = { { uri = vim.uri_from_fname(path), kind = "full", items = {} } } })
+    return true, 1
+  end
+  local push_namespace = vim.lsp.diagnostic.get_namespace(client.id, false)
+  local pull_namespace = vim.lsp.diagnostic.get_namespace(client.id, true, "native")
+  vim.diagnostic.set(push_namespace, source_buffer, { { lnum = 0, col = 0, message = "compiler error" } })
+  vim.diagnostic.set(pull_namespace, source_buffer, { { lnum = 0, col = 0, message = "resolved native error" } })
+  MiniTest.finally(function() pcall(vim.diagnostic.reset, push_namespace) pcall(vim.diagnostic.reset, pull_namespace) end)
+  local result
+  require("forge.lsp.diagnostics").workspace(client, function(failure, value) eq(failure, nil) result = value end)
+  eq(#result.items, 2)
+  eq(result.items[1].items, {})
+  eq(result.items[2].items[1].message, "compiler error")
+end
+
 T["workspace_prefers_native_pull"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   local calls, cancelled = {}, nil
@@ -91,7 +152,7 @@ T["workspace_prefers_native_pull"] = function()
     return true, 44
   end
   function client:cancel_request(identity) cancelled = identity end
-  stub(vim.diagnostic, "get", function() error("native pull read the push namespace") end)
+  stub(vim.diagnostic, "get", function() return {} end)
   local reply, acquisition
   local accepted, cancel = require("forge.lsp.diagnostics").workspace(client, function(failure, result, kind)
     eq(failure, nil)
@@ -117,7 +178,8 @@ T["workspace_published_reports_follow_neovim_replacement_and_client_lifetime"] =
   local active = client
   stub(vim.lsp, "get_client_by_id", function() return active end)
   local namespace = vim.lsp.diagnostic.get_namespace(client.id, false)
-  local pull_namespace = vim.lsp.diagnostic.get_namespace(client.id, true)
+  client.server_capabilities.diagnosticProvider.identifier = "fixture"
+  local pull_namespace = vim.lsp.diagnostic.get_namespace(client.id, true, "fixture")
   MiniTest.finally(function() vim.diagnostic.reset(namespace) vim.diagnostic.reset(pull_namespace) end)
   local function publish(message)
     vim.lsp.diagnostic.on_publish_diagnostics(nil, { uri = vim.uri_from_fname(path), diagnostics = message and {
@@ -139,10 +201,16 @@ T["workspace_published_reports_follow_neovim_replacement_and_client_lifetime"] =
   vim.diagnostic.set(pull_namespace, buffer, { { lnum = 0, col = 0, message = "pull-only" } })
   local reply = acquire()
   eq(#reply.items, 1)
-  eq(reply.items[1].items[1].message, "first")
-  eq(reply.items[1].items[1].range.start.character, 5)
+  eq(#reply.items[1].items, 2)
+  local messages = vim.tbl_map(function(item) return item.message end, reply.items[1].items)
+  table.sort(messages)
+  eq(messages, { "first", "pull-only" })
+  for _, item in ipairs(reply.items[1].items) do
+    if item.message == "first" then eq(item.range.start.character, 5) end
+  end
   eq(reply.items[1].encoding, "utf-8")
   publish("replacement")
+  vim.diagnostic.reset(pull_namespace)
   eq(acquire().items[1].items[1].message, "replacement")
   publish(nil)
   eq(acquire().items, {})

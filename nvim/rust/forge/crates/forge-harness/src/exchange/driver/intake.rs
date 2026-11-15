@@ -332,7 +332,8 @@ impl ExchangeDriver {
                     if unavailable {
                         return Ok(false);
                     }
-                    let snapshot = services.input.snapshot().map_err(InputOfferError::Queue)?;
+                    let store = services.input_store(input.id.as_str()).map_err(InputOfferError::Queue)?;
+                    let snapshot = store.snapshot().map_err(InputOfferError::Queue)?;
                     if snapshot.messages.iter().any(|message| message.delivery() == crate::input::InputDelivery::Unknown) { return Ok(false); }
                     let Some(message) = snapshot.messages.iter().find(|message| message.id == input.id.as_str() && message.revision == input.revision).cloned() else { return Ok(false); };
                     if !steering_input_eligible(&message, services)?
@@ -342,7 +343,7 @@ impl ExchangeDriver {
                     }
                     if !crate::input::input_purpose_is_current(&services.tasks, &services.questions, &message.purpose, &services.root, services.observer.session_id()).map_err(InputOfferError::Authority)? { return Ok(false); }
                     let ready = services.observer.input_readiness().map_err(InputOfferError::Queue)?;
-                    if ready.has_approval || ready.checks_running && !message.reports_check_failure() { return Ok(false); }
+                    if ready.has_approval || ready.checks_running && !matches!(message.purpose, crate::input::InputPurpose::CheckResult { .. }) { return Ok(false); }
                     let mut broker = broker.lock().await;
                     if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &message.purpose {
                         let current = crate::storage::HistoryReader::current(&services.root)
@@ -356,8 +357,9 @@ impl ExchangeDriver {
                     let target = if let Some(parent) = broker.parent_input.capture().filter(crate::provider::SteeringTarget::is_open) {
                         SteeringDispatchTarget::parent(parent, registry, crate::provider::ThreadOwner::root(session))
                     } else { return Ok(false); };
-                    let Some(message) = services.input.claim(input.id.as_str(), input.revision, crate::input::InputRoute::Steering).map_err(InputOfferError::Queue)? else { return Ok(false); };
+                    let Some(message) = store.claim(input.id.as_str(), input.revision, crate::input::InputRoute::Steering).map_err(InputOfferError::Queue)? else { return Ok(false); };
                     let claimed_revision = message.revision;
+                    self.check_results.dispatched(session, &message, crate::input::InputRoute::Steering);
                     self.steering.insert(input.id.clone(), InputDeliveryRun::start_steering(message, control, order, target, output.clone(), services));
                     let snapshot = services.input.snapshot().map_err(InputOfferError::Queue)?;
                     publish_input_observation(crate::input::InputUpdate { revision: snapshot.revision, suspended: snapshot.suspended,
@@ -400,7 +402,11 @@ impl ExchangeDriver {
                 }
                 let selected =
                     (|| -> Result<Option<crate::input::InputMessage>, InputOfferError> {
-                        let snapshot = services.input.snapshot().map_err(InputOfferError::Queue)?;
+                        let snapshot = services
+                            .input_store(input.id.as_str())
+                            .map_err(InputOfferError::Queue)?
+                            .snapshot()
+                            .map_err(InputOfferError::Queue)?;
                         let Some(message) = snapshot.messages.iter().find(|message| {
                             message.id == input.id.as_str() && message.revision == input.revision
                         }) else {
@@ -421,7 +427,11 @@ impl ExchangeDriver {
                             .observer
                             .input_readiness()
                             .map_err(InputOfferError::Queue)?;
-                        if ready.checks_running && !message.reports_check_failure()
+                        if ready.checks_running
+                            && !matches!(
+                                message.purpose,
+                                crate::input::InputPurpose::CheckResult { .. }
+                            )
                             || ready.has_approval
                             || message.intent == crate::input::InputIntent::Queue
                                 && ready.has_elicitation
@@ -461,7 +471,21 @@ impl ExchangeDriver {
                                 }
                             }
                         }
-                        let message = match services.input.claim(
+                        let store = match services.input_store(input.id.as_str()) {
+                            Ok(store) => store,
+                            Err(error) => {
+                                notify_input_offer(
+                                    reply,
+                                    Err(InputOfferError::Queue(error)),
+                                    trace,
+                                    session,
+                                    &input,
+                                    step,
+                                );
+                                return;
+                            }
+                        };
+                        let message = match store.claim(
                             input.id.as_str(),
                             input.revision,
                             crate::input::InputRoute::Turn,
@@ -510,6 +534,11 @@ impl ExchangeDriver {
                             );
                         }
                         let claimed_revision = message.revision;
+                        self.check_results.dispatched(
+                            session,
+                            &message,
+                            crate::input::InputRoute::Turn,
+                        );
                         services.cancellation.arm();
                         self.input_delivery = Some(InputDeliveryRun::start(
                             message,

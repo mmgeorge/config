@@ -151,7 +151,7 @@ T["lsp_query"] = function()
   handler = function(_, _, callback) callback(nil, { items = { { range = range, severity = 1, message = "fixture error" } } }) end
   await = execute({ operation = "diagnostics", path = path })
   result = assert(await())
-  assert(result.freshness == "current" and result.rows[1].text == "error: fixture error")
+  assert(result.freshness == nil and result.rows[1].text == "error: fixture error")
   handler = function(_, _, callback) callback(nil, { { uri = vim.uri_from_fname(path), range = range } }) end
   await = execute({ operation = "definition", path = path, line = 1, column = 3 }, function(_, receive) receive({}) end)
   result = assert(await())
@@ -342,8 +342,8 @@ T["workspace_published_diagnostics_respect_root_authorization_and_pagination"] =
   eq(result.rows[1].text, "publisher: warning: first warning")
   eq(result.next_offset, 1)
   eq(result.coverage[1].root, directory)
-  eq(result.coverage[1].state, "partial")
-  eq(result.freshness, "unknown")
+  eq(result.coverage[1].state, "complete")
+  eq(result.freshness, nil)
   eq(result.warnings, { "Results omitted by read policy" })
   result = execute(1)
   eq(result.rows[1].text, "publisher: warning: second warning")
@@ -353,8 +353,8 @@ T["workspace_published_diagnostics_respect_root_authorization_and_pagination"] =
   vim.diagnostic.reset(namespace)
   result = execute(0)
   eq(result.rows, {})
-  eq(result.coverage[1].state, "partial")
-  eq(result.freshness, "unknown")
+  eq(result.coverage[1].state, "complete")
+  eq(result.freshness, nil)
 end
 
 T["workspace_native_diagnostics_validate_reports"] = function()
@@ -371,19 +371,18 @@ T["workspace_native_diagnostics_validate_reports"] = function()
     return true, 1
   end
   local function execute()
-    local result
+    local result, failure
     require("forge.lsp.semantic").request(directory, { operation = "diagnostics" },
-      function(_, receive) receive({}) end, function(reply, failure) eq(failure, nil) result = reply end,
+      function(_, receive) receive({}) end, function(reply, message) result, failure = reply, message end,
       nil, { client = client })
-    return result
+    return result, failure
   end
   eq(execute().coverage[1].state, "complete")
-  eq(execute().freshness, "current")
+  eq(execute().freshness, nil)
   report = { items = { { kind = "unchanged" } } }
-  local result = execute()
-  eq(result.coverage[1].state, "failed")
-  eq(result.freshness, "unknown")
-  eq(result.warnings[1]:find("invalid_response", 1, true) ~= nil, true)
+  local result, failure = execute()
+  eq(result, nil)
+  eq(failure:find("invalid_response", 1, true) ~= nil, true)
 end
 
 T["workspace_snapshot_distinguishes_unsupported_storage_from_unavailable_client"] = function()
@@ -400,9 +399,8 @@ T["workspace_snapshot_distinguishes_unsupported_storage_from_unavailable_client"
       nil, { client = client })
   end
   execute()
-  eq(failure, nil)
-  eq(result.coverage[1].state, "unsupported")
-  eq(result.freshness, "unknown")
+  eq(result, nil)
+  eq(failure:find("unsupported", 1, true) ~= nil, true)
   client.is_stopped = function() return true end
   execute()
   eq(result, nil)

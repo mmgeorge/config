@@ -206,6 +206,30 @@ impl RepositoryToolScope {
         Ok(())
     }
 
+    /// Collect authorized changed files for fresh workspace diagnostic requests.
+    pub(crate) async fn diagnostic_paths(&self) -> Result<Vec<PathBuf>> {
+        self.check()?;
+        let Some(repository) = self.repository.open(self.workspace.clone()).await? else {
+            return Ok(Vec::new());
+        };
+        let snapshot = repository.snapshot(&self.repository).await?;
+        let root = repository
+            .identity
+            .worktree_root
+            .as_ref()
+            .context("repository has no worktree")?;
+        let mut paths = Vec::new();
+        for observed in &snapshot.path {
+            self.authorize(&repository, &observed.change.path).await?;
+            let path = forge_git::validate_path(root, &observed.change.path)?;
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+        self.check()?;
+        Ok(paths)
+    }
+
     pub(crate) async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
         self.check()?;
         ensure!(

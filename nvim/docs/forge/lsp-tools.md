@@ -47,7 +47,7 @@ context or a semantic query. No tool moves the editor cursor.
 | `lsp_references` | Target selector, `include_declaration=false` | Uses grouped by enclosing declaration, with one source line before and after |
 | `lsp_calls` | Target selector, required `direction=incoming` or `outgoing` | One level of callers or callees in an aligned symbol tree |
 | `lsp_paths` | `from` and `to` selectors, `max_depth=5`, `max_paths=3`, `max_requests=64` | Complete static call paths in aligned trees |
-| `lsp_diagnostics` | Optional file/directory `path`, `severity=all` | File diagnostics, or workspace reports with per-server coverage when path is omitted or a directory |
+| `lsp_diagnostics` | Optional file/directory `path`, `severity=all` | Refresh edited files and collect the selected server's push and pull diagnostics |
 | `lsp_status` | Optional `path` | Selected server root, initialization state, and supported capabilities |
 | `lsp_rename_symbol` | Target selector and required `new_name` | Apply a symbol rename across files |
 | `lsp_rename_file` | Required `old_path`, `new_path` | Move a file or directory and update references |
@@ -253,11 +253,9 @@ No-match output states the searched depth. Missing call-hierarchy support report
 an error. Conditions, data flow, and dynamic dispatch can require source review:
 a static call path does not establish that the path executes at runtime.
 
-Diagnostics omit the requested filename and report freshness explicitly:
+Diagnostics omit the requested filename for a file query:
 
 ```text
-freshness: current
-
      72:16   error[E0308]: expected &Session, found Session
      72          store.save(session)?;
 ```
@@ -331,27 +329,24 @@ partial: visibility unknown for 2 omitted declarations
   Store::flush  src/store.rs:35:8
 ```
 
-Diagnostics freshness is `current`, `stale`, or `unknown`. Pull diagnostics describe
-the captured source version. Push diagnostics retain unknown freshness when their
-version cannot be proved. Empty diagnostics do not establish a successful project
-typecheck. Use configured Harness checks for validation.
+Use `lsp_diagnostics` for fast feedback after editing. A file query synchronizes
+that document and awaits its diagnostic report. A workspace query refreshes changed
+files from the repository in the selected scope before collecting existing reports.
+Configured build and test checks still run at their normal verification boundaries.
 
 Omitting `path` from `lsp_diagnostics` queries the single server selected by
 `workspace`. A directory `path` narrows those workspace results. Forge uses native
-`workspace/diagnostic` when the server advertises it; otherwise it reads that
-client's existing published diagnostics in Neovim, including reports for unopened
-files. Results retain the server name and resolved project root, even when
-`workspace.path` names a nested Cargo project, and respect read authorization.
+`workspace/diagnostic` when the server advertises it and merges the client's
+stored push and named pull-provider diagnostics, including reports for unopened
+files. Results respect the selected scope and read authorization. Duplicate
+findings appear once; an empty replacement report clears resolved findings.
 
-Published snapshots report `coverage: partial` and `freshness: unknown`. An empty
-snapshot means no matching published diagnostics are available; it does not
-certify a clean workspace. Unsupported acquisition, failed requests, unavailable
-servers, and empty snapshots have distinct output. The query never runs Cargo,
-sends a refresh notification, or opens files to request diagnostics. For example,
-`rust-analyzer.check.workspace = false` can leave package-scoped reports; Forge
-preserves that setting and reports the snapshot's limits. Document queries keep
-their existing pull or published-report path. Workspace-symbol queries use the
-same server selection and coverage reporting.
+Successful diagnostic queries list findings or `No diagnostics.` without coverage
+or freshness headers. Source-version validation remains internal. Failed refreshes,
+unsupported acquisition, and disconnected servers report errors instead of empty
+success. Forge shares editor replacement responses with waiting agent requests,
+so an editor refresh cannot strand a cancelled agent request. Queries do not run
+Cargo or change the server's compiler-check configuration.
 
 ## Rename files and symbols
 

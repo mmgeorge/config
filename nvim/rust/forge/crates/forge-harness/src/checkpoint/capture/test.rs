@@ -102,6 +102,45 @@ fn repository() -> tempfile::TempDir {
     temporary
 }
 
+/// Committing verified bytes must not invalidate their check identity.
+#[tokio::test]
+async fn check_identity_survives_committing_unchanged_worktree() -> anyhow::Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let objects = ObjectStore::open(data.path())?;
+    let repositories = Arc::new(RepositoryStore::default());
+    let checkpoint = GitCheckpoint::new(repository.path());
+    fs::write(repository.path().join("tracked.txt"), "verified content\n")?;
+    let dirty = checkpoint
+        .capture(&objects, &repositories, "checks", 1)
+        .await?;
+    let identity = dirty.check_identity(&objects, None, &[])?;
+    let repeated = checkpoint
+        .capture(&objects, &repositories, "checks", 2)
+        .await?;
+    assert_eq!(identity, repeated.check_identity(&objects, None, &[])?);
+    forge_git::test_support::stage_and_commit(
+        repository.path(),
+        &["tracked.txt"],
+        "verified content",
+    );
+    let committed = checkpoint
+        .capture(&objects, &repositories, "checks", 3)
+        .await?;
+    assert!(dirty.equivalent(&committed, &objects)?);
+    assert_eq!(
+        identity,
+        committed.check_identity(&objects, None, &[])?,
+        "committing identical content invalidated verification"
+    );
+    fs::write(repository.path().join("tracked.txt"), "changed content\n")?;
+    let changed = checkpoint
+        .capture(&objects, &repositories, "checks", 4)
+        .await?;
+    assert_ne!(identity, changed.check_identity(&objects, None, &[])?);
+    Ok(())
+}
+
 #[test]
 fn stale_preview_rejects_before_any_file_changes() {
     use super::super::restore::{RestoreJournal, RestorePreview};

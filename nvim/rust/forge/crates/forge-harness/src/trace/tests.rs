@@ -2,6 +2,36 @@ use super::{LogLevel, store::TraceStore};
 use serde_json::json;
 use tempfile::tempdir;
 
+/// Preserve check delivery correlation at Info while excluding diagnostic and prompt bodies.
+#[test]
+fn check_delivery_info_events_preserve_correlation_without_contents() {
+    let directory = tempdir().unwrap();
+    let trace = TraceStore::open(directory.path()).unwrap();
+    trace.configure(LogLevel::Info).unwrap();
+    tracing::dispatcher::with_default(&trace.dispatch(), || {
+        tracing::info!(target: "forge::harness", event_name = "check_result.deferred",
+            session_id = "session", exchange_id = "exchange", run_id = "run",
+            input_id = "input", submission_id = "submission", deferral = "ProviderBusy",
+            route = "Steering", state = "Queued", complete = true,
+            prompt = "private prompt", diagnostic = "private diagnostic");
+    });
+    trace.flush().unwrap();
+    let contents = std::fs::read_to_string(trace.session_status("session").path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+    for (key, expected) in [
+        ("run_id", "run"),
+        ("exchange_id", "exchange"),
+        ("input_id", "input"),
+        ("submission_id", "submission"),
+        ("deferral", "ProviderBusy"),
+        ("route", "Steering"),
+    ] {
+        assert_eq!(record["payload"][key], expected);
+    }
+    assert_eq!(record["payload"]["complete"], true);
+    assert!(!contents.contains("private"));
+}
+
 /// Retain normalized collection diagnostics through storage and inspection without native text.
 #[test]
 fn terminal_collection_diagnostics_survive_trace_policy() {

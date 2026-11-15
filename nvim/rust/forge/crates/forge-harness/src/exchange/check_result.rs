@@ -6,10 +6,28 @@ use anyhow::{Result, ensure};
 use forge_provider_api::forge::{TurnInput, TurnKind};
 use tokio::time::Instant;
 
-/// Recover and admit check completion messages through the durable input queue.
+/// Recover check completions into an internal inbox independently of user input.
 pub(super) struct CheckResults {
     requested: bool,
     retry_at: Option<Instant>,
+    deferred: Option<(String, DeliveryDeferral)>,
+}
+
+/// Name the actual owner boundary retaining a result without logging its contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeliveryDeferral {
+    /// Owner shutdown or lifecycle work currently excludes dispatch.
+    OwnerBusy,
+    /// Another preparation operation owns the control permit.
+    ControlBusy,
+    /// The originating provider cannot currently accept another input.
+    ProviderBusy,
+    /// An approval must settle before execution can continue.
+    ApprovalPending,
+    /// Another exchange owns the active provider turn.
+    OtherExchange,
+    /// A previous result has uncertain delivery or needs intervention.
+    DeliveryUnresolved,
 }
 
 impl Default for CheckResults {
@@ -18,11 +36,50 @@ impl Default for CheckResults {
         Self {
             requested: true,
             retry_at: None,
+            deferred: None,
         }
     }
 }
 
 impl CheckResults {
+    /// Log a changed delivery barrier once instead of once per owner iteration.
+    pub(super) fn defer(
+        &mut self,
+        session: &str,
+        message: &InputMessage,
+        reason: DeliveryDeferral,
+    ) {
+        let observation = (message.id.clone(), reason);
+        if self.deferred.as_ref() != Some(&observation) {
+            if let InputPurpose::CheckResult {
+                exchange_id,
+                run_id,
+            } = &message.purpose
+            {
+                tracing::info!(target: "forge::harness", event_name = "check_result.deferred", session_id = session,
+                    exchange_id, run_id, input_id = message.id, deferral = ?reason, "Check result delivery deferred");
+            }
+            self.deferred = Some(observation);
+        }
+    }
+
+    /// Record dispatch after the result's delivery claim commits.
+    pub(super) fn dispatched(
+        &mut self,
+        session: &str,
+        message: &InputMessage,
+        route: crate::input::InputRoute,
+    ) {
+        self.deferred = None;
+        if let InputPurpose::CheckResult {
+            exchange_id,
+            run_id,
+        } = &message.purpose
+        {
+            tracing::info!(target: "forge::harness", event_name = "check_result.dispatched", session_id = session,
+                exchange_id, run_id, input_id = message.id, ?route, "Dispatching check result");
+        }
+    }
     /// Schedule reconciliation after actual process collection.
     pub(super) fn request(&mut self) {
         self.requested = true;
@@ -33,9 +90,8 @@ impl CheckResults {
         &mut self,
         services: &OwnerServices,
         runs: &crate::checks::owner::CheckOwnerRuns,
-        messages: Option<&forge_protocol::outbound::MessageSender>,
     ) -> Result<()> {
-        retire_obsolete(services, messages)?;
+        retire_obsolete(services)?;
         if !self.requested
             || self
                 .retry_at
@@ -43,7 +99,7 @@ impl CheckResults {
         {
             return Ok(());
         }
-        let result = reconcile(services, runs, messages);
+        let result = reconcile(services, runs);
         match &result {
             Ok(()) => {
                 self.requested = false;
@@ -68,12 +124,9 @@ impl CheckResults {
 }
 
 /// Remove never-delivered results when their originating exchange has been cancelled or retired.
-fn retire_obsolete(
-    services: &OwnerServices,
-    messages: Option<&forge_protocol::outbound::MessageSender>,
-) -> Result<()> {
+fn retire_obsolete(services: &OwnerServices) -> Result<()> {
     let mut retired = Vec::new();
-    for message in services.input.snapshot()?.messages {
+    for message in services.check_inbox.snapshot()?.messages {
         if matches!(message.purpose, InputPurpose::CheckResult { .. })
             && crate::input::task_input_retirable(&message)
             && !crate::input::input_purpose_is_current(
@@ -84,37 +137,29 @@ fn retire_obsolete(
                 services.observer.session_id(),
             )?
         {
+            if let InputPurpose::CheckResult {
+                exchange_id,
+                run_id,
+            } = &message.purpose
+            {
+                tracing::info!(target: "forge::harness", event_name = "check_result.retired",
+                    session_id = services.observer.session_id(), exchange_id, run_id, input_id = message.id,
+                    "Retiring result for an inactive exchange");
+            }
             retired.push((message.id, message.revision));
         }
     }
-    if let Some(update) = services.input.retire_internal_input(&retired)? {
-        services.publications.publish_once(
-            super::publication::PublicationOrigin::OwnerUpdate(format!(
-                "check-result-retired:{}",
-                update.revision
-            )),
-            forge_protocol::message::SessionEvent {
-                session_id: services.observer.session_id().into(),
-                event: "input_changed".into(),
-                payload: serde_json::to_value(update)?,
-            },
-            messages,
-        )?;
-    }
+    services.check_inbox.retire_internal_input(&retired)?;
     Ok(())
 }
 
 /// Commit result input before acknowledging delivery; operation receipts survive removal and restart.
-fn reconcile(
-    services: &OwnerServices,
-    runs: &crate::checks::owner::CheckOwnerRuns,
-    messages: Option<&forge_protocol::outbound::MessageSender>,
-) -> Result<()> {
+fn reconcile(services: &OwnerServices, runs: &crate::checks::owner::CheckOwnerRuns) -> Result<()> {
     // Recover immutable admissions before selecting new evidence.
     let history = services.checks.history()?;
     let mut delivered = std::collections::HashSet::new();
     let mut reported_failures = std::collections::HashSet::new();
-    for receipt in services.input.check_result_receipts()? {
+    for receipt in services.check_inbox.check_result_receipts()? {
         for message in &receipt.upsert {
             if let Some(input) = message.turn() {
                 for result in input.check_results() {
@@ -130,9 +175,6 @@ fn reconcile(
                     }
                 }
             }
-        }
-        if let Some(id) = receipt.operation_id.clone() {
-            publish(services, messages, &id, receipt)?;
         }
     }
     // Group runs by the exchange that requested them, including unfinished workers.
@@ -183,8 +225,8 @@ fn reconcile(
         let mut turn = TurnInput::new(TurnKind::CheckResult { result });
         turn.push_check_results(results);
         // Commit the grouped input and its publication under one journal transaction.
-        let snapshot = services.input.snapshot()?;
-        let update = services.input.apply(InputOperation {
+        let snapshot = services.check_inbox.snapshot()?;
+        let update = services.check_inbox.apply(InputOperation {
             id: operation_id.clone(),
             control_revision: snapshot.control_revision,
             after_control: snapshot.control_operation_id,
@@ -210,7 +252,17 @@ fn reconcile(
             "check result admission failed: {:?}",
             update.error
         );
-        publish(services, messages, &operation_id, update)?;
+        for result in update
+            .upsert
+            .iter()
+            .filter_map(InputMessage::turn)
+            .flat_map(TurnInput::check_results)
+        {
+            tracing::info!(target: "forge::harness", event_name = "check_result.admitted",
+                session_id = services.observer.session_id(), input_id = operation_id,
+                exchange_id = result.exchange_id, run_id = result.run_id, complete = result.complete, state = ?result.state,
+                "Retained check result in the internal inbox");
+        }
     }
     Ok(())
 }
@@ -276,27 +328,6 @@ fn ready_results(
                 )
         })
         .collect()
-}
-
-/// Keep queue admission visible through the same durable publication path as question replies.
-fn publish(
-    services: &OwnerServices,
-    messages: Option<&forge_protocol::outbound::MessageSender>,
-    id: &str,
-    mut update: crate::input::InputUpdate,
-) -> Result<()> {
-    // Initial delivery and recovery must publish the same immutable receipt bytes.
-    update.snapshot = None;
-    services.publications.publish_once(
-        super::publication::PublicationOrigin::CheckResult(super::command::InputId::new(id)?),
-        forge_protocol::message::SessionEvent {
-            session_id: services.observer.session_id().into(),
-            event: "input_changed".into(),
-            payload: serde_json::to_value(update)?,
-        },
-        messages,
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]

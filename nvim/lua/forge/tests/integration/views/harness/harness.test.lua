@@ -15,6 +15,59 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 -- requires-forge-host
+T["check_results_use_internal_delivery_instead_of_user_queue"] = function()
+  local workspace = temp.directory("internal-check-results")
+  vim.fn.writefile({ vim.json.encode({ checks = { fixture = {
+    trigger = { auto = false },
+    action = { category = "custom", command = { "nu", "--no-config-file", "-c", "null" }, label = "Fixture check" },
+  } } }) }, workspace .. "/.forge.json")
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local function request(method, params)
+    local result, failure, done
+    client.request({ session_id = state.session.id, method = method, params = params }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "tool_call", name = "check_run", arguments = { check = "fixture", all = true } },
+    { kind = "barrier", id = "check-requested" },
+    { kind = "message", content = "response", text = "Check requested" },
+  }, terminal = "completed" } })
+  request("session.prompt.submit", { text = "Run configured checks" })
+  request("session.provider.mock_response", { operation = "wait", id = "check-requested" })
+  local hold = request("session.provider.mock_response", { operation = "hold" })
+  request("session.provider.mock_response", { operation = "release", id = "check-requested" })
+  local delivered = request("session.provider.mock_response", { operation = "wait", id = hold.id })
+  eq(delivered.prompt:find("<check_result", 1, true) ~= nil, true)
+  local input = request("session.input.get", {})
+  for _, message in ipairs(input.messages) do
+    eq(message.purpose.kind == "check_result", false)
+  end
+  for _, message in ipairs(state.queue) do
+    eq(message.purpose and message.purpose.kind == "check_result", false)
+  end
+  local status = state.presentation.status_view
+  if status and status.buffer and vim.api.nvim_buf_is_valid(status.buffer) then
+    local text = buffer.text(status.buffer)
+    eq(text:find("Queued follow-up inputs", 1, true), nil)
+    eq(text:find("Steering active turn", 1, true), nil)
+  end
+  request("session.provider.mock_response", { operation = "release", id = hold.id })
+  wait_until(function() return not require("forge.views.harness.activity").busy(state) end, "check delivery did not settle")
+  eq(host.stop(), true)
+end
+
+-- requires-forge-host
 T["live_tool_groups_stay_folded_until_opened"] = function()
   local workspace = temp.directory("folded-tools")
   vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")

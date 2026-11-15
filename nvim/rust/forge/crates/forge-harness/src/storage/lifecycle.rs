@@ -158,6 +158,9 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for table in [
             "owner_command",
+            "check_inbox_session",
+            "check_inbox_operation",
+            "check_inbox_submitted",
             "input_operation",
             "input_submitted",
             "input_session",

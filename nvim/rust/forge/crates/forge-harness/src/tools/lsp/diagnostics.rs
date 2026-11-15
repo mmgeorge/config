@@ -11,9 +11,9 @@ pub(super) fn definition() -> ControlToolDefinition {
     fields.insert("severity".into(), json!({"type":"string","enum":["all","error","warning","information","hint"],"default":"all"}));
     ControlToolDefinition {
         name: NAME,
-        description: "Read file diagnostics when path names a file, or aggregate workspace diagnostics when path is \
-                omitted or names a directory. Reports server coverage and freshness. Unsupported or failed \
-                servers leave explicit gaps. Empty results do not establish a successful project typecheck.",
+        description: "Use after edits for fast diagnostic checks. Refresh the named file, or changed files in the \
+                selected workspace, then return all matching push and pull diagnostics from its language server. \
+                Reports errors, warnings, information, and hints; request failures are explicit.",
         input_schema: json!({"type":"object","additionalProperties":false,"required":required,"properties":properties}),
     }
 }
@@ -31,7 +31,16 @@ pub(super) async fn execute(
         .context("LSP tools require an enabled active editor interaction")?;
     let arguments =
         super::request::Arguments::parse(NAME, invocation.arguments).context("invalid_argument")?;
-    let message = scope.query(arguments).await?;
+    let diagnostic_paths = match (&arguments.path, &runtime.context.repository) {
+        (None, Some(repository)) => repository.diagnostic_paths().await?,
+        (Some(path), Some(repository)) if scope.workspace.join(path).is_dir() => {
+            repository.diagnostic_paths().await?
+        }
+        _ => Vec::new(),
+    };
+    let message = scope
+        .query_with_diagnostics(arguments, diagnostic_paths)
+        .await?;
     Ok(crate::tools::ControlToolResult {
         invocation: None,
         message,

@@ -573,8 +573,12 @@ fn verification_requirements_survive_history_loss_and_reject_stale_passes() -> R
     assert_eq!(ledger.pending(Some(&before))?.len(), 1);
     drop(ledger);
     // No command history is needed to recover the frozen definition and original selection.
-    let mut ledger =
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "checks-test")?;
+    let mut ledger = verification::VerificationRequirements::open(
+        data.path(),
+        workspace.path(),
+        "checks-test",
+        crate::storage::objects::ObjectStore::open(data.path())?,
+    )?;
     assert_eq!(ledger.pending(Some(&before))?[0].definition.id, "format");
     let frozen = ledger.resolution_input(&before)?;
     let frozen: verification::ResolutionRequirements =
@@ -691,9 +695,14 @@ fn verification_requirements_survive_history_loss_and_reject_stale_passes() -> R
     ledger.retire_unsupported(launched, &unsupported.commands[0], &before, &before)?;
     assert!(ledger.pending(Some(&before))?.is_empty());
     assert_eq!(
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "checks-test")?
-            .pending(Some(&before))?
-            .len(),
+        verification::VerificationRequirements::open(
+            data.path(),
+            workspace.path(),
+            "checks-test",
+            crate::storage::objects::ObjectStore::open(data.path())?
+        )?
+        .pending(Some(&before))?
+        .len(),
         0
     );
     // Unsupported output does not excuse an actual source change.
@@ -776,8 +785,12 @@ fn verification_requirements_survive_history_loss_and_reject_stale_passes() -> R
     std::fs::remove_dir(&path)?;
     std::fs::write(&path, saved)?;
     drop(ledger);
-    let ledger =
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "checks-test")?;
+    let ledger = verification::VerificationRequirements::open(
+        data.path(),
+        workspace.path(),
+        "checks-test",
+        crate::storage::objects::ObjectStore::open(data.path())?,
+    )?;
     assert_eq!(ledger.pending(Some(&before))?.len(), 1);
     Ok(())
 }
@@ -924,8 +937,12 @@ fn verification_identity_survives_policy_changes_but_rejects_tool_changes() -> R
         .lock()
         .unwrap()
         .prepare(&mutation, &mutation.commands[0])?;
-    let mut ledger =
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "checks-test")?;
+    let mut ledger = verification::VerificationRequirements::open(
+        data.path(),
+        workspace.path(),
+        "checks-test",
+        crate::storage::objects::ObjectStore::open(data.path())?,
+    )?;
     let mut verification = run.clone().into_record();
     verification.commands[0].state = CheckState::Passed;
     ledger.observe(
@@ -1044,14 +1061,23 @@ fn verification_ledger_rejects_invalid_restore_without_resetting() -> Result<()>
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     crate::storage::layout::prepare(data.path())?;
-    let ledger =
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "session")?;
+    let ledger = verification::VerificationRequirements::open(
+        data.path(),
+        workspace.path(),
+        "session",
+        crate::storage::objects::ObjectStore::open(data.path())?,
+    )?;
     assert!(ledger.pending(None)?.is_empty());
     let path = data.path().join("verification/requirements.json");
     let original = std::fs::read(&path)?;
     assert!(
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "different")
-            .is_err()
+        verification::VerificationRequirements::open(
+            data.path(),
+            workspace.path(),
+            "different",
+            crate::storage::objects::ObjectStore::open(data.path())?
+        )
+        .is_err()
     );
     let mut wrong: serde_json::Value = serde_json::from_slice(&original)?;
     let version = wrong["version"].as_u64().unwrap();
@@ -1059,25 +1085,45 @@ fn verification_ledger_rejects_invalid_restore_without_resetting() -> Result<()>
         wrong["version"] = incompatible.into();
         std::fs::write(&path, serde_json::to_vec(&wrong)?)?;
         assert!(
-            verification::VerificationRequirements::open(data.path(), workspace.path(), "session")
-                .is_err()
+            verification::VerificationRequirements::open(
+                data.path(),
+                workspace.path(),
+                "session",
+                crate::storage::objects::ObjectStore::open(data.path())?
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read(&path)?, serde_json::to_vec(&wrong)?);
     }
     std::fs::write(&path, b"{")?;
     assert!(
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "session")
-            .is_err()
+        verification::VerificationRequirements::open(
+            data.path(),
+            workspace.path(),
+            "session",
+            crate::storage::objects::ObjectStore::open(data.path())?
+        )
+        .is_err()
     );
     std::fs::remove_file(&path)?;
     assert!(
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "session")
-            .is_err()
+        verification::VerificationRequirements::open(
+            data.path(),
+            workspace.path(),
+            "session",
+            crate::storage::objects::ObjectStore::open(data.path())?
+        )
+        .is_err()
     );
     std::fs::write(&path, &original)?;
     assert!(
-        verification::VerificationRequirements::open(data.path(), workspace.path(), "session")
-            .is_ok()
+        verification::VerificationRequirements::open(
+            data.path(),
+            workspace.path(),
+            "session",
+            crate::storage::objects::ObjectStore::open(data.path())?
+        )
+        .is_ok()
     );
     Ok(())
 }
@@ -1328,13 +1374,24 @@ fn script_evidence_does_not_reuse_an_undeclared_tool_identity() -> Result<()> {
     let before = checkpoint.clone();
     let mut after = checkpoint.clone();
     after.id = "after-preparation".into();
-    let verified =
-        evidence::CheckEvidence::capture(&run, &run.commands[0], before.clone(), &after)?
-            .expect("valid verification inputs produce evidence");
+    let verified = evidence::CheckEvidence::capture(
+        &crate::storage::objects::ObjectStore::open(data.path())?,
+        &run,
+        &run.commands[0],
+        before.clone(),
+        &after,
+    )?
+    .expect("valid verification inputs produce evidence");
     assert_eq!(verified.checkpoint.id, before.id);
     run.commands[0].context.as_mut().unwrap().purpose = CheckPurpose::Prepare;
-    let prepared = evidence::CheckEvidence::capture(&run, &run.commands[0], before, &after)?
-        .expect("valid preparation inputs produce evidence");
+    let prepared = evidence::CheckEvidence::capture(
+        &crate::storage::objects::ObjectStore::open(data.path())?,
+        &run,
+        &run.commands[0],
+        before,
+        &after,
+    )?
+    .expect("valid preparation inputs produce evidence");
     assert_eq!(prepared.checkpoint.id, after.id);
     assert_ne!(verified.signature, prepared.signature);
     assert!(!evidence.matches_inputs(&run, &run.commands[0], &checkpoint)?);

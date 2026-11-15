@@ -52,6 +52,8 @@ Analysis fails closed, with a distinct error for each cause:
 
 Failed analysis never opens approval or authorizes part of a command, even under YOLO. Codex command text uses POSIX `shlex` quoting on every platform. In `permission.bash`, `"*"` is the lowest-priority decision.
 
+Permission evaluation errors return through the denied tool's reason, without a separate error notification. Expanding the denied tool shows that reason through the existing rejection renderer, which prefers a recorded host decision and otherwise uses the provider's terminal denial. Ordinary policy and user rejections use the same tool detail surface.
+
 Before an interactive Ask prompt, `forge-shell::resolution` also checks literal PowerShell command names in a clean, noninteractive PowerShell process. Discovery recognizes built-in aliases such as `%`, executable paths, and installed module exports without running the submitted command or initializing user modules. Missing names produce `shell_command_not_found`, including a reminder to quote literal pipes in Git format arguments. The five-second probe uses the policy workspace and host environment; profile-only definitions and environment changes made earlier in the submitted command are not available. This preflight does not run for saved allow/deny decisions, Allow or Deny mode, or other shell languages.
 
 ## CLI adapters for command rules

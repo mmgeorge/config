@@ -319,6 +319,23 @@ impl ExchangeDriver {
             ..
         } = &env;
         self.child_sender.get_or_init(|| services.children.sender());
+        match services.check_inbox.snapshot() {
+            Ok(snapshot) => {
+                for message in snapshot.messages {
+                    if let crate::input::InputPurpose::CheckResult {
+                        exchange_id,
+                        run_id,
+                    } = &message.purpose
+                    {
+                        tracing::info!(target: "forge::harness", event_name = "check_result.recovered",
+                            session_id, exchange_id, run_id, input_id = message.id,
+                            delivery = ?message.delivery(), submission_id = message.submission_id(),
+                            "Recovered internal check delivery");
+                    }
+                }
+            }
+            Err(error) => self.startup_fail(services, "Recover check result inbox", &error),
+        }
         self.commands
             .bind_publications(services.publications.clone());
         let (check_sender, check_events) = crate::checks::owner::CheckOwnerSender::channel();
@@ -453,6 +470,8 @@ impl ExchangeDriver {
                 )
                 .await;
                 self.turns_advance(&env, &mut state, step, closed, foreground_at_entry)
+                    .await;
+                self.check_results_advance(&env, &mut state, step, closed)
                     .await;
             }
             match self.step_finish_check(&env, &mut state, step, closed, &ready_wake) {
@@ -1189,6 +1208,41 @@ fn publish_input_observation(
     session: &str,
     step: u64,
 ) {
+    let internal = update
+        .upsert
+        .iter()
+        .map(|message| message.id.as_str())
+        .chain(update.removed.iter().map(String::as_str))
+        .chain(update.retracted.as_deref())
+        .map(|id| services.check_inbox.owns(id))
+        .collect::<Result<Vec<_>>>();
+    let internal = match internal {
+        Ok(owned) => owned.into_iter().any(|owned| owned),
+        Err(error) => {
+            tracing::error!(target: "forge::harness", event_name = "check_result.publication_failed",
+                session_id = session, %error, "Cannot classify result delivery update");
+            return;
+        }
+    };
+    if internal {
+        for message in &update.upsert {
+            if let crate::input::InputPurpose::CheckResult {
+                exchange_id,
+                run_id,
+            } = &message.purpose
+            {
+                tracing::info!(target: "forge::harness", event_name = "check_result.delivery_changed",
+                    session_id = session, exchange_id, run_id, input_id = message.id,
+                    delivery = ?message.delivery(), submission_id = message.submission_id(), error = message.error(),
+                    "Check result delivery state changed");
+            }
+        }
+        for id in &update.removed {
+            tracing::info!(target: "forge::harness", event_name = "check_result.settled",
+                session_id = session, input_id = id, "Check result delivery settled");
+        }
+        return;
+    }
     let published = (|| -> Result<()> {
         let payload = serde_json::to_value(update)?;
         retain_publication(

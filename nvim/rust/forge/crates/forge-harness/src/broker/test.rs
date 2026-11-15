@@ -13,6 +13,148 @@ use test_support::{
 };
 pub(super) use test_support::{git_repository, planning_question_broker, repository};
 
+/// Keep rejected command diagnostics on their tools without publishing error notifications.
+#[tokio::test]
+async fn command_rejections_retain_tool_reasons_without_notifications() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":root.path(),"data_root":root.path().join("data"),
+        "client_id":"command-rejections","provider":{"kind":"mock","command":[]},
+    }))?)?;
+    broker.session.approval_mode = ApprovalMode::Deny;
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().unwrap(),
+    )
+    .unwrap();
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |request, sink, start, _cancelled| async move {
+            use forge_provider_api::permissions::{
+                PermissionRequest, PermissionResponse, PermissionSubject, PermissionTarget,
+            };
+            start.observed(1).await?;
+            for (index, command) in ["[int]1", "probe 'unfinished", "probe"].iter().enumerate() {
+                let item_id = forge_provider_api::ItemId::new(format!("command-{index}")).unwrap();
+                let event = |event| forge_provider_api::AdapterActivity::Item {
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    item_id: item_id.clone(),
+                    event,
+                };
+                sink.send_wait(event(forge_provider_api::ItemEvent::Started(
+                    forge_provider_api::ItemStart::CommandExecution(
+                        forge_provider_api::ToolDescriptor {
+                            semantics: Default::default(),
+                            name: "shell".into(),
+                            title: command.to_string(),
+                            arguments: forge_provider_api::InspectableArguments::new(
+                                json!({"command":command}),
+                            ),
+                        },
+                    ),
+                )))
+                .await?;
+                let response = request
+                    .permissions
+                    .authorize(
+                        &request.scope,
+                        PermissionRequest {
+                            id: format!("permission-{index}"),
+                            provider: forge_providers::registry::nonselectable_id().unwrap(),
+                            subject: PermissionSubject::Tool(item_id.clone()),
+                            reason: None,
+                            target_list: vec![PermissionTarget::Command {
+                                command: command.to_string(),
+                                shell: Some(crate::permissions::shell::CommandShell::PowerShell),
+                            }],
+                        },
+                    )
+                    .await;
+                let PermissionResponse::Deny {
+                    reason: Some(reason),
+                } = response
+                else {
+                    panic!("fixture command was not rejected: {response:?}");
+                };
+                sink.send_wait(event(forge_provider_api::ItemEvent::Completed(
+                    forge_provider_api::ItemCompletion::CommandExecution(
+                        forge_provider_api::ToolCompletion {
+                            outcome: forge_provider_api::ToolOutcome::Denied {
+                                reason: forge_provider_api::SanitizedMessage::new(reason).unwrap(),
+                            },
+                            descriptor: None,
+                            output: None,
+                            changes: Default::default(),
+                        },
+                    ),
+                )))
+                .await?;
+            }
+            Ok(crate::provider::test_support::native_result(
+                &request,
+                forge_provider_api::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+            ))
+        },
+    );
+    broker.provider = Arc::new(crate::provider::Provider::new(
+        native.registration(),
+        broker.permission_coordinator.clone(),
+        broker.trace.clone(),
+        broker.data_root.clone(),
+    ));
+    let prompt = "Reject unsupported and disallowed commands";
+    let (_, events) = broker
+        .run_interaction(
+            prompt.into(),
+            PromptMode::Chat,
+            Some(ExchangeAdmission::chat(prompt.into())),
+        )
+        .await?;
+    let exchange = broker
+        .store
+        .latest_exchange(&broker.session.id)?
+        .context("missing exchange")?;
+    assert_eq!(exchange.tools().count(), 3);
+    assert!(
+        exchange
+            .tools()
+            .all(|(_, tool)| tool.state() == crate::turn::ToolState::Denied)
+    );
+    let projected = crate::buffer::projection::project(
+        crate::buffer::projection::ProjectionSource::Exchange(&exchange),
+        &forge_buffer::width::WidthProfile::default(),
+        2,
+        false,
+        &HashMap::new(),
+        &HashMap::new(),
+        &mut crate::buffer::identity::DisplayRegistry::default(),
+    )?;
+    let mut retained = String::new();
+    for output in projected.tool.values() {
+        retained.push_str(&output.preview(true)?.row.join("\n"));
+    }
+    for reason in [
+        "shell_command_unsupported",
+        "shell_command_parse_error",
+        "Denied by approval mode",
+    ] {
+        assert!(
+            retained.contains(reason),
+            "missing tool rejection: {reason}"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event == "provider_event" && event.payload["kind"] == "error"),
+        "command rejections emitted error notifications: {events:?}"
+    );
+    Ok(())
+}
+
 /// A failed pre-baseline owner releases its own capture while an unrelated Git editor stays admitted.
 #[tokio::test]
 async fn prebaseline_failure_settles_while_shared_git_admission_remains_held() -> Result<()> {
