@@ -1888,12 +1888,75 @@ pub(crate) fn retire_task(
     Ok(())
 }
 
+/// Capture answer submissions as exchange openers with their original question content.
+pub(crate) fn answer_origin(
+    input: &forge_provider_api::forge::TurnInput,
+    snapshot: &QuestionSnapshot,
+) -> Result<Option<crate::exchange::ExchangeOrigin>> {
+    use forge_provider_api::{QuestionReplyResponse, forge::TurnKind};
+    let responses = match input.kind() {
+        TurnKind::QuestionResponse { response } => std::slice::from_ref(response),
+        TurnKind::QuestionBatch { responses } => responses.as_slice(),
+        _ => return Ok(None),
+    };
+    if responses.is_empty()
+        || responses
+            .iter()
+            .any(|reply| !matches!(reply.response, QuestionReplyResponse::Answer { .. }))
+    {
+        return Ok(None);
+    }
+    let mut answers = Vec::new();
+    for reply in responses {
+        let source = snapshot
+            .questions
+            .iter()
+            .find(|question| question.id.as_str() == reply.question_id)
+            .context("answer opener references a missing question")?;
+        let QuestionReplyResponse::Answer { answer, .. } = &reply.response else {
+            unreachable!()
+        };
+        answers.push(crate::exchange::AnsweredQuestion {
+            question: crate::plan::PlanQuestion {
+                id: source.id.as_str().to_owned(),
+                header: source.content.header.clone(),
+                question: source.content.question.clone(),
+                allow_freeform: true,
+                options: source
+                    .content
+                    .options
+                    .iter()
+                    .map(|option| crate::plan::PlanQuestionOption {
+                        recommended: option.recommended,
+                        label: option.label.clone(),
+                        description: option.description.clone(),
+                    })
+                    .collect(),
+            },
+            answer: crate::plan::PlanQuestionResponse::Other {
+                text: answer.clone(),
+            },
+        });
+    }
+    Ok(Some(crate::exchange::ExchangeOrigin::QuestionAnswers {
+        answers,
+    }))
+}
+
 /// Project retained questions into their originating exchange without changing stored exchanges.
 pub(crate) fn project(
     exchanges: &mut [crate::exchange::Exchange],
     snapshot: &QuestionSnapshot,
 ) -> Result<()> {
     for question in &snapshot.questions {
+        if exchanges.iter().any(|exchange| match &exchange.origin {
+            crate::exchange::ExchangeOrigin::QuestionAnswers { answers } => answers.iter().any(|answer| answer.question.id == question.id.as_str()),
+            _ => exchange.node_list.iter().any(|node| matches!(node,
+                crate::exchange::ExchangeNode::ExchangeInput { prompt }
+                if matches!(&prompt.intent, crate::exchange::InputIntent::QuestionResponse { responses }
+                    if responses.iter().any(|reply| reply.question_id == question.id.as_str() && matches!(reply.response, forge_provider_api::QuestionReplyResponse::Answer { .. })))
+            )),
+        }) { continue; }
         let Some(exchange) = exchanges
             .iter_mut()
             .find(|exchange| exchange.id == question.exchange_id)
@@ -1905,7 +1968,7 @@ pub(crate) fn project(
             let author = match message.kind {
                 QuestionMessageKind::Clarification => "You asked",
                 QuestionMessageKind::Reply => "Explanation",
-                QuestionMessageKind::Answer => "You answered",
+                QuestionMessageKind::Answer => continue,
                 QuestionMessageKind::Correction => "You corrected",
             };
             text.push_str(&format!("\n\n{author}: {}", message.text));
@@ -1932,7 +1995,7 @@ pub(crate) fn project(
                             "{}{}",
                             question.content.header,
                             if question.requirement == QuestionRequirement::Required {
-                                " · Required"
+                                " Â· Required"
                             } else {
                                 ""
                             }

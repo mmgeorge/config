@@ -3263,6 +3263,241 @@ do
 end
 end
 
+-- A question response keeps its category while the provider has accepted but not consumed it.
+T["question_answers_never_become_steering"] = function()
+  local workspace = temp.directory("question-answer-steering")
+  local started = host.start({ config = true })
+  vim.fn.chdir(workspace)
+  require("forge").setup({ harness = { provider = "mock" } })
+  local client, session_id = started.client, nil
+  local function request(method, params)
+    local result, failure, done
+    client.request({ session_id = session_id, method = method, params = params or {} }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  local initialized
+  client.session_initialize(function(result, failure) eq(failure, nil) initialized = result end)
+  wait_until(function() return initialized end, "Harness did not initialize")
+  session_id = initialized.session.id
+  request("session.provider.mock_response", { operation = "script", script = {
+    steps = { { kind = "tool_call", name = "question_ask", arguments = { questions = {
+      { header = "Layout", question = "Which layout?", options = {} },
+    } } } }, terminal = "completed",
+  } })
+  request("session.prompt.submit", { text = "Ask about layout." })
+  local current
+  wait_until(function()
+    current = request("session.state.get")
+    return current.status.kind == "idle" and current.questions and #current.questions.questions == 1
+  end, "question did not settle")
+  local question = current.questions.questions[1]
+  local held = request("session.provider.mock_response", { operation = "hold" })
+  request("session.prompt.submit", { text = "Continue researching." })
+  request("session.provider.mock_response", { operation = "wait", id = held.id })
+  request("session.document", { operation = "open", document = "answer-stage", view = "answer-view",
+    width = { columns = 120, tabstop = 4 } })
+  request("session.question.answer", { command = {
+    operation_id = "answer-layout", question_id = question.id, revision = question.content.revision,
+    action = { kind = "answer", answer = { kind = "other", text = "Tabs" } },
+  } })
+  local message
+  wait_until(function()
+    local input = request("session.input.get")
+    for _, candidate in ipairs(input.messages) do
+      if candidate.purpose.kind == "question" then message = candidate end
+    end
+    return message and message.delivery == "accepted"
+  end, "answer did not reach the held provider")
+  eq(message.route, "steering")
+  request("session.document", { operation = "staging", document = "answer-stage", sequence = 1,
+    queue = {}, steering = { { id = message.id, text = message.text, failed = false,
+      content = { kind = "question_response", responses = { message.purpose.reply } } } } })
+  wait_until(function()
+    local document = request("session.document", { operation = "snapshot", document = "answer-stage" })
+    eq(vim.json.encode(document):find("Steering", 1, true), nil)
+    local status = request("session.document", { operation = "snapshot", document = "answer-stage:status" })
+    eq(vim.json.encode(status):find("Steering active turn", 1, true), nil)
+    local answer_count = 0
+    for _, block in ipairs(document.block) do
+      for _, row in ipairs(block.text) do
+        if row:find("Answered 1 question", 1, true) then answer_count = answer_count + 1 end
+      end
+    end
+    return answer_count == 1
+  end, "accepted answer did not retain its question category")
+  request("session.provider.mock_response", { operation = "release", id = held.id })
+  wait_until(function() return request("session.state.get").status.kind == "idle" end, "held turn did not settle")
+  eq(host.stop(), true)
+end
+
+T["question_answer_opens_new_exchange_once"] = function()
+  local workspace = temp.directory("answer-opener")
+  local started = host.start({ config = true })
+  vim.fn.chdir(workspace)
+  require("forge").setup({ harness = { provider = "mock" } })
+  local client, session_id = started.client, nil
+  local function request(method, params)
+    local result, failure, done
+    client.request({ session_id = session_id, method = method, params = params or {} }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  local initialized, failure
+  client.session_initialize(function(result, error) initialized, failure = result, error end)
+  wait_until(function() return initialized or failure end, "Harness did not initialize")
+  eq(failure, nil)
+  session_id = initialized.session.id
+  request("session.provider.mock_response", { operation = "script", script = {
+    steps = { { kind = "tool_call", name = "question_ask", arguments = { questions = {
+      { header = "Layout", question = "Which layout?", options = {} },
+      { header = "Color", question = "Which color?", options = {} },
+    } } } }, terminal = "completed",
+  } })
+  request("session.prompt.submit", { text = "Ask two optional questions." })
+  local current
+  wait_until(function()
+    current = request("session.state.get")
+    return current.status.kind == "idle" and current.questions and #current.questions.questions == 2
+  end, "questions did not settle")
+  local answers = {}
+  for index, question in ipairs(current.questions.questions) do
+    answers[#answers + 1] = { question_id = question.id, revision = question.content.revision,
+      action = { kind = "answer", answer = { kind = "other", text = index == 1 and "Tabs" or "Blue" } } }
+  end
+  local held = request("session.provider.mock_response", { operation = "hold" })
+  request("session.question.answer_batch", { operation_id = "answer-opener", answers = answers })
+  request("session.provider.mock_response", { operation = "wait", id = held.id })
+  local document = request("session.document", { operation = "open", document = "opener", view = "opener-view",
+    width = { columns = 120, tabstop = 4 } }).transcript
+  local function assert_opener(snapshot)
+    local heading, thought, count = nil, nil, 0
+    for index, block in ipairs(snapshot.block) do
+      for _, row in ipairs(block.text) do
+        if row:find("Answered 2 questions", 1, true) then
+          heading, count = index, count + 1
+          eq(block.metadata.node.parent, nil)
+        end
+      end
+      if block.metadata.node and block.metadata.node ~= vim.NIL and block.metadata.node.kind == "exchange" then thought = index end
+    end
+    eq(count, 1)
+    eq(heading < thought, true)
+  end
+  assert_opener(document)
+  request("session.provider.mock_response", { operation = "release", id = held.id })
+  wait_until(function() return request("session.state.get").status.kind == "idle" end, "answer exchange did not settle")
+  request("session.state.get")
+  document = request("session.document", { operation = "snapshot", document = "opener" })
+  assert_opener(document)
+  request("session.document", { operation = "close", document = "opener" })
+  document = request("session.document", { operation = "open", document = "reopened-opener", view = "reopened-view",
+    width = { columns = 120, tabstop = 4 } }).transcript
+  assert_opener(document)
+  eq(host.stop(), true)
+end
+
+-- Both delivery forms preserve the same rendered question category.
+local function verify_answered_question_group(batched)
+  local workspace = temp.directory("answered-question-group")
+  local started = host.start({ config = true })
+  vim.fn.chdir(workspace)
+  require("forge").setup({ harness = { provider = "mock" } })
+  local client, session_id = started.client, nil
+  local function request(method, params)
+    local result, failure, done
+    client.request({ session_id = session_id, method = method, params = params or {} }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  local initialized, initialization_error
+  client.session_initialize(function(result, failure) initialized, initialization_error = result, failure end)
+  wait_until(function() return initialized or initialization_error end, "Harness did not initialize")
+  eq(initialization_error, nil)
+  session_id = initialized.session.id
+  request("session.provider.mock_response", { operation = "script", script = {
+    steps = { { kind = "tool_call", name = "question_ask", arguments = { wait = true, questions = {
+      { header = "Layout", question = "Which layout?", options = {} },
+      { header = "Color", question = "Which color?", options = {} },
+    } } } }, terminal = "completed",
+  } })
+  request("session.prompt.submit", { text = "Ask about layout and color." })
+  local current
+  wait_until(function()
+    current = request("session.state.get")
+    return current.questions and #current.questions.questions == 2
+  end, "MockProvider did not publish the question set")
+  local decisions = {}
+  for index, answer in ipairs({ "Tabs", "Blue" }) do
+    local question = current.questions.questions[index]
+    decisions[#decisions + 1] = { question_id = question.id, revision = question.content.revision,
+      action = { kind = "answer", answer = { kind = "other", text = answer } } }
+    if not batched then
+      request("session.question.answer", { command = vim.tbl_extend("force", decisions[index], {
+        operation_id = "answer-" .. index,
+      }) })
+    end
+  end
+  if batched then request("session.question.answer_batch", { operation_id = "answer-batch", answers = decisions }) end
+  wait_until(function() return request("session.state.get").status.kind == "idle" end, "question tool did not finish")
+  local document = request("session.document", { operation = "open", document = "questions", view = "questions-view",
+    width = { columns = 120, tabstop = 4 } }).transcript
+  for _, block in ipairs(document.block) do
+    local node = block.metadata.node
+    if node and node ~= vim.NIL and node.kind == "exchange" then
+      request("session.document", { operation = "node", document = "questions", view = "questions-view",
+        sequence = 1, node = node.id, generation = node.generation, action = "set_expansion", expanded = true,
+        rows = 100, width = { columns = 120, tabstop = 4 } })
+      break
+    end
+  end
+  document = request("session.document", { operation = "snapshot", document = "questions" })
+  local text = vim.json.encode(document)
+  local _, headings = text:gsub("Answered %d+ questions?", "")
+  eq(headings, 1)
+  eq(text:find("Answered 2 questions", 1, true) ~= nil, true)
+  local answer_group
+  for _, block in ipairs(document.block) do
+    if vim.json.encode(block):find("Answered 2 questions", 1, true) then
+      answer_group = block.metadata.node
+      eq(answer_group.display, "heading")
+      eq(vim.json.encode(block.metadata.decoration):find("ForgeHarnessPrompt", 1, true) ~= nil, true)
+    end
+  end
+  eq(type(answer_group), "table")
+  request("session.document", { operation = "node", document = "questions", view = "questions-view",
+    sequence = 2, node = answer_group.id, generation = answer_group.generation,
+    action = "set_expansion", expanded = true, rows = 100, width = { columns = 120, tabstop = 4 } })
+  document = request("session.document", { operation = "snapshot", document = "questions" })
+  local rows = {}
+  for _, block in ipairs(document.block) do
+    for _, row in ipairs(block.text) do rows[#rows + 1] = row end
+  end
+  text = table.concat(rows, "\n")
+  for _, answer in ipairs({ "Tabs", "Blue" }) do
+    local _, copies = text:gsub("You answered: " .. answer, "")
+    eq(copies, 1)
+  end
+  eq(host.stop(), true)
+end
+
+T["answered_questions_share_one_transcript_group"] = function()
+  verify_answered_question_group(false)
+end
+
+T["batched_answers_share_one_transcript_group"] = function()
+  verify_answered_question_group(true)
+end
+
 T["question_batch_reaches_provider_together"] = function()
   vim.o.columns, vim.o.lines = 140, 55
   local snapshot = dofile("nvim/lua/forge/tests/support/state.lua")

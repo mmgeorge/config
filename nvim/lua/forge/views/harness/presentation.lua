@@ -350,18 +350,18 @@ function M.open(options, callback)
   end
 
   ---Replace transient staged messages without changing the composer or durable history.
-  ---@param queue (string|{id?: string, text: string, failed?: boolean})[]?
-  ---@param steering {id?: string, text: string, failed?: boolean}[]?
+  ---@param queue (string|ForgeStagedInput)[]?
+  ---@param steering ForgeStagedInput[]?
   function owner.set_staging(queue, steering)
     if not alive() then return end
     local staged = { queue = {}, steering = {} }
     for _, entry in ipairs(queue or {}) do
       staged.queue[#staged.queue + 1] = type(entry) == "table" and entry.id
-        and { id = entry.id, text = entry.text, failed = entry.failed == true } or type(entry) == "table" and entry.text or entry
+        and { id = entry.id, text = entry.text, failed = entry.failed == true, content = entry.content } or type(entry) == "table" and entry.text or entry
     end
     for _, entry in ipairs(steering or {}) do
       staged.steering[#staged.steering + 1] = entry.id
-        and { id = entry.id, text = entry.text, failed = entry.failed == true } or entry.text or ""
+        and { id = entry.id, text = entry.text, failed = entry.failed == true, content = entry.content } or entry.text or ""
     end
     -- Staged steering publishes at once: the host keeps an acknowledged message in the same status
     -- section until its provider reports consumption, so the message has one visible place

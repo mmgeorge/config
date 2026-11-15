@@ -2,6 +2,21 @@ local M = {}
 local attachment = require("forge.views.harness.attachment")
 local input_state = require("forge.views.harness.input_state")
 
+---@class ForgeStagedMessageContent
+---@field kind 'message'
+
+---@class ForgeStagedQuestionContent
+---@field kind 'question_response'
+---@field responses table[] Original structured replies from the host input purpose.
+
+---@alias ForgeStagedContent ForgeStagedMessageContent|ForgeStagedQuestionContent
+
+---@class ForgeStagedInput
+---@field id string
+---@field text string
+---@field failed boolean
+---@field content ForgeStagedContent
+
 ---@class ForgeQueuedPrompt
 ---@field text string
 ---@field purpose? table
@@ -193,7 +208,7 @@ end
 ---Mark the reserved entry in the status split without changing queued payloads.
 ---@param state table
 ---@param draft? string
----@return (string|{text: string})[]
+---@return ForgeStagedInput[]
 function M.staging(state, draft, entries)
   local edit = state.queue_edit
   local staged = {}
@@ -207,7 +222,14 @@ function M.staging(state, draft, entries)
       local retry = keys[1] and (" " .. keys[1] .. " retry") or ""
       text = "[" .. (entry.draft_state or entry.delivery) .. "]" .. retry .. " " .. text .. " — " .. entry.error
     end
-    staged[#staged + 1] = { id = entry.id, text = text, failed = entry.error ~= nil }
+    ---@type ForgeStagedContent
+    local content = { kind = "message" }
+    if entry.purpose and entry.purpose.kind == "question" then
+      local responses = { entry.purpose.reply }
+      vim.list_extend(responses, entry.purpose.additional_replies or {})
+      content = { kind = "question_response", responses = responses }
+    end
+    staged[#staged + 1] = { id = entry.id, text = text, failed = entry.error ~= nil, content = content }
   end
   return staged
 end

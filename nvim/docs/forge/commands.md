@@ -316,6 +316,11 @@ popup by default. Saved tool rules still apply. File access, write mode, and
 protected-path checks remain enforced. External MCP and provider tools keep their
 normal approval behavior.
 
+Harness sessions suppress provider-native question, agent, plan, and task tools
+that compete with Harness workflows. File, shell, and web tools remain available.
+Codex's separate `send_message_to_user_async` tool may still appear when its model
+catalog enables it; the native feature flag does not fully suppress that tool.
+
 File-write permission popups offer **Always allow writes in this workspace** for
 paths inside the current workspace. The choice persists a workspace-specific rule,
 not filesystem-wide access. Explicit denials and protected files remain restricted.
@@ -699,6 +704,12 @@ interrupt. The picker retains the full text. Optional questions remain answerabl
 after work finishes or chat execution is cancelled; late answers do not restart the
 cancelled work. The agent can retract a pending question with `question_withdraw`
 and a reason. `H` in the picker includes answered history and allows explicit corrections.
+Submitted answers appear as a blue, collapsed **Answered N questions** transcript row.
+Adjacent answered entries share one row, including answers submitted separately.
+Answers retain this presentation while being delivered to an active turn; they do
+not appear briefly as steering messages.
+Expand it to read the questions and answers. Pending questions retain their status display
+and picker behavior.
 **Tools** contains toggles for Subagents, LSP, and Session history.
 Both timeout settings show one value, such as `10m`. Enter opens an
 inline editor: Up/Down adjust the duration, Enter saves, and Esc cancels. Values

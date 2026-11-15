@@ -5,6 +5,7 @@ mod operations;
 pub mod provider;
 mod resources;
 mod rpc;
+mod tool_policy;
 mod turn_context;
 
 pub use connection::{CodexConnection, CodexConnectionError, ReceivedMessage};

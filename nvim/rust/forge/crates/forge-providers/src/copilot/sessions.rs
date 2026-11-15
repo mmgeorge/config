@@ -1563,7 +1563,6 @@ mod tests {
                                         Vec::new()
                                     },
                                 },
-                                excluded_tools: Vec::new(),
                                 tools: Vec::new(),
                                 native_callbacks: None,
                             },

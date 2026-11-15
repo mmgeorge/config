@@ -79,7 +79,7 @@ pub use node::{
     ActiveWait, ArtifactChange, DeclarationRevision, ExchangeInput, ExchangeNode, InputConsumption,
     InputIntent, PlanCommentResolution, QuestionInput, VerificationResult,
 };
-pub use origin::{ExchangeOrigin, TaskStart};
+pub use origin::{AnsweredQuestion, ExchangeOrigin, TaskStart};
 pub(crate) use record::ExchangeActivity;
 pub use record::{
     Exchange, ExchangeCollection, ExchangeComment, ExchangeOutcome, ExchangeState,

@@ -470,9 +470,37 @@ impl SteerCommand {
                         start,
                         prompt: self.text.clone(),
                     },
-                    None => super::session_execution::InputPresentation::Steering {
-                        text: self.text.clone(),
-                    },
+                    None => {
+                        use super::session_execution::{DeliveredInput, InputPresentation};
+                        use forge_provider_api::forge::TurnKind;
+                        let content = match receipt.record()?.request.input.turn().kind() {
+                            TurnKind::QuestionResponse { response } => {
+                                DeliveredInput::QuestionResponse(vec![response.clone()])
+                            }
+                            TurnKind::QuestionBatch { responses } => {
+                                DeliveredInput::QuestionResponse(responses.clone())
+                            }
+                            TurnKind::UserMessage { .. }
+                            | TurnKind::PlanDiscussion { .. }
+                            | TurnKind::ChecksSetup { .. }
+                            | TurnKind::PendingQuestions { .. }
+                            | TurnKind::PlanReviewQuestion { .. }
+                            | TurnKind::QuestionsResolved { .. }
+                            | TurnKind::PlanFeedback { .. }
+                            | TurnKind::WorkflowAnswers { .. }
+                            | TurnKind::PlanReview { .. }
+                            | TurnKind::CheckRepair { .. }
+                            | TurnKind::ChildResults
+                            | TurnKind::AgentTask { .. }
+                            | TurnKind::SessionMessage { .. }
+                            | TurnKind::PermissionTimeout { .. }
+                            | TurnKind::TaskStep { .. }
+                            | TurnKind::Background { .. } => {
+                                DeliveredInput::UserText(self.text.clone())
+                            }
+                        };
+                        InputPresentation::Message { content }
+                    }
                 };
                 event_sink
                     .send_acceptance(

@@ -8816,7 +8816,8 @@ impl HarnessBroker {
                     &displayed,
                 )?);
             }
-            InputPresentation::Steering { text } => {
+            InputPresentation::Message { content } => {
+                let (intent, text) = content.exchange_input();
                 // Accepted steering joins the native history, so retraction is no longer safe.
                 runtime.retraction_eligibility.consume();
                 if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
@@ -8830,13 +8831,13 @@ impl HarnessBroker {
                     scope,
                     input_id.clone(),
                     Some(receipt.receipt_id().clone()),
-                    crate::exchange::InputIntent::Steering,
-                    text.clone(),
+                    intent,
+                    text,
                     now_ms,
                 )?;
                 self.store.save_exchange(interaction)?;
-                // Awaiting and unconfirmed input has not been shown to reach the model, so only an
-                // acknowledgement that adopts an earlier consumption report publishes the prompt.
+                // Consumption remains independent of presentation: typed answers are visible on
+                // acceptance, while this notification still reports only consumed prompts.
                 let prompt = prompt.consumption.is_consumed().then_some(prompt);
                 effects.push(self.prepare_live_interaction(
                     SessionUpdate::Timeline {
@@ -8880,9 +8881,10 @@ impl HarnessBroker {
             .unwrap_or_else(|| receipt.receipt_id().as_str().to_owned());
         let now_ms = self.clock.now_ms();
         match presentation {
-            InputPresentation::Steering { text } => {
+            InputPresentation::Message { content } => {
+                let (intent, text) = content.exchange_input();
                 if !interaction.node_list.iter().any(|node| matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == id)) {
-                    interaction.append_acknowledged_input(scope, Some(id), Some(receipt.receipt_id().clone()), crate::exchange::InputIntent::Steering, text.clone(), now_ms)?;
+                    interaction.append_acknowledged_input(scope, Some(id), Some(receipt.receipt_id().clone()), intent, text, now_ms)?;
                 }
             }
             InputPresentation::TaskStarted { start, prompt } => {

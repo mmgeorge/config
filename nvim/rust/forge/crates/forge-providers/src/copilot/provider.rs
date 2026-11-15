@@ -2840,7 +2840,6 @@ impl CopilotProvider {
                 skill_directories: vec![profile_path.join("skills")],
                 selected_mcp,
             },
-            excluded_tools: Vec::new(),
             tools: tools.clone(),
             native_callbacks: Some(callbacks.clone()),
         };
@@ -3238,7 +3237,6 @@ impl CopilotProvider {
                 skill_directories: vec![profile_path.join("skills")],
                 selected_mcp,
             },
-            excluded_tools: Vec::new(),
             tools: tools.clone(),
             native_callbacks: Some(state.callbacks.clone()),
         };

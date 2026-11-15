@@ -8,12 +8,23 @@ pub enum ExchangeOrigin {
     User,
     /// Observe provider-native child work without claiming a Harness task or user submission.
     NativeAgent,
+    /// The submitted answer batch is the user input that opens this exchange.
+    QuestionAnswers {
+        answers: Vec<AnsweredQuestion>,
+    },
     TaskStarted {
         start: TaskStart,
     },
     TaskContinuation {
         reason: String,
     },
+}
+
+/// Keep each submitted answer attached to its original question and choices.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnsweredQuestion {
+    pub question: crate::plan::PlanQuestion,
+    pub answer: crate::plan::PlanQuestionResponse,
 }
 
 impl ExchangeOrigin {

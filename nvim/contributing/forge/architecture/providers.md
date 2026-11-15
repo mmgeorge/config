@@ -75,6 +75,10 @@ Terminal inventory protocol failures additionally retain a typed field failure: 
 
 ## Sessions
 
+Adapters suppress native workflow tools before model execution so questions, agent work, plans, and goals use Harness authority. Claude extends its launch-time denylist with plan transitions, task tracking, and agent discovery; Copilot applies source-qualified `builtin:` exclusions on create and resume, including `task_complete`, while preserving custom tools and selected MCP tools. Copilot inputs remain explicitly interactive, native autopilot continuation stays disabled, and root idle remains its turn-completion boundary. Native file, shell, and web tools remain available under the existing permission policy.
+
+Codex applies one shared workflow configuration to open, resume, replacement, fork, and turn requests. It disables native structured questions, plan tracking, goals, and agent tools. It also disables the `send_message_to_user_async` feature flag, but Codex 0.164–0.169 independently enables that tool when model metadata advertises it; the public app-server configuration therefore cannot guarantee its removal. The adapter does not replace model metadata or claim complete suppression of native user messaging. Antigravity's tool policy is unchanged.
+
 Codex turn requests explicitly set `summary: "concise"` so the status preview does
 not depend on the model catalog's reasoning-summary default. The adapter maps
 `item/reasoning/summaryTextDelta` to readable summaries and keeps raw reasoning

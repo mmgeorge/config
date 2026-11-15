@@ -919,7 +919,7 @@ impl BrokerObserver {
         }
         for run in &execution.check_runs {
             if let Some(planned) = &run.planned_tests {
-                report.push_str(&format!("\n### Planned test results · {}\n\n", run.id));
+                report.push_str(&format!("\n### Planned test results Â· {}\n\n", run.id));
                 for line in planned.review_lines() {
                     report.push_str(&format!("- {line}\n"));
                 }
@@ -928,7 +928,7 @@ impl BrokerObserver {
         report.push_str("\n### Verification assessments\n\n");
         for evidence in &execution.verification {
             report.push_str(&format!(
-                "- Revision {} · {:?}: {}\n  Observed in: {}\n",
+                "- Revision {} Â· {:?}: {}\n  Observed in: {}\n",
                 evidence.revision,
                 evidence.report.status,
                 evidence.summary,
@@ -946,7 +946,7 @@ impl BrokerObserver {
         report.push_str("\n### Revision history\n\n");
         for revision in &execution.revision_history {
             report.push_str(&format!(
-                "- Revision {} · {} approval: {}\n",
+                "- Revision {} Â· {} approval: {}\n",
                 revision.revision, revision.approval, revision.reason
             ));
         }

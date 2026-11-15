@@ -332,7 +332,7 @@ impl CodexProvider {
         if !resource_config.is_null() {
             parameters["config"] = resource_config;
         }
-        parameters["config"]["features.goals"] = json!(false);
+        super::tool_policy::apply(&mut parameters);
         parameters["config"]["thread_unload_delay_secs"] = json!(0);
         if isolated {
             let config = parameters["config"]
@@ -620,7 +620,7 @@ impl CodexProvider {
             }
         });
         security.apply_turn(&mut params, &session.workspace);
-        params["config"]["features.goals"] = json!(false);
+        super::tool_policy::apply(&mut params);
         if session.isolated {
             params["approvalPolicy"] = json!("never");
             params["sandboxPolicy"] = json!({"type":"readOnly","networkAccess":false});
@@ -985,7 +985,7 @@ impl CodexProvider {
             if !config.is_null() {
                 parameters["config"] = config;
             }
-            parameters["config"]["features.goals"] = json!(false);
+            super::tool_policy::apply(&mut parameters);
             parameters["config"]["thread_unload_delay_secs"] = json!(0);
             parameters["model"] = model_parameters["model"].clone();
             parameters["serviceTier"] = model_parameters["serviceTier"].clone();
@@ -1924,7 +1924,8 @@ impl CodexProvider {
                 ));
             }
         }
-        let mut parameters = json!({"threadId":thread_id.as_str(),"cwd":request.target.workspace,"excludeTurns":true,"developerInstructions":request.target.system_instructions,"config":{"features.goals":false,"thread_unload_delay_secs":0}});
+        let mut parameters = json!({"threadId":thread_id.as_str(),"cwd":request.target.workspace,"excludeTurns":true,"developerInstructions":request.target.system_instructions,"config":{"thread_unload_delay_secs":0}});
+        super::tool_policy::apply(&mut parameters);
         if let Some(checkpoint) = checkpoint {
             parameters["lastTurnId"] = json!(checkpoint.as_str());
         }

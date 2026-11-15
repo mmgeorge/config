@@ -804,6 +804,17 @@ impl HarnessBroker {
             )?,
         };
         let input_message_id = submission.record()?.input_message_id;
+        let answer_origin =
+            crate::question::answer_origin(input.turn(), &self.questions.snapshot()?)?;
+        let answer_admission = answer_origin.map(|origin| ExchangeAdmission {
+            origin,
+            check_owner: None,
+            automatic_owner: None,
+            plan_event_id: None,
+            prompt: text.to_owned(),
+            agent_run_id: None,
+        });
+        let admission = answer_admission.as_ref().or(admission);
         let (exchange, new_runtime, events, effects) =
             self.stage_admit_interaction(text, mode, admission, input_message_id, selected)?;
         Ok(StagedInteraction {

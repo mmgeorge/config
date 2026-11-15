@@ -9,6 +9,19 @@ use github_copilot_sdk::{ResumeSessionConfig, SessionConfig, SessionId, SystemMe
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Native workflows whose question, task, and agent state belongs to Harness.
+const EXCLUDED_NATIVE_TOOLS: &[&str] = &[
+    "builtin:ask_user",
+    "builtin:exit_plan_mode",
+    "builtin:task_complete",
+    "builtin:task",
+    "builtin:read_agent",
+    "builtin:write_agent",
+    "builtin:list_agents",
+    "builtin:send_inbox",
+    "builtin:context_board",
+];
+
 /// Retain the complete host-selected resources without implicit native discovery.
 #[derive(Default)]
 pub struct SessionResources {
@@ -27,7 +40,6 @@ pub struct SessionOptions {
     pub workspace: PathBuf,
     pub system_message: String,
     pub resources: SessionResources,
-    pub excluded_tools: Vec<String>,
     pub tools: Vec<ControlToolDefinition>,
     pub native_callbacks: Option<Arc<dyn super::provider::NativeCallbackRouter>>,
 }
@@ -102,7 +114,12 @@ pub async fn open(
             config.event_buffer_capacity = Some(forge_protocol::MAX_PENDING_FRAMES);
             config.suppress_resume_event = Some(true);
             config.continue_pending_work = Some(false);
-            config.excluded_tools = Some(options.excluded_tools.clone());
+            config.excluded_tools = Some(
+                EXCLUDED_NATIVE_TOOLS
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+            );
             config.autopilot = Some(github_copilot_sdk::types::AutopilotOptions {
                 continuation_enabled: Some(false),
                 max_continues: Some(0),
@@ -156,7 +173,12 @@ pub async fn open(
             let mut config = SessionConfig::default();
             config.event_buffer_capacity = Some(forge_protocol::MAX_PENDING_FRAMES);
             config.session_id = Some(SessionId::new(native_id.clone()));
-            config.excluded_tools = Some(options.excluded_tools.clone());
+            config.excluded_tools = Some(
+                EXCLUDED_NATIVE_TOOLS
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+            );
             config.autopilot = Some(github_copilot_sdk::types::AutopilotOptions {
                 continuation_enabled: Some(false),
                 max_continues: Some(0),

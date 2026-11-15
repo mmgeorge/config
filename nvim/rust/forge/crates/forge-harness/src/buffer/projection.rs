@@ -1457,7 +1457,37 @@ impl TimelineRenderer<'_> {
             Some(&layout.questions),
             MarkdownRole::Response,
         )?;
-        if let crate::exchange::ExchangeOrigin::TaskStarted { start } = &interaction.origin {
+        if let crate::exchange::ExchangeOrigin::QuestionAnswers { answers } = &interaction.origin {
+            let id = format!("{}:prompt", interaction.id);
+            let set = crate::plan::PlanQuestionSet {
+                id: answers
+                    .first()
+                    .map(|answer| answer.question.id.clone())
+                    .unwrap_or_default(),
+                questions: answers
+                    .iter()
+                    .map(|answer| answer.question.clone())
+                    .collect(),
+            };
+            let group = super::question::QuestionGroup {
+                id: &id,
+                set: std::borrow::Cow::Borrowed(&set),
+                branch: answers
+                    .iter()
+                    .map(|answer| super::question::QuestionBranch {
+                        question_set_id: answer.question.id.clone(),
+                        question: std::borrow::Cow::Borrowed(&answer.question),
+                        clarification: Vec::new(),
+                        answer: Some(super::question::response_text(&answer.answer)),
+                        source: crate::session::ResolutionSource::User,
+                    })
+                    .collect(),
+                clarification: Vec::new(),
+                resolved: true,
+                withdrawal: None,
+            };
+            self.question_group(&group, interaction, agents, depth)?;
+        } else if let crate::exchange::ExchangeOrigin::TaskStarted { start } = &interaction.origin {
             self.task_notice(
                 &format!("{}:start", interaction.id),
                 &start.heading(),
@@ -2148,6 +2178,9 @@ impl TimelineRenderer<'_> {
                             "Steering (not confirmed read)"
                         }
                         crate::exchange::InputIntent::Steering => "Steering",
+                        crate::exchange::InputIntent::QuestionResponse { .. } => {
+                            "Question response"
+                        }
                         crate::exchange::InputIntent::Clarification => "You asked",
                         crate::exchange::InputIntent::Answer => "You answered",
                     };
@@ -2572,6 +2605,15 @@ impl TimelineRenderer<'_> {
                 "▸ Questions · Cancelled · {answered}/{} answered",
                 group.branch.len()
             )
+        } else if group.resolved && answered > 0 {
+            format!(
+                "▸ Answered {answered} {}",
+                if answered == 1 {
+                    "question"
+                } else {
+                    "questions"
+                }
+            )
         } else {
             format!("▸ Questions · {answered}/{} answered", group.branch.len())
         };
@@ -2582,6 +2624,28 @@ impl TimelineRenderer<'_> {
                 question_set_id: group.set.id.clone(),
             }),
         )?;
+        if group.resolved && answered > 0 {
+            let heading = self
+                .block
+                .last_mut()
+                .expect("question heading was just rendered");
+            if let Some(marker) = &mut heading.layout.marker {
+                marker.capture = "ForgeHarnessPrompt".into();
+            }
+            let row_count = heading.text.row_count();
+            heading.metadata.decoration.push(Decoration {
+                range: TextRange {
+                    start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition {
+                        row: row_count,
+                        column: 0,
+                    },
+                },
+                capture: "ForgeHarnessPrompt".into(),
+                priority: 100,
+            });
+            self.prompt.push(heading.id.clone());
+        }
         let section = self.begin_section(2);
         for branch in &group.branch {
             let id = format!("{}:question:{}", group.id, branch.question.id);
@@ -2599,9 +2663,13 @@ impl TimelineRenderer<'_> {
                 });
             self.literal(
                 &id,
-                &format!("▸ {} · {status}", branch.question.question),
+                &if group.resolved && branch.answer.is_some() {
+                    branch.question.question.clone()
+                } else {
+                    format!("▸ {} · {status}", branch.question.question)
+                },
                 (!cancelled).then(|| TranscriptAction::Question {
-                    question_set_id: group.set.id.clone(),
+                    question_set_id: branch.question_set_id.to_owned(),
                 }),
             )?;
             let question_section = self.begin_section(2);
@@ -2647,7 +2715,7 @@ impl TimelineRenderer<'_> {
                 self.prompt.push(block.id.clone());
                 self.push(block)?;
             }
-            self.finish_section(question_section, &id, settled);
+            self.finish_section(question_section, &id, settled && !group.resolved);
         }
         for clarification in &group.clarification {
             self.clarification(clarification, exchange, agents, depth, settled)?;
@@ -4089,7 +4157,7 @@ mod tests {
                     "continued tool groups must nest inside their thought"
                 );
                 if planning_question.is_some() {
-                    let question = text.find("Questions · 1/1 answered").unwrap();
+                    let question = text.find("Answered 1 question").unwrap();
                     assert!(response < question && question < continuation);
                     assert_eq!(text.matches("You answered: 2D arena survival").count(), 1);
                 }

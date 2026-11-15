@@ -152,4 +152,18 @@ T["unavailable_edit"] = function()
   end
 end
 
+T["question_staging_preserves_typed_responses"] = function()
+  local editor = require("forge.views.harness.queue_editor")
+  local first = { question_id = "layout", revision = 1, message_id = "first", question = "Which layout?",
+    response = { kind = "answer", answer = "Tabs", required_questions_remain = false } }
+  local second = vim.deepcopy(first)
+  second.question_id, second.message_id = "color", "second"
+  local staged = editor.staging({}, nil, {
+    { id = "answer", text = "plain display text", purpose = { kind = "question", reply = first, additional_replies = { second } } },
+    { id = "user", text = "You answered: this is ordinary user text", purpose = { kind = "user" } },
+  })
+  eq(staged[1].content, { kind = "question_response", responses = { first, second } })
+  eq(staged[2].content, { kind = "message" })
+end
+
 return T

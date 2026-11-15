@@ -136,10 +136,14 @@ pub struct DeclarationRevision {
 }
 
 /// Distinguishes user input that extends an existing exchange.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputIntent {
     Steering,
+    /// Preserve structured question content independently of its active-turn delivery route.
+    QuestionResponse {
+        responses: Vec<forge_provider_api::QuestionReply>,
+    },
     Clarification,
     Answer,
 }

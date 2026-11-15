@@ -72,6 +72,17 @@ struct StagingContent {
     steering: Vec<StagedInput>,
 }
 
+/// Preserve input meaning separately from queue or steering delivery.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StagedContent {
+    #[default]
+    Message,
+    QuestionResponse {
+        responses: Vec<forge_provider_api::QuestionReply>,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum StagedInput {
@@ -79,6 +90,8 @@ pub enum StagedInput {
     Message {
         id: String,
         text: String,
+        #[serde(default)]
+        content: StagedContent,
         #[serde(default)]
         failed: bool,
     },
@@ -2186,8 +2199,14 @@ fn history_input_ids(entries: &[TimelineEntry]) -> HashSet<String> {
         if let TimelineEntry::Exchange { exchange, .. } = entry {
             ids.extend(exchange.input_message_id.iter().cloned());
             for node in &exchange.node_list {
-                if let crate::exchange::ExchangeNode::ExchangeInput { prompt } = node {
-                    ids.insert(prompt.id.clone());
+                match node {
+                    crate::exchange::ExchangeNode::ExchangeInput { prompt } => {
+                        ids.insert(prompt.id.clone());
+                    }
+                    crate::exchange::ExchangeNode::QuestionPresented { id, .. } => {
+                        ids.insert(id.clone());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2204,7 +2223,14 @@ fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<StagedInput> {
             _ => None,
         })
         .flat_map(|exchange| exchange.awaiting_inputs())
+        .filter(|prompt| {
+            !matches!(
+                prompt.intent,
+                crate::exchange::InputIntent::QuestionResponse { .. }
+            )
+        })
         .map(|prompt| StagedInput::Message {
+            content: StagedContent::Message,
             id: prompt.id.clone(),
             text: prompt.text.clone(),
             failed: false,
@@ -2225,6 +2251,18 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
             .iter()
             .filter(|value| match value {
                 StagedInput::Text(_) => true,
+                StagedInput::Message {
+                    content: StagedContent::QuestionResponse { responses },
+                    ..
+                } if responses.iter().all(|response| {
+                    matches!(
+                        response.response,
+                        forge_provider_api::QuestionReplyResponse::Answer { .. }
+                    )
+                }) =>
+                {
+                    false
+                }
                 StagedInput::Message { id, .. } => !open.history_input_id.contains(id),
             })
             .cloned()
@@ -3023,6 +3061,7 @@ mod tests {
         let staged = || {
             vec![StagedInput::Message {
                 id: "steer".into(),
+                content: StagedContent::Message,
                 text: steer.into(),
                 failed: false,
             }]

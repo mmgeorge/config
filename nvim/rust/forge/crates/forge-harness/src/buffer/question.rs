@@ -13,7 +13,7 @@ pub(super) struct QuestionHistory<'exchange> {
 /// Owns the presentation branches of one question-set occurrence.
 pub(super) struct QuestionGroup<'exchange> {
     pub id: &'exchange str,
-    pub set: &'exchange PlanQuestionSet,
+    pub set: std::borrow::Cow<'exchange, PlanQuestionSet>,
     pub branch: Vec<QuestionBranch<'exchange>>,
     pub clarification: Vec<Clarification<'exchange>>,
     pub resolved: bool,
@@ -22,7 +22,8 @@ pub(super) struct QuestionGroup<'exchange> {
 
 /// Keeps a question's decisions and explanations together across picker navigation.
 pub(super) struct QuestionBranch<'exchange> {
-    pub question: &'exchange PlanQuestion,
+    pub question_set_id: String,
+    pub question: std::borrow::Cow<'exchange, PlanQuestion>,
     pub clarification: Vec<Clarification<'exchange>>,
     pub answer: Option<String>,
     pub source: crate::session::ResolutionSource,
@@ -42,6 +43,50 @@ impl<'exchange> QuestionHistory<'exchange> {
         };
         let mut occurrence = Vec::new();
         for (position, node) in exchange.node_list.iter().enumerate() {
+            if let ExchangeNode::ExchangeInput { prompt } = node
+                && let InputIntent::QuestionResponse { responses } = &prompt.intent
+            {
+                let mut branches = Vec::new();
+                for response in responses {
+                    if let forge_provider_api::QuestionReplyResponse::Answer { answer, .. } =
+                        &response.response
+                    {
+                        branches.push(QuestionBranch {
+                            question_set_id: response.question_id.clone(),
+                            question: std::borrow::Cow::Owned(PlanQuestion {
+                                id: response.question_id.clone(),
+                                header: String::new(),
+                                question: response.question.clone(),
+                                options: Vec::new(),
+                                allow_freeform: true,
+                            }),
+                            clarification: Vec::new(),
+                            answer: Some(answer.clone()),
+                            source: crate::session::ResolutionSource::User,
+                        });
+                    }
+                }
+                if let Some(first) = branches.first() {
+                    occurrence.push((
+                        position,
+                        QuestionGroup {
+                            id: &prompt.id,
+                            set: std::borrow::Cow::Owned(PlanQuestionSet {
+                                id: first.question_set_id.clone(),
+                                questions: branches
+                                    .iter()
+                                    .map(|branch| branch.question.as_ref().clone())
+                                    .collect(),
+                            }),
+                            branch: branches,
+                            clarification: Vec::new(),
+                            resolved: true,
+                            withdrawal: None,
+                        },
+                    ));
+                }
+                continue;
+            }
             let source = match node {
                 ExchangeNode::QuestionPresented {
                     id,
@@ -90,12 +135,13 @@ impl<'exchange> QuestionHistory<'exchange> {
                 });
                 let mut group = QuestionGroup {
                     id,
-                    set,
+                    set: std::borrow::Cow::Borrowed(set),
                     branch: set
                         .questions
                         .iter()
                         .map(|question| QuestionBranch {
-                            question,
+                            question_set_id: set.id.clone(),
+                            question: std::borrow::Cow::Borrowed(question),
                             clarification: Vec::new(),
                             answer: None,
                             source: crate::session::ResolutionSource::User,
@@ -142,7 +188,10 @@ impl<'exchange> QuestionHistory<'exchange> {
             let ExchangeNode::ExchangeInput { prompt } = node else {
                 continue;
             };
-            if prompt.intent == InputIntent::Steering {
+            if matches!(
+                prompt.intent,
+                InputIntent::Steering | InputIntent::QuestionResponse { .. }
+            ) {
                 continue;
             }
             let Some((_, group)) = occurrence.iter_mut().rev().find(|(start, group)| {
@@ -253,7 +302,25 @@ impl<'exchange> QuestionHistory<'exchange> {
                     .map(|answer| response_text(&answer.response));
             }
         }
-        history.group = occurrence
+        // Merge adjacent answer categories without moving them across visible activity.
+        let mut grouped: Vec<(usize, QuestionGroup<'exchange>)> = Vec::new();
+        for (position, mut group) in occurrence {
+            if group.answered()
+                && let Some((previous_position, previous)) = grouped.last_mut()
+                && previous.answered()
+                && exchange.node_list[*previous_position + 1..position]
+                    .iter()
+                    .all(|node| history.nested.contains(node.id()) || !exchange.displays_node(node))
+            {
+                history.nested.insert(group.id);
+                previous.branch.append(&mut group.branch);
+                previous.clarification.append(&mut group.clarification);
+                *previous_position = position;
+            } else {
+                grouped.push((position, group));
+            }
+        }
+        history.group = grouped
             .into_iter()
             .map(|(_, group)| (group.id, group))
             .collect();
@@ -262,6 +329,13 @@ impl<'exchange> QuestionHistory<'exchange> {
 }
 
 impl QuestionGroup<'_> {
+    /// Identify completed answer groups independently of their submission mechanism.
+    fn answered(&self) -> bool {
+        self.resolved
+            && self.withdrawal.is_none()
+            && self.branch.iter().any(|branch| branch.answer.is_some())
+    }
+
     fn legacy_answer(&mut self, answer: &str) {
         for branch in &mut self.branch {
             let prefix = format!("{}:", branch.question.header);
@@ -287,7 +361,7 @@ impl QuestionGroup<'_> {
     }
 }
 
-fn response_text(response: &PlanQuestionResponse) -> String {
+pub(super) fn response_text(response: &PlanQuestionResponse) -> String {
     match response {
         PlanQuestionResponse::Selected { option, feedback } => feedback.as_ref().map_or_else(
             || option.clone(),
@@ -295,5 +369,54 @@ fn response_text(response: &PlanQuestionResponse) -> String {
         ),
         PlanQuestionResponse::Other { text } => text.clone(),
         PlanQuestionResponse::Skipped => "Skipped".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Merge adjacent answers while preserving pending boundaries and original question actions.
+    #[test]
+    fn answered_groups_preserve_order_boundaries_and_question_identity() {
+        for pending_middle in [false, true] {
+            let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+                "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Choose preferences", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))
+            .unwrap();
+            for (index, identity) in ["layout", "color", "scope"].into_iter().enumerate() {
+                exchange.node_list.push(ExchangeNode::QuestionPresented {
+                    id: identity.into(),
+                    question: serde_json::from_value(serde_json::json!({
+                        "id":identity, "questions":[{
+                            "id":identity, "header":identity, "question":identity,
+                            "options":[], "allow_freeform":true
+                        }]
+                    }))
+                    .unwrap(),
+                    answer: (!(pending_middle && index == 1)).then(|| "Selected".into()),
+                });
+            }
+            let history = QuestionHistory::new(&exchange);
+            if pending_middle {
+                assert_eq!(history.group.len(), 3);
+                assert!(history.nested.is_empty());
+            } else {
+                assert_eq!(history.group.len(), 1);
+                let group = &history.group["layout"];
+                assert_eq!(
+                    group
+                        .branch
+                        .iter()
+                        .map(|branch| branch.question_set_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["layout", "color", "scope"]
+                );
+                assert!(history.nested.contains("color"));
+                assert!(history.nested.contains("scope"));
+            }
+        }
     }
 }

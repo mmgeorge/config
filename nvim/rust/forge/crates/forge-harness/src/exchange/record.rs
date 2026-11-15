@@ -1534,7 +1534,10 @@ impl Exchange {
         // exchange as soon as Harness records it.
         let steering = match (&admission, &submission_id) {
             (InputAppend::Acknowledged(invocation), Some(submission))
-                if intent == InputIntent::Steering =>
+                if matches!(
+                    intent,
+                    InputIntent::Steering | InputIntent::QuestionResponse { .. }
+                ) =>
             {
                 Some((invocation, submission))
             }
@@ -1628,11 +1631,14 @@ impl Exchange {
 
     /// Report whether the transcript shows this node at its exchange position.
     ///
-    /// Steering awaiting consumption belongs to the status area, and a consumption anchor only
-    /// reserves the position that its input's row takes once acknowledged.
+    /// Ordinary steering awaiting consumption belongs to status. Typed question responses
+    /// stay visible on acceptance; consumption anchors reserve their eventual position.
     pub(crate) fn displays_node(&self, node: &ExchangeNode) -> bool {
         match node {
-            ExchangeNode::ExchangeInput { prompt } => !prompt.is_awaiting_consumption(),
+            ExchangeNode::ExchangeInput { prompt } => {
+                matches!(prompt.intent, InputIntent::QuestionResponse { .. })
+                    || !prompt.is_awaiting_consumption()
+            }
             ExchangeNode::TurnContent { .. } => self.consumption_anchor_submission(node).is_none(),
             _ => true,
         }

@@ -73,6 +73,7 @@ pub(crate) enum McpConfig {
 pub(crate) const DISALLOWED_TOOLS: &[&str] = &[
     "Agent",
     "Task",
+    "ListAgents",
     "ProposeGoal",
     "CronCreate",
     "CronDelete",
@@ -88,6 +89,13 @@ pub(crate) const DISALLOWED_TOOLS: &[&str] = &[
     "TaskStop",
     "TaskOutput",
     "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "TodoWrite",
 ];
 
 impl LaunchSpec {

@@ -64,6 +64,19 @@ The exchange metrics header shows input summed across every request in the excha
 
 ## Transcript window and pickers
 
+Answered questions use retained input admission identities to render one blue
+**Answered N questions** fold from acceptance onward. `QuestionHistory` merges
+adjacent answered groups in an exchange regardless of batching or delivery through a
+waiting tool. Visible intervening activity and pending or withdrawn groups end the
+run. Each branch retains its original question-set action, and each answer appears
+once. The originating exchange receives no duplicate questions summary. This
+preserves provider routing. Active-turn acceptance carries `DeliveredInput::QuestionResponse`
+into `InputIntent::QuestionResponse`, retaining the structured replies instead of
+converting them to steering text. The transcript renders answers on acceptance,
+even while provider consumption is pending. Typed question staging never enters
+the steering status section. Disposable state version 53 records this distinction;
+persistent settings remain outside that namespace.
+
 The Harness controller binds a native transcript document, a native status document, and a Lua-owned composer buffer, all owned by `OpenPresentation`. The status document has its own revision, so status-only updates leave transcript rows unchanged. `HarnessStatusView` owns the split above the composer and a separate display buffer, so local notices never modify the native replica. Lua fills unused transcript space with virtual rows, so the live tail ends at the bottom without changing native text.
 
 Switching a saved session into the current tab releases both window-bound presentations before transferring the panes. Their buffers, drafts, and queued input remain session-owned. The receiving session then binds fresh presentation, composer-height, and scroll observers to its new windows; closing only the old tab does not release those subscriptions.
