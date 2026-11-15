@@ -351,10 +351,13 @@ answer. In that case, Forge also displays the last commentary as a final respons
 with the same text in both places. The original commentary keeps its tools.
 An explicitly empty final answer does not produce a replacement response.
 
-`N Tools` groups stay folded while calls run. Expand a group to see its calls,
+`Tools · successful/total` groups stay folded while calls run. Failed and denied counts
+appear in parentheses before the duration when nonzero. Expand a group to see its calls,
 then expand an individual call to read its output. Completion folds the group again.
 The group duration counts overlapping calls once and excludes gaps between calls.
 Individual rows show each call's duration, so their sum can exceed the group duration.
+
+Loaded skills appear as `≡ Skill · name`; opening a skill entry opens its instruction file.
 
 Thoughts with activity start collapsed and preserve the assistant's text in their heading.
 Expanding a thought shows its events first, then its tool summary, then its file changes,
@@ -510,6 +513,9 @@ Each running check expands to show its progress and latest output; successful ch
 collapse to their result and elapsed time, while unsuccessful checks retain their reported
 cause. Concurrent checks each show their own progress. Pending questions appear after
 the check tree, with their answer control beside the phase label.
+
+Formatting checks show file counts only when the formatter supplies a total or reports
+file outcomes. Otherwise, the running check shows its label and elapsed time.
 
 While the prompt buffer is focused, new activity in the current live exchange
 automatically scrolls the transcript to its end, exposing running tools and progress.

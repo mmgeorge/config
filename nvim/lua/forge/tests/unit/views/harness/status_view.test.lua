@@ -55,11 +55,16 @@ T["check_tree_spinners_share_clock_and_retire_completed_marks"] = function()
   eq(initial[2][2], 2)
   eq(initial[2][3], #prefix + 2)
   eq(initial[2][4].virt_text_pos, "overlay")
+  eq(initial[2][4].virt_text[1][2], "ForgeStatusHint")
+  eq(initial[1][4].virt_text[1][2], "ForgeTimelineStatusSpinner")
+  eq(initial[2][4].virt_text[1][1], "◐")
   local text = buffer.lines(status.buffer)
-  current_time = 67
-  tick()
-  vim.wait(1000, function() return marks()[1][4].virt_text[1][1] == "⠙" end)
-  for _, mark in ipairs(marks()) do eq(mark[4].virt_text[1][1], "⠙") end
+  for index, frame in ipairs({ "◓", "◑", "◒", "◐" }) do
+    current_time = index * 120
+    tick()
+    wait_until(function() return marks()[2][4].virt_text[1][1] == frame end, "circle spinner did not advance")
+    eq(marks()[3][4].virt_text[1][1], frame)
+  end
   eq(buffer.lines(status.buffer), text)
   eq(vim.api.nvim_get_current_win(), composer_window)
   status.snapshot = snapshot(true)
@@ -71,9 +76,9 @@ T["check_tree_spinners_share_clock_and_retire_completed_marks"] = function()
   status.snapshot = waiting
   status:render()
   eq(marks()[1][4].virt_text[1][1], "◷")
-  current_time = 134
+  current_time = 600
   tick()
-  wait_until(function() return marks()[2][4].virt_text[1][1] == "⠹" end, "check spinner stopped during a question")
+  wait_until(function() return marks()[2][4].virt_text[1][1] == "◓" end, "check spinner stopped during a question")
   eq(marks()[1][4].virt_text[1][1], "◷")
   status:suspend(true)
   eq(#marks(), 0)

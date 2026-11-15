@@ -61,7 +61,7 @@ T["live_tool_groups_stay_folded_until_opened"] = function()
   wait_until(function() return tool_group().display == "heading" end, "explicit collapse did not close live tools")
   request("session.provider.mock_response", { operation = "release", id = "tools-visible" })
   request("session.provider.mock_response", { operation = "wait", id = "tools-updated" })
-  wait_until(function() return buffer.text(state.transcript_buf):find("2 Tools", 1, true) ~= nil end,
+  wait_until(function() return buffer.text(state.transcript_buf):find("Tools · 2/2", 1, true) ~= nil end,
     "updated tool count did not arrive")
   eq(tool_group().display, "heading")
   request("session.provider.mock_response", { operation = "release", id = "tools-updated" })
@@ -107,10 +107,10 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   eq(check_mark[2], 5)
   local marker_column = status.content.lines[6]:find("⠋", 1, true) - 1
   eq(check_mark[3], marker_column)
-  current_time = 67
+  current_time = 120
   tick()
   wait_until(function()
-    return vim.api.nvim_buf_get_extmark_by_id(status.buffer, status.animation_namespace, check_mark[1], { details = true })[3].virt_text[1][1] == "⠙"
+    return vim.api.nvim_buf_get_extmark_by_id(status.buffer, status.animation_namespace, check_mark[1], { details = true })[3].virt_text[1][1] == "◓"
   end, "check tree spinner did not advance")
 end
 

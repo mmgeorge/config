@@ -294,12 +294,16 @@ fn tool_group_label<'tool>(
 ) -> String {
     let calls: Vec<_> = calls.into_iter().collect();
     let count = calls.len();
+    let successful = calls
+        .iter()
+        .filter(|tool| tool.state() == crate::turn::ToolState::Completed && !tool.failed)
+        .count();
     let failed = calls.iter().filter(|tool| tool.failed).count();
     let denied = calls
         .iter()
         .filter(|tool| tool.state() == crate::turn::ToolState::Denied)
         .count();
-    let mut label = format!("▸ {count} {}", if count == 1 { "Tool" } else { "Tools" });
+    let mut label = format!("▸ Tools · {successful}/{count}");
     let mut outcomes = Vec::new();
     if failed > 0 {
         outcomes.push(format!("{failed} failed"));
@@ -308,7 +312,7 @@ fn tool_group_label<'tool>(
         outcomes.push(format!("{denied} denied"));
     }
     if !outcomes.is_empty() {
-        label.push_str(&format!(" ({})", outcomes.join(", ")));
+        label.push_str(&format!(" · ({})", outcomes.join(", ")));
     }
     if let Some(elapsed) = tool_group_elapsed(&calls, now) {
         label.push_str(&format!(
@@ -2082,7 +2086,7 @@ impl TimelineRenderer<'_> {
                 ExchangeNode::SkillRead { id, read, .. } => {
                     self.literal(
                         id,
-                        &format!("◇ Skill · {}", read.name),
+                        &format!("≡ Skill · {}", read.name),
                         Some(TranscriptAction::File {
                             path: read.path.clone(),
                             line: 1,
@@ -3837,7 +3841,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 super::tool_group_label(&calls, ToolInstant::wall(10_000),),
-                format!("▸ {} Tools · {expected}", calls.len()),
+                format!("▸ Tools · {0}/{0} · {expected}", calls.len()),
             );
         }
     }
@@ -3861,7 +3865,7 @@ mod tests {
             .collect();
         assert_eq!(
             super::tool_group_label(&calls, ToolInstant::wall(0)),
-            "▸ 3 Tools (1 failed, 1 denied)",
+            "▸ Tools · 1/3 · (1 failed, 1 denied)",
         );
         assert!(calls[1].failed);
         assert_eq!(calls[2].state(), ToolState::Denied);
@@ -3901,7 +3905,7 @@ mod tests {
                     active_ms: Some(2_000),
                 },
             ),
-            "▸ 2 Tools · 2s",
+            "▸ Tools · 1/2 · 2s",
         );
     }
 
@@ -3935,10 +3939,13 @@ mod tests {
         };
         assert_eq!(
             super::tool_group_label(&calls, now),
-            "▸ 2 Tools (1 failed) · 3s",
+            "▸ Tools · 1/2 · (1 failed) · 3s",
         );
         calls[1].started_at_ms = None;
-        assert_eq!(super::tool_group_label(&calls, now), "▸ 2 Tools (1 failed)",);
+        assert_eq!(
+            super::tool_group_label(&calls, now),
+            "▸ Tools · 1/2 · (1 failed)",
+        );
     }
 
     #[test]

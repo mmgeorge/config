@@ -274,6 +274,12 @@ T["provider_catalog"] = function()
     end,
   })
   provider_picker.open_mcp({ host = host })
+  for _, icon in ipairs({ "◐", "◓", "◑", "◒", "◐" }) do
+    mcp_picker = picker._state_for_test()
+    mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+    MiniTest.expect.equality(mcp_page.option_list[1].label, icon .. " starting-server")
+    advance_ticks(1)
+  end
   advance_until(function() return pending_refresh ~= nil end,
     "starting servers should refresh their status without reopening the picker")
   advance_ticks(34)

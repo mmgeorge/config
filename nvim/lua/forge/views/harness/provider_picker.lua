@@ -1,12 +1,12 @@
 local notifications = require("forge.infra.notifications")
 local picker = require("forge.views.picker")
 local provider_catalog = require("forge.views.harness.provider_catalog")
+local spinner = require("forge.render.spinner")
 
 local M = {}
 local owner = "harness-provider-catalog"
 local mcp_generation = 0
 local skills_generation = 0
-local loading_icon_list = { "○", "◔", "◑", "◕", "●", "◕", "◑", "◔" }
 
 ---@alias ForgeResourceScope "global"|"workspace"
 
@@ -38,11 +38,11 @@ end
 
 ---@param definition table
 ---@param loading_name string?
----@param animation_index integer
+---@param animation_elapsed_ms integer
 ---@return string
-local function mcp_icon(definition, loading_name, animation_index)
+local function mcp_icon(definition, loading_name, animation_elapsed_ms)
   if definition.name == loading_name or definition.status == "loading" then
-    return loading_icon_list[animation_index]
+    return spinner.circle_frame_at(animation_elapsed_ms)
   end
   if not definition.enabled or definition.status == "disabled" then return "○" end
   if definition.status == "connected" then return "✓" end
@@ -226,7 +226,7 @@ function M.open_mcp(options)
     local current_mcp_list = mcp_list or {}
     local expanded_by_id = {}
     local loading_name = nil
-    local animation_index = 1
+    local animation_elapsed_ms = 0
     local animation_timer = nil
     local pending_by_id = {}
     local closed = false
@@ -246,7 +246,7 @@ function M.open_mcp(options)
         animation_timer = nil
       end
       loading_name = nil
-      animation_index = 1
+      animation_elapsed_ms = 0
     end
 
     local function refresh()
@@ -271,14 +271,14 @@ function M.open_mcp(options)
     start_animation = function(name)
       if name then loading_name = name end
       if animation_timer then return end
-      animation_index = 1
+      animation_elapsed_ms = 0
       animation_timer = assert(vim.uv.new_timer())
-      animation_timer:start(120, 120, vim.schedule_wrap(function()
+      animation_timer:start(spinner.circle_frame_interval_ms, spinner.circle_frame_interval_ms, vim.schedule_wrap(function()
         if closed or not picker.is_open(owner) or (options.is_current and not options.is_current()) then
           stop_animation()
           return
         end
-        animation_index = animation_index % #loading_icon_list + 1
+        animation_elapsed_ms = animation_elapsed_ms + spinner.circle_frame_interval_ms
         if loading_name or provider_is_loading() then picker.update(build_spec()) end
         refresh_ticks = refresh_ticks + 1
         if refresh_ticks >= 17 and not next(pending_by_id) and not refreshing then
@@ -294,14 +294,14 @@ function M.open_mcp(options)
         option_list[#option_list + 1] = {
           id = definition.resource_id or definition.name,
           value = definition,
-          label = mcp_icon(definition, loading_name, animation_index) .. " " .. definition.name,
+          label = mcp_icon(definition, loading_name, animation_elapsed_ms) .. " " .. definition.name,
           detail = table.concat({
             definition.transport or "unknown",
             token_label(definition.token_count, definition.token_estimated),
             pending_by_id[definition.resource_id or definition.name] and "pending" or mcp_status_label(definition),
           }, "  "),
           columns = {
-            mcp_icon(definition, loading_name, animation_index) .. " " .. definition.name,
+            mcp_icon(definition, loading_name, animation_elapsed_ms) .. " " .. definition.name,
             source_label(definition.scope),
             definition.transport or "unknown",
             token_label(definition.token_count, definition.token_estimated),

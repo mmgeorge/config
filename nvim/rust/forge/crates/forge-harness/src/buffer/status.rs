@@ -472,6 +472,7 @@ fn append_checks(
                 ));
             }
             if let Some(crate::checks::adapter::AdapterProgress::Format(format)) = &command.progress
+                && (format.total.is_some() || format.reported > 0)
             {
                 let files = format.total.map_or_else(
                     || format!("{} file outcomes", format.reported),
@@ -640,6 +641,57 @@ mod tests {
         },
     };
     use std::path::Path;
+
+    /// Omit unknown formatting coverage until the adapter reports a file outcome.
+    #[test]
+    fn format_details_require_reported_progress() {
+        for (total, reported, expected) in [
+            (None, 0, None),
+            (Some(40), 0, Some("   └─ 0/40 files · 0 unformatted")),
+            (Some(40), 12, Some("   └─ 12/40 files · 0 unformatted")),
+            (None, 12, Some("   └─ 12 file outcomes · 0 unformatted")),
+        ] {
+            let checks = CheckActivity {
+                run_id: "run".into(),
+                duration_ms: 0,
+                started_at_ms: Some(0),
+                completed_count: 0,
+                total_count: 1,
+                command_list: vec![CheckCommandActivity {
+                    title: "Formatting".into(),
+                    started_at_ms: Some(0),
+                    completed_at_ms: None,
+                    state: CheckState::Running,
+                    output_line: None,
+                    progress: Some(AdapterProgress::Format(
+                        crate::checks::adapter::events::FormatProgress {
+                            phase: None,
+                            total,
+                            reported,
+                            unformatted: 0,
+                        },
+                    )),
+                }],
+            };
+            let block = StatusView {
+                id: "status",
+                status: &SessionPhase::Idle,
+                agent_count: 0,
+                status_thoughts: false,
+                checks: Some(&checks),
+            }
+            .render(&WidthProfile::default(), 2_000)
+            .unwrap()
+            .block
+            .unwrap();
+            let mut expected_rows = vec![
+                "Checking · 0/1 finished · 2s",
+                "└─ ⠋ Formatting · running · 2s",
+            ];
+            expected_rows.extend(expected);
+            assert_eq!(block.text.wire_rows(), expected_rows);
+        }
+    }
 
     /// Keep build progress inline and replace it with counts when execution begins.
     #[test]

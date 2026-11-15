@@ -155,9 +155,10 @@ function StatusView:update_animation()
         vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.animated, 0,
           { id = 1, virt_text = { { frame, "ForgeTimelineStatusSpinner" } }, virt_text_win_col = 0 })
       end
+      local circle_frame = spinner.circle_frame_at(vim.uv.now())
       for index, marker in ipairs(content.spinners or {}) do
         vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, marker.row, marker.column,
-          { id = index + 1, virt_text = { { frame, "ForgeTimelineStatusSpinner" } }, virt_text_pos = "overlay" })
+          { id = index + 1, virt_text = { { circle_frame, "ForgeStatusHint" } }, virt_text_pos = "overlay" })
       end
       -- Rust renders elapsed labels and refreshes them only when a sync arrives. A silent
       -- tool produces no host events, so request one sync per second while Rust reports

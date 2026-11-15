@@ -47,7 +47,9 @@ local function append_interaction_detail(result, interaction, width, indent)
       elseif turn and node.item.kind == "tool" then
         local tool = turn.tool and turn.tool.item and turn.tool.item[node.item.id]
         if tool then
-          result.lines[#result.lines + 1] = item_prefix .. "▸ 1 Tool"
+          local successful = tool.state == "completed" and not tool.failed and 1 or 0
+          local outcome = tool.state == "denied" and " · (1 denied)" or tool.failed and " · (1 failed)" or ""
+          result.lines[#result.lines + 1] = item_prefix .. "▸ Tools · " .. successful .. "/1" .. outcome
         end
       end
     elseif node.kind == "exchange_input" and node.prompt then

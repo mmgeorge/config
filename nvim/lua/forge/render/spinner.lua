@@ -3,11 +3,20 @@ local M = {}
 M.frame_list = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 --- Target duration of one animation frame in milliseconds (15 frames per second).
 M.frame_interval_ms = 1000 / 15
+--- Clockwise circle frames shared by loading lists and check trees.
+M.circle_frame_list = { "◐", "◓", "◑", "◒" }
+M.circle_frame_interval_ms = 120
 
 ---@param now_ms integer
 ---@return string
 function M.frame_at(now_ms)
   return M.frame_list[math.floor(now_ms / M.frame_interval_ms) % #M.frame_list + 1]
+end
+
+---@param now_ms integer
+---@return string
+function M.circle_frame_at(now_ms)
+  return M.circle_frame_list[math.floor(now_ms / M.circle_frame_interval_ms) % #M.circle_frame_list + 1]
 end
 
 ---@param current fun(): boolean
