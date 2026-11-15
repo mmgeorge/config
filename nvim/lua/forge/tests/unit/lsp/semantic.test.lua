@@ -373,4 +373,21 @@ T["workspace_snapshot_distinguishes_unsupported_storage_from_unavailable_client"
   eq(failure, "unavailable: selected LSP is not running")
 end
 
+T["mismatched_language_fails_before_document_requests"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local root = temp.directory("wrong-language")
+  local path = root .. "/init.lua"
+  vim.fn.writefile({ "return {}" }, path)
+  local client = { id = 492, name = "rust", initialized = true, config = { root_dir = root, filetypes = { "rust" } },
+    is_stopped = function() return false end, request = function() error("wrong language reached server") end }
+  stub(require("forge.lsp.startup"), "ready", function(selected, receive) receive(selected) return function() end end)
+  for _, operation in ipairs({ "definition", "references", "diagnostics", "status" }) do
+    local failure
+    require("forge.lsp.semantic").request(root, { operation = operation, path = path, line = 1, column = 1 },
+      function(paths, receive) local allowed = {} for _, requested in ipairs(paths) do allowed[requested] = true end receive(allowed) end,
+      function(_, message) failure = message end, nil, { client = client })
+    eq(failure, "invalid_workspace: selected LSP does not serve lua files")
+  end
+end
+
 return T

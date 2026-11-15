@@ -218,6 +218,7 @@ T["command_reconciliation"] = function()
   assert(raced == 1 and next(subscribers) == nil)
 end
 
+-- requires-forge-host
 T["receive_initialize"] = function()
   local executable = require("forge.builder").binary_path()
   assert(vim.fn.executable(executable) == 1, "build the Forge host before running this fixture")

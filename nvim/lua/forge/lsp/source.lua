@@ -189,6 +189,22 @@ function M.covers(client, path)
   return false
 end
 
+---Reject file requests outside the selected client's language or project.
+---@param client vim.lsp.Client
+---@param path string
+---@param filetype string
+---@param buffer integer?
+---@param scope? "workspace"|"all"
+---@return string? failure
+function M.validate_client(client, path, filetype, buffer, scope)
+  if not vim.tbl_contains(client.config.filetypes or {}, filetype) then
+    return "invalid_workspace: selected LSP does not serve " .. filetype .. " files"
+  end
+  if scope ~= "all" and not M.covers(client, path) and not (buffer and vim.lsp.buf_is_attached(buffer, client.id)) then
+    return "invalid_workspace: selected LSP does not cover " .. path
+  end
+end
+
 ---@param path string
 ---@param filetype string
 ---@param buffer integer?

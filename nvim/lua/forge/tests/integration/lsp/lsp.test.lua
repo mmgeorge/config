@@ -7,9 +7,12 @@ local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
 local host = dofile("nvim/lua/forge/tests/support/host.lua")
 local git_repository = dofile("nvim/lua/forge/tests/support/git_repository.lua")
 local state_fixture = dofile("nvim/lua/forge/tests/support/state.lua")
+local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+local lua_selection_recording = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/lsp-lua-selection.json"), "\n"))
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
 T["semantic_tools_wait_for_rust_workspace_and_preserve_write_access"] = function()
   local root = vim.fn.getcwd()
   -- Release the workspace, stop the host, and leave the workspace directory before the
@@ -97,6 +100,8 @@ T["semantic_tools_wait_for_rust_workspace_and_preserve_write_access"] = function
   vim.lsp.get_clients = function() return { mock } end
   vim.lsp.get_client_by_id = function(id) return id == mock.id and mock or nil end
   vim.lsp.buf_is_attached = function() return true end
+  stub(vim.lsp, "buf_attach_client", function() return true end)
+  stub(vim.lsp, "buf_detach_client", function() return true end)
   local item_buffer = vim.fn.bufadd(workspace .. "/src/item.rs")
   vim.fn.bufload(item_buffer)
   vim.bo[item_buffer].filetype = "rust"
@@ -145,22 +150,23 @@ T["semantic_tools_wait_for_rust_workspace_and_preserve_write_access"] = function
     }
   end
   startup.selected = selected_startup
-  query("lsp_symbols", { workspace = "Cargo.toml", query = "value" })
+  query("lsp_symbols", { workspace = { path = ".", language = "rust" }, query = "value" })
   vim.uv.new_timer = original_timer
   startup.selected = function(_, _, callback) callback(mock) return function() end end
   assert(loaded and symbol_requests == 1, "first symbol request did not wait for loaded workspace")
   vim.lsp.handlers["experimental/serverStatus"](nil, { health = "ok", quiescent = true }, { client_id = mock.id })
-  local result = query("lsp_rename_symbol", { workspace = "Cargo.toml", path = "src/item.rs", line = 1, column = 8, new_name = "count" })
+  local result = query("lsp_rename_symbol", { workspace = { path = ".", language = "rust" }, path = "src/item.rs", line = 1, column = 8, new_name = "count" })
   assert(table.concat(vim.fn.readfile(workspace .. "/src/item.rs"), "\n"):find("fn count", 1, true), result)
   assert(table.concat(vim.fn.readfile(workspace .. "/src/lib.rs"), "\n"):find("item::count()", 1, true), result)
   assert(buffer.line(item_buffer, 1):find("fn count", 1, true), "editor did not refresh")
   request("session.configure", { access = vim.tbl_extend("force", state.session.access, { write_access = "off" }) })
-  result = query("lsp_rename_symbol", { workspace = "Cargo.toml", path = "src/item.rs", line = 1, column = 8, new_name = "blocked" })
+  result = query("lsp_rename_symbol", { workspace = { path = ".", language = "rust" }, path = "src/item.rs", line = 1, column = 8, new_name = "blocked" })
   assert(table.concat(vim.fn.readfile(workspace .. "/src/item.rs"), "\n"):find("fn count", 1, true), result)
   assert(#(state.approval or {}) == 0, "write-off opened approval")
   assert(unrelated_calls == 0, "rename contacted an unrelated LSP")
 end
 
+-- requires-forge-host
 T["workspace_published_diagnostics_are_partial_even_when_empty"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   local original_directory = vim.fn.getcwd()
@@ -203,7 +209,7 @@ T["workspace_published_diagnostics_are_partial_even_when_empty"] = function()
   request("session.configure", { lsp_tools = true })
   local function query(marker)
     request("session.provider.mock_response", { operation = "script", script = { steps = {
-      { kind = "tool_call", name = "lsp_diagnostics", arguments = { workspace = "nested/Cargo.toml" } },
+      { kind = "tool_call", name = "lsp_diagnostics", arguments = { workspace = { path = "nested", language = "rust" } } },
       { kind = "message", content = "response", text = marker },
     }, terminal = "completed" } })
     request("session.prompt.submit", { text = "Read published diagnostics " .. marker })
@@ -238,6 +244,74 @@ T["workspace_published_diagnostics_are_partial_even_when_empty"] = function()
   MiniTest.expect.equality(output:find("No published diagnostics in the", 1, true) ~= nil, true)
   MiniTest.expect.equality(output:find("workspace has no diagnostics", 1, true), nil)
   vim.diagnostic.reset(vim.lsp.diagnostic.get_namespace(mock.id, false))
+end
+
+-- requires-forge-host
+T["lua_project_selection_reaches_only_the_configured_server"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local original_directory = vim.fn.getcwd()
+  MiniTest.finally(function()
+    pcall(function() require("forge.lsp.bridge").close() end)
+    pcall(function() require("forge.views.harness.workspace").release(require("forge.session").harness) end)
+    pcall(host.stop)
+    pcall(vim.api.nvim_set_current_dir, original_directory)
+  end)
+  local workspace = temp.directory("lua-selection")
+  vim.fn.writefile({ "{}" }, workspace .. "/.luarc.json")
+  vim.fn.writefile({ "local function sample() end", "return sample" }, workspace .. "/init.lua")
+  local client = host.start().client
+  local state = require("forge.session").harness
+  local calls = {}
+  local mock = { id = 8920, name = "lua-fixture", initialized = true, root_dir = workspace,
+    config = { root_dir = workspace, filetypes = { "lua" } }, offset_encoding = "utf-16",
+    server_capabilities = {}, is_stopped = function() return false end,
+    supports_method = function(_, method) return method == "workspace/symbol" end, cancel_request = function() end }
+  function mock:request(method, _, receive)
+    calls[#calls + 1] = method
+    receive(nil, { { name = "sample", kind = 12, location = { uri = vim.uri_from_fname(workspace .. "/init.lua"),
+      range = { start = { line = 0, character = 15 }, ["end"] = { line = 0, character = 21 } } } } })
+    return true, #calls
+  end
+  stub(require("forge.text.harper"), "attach", function() end)
+  stub(vim.lsp, "get_clients", function() return { mock } end)
+  stub(vim.lsp, "get_client_by_id", function(identity) return identity == mock.id and mock or nil end)
+  stub(vim.lsp, "get_configs", function() return { { name = mock.name, filetypes = { "lua" }, root_markers = { ".luarc.json" } } } end)
+  stub(vim.lsp, "start", function() error("selection restarted an editor client") end)
+  vim.api.nvim_set_current_dir(workspace)
+  require("forge").setup({ diff_logging = false, harness_logging = false,
+    harness = { provider = "mock", providers = { mock = { selectable = true } } } })
+  require("forge.views.harness").open()
+  wait_until(function() return state.session ~= nil end, "Harness did not start")
+  local function request(method, params)
+    local done, failure
+    client.request({ method = method, params = params, session_id = state.session.id },
+      function(_, message) done, failure = true, message end)
+    wait_until(function() return done end, method .. " did not answer")
+    MiniTest.expect.equality(failure, nil)
+  end
+  request("session.configure", { lsp_tools = true })
+  local symbol_arguments = vim.deepcopy(lua_selection_recording.arguments)
+  symbol_arguments.operation = nil
+  symbol_arguments.workspace.path = "."
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "tool_call", name = "lsp_workspace_list", arguments = {} },
+    { kind = "tool_call", name = "lsp_symbols", arguments = symbol_arguments },
+    { kind = "message", content = "response", text = "lua-selection-complete" },
+  }, terminal = "completed" } })
+  request("session.prompt.submit", { text = "List Lua workspaces and find sample" })
+  wait_until(function() return state.transcript_buf and buffer.text(state.transcript_buf):find("lua-selection-complete", 1, true) end,
+    "Lua selection did not finish")
+  wait_until(function() return state_fixture.get(1000).status.kind == "idle" end, "provider did not settle")
+  MiniTest.expect.equality(calls, { "workspace/symbol" })
+  wait_until(function()
+    local transcript = state.presentation.transcript
+    for index = 0, transcript.sequence:count() - 1 do
+      local node = transcript.sequence:at(index).entry.metadata.node
+      if node and node ~= vim.NIL and node.display == "heading" then state.presentation.set_section(node.id, true, false) end
+    end
+    local contents = buffer.text(state.transcript_buf)
+    return contents:find("local function sample", 1, true) ~= nil
+  end, "Lua symbol output did not reach the transcript")
 end
 
 return T

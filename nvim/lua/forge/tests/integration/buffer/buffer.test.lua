@@ -413,6 +413,7 @@ T["row_prefix"] = function()
   end
 end
 
+-- requires-forge-host
 T["source"] = function()
   local source, state
   -- Close the source and stop the host before the temporary directories registered below are deleted.

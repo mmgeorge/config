@@ -79,5 +79,23 @@ def run_adapter_tests [] {
   assert equal $selected.exit_code 0
   let events = open --raw $selected_events | lines | each {|line| $line | from json }
   assert equal ($events | where event == "finished" | get id) [$"($fixture)::computed_entry"]
+
+  let mixed = "nvim/lua/forge/tests/integration/client/client.test.lua"
+  let declared = adapter_cases $mixed
+  let non_host = partition_cases $declared "non-host"
+  let host = partition_cases $declared "host"
+  assert equal ($host | get name) ["receive_initialize"]
+  assert equal ($non_host | get name | sort) ["command_reconciliation" "publication_replay"]
+  assert equal (($host | get id) | where {|id| $id in ($non_host | get id) } | length) 0
+  assert equal (($host | append $non_host | get id | sort)) ($declared | get id | sort)
+  for partition in ["host" "non-host"] {
+    let result_path = $scratch | path join $"partition-($partition).json"
+    let request = {version: 1, op: "discover", within: [$mixed], files: [], mode: "exact", result: $result_path}
+    let result = $request | to json --raw | ^nu --stdin --no-config-file .forge/checks/lua-tests.nu adapter --partition $partition | complete
+    assert equal $result.exit_code 0
+    let names = open $result_path | get items | where case == true | get name | sort
+    let expected = partition_cases $declared $partition | get name | sort
+    assert equal $names $expected
+  }
   print $"Lua adapter assertions passed. Evidence: ($scratch)"
 }

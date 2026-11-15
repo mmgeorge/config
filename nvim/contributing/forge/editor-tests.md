@@ -67,19 +67,26 @@ A file that must reload itself in a fresh editor starts a child with `MiniTest.n
 
 ## Suites
 
-The `lua-test` adapter accepts discovered test IDs or affected repository paths. A changed test file runs itself; a changed Lua source file selects its mirrored unit test and its integration area, the nearest mirrored integration directory of the file or an ancestor; a source file with no area selects its plugin's whole test directory. Shared runner changes can select every test. An empty or invalid targeted selection does not expand to the whole suite; request `all: true` explicitly when full coverage is needed.
+The `lua-test` and `lua-host-test` adapters accept discovered test IDs or affected repository paths. `lua-test` owns cases that do not launch the Forge executable and has no build prerequisite. `lua-host-test` owns cases that launch the executable, including through a helper or child Neovim, and requires `rust-build`. Integration tests that use mocks or real Git alone remain in `lua-test`.
+
+Mark a host-dependent case with `-- requires-forge-host` immediately above its top-level `T["name"] = ...` declaration. Both static discovery and execution use this marker; they retain the same case ID while assigning it to exactly one check. Keep the marker when renaming or moving a case, and add it when a case starts using a host-backed helper. Computed cases inherit their top-level entry's classification. A computed entry without a static declaration belongs to `lua-test`.
+
+A changed test file selects its cases in each partition; a changed Lua source file selects its mirrored unit test and its integration area, the nearest mirrored integration directory of the file or an ancestor. A source file with no area selects its plugin's whole test directory. Shared runner changes can select every test. An empty or invalid targeted selection does not expand to the whole suite; request `all: true` explicitly when full coverage is needed. Run both checks to cover both partitions of an affected source area.
 
 ## Run a fixture
 
-`.forge/checks/lua-tests.nu` is the only way to run Lua tests, both inside Harness, where the `lua-test` adapter calls it, and outside. The runner clones the pinned mini.test commit once into a commit-named directory beside the Nushell cache. It runs every unit shard and every integration case in its own fresh Neovim from the repository root: `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" --cmd "set rtp^=<mini.test>" -l nvim/lua/forge/tests/support/minitest_shard.lua <file> [case]`. The shard bootstrap arms a five-second deadline for each case as it starts and exits with status 124 naming the hung case, so a timeout ends the shard and later cases in a unit file do not run. The runner kills the whole process tree, including any Forge host, of a single-case process still running one second past that deadline, and of a unit shard still running after one minute. It runs processes in parallel, by default on a sixth of the logical CPUs, because host tests contend for process launches and `git`.
+`.forge/checks/lua-tests.nu` is the only way to run Lua tests, both inside Harness, where both Lua adapters call it, and outside. The runner clones the pinned mini.test commit once into a commit-named directory beside the Nushell cache. It runs every unit shard and every integration case in its own fresh Neovim from the repository root: `nvim --headless -i NONE -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.loader.enable(false)" --cmd "set rtp^=<mini.test>" -l nvim/lua/forge/tests/support/minitest_shard.lua <file> [case]`. The shard bootstrap arms a five-second deadline for each case as it starts and exits with status 124 naming the hung case, so a timeout ends the shard and later cases in a unit file do not run. The runner kills the whole process tree, including any Forge host, of a single-case process still running one second past that deadline, and of a unit shard still running after one minute. It runs processes in parallel, by default on a sixth of the logical CPUs, because host tests contend for process launches and `git`.
 
 Inside Harness, select tests through the check:
 
 ```text
 check_discover({"check":"lua-test","mode":"static"})
+check_discover({"check":"lua-host-test","mode":"static"})
 check_run({"check":"lua-test","tests":{"ids":["<ID returned by discovery>"]}})
-check_run({"check":"lua-test","tests":{"affected":["nvim/lua/forge/lsp"]}})
+check_run({"check":["lua-test","lua-host-test"],"tests":{"affected":["nvim/lua/forge/client.lua"]}})
 ```
+
+The current Harness can skip an implicit `rust-build` prerequisite when its changed-path selection is empty, then skip `lua-host-test` because the prerequisite did not pass. To run the complete host suite in that situation, explicitly select both checks with `check_run({"check":["rust-build","lua-host-test"],"all":true})`. A skipped run is not passing evidence.
 
 Select a whole source directory only when the area needs full coverage.
 
@@ -147,6 +154,7 @@ Any change to a payload the host sends to Lua must keep its recordings current i
 | `review-commit-semantic.json` | `forge-review` `commit_diff_controls_isolate_immutable_sources_and_preserve_them_on_refresh` | `unit/review_document.test.lua` |
 | `notification.json` | none | `unit/notifications.test.lua` |
 | `cancellation-progress.json` | `forge-harness` `cancellation_progress_is_durable_and_recorded` | `unit/views/harness/cleanup_progress.test.lua`, `unit/views/harness/snapshot.test.lua` |
+| `lsp-lua-selection.json` | `forge-harness` `lua_selection_matches_editor_recording` | `integration/lsp/lsp.test.lua` |
 
 `notification.json` has no Rust check, because its producing test was removed. When the notification document snapshot changes, record a new snapshot from the host by hand and update the recording in the same change, or add a Rust check that produces it.
 

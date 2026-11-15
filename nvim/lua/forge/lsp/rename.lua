@@ -403,7 +403,7 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
     end))
   end
   local function query(arguments, callback)
-    active_cancel = semantic.request(workspace, arguments, authorize, guard(function(reply, failure)
+    active_cancel = semantic.request(readiness.selection and readiness.selection.path or workspace, arguments, authorize, guard(function(reply, failure)
       active_cancel = nil
       if failure then finish(failure) else callback(reply) end
     end), nil, readiness)
@@ -414,6 +414,8 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
       local filetype = vim.filetype.match({ filename = target.path }) or ""
       local buffer = source.loaded(target.path)
       local client, error = readiness.client, "invalid_workspace: no selected client"
+      local coverage_failure = client and source.validate_client(client, target.path, filetype, buffer)
+      if coverage_failure then finish(coverage_failure) return end
       if client and not client:supports_method("textDocument/rename", buffer) then finish("unsupported: selected LSP does not support rename") return end
       if not client then finish(error) return end
       read(target.path, function(contents)
@@ -446,6 +448,13 @@ function M.prepare(id, workspace, request, authorize, analyze, receive)
     local old, new = request.old_path, request.new_path
     local stat = vim.uv.fs_stat(old)
     if not stat then finish("path_not_found: " .. old) return end
+    if not readiness.client or not source.covers(readiness.client, old) or not source.covers(readiness.client, new) then
+      finish("invalid_workspace: selected LSP does not cover the rename paths") return
+    end
+    if stat.type == "file" then
+      local coverage_failure = source.validate_client(readiness.client, old, vim.filetype.match({ filename = old }) or "", source.loaded(old))
+      if coverage_failure then finish(coverage_failure) return end
+    end
     local failure = touch(old) or touch(new)
     if failure then finish(failure) return end
     local selected = {}

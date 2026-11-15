@@ -511,14 +511,39 @@ def adapter_emit [target: path, event: record] {
   ($event | to json --raw) + "\n" | save --append $target
 }
 
-# Approximate source metadata; only runtime collection establishes exact membership.
-def adapter_cases [file: string] {
-  open --raw ($repository_root | path join $file) | lines | enumerate | each {|row|
+# Case-local host markers keep static discovery and runtime selection in the same partition.
+def case_requirements [file: string] {
+  let rows = open --raw ($repository_root | path join $file) | lines
+  $rows | enumerate | each {|row|
     let parsed = $row.item | parse --regex '^T\["(?<name>[^"]+)"\] = '
     if ($parsed | is-empty) { null } else {
-      {id: $"($file)::($parsed.0.name)", parent: $file, label: $parsed.0.name, case: true, name: $parsed.0.name, path: $file, line: ($row.index + 1)}
+      let requires_host = $row.index > 0 and ($rows | get ($row.index - 1) | str trim) == '-- requires-forge-host'
+      {id: $"($file)::($parsed.0.name)", parent: $file, label: $parsed.0.name, case: true, name: $parsed.0.name, path: $file, line: ($row.index + 1), requires_host: $requires_host}
     }
   } | compact
+}
+
+# Approximate source metadata; only runtime collection establishes exact membership.
+def adapter_cases [file: string] {
+  case_requirements $file | reject requires_host
+}
+
+# Select disjoint case inventories without executing test bodies or hooks.
+def partition_cases [cases: list, partition: string] {
+  if $partition == "all" { return $cases }
+  $cases | group-by path | transpose file cases | each {|group|
+    let host_names = case_requirements $group.file | where requires_host | get name
+    $group.cases | where {|item| ($item.name in $host_names) == ($partition == "host") }
+  } | flatten
+}
+
+# Avoid collecting files whose statically declared cases all belong to the other check.
+def partition_files [files: list<string>, partition: string] {
+  if $partition == "all" { return $files }
+  $files | where {|file|
+    let requirements = case_requirements $file
+    ($requirements | is-empty) or ($requirements | any {|item| $item.requires_host == ($partition == "host") })
+  }
 }
 
 # Include every ancestor so opaque group IDs round-trip through Harness coverage validation.
@@ -623,7 +648,7 @@ def adapter_drain [worker: record, target: path] {
 }
 
 # Run ordinary shard workers while the main thread alone publishes adapter events.
-def adapter_run [request: record, jobs: int] {
+def adapter_run [request: record, jobs: int, partition: string = "all"] {
   let ids = $request.select.ids? | default []
   let affected = $request.select.affected? | default []
   let all = ($ids | is-empty) and ($affected | is-empty)
@@ -632,11 +657,12 @@ def adapter_run [request: record, jobs: int] {
     let explicit = if ($ids | is-empty) { [] } else { adapter_files $ids }
     $explicit | append $changed | uniq | sort
   }
-  let collected = try { adapter_collect $files $jobs } catch {|failure|
+  let collected = try { adapter_collect (partition_files $files $partition) $jobs } catch {|failure|
     adapter_emit $request.events {event: "error", message: $failure.msg}
     return 1
   }
-  let cases = $collected | where {|item| $all or $item.path in $changed or (adapter_matches $item $ids) }
+  let selected = $collected | where {|item| $all or $item.path in $changed or (adapter_matches $item $ids) }
+  let cases = partition_cases $selected $partition
   let fixtures = $cases | group-by path | transpose file cases | each {|group|
     let whole_file = ($group.cases | length) == ($collected | where path == $group.file | length)
     if (is_unit_test_path $group.file) and $whole_file { [$group.file] } else { $group.cases | get id }
@@ -694,9 +720,10 @@ def adapter_run [request: record, jobs: int] {
 }
 
 # Protocol mode requires `nu --stdin` so $in contains the request until EOF.
-def "main adapter" [--jobs: int] {
+def "main adapter" [--jobs: int, --partition: string = "all"] {
   let request = $in | from json
   if $request.version != 1 { error make {msg: "Unsupported check adapter protocol version"} }
+  if $partition not-in ["all" "host" "non-host"] { error make {msg: $"Unknown Lua test partition: ($partition)"} }
   let concurrency = $jobs | default (default_jobs)
   if $concurrency < 1 { error make {msg: "Adapter jobs must be positive"} }
   cd $repository_root
@@ -710,10 +737,11 @@ def "main adapter" [--jobs: int] {
       let mode = $request.mode? | default 'static'
       # Resolve item identity before intersecting source files. Otherwise a known
       # group with no matching files is indistinguishable from an unknown ID.
-      let cases = if $mode == 'exact' { adapter_collect $candidates $concurrency } else if $mode == 'static' {
+      let inventory = if $mode == 'exact' { adapter_collect $candidates $concurrency } else if $mode == 'static' {
         $candidates | each {|file| adapter_cases $file } | flatten
       } else { error make {msg: $"Unknown discovery mode: ($mode)"} }
-      let items = adapter_items $cases $candidates
+      let cases = partition_cases $inventory $partition
+      let items = adapter_items $cases (partition_files $candidates $partition)
       for id in $within {
         if not ($id in ($items | get id)) { error make {msg: $"Unknown discovery item: ($id)"} }
       }
@@ -735,7 +763,7 @@ def "main adapter" [--jobs: int] {
       {items: ($items | where {|item| $item.id in $included }), mode: $mode} | to json --raw | save --force $request.result
     }
     "run" => {
-      let code = adapter_run $request $concurrency
+      let code = adapter_run $request $concurrency $partition
       if $code != 0 { exit $code }
     }
     _ => { adapter_emit $request.events {event: "unsupported"} }

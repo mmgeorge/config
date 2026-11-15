@@ -86,4 +86,12 @@ T["lsp_source_read"] = function()
   source.close()
 end
 
+T["selected_client_checks_language_and_dependency_scope"] = function()
+  local source = require("forge.lsp.source")
+  local client = { id = 947, config = { root_dir = "/project", filetypes = { "lua" } } }
+  eq(source.validate_client(client, "/project/init.lua", "rust", nil):find("does not serve rust", 1, true) ~= nil, true)
+  eq(source.validate_client(client, "/dependency/init.lua", "lua", nil):find("does not cover", 1, true) ~= nil, true)
+  eq(source.validate_client(client, "/dependency/init.lua", "lua", nil, "all"), nil)
+end
+
 return T

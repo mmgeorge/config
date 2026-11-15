@@ -13,7 +13,7 @@ Run Rust filters as `cargo nextest run --cargo-profile dev --locked -p <package>
 | Provider lifecycle | Exact selectors and package ownership below | `harness::prompt_lifecycle` |
 | Input and queues | `broker::test::input::` | None |
 | Transcript folds | None | `harness::message_folds` |
-| Agent LSP tools | None | `lsp/semantic.test.lua::lsp_query`, `startup::startup`, `startup::lazy_startup`, `semantic::workspace` |
+| Agent LSP tools | `tools::lsp::request::tests::every_semantic_tool_accepts_lua_selection`, `tools::lsp::rename::tests::rename_tools_accept_lua_project_selection`, `tools::lsp::render::tests::workspace_listing_uses_paths_and_language_keys` | `workspace::lua_workspace_uses_configured_root_without_starting_server`, `root::marker_priority_matches_editor_configuration`, `semantic::mismatched_language_fails_before_document_requests`, `lsp::lua_project_selection_reaches_only_the_configured_server` |
 | Background generation | `compaction` and `commit_message::` in `forge` | `harness::background`, `commit_settings` |
 | Configuration controls | None | `picker::picker`, `settings::settings`, `commit_settings` |
 | Provider registry | None | `client::provider_registry_config_reload` |

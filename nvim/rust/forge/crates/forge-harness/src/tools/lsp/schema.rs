@@ -1,10 +1,18 @@
 use serde_json::{Value, json};
+
+/// Describe the project selector shared by every semantic tool.
+pub(super) fn workspace_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["path","language"],"properties":{
+        "path":{"type":"string","minLength":1,"description":"Project directory returned by lsp_workspace_list, relative to the session repository."},
+        "language":{"type":"string","enum":["rust","typescript","lua"],"description":"Language key returned by lsp_workspace_list; typescript includes JavaScript."}
+    }})
+}
 /// Build common source-query fields; each tool adds its own options.
 pub(super) fn base_schema(operation: &str) -> (serde_json::Map<String, Value>, Vec<&'static str>) {
     let position = matches!(operation, "definition" | "context" | "references" | "calls");
     let mut properties = serde_json::Map::from_iter([(
         "path".into(),
-        json!({"type":"string","minLength":1,"description":"Workspace-relative or authorized absolute path."}),
+        json!({"type":"string","minLength":1,"description":"Session-repository-relative or authorized absolute path; not relative to workspace.path."}),
     )]);
     let fields = &mut properties;
     let required = if matches!(
@@ -16,7 +24,7 @@ pub(super) fn base_schema(operation: &str) -> (serde_json::Map<String, Value>, V
         vec!["workspace"]
     };
     if !matches!(operation, "overview" | "source_symbols" | "workspace_list") {
-        fields.insert("workspace".into(), json!({"type":"string","minLength":1,"description":"Path to the selected Cargo.toml or package.json, relative to the session repository."}));
+        fields.insert("workspace".into(), workspace_schema());
     }
     if position {
         fields.insert("line".into(), json!({"type":"integer","minimum":1,"description":"One-based source line from a tool result."}));

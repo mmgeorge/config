@@ -2,6 +2,61 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Supported project language families, independent of configured server names.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum WorkspaceLanguage {
+    /// Rust projects discovered through Cargo manifests.
+    Rust,
+    /// TypeScript and JavaScript projects discovered through package manifests.
+    Typescript,
+    /// Lua projects resolved through the enabled editor configuration.
+    Lua,
+}
+
+/// Select one project directory and its language family.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "WorkspaceSelectionWire")]
+pub(super) struct WorkspaceSelection {
+    /// Project directory, relative to the repository until authorization.
+    path: String,
+    /// Language family used to select an enabled Neovim configuration.
+    language: WorkspaceLanguage,
+}
+
+/// Decode selector fields before validating the project path.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSelectionWire {
+    path: String,
+    language: WorkspaceLanguage,
+}
+
+impl WorkspaceSelection {
+    /// Get the selected project directory.
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Replace the project directory after host authorization.
+    pub(super) fn path_replace(&mut self, path: String) -> Result<()> {
+        ensure!(!path.trim().is_empty(), "workspace path must be nonempty");
+        self.path = path;
+        Ok(())
+    }
+}
+
+impl TryFrom<WorkspaceSelectionWire> for WorkspaceSelection {
+    type Error = anyhow::Error;
+
+    /// Reject empty project paths at every public decode boundary.
+    fn try_from(value: WorkspaceSelectionWire) -> Result<Self> {
+        let WorkspaceSelectionWire { path, language } = value;
+        ensure!(!path.trim().is_empty(), "workspace path must be nonempty");
+        Ok(Self { path, language })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Operation {
@@ -101,7 +156,7 @@ impl Target {
 pub(super) struct Arguments {
     pub operation: Operation,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
+    pub workspace: Option<WorkspaceSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,16 +239,15 @@ impl Arguments {
             && self.include.as_ref().is_none_or(Vec::is_empty));
         ensure!(
             !needs_workspace || self.workspace.is_some(),
-            "workspace manifest is required"
+            "workspace path and language are required"
         );
         ensure!(
-            self.workspace.as_ref().is_none_or(|path| matches!(
-                std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|name| name.to_str()),
-                Some("Cargo.toml" | "package.json")
-            )),
-            "workspace must name Cargo.toml or package.json"
+            self.workspace.is_none()
+                || !matches!(
+                    self.operation,
+                    Operation::Overview | Operation::SourceSymbols | Operation::WorkspaceList
+                ),
+            "source-only tools do not accept workspace selection"
         );
         ensure!(
             self.operation != Operation::Symbols || self.query.is_some(),
@@ -377,7 +431,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn semantic_tools_require_manifest_selection() {
+    fn semantic_tools_require_project_selection() {
         for tool in [
             "lsp_symbols",
             "lsp_definition",
@@ -391,7 +445,7 @@ mod tests {
         assert!(
             Arguments::parse(
                 "lsp_symbols",
-                json!({"workspace":"Cargo.toml","query":"Store"})
+                json!({"workspace":{"path":".","language":"rust"},"query":"Store"})
             )
             .is_ok()
         );
@@ -399,6 +453,21 @@ mod tests {
             Arguments::parse("lsp_symbols", json!({"workspace":"src","query":"Store"})).is_err()
         );
         assert!(Arguments::parse("lsp_workspace_list", json!({})).is_ok());
+        for selection in [
+            json!({"path":"", "language":"lua"}),
+            json!({"path":"nvim", "language":"unknown"}),
+            json!({"path":"nvim"}),
+            json!({"language":"lua"}),
+            json!({"path":"nvim", "language":"lua", "server":"lua_ls"}),
+        ] {
+            assert!(
+                Arguments::parse(
+                    "lsp_symbols",
+                    json!({"workspace":selection,"query":"Store"})
+                )
+                .is_err()
+            );
+        }
         assert!(
             Arguments::parse("lsp_source_symbols", json!({"path":"src","query":"Store"})).is_ok()
         );
@@ -411,6 +480,59 @@ mod tests {
                 json!({"path":"src/lib.rs","symbol":"Store","include":["references"]})
             )
             .is_err()
+        );
+    }
+
+    /// Keep all semantic tool boundaries on the same path and language contract.
+    #[test]
+    fn every_semantic_tool_accepts_lua_selection() {
+        for (tool, mut arguments) in [
+            ("lsp_symbols", json!({"query":"sample"})),
+            (
+                "lsp_definition",
+                json!({"path":"nvim/init.lua","symbol":"sample"}),
+            ),
+            (
+                "lsp_context",
+                json!({"path":"nvim/init.lua","symbol":"sample","include":["references"]}),
+            ),
+            ("lsp_references", json!({"symbol":"sample"})),
+            (
+                "lsp_calls",
+                json!({"symbol":"sample","direction":"incoming"}),
+            ),
+            (
+                "lsp_paths",
+                json!({"from":{"symbol":"sample"},"to":{"symbol":"target"}}),
+            ),
+            ("lsp_diagnostics", json!({})),
+            ("lsp_status", json!({})),
+        ] {
+            arguments["workspace"] = json!({"path":"nvim","language":"lua"});
+            let parsed =
+                Arguments::parse(tool, arguments).expect("Lua project selection must parse");
+            assert_eq!(
+                parsed.workspace.expect("selection is retained").language,
+                super::WorkspaceLanguage::Lua
+            );
+        }
+    }
+
+    /// Keep the editor's replay fixture aligned with the serialized selector contract.
+    #[test]
+    fn lua_selection_matches_editor_recording() {
+        let arguments = Arguments::parse(
+            "lsp_symbols",
+            json!({
+                "workspace":{"path":"<workspace>","language":"lua"}, "query":"sample"
+            }),
+        )
+        .expect("valid Lua selector");
+        forge_recorded_fixtures::assert_matches_recording(
+            "lsp-lua-selection.json",
+            &json!({
+                "workspace":"<workspace>", "arguments":arguments
+            }),
         );
     }
 }

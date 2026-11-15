@@ -79,3 +79,31 @@ pub(in crate::tools) fn record(
     let _ = invocation;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Keep every semantic tool and both renames on the same public selector schema.
+    #[test]
+    fn every_semantic_schema_uses_project_selection() {
+        for definition in super::definitions() {
+            let selection = &definition.input_schema["properties"]["workspace"];
+            if matches!(
+                definition.name,
+                "lsp_overview" | "lsp_source_symbols" | "lsp_workspace_list"
+            ) {
+                assert!(
+                    selection.is_null(),
+                    "{} unexpectedly accepts workspace",
+                    definition.name
+                );
+            } else {
+                assert_eq!(
+                    selection,
+                    &super::super::schema::workspace_schema(),
+                    "{} has a different selector",
+                    definition.name
+                );
+            }
+        }
+    }
+}

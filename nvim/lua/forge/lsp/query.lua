@@ -6,6 +6,7 @@ local M = {}
 
 ---@class ForgeLspArguments
 ---@field operation string
+---@field workspace? ForgeLspWorkspace
 ---@field symbol? string
 ---@field from? ForgeLspTarget
 ---@field to? ForgeLspTarget
@@ -104,7 +105,8 @@ function M.request(workspace, arguments, authorize, analyze, receive)
     local workspace_query = not request.path and (request.operation == "workspace_symbols" or request.operation == "diagnostics")
     local completed = false
     if not readiness.client then finish("invalid_argument: semantic operation requires workspace") return end
-    local cancel, expire = semantic.request(workspace, request, authorize, function(reply, failure)
+    local selected_root = readiness.selection and readiness.selection.path or workspace
+    local cancel, expire = semantic.request(selected_root, request, authorize, function(reply, failure)
       completed = true
       if finished then return end
       active_cancel, active_expire = nil, nil
@@ -353,6 +355,17 @@ function M.request(workspace, arguments, authorize, analyze, receive)
   end
   local function start()
     if finished then return end
+    if readiness.client and arguments.path then
+      local stat = vim.uv.fs_stat(arguments.path)
+      if stat and stat.type == "file" then
+        local buffer = source.loaded(arguments.path)
+        local filetype = buffer and vim.bo[buffer].filetype or vim.filetype.match({ filename = arguments.path }) or ""
+        local failure = source.validate_client(readiness.client, arguments.path, filetype, buffer, arguments.scope)
+        if failure then finish(failure) return end
+      elseif stat and not source.covers(readiness.client, arguments.path) then
+        finish("invalid_workspace: selected LSP does not cover " .. arguments.path) return
+      end
+    end
     if arguments.operation == "paths" then paths()
     elseif source_listing then list()
     elseif arguments.operation == "context" then context()
@@ -403,6 +416,14 @@ function M.request(workspace, arguments, authorize, analyze, receive)
       if active_expire then draining = true active_expire()
       else finish("timeout: " .. arguments.operation .. " lookup exceeded " .. duration .. " seconds.") end
     end))
+    if readiness.client and arguments.path then
+      local buffer = source.loaded(arguments.path)
+      local filetype = buffer and vim.bo[buffer].filetype or vim.filetype.match({ filename = arguments.path })
+      if filetype then
+        local failure = source.validate_client(readiness.client, arguments.path, filetype, buffer, arguments.scope)
+        if failure then finish(failure) return end
+      end
+    end
     if vim.tbl_contains({ "definition", "context", "references", "calls" }, arguments.operation) then
       resolve(arguments, function(resolved)
         arguments.path, arguments.line, arguments.column = resolved.path, resolved.line, resolved.column
@@ -411,20 +432,24 @@ function M.request(workspace, arguments, authorize, analyze, receive)
     else start() end
   end
   if arguments.operation == "workspace_list" then
-    require("forge.lsp.workspace").list(arguments.path or workspace, authorize, active, function(reply, failure)
+    active_cancel = require("forge.lsp.workspace").list(arguments.path or workspace, authorize, active, function(reply, failure)
       if reply then result = reply end
       finish(failure)
-    end)
+    end, arguments)
   elseif arguments.operation == "status" then
     local config, failure = require("forge.lsp.workspace").config(arguments.workspace)
     if not config then finish(failure) return function() end end
     local candidates = {}
     for _, client in ipairs(vim.lsp.get_clients({ name = config.name, _uninitialized = true })) do
-      if source.covers(client, arguments.workspace) and not client:is_stopped() then candidates[#candidates + 1] = client end
+      local root = client.root_dir or client.config.root_dir
+      local matches_root = arguments.workspace.language ~= "lua" or type(root) == "string"
+        and source.canonical(root) == source.canonical(arguments.workspace.path)
+      if client.name == config.name and matches_root and source.covers(client, arguments.workspace.path)
+        and not client:is_stopped() then candidates[#candidates + 1] = client end
     end
     if #candidates > 1 then finish("ambiguous_server: multiple matching clients")
     elseif #candidates == 0 then result.message = config.name .. ": not started" finish()
-    else readiness.client = candidates[1] start() end
+    else readiness.client = candidates[1] readiness.selection = arguments.workspace start() end
   elseif arguments.workspace then
     active_cancel = require("forge.lsp.workspace").resolve(arguments.workspace, authorize, function(selected, failure)
       if finished then return end
@@ -432,8 +457,8 @@ function M.request(workspace, arguments, authorize, analyze, receive)
       readiness = selected
       if arguments.operation == "status" then start() else resolved_start() end
     end)
-  elseif source_listing or arguments.operation == "context" and arguments.path and not arguments.include then resolved_start()
-  else finish("invalid_argument: workspace manifest is required") end
+  elseif source_listing or arguments.operation == "context" and arguments.path and (not arguments.include or #arguments.include == 0) then resolved_start()
+  else finish("invalid_argument: workspace path and language are required") end
   return function() finish("cancelled: LSP request cancelled.") end
 end
 

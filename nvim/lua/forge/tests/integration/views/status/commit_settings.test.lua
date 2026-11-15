@@ -86,6 +86,7 @@ local T = MiniTest.new_set({ hooks = isolation.hooks() })
 ---@return string
 local function vim_string(value) return "'" .. value:gsub("'", "''") .. "'" end
 
+-- requires-forge-host
 T["commit_settings"] = function()
   local script = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")
   local data = temp.directory("data")

@@ -109,6 +109,7 @@ local test_path = debug.getinfo(1, "S").source:sub(2)
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
 T["language_syntax"] = function()
   local child = MiniTest.new_child_neovim()
   child.start()

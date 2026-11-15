@@ -377,18 +377,26 @@ The example template needs its required `package` value for every invocation.
 Custom inputs follow the saved declaration; they do not acquire the adapter's
 test-selection semantics.
 
-The repository migration replaces the two Lua templates with one `lua-test`
-adapter. Its request uses the common test-selection contract:
+The repository provides two Lua checks using the same test-selection contract.
+`lua-test` runs cases that do not launch Forge, while `lua-host-test` runs cases
+marked as requiring the Forge executable. Mock-only integration tests belong to
+`lua-test` alongside unit tests.
 
 ```json
 {"check":"lua-test"}
 {"check":"lua-test","tests":{"ids":["nvim/lua/forge/tests/unit/views/plan_review/checks.test.lua"]}}
 {"check":"lua-test","tests":{"affected":["nvim/lua/forge/views/plan_review/checks.lua"]}}
+{"check":"lua-host-test","tests":{"ids":["nvim/lua/forge/tests/integration/client/client.test.lua::receive_initialize"]}}
 ```
 
-The migrated definition retains `after: ["rust-build"]`, so Harness builds the
-Forge host first and skips the Lua tests when the build fails. Existing saved
-templates require reviewed publication of this migration before they can load.
+Only `lua-host-test` declares `after: ["rust-build"]`, so Harness builds the
+Forge host before those cases and skips them when the build fails. `lua-test`
+has no build prerequisite. Select both checks to cover both partitions of an
+affected source area. The manual runner without a partition still runs both.
+
+If Harness skips the implicit build because no changed Rust paths match, select
+both checks explicitly: `{"check":["rust-build","lua-host-test"],"all":true}`.
+This runs the complete host suite; a skipped dependency is not a passing build.
 
 Check IDs use language/tool-first names, while display labels name the action.
 `rulesync-local-preview` and `rulesync-global-preview` only preview generation.

@@ -146,6 +146,7 @@ T["commit"] = function()
     "amend reused the prior commit trace")
 end
 
+-- requires-forge-host
 T["commit_large_output"] = function()
   dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
   local commit = require("forge.integrations.commit")
@@ -318,6 +319,7 @@ T["commit_parent_exit_quit"] = function() assert_commit_parent_exit("quit") end
 T["commit_parent_exit_terminate"] = function() assert_commit_parent_exit("terminate") end
 T["commit_parent_exit_abort"] = function() assert_commit_parent_exit("abort") end
 
+-- requires-forge-host
 T["commit_scope"] = function()
   host.start({ schedule_ensure = false })
   local client = require("forge.client")
@@ -376,6 +378,7 @@ T["commit_scope"] = function()
   assert(host.stop(), "scope test host was not collected")
 end
 
+-- requires-forge-host
 T["commit_status_reuse"] = function()
   local root = vim.fn.getcwd()
   local status_closed = false
@@ -472,6 +475,7 @@ T["commit_status_reuse"] = function()
   assert(host.stop(), "fixture host did not stop")
 end
 
+-- requires-forge-host
 T["commit_accept_preserves_status_tab"] = function()
   local root = vim.fn.getcwd()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
@@ -510,6 +514,7 @@ T["commit_accept_preserves_status_tab"] = function()
   MiniTest.expect.equality(vim.trim(repository.run({ "log", "-1", "--format=%s" })), "test: preserve the Status tab")
 end
 
+-- requires-forge-host
 T["empty_diff_cursor"] = function()
   local root = vim.fs.normalize(vim.fn.getcwd())
   local status, state
@@ -1024,6 +1029,7 @@ T["revision_commands"] = function()
   assert(host_count == 1 and harness_count == 1, "Harness launched a second host")
 end
 
+-- requires-forge-host
 T["revision_commands_real"] = function()
   local client = require("forge.client")
   local builder = require("forge.builder")
@@ -1274,6 +1280,7 @@ T["tab_retries_deferred_body"] = function()
   notices:assert_none()
 end
 
+-- requires-forge-host
 T["status"] = function()
   local root = vim.fs.normalize(vim.fn.getcwd())
   local phase_file = vim.fn.tempname() .. ".status-host-phase.log"
@@ -1408,6 +1415,7 @@ local function open_popup_fixture()
   return fixture
 end
 
+-- requires-forge-host
 T["popup"] = function()
   local fixture = open_popup_fixture()
   local state, status, notices, idle, file_row, read =
@@ -1452,6 +1460,7 @@ T["popup"] = function()
   fixture.finish()
 end
 
+-- requires-forge-host
 T["popup_selection_discard"] = function()
   local fixture = open_popup_fixture()
   local state, status, notices, idle, file_row, read =
@@ -1478,6 +1487,7 @@ T["popup_selection_discard"] = function()
   fixture.finish()
 end
 
+-- requires-forge-host
 T["popup_issues_write"] = function()
   local fixture = open_popup_fixture()
   local state, notices, idle, read = fixture.state, fixture.notices, fixture.idle, fixture.read
@@ -1498,6 +1508,7 @@ T["popup_issues_write"] = function()
   fixture.finish()
 end
 
+-- requires-forge-host
 T["push"] = function()
   local root = vim.fn.getcwd()
   MiniTest.finally(function()
@@ -1742,6 +1753,7 @@ T["recent_commits"] = function()
   assert(#notices == 0, notice_text())
 end
 
+-- requires-forge-host
 T["status_recent_commits"] = function()
   local root = vim.fn.getcwd()
   local status, state
@@ -1850,6 +1862,7 @@ T["status_recent_commits"] = function()
   notices:assert_none()
 end
 
+-- requires-forge-host
 T["word_wrap"] = function()
   local root = vim.fn.getcwd()
   local closed = false

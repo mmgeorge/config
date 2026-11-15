@@ -11,6 +11,7 @@ local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
 T["directory_planning"] = function()
   local started = host.start({ config = true })
   local workspace = temp.directory("planning-workspace")

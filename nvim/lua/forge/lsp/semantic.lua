@@ -392,6 +392,18 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   end
   local function start()
     if arguments.operation == "status" then
+      if arguments.path then
+        local stat = vim.uv.fs_stat(arguments.path)
+        if not stat then finish("path_not_found: " .. arguments.path) return end
+        if not selected_client or not source.covers(selected_client, arguments.path) then
+          finish("invalid_workspace: selected LSP does not cover " .. arguments.path) return
+        end
+        if stat.type == "file" then
+          local failure = source.validate_client(selected_client, arguments.path,
+            vim.filetype.match({ filename = arguments.path }) or "", source.loaded(arguments.path))
+          if failure then finish(failure) return end
+        end
+      end
       for _, client in ipairs(selected_client and { selected_client } or {}) do
         local filetype = arguments.path and vim.filetype.match({ filename = arguments.path })
         local config = client.config --[[@as vim.lsp.Config]]
@@ -414,6 +426,9 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
     if workspace_query then
       local client = selected_client
       if not client or client:is_stopped() then finish("unavailable: selected LSP is not running") return end
+      if arguments.search_path and not source.covers(client, arguments.search_path) then
+        finish("invalid_workspace: selected LSP does not cover " .. arguments.search_path) return
+      end
       local root = client.root_dir or client.config.root_dir
       local coverage = { name = client.name, root = type(root) == "string" and root or workspace, state = "pending" }
       diagnostic_root = source.canonical(coverage.root)
@@ -449,6 +464,8 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
     if not filetype then finish("unsupported: Cannot determine the language of " .. path) return end
     local method = arguments.operation ~= "diagnostics" and methods[arguments.operation] or nil
     local client, failure = selected_client, "invalid_workspace: no selected client"
+    local coverage_failure = client and source.validate_client(client, path, filetype, buffer, arguments.scope)
+    if coverage_failure then finish(coverage_failure) return end
     if client and method and not client:supports_method(method, buffer) then
       finish("unsupported: selected LSP does not support " .. method) return
     end

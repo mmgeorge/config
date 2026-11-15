@@ -20,6 +20,66 @@
         "category": "lint"
       }
     },
+    "lua-adapter-test": {
+      "trigger": {
+        "auto": true,
+        "paths": [
+          ".forge/checks/lua-tests.nu",
+          ".forge/checks/lua-adapter.test.nu"
+        ]
+      },
+      "action": {
+        "command": [
+          "nu",
+          "--no-config-file",
+          "-c",
+          "source .forge/checks/lua-adapter.test.nu; run_adapter_tests"
+        ],
+        "label": "Verify Lua test adapter",
+        "category": "custom"
+      }
+    },
+    "lua-host-test": {
+      "trigger": {
+        "auto": true,
+        "paths": [
+          "nvim/lua/forge/**",
+          "nvim/lua/github/**",
+          "nvim/lua/rust_sidecar/**",
+          "nvim/lua/markdown_math/**",
+          "nvim/lua/markdown_code.lua",
+          "nvim/lua/plugins/forge.lua",
+          "nvim/lua/*/tests/**/*.lua",
+          ".forge/checks/lua-tests.nu",
+          "nvim/lua/git/**"
+        ],
+        "exclude": [
+          "nvim/lua/*/tests/fixtures/**",
+          "nvim/lua/*/tests/support/**",
+          "nvim/lua/*/tests/plans/**"
+        ]
+      },
+      "action": {
+        "adapter": {
+          "script": {
+            "command": [
+              "nu",
+              "--stdin",
+              "--no-config-file",
+              ".forge/checks/lua-tests.nu",
+              "adapter",
+              "--partition",
+              "host"
+            ]
+          }
+        },
+        "label": "Run Lua tests requiring the Forge host",
+        "category": "test",
+        "after": [
+          "rust-build"
+        ]
+      }
+    },
     "lua-test": {
       "trigger": {
         "auto": true,
@@ -48,15 +108,14 @@
               "--stdin",
               "--no-config-file",
               ".forge/checks/lua-tests.nu",
-              "adapter"
+              "adapter",
+              "--partition",
+              "non-host"
             ]
           }
         },
-        "label": "Run affected Lua tests",
-        "category": "test",
-        "after": [
-          "rust-build"
-        ]
+        "label": "Run Lua tests without the Forge host",
+        "category": "test"
       }
     },
     "nushell-check": {

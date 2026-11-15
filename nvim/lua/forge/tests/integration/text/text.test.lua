@@ -253,6 +253,7 @@ T["async_lifecycle"] = function()
   assert(fixture.exec('return #text_errors')==0)
 end
 
+-- requires-forge-host
 T["contractions"] = function()
   local fixture=text_fixture.native()
   MiniTest.finally(fixture.close)
@@ -409,6 +410,7 @@ T["comment_context"] = function()
   MiniTest.expect.equality(fixture.exec("return text_errors"), {})
 end
 
+-- requires-forge-host
 T["comment_capitalization"] = function()
   local fixture = text_fixture.native()
   MiniTest.finally(fixture.close)
@@ -547,6 +549,7 @@ T["stale_reply"] = function()
   assert(fixture.exec('return #text_errors')==0)
 end
 
+-- requires-forge-host
 T["sustained_input"] = function()
   -- Sustained typing and long contexts against the real text host. Each word is typed only after
   -- the previous correction applies, so the fixture advances on host replies rather than on a
@@ -604,6 +607,7 @@ T["sustained_input"] = function()
   assert(#fixture.exec('return text_errors')==0,vim.inspect(fixture.exec('return text_errors')))
 end
 
+-- requires-forge-host
 T["wordlist"] = function()
   local fixture=text_fixture.native()
   MiniTest.finally(fixture.close)

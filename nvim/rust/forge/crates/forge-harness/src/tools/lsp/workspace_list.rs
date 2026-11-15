@@ -10,7 +10,7 @@ pub(super) fn definition() -> ControlToolDefinition {
 
     ControlToolDefinition {
         name: NAME,
-        description: "List authorized Cargo.toml and package.json workspaces without starting language servers.",
+        description: "List authorized project directories and language keys (rust, typescript, lua) for workspace selection without starting language servers.",
         input_schema: json!({"type":"object","additionalProperties":false,"required":required,"properties":properties}),
     }
 }

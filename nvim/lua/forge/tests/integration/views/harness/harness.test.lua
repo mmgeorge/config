@@ -14,6 +14,7 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
 T["rejected_tool_expands_reason_with_orange_marker"] = function()
   local approval = dofile("nvim/lua/forge/tests/support/approval.lua")
   local workspace = temp.directory("approval-rejection")
@@ -88,6 +89,7 @@ T["rejected_tool_expands_reason_with_orange_marker"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
 T["approval_timeout_shows_original_request"] = function()
   local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
   local workspace = temp.directory("approval-timeout")
@@ -169,6 +171,7 @@ T["approval_timeout_shows_original_request"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
 T["opening_commands_use_tabs_and_clear_replaces_session"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   vim.o.columns, vim.o.lines = 140, 55
@@ -227,6 +230,7 @@ T["opening_commands_use_tabs_and_clear_replaces_session"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
 T["global_timeout_preserves_resource_maps"] = function()
   vim.o.columns, vim.o.lines = 140, 55
   local workspace = temp.directory("global-timeout")
@@ -271,6 +275,7 @@ T["global_timeout_preserves_resource_maps"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
 T["background"] = function()
 local root = temp.directory("background")
 local workspace = root .. "/repository"
@@ -327,6 +332,7 @@ assert(host.stop(), "Host did not stop")
 end
 -- The Background provider is its own saved setting: a chat provider that cannot run Background
 -- sessions must not leak into Background settings or decide which provider generates.
+-- requires-forge-host
 T["background_provider_independent"] = function()
 local root = temp.directory("background-provider")
 local workspace = root .. "/repository"
@@ -358,6 +364,7 @@ wait_until(function() return generated end, "Background generation did not settl
 assert(result and result.message and result.message ~= "", tostring(generation_failure))
 assert(host.stop(), "Host did not stop")
 end
+-- requires-forge-host
 T["access_preferences"] = function()
 local workspace = temp.directory("workspace")
 git_repository.run(workspace, { "init" })
@@ -458,6 +465,7 @@ picker.close(false)
 require("forge.views.harness.workspace").release(state)
 assert(host.stop(), "Harness host was not collected")
 end
+-- requires-forge-host
 T["check_shortcuts"] = function()
 local check_tool = dofile(check_tool_path)
 local workspace = temp.directory("workspace")
@@ -2395,6 +2403,7 @@ input.receive(state, { revision = host.revision, suspended = true, upsert = {}, 
 assert(composer_text() == "preserve this" and assert(retained_message("retract while typing")).id == retracted.id)
 errors:assert_none()
 end
+-- requires-forge-host
 T["provider_checklist"] = function()
 -- Exercise provider checklists and deferred native creation through a real host and mock provider.
 local original_directory = vim.fn.getcwd()
@@ -2538,6 +2547,7 @@ local release_failure = fixture_evidence.release(success and collected)
 assert(success and collected, failure or "host was not collected")
 assert(not release_failure, release_failure)
 end
+-- requires-forge-host
 T["aside_fork"] = function()
 -- `/btw` through a real host and mock provider: the aside forks a running origin at its last
 -- finished exchange, receives the question in its own tab, and leaves the origin's turn running.
@@ -2779,6 +2789,7 @@ state.session = source_session
 state.pending_steer = { { prompt = 'pending' } }
 assert(not harness.provider_switch_available())
 end
+-- requires-forge-host
 T["queue_viewport"] = function()
 vim.o.lines, vim.o.columns = 30, 80
 local workspace, data = temp.directory("workspace"), temp.directory("data")
@@ -3419,6 +3430,7 @@ end
 end
 
 -- A question response keeps its category while the provider has accepted but not consumed it.
+-- requires-forge-host
 T["question_answers_never_become_steering"] = function()
   local workspace = temp.directory("question-answer-steering")
   local started = host.start({ config = true })
@@ -3510,6 +3522,7 @@ T["question_answers_never_become_steering"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
 T["question_answer_opens_new_exchange_once"] = function()
   local workspace = temp.directory("answer-opener")
   local started = host.start({ config = true })
@@ -3679,14 +3692,17 @@ local function verify_answered_question_group(batched)
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
 T["answered_questions_share_one_transcript_group"] = function()
   verify_answered_question_group(false)
 end
 
+-- requires-forge-host
 T["batched_answers_share_one_transcript_group"] = function()
   verify_answered_question_group(true)
 end
 
+-- requires-forge-host
 T["question_batch_reaches_provider_together"] = function()
   vim.o.columns, vim.o.lines = 140, 55
   local snapshot = dofile("nvim/lua/forge/tests/support/state.lua")
@@ -3764,6 +3780,7 @@ end
 -- An acknowledged steer has reached the provider but not the model. MockProvider consumes
 -- steering only when its held response begins, so until then the message belongs in the
 -- "Steering active turn" status section, and the transcript row appears at consumption.
+-- requires-forge-host
 T["steering_waits_for_consumption"] = function()
   local workspace = temp.directory("steering-consumption")
   vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
@@ -3855,6 +3872,7 @@ T["steering_waits_for_consumption"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
 T["transcript_timeout_recovers_and_ignores_late_response"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   local workspace = temp.directory("transcript-timeout")

@@ -144,4 +144,24 @@ T["launch_preserves_explicit_process_directory"] = function()
   eq(config.cmd_cwd, explicit)
 end
 
+T["nested_lua_selection_does_not_reuse_parent_client"] = function()
+  local directory = temp.directory("nested-lua")
+  local path = directory .. "/init.lua"
+  vim.fn.writefile({ "return {}" }, path)
+  local parent = { id = 81, name = "lua", root_dir = vim.fs.dirname(directory), config = {},
+    is_stopped = function() return false end }
+  local child, result
+  stub(vim.lsp, "get_clients", function() return child and { parent, child } or { parent } end)
+  stub(vim.lsp, "get_client_by_id", function(identity) return child and identity == child.id and child or parent end)
+  stub(vim.lsp, "start", function(config)
+    child = { id = 82, name = "lua", root_dir = directory, config = config, initialized = true,
+      is_stopped = function() return false end }
+    return child.id
+  end)
+  require("forge.lsp.startup").selected(path, { name = "lua", filetypes = { "lua" }, root_dir = directory },
+    function(value) result = value end, directory)
+  wait_until(function() return result end, "nested Lua startup did not finish")
+  eq(result, child)
+end
+
 return T

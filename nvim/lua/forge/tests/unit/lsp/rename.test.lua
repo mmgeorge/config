@@ -122,4 +122,21 @@ T["file_rename_applies_reference_edits_and_follows_the_buffer"] = function()
     { fail_reason = "committed rename did not notify the language server" })
 end
 
+T["symbol_rename_rejects_a_different_language_before_requesting_edits"] = function()
+  local scene = rename_workspace()
+  local path = scene.workspace .. "/init.lua"
+  vim.fn.writefile({ "local sample = 1" }, path)
+  scene.mock.request = function() error("mismatched rename reached the server") end
+  local failure
+  require("forge.lsp.rename").prepare("wrong-language", scene.workspace,
+    { kind = "symbol", target = { path = path, line = 1, column = 7 }, new_name = "renamed" },
+    function(paths, receive)
+      local allowed = {} for _, requested in ipairs(paths) do allowed[requested] = true end receive(allowed)
+    end,
+    function(_, _, receive) receive({ declarations = {}, complete = true }) end,
+    function(_, message) failure = message end)
+  wait_until(function() return failure end, "mismatched rename did not finish")
+  eq(failure, "invalid_workspace: selected LSP does not serve lua files")
+end
+
 return T

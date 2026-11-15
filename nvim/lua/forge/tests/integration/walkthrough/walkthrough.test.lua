@@ -8,6 +8,7 @@ local git_repository = dofile("nvim/lua/forge/tests/support/git_repository.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
 T["walkthrough"] = function()
   local state
   -- Close the walkthrough and stop the host before the temporary directories registered below are deleted.

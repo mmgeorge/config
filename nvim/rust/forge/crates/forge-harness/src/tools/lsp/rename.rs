@@ -27,7 +27,7 @@ pub(super) fn definitions() -> Vec<ControlToolDefinition> {
             name: FILE,
             description: "Move a file or directory and update references using language servers. Requires willRenameFiles support, a vacant destination, existing read/write permission on all affected paths, and clean affected buffers. No permission prompts or plain filesystem fallback.",
             input_schema: json!({"type":"object","additionalProperties":false,"required":["workspace","old_path","new_path"],"properties":{
-                "workspace":{"type":"string","minLength":1},"old_path":{"type":"string","minLength":1},"new_path":{"type":"string","minLength":1}
+                "workspace":super::schema::workspace_schema(),"old_path":{"type":"string","minLength":1},"new_path":{"type":"string","minLength":1}
             }}),
         },
     ]
@@ -58,12 +58,12 @@ pub(crate) fn allowed_mode(mode: crate::provider::PromptMode) -> bool {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Request {
     Symbol {
-        workspace: String,
+        workspace: super::request::WorkspaceSelection,
         target: super::request::Target,
         new_name: String,
     },
     File {
-        workspace: String,
+        workspace: super::request::WorkspaceSelection,
         old_path: String,
         new_path: String,
     },
@@ -74,18 +74,10 @@ fn parse(name: &str, mut value: Value) -> Result<Request> {
     let workspace = value
         .as_object_mut()
         .and_then(|fields| fields.remove("workspace"))
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or(MutationError::Argument("workspace manifest is required"))?;
-    if !matches!(
-        std::path::Path::new(&workspace)
-            .file_name()
-            .and_then(|name| name.to_str()),
-        Some("Cargo.toml" | "package.json")
-    ) {
-        return Err(MutationError::Argument(
-            "workspace must name Cargo.toml or package.json",
-        ));
-    }
+        .ok_or(MutationError::Argument(
+            "workspace path and language are required",
+        ))?;
+    let workspace: super::request::WorkspaceSelection = serde_json::from_value(workspace)?;
     if name == SYMBOL {
         let new_name = value
             .as_object_mut()
@@ -177,12 +169,16 @@ pub(super) async fn execute(
     scope.check().map_err(MutationError::Service)?;
     let guard = scope.service.mutations.clone().lock_owned().await;
     let mut request = request;
-    let manifest = match &mut request {
+    let selection = match &mut request {
         Request::Symbol { workspace, .. } | Request::File { workspace, .. } => workspace,
     };
-    *manifest = super::transaction::authorize(&scope, &policy, manifest, false)?
-        .to_string_lossy()
-        .into_owned();
+    let path = super::transaction::authorize(&scope, &policy, selection.path(), false)?;
+    if !path.is_dir() {
+        return Err(MutationError::Argument("workspace path must be an existing directory").into());
+    }
+    selection
+        .path_replace(path.to_string_lossy().into_owned())
+        .map_err(MutationError::Service)?;
     match &mut request {
         Request::Symbol { target, .. } => {
             if let Some(path) = target.path_mut() {
@@ -268,4 +264,39 @@ pub(super) async fn execute(
         invocation: None,
         message: result,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FILE, SYMBOL, parse};
+    use serde_json::json;
+
+    /// Keep both mutation tools on the same selector as read-only tools.
+    #[test]
+    fn rename_tools_accept_lua_project_selection() {
+        assert!(
+            parse(
+                SYMBOL,
+                json!({"workspace":{"path":"nvim","language":"lua"},
+            "path":"nvim/init.lua","symbol":"sample","new_name":"renamed"})
+            )
+            .is_ok()
+        );
+        assert!(
+            parse(
+                FILE,
+                json!({"workspace":{"path":"nvim","language":"lua"},
+            "old_path":"nvim/old.lua","new_path":"nvim/new.lua"})
+            )
+            .is_ok()
+        );
+        assert!(
+            parse(
+                FILE,
+                json!({"workspace":"nvim/.luarc.json",
+            "old_path":"nvim/old.lua","new_path":"nvim/new.lua"})
+            )
+            .is_err()
+        );
+    }
 }

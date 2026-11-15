@@ -22,9 +22,10 @@ Inside Harness, run the configured checks instead of these commands:
 | Apply formatting | `rust-format` with `apply: true`, then restart from the type check |
 | Lint | `rust-lint` |
 | Build | `rust-build` |
-| Lua tests | `lua-test`, selected with discovered test IDs or affected paths |
+| Lua tests without the host | `lua-test`, selected with discovered test IDs or affected paths |
+| Lua tests that launch the host | `lua-host-test`, selected with discovered test IDs or affected paths |
 
-Rust checks use category adapters: script adapters for Cargo validation, formatting, lint, and builds, and the built-in nextest adapter for tests. `lua-test` declares `rust-build` as a prerequisite, so Harness builds the executable before the Lua tests and skips them when the build fails. Category order does not require earlier checks to pass. Explicit whole-suite execution uses `all: true`; an empty or invalid targeted selection does not expand to the whole suite.
+Rust checks use category adapters: script adapters for Cargo validation, formatting, lint, and builds, and the built-in nextest adapter for tests. Only `lua-host-test` declares `rust-build` as a prerequisite; `lua-test` runs without building Rust. Mark cases that launch Forge with `-- requires-forge-host` immediately above their top-level declaration, including cases that launch through helpers or child editors. The shared runner partitions discovery and execution by this marker. Run both checks when validating a source area containing both kinds of case. Category order does not require earlier checks to pass. Explicit whole-suite execution uses `all: true`; an empty or invalid targeted selection does not expand to the whole suite.
 
 The commands in this guide show what each check runs, and they do not give agents a separate validation path.
 

@@ -134,6 +134,16 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
         .map(|row| row.indent * 2 + row.text.chars().count())
         .max()
         .unwrap_or(0);
+    let workspace_width = reply
+        .rows
+        .iter()
+        .map(|row| {
+            super::service::display_path(&row.path, workspace)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
     for (index, row) in reply.rows.iter().enumerate() {
         ensure!(
             row.line > 0 && row.column > 0 && row.indent <= 8,
@@ -167,6 +177,12 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
                     ""
                 }
             ));
+        } else if arguments.operation == Operation::WorkspaceList {
+            ensure!(
+                matches!(row.text.as_str(), "rust" | "typescript" | "lua"),
+                "invalid workspace language"
+            );
+            block.push_str(&format!("{display:workspace_width$}  {}\n", row.text));
         } else {
             if section != previous_section && !section.is_empty() {
                 block.push_str(&format!("\n{section}\n"));
@@ -455,8 +471,11 @@ mod tests {
     /// Preserve partial coverage and unknown freshness for an empty published snapshot.
     #[test]
     fn published_diagnostics_do_not_certify_an_empty_workspace() {
-        let arguments = Arguments::parse("lsp_diagnostics", json!({"workspace":"Cargo.toml"}))
-            .expect("valid diagnostic arguments");
+        let arguments = Arguments::parse(
+            "lsp_diagnostics",
+            json!({"workspace":{"path":".","language":"rust"}}),
+        )
+        .expect("valid diagnostic arguments");
         let reply: Reply = serde_json::from_value(json!({
             "rows":[], "source":"workspace", "freshness":"unknown",
             "coverage":[{"name":"publisher", "root":"/project", "state":"partial",
@@ -481,5 +500,21 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    /// Expose exact selector keys without pretending directories have source coordinates.
+    #[test]
+    fn workspace_listing_uses_paths_and_language_keys() {
+        let arguments = Arguments::parse("lsp_workspace_list", json!({})).expect("valid listing");
+        let reply = serde_json::from_value(json!({"source":"workspace selection", "rows":[
+            {"path":"/project/nvim", "line":1, "column":1, "text":"lua"},
+            {"path":"/project/nvim/rust/forge", "line":1, "column":1, "text":"rust"}
+        ]}))
+        .expect("valid workspace reply");
+        let output = render(reply, &arguments, Path::new("/project")).expect("render listing");
+        assert!(output.contains("nvim"));
+        assert!(output.contains("lua"));
+        assert!(output.contains("nvim/rust/forge  rust"));
+        assert!(!output.contains("1:1"));
     }
 }

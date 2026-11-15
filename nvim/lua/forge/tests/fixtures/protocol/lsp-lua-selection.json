@@ -1,0 +1,11 @@
+{
+  "arguments": {
+    "operation": "symbols",
+    "query": "sample",
+    "workspace": {
+      "language": "lua",
+      "path": "<workspace>"
+    }
+  },
+  "workspace": "<workspace>"
+}

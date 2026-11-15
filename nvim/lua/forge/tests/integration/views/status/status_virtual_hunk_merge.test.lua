@@ -161,6 +161,7 @@ local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
 T["status_virtual_hunk_merge"] = function()
   local test_path = debug.getinfo(1, "S").source:sub(2)
   local child = MiniTest.new_child_neovim()

@@ -1,14 +1,15 @@
 # Agent LSP tools
 
 Enable **LSP tools** in `/config` to expose eleven read-only tools and two rename tools to root and child
-agents. Semantic commands require `workspace`, the path to one Cargo.toml or
-package.json, relative to the session repository. Every request uses one LSP.
-`lsp_workspace_list` lists manifests without starting servers; `lsp_source_symbols`
+agents. Semantic commands require `workspace: { path, language }`, where `path`
+is a project directory relative to the session repository and `language` is
+`rust`, `typescript` (including JavaScript), or `lua`. Every request uses one LSP.
+`lsp_workspace_list` lists project directories and language keys without starting servers; `lsp_source_symbols`
 searches parsed source without an LSP. The setting defaults to off. Disabling it revokes agent requests without
 stopping editor servers or disabling plan navigation.
 
 Select the Neovim configuration with `require("forge").setup({ lsp = {
-workspace_servers = { rust = "rust_analyzer", typescript = "tsgo" } } })`
+workspace_servers = { rust = "rust_analyzer", typescript = "tsgo", lua = "lua_ls" } } })`
 when more than one enabled configuration matches a language. These values name
 existing configurations; Forge preserves their settings and commands. A sole
 matching configuration needs no preference. An ambiguous selection starts none.
@@ -18,6 +19,18 @@ renames, require `workspace`. Paths remain relative to the session repository.
 `lsp_context` without workspace accepts only a local file target with no semantic
 relationships. Status inspects the selected server without starting it.
 
+Workspace listing returns the exact path and language keys accepted by semantic tools:
+
+```text
+nvim                      lua
+nvim/rust/forge           rust
+nvim/tools/markdown-math  typescript
+```
+
+For example, `lsp_symbols({ workspace = { path = "nvim", language = "lua" },
+query = "request" })` selects the configured Lua server. The caller never names
+that server. Directories have no source coordinates in the listing.
+
 ## Choose a tool
 
 Use overview or symbols to discover names and positions, then reuse either with
@@ -26,7 +39,7 @@ context or a semantic query. No tool moves the editor cursor.
 | Tool | Input | Result |
 | --- | --- | --- |
 | `lsp_overview` | Directory `path` (default `.`), `depth=2`, `declaration_depth=2`, `visibility=public` | Public declarations, fields, and methods grouped by directory and file |
-| `lsp_workspace_list` | Optional directory `path` | Cargo.toml and package.json manifest paths |
+| `lsp_workspace_list` | Optional directory `path` | Project directories and language keys |
 | `lsp_source_symbols` | File/directory `path`, optional `query`, `depth`, `visibility` | Parsed source declarations |
 | `lsp_symbols` | Required `workspace` and `query` | Symbols from one selected language server |
 | `lsp_definition` | Target selector, `kind=definition` | Definitions, type declarations (`type`), or implementations (`implementation`) |
@@ -39,7 +52,8 @@ context or a semantic query. No tool moves the editor cursor.
 | `lsp_rename_symbol` | Target selector and required `new_name` | Apply a symbol rename across files |
 | `lsp_rename_file` | Required `old_path`, `new_path` | Move a file or directory and update references |
 
-Paths are workspace-relative or authorized absolute paths. Lines and columns start
+Source paths are relative to the session repository, not the selected project,
+or are authorized absolute paths. Lines and columns start
 at one. Columns count Unicode code points, not bytes or screen cells. A returned
 identifier position can be passed directly to another tool.
 
@@ -55,10 +69,14 @@ and workspace name searches wait for the relevant servers. Optional hover is
 included only when its server is already ready. Semantic queries reuse server
 readiness within one tool call and check it again on the next call.
 Workspace listing excludes nested Git repositories and linked worktrees. List a
-nested checkout explicitly to discover its manifests. A semantic request starts
-only the configuration selected for its manifest.
-Root discovery skips callbacks that do not answer within two seconds; a server
-that has started retains the longer initialization timeout.
+nested checkout explicitly to discover its projects. Cargo.toml and package.json
+identify Rust and TypeScript/JavaScript project directories. Lua discovery uses
+authorized Lua files and the enabled Lua configuration's `root_dir` or
+`root_markers`, then deduplicates resolved roots. Root callbacks use a 60-second
+deadline. Missing roots and unavailable or ambiguous configurations appear as
+explicit discovery warnings. A semantic request starts only the selected configuration.
+For static root markers, discovery resolves each source directory once; custom
+root callbacks run for each file because their result may depend on that file.
 Rust searches request all symbol kinds from rust-analyzer rather than its default
 type-only search. Missing paths are rejected before language-server startup and
 do not affect later valid requests.
@@ -259,10 +277,10 @@ Rust, TypeScript/TSX, JavaScript/JSX/MJS/CJS, and Lua. LSP supplies semantic ide
 and relationships. Missing capabilities, failures, and empty results are distinct.
 
 Opening Harness and applying session snapshots do not start language servers.
-A file request resolves only that file's matching configurations and project root.
-Workspace requests discover distinct project roots in scheduled batches, excluding
-build and dependency directories. Workspace discovery identifies JavaScript and
-TypeScript projects through `package.json`, and Rust projects through `Cargo.toml`.
+A file request uses the selected project's configuration and validates that the
+client serves the file's language and root. Workspace discovery excludes build
+and dependency directories. Lua root resolution reuses Neovim's configured
+marker precedence and root callbacks without launching a server.
 Queries reuse editor clients already serving the same root, including clients
 started by opening a source file. A client for an unrelated sibling project does
 not receive a file request.
@@ -323,7 +341,7 @@ Omitting `path` from `lsp_diagnostics` queries the single server selected by
 `workspace/diagnostic` when the server advertises it; otherwise it reads that
 client's existing published diagnostics in Neovim, including reports for unopened
 files. Results retain the server name and resolved project root, even when
-`workspace` names a nested Cargo manifest, and respect read authorization.
+`workspace.path` names a nested Cargo project, and respect read authorization.
 
 Published snapshots report `coverage: partial` and `freshness: unknown`. An empty
 snapshot means no matching published diagnostics are available; it does not
@@ -340,11 +358,11 @@ same server selection and coverage reporting.
 Prefer `lsp_rename_symbol` for a symbol rename and `lsp_rename_file` for a file or directory move. The enabled LSP setting injects the LSP guidance immediately after Harness's system instructions, naming these tools and the semantic search tools. Read-only planning and question-discussion turns cannot invoke rename.
 
 ```json
-{"path":"src/store.rs","symbol":"Store::save","new_name":"persist"}
+{"workspace":{"path":".","language":"rust"},"path":"src/store.rs","symbol":"Store::save","new_name":"persist"}
 ```
 
 ```json
-{"old_path":"src/store.rs","new_path":"src/storage.rs"}
+{"workspace":{"path":".","language":"rust"},"old_path":"src/store.rs","new_path":"src/storage.rs"}
 ```
 
 Both tools write to disk. They require existing read and write permission for every affected path, including move destinations and directory descendants. Missing permission returns an error without opening an approval prompt. Saved tool denials still apply. Any affected unsaved buffer rejects the whole operation; save or discard those changes before requesting a rename.

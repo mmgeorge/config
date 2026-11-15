@@ -153,6 +153,7 @@ local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
 T["harness_attachments"] = function()
   local child = MiniTest.new_child_neovim()
   child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
