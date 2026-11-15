@@ -79,4 +79,83 @@ T["lsp_diagnostics"] = function()
   assert(cancelled[5], "unowned diagnostic request was not cancelled")
 end
 
+T["workspace_prefers_native_pull"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local calls, cancelled = {}, nil
+  local client = { id = 985, server_capabilities = {
+    diagnosticProvider = { workspaceDiagnostics = true, identifier = "native" },
+  } }
+  function client:request(method, params, receive)
+    calls[#calls + 1] = { method, params }
+    receive(nil, { items = {} })
+    return true, 44
+  end
+  function client:cancel_request(identity) cancelled = identity end
+  stub(vim.diagnostic, "get", function() error("native pull read the push namespace") end)
+  local reply, acquisition
+  local accepted, cancel = require("forge.lsp.diagnostics").workspace(client, function(failure, result, kind)
+    eq(failure, nil)
+    reply, acquisition = result, kind
+  end)
+  eq(accepted, true)
+  eq(calls, { { "workspace/diagnostic", { identifier = "native", previousResultIds = {} } } })
+  eq(reply, { items = {} })
+  eq(acquisition, "native")
+  cancel()
+  eq(cancelled, 44)
+end
+
+T["workspace_published_reports_follow_neovim_replacement_and_client_lifetime"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
+  local path = temp.file("unopened.rs", { "😀 value" })
+  local stopped = false
+  local client = { id = 986, name = "publisher", offset_encoding = "utf-16",
+    server_capabilities = { diagnosticProvider = { workspaceDiagnostics = false } },
+    is_stopped = function() return stopped end,
+    request = function() error("published acquisition requested diagnostics") end }
+  local active = client
+  stub(vim.lsp, "get_client_by_id", function() return active end)
+  local namespace = vim.lsp.diagnostic.get_namespace(client.id, false)
+  local pull_namespace = vim.lsp.diagnostic.get_namespace(client.id, true)
+  MiniTest.finally(function() vim.diagnostic.reset(namespace) vim.diagnostic.reset(pull_namespace) end)
+  local function publish(message)
+    vim.lsp.diagnostic.on_publish_diagnostics(nil, { uri = vim.uri_from_fname(path), diagnostics = message and {
+      { range = { start = { line = 0, character = 3 }, ["end"] = { line = 0, character = 8 } },
+        severity = 2, message = message },
+    } or {} }, { client_id = client.id })
+  end
+  local function acquire()
+    local reply, failure, acquisition
+    require("forge.lsp.diagnostics").workspace(client, function(message, value, kind)
+      reply, failure, acquisition = value, message, kind
+    end)
+    eq(acquisition, "published")
+    return reply, failure
+  end
+  publish("first")
+  local buffer = vim.fn.bufnr(path)
+  eq(vim.api.nvim_buf_is_loaded(buffer), false)
+  vim.diagnostic.set(pull_namespace, buffer, { { lnum = 0, col = 0, message = "pull-only" } })
+  local reply = acquire()
+  eq(#reply.items, 1)
+  eq(reply.items[1].items[1].message, "first")
+  eq(reply.items[1].items[1].range.start.character, 5)
+  eq(reply.items[1].encoding, "utf-8")
+  publish("replacement")
+  eq(acquire().items[1].items[1].message, "replacement")
+  publish(nil)
+  eq(acquire().items, {})
+  publish("retired")
+  stopped = true
+  local missing, failure = acquire()
+  eq(missing, nil)
+  eq(failure.message, "selected diagnostic publisher is no longer running")
+  stopped, active = false, vim.deepcopy(client)
+  missing, failure = acquire()
+  eq(missing, nil)
+  eq(failure.message, "selected diagnostic publisher is no longer running")
+  eq(vim.api.nvim_buf_is_loaded(buffer), false)
+end
+
 return T

@@ -24,7 +24,9 @@ Manifest discovery lists every nested Cargo.toml and package.json outside depend
 
 `forge.lsp.target` resolves names and occurrences, failing on ambiguity or incomplete search before the semantic operation starts. `forge.lsp.paths` walks outgoing call hierarchy edges with cycle checks, and captures every visited file so any change invalidates the result.
 
-`forge.lsp.diagnostics` reuses a pull report only while its buffer tick and client generation match, and reports push-only diagnostics with unknown freshness. Workspace diagnostics and symbols report the selected server's coverage. Empty results, incomplete coverage, unsupported capabilities, startup failure, and disconnected servers each produce a distinct message.
+`forge.lsp.diagnostics` reuses a document pull report only while its buffer tick and client generation match. For workspace diagnostics it prefers native `workspace/diagnostic` when the selected server advertises support; otherwise it reads Neovim's push namespace for that live client, including reports for unopened files. Neovim owns report replacement and clearing. Forge neither duplicates that cache nor includes document-pull namespaces or retired clients.
+
+Workspace diagnostic results stay within the selected client's resolved root, including when selection starts from a nested manifest. The semantic adapter authorizes reported paths before reading source or exposing messages, then applies severity filtering and pagination. Published snapshots carry partial coverage and unknown freshness, even when empty; native workspace reports retain their response validation and coverage reporting. Collection never opens files to provoke diagnostics, requests diagnostics per file, or triggers compiler checks or refresh notifications. An empty published snapshot establishes only that the client currently has no matching published reports, not that the workspace is clean. Unsupported acquisition, startup failure, and disconnected servers remain explicit failures.
 
 ## Rename ownership
 

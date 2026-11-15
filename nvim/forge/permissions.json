@@ -351,6 +351,7 @@
       "rg *": "allow",
       "route": "allow",
       "route *": "allow",
+      "rust-analyzer --version": "allow",
       "rustc --version": "allow",
       "rustup component list --installed": "allow",
       "rustup show": "allow",

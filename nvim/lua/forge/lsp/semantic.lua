@@ -81,6 +81,8 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   local requests, buffers, versions, clients, raw, warnings = {}, {}, {}, {}, {}, {}
   local result = { rows = {}, source = "workspace" }
   local workspace_query = not arguments.path and (arguments.operation == "workspace_symbols" or arguments.operation == "diagnostics")
+  local diagnostic_root = workspace
+  local published_client
   if workspace_query then result.coverage = {} end
   local deadline = assert(vim.uv.new_timer())
   local guard = assert(vim.uv.new_timer())
@@ -109,6 +111,9 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
   end
   local function valid()
     if finished then return false end
+    if published_client and (published_client:is_stopped() or vim.lsp.get_client_by_id(published_client.id) ~= published_client) then
+      finish("unavailable: selected diagnostic publisher is no longer running") return false
+    end
     for buffer, version in pairs(versions) do
       if not vim.api.nvim_buf_is_valid(buffer) or vim.api.nvim_buf_get_changedtick(buffer) ~= version then
         finish("source_changed: " .. vim.api.nvim_buf_get_name(buffer) .. " changed during the request.") return false
@@ -120,7 +125,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
     return true
   end
   guard:start(50, 50, vim.schedule_wrap(valid))
-  local function location(value, client, label, call_root, is_root)
+  local function location(value, client, label, call_root, is_root, encoding)
     local uri = value.targetUri or value.uri
     local range = value.targetSelectionRange or value.selectionRange or value.range or value.targetRange
     if type(uri) ~= "string" or uri:sub(1, 7) ~= "file://" or not range or not range.start then
@@ -128,10 +133,11 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       return
     end
     local path = source.canonical(vim.uri_to_fname(uri))
-    if workspace_query and arguments.scope ~= "all" and not source.inside(path, workspace) then return end
+    if workspace_query and arguments.operation == "diagnostics" and not source.inside(path, diagnostic_root) then return end
+    if workspace_query and arguments.operation ~= "diagnostics" and arguments.scope ~= "all" and not source.inside(path, workspace) then return end
     if arguments.search_path and not source.inside(path, arguments.search_path) then return end
     raw[#raw + 1] = { path = path, position = range.start,
-      encoding = client.offset_encoding or "utf-16", text = label, call_root = call_root, is_root = is_root }
+      encoding = encoding or client.offset_encoding or "utf-16", text = label, call_root = call_root, is_root = is_root }
   end
   local function symbols(values, client, path, parent)
     for _, symbol in ipairs(values or {}) do
@@ -189,7 +195,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       end
       for _, row in ipairs(unique) do
         if not allowed[row.path] then denied = true end
-        if allowed[row.path] and (row.is_root or arguments.scope ~= "workspace" or source.inside(row.path, workspace)) and
+        if allowed[row.path] and (row.is_root or arguments.scope ~= "workspace" or source.inside(row.path, workspace_query and arguments.operation == "diagnostics" and diagnostic_root or workspace)) and
           (not row.call_root or root_allowed[row.call_root]) then permitted[#permitted + 1] = row end
       end
       if denied then warnings[#warnings + 1] = "Results omitted by read policy" end
@@ -263,7 +269,7 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
     attempted = attempted + 1
     clients[client.id] = client
     local received = false
-    local function response(failure, value)
+    local function response(failure, value, acquisition)
       if received or finished then return end
       received = true
       outstanding = outstanding - 1
@@ -289,24 +295,34 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
         return
       end
       if failure then
-        local message = "server_error: " .. client.name .. " — " .. shorten(failure.message or "Request failed.", 160)
+        local unsupported = failure.code == -32601
+        local message = (unsupported and "unsupported: " or "server_error: ") .. client.name .. " — " .. shorten(failure.message or "Request failed.", 160)
         warnings[#warnings + 1] = message
-        if coverage then coverage.state, coverage.message = "failed", message end
+        if coverage then coverage.state, coverage.message = unsupported and "unsupported" or "failed", message end
       else
         responses = responses + 1
-        local success, callback_error = pcall(callback, value == vim.NIL and nil or value)
+        local success, callback_error = pcall(callback, value == vim.NIL and nil or value, acquisition)
         if not success then
           local message = "invalid_response: " .. client.name .. " — " .. tostring(callback_error)
           if not coverage then finish(message) return end
           coverage.state, coverage.message = "failed", message
           warnings[#warnings + 1] = message
-        elseif coverage then coverage.state = "complete" end
+        elseif coverage then
+          coverage.state = acquisition == "published" and "partial" or "complete"
+          if acquisition == "published" then
+            coverage.message = #raw == 0
+              and "No published diagnostics in the selected workspace snapshot; coverage is partial and freshness is unknown."
+              or "Published diagnostic snapshot; workspace coverage is partial and freshness is unknown."
+          end
+        end
       end
       collect()
     end
     local accepted, id, cancel
     if method == methods.diagnostics then
       accepted, cancel = diagnostics.request(client, buffer, params, response)
+    elseif method == "workspace/diagnostic" then
+      accepted, cancel = diagnostics.workspace(client, response)
     else accepted, id = client:request(method, params, response, buffer) end
     if accepted then requests[#requests + 1] = { client = client, id = id, cancel = cancel,
       expire = function() response({ message = "Request timed out." }) end }
@@ -400,16 +416,16 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
       if not client or client:is_stopped() then finish("unavailable: selected LSP is not running") return end
       local root = client.root_dir or client.config.root_dir
       local coverage = { name = client.name, root = type(root) == "string" and root or workspace, state = "pending" }
+      diagnostic_root = source.canonical(coverage.root)
       result.coverage[1] = coverage
-      local provider = client.server_capabilities and client.server_capabilities.diagnosticProvider
-      local supported = arguments.operation == "workspace_symbols" and client:supports_method(methods.workspace_symbols)
-        or arguments.operation == "diagnostics" and type(provider) == "table" and provider.workspaceDiagnostics == true
+      local supported = arguments.operation == "diagnostics" or client:supports_method(methods.workspace_symbols)
       if not supported then finish("unsupported: selected LSP does not support workspace " .. arguments.operation) return end
       outstanding = outstanding + 1
       if arguments.operation == "workspace_symbols" then
         send(client, methods.workspace_symbols, symbol_query(client), nil, function(value) symbols(value, client) end, nil, coverage)
       else
-        send(client, "workspace/diagnostic", { identifier = provider.identifier, previousResultIds = {} }, nil, function(value)
+        send(client, "workspace/diagnostic", {}, nil, function(value, acquisition)
+          if acquisition == "published" then published_client = client end
           assert(type(value) == "table" and type(value.items) == "table", "Missing workspace diagnostic report")
           for _, report in ipairs(value.items) do
             assert(report.kind == "full" and type(report.items) == "table", "Workspace report omitted diagnostics without a previous result")
@@ -417,7 +433,8 @@ function M.request(workspace, arguments, authorize, receive, budget, readiness)
               local severity = ({ "error", "warning", "information", "hint" })[diagnostic.severity or 1] or "error"
               if not arguments.severity or arguments.severity == "all" or arguments.severity == severity then
                 location({ uri = report.uri, range = diagnostic.range }, client,
-                  client.name .. ": " .. severity .. (diagnostic.code and "[" .. tostring(diagnostic.code) .. "]" or "") .. ": " .. diagnostic.message)
+                  client.name .. ": " .. severity .. (diagnostic.code and "[" .. tostring(diagnostic.code) .. "]" or "") .. ": " .. diagnostic.message,
+                  nil, nil, report.encoding)
               end
             end
           end

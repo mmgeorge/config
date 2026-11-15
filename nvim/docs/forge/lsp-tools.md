@@ -318,13 +318,22 @@ the captured source version. Push diagnostics retain unknown freshness when thei
 version cannot be proved. Empty diagnostics do not establish a successful project
 typecheck. Use configured Harness checks for validation.
 
-Omitting `path` from `lsp_diagnostics` requests workspace diagnostics from each
-applicable server supporting `workspace/diagnostic`. Results retain server names
-and project roots. Unsupported, failed, and timed-out servers leave explicit
-coverage gaps, while successful reports remain available. An empty response with
-partial coverage does not establish that the workspace has no diagnostics.
-Servers that only report diagnostics for opened files cannot certify full workspace
-coverage. Workspace-symbol queries use the same project discovery and coverage reporting.
+Omitting `path` from `lsp_diagnostics` queries the single server selected by
+`workspace`. A directory `path` narrows those workspace results. Forge uses native
+`workspace/diagnostic` when the server advertises it; otherwise it reads that
+client's existing published diagnostics in Neovim, including reports for unopened
+files. Results retain the server name and resolved project root, even when
+`workspace` names a nested Cargo manifest, and respect read authorization.
+
+Published snapshots report `coverage: partial` and `freshness: unknown`. An empty
+snapshot means no matching published diagnostics are available; it does not
+certify a clean workspace. Unsupported acquisition, failed requests, unavailable
+servers, and empty snapshots have distinct output. The query never runs Cargo,
+sends a refresh notification, or opens files to request diagnostics. For example,
+`rust-analyzer.check.workspace = false` can leave package-scoped reports; Forge
+preserves that setting and reports the snapshot's limits. Document queries keep
+their existing pull or published-report path. Workspace-symbol queries use the
+same server selection and coverage reporting.
 
 ## Rename files and symbols
 

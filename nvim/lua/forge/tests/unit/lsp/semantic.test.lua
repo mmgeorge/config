@@ -241,4 +241,136 @@ T["workspace_warning_is_returned_with_symbol_results"] = function()
   eq(reply.warnings[1]:find("build scripts failed", 1, true) ~= nil, true)
 end
 
+T["workspace_published_diagnostics_respect_root_authorization_and_pagination"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local directory = temp.directory("published-root")
+  vim.fn.mkdir(directory .. "/nested", "p")
+  local path = directory .. "/source.rs"
+  local denied = directory .. "/denied.rs"
+  local outside = temp.file("outside.rs", { "outside" })
+  vim.fn.writefile({ "😀 value", "second" }, path)
+  vim.fn.writefile({ "private source" }, denied)
+  local client = { id = 987, name = "publisher", initialized = true, root_dir = directory,
+    config = { root_dir = directory }, offset_encoding = "utf-16",
+    server_capabilities = { diagnosticProvider = { workspaceDiagnostics = false } },
+    is_stopped = function() return false end,
+    request = function() error("snapshot sent a server request") end }
+  stub(vim.lsp, "get_client_by_id", function(identity) return identity == client.id and client or nil end)
+  stub(require("forge.lsp.startup"), "ready", function(selected, receive) receive(selected) return function() end end)
+  stub(require("forge.lsp.source"), "open", function() error("snapshot opened a source buffer") end)
+  stub(vim, "system", function() error("snapshot started a process") end)
+  local namespace = vim.lsp.diagnostic.get_namespace(client.id, false)
+  local other_namespace = vim.lsp.diagnostic.get_namespace(988, false)
+  MiniTest.finally(function() vim.diagnostic.reset(namespace) vim.diagnostic.reset(other_namespace) end)
+  local function publish(target, items, selected_namespace)
+    local buffer = vim.fn.bufadd(target)
+    vim.diagnostic.set(selected_namespace or namespace, buffer, items)
+    return buffer
+  end
+  local buffer = publish(path, {
+    { lnum = 0, col = 5, severity = 2, message = "first warning" },
+    { lnum = 1, col = 0, severity = 2, message = "second warning" },
+    { lnum = 0, col = 0, severity = 1, message = "filtered error" },
+  })
+  publish(denied, { { lnum = 0, col = 0, severity = 2, message = "secret diagnostic" } })
+  publish(outside, { { lnum = 0, col = 0, severity = 2, message = "outside diagnostic" } })
+  publish(path, { { lnum = 0, col = 0, severity = 2, message = "other client diagnostic" } }, other_namespace)
+  local source = require("forge.lsp.source")
+  local original_read = source.read
+  local reads, authorized = {}, {}
+  stub(source, "read", function(target, receive)
+    eq(authorized[target], true)
+    reads[#reads + 1] = target
+    original_read(target, receive)
+  end)
+  local function execute(offset)
+    local result, failure
+    require("forge.lsp.semantic").request(directory .. "/nested", {
+      operation = "diagnostics", severity = "warning", limit = 1, offset = offset, scope = "all",
+    }, function(paths, receive)
+      local allowed = {}
+      for _, target in ipairs(paths) do
+        eq(target == source.canonical(outside), false)
+        allowed[target] = target ~= source.canonical(denied)
+        authorized[target] = allowed[target]
+      end
+      receive(allowed)
+    end, function(reply, message) result, failure = reply, message end, nil, { client = client })
+    wait_until(function() return result or failure end, "published query did not settle")
+    eq(failure, nil)
+    return result
+  end
+  local result = execute(0)
+  eq(#result.rows, 1)
+  eq(result.rows[1].column, 3)
+  eq(result.rows[1].text, "publisher: warning: first warning")
+  eq(result.next_offset, 1)
+  eq(result.coverage[1].root, directory)
+  eq(result.coverage[1].state, "partial")
+  eq(result.freshness, "unknown")
+  eq(result.warnings, { "Results omitted by read policy" })
+  result = execute(1)
+  eq(result.rows[1].text, "publisher: warning: second warning")
+  eq(result.next_offset, nil)
+  eq(reads, { source.canonical(path), source.canonical(path) })
+  eq(vim.api.nvim_buf_is_loaded(buffer), false)
+  vim.diagnostic.reset(namespace)
+  result = execute(0)
+  eq(result.rows, {})
+  eq(result.coverage[1].state, "partial")
+  eq(result.freshness, "unknown")
+end
+
+T["workspace_native_diagnostics_validate_reports"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local directory = temp.directory("native-diagnostics")
+  local client = { id = 989, name = "native", initialized = true, root_dir = directory,
+    config = { root_dir = directory }, is_stopped = function() return false end,
+    cancel_request = function() end, server_capabilities = { diagnosticProvider = { workspaceDiagnostics = true } } }
+  stub(require("forge.lsp.startup"), "ready", function(selected, receive) receive(selected) return function() end end)
+  local report = { items = {} }
+  function client:request(method, _, receive)
+    eq(method, "workspace/diagnostic")
+    receive(nil, report)
+    return true, 1
+  end
+  local function execute()
+    local result
+    require("forge.lsp.semantic").request(directory, { operation = "diagnostics" },
+      function(_, receive) receive({}) end, function(reply, failure) eq(failure, nil) result = reply end,
+      nil, { client = client })
+    return result
+  end
+  eq(execute().coverage[1].state, "complete")
+  eq(execute().freshness, "current")
+  report = { items = { { kind = "unchanged" } } }
+  local result = execute()
+  eq(result.coverage[1].state, "failed")
+  eq(result.freshness, "unknown")
+  eq(result.warnings[1]:find("invalid_response", 1, true) ~= nil, true)
+end
+
+T["workspace_snapshot_distinguishes_unsupported_storage_from_unavailable_client"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local client = { id = 991, name = "publisher", initialized = true, root_dir = "/project",
+    config = {}, server_capabilities = {}, is_stopped = function() return false end }
+  stub(vim.lsp, "get_client_by_id", function() return client end)
+  stub(require("forge.lsp.startup"), "ready", function(selected, receive) receive(selected) return function() end end)
+  stub(vim.diagnostic, "get", nil)
+  local result, failure
+  local function execute()
+    require("forge.lsp.semantic").request("/project", { operation = "diagnostics" },
+      function(_, receive) receive({}) end, function(reply, message) result, failure = reply, message end,
+      nil, { client = client })
+  end
+  execute()
+  eq(failure, nil)
+  eq(result.coverage[1].state, "unsupported")
+  eq(result.freshness, "unknown")
+  client.is_stopped = function() return true end
+  execute()
+  eq(result, nil)
+  eq(failure, "unavailable: selected LSP is not running")
+end
+
 return T

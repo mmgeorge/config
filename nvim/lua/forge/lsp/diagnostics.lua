@@ -151,4 +151,55 @@ function M.request(client, buffer, params, receive)
   return true, cancel
 end
 
+---@class ForgeLspWorkspaceReport
+---@field uri string
+---@field kind string
+---@field items lsp.Diagnostic[]
+---@field encoding? string
+
+---Prefer native workspace pull; otherwise read only the live client's push namespace.
+---@param client vim.lsp.Client
+---@param receive fun(failure: table?, result: {items: ForgeLspWorkspaceReport[]}?, acquisition: "native"|"published")
+---@return boolean accepted
+---@return fun() cancel
+function M.workspace(client, receive)
+  local provider = client.server_capabilities and client.server_capabilities.diagnosticProvider
+  if type(provider) == "table" and provider.workspaceDiagnostics == true then
+    local accepted, request_id = client:request("workspace/diagnostic", {
+      identifier = provider.identifier, previousResultIds = {},
+    }, function(failure, result) receive(failure, result, "native") end)
+    return accepted, function() if request_id then client:cancel_request(request_id) end end
+  end
+  if client:is_stopped() or vim.lsp.get_client_by_id(client.id) ~= client then
+    receive({ message = "selected diagnostic publisher is no longer running" }, nil, "published")
+    return true, function() end
+  end
+  if not vim.lsp.diagnostic or not vim.lsp.diagnostic.get_namespace or not vim.diagnostic.get then
+    receive({ code = -32601, message = "published diagnostic acquisition is unsupported" }, nil, "published")
+    return true, function() end
+  end
+  local namespace = vim.lsp.diagnostic.get_namespace(client.id, false)
+  local reports = {}
+  for _, diagnostic in ipairs(vim.diagnostic.get(nil, { namespace = namespace })) do
+    if vim.api.nvim_buf_is_valid(diagnostic.bufnr) then
+      local path = vim.api.nvim_buf_get_name(diagnostic.bufnr)
+      if path ~= "" then
+        local report = reports[path]
+        if not report then
+          report = { uri = vim.uri_from_fname(path), kind = "full", items = {}, encoding = "utf-8" }
+          reports[path] = report
+        end
+        -- Neovim stores byte columns even when the publisher uses UTF-16 positions.
+        report.items[#report.items + 1] = {
+          range = { start = { line = diagnostic.lnum, character = diagnostic.col },
+            ["end"] = { line = diagnostic.end_lnum, character = diagnostic.end_col } },
+          severity = diagnostic.severity, code = diagnostic.code, message = diagnostic.message,
+        }
+      end
+    end
+  end
+  receive(nil, { items = vim.tbl_values(reports) }, "published")
+  return true, function() end
+end
+
 return M

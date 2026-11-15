@@ -30,12 +30,38 @@ pub(super) struct Row {
     pub section: Option<String>,
 }
 
+/// Classify the selected server's diagnostic or symbol coverage.
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CoverageState {
+    /// The native workspace request completed.
+    Complete,
+    /// Existing reports do not establish complete workspace coverage.
+    Partial,
+    /// The selected acquisition failed.
+    Failed,
+    /// The server cannot supply the requested acquisition.
+    Unsupported,
+}
+
+impl CoverageState {
+    /// Get the coverage label for tool output.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Coverage {
     pub name: String,
     pub root: String,
-    pub state: String,
+    pub state: CoverageState,
     pub message: Option<String>,
 }
 
@@ -74,25 +100,18 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
         let complete = reply
             .coverage
             .iter()
-            .all(|coverage| coverage.state == "complete");
+            .all(|coverage| coverage.state == CoverageState::Complete);
         output.push_str(if complete {
             "coverage: complete\n"
         } else {
             "coverage: partial\n"
         });
         for coverage in &reply.coverage {
-            ensure!(
-                matches!(
-                    coverage.state.as_str(),
-                    "complete" | "failed" | "unsupported"
-                ),
-                "invalid LSP coverage state"
-            );
             output.push_str(&format!(
                 "{} [{}]: {}{}\n",
                 coverage.name,
                 super::service::display_path(&coverage.root, workspace),
-                coverage.state,
+                coverage.state.label(),
                 coverage
                     .message
                     .as_ref()
@@ -258,7 +277,7 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
             || reply
                 .coverage
                 .iter()
-                .any(|coverage| coverage.state != "complete");
+                .any(|coverage| coverage.state != CoverageState::Complete);
         let message = if partial {
             "No results returned.\n"
         } else {
@@ -424,4 +443,43 @@ fn location(line: u32, column: Option<u32>, hit: bool, text: &str) -> String {
         "{}{line:>5}{column}  {text}\n",
         if hit { "> " } else { "  " }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Reply, render};
+    use crate::tools::lsp::request::Arguments;
+    use serde_json::json;
+    use std::path::Path;
+
+    /// Preserve partial coverage and unknown freshness for an empty published snapshot.
+    #[test]
+    fn published_diagnostics_do_not_certify_an_empty_workspace() {
+        let arguments = Arguments::parse("lsp_diagnostics", json!({"workspace":"Cargo.toml"}))
+            .expect("valid diagnostic arguments");
+        let reply: Reply = serde_json::from_value(json!({
+            "rows":[], "source":"workspace", "freshness":"unknown",
+            "coverage":[{"name":"publisher", "root":"/project", "state":"partial",
+                "message":"No published diagnostics in the selected workspace snapshot."}]
+        }))
+        .expect("published coverage is supported");
+        let output = render(reply, &arguments, Path::new("/project")).expect("render snapshot");
+        assert!(output.contains("coverage: partial"));
+        assert!(output.contains("publisher [.]: partial"));
+        assert!(output.contains("freshness: unknown"));
+        assert!(output.contains("No results returned."));
+        assert!(!output.contains("coverage: complete"));
+    }
+
+    /// Reject unknown coverage states at the editor response boundary.
+    #[test]
+    fn unknown_coverage_is_rejected_during_decode() {
+        assert!(
+            serde_json::from_value::<Reply>(json!({
+                "rows":[], "source":"workspace",
+                "coverage":[{"name":"publisher", "root":"/project", "state":"invented"}]
+            }))
+            .is_err()
+        );
+    }
 }
