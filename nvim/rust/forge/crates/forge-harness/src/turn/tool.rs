@@ -195,11 +195,6 @@ impl ToolCall {
     pub fn state(&self) -> ToolState {
         self.state
     }
-
-    /// Use failure styling for rejected operations without changing their denied lifecycle.
-    pub(crate) fn failure_style(&self) -> bool {
-        matches!(self.state, ToolState::Failed | ToolState::Denied)
-    }
 }
 
 /// Store tool items in admission order under checked normalized identities.

@@ -24,6 +24,7 @@ pub struct ToolHeading<'call> {
     pub shell: Option<&'call str>,
     pub elapsed_ms: Option<u64>,
     pub failed: bool,
+    pub denied: bool,
     pub title: &'call str,
     pub expanded: bool,
 }
@@ -414,6 +415,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             kind,
             elapsed_ms,
             failed,
+            denied,
             title,
             expanded,
         } = heading;
@@ -443,7 +445,7 @@ impl<'profile> TranscriptRenderer<'profile> {
                 ..BlockMetadata::default()
             },
         };
-        decorate_tool_heading(&mut block, title_rows, kind, failed);
+        decorate_tool_heading(&mut block, title_rows, kind, failed, denied);
         Self::heading_marker(&mut block, "Normal");
         if block.text.row_count() > title_rows {
             block.metadata.decoration.push(Decoration {
@@ -597,7 +599,13 @@ fn tool_source_rows(profile: &WidthProfile, kind: &str, title: &str) -> Result<V
     tool_body_rows(profile, &format!("Command: {title}"), true)
 }
 
-fn decorate_tool_heading(block: &mut BufferBlock, title_rows: usize, kind: &str, failed: bool) {
+fn decorate_tool_heading(
+    block: &mut BufferBlock,
+    title_rows: usize,
+    kind: &str,
+    failed: bool,
+    denied: bool,
+) {
     if let Some(column) = block.text.row(0).and_then(|text| text.find('•')) {
         block.metadata.decoration.push(Decoration {
             range: TextRange {
@@ -607,7 +615,9 @@ fn decorate_tool_heading(block: &mut BufferBlock, title_rows: usize, kind: &str,
                     column: column + '•'.len_utf8(),
                 },
             },
-            capture: if failed {
+            capture: if denied {
+                "ForgeHarnessToolDenied".into()
+            } else if failed {
                 "ForgeHarnessToolFailure".into()
             } else {
                 "ForgeHarnessToolSuccess".into()

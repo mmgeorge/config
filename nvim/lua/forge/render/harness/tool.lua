@@ -201,6 +201,7 @@ end
 function M.foldtext_chunks(tool, indent, visible_text, now_ms)
   local prefix = (indent or "") .. "• "
   local bullet_group = M.failed(tool) and "ForgeHarnessToolFailure" or "ForgeHarnessToolSuccess"
+  if tool.status == "denied" or tool.status == "rejected" then bullet_group = "ForgeHarnessToolDenied" end
   local kind = tool.kind or "tool_call"
   local duration = tool_duration(tool, now_ms)
   if kind ~= "command" then

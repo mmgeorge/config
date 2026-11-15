@@ -103,6 +103,7 @@ function M.setup()
   vim.api.nvim_set_hl(0, "ForgeHarnessOutput", { fg = palette.gray })
   vim.api.nvim_set_hl(0, "ForgeHarnessToolSuccess", { fg = palette.green })
   vim.api.nvim_set_hl(0, "ForgeHarnessToolFailure", { fg = palette.red })
+  vim.api.nvim_set_hl(0, "ForgeHarnessToolDenied", { fg = "#ffb86c" })
   vim.api.nvim_set_hl(0, "ForgeStatusPR", { fg = "#d4d4d4" })
   vim.api.nvim_set_hl(0, "ForgeStatusFetching", { fg = "#9ca3af", italic = true })
   vim.api.nvim_set_hl(0, "ForgeHunkContext", {

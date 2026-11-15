@@ -572,7 +572,8 @@ pub(super) fn timing_blocks(
                                 crate::buffer::transcript::ToolHeading {
                                     kind: &tool.kind,
                                     elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
-                                    failed: tool.failure_style(),
+                                    failed: tool.failed,
+                                    denied: tool.state() == crate::turn::ToolState::Denied,
                                     title: &tool.title,
                                     expanded: false,
                                     shell: tool.command_shell.as_deref(),
@@ -623,7 +624,8 @@ pub(super) fn timing_blocks(
                     crate::buffer::transcript::ToolHeading {
                         kind: &tool.kind,
                         elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
-                        failed: tool.failure_style(),
+                        failed: tool.failed,
+                        denied: tool.state() == crate::turn::ToolState::Denied,
                         title: &tool.title,
                         expanded: expanded.get(&format!("{call_id}:tool")) == Some(&true),
                         shell: tool.command_shell.as_deref(),
@@ -2066,24 +2068,6 @@ impl TimelineRenderer<'_> {
                 node.more = more;
             }
             node.resolve(expansion);
-            if let Some(reason) = super::tool_outcome::rejection(exchange, call) {
-                let width = self.content_width();
-                let renderer = TranscriptRenderer::new(&width)?;
-                let mut block =
-                    renderer.literal(BlockId(format!("{call_id}:rejection")), &reason, 2)?;
-                block.metadata.decoration.push(Decoration {
-                    range: TextRange {
-                        start: TextPosition { row: 0, column: 0 },
-                        end: TextPosition {
-                            row: block.text.row_count(),
-                            column: 0,
-                        },
-                    },
-                    capture: "ForgeHarnessToolFailure".into(),
-                    priority: 100,
-                });
-                self.push(block)?;
-            }
         }
         let expansion = self.expansion.get(&group_id).copied();
         let node = self.fold(start, &group_id, settled, NodeKind::ToolGroup);
@@ -3081,7 +3065,10 @@ impl TimelineRenderer<'_> {
             scope,
         );
         let call_id = display;
-        let mut output = if let Some((root, object)) = exchange.output_store.as_ref().zip(
+        let rejection = super::tool_outcome::rejection(exchange, call);
+        let mut output = if tool.state() == crate::turn::ToolState::Denied {
+            ToolOutputView::new(call_id, rejection.as_deref().unwrap_or("Permission denied"))
+        } else if let Some((root, object)) = exchange.output_store.as_ref().zip(
             exchange
                 .archived_output
                 .get(&format!("{interaction}:{}", tool.id)),
@@ -3111,7 +3098,8 @@ impl TimelineRenderer<'_> {
                 shell: tool.command_shell.as_deref(),
                 kind: &tool.kind,
                 elapsed_ms: tool.elapsed_ms(exchange.tool_instant(self.now_ms)),
-                failed: tool.failure_style(),
+                failed: tool.failed,
+                denied: tool.state() == crate::turn::ToolState::Denied,
                 title: &label,
                 expanded,
             },
@@ -3900,9 +3888,9 @@ mod tests {
             super::tool_group_label(&calls, super::NodeLifecycle::Settled, ToolInstant::wall(0)),
             "▸ Ran 3 tools (1 failed, 1 denied)",
         );
-        assert!(calls[1].failure_style());
-        assert!(calls[2].failure_style());
-        assert!(!calls[0].failure_style());
+        assert!(calls[1].failed);
+        assert_eq!(calls[2].state(), ToolState::Denied);
+        assert!(!calls[0].failed);
     }
 
     /// Freeze completed intervals and measure live overlap on the approval-paused clock.

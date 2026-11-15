@@ -291,10 +291,11 @@ function M._finish(code)
       record(st.trace, "cleanup", { ms = perf.elapsed_ms(cleanup_started) })
     end
     vim.notify(code == 0 and (st.amend and "Amend complete" or "Commit complete") or "Commit aborted", vim.log.levels.INFO)
+    -- Restore the borrowed window before wiping its console, which can close the tab.
+    restore_preview(st)
     if st.console and vim.api.nvim_buf_is_valid(st.console) then
       pcall(vim.api.nvim_buf_delete, st.console, { force = true })
     end
-    restore_preview(st)
     return
   end
 
@@ -315,8 +316,8 @@ function M._finish(code)
   for _, key in ipairs({ "q", "<Esc>" }) do
     vim.keymap.set("n", key, function()
       winbar(st.win, st.prev_winbar or "")
-      if vim.api.nvim_buf_is_valid(errbuf) then pcall(vim.api.nvim_buf_delete, errbuf, { force = true }) end
       restore_preview(st)
+      if vim.api.nvim_buf_is_valid(errbuf) then pcall(vim.api.nvim_buf_delete, errbuf, { force = true }) end
     end, { buffer = errbuf, nowait = true, silent = true })
   end
 end

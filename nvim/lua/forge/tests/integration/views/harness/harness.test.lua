@@ -14,7 +14,7 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
-T["rejected_tool_shows_reason_and_red_marker"] = function()
+T["rejected_tool_expands_reason_with_orange_marker"] = function()
   local approval = dofile("nvim/lua/forge/tests/support/approval.lua")
   local workspace = temp.directory("approval-rejection")
   local config = temp.directory("approval-rejection-config")
@@ -61,21 +61,30 @@ T["rejected_tool_shows_reason_and_red_marker"] = function()
         state.presentation.set_section(node.id, true, false)
       end
     end
-    return buffer.text(state.transcript_buf):find("Rejected by user", 1, true)
+    return buffer.text(state.transcript_buf):find("check_definition_edit", 1, true)
   end,
     "the rejected tool lost its approval reason", { context = function() return buffer.text(state.transcript_buf) end })
   eq(buffer.text(state.transcript_buf):find("1 denied", 1, true) ~= nil, true)
-  local red = false
+  eq(buffer.text(state.transcript_buf):find("Rejected by user", 1, true), nil)
+  local orange = false
   for index = 0, transcript.sequence:count() - 1 do
     local entry = transcript.sequence:at(index).entry
     local node = entry.metadata.node
     if node and node ~= vim.NIL and node.kind == "tool" then
       for _, decoration in ipairs(entry.metadata.decoration or {}) do
-        red = red or decoration.capture == "ForgeHarnessToolFailure"
+        orange = orange or decoration.capture == "ForgeHarnessToolDenied"
       end
     end
   end
-  eq(red, true)
+  eq(orange, true)
+  for index = 0, transcript.sequence:count() - 1 do
+    local node = transcript.sequence:at(index).entry.metadata.node
+    if node and node ~= vim.NIL and node.kind == "tool" then
+      state.presentation.set_section(node.id, true, false)
+    end
+  end
+  wait_until(function() return buffer.text(state.transcript_buf):find("Rejected by user", 1, true) end,
+    "expanding the rejected tool did not show its reason")
   eq(host.stop(), true)
 end
 
@@ -139,6 +148,24 @@ T["approval_timeout_shows_original_request"] = function()
   local exchanges = call("session.exchange.list")
   eq(exchanges[#exchanges].prompt:find("No user decision was recorded.", 1, true) ~= nil, true)
   eq(exchanges[#exchanges].prompt:find("Continue authorized work", 1, true), nil)
+  wait_until(function()
+    local orange = false
+    for index = 0, transcript.sequence:count() - 1 do
+      local entry = transcript.sequence:at(index).entry
+      local node = entry.metadata.node
+      if node and node ~= vim.NIL then
+        if node.kind == "tool" then
+          for _, decoration in ipairs(entry.metadata.decoration or {}) do
+            orange = orange or decoration.capture == "ForgeHarnessToolDenied"
+          end
+          if node.display == "heading" then state.presentation.set_section(node.id, true, false) end
+        elseif node.display == "heading" then
+          state.presentation.set_section(node.id, true, false)
+        end
+      end
+    end
+    return orange and buffer.text(state.transcript_buf):find("Approval timed out; automatically rejected.", 1, true)
+  end, "timed-out tool did not expand its rejection details")
   eq(host.stop(), true)
 end
 

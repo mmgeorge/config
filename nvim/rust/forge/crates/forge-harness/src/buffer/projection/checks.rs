@@ -866,6 +866,7 @@ impl TimelineRenderer<'_> {
                 kind: "check",
                 elapsed_ms: elapsed,
                 failed,
+                denied: false,
                 title: &title,
                 expanded,
             },

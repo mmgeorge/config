@@ -36,6 +36,11 @@ Overloads are never paired by position, and ambiguous matches keep body excerpts
 
 ## Temporary generation
 
+The commit editor borrows the invoking Status window. Once Git finishes, success
+and abort restore the Status buffer before deleting the console; dismissing a Git
+failure follows the same order. Deleting a displayed console first can close the
+borrowed window and its tab, leaving no destination for restoration.
+
 `HarnessService.generate_text` runs commit and PR text generation through the shared temporary-generation lifecycle. Each request captures worktree identity, branch, HEAD, and recent reachable commit messages, then supplies the prepared evidence to a fresh provider conversation. It never resumes or appends to the interactive conversation.
 
 The Commit model settings store the independently selected provider, model, reasoning, and service tier. Existing Background preferences seed an initial Commit selection; saving that selection stores it independently. Temporary generation does not use a persistent `BackgroundManager` conversation or its compaction policy. The Background timeline describes retained Background work, not these temporary requests.
