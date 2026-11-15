@@ -694,7 +694,12 @@ local function host_dispatch_message(message, timing)
       if snapshot then snapshot.prompt_history = vim.deepcopy(message.result or {}) end
     end
     local result_session_id = message.result and message.result.session and message.result.session.id
-    if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
+    if result_session_id then
+      -- Outbound admission already acknowledges the page. Deliver its events even when the
+      -- consumer rejects the associated snapshot as stale.
+      M.replay_publication(message.result)
+      client.snapshot_by_id[result_session_id] = message.result
+    end
     pending.callback(message.result, nil)
   end
 end

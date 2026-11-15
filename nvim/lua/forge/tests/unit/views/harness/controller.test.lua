@@ -1171,6 +1171,33 @@ T["state_sync_keyed_by_session"] = function()
     "the shown session was never read after an in-place switch")
 end
 
+T["state_sync_preserves_receipts_from_invalidated_snapshots"] = function()
+  ---@type table
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local snapshot = require("forge.views.harness.snapshot")
+  quiet_state_read(controller)
+  local requests = mock_client.record()
+  state.session = { id = "invalidated-page", name = "current" }
+  state.runtime_epoch, state.snapshot_revision = "current-owner", 5
+  state.publication_cursor = 12
+  controller.synchronize_state()
+  local request = requests[#requests]
+  state.state_invalidation = (state.state_invalidation or 0) + 1
+  request.callback({ session = { id = "invalidated-page", name = "stale" },
+    runtime_epoch = "current-owner", snapshot_revision = 4,
+    owner_publication = { receipt_id = "cancel-page", after = 12, through = 13,
+      events = { { sequence = 13, event = { payload = { retracted = "cancelled-input" } } } } } })
+  eq(state.session.name, "current")
+  eq(state.snapshot_revision, 5)
+  eq(state.publication_cursor, 12)
+  eq(snapshot.confirm_publication(state, { receipt_id = "cancel-page", runtime_epoch = "current-owner",
+    after = 12, through = 13 }), true)
+  eq(state.publication_cursor, 13)
+  wait_until(function() return #requests == 2 end, "Invalidated snapshot was not refreshed")
+  eq(requests[2].spec.params.publication_cursor, 13)
+end
+
 T["document_change_does_not_invalidate_reads"] = function()
   local client = require("forge.client")
   local state = require("forge.session").harness

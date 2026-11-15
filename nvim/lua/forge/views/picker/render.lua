@@ -29,7 +29,7 @@ function PickerRender.apply(buf, frame)
   end
   for _, content in ipairs(frame.content_range) do
     for line = content.first, content.last do
-      highlight_row(buf, frame, line, content.group or "ForgePickerText")
+      highlight_row(buf, frame, line, content.group or "ForgePickerText", content.priority)
     end
   end
   for _, span in ipairs(frame.content_span_list or {}) do

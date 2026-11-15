@@ -150,6 +150,36 @@ T["snapshot"] = function()
     "replacement runtime input was applied to the previous runtime's input owner")
 end
 
+T["stale_snapshot_still_retains_and_confirms_its_publication_page"] = function()
+  local snapshot = require("forge.views.harness.snapshot")
+  local state = { session = { id = "retained-events", name = "current" },
+    runtime_epoch = "owner", snapshot_revision = 8, publication_cursor = 20 }
+  local response = { session = { id = "retained-events", name = "old" },
+    runtime_epoch = "owner", snapshot_revision = 7,
+    owner_publication = { receipt_id = "older-state", after = 20, through = 21 } }
+  eq(snapshot.apply(state, response), false)
+  eq(state.session.name, "current")
+  eq(snapshot.confirm_publication(state, { receipt_id = "older-state", runtime_epoch = "owner",
+    after = 20, through = 21 }), true)
+  eq(state.publication_cursor, 21)
+  snapshot.receive_publication(state, response)
+  eq(state.publication_received, nil)
+end
+
+T["cursorless_reconnect_confirms_the_host_admitted_prefix"] = function()
+  local snapshot = require("forge.views.harness.snapshot")
+  local state = { session = { id = "reopened" }, runtime_epoch = "owner" }
+  snapshot.receive_publication(state, { runtime_epoch = "owner",
+    owner_publication = { receipt_id = "bootstrap", after = 80, through = 82 } })
+  eq(state.publication_cursor, nil)
+  eq(snapshot.confirm_publication(state, { receipt_id = "bootstrap", runtime_epoch = "owner",
+    after = 80, through = 82 }), true)
+  eq(state.publication_cursor, 82)
+  snapshot.receive_publication(state, { runtime_epoch = "owner",
+    owner_publication = { receipt_id = "old", after = 80, through = 81 } })
+  eq(state.publication_received, nil)
+end
+
 T["active_cancellation_survives_idle_activity_and_runtime_replacement"] = function()
   local snapshot = require("forge.views.harness.snapshot")
   local cleanup = require("forge.views.harness.cleanup_progress")

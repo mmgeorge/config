@@ -12,16 +12,30 @@ local function presentation_value(value)
   return projected
 end
 
+---Retain the receipt for a page the transport delivered, even when its state snapshot is stale.
+---@param state table
+---@param result table
+function HarnessSnapshot.receive_publication(state, result)
+  local publication = result.owner_publication
+  if not publication then return end
+  if state.publication_cursor ~= nil and publication.after ~= state.publication_cursor then return end
+  state.publication_received = {
+    receipt_id = publication.receipt_id, after = publication.after, through = publication.through,
+    runtime_epoch = result.runtime_epoch,
+  }
+  state.publication_more = publication.more == true
+end
+
 ---@param state table
 ---@param result table
 function HarnessSnapshot.apply(state, result)
   result = assert(presentation_value(result), "Harness snapshot is missing")
   assert(type(result) == "table" and type(result.session) == "table" and type(result.session.id) == "string" and result.session.id ~= "",
     "Harness snapshot is missing its session identity")
+  HarnessSnapshot.receive_publication(state, result)
   if state.session and result.session and state.session.id == result.session.id
     and state.runtime_epoch == result.runtime_epoch
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
-  if result.owner_publication then require("forge.client").replay_publication(result) end
   local session_changed = state.session and result.session and state.session.id ~= result.session.id
   local runtime_changed = state.runtime_epoch ~= result.runtime_epoch
   if session_changed or state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
@@ -52,16 +66,9 @@ function HarnessSnapshot.apply(state, result)
     end
   end
   state.runtime_epoch, state.snapshot_revision = result.runtime_epoch, result.snapshot_revision
+  if session_changed or runtime_changed then HarnessSnapshot.receive_publication(state, result) end
   require("forge.views.harness.cleanup_progress").apply(state, result.cancellation)
   if result.activity then activity.receive(state, result.activity, result.runtime_epoch) end
-  local publication = result.owner_publication
-  if publication then
-    state.publication_received = {
-      receipt_id = publication.receipt_id, after = publication.after, through = publication.through,
-      runtime_epoch = result.runtime_epoch,
-    }
-    state.publication_more = publication.more == true
-  end
   if state.host_error then state.host_error, state.execution_notice = nil, nil end
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
@@ -139,7 +146,7 @@ function HarnessSnapshot.confirm_publication(state, acknowledgment)
     or received.runtime_epoch ~= acknowledgment.runtime_epoch
     or state.runtime_epoch ~= acknowledgment.runtime_epoch
     or received.after ~= acknowledgment.after or received.through ~= acknowledgment.through
-    or received.after ~= state.publication_cursor then return false end
+    or state.publication_cursor ~= nil and received.after ~= state.publication_cursor then return false end
   state.publication_cursor = received.through or received.after or state.publication_cursor
   state.publication_received = nil
   return true

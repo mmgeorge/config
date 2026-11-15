@@ -534,16 +534,17 @@ local function synchronize_state(callback, target_state)
       end
       return
     end
-    if result and invalidation ~= (synchronized_state.state_invalidation or 0) then
-      vim.schedule(function() synchronize_state(nil, synchronized_state) end)
-      return
-    end
     if result and result.session and result.session.id ~= synchronized_session then
       local failure = "Snapshot belongs to another conversation"
       diagnostic.set(synchronized_state, "sync_error", failure,
         { owner = synchronized_session, category = "protocol", severity = "error", recovery = "reconnect" })
       M.settle_state_sync(synchronized_state, nil, failure)
       if harness_state() == synchronized_state then M.render() end
+      return
+    end
+    if result and result.session then snapshot.receive_publication(synchronized_state, result) end
+    if result and invalidation ~= (synchronized_state.state_invalidation or 0) then
+      vim.schedule(function() synchronize_state(nil, synchronized_state) end)
       return
     end
     if result and result.runtime_epoch == synchronized_state.runtime_epoch

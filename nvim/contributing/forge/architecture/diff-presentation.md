@@ -4,6 +4,8 @@ Each view that rendered its own diffs would disagree about hunks, gutters, and f
 
 [Buffers and rendering](buffers-and-rendering.md) covers publication.
 
+Check configuration approvals adapt host-authored field diffs and helper source diffs through `forge.render.diff_component`. The shared picker accepts styled child content beneath expandable section rows, preserving diff spans through wrapping and scrolling. Approval controls remain owned by the permission picker; expanding a section never submits a decision.
+
 ## Shared presenter
 
 `forge-diff::presentation::DiffPresenter` owns file and hunk headings, row styling, gutter widths, and fold boundaries for Status, PlanReview, PR and commit reviews, walkthroughs, and Harness change trees. Consumers supply rows, block identities, and domain targets, and the presenter never mutates repositories. It keeps each syntax capture's parser language, preserves query precedence for overlapping captures, and sizes gutters from the whole display group, so chunks of one hunk stay aligned.

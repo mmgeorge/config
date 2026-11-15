@@ -1347,4 +1347,60 @@ T["provider_registry_config_reload"] = function()
     "user provider overrides must merge with registry descriptors")
 end
 
+T["snapshot_events_arrive_before_a_consumer_can_discard_the_snapshot"] = function()
+  local config = require("forge.infra.config")
+  local options = vim.deepcopy(config.defaults)
+  options.harness.provider = "mock"
+  config.setup(options)
+  local client = require("forge.client")
+  local emit, request_id
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.builder"), "ensure", function(callback)
+    callback({ ok = true, path = "publication-fixture" })
+  end)
+  client._host_set_launcher_for_test(function(_, options, on_exit)
+    emit = function(message) options.stdout(nil, vim.json.encode(message) .. "\n") end
+    return {
+      write = function(_, encoded)
+        local request = vim.json.decode(encoded)
+        if request.method == "host.initialize" then
+          emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
+        elseif request.method == "session.state.get" then request_id = request.id
+        elseif request.method == "host.shutdown" then
+          vim.schedule(function() on_exit({ code = 0 }) end)
+        elseif request.method == "settings.provider.get" then emit({ id = request.id, result = {} }) end
+      end,
+      kill = function() end,
+    }
+  end)
+  local ready = false
+  client.host_start(function(_, failure) eq(failure, nil) ready = true end)
+  wait_until(function() return ready end, "Fixture host did not start")
+  client._client.runtime_ready = true
+  client._provider_registry_adopt_for_test(true)
+  local events, consumed = {}, false
+  client.session_events_subscribe(function(event, payload)
+    if event == "input_changed" then events[#events + 1] = payload.retracted end
+  end)
+  -- Establish an existing live subscription; initial attachment must still skip historical effects.
+  client._client.publication_by_session["publication-fixture"] = {
+    generation = client.host_get_generation(), cursor = 1, seen = {},
+  }
+  client.request({ session_id = "publication-fixture", method = "session.state.get", params = {} }, function()
+    eq(events, { "cancelled-prompt" })
+    consumed = true
+  end)
+  wait_until(function() return request_id ~= nil end, "Snapshot request was not sent")
+  emit({ id = request_id, result = { session = { id = "publication-fixture" },
+    owner_publication = { after = 1, through = 2, high_water = 2, events = {
+      { sequence = 2, event = { session_id = "publication-fixture", event = "input_changed",
+        payload = { retracted = "cancelled-prompt", _publication = { sequence = 2 } } } },
+    } } } })
+  wait_until(function() return consumed end, "Snapshot consumer did not finish")
+  client.replay_publication({ session = { id = "publication-fixture" }, owner_publication = {
+    events = { { sequence = 2, event = { session_id = "publication-fixture", event = "input_changed",
+      payload = { retracted = "cancelled-prompt", _publication = { sequence = 2 } } } } },
+  } })
+  eq(events, { "cancelled-prompt" })
+end
+
 return T

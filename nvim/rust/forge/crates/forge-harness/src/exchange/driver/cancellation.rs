@@ -96,7 +96,22 @@ impl ExchangeDriver {
             .append_core(&super::super::core_log::CoreRecord::CancellationProgress {
                 progress: progress.clone(),
             })?;
-        let snapshot = env.services.observer.snapshot()?;
+        let mut snapshot = env.services.observer.snapshot()?;
+        // The state notification and native status document must describe the same committed
+        // cancellation revision, including settlement after the foreground has disappeared.
+        let patch = env
+            .services
+            .presentation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+            .reconcile_with_status_thoughts(
+                snapshot.timeline.clone(),
+                env.services
+                    .observer
+                    .status_thoughts
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )?;
+        snapshot.timeline_revision = patch.revision;
         let event = crate::broker::publication::encode_session_event(
             &env.session_id,
             &crate::broker::publication::SessionUpdate::ExecutionState {
@@ -111,6 +126,20 @@ impl ExchangeDriver {
             &env.session_id,
             step,
         )?;
+        if !patch.is_empty() {
+            retain_publication(
+                forge_protocol::message::SessionEvent {
+                    session_id: env.session_id.clone(),
+                    event: "document_changed".into(),
+                    payload: patch.notification(),
+                },
+                state.command_messages.as_ref(),
+                &env.services,
+                &env.trace,
+                &env.session_id,
+                step,
+            )?;
+        }
         self.cancellation_progress = Some(progress);
         Ok(())
     }

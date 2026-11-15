@@ -5,6 +5,7 @@ local picker = require("forge.views.picker")
 local keymaps = require("forge.shared.keymaps")
 local perf = require("forge.infra.perf")
 local command_detail = require("forge.views.harness.command_detail")
+local check_review = require("forge.views.harness.check_review")
 
 ---@class ForgeApprovalChoice
 ---@field choice_id string
@@ -53,6 +54,7 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field selection table<string, ForgeApprovalChoice>
 ---@field page_index integer
 ---@field submitting boolean
+---@field review table<string, ForgeCheckReview> Parsed check sections owned by this popup.
 
 ---@class ForgeApprovalPickerOption
 ---@field key? string
@@ -167,12 +169,23 @@ local function build_spec(instance)
         label = "Cancel permission request", wrap_label = true,
       }
       local content_list = detail_content(item)
+      local review = instance.review[item.target_id]
+      if review then
+        content_list = { { text = review.introduction, group = "ForgePickerText", preformatted = true } }
+        for _, section in ipairs(review.sections) do
+          option_list[#option_list + 1] = {
+            value = section.id, review_section = section,
+            label = (section.expanded and "▾ " or "▸ ") .. section.title,
+            section = "Changes", child_content_list = section.expanded and section.content or nil,
+          }
+        end
+      end
       if host.owner_label then table.insert(content_list, 1, { text = host.owner_label, group = "ForgePickerText" }) end
       if request.reason then content_list[#content_list + 1] = { text = "Reason: " .. request.reason, group = "ForgePickerText" } end
       page_list[#page_list + 1] = {
         id = item.target_id, title = "Review Permission", subtitle = item.title ~= "Run command" and item.title or nil,
         content_list = content_list,
-        scroll_content = true,
+        scroll_content = review == nil,
         column_headers = { "Decision" }, option_list = option_list, selected_index = selected_index,
         footer = "←→ page  ↑↓ select  Enter confirm  PgUp/PgDn details  q close"
           .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. (request.execution_kind == "native_observed" and " cancel request" or " interrupt")) or ""),
@@ -188,6 +201,11 @@ local function build_spec(instance)
     page_list = page_list, initial_page = instance.page_index,
     on_confirm = function(result)
       if active ~= instance or instance.submitting then return false end
+      if result.option.review_section then
+        result.option.review_section.expanded = not result.option.review_section.expanded
+        picker.update(build_spec(instance))
+        return false
+      end
       if result.option.cancel_request then
         submit(instance, true)
         return false
@@ -222,8 +240,11 @@ end
 function Approval.open(request, host)
   picker.close(true)
   local instance = {
-    request = request, host = host, selection = {}, page_index = 1, submitting = false,
+    request = request, host = host, selection = {}, page_index = 1, submitting = false, review = {},
   }
+  for _, item in ipairs(request.targets) do
+    if item.title == "Update project checks" then instance.review[item.target_id] = check_review.parse(item.detail) end
+  end
   active = instance
   perf.trace("harness", "ui.approval.open", { request_id = request.request_id, count = #request.targets }, function()
     picker.open(build_spec(instance))

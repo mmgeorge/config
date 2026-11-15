@@ -700,7 +700,13 @@ impl ConfigureChecks {
         let mut detail = String::from(
             "Approve these project check changes and managed helper updates. No checks will run.\n\n",
         );
-        detail.push_str(
+        detail.push_str(&super::review::describe(
+            &document["checks"],
+            &serde_json::to_value(&self.config)?,
+        )?);
+        detail.push_str("\n### Raw configuration diff\n");
+        detail.push_str(&super::review::fenced(
+            "raw-diff",
             &similar::TextDiff::from_lines(&before, &after)
                 .unified_diff()
                 .header(
@@ -708,7 +714,7 @@ impl ConfigureChecks {
                     ".forge.json checks (proposed)",
                 )
                 .to_string(),
-        );
+        ));
         if before == after {
             detail.push_str("Check definitions are unchanged.\n");
         }
@@ -736,8 +742,12 @@ impl ConfigureChecks {
                 .map(std::str::from_utf8)
                 .transpose()?
                 .unwrap_or("");
-            detail.push_str(&format!("\nManaged helper: {}\n", helper.path));
-            detail.push_str(
+            detail.push_str(&format!(
+                "\n### Helper: {}\n",
+                serde_json::to_string(&helper.path)?
+            ));
+            detail.push_str(&super::review::fenced(
+                "diff",
                 &similar::TextDiff::from_lines(before, &helper.source)
                     .unified_diff()
                     .header(
@@ -745,7 +755,7 @@ impl ConfigureChecks {
                         &format!("{} (proposed)", helper.path),
                     )
                     .to_string(),
-            );
+            ));
         }
         Ok(detail)
     }
@@ -1133,5 +1143,49 @@ impl CheckSupervisor {
             self.publish(&run, sink).await?;
         }
         self.catalog(None)
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn check_approval_review_matches_editor_recording() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let original = json!({"checks":{"lua-test":{"trigger":{},"action":{
+            "category":"test","after":["rust-build"],"adapter":{"script":{"command":["nu","tests.nu"]}}
+        }},"rust-build":{"trigger":{},"action":{"category":"build","adapter":{"script":{"command":["nu","build.nu"]}}}}}});
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            serde_json::to_vec(&original)?,
+        )?;
+        let mut proposed = original["checks"].clone();
+        proposed["lua-test"]["action"]["after"] = json!([]);
+        proposed["lua-test"]["action"]["adapter"]["script"]["command"] =
+            json!(["nu", "tests.nu", "--partition", "non-host"]);
+        let request = ConfigureChecks {
+            expected_revision: crate::plan::digest(&serde_json::to_vec(&original)?),
+            config: serde_json::from_value(proposed)?,
+            helpers: vec![CheckHelper {
+                path: ".forge/checks/example.nu".into(),
+                source: "print 'ready'\n".into(),
+                expected_digest: None,
+            }],
+        };
+        let detail = request.review(workspace.path())?;
+        forge_recorded_fixtures::assert_matches_recording(
+            "check-approval-review.json",
+            &json!({"detail":detail}),
+        );
+        assert_eq!(
+            super::super::config::read_document(workspace.path())?,
+            original
+        );
+        assert!(!workspace.path().join(".forge/checks/example.nu").exists());
+        let mut stale = request;
+        stale.expected_revision = "stale".into();
+        assert!(stale.review(workspace.path()).is_err());
+        Ok(())
     }
 }

@@ -399,6 +399,8 @@ both checks explicitly: `{"check":["rust-build","lua-host-test"],"all":true}`.
 This runs the complete host suite; a skipped dependency is not a passing build.
 
 Check IDs use language/tool-first names, while display labels name the action.
+
+When check editing requires approval, the popup groups changes by check and marks added and removed field values with diff colors. Changed checks open expanded. Select a section and press the picker confirmation key to expand or collapse it; raw configuration and helper source diffs start collapsed. The separate Approve update and Reject update choices decide publication. Reviewing or expanding a section never executes checks.
 `rulesync-local-preview` and `rulesync-global-preview` only preview generation.
 Their manual `rulesync-local-update` and `rulesync-global-update` counterparts
 write generated files and declare source preparation. Each update requires its

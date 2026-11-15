@@ -7,6 +7,7 @@ local PickerLayout = {}
 ---@field spans? ForgePickerColumnSpan[] Byte spans attached to the first row.
 ---@field key_end? integer Exclusive byte end of an option shortcut.
 ---@field group? string Highlight group for content rows.
+---@field priority? integer Highlight priority for content rows.
 
 --- Page text and geometry shared by the viewport, navigation, renderer, and overlays.
 ---@class ForgePickerFrame
@@ -44,6 +45,9 @@ local PickerLayout = {}
 ---@field preformatted? boolean
 ---@field spans? ForgePickerColumnSpan[]
 ---@field focus_offset? integer Zero-based byte offset initially kept visible.
+
+---@class ForgePickerContentOption
+---@field child_content_list? ForgePickerContent[] Styled expandable content below the option.
 
 --- Configuration field rendered beneath an option, aligned with its sibling values.
 ---@class ForgePickerDetailField
@@ -142,6 +146,37 @@ local function wrap_preformatted(text, width)
   return { lines = result, segment_list = segment_list }
 end
 
+--- Append reusable styled content while mapping spans through wrapping.
+---@param lines string[]
+---@param ranges ForgePickerRowRange[]
+---@param spans table[]
+---@param content ForgePickerContent
+---@param width integer
+---@return integer? focus_line
+local function append_content(lines, ranges, spans, content, width)
+  local first, focus_line = #lines + 1, nil
+  if content.preformatted then
+    local wrapped = wrap_preformatted(content.text, width)
+    append(lines, wrapped.lines)
+    for _, segment in ipairs(wrapped.segment_list) do
+      local row = first + segment.line - 1
+      if content.focus_offset and not focus_line
+        and content.focus_offset >= segment.first and content.focus_offset < segment.last then focus_line = row end
+      for _, span in ipairs(content.spans or {}) do
+        local start, final = math.max(span.first, segment.first), math.min(span.last, segment.last)
+        if start < final then
+          spans[#spans + 1] = { line = row, first = segment.prefix + start - segment.first,
+            last = segment.prefix + final - segment.first, group = span.group, priority = span.priority }
+        end
+      end
+    end
+  else
+    append(lines, wrap(content.text, width, "  "))
+  end
+  ranges[#ranges + 1] = { first = first, last = #lines, group = content.group, priority = 110 }
+  return focus_line
+end
+
 --- Keep field values aligned while retaining whitespace and wrapping complete content.
 ---@param fields ForgePickerDetailField[]
 ---@param width integer
@@ -208,30 +243,8 @@ function PickerLayout.build(page, selected_index, width, options)
   end
   local content_start = #lines + 1
   for _, content in ipairs(page.content_list or {}) do
-    local first = #lines + 1
-    if content.preformatted then
-      local wrapped = wrap_preformatted(content.text, usable_width)
-      append(lines, wrapped.lines)
-      for _, segment in ipairs(wrapped.segment_list) do
-        local row = first + segment.line - 1
-        if content.focus_offset and not content_focus_line
-          and content.focus_offset >= segment.first and content.focus_offset < segment.last then
-          content_focus_line = row
-        end
-        for _, span in ipairs(content.spans or {}) do
-          local start, final = math.max(span.first, segment.first), math.min(span.last, segment.last)
-          if start < final then
-            content_span_list[#content_span_list + 1] = {
-              line = row, first = segment.prefix + start - segment.first,
-              last = segment.prefix + final - segment.first, group = span.group, priority = span.priority,
-            }
-          end
-        end
-      end
-    else
-      append(lines, wrap(content.text, usable_width, "  "))
-    end
-    content_range[#content_range + 1] = { first = first, last = #lines, group = content.group }
+    local focus_line = append_content(lines, content_range, content_span_list, content, usable_width)
+    content_focus_line = content_focus_line or focus_line
   end
   local content_end = #lines
   if #(page.content_list or {}) > 0 and #page.option_list > 0 then lines[#lines + 1] = "" end
@@ -402,6 +415,9 @@ function PickerLayout.build(page, selected_index, width, options)
       append(lines, wrap(child, usable_width, "    ", "      "))
     end
     append(lines, detail_field_lines(option.child_field_list or {}, usable_width))
+    for _, content in ipairs(option.child_content_list or {}) do
+      append_content(lines, content_range, content_span_list, content, usable_width)
+    end
     option_range[index] = { first = first, last = #lines }
     primary_range[index] = { first = first, last = primary_last, spans = primary.spans, key_end = option.key and (2 + #option.key) }
     if primary_last < #lines then child_range[index] = { first = primary_last + 1, last = #lines } end

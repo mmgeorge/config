@@ -298,4 +298,64 @@ T["harness_approval"] = function()
   ]])
 end
 
+T["check_review_sections_expand_without_approving"] = function()
+  local approval = require("forge.views.harness.approval")
+  local picker = require("forge.views.picker")
+  local layout = require("forge.views.picker.layout")
+  local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
+  local recording = vim.json.decode(table.concat(vim.fn.readfile(
+    "nvim/lua/forge/tests/fixtures/protocol/check-approval-review.json"), "\n"))
+  local submitted = 0
+  approval.open({ request_id = "checks", execution_kind = "managed", targets = {
+    { target_id = "proposal", title = "Update project checks", detail = recording.detail, commands = {}, choices = {
+      { choice_id = "allow_once", label = "Approve update" },
+      { choice_id = "deny_once", label = "Reject update" },
+    } },
+  } }, {
+    transcript_win = vim.api.nvim_get_current_win(), interrupt = function() end, closed = function() end,
+    resolve = function(_, answers, callback)
+      submitted = submitted + 1
+      MiniTest.expect.equality(answers, { { item_id = "proposal", choice_id = "allow_once" } })
+      callback(true)
+    end,
+  })
+  MiniTest.finally(function() pcall(approval.close) end)
+  local instance = picker._state_for_test()
+  local page = instance.spec.page_list[1]
+  MiniTest.expect.equality(instance.state.selected_index_by_page.proposal, 0)
+  MiniTest.expect.equality(page.option_list[4].review_section.expanded, true)
+  MiniTest.expect.equality(page.option_list[5].review_section.expanded, false)
+  MiniTest.expect.equality(page.option_list[6].review_section.expanded, false)
+  local function expand(index)
+    while picker._state_for_test().state.selected_index_by_page.proposal < index do keymap.invoke("<Down>") end
+    while picker._state_for_test().state.selected_index_by_page.proposal > index do keymap.invoke("<Up>") end
+    keymap.invoke("<CR>")
+  end
+  expand(5)
+  MiniTest.expect.equality(submitted, 0)
+  instance = picker._state_for_test()
+  MiniTest.expect.equality(instance.spec.page_list[1].option_list[5].review_section.expanded, true)
+  expand(5)
+  expand(6)
+  local current_page = picker._state_for_test().spec.page_list[1]
+  MiniTest.expect.equality(current_page.option_list[6].review_section.expanded, true)
+  for _, width in ipairs({ 30, 80 }) do
+    local frame = layout.build(current_page, 0, width)
+    local text = table.concat(frame.lines, "\n")
+    local compact = text:gsub("%s", "")
+    MiniTest.expect.equality(compact:find("rust-build", 1, true) ~= nil, true)
+    MiniTest.expect.equality(compact:find("print'ready'", 1, true) ~= nil, true)
+    MiniTest.expect.equality(text:find('"checks":', 1, true), nil)
+    local additions, removals = false, false
+    for _, span in ipairs(frame.content_span_list) do
+      additions = additions or span.group == "ForgeAddLineNr"
+      removals = removals or span.group == "ForgeDeleteLineNr"
+    end
+    MiniTest.expect.equality({ additions, removals }, { true, true })
+  end
+  MiniTest.expect.equality(submitted, 0)
+  expand(1)
+  MiniTest.expect.equality(submitted, 1)
+end
+
 return T

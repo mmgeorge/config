@@ -2247,6 +2247,84 @@ do
     { fail_reason = "repeated ForgeHarness should focus the existing tab" })
 end
 end
+-- requires-forge-host
+T["cancellation_restores_prompt_and_clears_status"] = function()
+  local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
+  local workspace = temp.directory("cancellation-workspace")
+  vim.fn.writefile({ '{"checks":{}}' }, workspace .. "/.forge.json")
+  host.start({ config = true })
+  require("forge.harness.provider_preference").load = function() return "mock" end
+  vim.api.nvim_set_current_dir(workspace)
+  local options = vim.deepcopy(require("forge.infra.config").defaults)
+  options.harness.provider = "mock"
+  require("forge").setup(options)
+  require("forge.views.harness").open()
+  ---@type table
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local client = require("forge.client")
+  local controller = require("forge.views.harness.controller")
+  local function request(parameters)
+    local completion = {}
+    client.request({ session_id = state.session.id, method = "session.provider.mock_response", params = parameters },
+      function(result, failure) completion.result, completion.failure, completion.done = result, failure, true end)
+    wait_until(function() return completion.done end, "Mock provider control did not finish")
+    eq(completion.failure, nil)
+    return completion.result
+  end
+  local function pending_status()
+    for _, current_buffer in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.bo[current_buffer].filetype == "ForgeHarnessStatus"
+        and buffer.text(current_buffer):find("Cancellation pending", 1, true) then return true end
+    end
+    return false
+  end
+  for scenario_index, scenario in ipairs({
+    { prompt = "Restore the cancelled prompt", acceptance = "before_response" },
+    { prompt = "Restore before acceptance\n日本語", acceptance = "after_response" },
+    { prompt = "Recover the original prompt", acceptance = "before_response", newer = "Keep newer typing" },
+  }) do
+    local barrier = "cancel-boundary-" .. scenario_index
+    request({ operation = "script", script = { acceptance = scenario.acceptance,
+      steps = { { kind = "barrier", id = barrier } }, terminal = "completed" } })
+    vim.api.nvim_set_current_win(state.composer_win)
+    buffer.set(state.composer_buf, vim.split(scenario.prompt, "\n", { plain = true }))
+    keymap.invoke("<C-s>")
+    request({ operation = "wait", id = barrier })
+    if scenario.newer then buffer.set(state.composer_buf, { scenario.newer }) end
+    controller.cancel_turn()
+    local operation = state.cleanup_request_id
+    controller.cancel_turn()
+    eq(state.cleanup_request_id, operation)
+    wait_until(function()
+      return state.cancellation and state.cancellation.phase == "settled" and #state.input.confirmed == 0
+    end, "Cancellation did not settle its input")
+    eq(buffer.text(state.composer_buf), scenario.newer or scenario.prompt)
+    if scenario.newer then
+      eq(#state.queue, 1)
+      eq(state.queue[1].text, scenario.prompt)
+      eq(state.queue[1].local_only, true)
+      require("forge.views.harness.input_state").discard_rejected(state, state.queue[1].id)
+    else eq(#state.queue, 0) end
+    wait_until(function() return not pending_status() end, "Settled cancellation retained its pending status")
+    eq(state.status.kind, "idle")
+    controller.cancel_turn()
+    wait_until(function() return state.cleanup_request_id == nil and not pending_status() end,
+      "Repeated cancellation did not settle")
+    eq(buffer.text(state.composer_buf), scenario.newer or scenario.prompt)
+  end
+  local held = mock_provider.hold(state.session.id)
+  buffer.set(state.composer_buf, { "Continue after cancellation" })
+  controller.submit()
+  held:wait()
+  eq(buffer.text(state.composer_buf), "")
+  held:release()
+  wait_until(function() return state.status.kind == "idle" and not require("forge.views.harness.activity").busy(state)
+    and #state.input.confirmed == 0 end,
+    "Session could not finish another prompt after cancellation")
+  eq(#state.queue, 0)
+end
 T["prompt_lifecycle"] = function()
 local state = require("forge.session").harness
 local client = require("forge.client")

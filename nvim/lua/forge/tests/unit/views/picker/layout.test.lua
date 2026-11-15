@@ -3,6 +3,25 @@ local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 local eq = MiniTest.expect.equality
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["expanded content keeps diff styling through wrapping and viewport projection"] = function()
+  local layout = require("forge.views.picker.layout")
+  local text = "+ " .. string.rep("λ", 90)
+  local frame = layout.build({ option_list = { { label = "Modified check", child_content_list = {
+    { text = text, preformatted = true, group = "ForgeAddBg", spans = {
+      { first = 0, last = #text, group = "ForgeAddLineNr" },
+    } },
+  } } } }, 1, 30)
+  local projected = layout.viewport(frame, 8)
+  eq(#frame.content_span_list > 1, true)
+  eq(#projected.content_span_list > 0, true)
+  for _, span in ipairs(projected.content_span_list) do
+    eq(span.last <= #projected.lines[span.line], true)
+    eq(span.group, "ForgeAddLineNr")
+  end
+  eq(projected.content_range[1].group, "ForgeAddBg")
+  eq(projected.content_range[1].priority, 110)
+end
+
 T["detail fields align nested labels and list continuations"] = function()
   local layout = require("forge.views.picker.layout")
   local frame = layout.build({ option_list = { { label = "Check", child_field_list = {
