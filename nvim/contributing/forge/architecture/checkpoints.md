@@ -20,13 +20,13 @@ Acquisition failure or the 25-second barrier deadline denies tool execution. If 
 
 ## Change attribution
 
-At terminal capture, `ProviderChangeIndex` collects paths from successful structured file changes in the main timeline and every child-agent turn. The comparer produces a diff restricted to those paths and a full checkpoint diff, both from the same baseline-to-terminal comparison, so repeated edits and reversions collapse into one patch. The full comparison supplies **Workspace changes**, which can include command, formatter, child, and external edits. Provider attribution stays internal and never claims exclusive authorship. Non-Git exchanges keep provider-reported edits without any checkpoint or rollback.
+At terminal capture, `ProviderChangeIndex` collects paths from successful structured file changes in the main timeline and every child-agent turn. The comparer produces a diff restricted to those paths and a full checkpoint diff, both from the same baseline-to-terminal comparison, so repeated edits and reversions collapse into one patch. The full comparison supplies the exchange's **Edits** summary, which can include command, formatter, child, and external edits. Provider attribution stays internal and never claims exclusive authorship. Non-Git exchanges keep provider-reported edits without any checkpoint or rollback.
 
 ## Comparison
 
 Checkpoint comparisons run on the runtime `DiffEngine`. `forge-diff::raw` uses histogram comparison with `imara-diff`, and its hunk identities include both source hashes, representations, and exact byte ranges. `SourceVersion` keeps complete bytes with a lazy SHA-256 identity. Saved patch presentation compares LF and CRLF lines by text and reports line-ending conversions separately, while the raw patch and restore keep the original bytes.
 
-Finalization commits the terminal checkpoint and exchange together, and only a successful commit replaces live comparison state. A failure keeps the earlier evidence and records the error. An empty patch shows no workspace-change row, and missing evidence shows **Workspace changes unavailable**.
+Finalization commits the terminal checkpoint and exchange together, and only a successful commit replaces live comparison state. A failure keeps the earlier evidence and records the error. An empty patch shows no Edits row, and missing evidence shows **Edits unavailable**.
 
 An in-progress finalization may change its intended outcome to Failed when capture or cleanup fails. Other outcome changes remain rejected, and a finished exchange cannot re-enter finalization. This lets failure handling retry capture or retain the original capture error instead of repeatedly failing on an outcome conflict.
 

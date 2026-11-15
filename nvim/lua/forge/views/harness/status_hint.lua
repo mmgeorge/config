@@ -18,7 +18,7 @@ local display_text = require("forge.render.display_text")
 ---@param width? integer Available display columns, including status indentation.
 ---@return table
 function M.compose(snapshot, context, commands, width)
-  local content = { lines = {}, highlights = {} }
+  local content = { lines = {}, highlights = {}, spinners = {} }
   local pending_questions = {}
   for _, question in ipairs((context.questions or {}).questions or {}) do
     if question.resolution.kind == "pending" then pending_questions[#pending_questions + 1] = question end
@@ -57,6 +57,7 @@ function M.compose(snapshot, context, commands, width)
     local metadata = block.metadata or {}
     local status = metadata.status
     local rendered_rows = {}
+    local column_shift = {}
     local thought_rows, thought = {}, {}
     if type(status) == "table" then
       for _, decoration in ipairs(metadata.decoration or {}) do
@@ -111,12 +112,20 @@ function M.compose(snapshot, context, commands, width)
           local child_row = rendered_rows[index]
           if child_row and block.text[index]:sub(1, 3) == "   " then
             content.lines[child_row + 1] = content.lines[child_row + 1]:gsub("^     ", "  │  ", 1)
+            column_shift[child_row] = #"│" - 1
           end
         end
       end
       append_questions()
     end
     for _, decoration in ipairs(metadata.decoration or {}) do
+      if decoration.capture == "ForgeTimelineStatusSpinner" then
+        local rendered_row = rendered_rows[decoration.range.start.row + 1]
+        if rendered_row then
+          local column = decoration.range.start.column + 2 + (column_shift[rendered_row] or 0)
+          content.spinners[#content.spinners + 1] = { row = rendered_row, column = column }
+        end
+      end
       for row = decoration.range.start.row, decoration.range["end"].row - 1 do
         local rendered_row = rendered_rows[row + 1]
         if rendered_row then

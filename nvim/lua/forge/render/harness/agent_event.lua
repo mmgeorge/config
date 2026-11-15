@@ -47,7 +47,7 @@ local function append_interaction_detail(result, interaction, width, indent)
       elseif turn and node.item.kind == "tool" then
         local tool = turn.tool and turn.tool.item and turn.tool.item[node.item.id]
         if tool then
-          result.lines[#result.lines + 1] = item_prefix .. "▸ Ran 1 tool"
+          result.lines[#result.lines + 1] = item_prefix .. "▸ 1 Tool"
         end
       end
     elseif node.kind == "exchange_input" and node.prompt then

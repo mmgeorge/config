@@ -396,6 +396,7 @@ fn append_checks(
     let nested = !matches!(status, SessionPhase::Idle);
     let root = if nested { "   " } else { "" };
     let mut lines = Vec::new();
+    let mut running_rows = Vec::new();
     if nested {
         lines.push(format!("└─ {}", check_heading(checks, now_ms)));
     }
@@ -419,6 +420,9 @@ fn append_checks(
         let elapsed = command
             .elapsed_ms(now_ms)
             .map_or_else(String::new, |elapsed| format!(" · {}s", elapsed / 1000));
+        if command.state == CheckState::Running {
+            running_rows.push(lines.len());
+        }
         lines.push(format!(
             "{root}{branch} {marker} {} · {outcome}{elapsed}",
             command.title
@@ -501,6 +505,32 @@ fn append_checks(
         0,
     )?;
     let start = block.text.row_count();
+    let mut rendered_row = start;
+    for (source_row, line) in lines.iter().enumerate() {
+        let wrapped = width.wrap_plain(line, 0)?;
+        if running_rows.contains(&source_row) {
+            for (offset, row) in wrapped.iter().enumerate() {
+                if let Some(column) = row.find('⠋') {
+                    block.metadata.decoration.push(Decoration {
+                        range: TextRange {
+                            start: TextPosition {
+                                row: rendered_row + offset,
+                                column,
+                            },
+                            end: TextPosition {
+                                row: rendered_row + offset,
+                                column: column + "⠋".len(),
+                            },
+                        },
+                        capture: "ForgeTimelineStatusSpinner".into(),
+                        priority: 110,
+                    });
+                    break;
+                }
+            }
+        }
+        rendered_row += wrapped.len();
+    }
     let mut rows = block.text.wire_rows();
     rows.extend(rendered.text.wire_rows());
     block.text = BufferText::from_rows(rows)?;
@@ -784,6 +814,19 @@ mod tests {
         let rows = block.text.wire_rows();
         assert!(rows.contains(&"│  └─ Running session tests"));
         assert!(rows.contains(&"   └─ Compiling forge"));
+        let markers = block
+            .metadata
+            .decoration
+            .iter()
+            .filter(|decoration| decoration.capture == "ForgeTimelineStatusSpinner")
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 2);
+        for marker in markers {
+            assert_eq!(
+                &rows[marker.range.start.row][marker.range.start.column..marker.range.end.column],
+                "⠋"
+            );
+        }
         Ok(())
     }
 }

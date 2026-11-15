@@ -100,9 +100,7 @@ pub struct ProjectedEntry {
 impl ProjectedEntry {
     pub(super) fn require_workspace_preview(&self) -> Result<()> {
         if let Some(error) = &self.workspace_error {
-            anyhow::bail!(
-                "Workspace changes preview failed, retaining the previous document: {error}"
-            );
+            anyhow::bail!("Edits preview failed, retaining the previous document: {error}");
         }
         Ok(())
     }
@@ -292,7 +290,6 @@ fn part_turn_id<'source>(
 /// Render a group's tool count and occupied execution time without counting overlaps twice.
 fn tool_group_label<'tool>(
     calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
-    lifecycle: NodeLifecycle,
     now: crate::turn::ToolInstant,
 ) -> String {
     let calls: Vec<_> = calls.into_iter().collect();
@@ -302,15 +299,7 @@ fn tool_group_label<'tool>(
         .iter()
         .filter(|tool| tool.state() == crate::turn::ToolState::Denied)
         .count();
-    let mut label = format!(
-        "▸ {} {count} {}",
-        if lifecycle == NodeLifecycle::Live {
-            "Running"
-        } else {
-            "Ran"
-        },
-        if count == 1 { "tool" } else { "tools" }
-    );
+    let mut label = format!("▸ {count} {}", if count == 1 { "Tool" } else { "Tools" });
     let mut outcomes = Vec::new();
     if failed > 0 {
         outcomes.push(format!("{failed} failed"));
@@ -635,12 +624,6 @@ pub(super) fn timing_blocks(
             let Some(previous) = document.block(&BlockId(id.into())) else {
                 continue;
             };
-            let lifecycle = previous
-                .metadata
-                .node
-                .as_ref()
-                .context("tool group lifecycle is missing")?
-                .lifecycle;
             let mut profile = width.clone();
             profile.columns = profile
                 .columns
@@ -656,7 +639,6 @@ pub(super) fn timing_blocks(
                 previous.id.clone(),
                 &tool_group_label(
                     calls.iter().map(|(_, tool)| *tool),
-                    lifecycle,
                     exchange.tool_instant(now_ms),
                 ),
                 2,
@@ -1673,7 +1655,7 @@ impl TimelineRenderer<'_> {
             })
             .collect();
         let heading = format!(
-            "Checks finished · {} · {:.1}s",
+            "Checks · {} · {:.1}s",
             checks::check_summary(&combined),
             runs.iter().map(|run| run.duration_ms()).sum::<u64>() as f64 / 1000.0
         );
@@ -2049,7 +2031,6 @@ impl TimelineRenderer<'_> {
         let group_id = format!("{}:tools", first.id);
         let label = tool_group_label(
             group.call.iter().map(|call| call.tool),
-            lifecycle,
             exchange.tool_instant(self.now_ms),
         );
         self.literal(&group_id, &label, None)?;
@@ -2070,13 +2051,8 @@ impl TimelineRenderer<'_> {
             node.resolve(expansion);
         }
         let expansion = self.expansion.get(&group_id).copied();
-        let node = self.fold(start, &group_id, settled, NodeKind::ToolGroup);
+        let node = self.fold(start, &group_id, true, NodeKind::ToolGroup);
         node.lifecycle = lifecycle;
-        node.default_display = if settled {
-            NodeDisplay::Heading
-        } else {
-            NodeDisplay::Full
-        };
         node.resolve(expansion);
         Ok(())
     }
@@ -2106,7 +2082,7 @@ impl TimelineRenderer<'_> {
                 ExchangeNode::SkillRead { id, read, .. } => {
                     self.literal(
                         id,
-                        &format!("◇ Read skill · {}", read.name),
+                        &format!("◇ Skill · {}", read.name),
                         Some(TranscriptAction::File {
                             path: read.path.clone(),
                             line: 1,
@@ -2770,11 +2746,7 @@ impl TimelineRenderer<'_> {
             ExchangeChangeResult::Unavailable {
                 previous: None,
                 reason,
-            } => self.literal(
-                identity,
-                &format!("◇ Workspace changes unavailable: {reason}"),
-                None,
-            ),
+            } => self.literal(identity, &format!("◇ Edits unavailable: {reason}"), None),
         }
     }
 
@@ -2871,7 +2843,7 @@ impl TimelineRenderer<'_> {
         let mut tree = super::changes::ChangeTree::render(
             &TranscriptRenderer::new(&self.content_width())?,
             identity,
-            "Workspace changes",
+            "Edits",
             suffix,
             comparison.text(),
             None,
@@ -2885,7 +2857,7 @@ impl TimelineRenderer<'_> {
             self.workspace_error.get_or_insert(error.into());
             return self.literal(
                 identity,
-                &format!("◇ Workspace changes: preview unavailable ({error}){suffix}"),
+                &format!("◇ Edits: preview unavailable ({error}){suffix}"),
                 Some(TranscriptAction::Diff {
                     text: comparison.text().into(),
                     syntax: false,
@@ -2933,7 +2905,7 @@ impl TimelineRenderer<'_> {
             })
             .count();
         let mut label = format!(
-            "▸ Reported edits · {} {}",
+            "▸ Edits · {} {}",
             calls.len(),
             if calls.len() == 1 {
                 "operation"
@@ -3738,6 +3710,15 @@ mod tests {
                         .any(|row| row.contains("-one") || row.contains("-five"))
                 }));
                 let latest = tools.last().unwrap().id.0.clone();
+                let group = collapsed.tool.values().next().unwrap().group.clone();
+                let group_node = collapsed
+                    .entry
+                    .block
+                    .iter()
+                    .filter_map(|block| block.metadata.node.as_ref())
+                    .find(|node| node.kind == NodeKind::ToolGroup)
+                    .unwrap();
+                assert_eq!(group_node.display, NodeDisplay::Heading);
                 let visible = crate::buffer::sections::preview(collapsed.entry)?;
                 let headings = visible
                     .block
@@ -3752,14 +3733,10 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(
                     headings.len(),
-                    2,
-                    "the live group must show every tool heading"
+                    0,
+                    "the live group must keep its tool headings folded"
                 );
-                assert!(
-                    headings
-                        .iter()
-                        .all(|node| node.display == NodeDisplay::Heading)
-                );
+                expansion.insert(group.clone(), true);
                 expansion.insert(latest.clone(), true);
                 let expanded = super::project(
                     super::ProjectionSource::Exchange(&exchange),
@@ -3803,6 +3780,7 @@ mod tests {
                     );
                 }
                 expansion.insert(latest, false);
+                expansion.remove(&group);
             }
             let update = crate::turn::test_support::item_event(
                 &address,
@@ -3858,12 +3836,8 @@ mod tests {
                 })
                 .collect();
             assert_eq!(
-                super::tool_group_label(
-                    &calls,
-                    super::NodeLifecycle::Settled,
-                    ToolInstant::wall(10_000),
-                ),
-                format!("▸ Ran {} tools · {expected}", calls.len()),
+                super::tool_group_label(&calls, ToolInstant::wall(10_000),),
+                format!("▸ {} Tools · {expected}", calls.len()),
             );
         }
     }
@@ -3886,8 +3860,8 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            super::tool_group_label(&calls, super::NodeLifecycle::Settled, ToolInstant::wall(0)),
-            "▸ Ran 3 tools (1 failed, 1 denied)",
+            super::tool_group_label(&calls, ToolInstant::wall(0)),
+            "▸ 3 Tools (1 failed, 1 denied)",
         );
         assert!(calls[1].failed);
         assert_eq!(calls[2].state(), ToolState::Denied);
@@ -3922,13 +3896,12 @@ mod tests {
         assert_eq!(
             super::tool_group_label(
                 &calls,
-                super::NodeLifecycle::Live,
                 ToolInstant {
                     wall_ms: 20_000,
                     active_ms: Some(2_000),
                 },
             ),
-            "▸ Running 2 tools · 2s",
+            "▸ 2 Tools · 2s",
         );
     }
 
@@ -3961,14 +3934,11 @@ mod tests {
             active_ms: Some(5_000),
         };
         assert_eq!(
-            super::tool_group_label(&calls, super::NodeLifecycle::Settled, now),
-            "▸ Ran 2 tools (1 failed) · 3s",
+            super::tool_group_label(&calls, now),
+            "▸ 2 Tools (1 failed) · 3s",
         );
         calls[1].started_at_ms = None;
-        assert_eq!(
-            super::tool_group_label(&calls, super::NodeLifecycle::Settled, now),
-            "▸ Ran 2 tools (1 failed)",
-        );
+        assert_eq!(super::tool_group_label(&calls, now), "▸ 2 Tools (1 failed)",);
     }
 
     #[test]

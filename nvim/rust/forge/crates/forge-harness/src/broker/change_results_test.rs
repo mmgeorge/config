@@ -75,6 +75,6 @@ async fn captured_workspace_result_survives_formatting_external_edits_and_reopen
         .flat_map(|block| block.text.wire_rows())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Workspace changes 3 files"));
+    assert!(rendered.contains("Edits 3 files"));
     assert!(!rendered.contains("later unrelated workspace"));
 }

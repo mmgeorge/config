@@ -263,19 +263,14 @@ impl TimelineRenderer<'_> {
                     .unwrap_or_else(|| "Check configuration saved".into())
             } else {
                 format!(
-                    "Checks {} · {} · {:.1}s",
-                    if run.state == crate::checks::CheckState::Interrupted {
-                        "interrupted"
-                    } else {
-                        "finished"
-                    },
+                    "Checks · {} · {:.1}s",
                     check_summary(run),
                     run.duration_ms() as f64 / 1000.0
                 )
             }
         } else {
             format!(
-                "Checks finished · {} · {:.1}s",
+                "Checks · {} · {:.1}s",
                 check_summary(run),
                 run.duration_ms() as f64 / 1000.0
             )
@@ -1129,6 +1124,17 @@ mod tests {
             )
         };
         let mut projected = render(&run, &mut registry)?;
+        let heading = projected
+            .entry
+            .block
+            .iter()
+            .find(|block| block.id.0 == "run:checks")
+            .unwrap();
+        assert!(heading.text.wire_rows()[0].contains("Checks · "));
+        assert_eq!(
+            heading.metadata.node.as_ref().unwrap().display,
+            NodeDisplay::Heading
+        );
         let text = projected
             .entry
             .block

@@ -14,7 +14,68 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+-- requires-forge-host
+T["live_tool_groups_stay_folded_until_opened"] = function()
+  local workspace = temp.directory("folded-tools")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local function request(method, params)
+    local result, failure, done
+    client.request({ session_id = state.session.id, method = method, params = params }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "message", content = "commentary", text = "Inspecting the configured checks" },
+    { kind = "tool_call", name = "check_definition_list", arguments = {} },
+    { kind = "barrier", id = "tools-visible" },
+    { kind = "tool_call", name = "check_definition_list", arguments = {} },
+    { kind = "barrier", id = "tools-updated" },
+    { kind = "message", content = "response", text = "Inspection complete" },
+  }, terminal = "completed" } })
+  request("session.prompt.submit", { text = "Inspect checks" })
+  request("session.provider.mock_response", { operation = "wait", id = "tools-visible" })
+  local function tool_group()
+    local transcript = state.presentation.transcript
+    for index = 0, transcript.sequence:count() - 1 do
+      local node = transcript.sequence:at(index).entry.metadata.node
+      if node and node ~= vim.NIL and node.kind == "tool_group" then return node end
+    end
+  end
+  wait_until(function() return tool_group() ~= nil end, "tool group did not arrive")
+  eq(tool_group().lifecycle, "live")
+  eq(tool_group().display, "heading")
+  state.presentation.set_section(tool_group().id, true, false)
+  wait_until(function() return tool_group().display == "full" end, "explicit expansion did not open live tools")
+  state.presentation.set_section(tool_group().id, false, false)
+  wait_until(function() return tool_group().display == "heading" end, "explicit collapse did not close live tools")
+  request("session.provider.mock_response", { operation = "release", id = "tools-visible" })
+  request("session.provider.mock_response", { operation = "wait", id = "tools-updated" })
+  wait_until(function() return buffer.text(state.transcript_buf):find("2 Tools", 1, true) ~= nil end,
+    "updated tool count did not arrive")
+  eq(tool_group().display, "heading")
+  request("session.provider.mock_response", { operation = "release", id = "tools-updated" })
+  wait_until(function() return not require("forge.views.harness.activity").busy(state) end, "inspection did not settle")
+  eq(host.stop(), true)
+end
+
 T["status_tree_preserves_controls_and_question_branch"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local current_time, tick = 0, nil
+  stub(vim.uv, "now", function() return current_time end)
+  stub(vim.uv, "new_timer", function()
+    return { start = function(_, _, _, callback) tick = callback end, stop = function() end, close = function() end }
+  end)
   local snapshot = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/status-layout.json"), "\n"))
   local commands = require("forge.shared.view_command_set").new()
   require("forge.shared.view_command_set").register(commands, "cancel", function() end)
@@ -40,6 +101,17 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   eq(table.concat(status.content.lines, "\n"):find("unknown field", 1, true) ~= nil, true)
   eq(vim.api.nvim_get_current_win(), composer_window)
   eq(vim.api.nvim_buf_line_count(composer_buffer) > 0, true)
+  local marks = vim.api.nvim_buf_get_extmarks(status.buffer, status.animation_namespace, 0, -1, { details = true })
+  eq(#marks, 2)
+  local check_mark = marks[2]
+  eq(check_mark[2], 5)
+  local marker_column = status.content.lines[6]:find("⠋", 1, true) - 1
+  eq(check_mark[3], marker_column)
+  current_time = 67
+  tick()
+  wait_until(function()
+    return vim.api.nvim_buf_get_extmark_by_id(status.buffer, status.animation_namespace, check_mark[1], { details = true })[3].virt_text[1][1] == "⠙"
+  end, "check tree spinner did not advance")
 end
 
 -- requires-forge-host

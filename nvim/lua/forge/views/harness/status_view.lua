@@ -140,14 +140,25 @@ function StatusView:update_animation()
   vim.api.nvim_buf_clear_namespace(self.buffer, self.animation_namespace, 0, -1)
   local content = self.content
   local visible = not self.suspended and self.window and vim.api.nvim_win_is_valid(self.window)
-  if content and content.animated and visible then
+  if content and content.waiting and visible then
+    vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.waiting, 0,
+      { id = 1, virt_text = { { "◷", "ForgeStatusHint" } }, virt_text_win_col = 0 })
+  end
+  if content and (content.animated or #(content.spinners or {}) > 0) and visible then
     local timer = vim.uv.new_timer()
     local refreshed_at = vim.uv.now()
     -- A tick scheduled before this timer stopped must not overwrite the next state's icon.
     local function draw()
       if self.timer ~= timer or self.closed or self.suspended or not self.options.alive() then return end
-      vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.animated, 0,
-        { id = 1, virt_text = { { spinner.frame_at(vim.uv.now()), "ForgeTimelineStatusSpinner" } }, virt_text_win_col = 0 })
+      local frame = spinner.frame_at(vim.uv.now())
+      if content.animated then
+        vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.animated, 0,
+          { id = 1, virt_text = { { frame, "ForgeTimelineStatusSpinner" } }, virt_text_win_col = 0 })
+      end
+      for index, marker in ipairs(content.spinners or {}) do
+        vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, marker.row, marker.column,
+          { id = index + 1, virt_text = { { frame, "ForgeTimelineStatusSpinner" } }, virt_text_pos = "overlay" })
+      end
       -- Rust renders elapsed labels and refreshes them only when a sync arrives. A silent
       -- tool produces no host events, so request one sync per second while Rust reports
       -- active work; Rust's own ticking gate decides whether any text changes.
@@ -160,9 +171,6 @@ function StatusView:update_animation()
     draw()
     local interval = math.ceil(spinner.frame_interval_ms)
     timer:start(interval, interval, vim.schedule_wrap(draw))
-  elseif content and content.waiting and visible then
-    vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, content.waiting, 0,
-      { id = 1, virt_text = { { "◷", "ForgeStatusHint" } }, virt_text_win_col = 0 })
   end
 end
 

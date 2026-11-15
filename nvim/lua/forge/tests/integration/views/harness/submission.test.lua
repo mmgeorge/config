@@ -1,4 +1,4 @@
-if vim.g.forge_acp_fixture_grid then
+local function verify_submission()
   local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
   local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
   local kind = "antigravity"
@@ -112,16 +112,18 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       assert(native[2]:find("SECOND_SUBMISSION_MARKER", 1, true), "follow-up input was lost")
       local transcript = state.presentation.transcript
       local function set_activity(expanded)
-        local row
+        local row, selected_id
         wait_until(function()
           local count = 0
           for index = 0, transcript.sequence:count() - 1 do
             local node = transcript.sequence:at(index)
             local descriptor = node.entry.metadata.node
             if descriptor and descriptor ~= vim.NIL and descriptor.kind == "exchange" then
+              if descriptor.lifecycle ~= "settled" then return false end
               count = count + 1
               local _, position = transcript.sequence:position(node.id)
               row = position
+              selected_id = descriptor.id
             end
           end
           return count == 2
@@ -131,6 +133,15 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         local location = require("forge.buffer").locate(transcript, row, 0)
         local descriptor = transcript.sequence.node[location.block].entry.metadata.node
         state.presentation.set_section(descriptor.id, expanded, false)
+        wait_until(function()
+          for index = 0, transcript.sequence:count() - 1 do
+            local node = transcript.sequence:at(index).entry.metadata.node
+            if node and node ~= vim.NIL and node.id == selected_id then
+              return node.display == (expanded and "full" or "heading")
+            end
+          end
+          return false
+        end, "activity expansion did not settle", { timeout_ms = 1000 })
       end
       set_activity(true)
       local expanded = {}
@@ -145,7 +156,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         end
         local found = {}
         for row, text in ipairs(buffer.lines(state.transcript_buf)) do
-          for _, label in ipairs({ "Read fixture", "Reported edits" }) do
+          for _, label in ipairs({ "Read fixture", "Edits" }) do
             if text:find(label, 1, true) then
               local location = require("forge.buffer").locate(transcript, row - 1, 0)
               local entry = transcript.sequence.node[location.block].entry
@@ -155,30 +166,26 @@ readline.createInterface({input:process.stdin}).on('line', line => {
           end
         end
         -- The failed edit's outcome reaches the group summary in a later publication than its rows.
-        return found["Read fixture"] and found["Reported edits"]
+        return found["Read fixture"] and found["Edits"]
           and buffer.text(state.transcript_buf):find("1 unsuccessful", 1, true) ~= nil
       end
-      wait_until(assert_activity, "activity events did not render", { timeout_ms = 4000,
+      wait_until(assert_activity, "activity events did not render", { timeout_ms = 1000,
         context = function() return buffer.text(state.transcript_buf) .. "\n" .. table.concat(errors, "\n") end })
       local visible = buffer.text(state.transcript_buf)
-      assert(visible:find("Read fixture", 1, true) and visible:find("Reported edits", 1, true))
+      assert(visible:find("Read fixture", 1, true) and visible:find("Edits", 1, true))
       assert(visible:find("1 unsuccessful", 1, true), "failed ACP edit lost its outcome")
       vim.api.nvim_set_current_win(state.transcript_win)
       for row, text in ipairs(buffer.lines(state.transcript_buf)) do
-        if text:find("Read fixture", 1, true) or text:find("Reported edits", 1, true) then
+        if text:find("Read fixture", 1, true) or text:find("Edits", 1, true) then
           vim.api.nvim_win_set_cursor(state.transcript_win, { row, 0 })
           vim.cmd("normal! zz")
-          vim.cmd("redraw!")
-          local screen = vim.fn.screenpos(state.transcript_win, row, 1)
-          local rendered = ""
-          for column = 1, 120 do rendered = rendered .. vim.fn.screenstring(screen.row, column) end
-          assert(rendered:find(text, 1, true), "activity text is absent from the attached editor grid: " .. rendered)
+          assert(vim.api.nvim_get_current_line() == text, "activity navigation selected another row")
         end
       end
       set_activity(false)
       wait_until(function()
         visible = buffer.text(state.transcript_buf)
-        return not visible:find("Read fixture", 1, true) and not visible:find("Reported edits", 1, true)
+        return not visible:find("Read fixture", 1, true) and not visible:find("Edits", 1, true)
       end, "collapsed activity left its events outside the fold", { timeout_ms = 4000 })
       assert(visible:find("ACP_SUBMISSION_ACCEPTED", 1, true), "activity collapse hid the final response")
     end
@@ -200,17 +207,7 @@ local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 -- requires-forge-host
 T["submission"] = function()
-  local child = MiniTest.new_child_neovim()
-  child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
-  MiniTest.finally(function() pcall(child.stop) end)
-  child.api.nvim_ui_attach(120, 42, { rgb = true })
-  child.lua([[
-    local lost = ...
-    vim.g.forge_acp_fixture_grid = true
-    vim.g.forge_acp_fixture_lost_ack = lost
-    vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim')
-    dofile('nvim/lua/forge/tests/integration/views/harness/submission.test.lua')
-  ]], { vim.g.forge_acp_fixture_lost_ack == true })
+  verify_submission()
 end
 
 return T

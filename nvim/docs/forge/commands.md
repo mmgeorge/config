@@ -351,9 +351,8 @@ answer. In that case, Forge also displays the last commentary as a final respons
 with the same text in both places. The original commentary keeps its tools.
 An explicitly empty final answer does not produce a replacement response.
 
-`Running` tool groups show only the latest call and its four-row output preview.
-When a group changes to `Ran`, it folds automatically. Expanding that completed group
-shows every call in the group, with individual output available on expansion.
+`N Tools` groups stay folded while calls run. Expand a group to see its calls,
+then expand an individual call to read its output. Completion folds the group again.
 The group duration counts overlapping calls once and excludes gaps between calls.
 Individual rows show each call's duration, so their sum can exceed the group duration.
 
@@ -361,15 +360,16 @@ Thoughts with activity start collapsed and preserve the assistant's text in thei
 Expanding a thought shows its events first, then its tool summary, then its file changes,
 one indentation level deeper. Thoughts without activity keep the `○` marker. Your explicit
 expansion choice survives incoming activity. Tools and file writes accumulate into two entries,
-even when they alternate. **Reported edits** counts operations and preserves their order,
+even when they alternate. **Edits** counts operations and preserves their order,
 individual patches, pending status, and failure diagnostics. Repeated writes to one file
 remain separate operations. A new assistant thought or question branch starts a new section.
 Steering stays inside the current commentary and divides its activity into ordered groups.
 Subsequent tools and edits remain under that commentary until the assistant starts another
 one. Question answers and clarifications still start separate branches.
 
-Each exchange also displays **Workspace changes** and a separate **Checks** summary outside
-its Thought fold. Workspace changes compares the saved starting and final checkpoints,
+Each exchange also displays **Edits** and a separate **Checks** summary outside
+its Thought fold. The Checks summary stays folded until expanded. The Edits summary
+compares the saved starting and final checkpoints,
 including captured formatter, command, child-agent, and external edits. Its file counts,
 line counts, hunks, and raw-diff action all use that saved comparison. Opening a file
 navigates to the live file, whose contents may have changed since capture.
@@ -384,8 +384,8 @@ every entry does not complete a plan, goal, or check, and an interrupted turn le
 unfinished entries unchecked. Exchanges without a reported checklist show no section.
 
 A file created and deleted within the captured interval is absent from the workspace result
-but remains in Reported edits. An empty saved comparison produces no workspace-change row.
-Missing checkpoint evidence displays **Workspace changes unavailable**, including non-Git
+but remains in Edits. An empty saved comparison produces no workspace-change row.
+Missing checkpoint evidence displays **Edits unavailable**, including non-Git
 workspaces. An active exchange without a saved comparison displays a pending indication.
 During recapture, a nonempty previous comparison remains visible as **previous capture**.
 Failed recapture retains that comparison with the
@@ -473,9 +473,9 @@ Delivered messages remain in conversation history.
 Each entry previews only its first line on one display row, with an ellipsis when
 that line exceeds the available width. Editing opens the complete message in the
 prompt while live status remains above the composer.
-Live tool output uses only the rows it needs, up to four preview rows, without
-blank padding. Tools with no output reserve no preview space.
-The latest active commentary stays unfolded to expose that preview, including
+Live tool groups show a folded count heading until you expand them. Individual
+tool output stays behind each tool's own expansion control.
+The latest active commentary stays unfolded to expose that count, including
 the initial "Considering initial steps" group. Earlier commentary folds when its
 activity settles, and exchange completion collapses the activity. You can reopen
 completed commentary explicitly.

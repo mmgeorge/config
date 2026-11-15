@@ -1815,11 +1815,7 @@ impl CheckSupervisor {
         run.record(
             CheckEventKind::Finished,
             None,
-            format!(
-                "Checks finished · {} · {}ms",
-                run.summary(),
-                run.duration_ms()
-            ),
+            format!("Checks · {} · {}ms", run.summary(), run.duration_ms()),
         );
         Ok(())
     }

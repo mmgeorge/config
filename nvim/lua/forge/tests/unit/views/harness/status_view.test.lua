@@ -8,6 +8,77 @@ local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["check_tree_spinners_share_clock_and_retire_completed_marks"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local current_time, tick = 0, nil
+  stub(vim.uv, "now", function() return current_time end)
+  stub(vim.uv, "new_timer", function()
+    return {
+      start = function(_, _, _, callback) tick = callback end,
+      stop = function() end,
+      close = function() end,
+    }
+  end)
+  local layout = require("forge.views.harness.layout")
+  local transcript_buffer, transcript_window, _, composer_window = layout.open("check-spinners")
+  local status = require("forge.views.harness.status_view").new({
+    transcript = { document = "check-spinners", buffer = transcript_buffer },
+    transcript_window = transcript_window, composer_window = composer_window,
+    alive = function() return true end, notice = error, recover = function() end,
+  })
+  MiniTest.finally(function() pcall(status.close, status) end)
+  local prefix = "   ├─ "
+  local function snapshot(completed)
+    return { block = { { text = {
+      "Working · 1s", "└─ Checking · 0/2 finished", prefix .. (completed and "✓ first" or "⠋ first"),
+      "   └─ ⠋ second", "      └─ literal ⠋ output",
+    }, metadata = {
+      status = { row = 0, animated = true, hint = "working" },
+      decoration = {
+        { range = { start = { row = 3, column = #prefix }, ["end"] = { row = 3, column = #prefix + #"⠋" } },
+          capture = "ForgeTimelineStatusSpinner" },
+      },
+    } } } }
+  end
+  local running = snapshot(false)
+  table.insert(running.block[1].metadata.decoration, {
+    range = { start = { row = 2, column = #prefix }, ["end"] = { row = 2, column = #prefix + #"⠋" } },
+    capture = "ForgeTimelineStatusSpinner",
+  })
+  status.snapshot = running
+  status:render()
+  local function marks()
+    return vim.api.nvim_buf_get_extmarks(status.buffer, status.animation_namespace, 0, -1, { details = true })
+  end
+  local initial = marks()
+  eq(#initial, 3)
+  eq(initial[2][2], 2)
+  eq(initial[2][3], #prefix + 2)
+  eq(initial[2][4].virt_text_pos, "overlay")
+  local text = buffer.lines(status.buffer)
+  current_time = 67
+  tick()
+  vim.wait(1000, function() return marks()[1][4].virt_text[1][1] == "⠙" end)
+  for _, mark in ipairs(marks()) do eq(mark[4].virt_text[1][1], "⠙") end
+  eq(buffer.lines(status.buffer), text)
+  eq(vim.api.nvim_get_current_win(), composer_window)
+  status.snapshot = snapshot(true)
+  status:render()
+  eq(#marks(), 2)
+  eq(marks()[2][2], 3)
+  local waiting = snapshot(true)
+  waiting.block[1].metadata.status = { row = 0, animated = false, hint = "question" }
+  status.snapshot = waiting
+  status:render()
+  eq(marks()[1][4].virt_text[1][1], "◷")
+  current_time = 134
+  tick()
+  wait_until(function() return marks()[2][4].virt_text[1][1] == "⠹" end, "check spinner stopped during a question")
+  eq(marks()[1][4].virt_text[1][1], "◷")
+  status:suspend(true)
+  eq(#marks(), 0)
+end
+
 T["harness_status_view"] = function()
   vim.o.columns, vim.o.lines = 120, 42
   require("forge.infra.highlights").setup()
