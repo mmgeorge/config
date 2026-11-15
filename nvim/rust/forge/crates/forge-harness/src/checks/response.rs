@@ -229,13 +229,7 @@ pub(super) fn summary(run: &CheckRun) -> Value {
                 command.completed_at_ms.or(command.started_at_ms),
             )
         });
-    let latest_output = latest.and_then(|command| {
-        String::from_utf8_lossy(&strip_ansi_escapes::strip(command.preview.as_bytes()))
-            .rsplit(['\r', '\n'])
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(str::to_owned)
-    });
+    let latest_output = latest.and_then(|command| super::output::latest_line(&command.preview));
     let error = selected
         .iter()
         .filter(|command| !matches!(command.state, CheckState::Passed | CheckState::Skipped))
@@ -658,6 +652,28 @@ mod result_tests {
             "progress":crate::plan::execution::SemanticProgress::default(),"workspace_identity":null,"workspace_digest":{},
             "commands":commands
         }))?)
+    }
+
+    /// Keep UI and tool summaries aligned when a diagnostic ends with a decorative border.
+    #[test]
+    fn diagnostic_preview_matches_live_status_and_tool_summary() -> Result<()> {
+        let mut run = run(vec![Value::Null])?;
+        run.state = CheckState::Running;
+        run.completed_at_ms = None;
+        run.commands[0].state = CheckState::Running;
+        run.commands[0].completed_at_ms = None;
+        run.commands[0].preview = "error: protocol mismatch\n  x client and host versions differ\n   ,-[check.nu:921:16]\n921 | fail()\n    : ^^^^^^\n   `----\n".into();
+        let activity = super::super::CheckActivity::from_run(&run).unwrap();
+        assert_eq!(
+            activity.command_list[0].output_line.as_deref(),
+            Some("x client and host versions differ")
+        );
+        assert_eq!(
+            summary(&run)["latest_output"],
+            "x client and host versions differ"
+        );
+        assert!(run.commands[0].preview.ends_with("`----\n"));
+        Ok(())
     }
 
     /// Traverse every collection once while limiting entries and preserving large stored messages.

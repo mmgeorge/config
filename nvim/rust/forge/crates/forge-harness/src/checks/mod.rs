@@ -10,6 +10,7 @@ mod failure;
 mod inputs;
 mod invocation;
 mod model;
+mod output;
 pub(crate) mod owner;
 mod planned;
 mod preview;

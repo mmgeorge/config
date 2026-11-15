@@ -85,13 +85,7 @@ impl CheckActivity {
                 ),
                 started_at_ms: command.started_at_ms,
                 progress: command.adapter_progress.clone(),
-                output_line: String::from_utf8_lossy(&strip_ansi_escapes::strip(
-                    command.preview.as_bytes(),
-                ))
-                .rsplit(['\n', '\r'])
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map(str::to_owned),
+                output_line: super::output::latest_line(&command.preview),
             })
             .collect();
         Some(Self {
@@ -120,7 +114,7 @@ pub struct CheckCommandActivity {
     pub title: String,
     /// Command execution interval used by the status timer.
     pub started_at_ms: Option<i64>,
-    /// Latest nonempty output line with terminal escape sequences removed.
+    /// Latest message with terminal escapes, diagnostic borders, and source excerpts removed.
     pub output_line: Option<String>,
     /// Structured progress from the active adapter contract.
     pub progress: Option<super::adapter::AdapterProgress>,

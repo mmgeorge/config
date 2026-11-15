@@ -1,3 +1,4 @@
+mod build;
 mod filter;
 mod runner;
 mod static_index;

@@ -53,8 +53,11 @@ applies immediately, including during active work. Disabling completion checks
 leaves explicit check runs and plan Checking available.
 
 While a check run is active, the status area shows executing checks and their latest
-nonempty output line. The line updates as output arrives, and complete logs remain
+message line, skipping diagnostic borders and source excerpts. The line updates as output arrives, and complete logs remain
 available in the saved result.
+Rust tests show `Building · Built <package>` as Cargo completes new artifacts, then
+switch to test counts when execution begins. The package names the latest completed
+compilation, not a currently running compiler; cached artifacts do not replace it.
 For planned-case context, the check label includes the selected test name.
 Explicit inputs appear in the frozen invocation and expanded details.
 Single-file checks show the selected path alongside the configured check name in

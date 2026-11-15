@@ -97,6 +97,9 @@ pub struct TestFailure {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TestProgress {
     pub phase: Option<TestPhase>,
+    /// Latest detail for the current phase, cleared when the phase changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     pub total: Option<usize>,
     pub finished: usize,
     pub failed: usize,
@@ -174,6 +177,7 @@ pub struct TestEventSink {
     record_count: usize,
     widened: Option<String>,
     phase: Option<TestPhase>,
+    phase_message: Option<String>,
     error: Option<String>,
     protocol_error: Option<String>,
     retained_bytes: usize,
@@ -201,6 +205,7 @@ impl TestEventSink {
             record_count: 0,
             widened: None,
             phase: None,
+            phase_message: None,
             error: None,
             protocol_error: None,
             retained_bytes: 0,
@@ -266,6 +271,7 @@ impl TestEventSink {
     pub fn progress(&self) -> TestProgress {
         TestProgress {
             phase: self.phase,
+            message: self.phase_message.clone(),
             total: self.planned.then_some(self.cases.len()),
             finished: self
                 .cases
@@ -352,8 +358,9 @@ impl TestEventSink {
         self.record_count += 1;
         match event {
             TestEvent::Unknown => Ok(()),
-            TestEvent::Phase { name, message: _ } => {
+            TestEvent::Phase { name, message } => {
                 self.phase = Some(name);
+                self.phase_message = message;
                 Ok(())
             }
             TestEvent::Plan {
@@ -573,6 +580,17 @@ mod tests {
     /// Create an all-tests sink without producing output files.
     fn sink() -> TestEventSink {
         TestEventSink::new(TestSelection::default(), Path::new("unused-test-output")).unwrap()
+    }
+
+    /// Keep older progress readable and omit absent details from the saved representation.
+    #[test]
+    fn progress_without_phase_message_remains_compatible() {
+        let original = serde_json::json!({
+            "phase": "build", "total": null, "finished": 0, "failed": 0, "running": []
+        });
+        let progress: TestProgress = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(progress.message, None);
+        assert_eq!(serde_json::to_value(progress).unwrap(), original);
     }
 
     /// Deliver fixture JSON through the real decoder and lifecycle validator.

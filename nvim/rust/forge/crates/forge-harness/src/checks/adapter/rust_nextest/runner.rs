@@ -5,7 +5,7 @@ use super::super::{
     process::ProcessOutput,
 };
 use super::{
-    filter, static_index,
+    build, filter, static_index,
     targets::BuildArguments,
     translate,
     version::{MESSAGE_FORMAT, MESSAGE_FORMAT_VERSION, NextestVersion},
@@ -114,6 +114,8 @@ impl RustNextestAdapter {
             self.options.nextest_profile.clone(),
             "-E".into(),
             filter.into(),
+            "--cargo-message-format".into(),
+            "json,json-render-diagnostics".into(),
         ];
         if self.options.locked {
             args.push("--locked".into());
@@ -156,10 +158,15 @@ impl RustNextestAdapter {
         context: &AdapterContext<'_>,
         version: &NextestVersion,
         expression: &str,
+        workspace: &WorkspaceModel,
+        mut events: Option<&mut TestEventSink>,
     ) -> Result<nextest_metadata::TestListSummary, AdapterError> {
         let mut args = self.arguments("list", expression);
         args.extend(["--message-format".into(), "json".into()]);
-        let (output, result) = capture(context, &args).await?;
+        let (output, result) = capture_filtered(context, &args, |line| {
+            build::consume(line, workspace, events.as_deref_mut())
+        })
+        .await?;
         if !result.exit.success {
             return Err(command_failure(version.operation("list"), &result));
         }
@@ -175,12 +182,23 @@ impl RustNextestAdapter {
         version: &NextestVersion,
         workspace: &WorkspaceModel,
         filters: &filter::DiscoveryFilters,
+        mut events: Option<&mut TestEventSink>,
     ) -> Result<ExactPlan, AdapterError> {
         // Resolve every requested case without exceeding a native command's filter bound.
         let mut selected = BTreeMap::<String, BTreeSet<String>>::new();
         let mut suites = BTreeMap::new();
         for expression in &filters.expressions {
-            for (binary, suite) in self.list(context, version, expression).await?.rust_suites {
+            for (binary, suite) in self
+                .list(
+                    context,
+                    version,
+                    expression,
+                    workspace,
+                    events.as_deref_mut(),
+                )
+                .await?
+                .rust_suites
+            {
                 let mut matches = BTreeSet::new();
                 for (name, case) in &suite.test_cases {
                     if case.filter_match.is_match() {
@@ -203,7 +221,17 @@ impl RustNextestAdapter {
         // Case and module filters need full inventories; parent selections already contain them.
         if !filters.complete_inventories {
             for expression in filter::inventories(selected.keys())? {
-                for (binary, suite) in self.list(context, version, &expression).await?.rust_suites {
+                for (binary, suite) in self
+                    .list(
+                        context,
+                        version,
+                        &expression,
+                        workspace,
+                        events.as_deref_mut(),
+                    )
+                    .await?
+                    .rust_suites
+                {
                     if suite
                         .test_cases
                         .values()
@@ -348,7 +376,7 @@ impl TestAdapter for RustNextestAdapter {
                     affected: Vec::new(),
                 };
                 let filter = filter::compile(&selection, &workspace, context.workspace)?;
-                self.exact(context, &version, &workspace, &filter)
+                self.exact(context, &version, &workspace, &filter, None)
                     .await?
                     .items
             }
@@ -371,8 +399,9 @@ impl TestAdapter for RustNextestAdapter {
         let workspace = self.workspace(context).await?;
         let version = installed_version(context).await?;
         let filter = filter::compile(selection, &workspace, context.workspace)?;
-        let ExactPlan { items, groups } =
-            self.exact(context, &version, &workspace, &filter).await?;
+        let ExactPlan { items, groups } = self
+            .exact(context, &version, &workspace, &filter, Some(events))
+            .await?;
         events.accept(TestEvent::Plan {
             cases: items
                 .iter()
@@ -381,10 +410,6 @@ impl TestAdapter for RustNextestAdapter {
                 .collect(),
             items,
             widened: filter.widened,
-        })?;
-        events.accept(TestEvent::Phase {
-            name: TestPhase::Run,
-            message: None,
         })?;
         let mut result = RunExit {
             code: Some(0),
@@ -424,7 +449,18 @@ impl TestAdapter for RustNextestAdapter {
                 .await
                 .map_err(cargo_launch_error)?;
             let translated = async {
+                let mut running = false;
                 while let Some(line) = process.next_line().await? {
+                    if build::consume(&line, &workspace, Some(events))? {
+                        continue;
+                    }
+                    if !running {
+                        events.accept(TestEvent::Phase {
+                            name: TestPhase::Run,
+                            message: None,
+                        })?;
+                        running = true;
+                    }
                     for event in plan.translate(&line, &workspace.root, context.workspace)? {
                         events.accept(event)?;
                     }
@@ -475,6 +511,15 @@ async fn capture(
     context: &AdapterContext<'_>,
     args: &[String],
 ) -> Result<(String, ProcessOutput), AdapterError> {
+    capture_filtered(context, args, |_| Ok(false)).await
+}
+
+/// Stream build records separately from the bounded native metadata document.
+async fn capture_filtered(
+    context: &AdapterContext<'_>,
+    args: &[String],
+    mut consume: impl FnMut(&str) -> Result<bool, AdapterError>,
+) -> Result<(String, ProcessOutput), AdapterError> {
     let mut process = context
         .processes
         .spawn(ProcessSpec {
@@ -490,6 +535,9 @@ async fn capture(
     let mut output = String::new();
     let read = async {
         while let Some(line) = process.next_line().await? {
+            if consume(&line)? {
+                continue;
+            }
             if output.len().saturating_add(line.len()).saturating_add(1) > OUTPUT_LIMIT {
                 return Err(AdapterError::Protocol(
                     "nextest metadata exceeds 32 MiB".into(),

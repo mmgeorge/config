@@ -394,7 +394,10 @@ fn append_checks(
         );
         lines.push(format!("  {} · {elapsed}", command.title));
         if let Some(crate::checks::adapter::AdapterProgress::Tests(tests)) = &command.progress {
-            let detail = if let Some(total) = tests.total {
+            let detail = if let Some(total) = tests
+                .total
+                .filter(|_| tests.phase != Some(crate::checks::adapter::events::TestPhase::Build))
+            {
                 format!(
                     "{}/{} tests · {} failed",
                     tests.finished, total, tests.failed
@@ -409,7 +412,15 @@ fn append_checks(
                     None => "Preparing tests".into(),
                 }
             };
-            lines.push(format!("    {detail}"));
+            let message = tests
+                .message
+                .as_deref()
+                .map(|message| message.split_whitespace().collect::<Vec<_>>().join(" "));
+            if let Some(message) = message.filter(|message| !message.is_empty()) {
+                lines.push(format!("    {detail} · {message}"));
+            } else {
+                lines.push(format!("    {detail}"));
+            }
         }
         if let Some(crate::checks::adapter::AdapterProgress::Diagnostics(diagnostics)) =
             &command.progress
@@ -536,4 +547,89 @@ fn working_status_text(
         return format!("{phase} · {elapsed_seconds}s · {attention}");
     }
     format!("{phase} · {elapsed_seconds}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checks::{
+        CheckCommandActivity,
+        adapter::{
+            AdapterProgress, TestSelection,
+            events::{TestEvent, TestEventSink, TestPhase},
+        },
+    };
+    use std::path::Path;
+
+    /// Keep build progress inline and replace it with counts when execution begins.
+    #[test]
+    fn build_message_renders_inline_until_test_execution() {
+        let mut events =
+            TestEventSink::new(TestSelection::default(), Path::new("unused-output")).unwrap();
+        let mut checks = CheckActivity {
+            run_id: "run".into(),
+            duration_ms: 0,
+            started_at_ms: Some(0),
+            completed_count: 0,
+            total_count: 1,
+            command_list: vec![CheckCommandActivity {
+                title: "Run Rust tests".into(),
+                started_at_ms: Some(0),
+                output_line: None,
+                progress: None,
+            }],
+        };
+        for (event, expected) in [
+            (
+                TestEvent::Phase {
+                    name: TestPhase::Build,
+                    message: None,
+                },
+                "    Building",
+            ),
+            (
+                TestEvent::Phase {
+                    name: TestPhase::Build,
+                    message: Some("Built forge-diff".into()),
+                },
+                "    Building · Built forge-diff",
+            ),
+            (
+                TestEvent::Plan {
+                    cases: Vec::new(),
+                    widened: None,
+                    items: Vec::new(),
+                },
+                "    Building · Built forge-diff",
+            ),
+            (
+                TestEvent::Phase {
+                    name: TestPhase::Run,
+                    message: None,
+                },
+                "    0/0 tests · 0 failed",
+            ),
+        ] {
+            events.accept(event).unwrap();
+            checks.command_list[0].progress = Some(AdapterProgress::Tests(events.progress()));
+            let rendered = StatusView {
+                id: "status",
+                status: &SessionPhase::Idle,
+                agent_count: 0,
+                status_thoughts: false,
+                checks: Some(&checks),
+            }
+            .render(&WidthProfile::default(), 27_000)
+            .unwrap();
+            assert_eq!(
+                rendered.block.unwrap().text.wire_rows(),
+                [
+                    "Checking",
+                    "Checks running · 0/1 finished · 27s",
+                    "  Run Rust tests · 27s",
+                    expected,
+                ]
+            );
+        }
+    }
 }

@@ -16,7 +16,7 @@
             ]
           }
         },
-        "label": "Check patch whitespace",
+        "label": "Check Git patch whitespace",
         "category": "lint"
       }
     },
