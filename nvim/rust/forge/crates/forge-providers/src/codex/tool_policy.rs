@@ -13,6 +13,8 @@ pub(super) fn apply(parameters: &mut Value) {
     config["features.goals"] = json!(false);
     config["features.multi_agent"] = json!(false);
     config["features.multi_agent_v2.disable_native_tools"] = json!(true);
+    // Codex otherwise requires a hosted multi-agent skill that Harness does not supply.
+    config["features.multi_agent_v2.multi_agent_mode_hint_text"] = json!("");
     // Catalog-advertised messaging bypasses this flag in Codex; it is not a complete opt-out.
     config["features.send_message_to_user_async"] = json!(false);
 }
