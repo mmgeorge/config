@@ -948,6 +948,15 @@ impl ProviderBridge {
             .clone()
             .unwrap_or_else(|| crate::tools::ControlTurnContext::inactive(request.mode));
         context.question_invocation = Some(scope.clone());
+        if let Some(checks) = &context.checks {
+            context.checks = Some(
+                checks
+                    .bind_invocation(scope.clone(), sink.clone())
+                    .map_err(|error| {
+                        super::lifecycle_error::classify(ProviderOperation::TurnStart, error)
+                    })?,
+            );
+        }
         context.bind_task_authority_progress();
         let directories = self
             .permissions

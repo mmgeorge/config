@@ -157,10 +157,10 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         local found = {}
         for row, text in ipairs(buffer.lines(state.transcript_buf)) do
           for _, label in ipairs({ "Read fixture", "Edits" }) do
-            if text:find(label, 1, true) then
+            if text:find(label, 1, true) and not text:find("Edits unavailable", 1, true) then
               local location = require("forge.buffer").locate(transcript, row - 1, 0)
               local entry = transcript.sequence.node[location.block].entry
-              assert(entry.metadata.layout.indent == 6, label .. " escaped activity indentation")
+              assert(entry.metadata.layout.indent == 6, label .. " escaped activity indentation: " .. vim.inspect(entry.metadata))
               found[label] = true
             end
           end
@@ -185,7 +185,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       set_activity(false)
       wait_until(function()
         visible = buffer.text(state.transcript_buf)
-        return not visible:find("Read fixture", 1, true) and not visible:find("Edits", 1, true)
+        return not visible:find("Read fixture", 1, true) and not visible:find("▸ Edits", 1, true)
       end, "collapsed activity left its events outside the fold", { timeout_ms = 4000 })
       assert(visible:find("ACP_SUBMISSION_ACCEPTED", 1, true), "activity collapse hid the final response")
     end

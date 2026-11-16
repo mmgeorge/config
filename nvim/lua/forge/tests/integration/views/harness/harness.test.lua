@@ -68,6 +68,55 @@ T["check_results_use_internal_delivery_instead_of_user_queue"] = function()
 end
 
 -- requires-forge-host
+T["check_completion_with_gitlink"] = function()
+  local repository = git_repository.create({ files = {
+    [".forge.json"] = { vim.json.encode({ checks = { fixture = {
+      trigger = { auto = false },
+      action = { category = "custom", command = { "nu", "--no-config-file", "-c", "null" } },
+    } } }) },
+  } })
+  vim.fn.mkdir(repository.path .. "/submodule", "p")
+  repository.run({ "update-index", "--add", "--cacheinfo",
+    "160000,1725b6e1be1f349e0250000824d92d3dc2193e64,submodule" })
+  repository.run({ "commit", "--quiet", "-m", "Record submodule pointer" })
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(repository.path)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+  local function request(method, params)
+    local result, failure, done
+    client.request({ session_id = state.session.id, method = method, params = params }, function(value, error)
+      result, failure, done = value, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return result
+  end
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "tool_call", name = "check_run", arguments = { check = "fixture", all = true } },
+    { kind = "barrier", id = "check-requested" },
+    { kind = "message", content = "response", text = "Check requested" },
+  }, terminal = "completed" } })
+  request("session.prompt.submit", { text = "Run the check in this repository" })
+  request("session.provider.mock_response", { operation = "wait", id = "check-requested" })
+  local hold = request("session.provider.mock_response", { operation = "hold" })
+  request("session.provider.mock_response", { operation = "release", id = "check-requested" })
+  local delivered = request("session.provider.mock_response", { operation = "wait", id = hold.id })
+  eq(delivered.prompt:find('state="passed"', 1, true) ~= nil, true)
+  local history = request("session.check.list", {}).history
+  eq(#history, 1)
+  eq(history[1].state, "passed")
+  request("session.provider.mock_response", { operation = "release", id = hold.id })
+  wait_until(function() return not require("forge.views.harness.activity").busy(state) end,
+    "check result continuation did not settle")
+  eq(host.stop(), true)
+end
+
+-- requires-forge-host
 T["live_tool_groups_stay_folded_until_opened"] = function()
   local workspace = temp.directory("folded-tools")
   vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
@@ -582,34 +631,18 @@ client.generation_config(function(value, failure) generation, generation_failure
 wait_until(function() return generation ~= nil or generation_failure ~= nil end, "generation configuration did not settle", { timeout_ms = 4000 })
 assert(generation, generation_failure)
 local preview = call("repository.generation", { operation = "preview", workspace = workspace, comparison = "head" })
-assert(preview.prompt.user:find("Current Background task: commit_message", 1, true))
-assert(preview.prompt.user:find("Conventional Commit", 1, true))
-assert(not preview.prompt.system:find("Conventional Commit", 1, true))
+assert(preview.prompt.system:find("Conventional Commit", 1, true))
+assert(not preview.prompt.user:find("Conventional Commit", 1, true))
 assert(preview.prompt.input_bytes == #preview.prompt.user + #preview.prompt.system)
 local params = { operation = "generate", workspace = workspace, comparison = "head", generation = generation }
 local first = call("repository.generation", params)
-assert(first.session_id and first.message and first.message ~= "")
+assert((first.session_id == nil or first.session_id == vim.NIL) and first.message and first.message ~= "")
 local second = call("repository.generation", params)
-assert(first.session_id == second.session_id, "HEAD-stable generation lost persistence")
+assert((second.session_id == nil or second.session_id == vim.NIL) and second.message and second.message ~= "")
 assert(state.session == nil, "Background generation initialized interactive Harness")
-local query = { workspace = workspace, data_root = generation.data_root }
-local snapshot = call("background.session.document", query)
-assert(snapshot.session.id == first.session_id)
-query.auto_compaction = { enabled = false, threshold_tokens = 64000 }
-query.expected_revision = snapshot.settings.revision
-snapshot = call("background.session.document", query)
-assert(snapshot.settings.desired.auto_compaction.threshold_tokens == 64000)
-query.auto_compaction, query.expected_revision = nil, nil
-require("forge").open_background_timeline()
-wait_until(function()
-  return vim.api.nvim_buf_get_name(0):match("ForgeBackground")
-    and buffer.text(0):find("Mock response",1,true)
-end, "Background timeline did not render", { timeout_ms = 4000 })
-assert(vim.bo.modifiable == false, "Background timeline is editable")
-assert(state.session == nil, "Debug timeline selected interactive Harness")
 repository.run({ "switch", "-q", "-c", "feature" })
 local branch = call("repository.generation", params)
-assert(branch.session_id ~= first.session_id, "branch switch reused obsolete context")
+assert((branch.session_id == nil or branch.session_id == vim.NIL) and branch.message and branch.message ~= "")
 errors:assert_none()
 assert(host.stop(), "Host did not stop")
 end
@@ -789,7 +822,7 @@ local function compose(text)
   buffer.set(state.composer_buf, { text })
 end
 vim.fn.writefile({ vim.json.encode({ checks = {
-["slow"] = { trigger = { auto = false }, action = { command = "print 'Shortcut check is running'; sleep 30sec", label = "Shortcut check", category = "test" } }
+["slow"] = { trigger = { auto = false }, action = { command = "print 'Shortcut check is running'; sleep 30sec", label = "Shortcut check", category = "custom" } }
 } }) }, workspace .. "/.forge.json")
 vim.api.nvim_set_current_dir(workspace)
 require("forge").setup({ diff_logging = false, harness_logging = false,

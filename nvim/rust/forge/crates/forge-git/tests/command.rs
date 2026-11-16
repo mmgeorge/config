@@ -2,7 +2,7 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
 
-use forge_git::command::{CommandLimits, read_command};
+use forge_git::command::{CommandLimits, read_command, read_command_pair};
 
 fn fixture(name: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -15,6 +15,49 @@ fn limits() -> CommandLimits {
         stderr_bytes: 4096,
         timeout: Duration::from_secs(5),
     }
+}
+
+/// Report launch failure without panicking when a synchronous read reaches an async worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_worker_reports_native_command_launch_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = Command::new(directory.path().join("missing-command"));
+    let failure = read_command(&mut command, limits(), || Ok(())).unwrap_err();
+    assert!(
+        failure.downcast_ref::<std::io::Error>().is_some(),
+        "{failure:#}"
+    );
+}
+
+/// Preserve paired-read errors when the caller runs on a multithreaded executor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_worker_reports_paired_command_launch_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let failure = read_command_pair(
+        Command::new(directory.path().join("missing-first")),
+        Command::new(directory.path().join("missing-second")),
+        limits(),
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(
+        failure.downcast_ref::<std::io::Error>().is_some(),
+        "{failure:#}"
+    );
+}
+
+/// Reject a single-thread runtime before replacing or dispatching the caller's command.
+#[tokio::test]
+async fn single_thread_runtime_rejects_native_command_without_panicking() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("missing-command");
+    let mut command = Command::new(&executable);
+    let failure = read_command(&mut command, limits(), || Ok(())).unwrap_err();
+    assert!(
+        failure.to_string().contains("blocking worker"),
+        "{failure:#}"
+    );
+    assert_eq!(command.get_program(), executable.as_os_str());
 }
 
 #[test]

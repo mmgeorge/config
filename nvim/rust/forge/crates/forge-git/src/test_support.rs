@@ -330,8 +330,13 @@ pub fn write_index_tree(root: &Path) -> ObjectId {
             if components.peek().is_some() {
                 node = node.directories.entry(component.to_vec()).or_default();
             } else {
-                node.files
-                    .insert(component.to_vec(), (tree::EntryKind::Blob.into(), entry.id));
+                node.files.insert(
+                    component.to_vec(),
+                    (
+                        tree::EntryMode::try_from(entry.mode.bits()).unwrap(),
+                        entry.id,
+                    ),
+                );
             }
         }
     }

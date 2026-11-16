@@ -160,10 +160,8 @@ drop(guard);
 
 ## Verification
 
-- Validate in the order `cargo check`, `cargo nextest run`, `cargo fmt --check`, `cargo clippy`, `cargo build`. Run `cargo check` on the affected package and target first, and fix compiler errors before running tests. After a compilation failure, repeat `cargo check` before retrying a test.
 - Run tests with `cargo nextest run`, never `cargo test`. nextest does not run doctests, so run `cargo test --doc` when the change touches documentation examples. When `cargo nextest` is not installed, report that rather than installing it or falling back to `cargo test`.
 - Never run broad automatic-fix commands such as `cargo clippy --fix` or `cargo fix`.
-- Finish source-changing preparation, such as code generation, before validation starts. Repeat the affected checks after any later source change. If a formatting fix changes source, restart from `cargo check`.
 - Pass `cargo check`, `cargo clippy`, `cargo nextest run`, and `cargo build` the same arguments as the project's development build. A mismatched argument invalidates the build cache and recompiles the dependency graph.
 - Do not add `--all-targets`, `--tests`, `--all-features`, `--release`, or a separate `--target-dir` by default. Select a named integration-test executable (`--test <name>`) only when the requested coverage requires it.
 - Select the smallest test coverage that exercises the change. Run individual tests with `cargo nextest run -p <package> <filter>`, batching related tests in one invocation. Use a filterset (`-E 'test(...)'`) when a name substring cannot select the tests precisely.

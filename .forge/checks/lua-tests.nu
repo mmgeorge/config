@@ -10,9 +10,6 @@
 const repository_root = path self | path dirname | path dirname | path dirname
 const runner_path = path self
 const per_case_timeout = 5sec
-# The shard bootstrap reports its own per-case timeout; the outer kill of a single-case process
-# waits this much longer so the process can name the case that hung before the runner kills it.
-const minitest_report_grace = 1sec
 # The limit for a whole unit test file run as one shard, whatever its case count.
 const minitest_shard_timeout = 1min
 const startup_argument_list = [
@@ -288,13 +285,18 @@ def publish_record [value: record, target_path: path] {
   mv --force $pending_path $target_path
 }
 
+# Evaluate the shared deadline from caller-supplied time, including a stalled unit case.
+def fixture_expired [started: datetime, phase_started: datetime, now: datetime] {
+  $now - $phase_started >= $per_case_timeout or $now - $started >= $minitest_shard_timeout
+}
+
 # Every live process below `root_pid`, deepest first, from a single process-table snapshot.
 def descendant_pid [root_pid: int] {
   let process_table = ps | select pid ppid
   mut frontier = [$root_pid]
   mut descendant_list = []
   while not ($frontier | is-empty) {
-    let child_list = $process_table | where {|row| $row.ppid in $frontier and $row.pid != $root_pid } | get pid
+    let child_list = $process_table | where {|row| $row.ppid in $frontier and $row.pid != $root_pid and $row.pid not-in $descendant_list } | get pid
     $descendant_list = $descendant_list | append $child_list
     $frontier = $child_list
   }
@@ -311,7 +313,7 @@ def live_pid_list [candidate_list: list<int>] {
 # after the attempt decides success rather than the status.
 def kill_process [process_id: int] {
   if $nu.os-info.family == "windows" {
-    ^taskkill /PID ($process_id | into string) /F | complete | ignore
+    ^pwsh -NoProfile -NonInteractive -File ($repository_root | path join '.forge/checks/stop-test-process.ps1') $process_id | complete | ignore
   } else {
     ^kill -KILL ($process_id | into string) | complete | ignore
   }
@@ -342,14 +344,15 @@ def terminate_owned_tree [pid: int] {
 # output redirected to files, and publishes the exit status, so a timeout can kill the tree and
 # still report the output written so far.
 #
-# The shard bootstrap enforces the per-case deadline itself. A whole-file shard is killed at
-# `minitest_shard_timeout`; a single-case process at the per-case deadline plus the report grace.
+# The outer worker watches case-start records independently of Neovim's event loop. Startup,
+# each case (including teardown), and collection all receive the same five-second deadline.
 def run_fixture [test: string, setup_list: list<string>, minitest_directory: string, events_path: string = "", collect_path: string = ""] {
   let scratch_directory = mktemp -d
   let spec_path = $scratch_directory | path join "spec.json"
   let result_path = $scratch_directory | path join "result.json"
   let pid_path = $scratch_directory | path join "worker.json"
   let output_path = $scratch_directory | path join "output.txt"
+  let progress_path = $scratch_directory | path join "progress.json"
   let setup_argument_list = $setup_list | each {|statement| ["--cmd" $"lua ($statement)"] } | flatten
   let fixture = split_fixture_entry $test
   let case_argument_list = if $fixture.case == null { [] } else { [$fixture.case] }
@@ -357,16 +360,23 @@ def run_fixture [test: string, setup_list: list<string>, minitest_directory: str
     "--cmd" $"set rtp^=($minitest_directory | str replace --all '\' '/')" "-l" $minitest_shard_path $fixture.path
   ]
   let command = ["nvim"] | append $startup_argument_list | append $setup_argument_list | append $script_argument_list | append $case_argument_list
-  let deadline = if $fixture.case == null { $minitest_shard_timeout } else { $per_case_timeout + $minitest_report_grace }
-  {command: $command, output_path: $output_path, events_path: $events_path, collect_path: $collect_path} | to json --raw | save --force $spec_path
+  {command: $command, output_path: $output_path, events_path: $events_path, collect_path: $collect_path, progress_path: $progress_path} | to json --raw | save --force $spec_path
   let started = date now
-  let worker_job = job spawn {
+  job spawn {
     try {
       run-external $nu.current-exe "--no-config-file" $runner_path "worker" $spec_path $result_path $pid_path | complete | ignore
     } catch { null }
-  }
+  } | ignore
   mut worker_result: any = null
-  while $worker_result == null and (date now) - $started < $deadline {
+  mut progress: any = null
+  mut phase_started = $started
+  while $worker_result == null {
+    let latest = try { open $progress_path } catch { null }
+    if $latest != null and $latest != $progress {
+      $progress = $latest
+      if $fixture.case == null { $phase_started = date now }
+    }
+    if (fixture_expired $started $phase_started (date now)) { break }
     if ($result_path | path exists) {
       $worker_result = try { open $result_path } catch {|failure|
         {exit_code: 127, failure: $"Worker result is unreadable: ($failure.msg)"}
@@ -388,7 +398,7 @@ def run_fixture [test: string, setup_list: list<string>, minitest_directory: str
     let fixture_error = $fixture_output =~ 'E[0-9]{3,}: (Lua chunk|Error executing lua|Vim)'
     let exit_status = if $worker_result.exit_code == 0 and $fixture_error { 1 } else { $worker_result.exit_code }
     let failure = $worker_result.failure? | default ""
-    {state: (if $exit_status == 0 { "passed" } else { "failed" }), exit_status: $exit_status, output: ($fixture_output + $failure)}
+    {state: (if $exit_status == 0 { "passed" } else if $exit_status == 124 { "timed_out" } else { "failed" }), exit_status: $exit_status, output: ($fixture_output + $failure)}
   } else {
     let worker_pid = try { open $pid_path | get pid | into int } catch { null }
     let termination = if $worker_pid == null {
@@ -397,10 +407,11 @@ def run_fixture [test: string, setup_list: list<string>, minitest_directory: str
       terminate_owned_tree $worker_pid
     }
     let fixture_output = try { open --raw $output_path | ansi strip } catch { "" }
-    let note = $"Timed out after ($deadline); killed the process tree with ($termination.method), status ($termination.exit_status). ($termination.stderr)"
+    let note = $"Timed out after ($per_case_timeout) in ($progress.case? | default $test); killed the process tree with ($termination.method), status ($termination.exit_status). ($termination.stderr)"
     {state: "timed_out", exit_status: 124, output: ($fixture_output + "\n" + $note)}
   }
-  try { job kill $worker_job } catch { null }
+  # Jobs remove themselves after the external exits. `job kill` holds Nushell's shared jobs
+  # mutex while invoking the platform killer, which can freeze every other worker's deadline.
   try { rm -rf $scratch_directory } catch { null }
   $outcome | merge {test: $test, command: $command, elapsed: $elapsed}
 }
@@ -498,6 +509,7 @@ def "main worker" [spec_path: path, result_path: path, pid_path: path] {
     mut variables = {}
     if ($spec.events_path? | default "") != "" { $variables = $variables | insert FORGE_TEST_EVENTS $spec.events_path }
     if ($spec.collect_path? | default "") != "" { $variables = $variables | insert FORGE_TEST_COLLECT $spec.collect_path }
+    $variables = $variables | insert FORGE_TEST_PROGRESS $spec.progress_path
     with-env $variables { run-external $program ...$argument_list o+e> $spec.output_path }
     {exit_code: 0}
   } catch {|failure|
@@ -647,6 +659,15 @@ def adapter_drain [worker: record, target: path] {
   $updated
 }
 
+# A crashed process cannot send its own terminal event. Settle every outstanding case once.
+def adapter_finish [worker: record, outcome: record, target: path] {
+  for id in $worker.running {
+    adapter_emit $target {event: "finished", id: $id,
+      status: (if $outcome.state == "timed_out" { "timed_out" } else { "failed" }),
+      failures: [{message: $"Test process ($outcome.state), exit ($outcome.exit_status)"}]}
+  }
+}
+
 # Run ordinary shard workers while the main thread alone publishes adapter events.
 def adapter_run [request: record, jobs: int, partition: string = "all"] {
   let ids = $request.select.ids? | default []
@@ -688,11 +709,11 @@ def adapter_run [request: record, jobs: int, partition: string = "all"] {
       let events = $scratch | path join $"($ordinal).events"
       let result = $scratch | path join $"($ordinal).json"
       $ordinal += 1
-      let job = job spawn {
+      job spawn {
         let outcome = run_fixture $fixture [] $minitest $events
         publish_record $outcome $result
-      }
-      $workers = $workers | append {fixture: $fixture, events: $events, result: $result, job: $job, seen: 0, running: []}
+      } | ignore
+      $workers = $workers | append {fixture: $fixture, events: $events, result: $result, seen: 0, running: []}
     }
     mut active = []
     for worker in $workers {
@@ -703,12 +724,9 @@ def adapter_run [request: record, jobs: int, partition: string = "all"] {
         if $outcome.output != "" { adapter_emit $request.events {event: "output", text: $outcome.output} }
         if $outcome.state != "passed" {
           $failed = true
-          if $outcome.state == "timed_out" {
-            for id in $current.running { adapter_emit $request.events {event: "finished", id: $id, status: "timed_out"} }
-          }
+          adapter_finish $current $outcome $request.events
           adapter_emit $request.events {event: "error", message: $"($current.fixture): ($outcome.state), exit ($outcome.exit_status)"}
         }
-        try { job kill $current.job } catch { null }
       } else { $active = $active | append $current }
     }
     $workers = $active

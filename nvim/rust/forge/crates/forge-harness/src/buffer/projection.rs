@@ -4070,6 +4070,12 @@ mod tests {
                 "The repository contains only .git. Three choices are pending.",
             );
             exchange.observe_event(&event, 2).unwrap();
+            let event = crate::turn::test_support::message_completed(
+                &address,
+                "response",
+                "The repository contains only .git. Three choices are pending.",
+            );
+            exchange.observe_event(&event, 2).unwrap();
             let event = crate::turn::test_support::completed_event(
                 &(address.clone()),
                 crate::turn::TurnOutcome::Completed {
@@ -4278,6 +4284,12 @@ mod tests {
                 &address,
                 "response",
                 Some(forge_provider_api::AgentMessageRole::Response),
+                "The design is ready for review.",
+            );
+            exchange.observe_event(&event, 10).unwrap();
+            let event = crate::turn::test_support::message_completed(
+                &address,
+                "response",
                 "The design is ready for review.",
             );
             exchange.observe_event(&event, 10).unwrap();

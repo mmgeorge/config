@@ -6,6 +6,22 @@ use std/assert
 def run_adapter_tests [] {
   cd $repository_root
   let scratch = mktemp -d
+  let started = '2026-01-01T00:00:00Z' | into datetime
+  assert equal (fixture_expired $started $started ($started + 4999ms)) false
+  assert equal (fixture_expired $started $started ($started + 5sec)) true
+  assert equal (fixture_expired $started ($started + 50sec) ($started + 54sec)) false
+  assert equal (fixture_expired $started ($started + 50sec) ($started + 55sec)) true
+  assert equal (fixture_expired $started ($started + 59sec) ($started + 1min)) true
+
+  let crashed_events = $scratch | path join 'crashed.jsonl'
+  adapter_finish {running: ['crashed-case']} {state: 'failed', exit_status: 9} $crashed_events
+  let crashed = open --raw $crashed_events | from json
+  assert equal $crashed.event 'finished'
+  assert equal $crashed.status 'failed'
+  assert equal $crashed.id 'crashed-case'
+  let timed_out_events = $scratch | path join 'timed-out.jsonl'
+  adapter_finish {running: ['blocked-case']} {state: 'timed_out', exit_status: 124} $timed_out_events
+  assert equal (open --raw $timed_out_events | from json | get status) 'timed_out'
   let shard = $scratch | path join "shard.jsonl"
   let combined = $scratch | path join "combined.jsonl"
   '{"event":"started","id":"case"}' | save $shard
@@ -35,6 +51,15 @@ def run_adapter_tests [] {
   let events = open --raw $failure_events | lines | each {|line| $line | from json }
   assert equal ($events | where event == "finished" | first | get status) "failed"
   assert equal ($events | where event == "finished" | first | get failures | first | get path) "nvim/lua/forge/tests/fixtures/check_adapter_failure.test.lua"
+
+  let exit_events = $scratch | path join 'exit.jsonl'
+  let request = {version: 1, op: 'run', select: {ids: ['nvim/lua/forge/tests/fixtures/check_adapter_exit.test.lua'], affected: []}, events: $exit_events}
+  let exited = $request | to json --raw | ^nu --stdin --no-config-file .forge/checks/lua-tests.nu adapter | complete
+  assert equal $exited.exit_code 1
+  let events = open --raw $exit_events | lines | each {|line| $line | from json }
+  assert equal ($events | where event == 'finished' | length) 1
+  assert equal ($events | where event == 'finished' | first | get status) 'failed'
+  assert equal ($events | last | get event) 'complete'
 
   let fixture = "nvim/lua/forge/tests/fixtures/check_adapter_collection.test.lua"
   let discovery_path = $scratch | path join "discovery.json"

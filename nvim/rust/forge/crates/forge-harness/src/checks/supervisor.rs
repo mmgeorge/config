@@ -1235,7 +1235,14 @@ impl CheckSupervisor {
         ))
         .catch_unwind()
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("check worker panicked")));
+        .unwrap_or_else(|payload| {
+            let cause = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-text panic payload");
+            Err(anyhow::anyhow!("check worker panicked: {cause}"))
+        });
         if let Some(planned) = &mut run.planned_tests {
             planned.record_results(&run.commands);
         }

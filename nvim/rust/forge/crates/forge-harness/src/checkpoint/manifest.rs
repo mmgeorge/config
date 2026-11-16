@@ -224,6 +224,9 @@ impl ResolvedFile {
     pub(super) fn read(&self, objects: &ObjectStore, root: &Path) -> Result<Vec<u8>> {
         match &self.source {
             Content::Stored(identity) => objects.get(identity),
+            Content::Git(file) if file.mode == 0o160000 => {
+                Ok(format!("Subproject commit {}\n", file.object_id).into_bytes())
+            }
             Content::Git(file) => forge_git::checkpoint::read_blob(root, file)
                 .context("checkpoint baseline content is unavailable"),
         }

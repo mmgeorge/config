@@ -102,8 +102,96 @@ fn repository() -> tempfile::TempDir {
     temporary
 }
 
+/// Compare submodule commit pointers without requiring their objects in the parent repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_identity_preserves_gitlinks_without_loading_submodule_commits() -> anyhow::Result<()>
+{
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let objects = ObjectStore::open(data.path())?;
+    let repositories = Arc::new(RepositoryStore::default());
+    let checkpoint = GitCheckpoint::new(repository.path());
+    fs::create_dir(repository.path().join("submodule"))?;
+    forge_git::test_support::stage_gitlink(
+        repository.path(),
+        "submodule",
+        "1725b6e1be1f349e0250000824d92d3dc2193e64".parse()?,
+    );
+    forge_git::test_support::commit_index(repository.path(), "record submodule pointer");
+    let initial = checkpoint
+        .capture(&objects, &repositories, "gitlink", 1)
+        .await?;
+    let baseline =
+        forge_git::checkpoint::tree_file(repository.path(), initial.tree.as_deref(), "submodule")?
+            .unwrap();
+    assert_eq!(baseline.mode, 0o160000);
+    let identity = initial.check_identity(&objects, None, &[])?;
+    assert!(initial.equivalent(&initial, &objects)?);
+    let unchanged = checkpoint
+        .capture(&objects, &repositories, "gitlink", 2)
+        .await?;
+    assert_eq!(identity, unchanged.check_identity(&objects, None, &[])?);
+    forge_git::test_support::stage_gitlink(
+        repository.path(),
+        "submodule",
+        "2725b6e1be1f349e0250000824d92d3dc2193e64".parse()?,
+    );
+    forge_git::test_support::commit_index(repository.path(), "change submodule pointer");
+    let changed = checkpoint
+        .capture(&objects, &repositories, "gitlink", 2)
+        .await?;
+    assert_ne!(identity, changed.check_identity(&objects, None, &[])?);
+    assert!(!initial.equivalent(&changed, &objects)?);
+    assert_eq!(initial.changed_paths(&changed)?, vec!["submodule"]);
+    let diff = checkpoint_diff(
+        &objects,
+        &repositories.reads,
+        &DiffEngine::new(Default::default(), 1),
+        &initial,
+        &changed,
+    )
+    .await?;
+    assert!(
+        diff.contains("-Subproject commit 1725b6e1be1f349e0250000824d92d3dc2193e64"),
+        "{diff}"
+    );
+    assert!(
+        diff.contains("+Subproject commit 2725b6e1be1f349e0250000824d92d3dc2193e64"),
+        "{diff}"
+    );
+    let restore =
+        RestorePreview::prepare(&objects, repository.path(), &changed, &initial).unwrap_err();
+    assert!(
+        restore
+            .to_string()
+            .contains("submodule restore is unavailable"),
+        "{restore:#}"
+    );
+    assert!(repository.path().join("submodule").is_dir());
+    Ok(())
+}
+
+/// Missing ordinary blob content must still fail verification instead of becoming a pointer.
+#[test]
+fn check_identity_rejects_missing_file_blobs() -> anyhow::Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let objects = ObjectStore::open(data.path())?;
+    let baseline = forge_git::checkpoint::BaseFile {
+        object_id: "1725b6e1be1f349e0250000824d92d3dc2193e64".into(),
+        mode: 0o100644,
+        checkout: Default::default(),
+    };
+    assert!(
+        objects
+            .baseline_identity(repository.path(), &baseline)
+            .is_err()
+    );
+    Ok(())
+}
+
 /// Committing verified bytes must not invalidate their check identity.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn check_identity_survives_committing_unchanged_worktree() -> anyhow::Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;

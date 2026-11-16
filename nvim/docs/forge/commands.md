@@ -346,6 +346,10 @@ the caret or message body to show or hide the complete text.
 Submitting another prompt preserves Markdown formatting in earlier responses while the new
 exchange starts.
 
+An interrupted response disappears from the transcript when Forge records its interruption.
+Its text remains in session history. Completed responses remain visible, including those
+completed before the provider consumes a steering message.
+
 Copilot can finish processing after commentary without a separately labeled final
 answer. In that case, Forge also displays the last commentary as a final response,
 with the same text in both places. The original commentary keeps its tools.

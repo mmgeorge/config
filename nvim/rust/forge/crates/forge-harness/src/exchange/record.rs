@@ -1648,7 +1648,8 @@ impl Exchange {
     ///
     /// Ordinary steering awaiting consumption belongs to status. Typed question responses
     /// stay visible on acceptance; check inputs use the existing check categories instead.
-    /// Consumption anchors reserve their eventual position.
+    /// Consumption anchors reserve their eventual position. Interrupted responses remain
+    /// in history without appearing as answers in the transcript.
     pub(crate) fn displays_node(&self, node: &ExchangeNode) -> bool {
         match node {
             ExchangeNode::ExchangeInput { prompt }
@@ -1665,7 +1666,22 @@ impl Exchange {
                 matches!(&prompt.intent, InputIntent::User { content } if content.is_question_reply())
                     || !prompt.is_awaiting_consumption()
             }
-            ExchangeNode::TurnContent { .. } => self.consumption_anchor_submission(node).is_none(),
+            ExchangeNode::TurnContent {
+                turn_id,
+                item: crate::turn::TurnItem::Message { id },
+                ..
+            } => {
+                self.consumption_anchor_submission(node).is_none()
+                    && !self
+                        .turn
+                        .iter()
+                        .find(|turn| turn.id() == turn_id)
+                        .and_then(|turn| turn.messages().iter().find(|message| message.id() == id))
+                        .is_some_and(|message| {
+                            message.role() == Some(forge_provider_api::AgentMessageRole::Response)
+                                && message.state() == crate::turn::MessageState::Interrupted
+                        })
+            }
             _ => true,
         }
     }
@@ -2309,6 +2325,9 @@ mod test {
             "Short form",
         );
         assert!(exchange.observe_event(&after, 3).unwrap());
+        let completed =
+            crate::turn::test_support::message_completed(&address, "after", "Short form");
+        assert!(exchange.observe_event(&completed, 3).unwrap());
         let completed = crate::turn::test_support::completed_event(
             &address,
             crate::turn::TurnOutcome::Completed {

@@ -517,7 +517,13 @@ impl GitWriteService {
             };
             let outcome = match started {
                 Ok(guard) => {
-                    match tokio::task::spawn_blocking(move || execute(intent, guard)).await {
+                    match tokio::task::spawn_blocking(move || {
+                        crate::command::blocking_worker(|| execute(intent, guard))
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result)
+                    {
                         Ok(outcome) => outcome,
                         Err(error) => WriteOutcome {
                             operation,
@@ -525,7 +531,7 @@ impl GitWriteService {
                                 path: None,
                                 completion: TargetCompletion::OutcomeUnknown,
                                 exit_code: None,
-                                diagnostic: Some(format!("Git owner panicked: {error}")),
+                                diagnostic: Some(format!("Git worker failed: {error}")),
                             }],
                             affected: Vec::new(),
                             settled: None,

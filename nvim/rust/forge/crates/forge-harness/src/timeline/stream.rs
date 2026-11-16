@@ -132,6 +132,11 @@ impl TimelineStream {
         else {
             return Ok(None);
         };
+        if message.role() == Some(forge_provider_api::AgentMessageRole::Response)
+            && message.state() == crate::turn::MessageState::Interrupted
+        {
+            return Ok(None);
+        }
         let address = source.provider();
         let entry_id = self.entry_list[index].id();
         let main_exchange = matches!(&self.entry_list[index],TimelineEntry::Exchange { exchange:owner,.. } if owner.id == exchange.id);

@@ -49,6 +49,7 @@ pub(crate) struct ConfigureChecks {
 }
 
 /// Restricts provider check tools to one authenticated root interaction and captured task.
+#[derive(Clone)]
 pub(crate) struct CheckToolScope {
     runner: Arc<CheckSupervisor>,
     data_root: PathBuf,
@@ -63,13 +64,13 @@ pub(crate) struct CheckToolScope {
     operations: CheckToolOperations,
     agent: Arc<crate::agent::AgentCoordinator>,
     cancelled: tokio::sync::watch::Receiver<bool>,
-    delivery: Mutex<Option<CheckDelivery>>,
+    authorization: HarnessEventSink,
+    delivery: Arc<Mutex<Option<CheckDelivery>>>,
     task_authority: Option<crate::tools::TaskAuthority>,
 }
 
 #[derive(Clone)]
 struct CheckDelivery {
-    authorization: HarnessEventSink,
     lifecycle: Option<crate::broker::publication::SessionUpdateSink>,
 }
 
@@ -170,6 +171,26 @@ impl Drop for CheckToolLease {
 }
 
 impl CheckToolScope {
+    /// Bind immutable invocation authority while retaining the foreground owner's revocation lease.
+    pub(crate) fn bind_invocation(
+        &self,
+        scope: crate::provider::InvocationScope,
+        authorization: HarnessEventSink,
+    ) -> Result<Arc<Self>> {
+        self.validate_live()?;
+        ensure!(
+            scope.owner() == self.scope.owner()
+                && scope.exchange_id == self.scope.exchange_id
+                && authorization.invocation_scope()? == &scope,
+            "check invocation belongs to another interaction"
+        );
+        Ok(Arc::new(Self {
+            scope,
+            authorization,
+            ..self.clone()
+        }))
+    }
+
     /// Resolve existing planned tests through static owner-managed discovery at one source snapshot.
     pub(crate) async fn planned_warnings(
         &self,
@@ -344,10 +365,8 @@ impl CheckToolScope {
             operations,
             agent,
             cancelled,
-            delivery: Mutex::new(Some(CheckDelivery {
-                authorization: authorization_sink,
-                lifecycle: sink,
-            })),
+            authorization: authorization_sink,
+            delivery: Arc::new(Mutex::new(Some(CheckDelivery { lifecycle: sink }))),
             task_authority,
         });
         (Arc::clone(&scope), CheckToolLease(scope))
@@ -476,7 +495,7 @@ impl CheckToolScope {
                         },
                     )
                     .collect();
-                self.authorize(self.permission, target_list, &delivery.authorization)
+                self.authorize(self.permission, target_list, &self.authorization)
                     .await?;
                 ensure!(
                     self.permission != ApprovalMode::Deny,
@@ -489,7 +508,7 @@ impl CheckToolScope {
                             "Update project checks".into(),
                             review,
                             self.scope.clone(),
-                            &delivery.authorization,
+                            &self.authorization,
                         )
                         .await?;
                     ensure!(

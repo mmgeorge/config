@@ -348,14 +348,16 @@ async fn whole_file_stage_accepts_large_sources_and_changes_after_preparation() 
     let mut command = git_command(&repository).unwrap();
     command.args(["show", ":large.bin"]);
     let staged = tokio::task::spawn_blocking(move || {
-        crate::command::read_command(
-            &mut command,
-            CommandLimits {
-                stderr_bytes: 4096,
-                timeout: Duration::from_secs(30),
-            },
-            || Ok(()),
-        )
+        crate::command::blocking_worker(|| {
+            crate::command::read_command(
+                &mut command,
+                CommandLimits {
+                    stderr_bytes: 4096,
+                    timeout: Duration::from_secs(30),
+                },
+                || Ok(()),
+            )
+        })?
     })
     .await
     .unwrap()

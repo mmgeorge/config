@@ -69,6 +69,11 @@ local reporter = {
     if case_number ~= started_case_number then
       started_case_number = case_number
       local label = case_label(cases[case_number])
+      if vim.env.FORGE_TEST_PROGRESS then
+        local file = assert(io.open(vim.env.FORGE_TEST_PROGRESS, "w"))
+        assert(file:write(vim.json.encode({ case = label, index = case_number })))
+        assert(file:close())
+      end
       deadline:start(case_deadline_ms, 0, function()
         if event_reporter then event_reporter:timeout() end
         io.stdout:write(("\nTimed out after %d ms in case %s\n"):format(case_deadline_ms, label))

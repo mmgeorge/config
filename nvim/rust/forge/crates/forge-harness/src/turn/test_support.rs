@@ -115,6 +115,30 @@ pub(crate) fn message(
     )
 }
 
+/// Complete an admitted assistant message with authoritative final text.
+pub(crate) fn message_completed(
+    turn: &TurnAddress,
+    id: &str,
+    text: &str,
+) -> crate::provider::events::HarnessEvent {
+    crate::provider::test_support::native_event(
+        crate::provider::EventScope::Invocation {
+            invocation: turn.scope.clone(),
+        },
+        ProviderEvent::Item {
+            thread_id: turn.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            item_id: ItemId::new(id).unwrap(),
+            event: ItemEvent::Completed(forge_provider_api::ItemCompletion::AgentMessage(
+                forge_provider_api::MessageCompletion {
+                    text: text.into(),
+                    outcome: forge_provider_api::MessageOutcome::Completed,
+                },
+            )),
+        },
+    )
+}
+
 /// Observe an admitted typed tool item followed by its ordered activity.
 pub(crate) fn tool(
     exchange: &mut Exchange,

@@ -56,6 +56,10 @@ Statistics compare only changed sides with the pinned `gix-imara-diff` histogram
 
 `forge_git::command::read_command` owns one child and drains both pipes concurrently, preserving binary output and exit status. Cancellation, timeout, or reader errors terminate the child, wait for it, and join both readers. `file_command` streams large blob output into a temporary file with a 30-second deadline. Only diagnostic commands keep bounded output tails.
 
+The synchronous command boundary enters `block_in_place` when called from a multithreaded Tokio runtime, handing its worker's queued tasks to another thread before collecting the command. Calls from a current-thread runtime fail before dispatch and require a blocking worker. Calls outside a runtime use the shared command runtime. This keeps synchronous checkpoint verification from nesting `block_on` on an async worker.
+
+The repository read pool and Git writer enter the shared command runtime inside their admitted blocking workers. A blocking worker otherwise inherits its caller's runtime handle, including a current-thread handle; that inherited handle does not mean the worker is an executor thread. Explicit entry keeps these workers independent of the caller's scheduler while preserving rejection of direct synchronous calls on a current-thread executor.
+
 ## Harness operation recovery
 
 Harness keeps repository access and admission locks in the shared per-user reservation directory, including an explicitly configured override. Separate Harness roots therefore contend on the same canonical repository identity. Each operation retains its Harness state lease and writes its journal beneath `state/vN/repository-operations/`; shared discovery records contain only owner lease and process-containment identities.

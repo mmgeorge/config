@@ -188,12 +188,15 @@ impl ObjectStore {
         Ok(self.baseline_identity(root, baseline)? == identity)
     }
 
-    /// Returns the raw working-content digest for an immutable Git source.
+    /// Identify Git content, treating a gitlink as a commit pointer rather than a blob.
     pub(crate) fn baseline_identity(
         &self,
         root: &Path,
         baseline: &forge_git::checkpoint::BaseFile,
     ) -> Result<String> {
+        if baseline.mode == 0o160000 {
+            return Ok(crate::plan::digest(baseline.object_id.as_bytes()));
+        }
         let key = serde_json::to_string(baseline)?;
         if let Some(digest) = self
             .baseline

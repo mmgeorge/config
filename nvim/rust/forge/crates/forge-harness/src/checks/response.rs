@@ -234,6 +234,13 @@ pub(super) fn summary(run: &CheckRun) -> Value {
         .iter()
         .filter(|command| !matches!(command.state, CheckState::Passed | CheckState::Skipped))
         .find_map(|command| command.error.as_deref())
+        .or_else(|| {
+            run.lifecycle
+                .iter()
+                .rev()
+                .find(|event| matches!(event.kind, super::CheckEventKind::ExecutionError))
+                .map(|event| event.text.as_str())
+        })
         .map(str::to_owned);
     json!({
         "run_id":run.id,
@@ -652,6 +659,26 @@ mod result_tests {
             "progress":crate::plan::execution::SemanticProgress::default(),"workspace_identity":null,"workspace_digest":{},
             "commands":commands
         }))?)
+    }
+
+    /// Expose owner finalization errors independently of successful command outcomes.
+    #[test]
+    fn summary_reports_finalization_failure_after_commands_pass() -> Result<()> {
+        let mut run = run(vec![Value::Null])?;
+        run.state = CheckState::ExecutionError;
+        run.commands[0].state = CheckState::Passed;
+        run.commands[0].exit_code = Some(0);
+        run.record(
+            super::super::CheckEventKind::ExecutionError,
+            None,
+            "Check execution stopped: missing checkpoint object".into(),
+        );
+        assert_eq!(
+            summary(&run)["error"],
+            "Check execution stopped: missing checkpoint object"
+        );
+        assert_eq!(summary(&run)["exit_code"], 0);
+        Ok(())
     }
 
     /// Keep UI and tool summaries aligned when a diagnostic ends with a decorative border.

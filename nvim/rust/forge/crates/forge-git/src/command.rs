@@ -38,7 +38,8 @@ pub type CommandProgressSink = Arc<dyn Fn(CommandProgress) -> Result<()> + Send 
 
 /// Collects a command from a blocking repository worker.
 ///
-/// The caller owns admission and must not call this function on a Tokio executor thread.
+/// The caller owns admission. Multithreaded Tokio callers release their worker while
+/// collecting; current-thread runtimes must dispatch through a blocking worker.
 /// Cancellation, timeout, and stream failures terminate the group or job before releasing it.
 pub fn read_command(
     command: &mut Command,
@@ -82,7 +83,7 @@ pub fn read_command_pair(
     );
     check()?;
     let check = std::cell::RefCell::new(check);
-    command_runtime()?.block_on(async {
+    collect_blocking(|| async {
         let mut first_check = || (check.borrow_mut())();
         let mut second_check = || (check.borrow_mut())();
         let mut first_deadline_expired = timeout_elapsed(limits);
@@ -207,18 +208,38 @@ fn collect_command(
         "command timeout must be positive"
     );
     check()?;
-    let command = std::mem::replace(command, Command::new(""));
-    command_runtime()?.block_on(async move {
-        collect_async(command, limits, streams, &mut deadline_expired, &mut check).await
+    collect_blocking(|| {
+        let command = std::mem::replace(command, Command::new(""));
+        async move { collect_async(command, limits, streams, &mut deadline_expired, &mut check).await }
     })
+}
+
+/// Collect native I/O without nesting a runtime on an async worker.
+fn collect_blocking<Output, Work>(work: impl FnOnce() -> Work) -> Result<Output>
+where
+    Work: std::future::Future<Output = Result<Output>>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| runtime.block_on(work()))
+        }
+        Ok(_) => anyhow::bail!(
+            "synchronous native commands require a blocking worker on a current-thread runtime"
+        ),
+        Err(_) => command_runtime()?.block_on(work()),
+    }
+}
+
+/// Enter the command runtime only from an already admitted blocking worker.
+pub(crate) fn blocking_worker<Output>(work: impl FnOnce() -> Output) -> Result<Output> {
+    let runtime = command_runtime()?;
+    let _context = runtime.enter();
+    Ok(work())
 }
 
 fn command_runtime() -> Result<tokio::runtime::Handle> {
     static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
         OnceLock::new();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return Ok(handle);
-    }
     Ok(RUNTIME
         .get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()

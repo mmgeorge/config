@@ -25,6 +25,14 @@ Check resolution affects declared inputs, concrete commands, and the evidence th
 
 See [Extending project checks](extending-project-checks.md) when changing input binding or repository callbacks.
 
+## Rust fixture setup
+
+Broker tests take their workspace from `broker::test_support`. `repository()` returns a plain directory, which the broker opens without Git checkpoints, so most tests launch no Git process. Only tests that exercise checkpoints, rollback, or workspace changes use `git_repository()`. Under nextest, the `fixture-root` setup script ([`.config/fixture_root.nu`](../../rust/forge/.config/fixture_root.nu)) builds that seeded repository once per run and exports its path, so each test copies it instead of running `git init` and `git commit`. Setup scripts are an experimental nextest feature, enabled in `.config/nextest.toml`. Outside nextest, `git_repository()` builds the repository itself.
+
+The same script gives every nextest run its own temporary-directory root, `<OS temp>/forge-tests/<first eight characters of the run ID>/`, and exports it as `TMP`, `TEMP` and `TMPDIR`, so every `tempfile` fixture and `std::env::temp_dir()` path in a test lands there. `tempfile::TempDir` ignores deletion errors, and Windows refuses to delete a file that is still open, so a fixture dropped before its SQLite stores and lock files close leaves a remnant. The per-run root keeps those remnants out of the shared temporary directory, and the next run removes run directories unmodified for a day. The root stays short because checkpoint recovery files nest two 64-character digests and Windows still limits many paths to 260 characters. Declare a fixture's `TempDir` after every store, controller, or provider that holds files inside it, because Rust drops fields in declaration order.
+
+`nvim/rust/forge/clippy.toml` makes `rust-lint` reject three calls: a direct `rusqlite::Connection` open, `SqliteStore::open` or `SqliteStore::read_only`, and `std::thread::sleep`. History goes through `HistoryWriter` and `HistoryReader`, and a thread that must wait uses a channel, a condition variable, or the Tokio clock. A production call that cannot comply carries `#[expect(clippy::disallowed_methods, reason = "..")]` stating why; test modules, examples, and stdio fixtures are exempt because they build storage through handles of their own. A Harness test that needs a second connection to the history database, to install a failing trigger or to seed and observe rows, opens it through `storage::test::raw_connection`.
+
 ## Provider lifecycle
 
 Compile the affected package first, with a 300-second compile deadline. Select the exact regression for the changed boundary; source files and broad module filters are not substitutes for a named regression. These selectors name current test functions and describe their coverage, not recorded passing results.

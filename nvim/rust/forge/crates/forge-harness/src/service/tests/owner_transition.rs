@@ -9,6 +9,298 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+/// A deferred follow-up must admit check discovery under its successor invocation's identity.
+#[tokio::test]
+async fn deferred_followup_can_start_checks() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    crate::checks::configure_fixture(fixture.path());
+    let service = super::bootstrap::service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
+    let (steered, mut steering) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider_gate = gate.clone();
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().unwrap(),
+        )
+        .unwrap(),
+        move |request, _sink, start, _cancelled| {
+            let started = started.clone();
+            let checked = checked.clone();
+            let gate = provider_gate.clone();
+            async move {
+                start.observed(1).await?;
+                if request.input.user_input().is_some_and(|input| {
+                    matches!(input, forge_provider_api::PromptInput::Text(text) if text == "Initial input")
+                }) {
+                    let _ = started.send(request.clone());
+                    crate::provider::test_support::wait_gate(&gate).await?;
+                } else {
+                    // The owner rejects this ID after admission, without launching a process.
+                    let result = crate::provider::test_support::call_tool(
+                        &request, "check_discover", json!({"check":"missing"}),
+                    ).await;
+                    let _ = checked.send((request.scope.clone(), result));
+                }
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            }
+        },
+    );
+    native.with_steering(move |_| {
+        let steered = steered.clone();
+        async move {
+            let _ = steered.send(());
+            Err(crate::provider::ProviderError::NotConsumed)
+        }
+    });
+    let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    *controller.provider.write().unwrap() = provider.provider_handle();
+    controller
+        .broker
+        .lock()
+        .await
+        .set_provider_for_test(provider.provider_handle());
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let scenario = async {
+        submit_input(
+            &service,
+            &controller,
+            &session_id,
+            2,
+            "initial",
+            "Initial input",
+            &sink,
+        )
+        .await?;
+        let initial = starts.recv().await.context("initial invocation missing")?;
+        while !controller.parent_input.is_active() {
+            tokio::task::yield_now().await;
+        }
+        submit_input(
+            &service,
+            &controller,
+            &session_id,
+            3,
+            "followup",
+            "Continue with checks",
+            &sink,
+        )
+        .await?;
+        steering
+            .recv()
+            .await
+            .context("follow-up was not offered as steering")?;
+        gate.add_permits(1);
+        let (scope, result) = checks
+            .recv()
+            .await
+            .context("successor check result missing")?;
+        assert_eq!(scope.exchange_id, initial.scope.exchange_id);
+        assert_ne!(scope.invocation_id, initial.scope.invocation_id);
+        let result = result?;
+        assert!(
+            result.to_string().contains("unknown discovery check"),
+            "{result}"
+        );
+        let stale = crate::provider::test_support::call_tool(
+            &initial,
+            "check_discover",
+            json!({"check":"missing"}),
+        )
+        .await;
+        assert!(stale.is_err(), "predecessor callback must remain revoked");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    gate.add_permits(1);
+    service.shutdown(Duration::from_secs(5)).await?;
+    reader.abort();
+    scenario
+}
+
+/// Retract interrupted response text from live and reopened documents while retaining history.
+#[tokio::test]
+async fn interrupted_response_disappears_from_live_and_reopened_timeline() -> Result<()> {
+    use forge_buffer::identity::{DocumentId, ViewId};
+    use forge_provider_api::{
+        AgentMessageRole, AgentMessageStart, ItemCompletion, ItemEvent, ItemStart,
+        MessageClassification, MessageCompletion, MessageOutcome,
+    };
+
+    let fixture = tempfile::tempdir()?;
+    crate::checks::configure_fixture(fixture.path());
+    let service = super::bootstrap::service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider_gate = gate.clone();
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().unwrap(),
+        )
+        .unwrap(),
+        move |request, sink, start, _cancelled| {
+            let gate = provider_gate.clone();
+            async move {
+                start.observed(1).await?;
+                let address = crate::provider::test_support::address(&request.scope);
+                for event in crate::provider::test_support::message(
+                    &address,
+                    "completed-response",
+                    Some(crate::provider::TestMessageContent::Response),
+                    "Completed earlier reply",
+                ) {
+                    sink.send_wait(crate::provider::test_support::activity(event)?)
+                        .await?;
+                }
+                let response_id = forge_provider_api::ItemId::new("partial-response")?;
+                sink.send_wait(forge_provider_api::AdapterActivity::Item {
+                    thread_id: address.thread_id.clone(),
+                    turn_id: address.turn_id.clone(),
+                    item_id: response_id.clone(),
+                    event: ItemEvent::Started(ItemStart::AgentMessage(AgentMessageStart {
+                        text: "Unfinished response".into(),
+                        classification: MessageClassification::Known(AgentMessageRole::Response),
+                    })),
+                })
+                .await?;
+                crate::provider::test_support::wait_gate(&gate).await?;
+                sink.send_wait(forge_provider_api::AdapterActivity::Item {
+                    thread_id: address.thread_id.clone(),
+                    turn_id: address.turn_id.clone(),
+                    item_id: response_id,
+                    event: ItemEvent::Completed(ItemCompletion::AgentMessage(MessageCompletion {
+                        text: "Unfinished response".into(),
+                        outcome: MessageOutcome::Interrupted,
+                    })),
+                })
+                .await?;
+                crate::provider::test_support::wait_gate(&gate).await?;
+                for event in crate::provider::test_support::message(
+                    &address,
+                    "replacement-response",
+                    Some(crate::provider::TestMessageContent::Response),
+                    "Replacement reply",
+                ) {
+                    sink.send_wait(crate::provider::test_support::activity(event)?)
+                        .await?;
+                }
+                crate::provider::test_support::wait_gate(&gate).await?;
+                Ok(crate::provider::test_support::native_result(
+                    &request,
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                ))
+            }
+        },
+    );
+    let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    *controller.provider.write().unwrap() = provider_fixture.provider_handle();
+    let presentation = {
+        let mut broker = controller.broker.lock().await;
+        broker.set_provider_for_test(provider_fixture.provider_handle());
+        broker.presentation()
+    };
+    let document = DocumentId("transcript:interrupted-response".into());
+    presentation.lock().unwrap().open(
+        document.clone(),
+        ViewId("view:interrupted-response".into()),
+        Default::default(),
+    )?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let scenario = async {
+        prompt::apply(
+            &controller,
+            Request {
+                id: 2,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"interrupted-response-input","text":"Show the reply"}),
+            },
+            &sink,
+        )
+        .await?;
+        let text = || -> Result<String> {
+            Ok(presentation.lock().unwrap().snapshot(&document)?.block.iter()
+                .flat_map(|block| block.text.rows()).collect::<Vec<_>>().join("\n"))
+        };
+        while !text()?.contains("Unfinished response") {
+            tokio::task::yield_now().await;
+        }
+        gate.add_permits(1);
+        loop {
+            let snapshot = controller.broker.lock().await.snapshot()?;
+            if snapshot.exchange.iter().any(|exchange| {
+                exchange.turn.iter().flat_map(|turn| turn.messages()).any(|message| {
+                    message.text() == "Unfinished response"
+                        && message.state() == crate::turn::MessageState::Interrupted
+                })
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let interrupted = text()?;
+        assert!(!interrupted.contains("Unfinished response"), "{interrupted}");
+        assert!(interrupted.contains("Completed earlier reply"), "{interrupted}");
+        gate.add_permits(1);
+        while !text()?.contains("Replacement reply") {
+            tokio::task::yield_now().await;
+        }
+        let live = text()?;
+        assert!(!live.contains("Unfinished response"), "{live}");
+        assert!(live.contains("Completed earlier reply"), "{live}");
+        gate.add_permits(1);
+        settle_exchanges(&controller, &session_id, 1).await?;
+        let saved = crate::storage::SqliteStore::read_only(&controller.data_root)?
+            .latest_exchange(&session_id)?.context("exchange missing")?;
+        assert!(saved.turn.iter().flat_map(|turn| turn.messages()).any(|message| {
+            message.text() == "Unfinished response"
+                && message.state() == crate::turn::MessageState::Interrupted
+        }));
+        {
+            let mut owner = presentation.lock().unwrap();
+            owner.close(&document)?;
+            owner.open(document.clone(), ViewId("view:reopened-response".into()), Default::default())?;
+        }
+        let reopened = text()?;
+        assert!(!reopened.contains("Unfinished response"), "{reopened}");
+        assert!(reopened.contains("Completed earlier reply"), "{reopened}");
+        assert!(reopened.contains("Replacement reply"), "{reopened}");
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    gate.add_permits(3);
+    service.shutdown(Duration::from_secs(5)).await?;
+    reader.abort();
+    scenario
+}
+
 /// A fresh conversation must accept new input after cancellation proves its first input was unsent.
 #[tokio::test]
 async fn owner_cancel_before_first_acceptance_allows_immediate_new_input() -> Result<()> {

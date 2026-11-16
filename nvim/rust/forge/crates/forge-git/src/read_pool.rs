@@ -259,7 +259,7 @@ impl ReadAdmission {
         let handle = runtime.spawn_blocking(move || {
             let result = (move || {
                 worker_cancellation.check()?;
-                let result = work(worker_cancellation.clone());
+                let result = crate::command::blocking_worker(|| work(worker_cancellation.clone()))?;
                 worker_cancellation.check()?;
                 result
             })();
@@ -352,6 +352,34 @@ mod tests {
             std::task::Poll::Ready(waiting.as_mut().poll(context).is_pending())
         })
         .await
+    }
+
+    /// A blocking worker must collect native I/O even when admitted by a current-thread runtime.
+    #[tokio::test]
+    async fn current_thread_caller_can_collect_commands_on_blocking_pool() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("missing-command");
+        let pool = BlockingReadPool::new(1)?;
+        let failure = pool
+            .submit(0, move |_| {
+                crate::command::read_command(
+                    &mut std::process::Command::new(executable),
+                    crate::command::CommandLimits {
+                        stderr_bytes: 4096,
+                        timeout: Duration::from_secs(1),
+                    },
+                    || Ok(()),
+                )
+            })?
+            .finish()
+            .await
+            .unwrap_err();
+        assert!(
+            failure.downcast_ref::<std::io::Error>().is_some(),
+            "{failure:#}"
+        );
+        assert_eq!(pool.status().active_jobs, 0);
+        Ok(())
     }
 
     #[tokio::test]
