@@ -86,10 +86,23 @@ pub enum AdapterActivity {
 /// Permit turn metadata while reserving start and completion for the retained runner.
 #[derive(Clone, Debug)]
 pub enum TurnMetadataEvent {
-    Error { error: ProviderFailure },
+    Error {
+        error: ProviderFailure,
+    },
     ModelResolved(crate::model::ResolvedModel),
     Usage(TurnUsageReport),
     ChecklistUpdated(ProviderChecklistUpdate),
+    /// Report instruction content positively read by this provider turn.
+    InstructionRead(InstructionRead),
+}
+
+/// Identify an instruction file whose contents entered provider context.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InstructionRead {
+    /// Preserve the complete source path for navigation and attribution.
+    pub path: String,
+    /// Display the source filename without its containing directories.
+    pub file_name: String,
 }
 
 impl From<AdapterActivity> for ProviderEvent {
@@ -111,6 +124,7 @@ impl From<AdapterActivity> for ProviderEvent {
                     TurnMetadataEvent::ChecklistUpdated(checklist) => {
                         TurnEvent::ChecklistUpdated(checklist)
                     }
+                    TurnMetadataEvent::InstructionRead(read) => TurnEvent::InstructionRead(read),
                 },
             },
             AdapterActivity::Item {

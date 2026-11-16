@@ -7,6 +7,7 @@ mod acp;
 mod claude;
 mod codex;
 mod copilot;
+mod instructions;
 mod mock;
 mod pending_input;
 mod retained_task;

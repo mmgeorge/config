@@ -387,6 +387,17 @@ impl CodexProvider {
         mcp_context.set_bindings(resources.mcp_aliases());
         let capabilities = negotiated_capabilities(&validated);
         let mut normalization = CodexNormalization::default();
+        normalization.instructions.initialize(
+            result
+                .get("instructionSources")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|path| path.as_str().map(str::to_owned))
+                .collect(),
+            Vec::new(),
+            &request.workspace,
+        );
         normalization.admit_thread(session_id.as_str(), &request.thread_id)?;
         let retained = Arc::new(CodexBinding {
             binding: binding.clone(),
@@ -3374,6 +3385,16 @@ impl crate::turn_runner::NativeTurnDriver for CodexTurnDriver {
         start: forge_provider_api::NativeTurnStart,
     ) -> Result<forge_provider_api::TurnResult, ProviderError> {
         start.observed(self.started_at_ms).await?;
+        let instructions = self
+            .session
+            .normalization
+            .lock()
+            .await
+            .instructions
+            .initial(&self.address, &self.session.workspace);
+        for instruction in instructions {
+            publish_event(&self.session, instruction).await?;
+        }
         if let Some(model) = &self.native_confirmation {
             let event = self
                 .session

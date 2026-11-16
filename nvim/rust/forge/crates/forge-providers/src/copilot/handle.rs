@@ -25,6 +25,7 @@ pub struct CopilotSession {
     pub(crate) generation: super::client_generation::ClientGeneration,
     /// Set while selected MCP servers are still starting, so accepted input must release the load.
     pub(crate) mcp_loading: std::sync::atomic::AtomicBool,
+    pub(crate) instructions: Arc<std::sync::Mutex<crate::instructions::InstructionTracker>>,
 }
 
 pub struct SkillSelection {

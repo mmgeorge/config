@@ -289,6 +289,7 @@ impl SessionUpdate {
                     TurnEvent::Completed(_)
                     | TurnEvent::ModelResolved(_)
                     | TurnEvent::Usage(_)
+                    | TurnEvent::InstructionRead(_)
                     | TurnEvent::ChecklistUpdated(_) => None,
                 },
                 ProviderEvent::Item { .. } | ProviderEvent::Agent { .. } => None,

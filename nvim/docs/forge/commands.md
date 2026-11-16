@@ -9,6 +9,10 @@ argument parsing and completion. Contributor documentation starts at
 its eligible prose regions, and immediate Backspace rejection. It does not add a slash
 command or a provider request.
 
+## Instruction reads
+
+Claude, Copilot, and Codex conversations show `Instruction · <path>` rows beside skill reads. Selecting a row opens its full source path. The first exchange includes confirmed startup instructions; later rows report native loads or successful explicit instruction-file reads. Conditional Copilot rules appear when their bodies load, and repeated reports of the same path within a turn produce one row. Codex's unreported internal reloads and Antigravity instruction tracking are not displayed.
+
 ## Harness inspection
 
 Opening, creating, or resuming a Harness conversation starts its Codex or Copilot

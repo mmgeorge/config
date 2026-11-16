@@ -273,6 +273,7 @@ async fn boundary(
                 | TurnEvent::Error { .. }
                 | TurnEvent::ModelResolved(_)
                 | TurnEvent::Usage(_)
+                | TurnEvent::InstructionRead(_)
                 | TurnEvent::ChecklistUpdated(_) => {}
             }
         }

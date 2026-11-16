@@ -16,6 +16,15 @@ pub enum ExchangeNode {
         turn_id: String,
         read: crate::skill::SkillRead,
     },
+    /// Keep confirmed instruction reads beside commentary and selected-skill reads.
+    InstructionRead {
+        /// Stable identity derived from the owning turn and full source path.
+        id: String,
+        /// Preserve the provider turn that observed the read.
+        turn_id: String,
+        /// Retain the full source path independently of its displayed filename.
+        read: forge_provider_api::InstructionRead,
+    },
     /// Retains provider context replacement separately from model text and tool calls.
     Compaction {
         id: String,
@@ -70,6 +79,7 @@ impl ExchangeNode {
         match self {
             Self::TimelineEvent { event } => event.id(),
             Self::SkillRead { id, .. } => id,
+            Self::InstructionRead { id, .. } => id,
             Self::Compaction { id, .. } => id,
             Self::ImplementationReport { id, .. } => id,
             Self::VerificationResult { id, .. } => id,

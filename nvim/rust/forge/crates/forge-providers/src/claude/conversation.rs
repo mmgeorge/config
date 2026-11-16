@@ -247,6 +247,32 @@ impl ClaudeConversation {
         forge_provider_api::context::ContextUsage::reported(used, size)
     }
 
+    /// Return the native session's instruction-path base directory.
+    pub(crate) async fn workspace(&self) -> String {
+        self.options.read().await.workspace.clone()
+    }
+
+    /// Query files already included before SDK instruction callbacks could be registered.
+    pub(crate) async fn instruction_sources(&self) -> Result<Vec<String>, ProviderError> {
+        let usage = self
+            .request(
+                ProviderOperation::TurnStart,
+                OutboundControl::GetContextUsage {},
+            )
+            .await?;
+        Ok(usage
+            .get("memoryFiles")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|file| {
+                file.get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+
     /// Apply the model, effort, and permission mode of the next turn.
     pub(crate) async fn configure(
         &self,
@@ -578,7 +604,11 @@ fn launch_spec(
 fn initialize(options: &ConversationOptions, start: &SessionStart) -> Initialize {
     let isolated = matches!(start, SessionStart::Ephemeral);
     Initialize {
-        hooks: None,
+        hooks: (!isolated).then(|| {
+            serde_json::json!({
+                "InstructionsLoaded": [{"hookCallbackIds": ["forge-instructions"]}]
+            })
+        }),
         sdk_mcp_servers: if isolated {
             Vec::new()
         } else {

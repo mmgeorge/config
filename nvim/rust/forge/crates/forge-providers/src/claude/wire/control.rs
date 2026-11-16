@@ -18,7 +18,7 @@ pub(crate) struct InboundControlRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InboundControl {
     CanUseTool(Box<CanUseTool>),
-    HookCallback { callback_id: String },
+    HookCallback { callback_id: String, input: Value },
     McpMessage { server_name: String, message: Value },
     Other { subtype: String },
 }
@@ -83,6 +83,7 @@ impl InboundControlRequest {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                input: request.get("input").cloned().unwrap_or(Value::Null),
             },
             "mcp_message" => InboundControl::McpMessage {
                 server_name: request

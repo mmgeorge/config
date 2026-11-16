@@ -148,6 +148,8 @@ pub(crate) struct ClaudeSessionState {
     catalog: RwLock<SessionCatalog>,
     reported_notices: Mutex<HashSet<String>>,
     unsupported_events: Mutex<HashSet<String>>,
+    instructions: Mutex<crate::instructions::InstructionTracker>,
+    instruction_workspace: RwLock<String>,
 }
 
 impl ClaudeSessionState {
@@ -173,10 +175,26 @@ impl ClaudeSessionState {
             catalog: RwLock::new(SessionCatalog::default()),
             reported_notices: Mutex::new(HashSet::new()),
             unsupported_events: Mutex::new(HashSet::new()),
+            instructions: Mutex::new(Default::default()),
+            instruction_workspace: RwLock::new(String::new()),
         }
     }
 
     // ----- Admission -----------------------------------------------------------------------
+
+    /// Identify whether this binding still needs its initial instruction-file query.
+    pub(crate) async fn instructions_initialized(&self) -> bool {
+        self.instructions.lock().await.initialized()
+    }
+
+    /// Retain initial sources until positively observed native work owns their timeline rows.
+    pub(crate) async fn initialize_instructions(&self, paths: Vec<String>, workspace: &str) {
+        *self.instruction_workspace.write().await = workspace.to_owned();
+        self.instructions
+            .lock()
+            .await
+            .initialize(paths, Vec::new(), workspace);
+    }
 
     /// Get whether this native binding still permits new operations.
     pub(crate) fn is_admitting(&self) -> bool {
@@ -484,6 +502,11 @@ impl ClaudeSessionState {
             start.observed(observed_at_ms).await?;
         }
         if first {
+            let workspace = self.instruction_workspace.read().await.clone();
+            let instructions = self.instructions.lock().await.initial(&address, &workspace);
+            for instruction in instructions {
+                self.publish(instruction).await?;
+            }
             let model = self.catalog.read().await.selected_model.clone();
             if let Some(model_id) = model.and_then(|model| ModelId::new(model).ok()) {
                 self.decoder.lock().await.model_resolved = true;
@@ -830,7 +853,13 @@ impl ClaudeSessionState {
             .publication_sink()
             .await
             .ok_or_else(|| provider_failure(ProviderFailureKind::Rejected))?;
-        sink.activity_writer().send_wait(event).await?;
+        let workspace = self.instruction_workspace.read().await.clone();
+        let reads = self.instructions.lock().await.observe(&event, &workspace);
+        let writer = sink.activity_writer();
+        writer.send_wait(event).await?;
+        for read in reads {
+            writer.send_wait(read).await?;
+        }
         Ok(())
     }
 
@@ -1314,7 +1343,39 @@ impl ClaudeSessionState {
             InboundControl::McpMessage { server_name, .. } => Err(format!(
                 "Forge serves no SDK MCP server named {server_name}"
             )),
-            InboundControl::HookCallback { .. } => Ok(json!({"continue": true})),
+            InboundControl::HookCallback { callback_id, input } => {
+                let _callback = self.callback_work.read().await;
+                let active = self.active.read().await.clone();
+                if callback_id == "forge-instructions"
+                    && input.get("hook_event_name").and_then(Value::as_str)
+                        == Some("InstructionsLoaded")
+                    && let Some(path) = input.get("file_path").and_then(Value::as_str)
+                    && let Some(prompt_id) = input.get("prompt_id").and_then(Value::as_str)
+                    && let Some(active) = active.filter(|active| {
+                        !active.revocation.is_cancelled()
+                            && active.commands.iter().any(|command| command == prompt_id)
+                    })
+                {
+                    self.observe_native_start(timestamp())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let workspace = self.instruction_workspace.read().await.clone();
+                    let read =
+                        self.instructions
+                            .lock()
+                            .await
+                            .read(&active.address, path, &workspace);
+                    if let Some(read) = read {
+                        active
+                            .sink
+                            .activity_writer()
+                            .send_wait(read)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                Ok(json!({"continue": true}))
+            }
             InboundControl::Other { subtype } => {
                 Err(format!("Unsupported control request subtype: {subtype}"))
             }

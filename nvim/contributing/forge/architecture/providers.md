@@ -4,6 +4,12 @@ Each provider reports identities, phases, tools, and failures differently, and a
 
 [Harness](harness.md) covers the session lifecycle, [Permissions](permissions.md) covers approvals, and [Provider configuration](provider-configuration.md) covers settings, resources, and models. Input delivery is in [Provider submissions](../provider-submissions.md).
 
+## Instruction reads
+
+`TurnMetadataEvent::InstructionRead` carries a full source path and filename under the native turn that read it. Adapters collect one initial snapshot per binding and publish it only after positive native start, so opening a conversation alone creates no transcript activity. Claude queries `get_context_usage.memoryFiles`, Copilot queries `session.instructions.getSources` and excludes conditional or default-disabled sources, and Codex retains `instructionSources` from thread open.
+
+Claude registers an `InstructionsLoaded` SDK callback for later native loads. Copilot enables `enableOnDemandInstructionDiscovery` independently of ambient configuration discovery and consumes only successful, tool-correlated `model.tool_execution` messages tagged `instruction-discovery`; their runtime framing supplies the loaded paths. Its expanded startup source bodies also identify imported files. Successful explicit instruction-file reads use shared typed read semantics in all three adapters, including literal shell reads through `CommandInvocation::read_paths`, which skill attribution also uses. The tracker deduplicates a full path within its owning turn, permits another turn to report it again, and never infers reads from model commentary or tool output. Codex's unreported internal loads and ACP instruction tracking remain unsupported.
+
 ## Task completion and native outcomes
 
 Adapters report native facts and collect their resources. Successful task tools do not request interruption: there is no `tool_finished` or task handoff callback. Copilot continues through the assistant's final output and ordinary native completion after `plan_phase_done`. Native interruption remains `ProviderError::Interrupted`; an explicit host stop carries its separate cancellation, reconfiguration, or shutdown provenance. A pending completion request cannot turn a failed or interrupted native turn into success.

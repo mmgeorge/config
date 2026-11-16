@@ -416,6 +416,118 @@ async fn prompt_streams_text_and_completes_with_a_response() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// Startup discovery runs once, and callbacks must name a prompt in the active turn.
+#[tokio::test]
+async fn initial_and_lazy_instruction_reads_keep_their_original_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().to_string_lossy().into_owned();
+    let initial = directory
+        .path()
+        .join("CLAUDE.md")
+        .to_string_lossy()
+        .into_owned();
+    let nested = directory
+        .path()
+        .join("nested/CLAUDE.md")
+        .to_string_lossy()
+        .into_owned();
+    let launcher = PeerLauncher::new({
+        let initial = initial.clone();
+        let nested = nested.clone();
+        let workspace = workspace.clone();
+        move || {
+            let initial = initial.clone();
+            let nested = nested.clone();
+            let workspace = workspace.clone();
+            let mut prompt = None;
+            let mut previous_prompt = None;
+            Box::new(move |frame| {
+                if frame["request"]["subtype"] == "get_context_usage" {
+                    return Some(vec![success(
+                        frame["request_id"].clone(),
+                        json!({"totalTokens":100,"maxTokens":200000,"memoryFiles":[{"path":initial,"type":"Project","tokens":20}]}),
+                    )]);
+                }
+                if let Some(uuid) = user_uuid(frame) {
+                    prompt = Some(uuid.clone());
+                    return Some(vec![
+                        lifecycle(&uuid, "queued"),
+                        lifecycle(&uuid, "started"),
+                        json!({
+                            "type":"control_request","request_id":"stale-instruction-load","request":{
+                                "subtype":"hook_callback","callback_id":"forge-instructions",
+                                "input":{"hook_event_name":"InstructionsLoaded","file_path":format!("{workspace}/stale.md"),"prompt_id":previous_prompt}
+                            }
+                        }),
+                        json!({
+                            "type":"control_request","request_id":"instruction-load","request":{
+                                "subtype":"hook_callback","callback_id":"forge-instructions",
+                                "input":{"hook_event_name":"InstructionsLoaded","file_path":nested,"cwd":workspace,"load_reason":"nested_traversal","prompt_id":uuid}
+                            }
+                        }),
+                    ]);
+                }
+                if frame["type"] == "control_response"
+                    && frame["response"]["request_id"] == "instruction-load"
+                {
+                    let uuid = prompt.take().unwrap();
+                    previous_prompt = Some(uuid.clone());
+                    let mut frames = text_message("reply", &["done"]);
+                    frames.push(lifecycle(&uuid, "completed"));
+                    frames.push(result_success());
+                    return Some(frames);
+                }
+                None
+            })
+        }
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    for (turn, expected) in [
+        ("first", vec![initial.clone(), nested.clone()]),
+        ("second", vec![nested.clone()]),
+    ] {
+        provider
+            .turn_start(
+                operation_context(),
+                &opened.binding.id,
+                prompt_request(
+                    &opened.binding.id,
+                    turn,
+                    receipt(turn),
+                    forge_provider_api::permissions::PermissionResponse::Allow,
+                ),
+            )
+            .await
+            .unwrap();
+        let (events, _) = until_completed(&mut opened.events).await;
+        let reads = events
+            .iter()
+            .filter_map(|event| match event {
+                forge_provider_api::ProviderEvent::Turn {
+                    event: forge_provider_api::TurnEvent::InstructionRead(read),
+                    ..
+                } => Some(std::path::PathBuf::from(&read.path)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reads,
+            expected
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+    }
+    let queries = launcher
+        .frames("control_request")
+        .into_iter()
+        .filter(|frame| frame["request"]["subtype"] == "get_context_usage")
+        .count();
+    // Context accounting also queries at each completion; only the extra startup query is once.
+    assert_eq!(queries, 3);
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// Isolated prompts stream normally without a durable identity or inherited tool surface.
 #[tokio::test]
 async fn isolated_text_uses_an_unpersisted_tool_free_process() {

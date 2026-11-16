@@ -54,6 +54,72 @@ pub struct CommandDisplay {
     byte_range_list: Vec<Range<usize>>,
 }
 
+impl CommandInvocation {
+    /// Identify literal file reads without treating searches, scripts, or output text as reads.
+    pub fn read_paths(&self) -> Vec<String> {
+        let invocation = self;
+        let name = invocation
+            .command_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&invocation.command_name)
+            .to_ascii_lowercase()
+            .trim_end_matches(".exe")
+            .to_owned();
+        if name == "sed"
+            && invocation
+                .token_list
+                .get(1)
+                .is_none_or(|argument| argument != "-n")
+        {
+            return Vec::new();
+        }
+        let mut arguments = invocation.token_list.iter().skip(1);
+        let mut paths = Vec::new();
+        while let Some(argument) = arguments.next() {
+            let option = if name == "get-content" {
+                argument.to_ascii_lowercase()
+            } else {
+                argument.clone()
+            };
+            match (name.as_str(), option.as_str()) {
+                ("get-content", "-path" | "-literalpath") => {}
+                ("get-content", "-raw")
+                | ("cat", "--" | "-n" | "-b")
+                | ("open", "--raw" | "-r") => {}
+                ("get-content", "-totalcount" | "-tail") | ("head" | "tail", "-n" | "-c") => {
+                    if arguments
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_none()
+                    {
+                        return Vec::new();
+                    }
+                }
+                ("sed", "-n") => {
+                    let Some(expression) = arguments.next() else {
+                        return Vec::new();
+                    };
+                    if !expression.ends_with('p')
+                        || !expression[..expression.len() - 1]
+                            .chars()
+                            .all(|character| character.is_ascii_digit() || character == ',')
+                    {
+                        return Vec::new();
+                    }
+                }
+                (
+                    "cat" | "get-content" | "head" | "tail" | "type" | "more" | "bat" | "open"
+                    | "sed",
+                    _,
+                ) if !argument.starts_with('-') => paths.push(argument.clone()),
+                _ => return Vec::new(),
+            }
+        }
+        paths
+    }
+}
+
 impl CommandDisplay {
     /// Summarizes literal file operations without changing execution or approval input.
     pub fn summary(&self) -> Option<String> {

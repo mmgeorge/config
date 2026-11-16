@@ -124,6 +124,7 @@ impl<'exchange> ExchangeLayout<'exchange> {
             let owned_activity = match node {
                 ExchangeNode::AgentReference { .. } | ExchangeNode::TimelineEvent { .. } => true,
                 ExchangeNode::SkillRead { turn_id, .. }
+                | ExchangeNode::InstructionRead { turn_id, .. }
                 | ExchangeNode::TurnContent {
                     turn_id,
                     item: TurnItem::Tool { .. },

@@ -2604,6 +2604,16 @@ async fn run_prompt(
             return Err(reject_before_dispatch(&request.receipt, error).await);
         }
         *session.native_model.lock().await = request.configuration.model.clone();
+        if !session.state.instructions_initialized().await {
+            let workspace = session.conversation.workspace().await;
+            match session.conversation.instruction_sources().await {
+                Ok(paths) => session.state.initialize_instructions(paths, &workspace).await,
+                Err(error) => {
+                    tracing::warn!(?error, "Claude initial instruction sources unavailable");
+                    session.state.initialize_instructions(Vec::new(), &workspace).await;
+                }
+            }
+        }
         let event_sink = session.sink.invocation_sink(&request.scope)?;
         let address = forge_provider_api::TurnAddress {
             scope: request.scope.clone(),

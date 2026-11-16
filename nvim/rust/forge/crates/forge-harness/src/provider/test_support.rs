@@ -318,6 +318,7 @@ pub(crate) fn activity(
                 TurnEvent::Error { error } => TurnMetadataEvent::Error { error },
                 TurnEvent::ModelResolved(model) => TurnMetadataEvent::ModelResolved(model),
                 TurnEvent::Usage(usage) => TurnMetadataEvent::Usage(usage),
+                TurnEvent::InstructionRead(read) => TurnMetadataEvent::InstructionRead(read),
                 TurnEvent::ChecklistUpdated(checklist) => {
                     TurnMetadataEvent::ChecklistUpdated(checklist)
                 }

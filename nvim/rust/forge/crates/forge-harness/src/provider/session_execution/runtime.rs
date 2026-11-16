@@ -2472,6 +2472,7 @@ impl Driver {
             TurnEvent::Error { .. }
             | TurnEvent::ModelResolved(_)
             | TurnEvent::Usage(_)
+            | TurnEvent::InstructionRead(_)
             | TurnEvent::ChecklistUpdated(_) => {
                 if &scope.owner().thread_id() != thread_id
                     || scope.turn_id().ok().as_ref() != Some(turn_id)
@@ -3660,6 +3661,7 @@ impl Driver {
                     TurnEvent::Error { .. }
                     | TurnEvent::ModelResolved(_)
                     | TurnEvent::Usage(_)
+                    | TurnEvent::InstructionRead(_)
                     | TurnEvent::ChecklistUpdated(_) => Ok(()),
                 };
                 if result.is_err() {
@@ -3681,6 +3683,7 @@ impl Driver {
                 TurnEvent::Error { .. }
                 | TurnEvent::ModelResolved(_)
                 | TurnEvent::Usage(_)
+                | TurnEvent::InstructionRead(_)
                 | TurnEvent::ChecklistUpdated(_) => Ok(()),
             };
             if result.is_err() {
@@ -3716,7 +3719,10 @@ impl Driver {
                 TurnEvent::ModelResolved(model) => {
                     invocation.native_metadata.runtime.model = Some(model.model_id.to_string());
                 }
-                TurnEvent::Error { .. } | TurnEvent::Usage(_) | TurnEvent::ChecklistUpdated(_) => {}
+                TurnEvent::InstructionRead(_)
+                | TurnEvent::Error { .. }
+                | TurnEvent::Usage(_)
+                | TurnEvent::ChecklistUpdated(_) => {}
             }
         }
         // Accumulate retry-sensitive evidence while forwarding complete payloads to canonical reducers.

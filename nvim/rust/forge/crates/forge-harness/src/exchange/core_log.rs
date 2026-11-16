@@ -183,6 +183,7 @@ impl CoreProviderEvidence {
                     error: *error,
                 }),
                 TurnEvent::ModelResolved(_)
+                | TurnEvent::InstructionRead(_)
                 | TurnEvent::Usage(_)
                 | TurnEvent::ChecklistUpdated(_) => None,
             },

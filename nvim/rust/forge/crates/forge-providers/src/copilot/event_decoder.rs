@@ -89,6 +89,7 @@ pub struct CopilotEventDecoder {
     callbacks: Option<std::sync::Arc<dyn super::provider::NativeCallbackRouter>>,
     turn_owner: Option<forge_provider_api::ProviderEventSink>,
     unsupported_events: HashSet<String>,
+    instructions: std::sync::Arc<std::sync::Mutex<crate::instructions::InstructionTracker>>,
 }
 
 impl CopilotEventDecoder {
@@ -115,7 +116,17 @@ impl CopilotEventDecoder {
             child_events: HashMap::new(),
             child_agents: HashMap::new(),
             unsupported_events: HashSet::new(),
+            instructions: Default::default(),
         }
+    }
+
+    /// Share startup discovery and per-turn read deduplication across this binding's decoders.
+    pub(crate) fn with_instructions(
+        mut self,
+        instructions: std::sync::Arc<std::sync::Mutex<crate::instructions::InstructionTracker>>,
+    ) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     /// Keep exact callback routing alive with the retained decoder after the foreground finishes.
@@ -487,6 +498,50 @@ impl CopilotEventDecoder {
         let child_writer = self.turn.get(&thread).map(|turn| turn.writer.clone());
         let sink = child_writer.as_ref().unwrap_or(sink);
         match event.event_type.as_str() {
+            "model.tool_execution" => {
+                if event
+                    .data
+                    .pointer("/toolResult/resultType")
+                    .and_then(Value::as_str)
+                    == Some("success")
+                    && let Some(tool_id) = event.data.get("toolCallId").and_then(Value::as_str)
+                    && let Some(tool) = self.tool.get(&(thread.clone(), tool_id.to_owned()))
+                    && !self.turn.get(&thread).is_some_and(|turn| turn.settled)
+                {
+                    let mut reads = Vec::new();
+                    {
+                        let mut tracker = self
+                            .instructions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for message in event
+                            .data
+                            .pointer("/toolResult/newMessages")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            if message.get("source").and_then(Value::as_str)
+                                != Some("instruction-discovery")
+                            {
+                                continue;
+                            }
+                            if let Some(content) = message.get("content").and_then(Value::as_str) {
+                                for path in crate::instructions::copilot_discovery_paths(content) {
+                                    reads.extend(tracker.read(
+                                        &tool.address.turn,
+                                        &path,
+                                        &self.workspace,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    for read in reads {
+                        sink.send_wait(read).await?;
+                    }
+                }
+            }
             "assistant.turn_start" => {
                 let native_id = super::decode::string_field(&event.data, &["turnId"])
                     .ok_or_else(|| Self::protocol("Copilot turn start omitted turnId"))?;
@@ -537,6 +592,17 @@ impl CopilotEventDecoder {
                             child: None,
                         },
                     );
+                }
+                if event.agent_id.is_none() {
+                    let address = self.address(&thread)?;
+                    let reads = self
+                        .instructions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .initial(&address, &self.workspace);
+                    for read in reads {
+                        sink.send_wait(read).await?;
+                    }
                 }
                 if event.agent_id.is_none()
                     && let Some(update) = self.pending_checklist.take()
@@ -1484,12 +1550,25 @@ impl CopilotEventDecoder {
                     },
                 }
             };
-            sink.send_wait(
-                tool.address
-                    .clone()
-                    .activity(tool_completion(&tool.invocation, outcome)),
-            )
-            .await?;
+            let activity = tool
+                .address
+                .clone()
+                .activity(tool_completion(&tool.invocation, outcome));
+            let reads = {
+                let mut tracker = self
+                    .instructions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tracker.observe(
+                    &tool.address.clone().activity(tool_start(&tool.invocation)),
+                    &self.workspace,
+                );
+                tracker.observe(&activity, &self.workspace)
+            };
+            sink.send_wait(activity).await?;
+            for read in reads {
+                sink.send_wait(read).await?;
+            }
             tool.finished = true;
             tool.final_native = Some(event.data.clone());
         }

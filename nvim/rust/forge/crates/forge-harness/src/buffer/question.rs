@@ -192,6 +192,7 @@ impl<'exchange> QuestionHistory<'exchange> {
                             | ExchangeNode::AgentReference { .. }
                             | ExchangeNode::ArtifactChange { .. }
                             | ExchangeNode::SkillRead { .. }
+                            | ExchangeNode::InstructionRead { .. }
                             | ExchangeNode::Compaction { .. }
                     )
                 })

@@ -135,6 +135,7 @@ pub async fn open(
             config.working_directory = Some(options.workspace.clone());
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(false);
+            config.enable_on_demand_instruction_discovery = Some(!options.isolated_text);
             config.enable_skills = Some(true);
             config.mcp_servers = Some(Default::default());
             config.skill_directories = Some(skill_directories.clone());
@@ -194,6 +195,7 @@ pub async fn open(
             config.working_directory = Some(options.workspace.clone());
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(false);
+            config.enable_on_demand_instruction_discovery = Some(!options.isolated_text);
             config.enable_skills = Some(true);
             config.mcp_servers = Some(Default::default());
             config.skill_directories = Some(skill_directories);
@@ -284,6 +286,7 @@ pub async fn open(
             events: super::intake::SessionIntake::new(events, generation.clone()),
             generation,
             mcp_loading: Default::default(),
+            instructions: Default::default(),
         })
     }
     .await;

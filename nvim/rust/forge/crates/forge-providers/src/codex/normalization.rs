@@ -75,6 +75,7 @@ pub(super) struct CodexOutput {
 /// Map native protocol identities to normalized host objects under exact retained owners.
 #[derive(Default)]
 pub struct CodexNormalization {
+    pub(super) instructions: crate::instructions::InstructionTracker,
     scope: Option<EventScope>,
     threads: HashMap<String, ThreadId>,
     turns: HashMap<(String, String), TurnAddress>,
@@ -618,10 +619,15 @@ impl CodexNormalization {
     ) -> Result<()> {
         let activities = self.activities(message, workspace)?;
         for activity in activities {
+            let reads = self.instructions.observe(&activity, workspace);
             if let Some(sink) = sink {
                 sink.send_wait(activity).await?;
+                for read in reads {
+                    sink.send_wait(read).await?;
+                }
             } else {
                 output.event.push(activity);
+                output.event.extend(reads);
             }
         }
         Ok(())
@@ -1707,6 +1713,57 @@ fn timestamp() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Only successful reported command reads produce instruction activity at their admitted turn.
+    #[tokio::test]
+    async fn instruction_reads_follow_reported_commands_and_original_owners() -> Result<()> {
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        let address = normalization.admit_turn("native", "turn", &scope)?;
+        let workspace = tempfile::tempdir()?;
+        let workspace = workspace.path().to_string_lossy().into_owned();
+        let mut output = CodexOutput::default();
+        for (native_id, path, status, exit_code) in [
+            ("ordinary", "README.md", "completed", 0),
+            ("failed", "AGENTS.md", "failed", 1),
+            ("instruction", "nested/AGENTS.md", "completed", 0),
+        ] {
+            for method in ["item/started", "item/completed"] {
+                let completed = method == "item/completed";
+                normalization.normalize(&json!({
+                    "method":method,"params":{"threadId":"native","turnId":"turn","item":{
+                        "type":"commandExecution","id":native_id,"command":format!("cat {path}"),
+                        "cwd":workspace,"status":if completed {status} else {"inProgress"},
+                        "exitCode":if completed {Some(exit_code)} else {None}
+                    }}
+                }), &mut output, None, &workspace).await?;
+            }
+        }
+        let reads = output
+            .event
+            .iter()
+            .filter_map(|event| match event {
+                AdapterActivity::Turn {
+                    thread_id,
+                    turn_id,
+                    event: TurnMetadataEvent::InstructionRead(read),
+                } => {
+                    assert_eq!(thread_id, &address.thread_id);
+                    assert_eq!(turn_id, &address.turn_id);
+                    Some(read)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].file_name, "AGENTS.md");
+        assert_eq!(
+            std::path::Path::new(&reads[0].path),
+            std::path::Path::new(&workspace).join("nested/AGENTS.md")
+        );
+        Ok(())
+    }
 
     /// Trust only generated header lifetime evidence for the exact original unified-exec call and process.
     #[test]

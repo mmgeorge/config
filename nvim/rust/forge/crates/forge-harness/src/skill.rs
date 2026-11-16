@@ -88,7 +88,7 @@ impl SkillAccess {
                             return Path::new(path).is_absolute()
                                 && self.contained(path).is_some_and(|path| path.is_file());
                         }
-                        let paths = read_paths(invocation);
+                        let paths = invocation.read_paths();
                         !paths.is_empty()
                             && paths.iter().all(|path| {
                                 Path::new(path).is_absolute() && self.contained(path).is_some()
@@ -110,7 +110,7 @@ impl SkillAccess {
                     .flat_map(|invocation| {
                         script_path(invocation)
                             .map(|path| vec![path.to_owned()])
-                            .unwrap_or_else(|| read_paths(invocation))
+                            .unwrap_or_else(|| invocation.read_paths())
                     })
                     .collect()
             }
@@ -139,7 +139,11 @@ impl SkillAccess {
                     .unwrap_or_default();
                 let parsed = normalize_command_in(text, shell);
                 let path = if parsed.failure.is_none() {
-                    parsed.invocation_list.iter().flat_map(read_paths).collect()
+                    parsed
+                        .invocation_list
+                        .iter()
+                        .flat_map(CommandInvocation::read_paths)
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -292,58 +296,6 @@ fn executable_name(command: &str) -> String {
         .to_ascii_lowercase()
         .trim_end_matches(".exe")
         .to_owned()
-}
-
-fn read_paths(invocation: &CommandInvocation) -> Vec<String> {
-    let name = executable_name(&invocation.command_name);
-    if name == "sed"
-        && invocation
-            .token_list
-            .get(1)
-            .is_none_or(|argument| argument != "-n")
-    {
-        return Vec::new();
-    }
-    let mut arguments = invocation.token_list.iter().skip(1);
-    let mut paths = Vec::new();
-    while let Some(argument) = arguments.next() {
-        let option = if name == "get-content" {
-            argument.to_ascii_lowercase()
-        } else {
-            argument.clone()
-        };
-        match (name.as_str(), option.as_str()) {
-            ("get-content", "-path" | "-literalpath") => {}
-            ("get-content", "-raw") | ("cat", "--" | "-n" | "-b") | ("open", "--raw" | "-r") => {}
-            ("get-content", "-totalcount" | "-tail") | ("head" | "tail", "-n" | "-c") => {
-                if arguments
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .is_none()
-                {
-                    return Vec::new();
-                }
-            }
-            ("sed", "-n") => {
-                let Some(expression) = arguments.next() else {
-                    return Vec::new();
-                };
-                if !expression.ends_with('p')
-                    || !expression[..expression.len() - 1]
-                        .chars()
-                        .all(|character| character.is_ascii_digit() || character == ',')
-                {
-                    return Vec::new();
-                }
-            }
-            (
-                "cat" | "get-content" | "head" | "tail" | "type" | "more" | "bat" | "open" | "sed",
-                _,
-            ) if !argument.starts_with('-') => paths.push(argument.clone()),
-            _ => return Vec::new(),
-        }
-    }
-    paths
 }
 
 fn script_path(invocation: &CommandInvocation) -> Option<&str> {

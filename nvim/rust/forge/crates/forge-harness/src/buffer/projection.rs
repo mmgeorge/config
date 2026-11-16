@@ -2102,6 +2102,17 @@ impl TimelineRenderer<'_> {
                         }),
                     )?;
                 }
+                ExchangeNode::InstructionRead { id, read, .. } => {
+                    self.literal(
+                        id,
+                        &format!("≡ Instruction · {}", read.path),
+                        Some(TranscriptAction::File {
+                            path: read.path.clone(),
+                            line: 1,
+                            column: None,
+                        }),
+                    )?;
+                }
                 ExchangeNode::Compaction { id, compaction } => self.compaction(id, compaction)?,
                 ExchangeNode::TurnContent {
                     turn_id,
@@ -3645,6 +3656,63 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{exchange::Exchange, timeline::TimelineEntry};
+
+    /// Persist one instruction row per turn and show its full navigation path.
+    #[test]
+    fn instruction_reads_render_paths_and_preserve_navigation_after_reload()
+    -> anyhow::Result<()> {
+        let mut exchange = crate::storage::test::running_exchange("instruction-timeline");
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let read = forge_provider_api::InstructionRead {
+            path: "/fixture/nested/AGENTS.md".into(),
+            file_name: "AGENTS.md".into(),
+        };
+        let event = crate::provider::test_support::native_event(
+            crate::provider::EventScope::Invocation {
+                invocation: address.scope.clone(),
+            },
+            forge_provider_api::ProviderEvent::Turn {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                event: forge_provider_api::TurnEvent::InstructionRead(read),
+            },
+        );
+        assert!(exchange.observe_event(&event, 1)?);
+        assert!(!exchange.observe_event(&event, 1)?);
+        let exchange: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+        let mut display = crate::buffer::identity::DisplayRegistry::default();
+        let projected = super::project(
+            super::ProjectionSource::Exchange(&exchange),
+            &WidthProfile::default(),
+            2,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut display,
+        )?;
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Instruction · /fixture/nested/AGENTS.md"), "{text}");
+        assert_eq!(
+            exchange
+                .node_list
+                .iter()
+                .filter(|node| matches!(
+                    node,
+                    crate::exchange::ExchangeNode::InstructionRead { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(projected.action.values().any(|action| matches!(action, super::TranscriptAction::File { path, .. } if path == "/fixture/nested/AGENTS.md")));
+        Ok(())
+    }
 
     /// Retain internal evidence for replay without duplicating the visible check categories.
     #[test]

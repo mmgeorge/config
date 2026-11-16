@@ -338,6 +338,7 @@ impl OwnershipRegistry {
                     TurnEvent::Started(_)
                     | TurnEvent::Error { .. }
                     | TurnEvent::ChecklistUpdated(_)
+                    | TurnEvent::InstructionRead(_)
                     | TurnEvent::Usage(_)
                     | TurnEvent::ModelResolved(_) => {}
                 }

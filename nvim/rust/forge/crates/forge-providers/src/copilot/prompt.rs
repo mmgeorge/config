@@ -73,6 +73,35 @@ pub async fn run(
     session.ensure_healthy()?;
     let owned_session = session;
     let session = &session.inner;
+    if !owned_session
+        .instructions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .initialized()
+    {
+        let sources = session.rpc().instructions().get_sources().await;
+        let mut included = Vec::new();
+        let mut available = Vec::new();
+        match sources {
+            Ok(result) => {
+                for source in result.sources {
+                    available.push(source.source_path.clone());
+                    if source.default_disabled != Some(true)
+                        && source.apply_to.as_ref().is_none_or(Vec::is_empty)
+                    {
+                        included.push(source.source_path);
+                        included.extend(crate::instructions::copilot_imports(&source.content));
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(?error, "Copilot initial instruction sources unavailable"),
+        }
+        owned_session
+            .instructions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .initialize(included, available, &options.workspace);
+    }
     let output = ProviderCompletion {
         provider_session_id: Some(session.id().to_string().try_into().map_err(|_| {
             native_failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
@@ -87,6 +116,7 @@ pub async fn run(
     let decoder =
         CopilotEventDecoder::new(sink.invocation_scope()?.clone(), options.workspace.clone())
             .with_callbacks(native_callbacks)
+            .with_instructions(owned_session.instructions.clone())
             .with_turn_owner(owner_sink.clone());
     let retained_context = Arc::new(tokio::sync::Mutex::new(super::intake::TurnContext {
         decoder,

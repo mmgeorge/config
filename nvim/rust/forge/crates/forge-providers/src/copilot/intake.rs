@@ -480,6 +480,41 @@ mod tests {
         )
     }
 
+    /// Runtime discovery requires a successful original tool and deduplicates repeated load reports.
+    #[tokio::test]
+    async fn instruction_discovery_requires_native_provenance_and_success() -> anyhow::Result<()> {
+        let (context, mut stream) = context("instructions").await;
+        let mut context = context.lock().await;
+        let TurnContext {
+            decoder,
+            output,
+            sink,
+        } = &mut *context;
+        let instruction = "\n<system_reminder>\nCustom instructions from nested/AGENTS.md. Apply these to any code you write here:\n\nRules\n</system_reminder>";
+        decoder.decode(&event("tool-start", "tool.execution_start", json!({"toolCallId":"read","toolName":"view","arguments":{"path":"nested/sample.txt"}})), output, sink).await?;
+        for (id, result, source) in [
+            ("denied", "denied", "instruction-discovery"),
+            ("untrusted", "success", "other"),
+            ("loaded", "success", "instruction-discovery"),
+            ("duplicate", "success", "instruction-discovery"),
+        ] {
+            decoder.decode(&event(id, "model.tool_execution", json!({"toolCallId":"read","toolResult":{"resultType":result,"newMessages":[{"source":source,"content":instruction}]}})), output, sink).await?;
+        }
+        let mut reads = Vec::new();
+        while let Ok(envelope) = stream.try_recv() {
+            if let forge_provider_api::ProviderEvent::Turn {
+                event: forge_provider_api::TurnEvent::InstructionRead(read),
+                ..
+            } = envelope.event
+            {
+                reads.push(read);
+            }
+        }
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].file_name, "AGENTS.md");
+        Ok(())
+    }
+
     /// Create a session reader whose producer remains owned until explicit close.
     async fn fixture() -> (SessionIntake, mpsc::Sender<SessionEvent>) {
         let (read, _read_peer) = tokio::io::duplex(4096);

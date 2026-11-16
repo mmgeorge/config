@@ -614,6 +614,7 @@ async fn collect(
                     | api::TurnEvent::ModelResolved(_)
                     | api::TurnEvent::Usage(_)
                     | api::TurnEvent::ChecklistUpdated(_) => {}
+                    api::TurnEvent::InstructionRead(_) => {}
                 }
             }
             api::ProviderEvent::Item {

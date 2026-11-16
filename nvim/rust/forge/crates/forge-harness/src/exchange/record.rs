@@ -732,6 +732,25 @@ impl Exchange {
         };
         match event {
             ProviderEvent::Turn {
+                event: TurnEvent::InstructionRead(read),
+                ..
+            } => {
+                anyhow::ensure!(
+                    self.turn[index].completed().is_none(),
+                    "completed turn rejects instruction reads"
+                );
+                let turn_id = self.turn[index].id().to_owned();
+                let id = format!("{turn_id}:instruction:{}", read.path);
+                if self.node_list.iter().any(|node| node.id() == id) {
+                    return Ok(false);
+                }
+                self.node_list.push(ExchangeNode::InstructionRead {
+                    id,
+                    turn_id,
+                    read: read.clone(),
+                });
+            }
+            ProviderEvent::Turn {
                 event: TurnEvent::Completed(completed),
                 ..
             } => {

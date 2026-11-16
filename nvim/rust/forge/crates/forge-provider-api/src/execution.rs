@@ -119,4 +119,6 @@ pub enum TurnEvent {
     Usage(crate::TurnUsageReport),
     /// Preserve the positively confirmed model for this response cycle.
     ModelResolved(crate::model::ResolvedModel),
+    /// Retain a confirmed instruction read under its original turn.
+    InstructionRead(crate::InstructionRead),
 }
