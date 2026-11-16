@@ -113,7 +113,7 @@ impl LaunchSpec {
             "--setting-sources=project,local".to_owned(),
             format!(
                 "--settings={}",
-                serde_json::json!({"permissions": {"ask": ["*"]}})
+                serde_json::json!({"permissions": {"ask": ["*"]}, "autoMemoryEnabled": false})
             ),
             "--strict-mcp-config".to_owned(),
             "--mcp-config".to_owned(),
@@ -170,7 +170,9 @@ impl LaunchSpec {
                 arguments.push("--tools=".to_owned());
                 arguments.push("--safe-mode".to_owned());
                 arguments.push("--permission-prompts=none".to_owned());
-                arguments.push("--settings={\"disableAllHooks\":true}".to_owned());
+                arguments.push(
+                    "--settings={\"disableAllHooks\":true,\"autoMemoryEnabled\":false}".to_owned(),
+                );
             }
         }
         arguments
@@ -300,6 +302,7 @@ impl ClaudeLauncher for ProcessLauncher {
         command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
         // The CLI owns no background work, so no notification can start a turn on its own.
         command.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+        command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
         command.env(
             "CLAUDE_AGENT_SDK_CLIENT_APP",
             format!("forge/{}", env!("CARGO_PKG_VERSION")),

@@ -6,6 +6,8 @@ pub(super) fn apply(parameters: &mut Value) {
         parameters["config"] = json!({});
     }
     let config = &mut parameters["config"];
+    config["memories.use_memories"] = json!(false);
+    config["memories.generate_memories"] = json!(false);
     config["tools.experimental_request_user_input.enabled"] = json!(false);
     config["tools.update_plan.enabled"] = json!(false);
     config["features.goals"] = json!(false);

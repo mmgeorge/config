@@ -135,6 +135,7 @@ pub async fn open(
             config.working_directory = Some(options.workspace.clone());
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(false);
+            config.memory = Some(github_copilot_sdk::types::MemoryConfiguration::disabled());
             config.enable_on_demand_instruction_discovery = Some(!options.isolated_text);
             config.enable_skills = Some(true);
             config.mcp_servers = Some(Default::default());
@@ -195,6 +196,7 @@ pub async fn open(
             config.working_directory = Some(options.workspace.clone());
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(false);
+            config.memory = Some(github_copilot_sdk::types::MemoryConfiguration::disabled());
             config.enable_on_demand_instruction_discovery = Some(!options.isolated_text);
             config.enable_skills = Some(true);
             config.mcp_servers = Some(Default::default());
