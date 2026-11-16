@@ -25,8 +25,22 @@ function M.open_file(workspace, action)
     notifications.warn("Source file is no longer available: " .. path, "ForgeHarness")
     return
   end
+  local return_path = vim.api.nvim_buf_get_name(0)
   local opened, failure = pcall(vim.api.nvim_cmd, { cmd = "tabedit", args = { path } }, {})
   if not opened then notifications.error(failure, "ForgeHarness") return end
+  if return_path ~= "" then
+    vim.keymap.set("n", ",", function()
+      local returned, return_failure = pcall(vim.api.nvim_cmd, { cmd = "tabprevious" }, {})
+      if not returned then
+        notifications.error(return_failure, "ForgeHarness")
+        return
+      end
+      if vim.api.nvim_buf_get_name(0) ~= return_path then
+        local reopened, reopen_failure = pcall(vim.api.nvim_cmd, { cmd = "tabedit", args = { return_path } }, {})
+        if not reopened then notifications.error(reopen_failure, "ForgeHarness") end
+      end
+    end, { buffer = 0, desc = "Return to the Forge timeline" })
+  end
   local line = math.max(1, math.min(type(action.line) == "number" and action.line or 1, vim.api.nvim_buf_line_count(0)))
   local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
   local column = math.max(0, math.min(type(action.column) == "number" and action.column - 1 or 0, #text))
