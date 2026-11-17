@@ -631,6 +631,9 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) finalization: Option<Box<foreground_finalization::ForegroundFinalization>>,
     pub(crate) failure_cleanup_active: bool,
     pub(crate) failure_inbox_open: bool,
+    /// Whether failure settlement is collecting this exchange's children, so child commands
+    /// must keep waking the owner after its ordinary signal sources closed.
+    pub(crate) failure_child_collection: bool,
     pub(crate) failure: Option<foreground_failure::ForegroundFailure>,
     pub(crate) failure_secondary: Vec<String>,
 }
@@ -1689,6 +1692,10 @@ impl ForegroundTransaction {
                         Ok(()) => return Ok(ForegroundSignal::SessionObservationsReady),
                         Err(_) => { self.failure_inbox_open = false; continue; }
                     },
+                    changed = self.agent_revision.changed(), if self.failure_child_collection && !self.agent_command_active => {
+                        changed.context("agent coordinator closed during failure settlement")?;
+                        return Ok(ForegroundSignal::AgentChanged);
+                    }
                     else => std::future::pending::<()>().await,
                 }
                 continue;
@@ -4255,13 +4262,17 @@ impl HarnessBroker {
                 self.agent_provider_factory
                     .profiles
                     .resolve(Some(&agent.definition))?;
-                self.agent_coordinator.reserve_followup(
-                    &request,
-                    target,
-                    message,
-                    &admitted_parent.id,
-                    self.clock.now_ms(),
-                )?
+                self.agent_coordinator
+                    .reserve_followup(
+                        &request,
+                        target,
+                        message,
+                        &admitted_parent.id,
+                        self.clock.now_ms(),
+                    )
+                    .inspect_err(|error| {
+                        self.trace_child_lifecycle_failure("child_admission", error);
+                    })?
             }
         };
         let persisted = (|| -> Result<()> {
@@ -4274,6 +4285,7 @@ impl HarnessBroker {
             )
         })();
         if let Err(error) = persisted {
+            self.trace_child_lifecycle_failure("child_admission", &error);
             return Err(match admission.cancel() {
                 Ok(()) => error,
                 Err(cancellation) => {
@@ -4424,19 +4436,84 @@ impl HarnessBroker {
         .expect("registered session and agent identities are nonempty");
         let cancelled = self.agent_coordinator.interrupt(target)?;
         self.cancel_agent_approvals(&owner, event).await?;
-        for mut task in cancelled {
-            task.state = ExchangeState::Cancelled;
-            task.completed_at_ms = Some(self.clock.now_ms());
-            if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
+        for task in cancelled {
+            self.persist_queued_cancellation(&agent, task, QueuedTaskCancellation::Interrupted)?;
+        }
+        Ok(agent)
+    }
+
+    /// Record identifying metadata for typed child-lifecycle failures.
+    ///
+    /// Inspection keeps only allowlisted fields, so the identities travel as separate fields
+    /// rather than inside freeform error text that a later investigation could not read.
+    fn trace_child_lifecycle_failure(&self, operation: &str, error: &anyhow::Error) {
+        if let Some(unsettled) = error.downcast_ref::<crate::storage::DescendantUnsettled>() {
+            self.trace.record(
+                &self.session.id,
+                "exchange.descendant_unsettled",
+                json!({
+                    "operation": operation,
+                    "parent_exchange_id": unsettled.parent_exchange_id,
+                    "agent_id": unsettled.agent_id,
+                    "exchange_id": unsettled.exchange_id,
+                    "state": unsettled.state,
+                    "obligation": format!("{:?}", unsettled.obligation),
+                }),
+            );
+        } else if let Some(required) = error.downcast_ref::<crate::agent::ContinuationRequired>() {
+            self.trace.record(
+                &self.session.id,
+                "agent.continuation_required",
+                json!({
+                    "operation": operation,
+                    "agent_id": required.agent_id,
+                    "stopped_task_id": required.stopped_task_id.as_str(),
+                }),
+            );
+        }
+    }
+
+    /// Build the terminal record of an admitted task that never dispatched.
+    fn cancelled_queued_task(
+        &self,
+        mut task: crate::agent::AgentTask,
+        cancellation: QueuedTaskCancellation,
+    ) -> Result<(crate::agent::AgentTask, Option<Exchange>)> {
+        task.state = ExchangeState::Cancelled;
+        task.completed_at_ms = Some(self.clock.now_ms());
+        if let QueuedTaskCancellation::PrerequisiteStopped { stopped_task_id } = cancellation {
+            task.error = Some(format!(
+                "Cancelled before dispatch: prerequisite task {stopped_task_id} stopped and requires explicit user continuation"
+            ));
+            // The stopped task's own report carries the stop; reporting each cancelled
+            // follow-up again would require acknowledging a task the policy does not name.
+            task.parent_reported = true;
+        }
+        let exchange = match self.store.load_exchange(&task.id)? {
+            Some(mut exchange) => {
                 exchange.finish(
                     crate::exchange::ExchangeOutcome::Cancelled,
                     self.clock.now_ms(),
                 )?;
-                self.store.complete_agent_task(&agent, &task, &exchange)?;
+                Some(exchange)
             }
-            self.agent_coordinator.retain(agent.clone(), task)?;
+            None => None,
+        };
+        Ok((task, exchange))
+    }
+
+    /// Persist and retain the cancellation of one admitted task that never dispatched.
+    fn persist_queued_cancellation(
+        &mut self,
+        agent: &Agent,
+        task: crate::agent::AgentTask,
+        cancellation: QueuedTaskCancellation,
+    ) -> Result<()> {
+        let (task, exchange) = self.cancelled_queued_task(task, cancellation)?;
+        if let Some(exchange) = &exchange {
+            self.store.complete_agent_task(agent, &task, exchange)?;
         }
-        Ok(agent)
+        self.agent_coordinator.retain(agent.clone(), task)
     }
 
     /// Retry a flagged child's retained process cleanup and release its execution on success.
@@ -4446,7 +4523,7 @@ impl HarnessBroker {
             crate::provider::AgentId::new(agent.id.clone())?,
         )
         .expect("registered session and agent identities are nonempty");
-        if let Some(mut task) = self.agent_coordinator.cleanup_task(&agent.id) {
+        if let Some(task) = self.agent_coordinator.cleanup_task(&agent.id) {
             let provider = self
                 .child_provider_by_agent
                 .get(&agent.id)
@@ -4458,27 +4535,7 @@ impl HarnessBroker {
             })
             .await
             .context("child cleanup retry exceeded 30 seconds")??;
-            let mut agent = agent;
-            agent.state = AgentState::Ready;
-            agent.updated_at_ms = self.clock.now_ms();
-            task.error = None;
-            let mut exchange = self
-                .store
-                .load_exchange(&task.id)?
-                .context("child cleanup exchange missing")?;
-            exchange.finalization_error = None;
-            self.store.complete_agent_task(&agent, &task, &exchange)?;
-            self.agent_registry.insert(agent.clone());
-            self.agent_coordinator.retain(agent, task.clone())?;
-            self.agent_coordinator.settled(
-                owner.agent_id().as_str(),
-                &task.id,
-                crate::agent::AgentSettlementDisposition::Ready,
-            )?;
-            self.child_provider_by_agent
-                .remove(owner.agent_id().as_str());
-            self.child_execution_by_agent
-                .remove(owner.agent_id().as_str());
+            self.release_child_cleanup(agent, task)?;
         }
         Ok(())
     }
@@ -4608,6 +4665,9 @@ impl HarnessBroker {
                 let sender = self.agent_coordinator.sender();
                 let task_id = admission.task.id;
                 tokio::spawn(async move {
+                    // The runtime reports its own completion, collecting any provider it
+                    // started. It fails only before acquiring resources or when that report
+                    // cannot be delivered, so this fallback carries no cleanup obligation.
                     if let Err(error) = runtime.run().await {
                         let _ = sender
                             .send(crate::agent::AgentCommand::Completed {
@@ -4615,9 +4675,7 @@ impl HarnessBroker {
                                 task_id,
                                 output: Box::new(Err(error)),
                                 host_file_changes: Vec::new(),
-                                cleanup_error: Some(
-                                    "child event delivery or cleanup failed".into(),
-                                ),
+                                cleanup_error: None,
                             })
                             .await;
                     }
@@ -5116,9 +5174,9 @@ impl HarnessBroker {
         let provider_cancelled = output
             .as_ref()
             .is_err_and(|error| error.is::<TurnCancelled>());
-        task.error = cleanup_error
-            .clone()
-            .or_else(|| output.as_ref().err().map(|error| format!("{error:#}")));
+        // The task keeps the child's own outcome; a cleanup failure is a separate obligation
+        // recorded on the exchange, so a later cleanup retry cannot erase the original cause.
+        task.error = output.as_ref().err().map(|error| format!("{error:#}"));
         task.completed_at_ms = Some(self.clock.now_ms());
         if let Ok(output) = &output {
             agent.provider_thread_id = output
@@ -5153,9 +5211,7 @@ impl HarnessBroker {
                 }
             }
         }
-        task.state = if cleanup_error.is_some() {
-            ExchangeState::Failed
-        } else if output.is_err() {
+        task.state = if output.is_err() {
             if provider_cancelled || interrupted {
                 ExchangeState::Cancelled
             } else {
@@ -5239,17 +5295,44 @@ impl HarnessBroker {
             task.state,
             ExchangeState::Interrupted | ExchangeState::Cancelled | ExchangeState::Failed
         ) || self.requires_explicit_continuation(&exchange)?;
+        let mut cancelled_followups = Vec::new();
         if requires_authorization {
             agent.continuation = crate::agent::AgentContinuationPolicy::RequiresAuthorization {
                 task_id: task.id.clone().into(),
             };
+            // Follow-ups already queued behind this task can never launch without a user grant,
+            // so they settle now rather than holding their parent's delegation tree open.
+            for queued in self
+                .agent_coordinator
+                .queued_followups(owner.agent_id().as_str())
+            {
+                let (queued, queued_exchange) = self.cancelled_queued_task(
+                    queued,
+                    QueuedTaskCancellation::PrerequisiteStopped {
+                        stopped_task_id: task.id.clone(),
+                    },
+                )?;
+                cancelled_followups.push((
+                    queued,
+                    queued_exchange.context("queued child follow-up has no exchange")?,
+                ));
+            }
         }
-        self.store.complete_agent_task(&agent, &task, &exchange)?;
+        let mut outcomes = vec![(&task, &exchange)];
+        outcomes.extend(
+            cancelled_followups
+                .iter()
+                .map(|(queued, queued_exchange)| (queued, queued_exchange)),
+        );
+        self.store.complete_agent_tasks(&agent, &outcomes)?;
         for change in &exchange.host_file_changes {
             change.recorded()?;
         }
         self.agent_registry.insert(agent.clone());
         self.agent_coordinator.retain(agent.clone(), task.clone())?;
+        for (queued, _) in cancelled_followups {
+            self.agent_coordinator.retain(agent.clone(), queued)?;
+        }
         let next = self.agent_coordinator.settled(
             owner.agent_id().as_str(),
             &task_id,
@@ -6607,14 +6690,12 @@ impl HarnessBroker {
         else {
             return Ok((json!({"cancel_requested": true}), Vec::new()));
         };
-        let descendants: Vec<_> = referenced_child_exchange_list(&exchange)
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
         if let Err(error) = self
             .store
-            .require_settled_exchange_tree(&self.session.id, &descendants)
+            .require_settled_descendants(&exchange)
+            .context("finalization retry requires settled child work")
         {
+            self.trace_child_lifecycle_failure("finalization_retry", &error);
             exchange.finalization_error = Some(format!("{error:#}"));
             self.store.save_exchange(&exchange)?;
             return Err(error);
@@ -6657,12 +6738,9 @@ impl HarnessBroker {
                     self.refresh_settlement(interaction, scope).await?;
                 }
                 let outcome = interaction.finalization_outcome().unwrap_or(outcome);
-                let descendants: Vec<_> = referenced_child_exchange_list(interaction)
-                    .into_iter()
-                    .map(|(_, id)| id)
-                    .collect();
                 self.store
-                    .require_settled_exchange_tree(&self.session.id, &descendants)?;
+                    .require_settled_descendants(interaction)
+                    .context("checkpoint save requires settled child work")?;
                 if outcome == crate::exchange::ExchangeOutcome::Cancelled
                     && let Some(runtime) = self.exchange_runtime.as_mut().filter(|runtime| {
                         runtime.exchange_id == interaction.id && runtime.tools_blocked()
@@ -7751,13 +7829,17 @@ impl HarnessBroker {
                     self.agent_provider_factory
                         .profiles
                         .resolve(Some(&agent.definition))?;
-                    self.agent_coordinator.reserve_followup(
-                        &owned.request,
-                        target,
-                        message,
-                        &parent.id,
-                        self.clock.now_ms(),
-                    )?
+                    self.agent_coordinator
+                        .reserve_followup(
+                            &owned.request,
+                            target,
+                            message,
+                            &parent.id,
+                            self.clock.now_ms(),
+                        )
+                        .inspect_err(|error| {
+                            self.trace_child_lifecycle_failure("child_admission", error);
+                        })?
                 }
                 _ => anyhow::bail!("child admission has another operation"),
             };
@@ -7769,6 +7851,7 @@ impl HarnessBroker {
                     admission.continuation_authorization(),
                 )
             }) {
+                self.trace_child_lifecycle_failure("child_admission", &error);
                 return Err(match admission.cancel() {
                     Ok(()) => error,
                     Err(cancel) => error.context(format!("release child reservation: {cancel:#}")),
@@ -7888,7 +7971,7 @@ impl HarnessBroker {
         item: AgentInterruptItem,
     ) -> Result<Vec<AppliedProviderEvent>> {
         let AgentInterruptItem {
-            mut agent,
+            agent,
             owner,
             cancelled,
             cleanup,
@@ -7935,7 +8018,7 @@ impl HarnessBroker {
                 update: Box::new(approval_cancelled(&approval, self.clock.now_ms())?),
             }));
         }
-        for mut task in cancelled {
+        for task in cancelled {
             let current = self
                 .agent_coordinator
                 .task(&task.id)
@@ -7944,18 +8027,9 @@ impl HarnessBroker {
                 serde_json::to_value(&current)? == serde_json::to_value(&task)?,
                 "interrupted queued task changed during cleanup"
             );
-            task.state = ExchangeState::Cancelled;
-            task.completed_at_ms = Some(self.clock.now_ms());
-            if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
-                exchange.finish(
-                    crate::exchange::ExchangeOutcome::Cancelled,
-                    self.clock.now_ms(),
-                )?;
-                self.store.complete_agent_task(&agent, &task, &exchange)?;
-            }
-            self.agent_coordinator.retain(agent.clone(), task)?;
+            self.persist_queued_cancellation(&agent, task, QueuedTaskCancellation::Interrupted)?;
         }
-        if let Some(mut task) = cleanup.filter(|_| cleanup_succeeded) {
+        if let Some(task) = cleanup.filter(|_| cleanup_succeeded) {
             let current = self
                 .agent_coordinator
                 .cleanup_task(&agent.id)
@@ -7964,28 +8038,39 @@ impl HarnessBroker {
                 serde_json::to_value(&current)? == serde_json::to_value(&task)?,
                 "child cleanup obligation changed during cleanup"
             );
-            agent.state = AgentState::Ready;
-            agent.updated_at_ms = self.clock.now_ms();
-            task.error = None;
-            let mut exchange = self
-                .store
-                .load_exchange(&task.id)?
-                .context("child cleanup exchange missing")?;
-            exchange.finalization_error = None;
-            self.store.complete_agent_task(&agent, &task, &exchange)?;
-            self.agent_registry.insert(agent.clone());
-            self.agent_coordinator.retain(agent, task.clone())?;
-            self.agent_coordinator.settled(
-                owner.agent_id().as_str(),
-                &task.id,
-                crate::agent::AgentSettlementDisposition::Ready,
-            )?;
-            self.child_provider_by_agent
-                .remove(owner.agent_id().as_str());
-            self.child_execution_by_agent
-                .remove(owner.agent_id().as_str());
+            self.release_child_cleanup(agent, task)?;
         }
         Ok(effects)
+    }
+
+    /// Release a collected child's retained cleanup obligation and its execution slot.
+    ///
+    /// Only the collection failure clears: the task keeps its original error, state, and the
+    /// continuation policy bound to it, because cleanup success says nothing about the turn.
+    fn release_child_cleanup(
+        &mut self,
+        mut agent: Agent,
+        task: crate::agent::AgentTask,
+    ) -> Result<()> {
+        agent.state = AgentState::Ready;
+        agent.updated_at_ms = self.clock.now_ms();
+        let mut exchange = self
+            .store
+            .load_exchange(&task.id)?
+            .context("child cleanup exchange missing")?;
+        exchange.finalization_error = None;
+        self.store.complete_agent_task(&agent, &task, &exchange)?;
+        self.agent_registry.insert(agent.clone());
+        let agent_id = agent.id.clone();
+        self.agent_coordinator.retain(agent, task.clone())?;
+        self.agent_coordinator.settled(
+            &agent_id,
+            &task.id,
+            crate::agent::AgentSettlementDisposition::Ready,
+        )?;
+        self.child_provider_by_agent.remove(&agent_id);
+        self.child_execution_by_agent.remove(&agent_id);
+        Ok(())
     }
     /// Acknowledge only the exact child result sent to this invocation.
     pub(crate) fn apply_foreground_agent_result(
@@ -10078,14 +10163,16 @@ impl HarnessBroker {
                 .all(|exchange| exchange.is_finished()),
             "rollback requires settled exchanges"
         );
-        self.store.require_settled_exchange_tree(
-            &self.session.id,
-            &interaction
-                .iter()
-                .skip(target_index)
-                .map(|exchange| exchange.id.clone())
-                .collect::<Vec<_>>(),
-        )?;
+        self.store
+            .require_settled_exchange_tree(
+                &self.session.id,
+                &interaction
+                    .iter()
+                    .skip(target_index)
+                    .map(|exchange| exchange.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .context("rollback requires settled child work")?;
         let expected_id = interaction
             .iter()
             .rev()
@@ -10193,7 +10280,8 @@ impl HarnessBroker {
             );
             self.native_rewind(&exchanges, position)?;
             self.store
-                .require_settled_exchange_tree(&self.session.id, &preview.exchange_ids)?;
+                .require_settled_exchange_tree(&self.session.id, &preview.exchange_ids)
+                .context("rollback requires settled child work")?;
         }
         let journal = GitCheckpoint::new(&preview.workspace)
             .apply_preview(
@@ -10273,7 +10361,8 @@ impl HarnessBroker {
             .map(|exchange| exchange.id.clone())
             .collect::<Vec<_>>();
         self.store
-            .require_settled_exchange_tree(&self.session.id, &ids)?;
+            .require_settled_exchange_tree(&self.session.id, &ids)
+            .context("rollback requires settled child work")?;
         let events = self.finish_conversation_rollback(&ids).await?;
         Ok((json!({"restored":true,"scope":"conversation"}), events))
     }
@@ -10381,13 +10470,15 @@ impl HarnessBroker {
                 }) {
                     self.native_rewind(&exchange, position)?;
                 }
-                self.store.require_settled_exchange_tree(
-                    &self.session.id,
-                    &exchange
-                        .iter()
-                        .map(|exchange| exchange.id.clone())
-                        .collect::<Vec<_>>(),
-                )?;
+                self.store
+                    .require_settled_exchange_tree(
+                        &self.session.id,
+                        &exchange
+                            .iter()
+                            .map(|exchange| exchange.id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .context("rollback requires settled child work")?;
                 let journal = GitCheckpoint::new(&journal.preview.workspace)
                     .apply_preview(
                         Arc::clone(&self.repositories),
@@ -11083,6 +11174,15 @@ fn attribute_provider_tool(
         exchange.checklist = Some(checklist.snapshot().clone());
     }
     Ok(())
+}
+
+/// Distinguish why an admitted child task ends before it ever dispatched.
+enum QueuedTaskCancellation {
+    /// An explicit interrupt or a collecting transition cancelled it; the parent receives its
+    /// report like any other stopped task.
+    Interrupted,
+    /// Its child stopped on an earlier task that requires explicit user continuation.
+    PrerequisiteStopped { stopped_task_id: String },
 }
 
 /// Report every failure of a multi-target operation, keeping a lone failure's original error.

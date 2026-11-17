@@ -316,6 +316,9 @@ struct RepositorySessionProcess {
 
 impl forge_shell::process::ProcessOwner for RepositorySessionProcess {
     /// Admit provider startup under its enclosing reservation before any native child exists.
+    ///
+    /// Startup runs at the reservation's own level, so a provider can start under a shared
+    /// reader reservation; source writers still borrow `Write` and are refused there.
     fn spawn(
         &self,
         command: tokio::process::Command,
@@ -325,8 +328,18 @@ impl forge_shell::process::ProcessOwner for RepositorySessionProcess {
             .state
             .lock()
             .map_err(|_| std::io::Error::other("repository execution state lock poisoned"))?;
+        let access = state
+            .levels
+            .iter()
+            .find(|level| level.id == self.id)
+            .map(|level| level.access)
+            .ok_or_else(|| {
+                std::io::Error::other(RepositoryAccessError::Expired(
+                    (*self.core.workspace).clone(),
+                ))
+            })?;
         state
-            .authorize(self.id, RepositoryAccess::Write, &self.core.workspace)
+            .authorize(self.id, access, &self.core.workspace)
             .map_err(std::io::Error::other)?;
         self.core
             .journal()

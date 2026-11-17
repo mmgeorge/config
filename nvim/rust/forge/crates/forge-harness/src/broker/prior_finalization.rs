@@ -126,14 +126,12 @@ impl HarnessBroker {
             .exchange
             .finalization_outcome()
             .context("prior finalization outcome is missing")?;
-        let descendants: Vec<_> = referenced_child_exchange_list(&state.exchange)
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
         if let Err(error) = self
             .store
-            .require_settled_exchange_tree(&self.session.id, &descendants)
+            .require_settled_descendants(&state.exchange)
+            .context("prior exchange finalization requires settled child work")
         {
+            self.trace_child_lifecycle_failure("prior_finalization", &error);
             state.exchange.finalization_error = Some(format!("{error:#}"));
             self.store.save_exchange(&state.exchange)?;
             return Err(error);

@@ -312,13 +312,10 @@ impl ForegroundFinalization {
             .finalization_outcome()
             .context("exchange has no finalization outcome")?;
         if broker.checkpoint.is_none() {
-            let descendants: Vec<_> = referenced_child_exchange_list(exchange)
-                .into_iter()
-                .map(|(_, id)| id)
-                .collect();
             broker
                 .store
-                .require_settled_exchange_tree(&broker.session.id, &descendants)?;
+                .require_settled_descendants(exchange)
+                .context("exchange finalization requires settled child work")?;
             let mut changes = crate::exchange::ProviderDiffBuilder::default();
             broker.visit_provider_exchanges(exchange, |item| changes.record(item))?;
             exchange.attributed_diff_text = changes.finish();

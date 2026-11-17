@@ -9,7 +9,8 @@
       "model": "gpt-6-luna",
       "reasoning_effort": "low",
       "service_tier": "fast",
-      "approval_mode": "inherit"
+      "approval_mode": "inherit",
+      "write_access": "off"
     },
     "code-writer": {
       "enabled": true,
@@ -29,7 +30,8 @@
       "model": "gpt-6-luna",
       "reasoning_effort": "low",
       "service_tier": "fast",
-      "approval_mode": "inherit"
+      "approval_mode": "inherit",
+      "write_access": "off"
     },
     "reviewer": {
       "enabled": false,
@@ -39,7 +41,8 @@
       "model": "inherit",
       "reasoning_effort": "inherit",
       "service_tier": "inherit",
-      "approval_mode": "inherit"
+      "approval_mode": "inherit",
+      "write_access": "off"
     },
     "worker": {
       "enabled": true,

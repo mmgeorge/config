@@ -20,6 +20,23 @@ pub(crate) struct ForegroundFailure {
     admission_events: Vec<SessionEvent>,
     baseline_cleanup: FailureBaselinePhase,
     settlement_commit: FailureSettlementCommit,
+    child_collection: FailureChildCollection,
+}
+
+/// Track collection of the failed exchange's own children before its terminal checkpoint.
+///
+/// The checkpoint's descendant guard rejects an unfinished child, and no later event would
+/// finish one that failure settlement neither interrupts nor services, so the parent stayed
+/// finalizing until a later prompt found the same child.
+enum FailureChildCollection {
+    /// No child of this exchange has been interrupted yet.
+    Unrequested,
+    /// The interrupt job reports its outcome here; children then settle through their own
+    /// completions.
+    Requested(tokio::sync::oneshot::Receiver<Result<Value>>),
+    /// The interrupt failed. The checkpoint guard then reports the remaining child with its
+    /// identity, and a later finalization retry finds it again.
+    Abandoned,
 }
 
 /// Track who returns a failed invocation's native settlement to its execution owner.
@@ -606,6 +623,8 @@ impl HarnessBroker {
                     admission_events: Vec::new(),
                     baseline_cleanup: FailureBaselinePhase::Unexamined,
                     settlement_commit: FailureSettlementCommit::Closed,
+                    // A rejected admission never ran a provider turn that could delegate.
+                    child_collection: FailureChildCollection::Abandoned,
                 });
                 Ok(ForegroundAction::WaitForPublicationDrain)
             }
@@ -1027,6 +1046,7 @@ impl HarnessBroker {
                 admission_events: Vec::new(),
                 baseline_cleanup: FailureBaselinePhase::Unexamined,
                 settlement_commit,
+                child_collection: FailureChildCollection::Unrequested,
             });
         }
         if let Err(error) = self.collect_foreground_observations(transaction) {
@@ -1073,6 +1093,9 @@ impl HarnessBroker {
             || transaction.observation_publication_in_flight
         {
             return Ok(ForegroundAction::Wait);
+        }
+        if let Some(action) = self.collect_failed_exchange_children(transaction)? {
+            return Ok(action);
         }
         // Restoration deletes the exchange as if the provider never saw its prompt. A collection
         // that failed proves nothing about what the provider consumed, so the exchange stays.
@@ -1326,6 +1349,78 @@ impl HarnessBroker {
             }
         }
         self.prepare_foreground_failure_publication(admission)
+    }
+
+    /// Interrupt and await this failed exchange's unfinished children before its checkpoint.
+    ///
+    /// Returns the action that keeps failure settlement waiting, or `None` once no child of the
+    /// exchange remains unfinished or collection was abandoned. The interrupt reuses the
+    /// foreground child-interrupt job, which persists cancelled queued tasks and flags running
+    /// children; each running child then reports its own completion, which this owner services
+    /// while `failure_child_collection` keeps child commands waking it.
+    fn collect_failed_exchange_children(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+    ) -> Result<Option<ForegroundAction>> {
+        let parent_exchange_id = transaction.state.interaction.id.clone();
+        let unfinished = if transaction.state.interaction.is_finished() {
+            Vec::new()
+        } else {
+            self.agent_coordinator
+                .unfinished_task_agents(&parent_exchange_id)
+        };
+        let failure = transaction
+            .failure
+            .as_mut()
+            .expect("child collection runs only during failure settlement");
+        if unfinished.is_empty()
+            || matches!(failure.child_collection, FailureChildCollection::Abandoned)
+        {
+            transaction.failure_child_collection = false;
+            return Ok(None);
+        }
+        if let FailureChildCollection::Requested(receiver) = &mut failure.child_collection {
+            let error = match receiver.try_recv() {
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) | Ok(Ok(_)) => {
+                    return Ok(Some(ForegroundAction::Wait));
+                }
+                Ok(Err(error)) => error,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    anyhow::anyhow!("child interrupt ended without reporting")
+                }
+            };
+            failure
+                .secondary
+                .push(format!("collect failed exchange children: {error:#}"));
+            failure.child_collection = FailureChildCollection::Abandoned;
+            transaction.failure_child_collection = false;
+            return Ok(None);
+        }
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        failure.child_collection = FailureChildCollection::Requested(receiver);
+        transaction.failure_child_collection = true;
+        let request = OwnedAgentRequest {
+            request: crate::agent::AgentRequest {
+                operation_id: format!("{parent_exchange_id}:failure-collect-children"),
+                source: crate::agent::AgentSource::User,
+                operation: crate::agent::AgentOperation::InterruptAll,
+            },
+            authority: None,
+            target: None,
+            response,
+            parent_id: parent_exchange_id,
+            task_admission: None,
+        };
+        let action = self.prepare_foreground_agent_interrupt(
+            unfinished,
+            request,
+            json!({"status":"interrupting"}),
+        )?;
+        transaction.agent_command_active = matches!(
+            &action,
+            ForegroundAction::Effect(ForegroundJob::AgentInterrupt { .. })
+        );
+        Ok(Some(action))
     }
 
     /// Apply collection or cancellation proof only to the failed exchange that owns the baseline.

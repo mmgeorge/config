@@ -87,6 +87,8 @@ Adapters suppress native workflow tools before model execution so questions, age
 
 Codex applies one shared workflow configuration to open, resume, replacement, fork, and turn requests. It disables native structured questions, plan tracking, goals, and agent tools. It also disables the `send_message_to_user_async` feature flag, but Codex 0.164–0.169 independently enables that tool when model metadata advertises it; the public app-server configuration therefore cannot guarantee its removal. The adapter does not replace model metadata or claim complete suppression of native user messaging. Antigravity's tool policy is unchanged.
 
+The same policy sets `features.multi_agent_v2.multi_agent_mode_hint_text` to an empty string. Codex 0.169 otherwise appends a prerequisite to read a hosted multi-agent skill when native agent tools are hidden, although Harness supplies its own `agent_*` tools without that skill. Codex treats the empty override as an instruction to omit its multi-agent mode block, leaving delegation guidance to Harness and the selected project instructions.
+
 Codex turn requests explicitly set `summary: "concise"` so the status preview does
 not depend on the model catalog's reasoning-summary default. The adapter maps
 `item/reasoning/summaryTextDelta` to readable summaries and keeps raw reasoning

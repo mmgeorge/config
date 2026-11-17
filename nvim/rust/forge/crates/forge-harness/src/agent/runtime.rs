@@ -30,22 +30,52 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     /// Forward owned observations through shutdown before reporting the child's completion.
+    ///
+    /// Every admitted task reports exactly one completion. A task that ends before repository
+    /// admission acquired no provider resources and completes with nothing to collect; once
+    /// admission succeeds, every failure still runs provider shutdown and collection, so an early
+    /// error can neither leak a provider nor be mistaken for a cleanup failure. The returned error
+    /// reports only a failure to deliver that completion, or a request with no child owner.
     pub async fn run(mut self) -> Result<()> {
         let owner = self.request.owner()?;
         anyhow::ensure!(
             !owner.is_root(),
             "child runtime cannot own the root conversation"
         );
-        let repository = self
+        let access = super::repository_access(&self.request.access);
+        let repository = match self
             .sender
             .repository_admit(
                 &owner,
                 &self.task_id,
                 self.trace.root(),
                 std::path::Path::new(&self.request.workspace),
+                access,
                 self.cancellation.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(repository) => repository,
+            Err(error) => {
+                drop(self.lsp_lease.take());
+                let output = if *self.cancellation.borrow() {
+                    Err(anyhow::Error::new(crate::broker::TurnCancelled)
+                        .context("child task cancelled before repository admission"))
+                } else {
+                    Err(error.context("child repository admission failed"))
+                };
+                return self
+                    .sender
+                    .send(AgentCommand::Completed {
+                        owner,
+                        task_id: self.task_id.clone(),
+                        output: Box::new(output),
+                        host_file_changes: Vec::new(),
+                        cleanup_error: None,
+                    })
+                    .await;
+            }
+        };
         let context = self
             .request
             .control_context
@@ -54,34 +84,54 @@ impl AgentRuntime {
         context.repository_process = Some(repository.process_owner());
         // Subscribe before dispatch so retained child observations keep their original owner.
         let scope = crate::provider::InvocationScope::new(owner.clone(), self.task_id.clone());
-        let engine = self.execution_registry.owner(owner.clone()).await?;
-        let (session_sink, event_stream) = engine.session_observer().await?;
-        let event_sink = session_sink.invocation_sink(&scope)?;
-        let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
-            self.tool_timeout,
-        )?);
-        let event_sink = event_sink.with_observer(watchdog.clone());
-        let mut events = ChildObservation {
-            stream: Some(event_stream),
-            owner: owner.clone(),
-            native_outcome: None,
-        };
         let physical_changes = self
             .request
             .control_context
             .as_ref()
             .map(|context| context.provider_completion.clone());
-        let mut request = self.request.clone();
-        let mut cancelled = *self.cancellation.borrow();
-        let retry_admission =
-            crate::provider::retry::RetryAdmission::new(self.cancellation.clone());
-        // Run foreground work while consuming the owner's single ordered stream.
-        let mut output = {
+        let mut events = ChildObservation {
+            stream: None,
+            owner: owner.clone(),
+            native_outcome: None,
+        };
+        // Retain the engine through collection, as the dispatch loop's owner did before.
+        let mut retained_engine = None;
+        let mut output: Result<ProviderCompletion> = 'execution: {
+            let engine = match self.execution_registry.owner(owner.clone()).await {
+                Ok(engine) => engine,
+                Err(error) => break 'execution Err(error.into()),
+            };
+            retained_engine = Some(engine.clone());
+            let (session_sink, event_stream) = match engine.session_observer().await {
+                Ok(observer) => observer,
+                Err(error) => break 'execution Err(error.into()),
+            };
+            events.stream = Some(event_stream);
+            let event_sink = match session_sink.invocation_sink(&scope) {
+                Ok(sink) => sink,
+                Err(error) => break 'execution Err(error.into()),
+            };
+            let watchdog = match crate::provider::tool_timeout::ToolWatchdog::new(self.tool_timeout)
+            {
+                Ok(watchdog) => Arc::new(watchdog),
+                Err(error) => break 'execution Err(error),
+            };
+            let event_sink = event_sink.with_observer(watchdog.clone());
+            let mut request = self.request.clone();
+            let mut cancelled = *self.cancellation.borrow();
+            let retry_admission =
+                crate::provider::retry::RetryAdmission::new(self.cancellation.clone());
+            // Run foreground work while consuming the owner's single ordered stream.
             loop {
                 if request.submission.is_none() {
                     request.submission = Some(
-                        self.submission_store
-                            .prepare(&request, self.provider.descriptor().kind)?,
+                        match self
+                            .submission_store
+                            .prepare(&request, self.provider.descriptor().kind)
+                        {
+                            Ok(submission) => submission,
+                            Err(error) => break 'execution Err(error),
+                        },
                     );
                 }
                 let result = async {
@@ -153,22 +203,27 @@ impl AgentRuntime {
                 cancelled |= result
                     .as_ref()
                     .is_err_and(|error| error.is::<crate::broker::TurnCancelled>());
-                if (cancelled || result.is_err())
-                    && let Some(submission) = &request.submission
-                {
-                    submission.cancel()?;
-                }
                 if cancelled || result.is_err() {
-                    break result;
+                    let mut result = result;
+                    if let Some(submission) = &request.submission
+                        && let Err(error) = submission.cancel()
+                    {
+                        preserve_child_failure(&mut result, error);
+                    }
+                    break 'execution result;
                 }
-                events.drain(&self, &owner).await?;
+                if let Err(error) = events.drain(&self, &owner).await {
+                    break 'execution Err(error);
+                }
                 if !events.native_outcome.is_some_and(
                     forge_provider_api::turn::TurnOutcome::permits_automatic_continuation,
                 ) {
-                    break result;
+                    break 'execution result;
                 }
-                let Some(feedback) = self.permission.take_timeout_feedback(&owner)? else {
-                    break result;
+                let feedback = match self.permission.take_timeout_feedback(&owner) {
+                    Ok(Some(feedback)) => feedback,
+                    Ok(None) => break 'execution result,
+                    Err(error) => break 'execution Err(error),
                 };
                 if let Ok(output) = &result
                     && output.provider_session_id.is_some()
@@ -187,7 +242,6 @@ impl AgentRuntime {
                 request.recovered_input.clear();
             }
         };
-        drop(event_sink);
         drop(self.lsp_lease.take());
         // Read identity already published by open or the ordered binding stream.
         let retained = self.provider.retained_session_id(&owner).await;
@@ -235,7 +289,8 @@ impl AgentRuntime {
             Ok(failure) => Some(failure.join("\n")),
             Err(_) => Some("child cleanup exceeded 30 seconds".to_owned()),
         };
-        self.sender
+        let delivered = self
+            .sender
             .send(AgentCommand::Completed {
                 owner,
                 task_id: self.task_id.clone(),
@@ -244,7 +299,9 @@ impl AgentRuntime {
                     .map_or_else(Vec::new, |slot| slot.collected_file_changes()),
                 cleanup_error,
             })
-            .await
+            .await;
+        drop(retained_engine);
+        delivered
     }
 
     async fn publish(&self, owner: &ThreadOwner, event: OwnerObservation) -> Result<()> {

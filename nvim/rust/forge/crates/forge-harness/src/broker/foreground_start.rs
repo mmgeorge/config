@@ -269,6 +269,7 @@ impl HarnessBroker {
             finalization: None,
             failure_cleanup_active: false,
             failure_inbox_open: false,
+            failure_child_collection: false,
             failure: None,
             failure_secondary: Vec::new(),
         })

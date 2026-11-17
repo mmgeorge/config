@@ -265,6 +265,15 @@ async fn check_result_reaches_mock_provider_while_user_queue_is_paused() -> Resu
         ),
         2,
     )?;
+    // A response renders only once the provider completes it.
+    exchange.observe_event(
+        &crate::turn::test_support::message_completed(
+            &address,
+            "pending-response",
+            "Checks are pending.",
+        ),
+        2,
+    )?;
     exchange.observe_event(
         &crate::turn::test_support::completed_event(
             &address,

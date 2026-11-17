@@ -135,7 +135,8 @@ impl HarnessBroker {
             .map(|exchange| exchange.id.clone())
             .collect::<Vec<_>>();
         self.store
-            .require_settled_exchange_tree(&self.session.id, &ids)?;
+            .require_settled_exchange_tree(&self.session.id, &ids)
+            .context("rollback requires settled child work")?;
         let native = self.native_rewind(&exchanges, position)?;
         Ok(ConversationRewind {
             session_id: self.session.id.clone(),
@@ -173,7 +174,8 @@ impl HarnessBroker {
             "conversation changed during conversation rewind"
         );
         self.store
-            .require_settled_exchange_tree(&self.session.id, &rewind.exchanges)?;
+            .require_settled_exchange_tree(&self.session.id, &rewind.exchanges)
+            .context("rollback requires settled child work")?;
         let mut session = self.session.clone();
         session.active_task = None;
         self.apply_rewound_conversation(&mut session, rewind.native.as_ref())?;

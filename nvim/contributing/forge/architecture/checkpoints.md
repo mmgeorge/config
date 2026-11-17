@@ -20,7 +20,7 @@ Acquisition failure or the 25-second barrier deadline denies tool execution. If 
 
 ## Change attribution
 
-At terminal capture, `ProviderChangeIndex` collects paths from successful structured file changes in the main timeline and every child-agent turn. The comparer produces a diff restricted to those paths and a full checkpoint diff, both from the same baseline-to-terminal comparison, so repeated edits and reversions collapse into one patch. The full comparison supplies the exchange's **Edits** summary, which can include command, formatter, child, and external edits. Provider attribution stays internal and never claims exclusive authorship. Non-Git exchanges keep provider-reported edits without any checkpoint or rollback.
+At terminal capture, `ProviderChangeIndex` collects paths from successful structured file changes in the main timeline and every child-agent turn. The comparer produces a diff restricted to those paths and a full checkpoint diff, both from the same baseline-to-terminal comparison, so repeated edits and reversions collapse into one patch. The full comparison supplies the exchange's **Edits** summary, which can include command, formatter, child, and external edits. Provider attribution stays internal and never claims exclusive authorship. Non-Git exchanges keep provider-reported edits without any checkpoint or rollback. Capture and commit both require every delegated child exchange to be terminal through `SqliteStore::require_settled_descendants`, and the non-Git finalization path enforces the same guard, so a checkpoint never freezes a workspace that a child may still change; commit repeats the check against stale observations.
 
 ## Comparison
 

@@ -36,6 +36,17 @@ pub struct AgentProfile {
     pub service_tier: String,
     #[serde(default = "inherit")]
     pub approval_mode: String,
+    /// `off` denies the child reported writes and lets write-off children share the repository;
+    /// `inherit` keeps the root's write scope. It can only narrow the root, never widen it.
+    #[serde(default = "inherit")]
+    pub write_access: String,
+}
+
+impl AgentProfile {
+    /// Report whether this profile removes the child's write authority.
+    pub fn denies_writes(&self) -> bool {
+        self.write_access == "off"
+    }
 }
 
 impl Default for AgentProfile {
@@ -49,6 +60,7 @@ impl Default for AgentProfile {
             reasoning_effort: inherit(),
             service_tier: inherit(),
             approval_mode: inherit(),
+            write_access: inherit(),
         }
     }
 }
@@ -124,6 +136,10 @@ impl AgentProfileDocument {
                     "inherit" | "ask" | "deny" | "allow"
                 ),
                 "profile {name} has an unsupported approval_mode"
+            );
+            ensure!(
+                matches!(profile.write_access.as_str(), "inherit" | "off"),
+                "profile {name} has an unsupported write_access; expected inherit or off"
             );
         }
         Ok(())

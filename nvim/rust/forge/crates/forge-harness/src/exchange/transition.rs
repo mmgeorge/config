@@ -358,8 +358,10 @@ impl ExchangeStop {
                     ChildCollectionPolicy::Preserve => None,
                 },
             };
+            // Queued launches hold no execution slot but remain admitted work, so collection
+            // must cancel them as well; only a coordinator with no admitted work skips it.
             if matches!(child_policy, ChildCollectionPolicy::Preserve)
-                || children.active_count() == 0
+                || !children.collection_count().has_work()
             {
                 return Acquisition::Ready(ownership);
             }
@@ -1544,7 +1546,7 @@ async fn children_settled(
 ) -> anyhow::Result<()> {
     loop {
         let count = children.collection_count();
-        if count.running == 0 {
+        if count.running == 0 && count.queued == 0 {
             anyhow::ensure!(
                 count.cleanup_failed == 0,
                 "{} child agent cleanup failed during collection",
@@ -1651,5 +1653,71 @@ mod tests {
             settled.is_err(),
             "failed child cleanup must leave collection uncertain"
         );
+    }
+
+    /// Collect a queued launch that holds no execution slot.
+    ///
+    /// Collection previously skipped the interrupt whenever no slot was occupied, so admitted
+    /// work waiting for a launch outlived the cancellation that should have settled it.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_collects_pending_children_without_execution_slots() {
+        let coordinator = AgentCoordinator::new("root".into());
+        let spawn = SpawnAgentRequest {
+            profile: Some("review".into()),
+            text: "bounded task".into(),
+        };
+        let request = AgentRequest {
+            operation_id: "queued-child".into(),
+            source: AgentSource::User,
+            operation: AgentOperation::Spawn(spawn.clone()),
+        };
+        let selection = AgentSelection {
+            profile: "worker".into(),
+            instructions: String::new(),
+            provider: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            model: "model".into(),
+            reasoning_effort: "low".into(),
+            context_window: None,
+            service_tier: crate::provider::ServiceTier::Standard,
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+        };
+        let admission = coordinator
+            .reserve_spawn(&request, &spawn, selection, "parent", 1)
+            .expect("an idle coordinator admits one child");
+        // A launch fence that begins between reservation and commit queues the task instead.
+        let quiescence = coordinator.begin_quiescence();
+        let queued = match admission.commit().expect("the child admission commits") {
+            AgentCommit::Admitted(work) => work,
+            AgentCommit::Existing(_) => panic!("a new request reused an admission"),
+        };
+        assert!(!queued.launch);
+        assert_eq!(coordinator.active_count(), 0);
+        assert!(coordinator.collection_count().has_work());
+        let mut changed = coordinator.activity();
+        let collection = super::children_settled(&coordinator, &mut changed);
+        tokio::pin!(collection);
+        assert!(
+            futures_util::poll!(collection.as_mut()).is_pending(),
+            "queued work keeps collection open"
+        );
+        let cancelled = coordinator
+            .interrupt(&queued.agent.id)
+            .expect("interrupt drains the queued launch");
+        assert_eq!(cancelled.len(), 1);
+        let mut task = cancelled.into_iter().next().unwrap();
+        task.state = crate::exchange::ExchangeState::Cancelled;
+        task.completed_at_ms = Some(2);
+        coordinator
+            .retain(queued.agent.clone(), task)
+            .expect("the cancellation is retained");
+        tokio::time::timeout(std::time::Duration::from_secs(60), collection)
+            .await
+            .expect("collection ends once the queued launch is cancelled")
+            .expect("cancelled queued work settles cleanly");
+        assert!(!coordinator.collection_count().has_work());
+        drop(quiescence);
+        assert!(coordinator.ready_launch().unwrap().is_none());
     }
 }

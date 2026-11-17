@@ -121,12 +121,9 @@ impl HarnessBroker {
             interaction.finalization_outcome() == Some(outcome),
             "checkpoint capture requires the admitted finalization outcome"
         );
-        let descendants: Vec<_> = referenced_child_exchange_list(interaction)
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
         self.store
-            .require_settled_exchange_tree(&self.session.id, &descendants)?;
+            .require_settled_descendants(interaction)
+            .context("checkpoint capture requires settled child work")?;
         let owner = match interaction
             .turn
             .last()
@@ -212,12 +209,9 @@ impl HarnessBroker {
         {
             return Ok(FinalCheckpointCommit::Stale);
         }
-        let descendants: Vec<_> = referenced_child_exchange_list(interaction)
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect();
         self.store
-            .require_settled_exchange_tree(&self.session.id, &descendants)?;
+            .require_settled_descendants(interaction)
+            .context("checkpoint save requires settled child work")?;
         // Publish the complete durable exchange only after all stale-evidence checks pass.
         let mut settled = interaction.clone();
         settled.checkpoint_before = Some(captured.baseline);

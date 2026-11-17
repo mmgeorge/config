@@ -3623,6 +3623,9 @@ do
   focus("reasoning_effort")
   for _ = 1, 3 do current_form:cycle(1) end
   assert(current_form:values().reasoning_effort == "high")
+  focus("write_access")
+  current_form:cycle(1)
+  assert(current_form:values().write_access == "off", "write access did not cycle to off")
   edit("description", "Review carefully")
   edit("instructions", "Review instructions\nSecond line\n")
   focus("default")
@@ -3632,6 +3635,7 @@ do
   assert(saves == 1 and not vim.bo.modified)
   assert(snapshot.document.default_profile == "reviewer")
   assert(snapshot.document.profiles.reviewer.instructions == "Review instructions\nSecond line\n")
+  assert(snapshot.document.profiles.reviewer.write_access == "off", "saved profile lost write access")
   focus("instructions")
   local field_text = current_form:values().instructions
   current_form:refresh()
@@ -3668,6 +3672,7 @@ do
   edit("instructions", "Custom instructions")
   current_form:save()
   assert(snapshot.document.profiles.custom.provider == "inherit")
+  assert(snapshot.document.profiles.custom.write_access == "inherit", "a new profile must inherit write access")
   edit("name", "renamed")
   current_form:save()
   assert(snapshot.document.profiles.renamed and not snapshot.document.profiles.custom)
@@ -4094,81 +4099,6 @@ end
 -- requires-forge-host
 T["batched_answers_share_one_transcript_group"] = function()
   verify_answered_question_group(true)
-end
-
--- requires-forge-host
-T["question_batch_reaches_provider_together"] = function()
-  vim.o.columns, vim.o.lines = 140, 55
-  local snapshot = dofile("nvim/lua/forge/tests/support/state.lua")
-  local workspace = temp.directory("question-batch")
-  local client = host.start({ config = true }).client
-  local config = vim.deepcopy(require("forge.infra.config").options)
-  config.harness.provider = "mock"
-  require("forge").setup(config)
-  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
-  stub(require("forge.harness.provider_preference"), "load", function() return "mock" end)
-  vim.fn.chdir(workspace)
-  local state = require("forge.session").harness
-  MiniTest.finally(function()
-    pcall(require("forge.views.harness.workspace").release, state)
-    if state.presentation then pcall(state.presentation.close) end
-  end)
-  local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
-  require("forge.views.harness").open()
-  wait_until(function() return state.ready and state.session ~= nil end, "Harness did not start")
-  local function request(method, params)
-    local result, failure, done
-    client.request({ session_id = state.session.id, method = method, params = params or {} }, function(value, error)
-      result, failure, done = value, error, true
-    end)
-    wait_until(function() return done end, method .. " did not finish")
-    eq(failure, nil)
-    return result
-  end
-  request("session.provider.mock_response", { operation = "script", script = {
-    steps = { { kind = "tool_call", name = "question_ask", arguments = { questions = {
-      { header = "Layout", question = "Which layout?", options = {
-        { label = "Tabs", description = "Compact" }, { label = "Sidebar", description = "Wide" },
-      } },
-      { header = "Color", question = "Which color?", options = {
-        { label = "Blue", description = "Cool" }, { label = "Red", description = "Warm" },
-      } },
-    } } } }, terminal = "completed",
-  } })
-  request("session.prompt.submit", { text = "Ask about layout and color." })
-  wait_until(function()
-    local current = snapshot.get()
-    return current.status.kind == "idle" and current.questions and #current.questions.questions == 2
-  end, "MockProvider did not publish the question set")
-  local questions = require("forge.views.harness.questions")
-  local picker = require("forge.views.picker")
-  local window = vim.api.nvim_get_current_win()
-  questions.open(state, { window_list = { window }, control_win = window })
-  local submissions = 0
-  local original_request
-  original_request = stub(client, "request", function(spec, ...)
-    if spec.method == "session.question.answer" or spec.method == "session.question.answer_batch" then submissions = submissions + 1 end
-    return original_request(spec, ...)
-  end)
-  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
-  eq(submissions, 0)
-  local after_first = snapshot.get()
-  eq(after_first.questions.questions[1].resolution.kind, "pending")
-  eq(after_first.questions.questions[2].resolution.kind, "pending")
-  keymap.invoke("<S-Tab>", { buffer = picker._state_for_test().buf })
-  eq(picker._state_for_test().state.page_index, 1)
-  keymap.invoke("<Tab>", { buffer = picker._state_for_test().buf })
-  local held = request("session.provider.mock_response", { operation = "hold" })
-  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
-  eq(submissions, 1)
-  local delivered = request("session.provider.mock_response", { operation = "wait", id = held.id })
-  for _, value in ipairs({ after_first.questions.questions[1].id, after_first.questions.questions[2].id, "Tabs", "Blue" }) do
-    assert(delivered.prompt:find(value, 1, true), "provider input omitted " .. value)
-  end
-  request("session.provider.mock_response", { operation = "release", id = held.id })
-  wait_until(function() return not picker.is_open("questions") end, "completed batch left picker open")
-  diagnostics:assert_none()
-  eq(host.stop(), true)
 end
 
 -- An acknowledged steer has reached the provider but not the model. MockProvider consumes

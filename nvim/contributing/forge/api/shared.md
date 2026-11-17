@@ -22,6 +22,7 @@ A profile document has required `default_profile: string` and `profiles: object`
 | `reasoning_effort` | String, `inherit` | Nonblank effort choice or inheritance value. |
 | `service_tier` | String, `inherit` | `inherit`, `default`, `fast`, or `ultrafast`. |
 | `approval_mode` | String, `inherit` | `inherit`, `ask`, `deny`, or `allow`. |
+| `write_access` | String, `inherit` | `inherit` keeps the root's write scope; `off` denies the child reported writes and lets it share the repository with other write-off children. It never widens the root's scope. |
 
 Unknown profile fields fail decoding. These are reusable child definitions, not a list of running agents. The [profile store](../../../rust/forge/crates/forge-harness/src/agent/profile.rs) owns validation, file locking, and fallback reads.
 

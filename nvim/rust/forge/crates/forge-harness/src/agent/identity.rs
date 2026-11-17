@@ -29,6 +29,34 @@ pub enum AgentContinuationPolicy {
     },
 }
 
+/// Reject child work that a stopped task's continuation policy has not authorized.
+///
+/// Admission returns this error instead of queueing work that cannot launch until a user acts,
+/// because a queued task behind the gate would keep its parent's delegation tree unsettled.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "child {agent_path} stopped at task {stopped_task_id} and requires explicit user continuation before it accepts more work"
+)]
+pub struct ContinuationRequired {
+    pub agent_id: String,
+    pub agent_path: String,
+    pub stopped_task_id: forge_provider_api::ExchangeId,
+}
+
+impl ContinuationRequired {
+    /// Describe the stopped policy of `agent`, or `None` when it accepts work.
+    pub fn for_agent(agent: &Agent) -> Option<Self> {
+        match &agent.continuation {
+            AgentContinuationPolicy::Ready => None,
+            AgentContinuationPolicy::RequiresAuthorization { task_id } => Some(Self {
+                agent_id: agent.id.clone(),
+                agent_path: agent.task_path.clone(),
+                stopped_task_id: task_id.clone(),
+            }),
+        }
+    }
+}
+
 /// Stores one reusable provider-backed agent identity and lifecycle.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Agent {

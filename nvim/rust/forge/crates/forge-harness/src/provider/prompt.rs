@@ -191,7 +191,7 @@ mod tests {
         let open = request.open_instructions(ContextChannel::UserMessage);
         assert!(open.starts_with(HARNESS_SYSTEM_MESSAGE.trim_end()));
         assert!(open.contains("Saved project checks run in"));
-        assert!(open.contains("prefer them over text search"));
+        assert!(open.contains("Before using any semantic LSP command"));
         assert!(open.contains("When the harness_session_* toolset is on"));
         assert!(open.contains("at the start of a user message, before"));
         assert!(!open.contains("Tool approval:"));

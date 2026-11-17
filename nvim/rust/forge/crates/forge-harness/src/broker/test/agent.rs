@@ -1123,6 +1123,205 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
     Ok(())
 }
 
+/// Admit one model-delegated child task under `parent`, persisting the delegation as the broker does.
+fn admit_model_task(
+    broker: &mut HarnessBroker,
+    parent: &mut Exchange,
+    operation: crate::agent::AgentOperation,
+) -> Result<crate::agent::AgentWork> {
+    let request = crate::agent::AgentRequest {
+        operation_id: Uuid::new_v4().to_string(),
+        source: crate::agent::AgentSource::Model,
+        operation: operation.clone(),
+    };
+    let admission = match &operation {
+        crate::agent::AgentOperation::Spawn(spawn) => broker.agent_coordinator.reserve_spawn(
+            &request,
+            spawn,
+            crate::agent::AgentSelection {
+                profile: "worker".into(),
+                instructions: String::new(),
+                provider: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+                model: "mock".into(),
+                reasoning_effort: "low".into(),
+                context_window: None,
+                service_tier: Default::default(),
+                access: broker.session.access.clone(),
+                approval_mode: broker.session.approval_mode,
+            },
+            &parent.id,
+            100,
+        )?,
+        crate::agent::AgentOperation::Followup { target, message } => broker
+            .agent_coordinator
+            .reserve_followup(&request, target, message, &parent.id, 100)?,
+        _ => anyhow::bail!("fixture admits only spawns and follow-ups"),
+    };
+    parent.append_agent_task(&admission.task)?;
+    broker.store.admit_agent_task(
+        &admission.agent,
+        &admission.task,
+        parent,
+        admission.continuation_authorization(),
+    )?;
+    let work = match admission.commit()? {
+        crate::agent::AgentCommit::Admitted(work) => work,
+        crate::agent::AgentCommit::Existing(_) => anyhow::bail!("fixture reused a child admission"),
+    };
+    broker.agent_registry.insert(work.agent.clone());
+    Ok(work)
+}
+
+/// A child stop that requires authorization settles every follow-up queued behind it, a model
+/// retry is rejected without new work, and the parent's settlement and next prompt proceed.
+///
+/// The queued follow-up previously moved to the launch queue, where it waited forever for a
+/// grant; checkpoint settlement then rejected the parent on every later prompt.
+#[tokio::test]
+async fn stopped_child_retry_rejects_without_blocking_parent_save() -> Result<()> {
+    let stops: [fn() -> anyhow::Error; 2] = [
+        || anyhow::anyhow!("provider failed"),
+        || anyhow::Error::new(crate::broker::TurnCancelled),
+    ];
+    for (stop, expected) in stops
+        .into_iter()
+        .zip([ExchangeState::Failed, ExchangeState::Cancelled])
+    {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let provider = Arc::new(ResultReceivingProvider::default());
+        let fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+        broker.provider = fixture.provider_handle();
+        broker.agent_coordinator.set_enabled(true);
+        let mut parent = Exchange::agent_admission(
+            &broker.session.id,
+            broker.store.next_exchange_ordinal(&broker.session.id)?,
+            "Delegating parent".into(),
+            100,
+        );
+        let first = admit_model_task(
+            &mut broker,
+            &mut parent,
+            crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+                profile: Some("explorer".into()),
+                text: "Inspect".into(),
+            }),
+        )?;
+        let followup = admit_model_task(
+            &mut broker,
+            &mut parent,
+            crate::agent::AgentOperation::Followup {
+                target: first.agent.id.clone(),
+                message: "Inspect more".into(),
+            },
+        )?;
+        assert!(
+            !followup.launch,
+            "the follow-up waits behind the running task"
+        );
+        let owner = crate::provider::ThreadOwner::new(
+            broker.session.id.clone().into(),
+            forge_provider_api::agent::AgentId::new(first.agent.id.clone())?,
+        )?;
+        let mut event = Vec::new();
+        broker
+            .complete_managed_agent(
+                owner,
+                first.task.id.clone(),
+                Err(stop()),
+                Vec::new(),
+                None,
+                &mut event,
+            )
+            .await?;
+
+        let tasks = broker.store.list_agent_task(&broker.session.id)?;
+        let stopped = tasks.iter().find(|task| task.id == first.task.id).unwrap();
+        assert_eq!(stopped.state, expected);
+        let cancelled = tasks
+            .iter()
+            .find(|task| task.id == followup.task.id)
+            .unwrap();
+        assert_eq!(cancelled.state, ExchangeState::Cancelled);
+        assert!(cancelled.completed_at_ms.is_some());
+        assert!(cancelled.parent_reported);
+        assert!(
+            cancelled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(&first.task.id))
+        );
+        assert_eq!(
+            broker
+                .store
+                .load_exchange(&followup.task.id)?
+                .context("follow-up exchange retained")?
+                .state(),
+            ExchangeState::Cancelled
+        );
+        assert_eq!(broker.agent_coordinator.active_count(), 0);
+        assert!(!broker.agent_coordinator.collection_count().has_work());
+
+        let retry = broker
+            .handle_agent_request(
+                crate::agent::AgentRequest {
+                    operation_id: "model-retry".into(),
+                    source: crate::agent::AgentSource::Model,
+                    operation: crate::agent::AgentOperation::Followup {
+                        target: first.agent.id.clone(),
+                        message: "Retry".into(),
+                    },
+                },
+                Some(&mut parent),
+                &mut event,
+            )
+            .await
+            .err()
+            .context("a model retry of a stopped child must fail")?;
+        let required = retry
+            .downcast_ref::<crate::agent::ContinuationRequired>()
+            .context("the retry error names the stopped task")?;
+        assert_eq!(required.stopped_task_id.as_str(), first.task.id);
+        assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), 2);
+        assert_eq!(broker.agent_coordinator.collection_count().queued, 0);
+
+        // The parent's delegation tree is settled, so its pending finalization commits.
+        parent.phase =
+            crate::exchange::ExchangePhase::Finalizing(crate::exchange::ExchangeOutcome::Complete);
+        broker.store.save_exchange(&parent)?;
+        let mut prior = broker
+            .begin_prior_finalization()?
+            .context("the parent remains finalizing")?;
+        assert!(matches!(
+            broker.advance_prior_finalization(&mut prior, &mut event)?,
+            super::super::prior_finalization::PriorFinalizationAction::Ready
+        ));
+        let saved = broker
+            .store
+            .load_exchange(&parent.id)?
+            .context("parent retained")?;
+        assert!(saved.is_finished());
+        assert_eq!(saved.finalization_error, None);
+
+        broker
+            .run_interaction(
+                "EXPLICIT_NEXT_TURN".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("EXPLICIT_NEXT_TURN".into())),
+            )
+            .await?;
+        assert_eq!(provider.turn.load(Ordering::Acquire), 1);
+        assert!(
+            provider.input.lock().unwrap()[0].contains(&first.task.id),
+            "the stopped report travels with the next user input"
+        );
+    }
+    Ok(())
+}
+
 /// Start one fixture child and settle it with a retained process cleanup obligation.
 async fn child_with_cleanup_obligation(
     broker: &mut HarnessBroker,
@@ -1231,6 +1430,29 @@ async fn interrupt_all_retries_every_child_cleanup_after_one_fails() -> Result<(
         broker.agent_coordinator.resolve(&ordered[1])?.state,
         crate::agent::AgentState::Ready
     );
+    // A successful retry clears only the collection obligation; the turn's own failure and the
+    // stop policy bound to it survive.
+    let collected = broker
+        .store
+        .list_agent_task(&broker.session.id)?
+        .into_iter()
+        .find(|task| task.agent_id == ordered[1])
+        .context("collected child task retained")?;
+    assert_eq!(collected.error.as_deref(), Some("provider failed"));
+    assert_eq!(collected.state, ExchangeState::Failed);
+    assert_eq!(
+        broker
+            .store
+            .load_exchange(&collected.id)?
+            .context("collected child exchange retained")?
+            .finalization_error,
+        None
+    );
+    assert!(matches!(
+        broker.agent_coordinator.resolve(&ordered[1])?.continuation,
+        crate::agent::AgentContinuationPolicy::RequiresAuthorization { ref task_id }
+            if task_id.as_str() == collected.id
+    ));
     Ok(())
 }
 #[tokio::test]
@@ -1370,5 +1592,497 @@ async fn child_file_change_reservation_requires_durable_completion() -> Result<(
         repository.path(),
         crate::checks::CheckPurpose::Verify,
     )?;
+    Ok(())
+}
+
+/// Build a root provider that admits one child and then fails before that child can finish.
+///
+/// The child runs on the configured mock adapter, so it can still be starting or running when
+/// the root's failure reaches finalization.
+fn failing_root_after_spawn() -> Arc<crate::provider::test_support::EventFixtureProvider> {
+    let descriptor = crate::provider::ProviderDescriptor {
+        kind: forge_providers::registry::nonselectable_id().expect("fixture identity exists"),
+        label: "Root failure after child admission".into(),
+        capability: crate::provider::test_support::fixture_capability(),
+    };
+    crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        move |request, _sink, start, _cancelled| async move {
+            start.observed(0).await?;
+            crate::provider::test_support::call_tool(
+                &request,
+                "agent_spawn",
+                json!({"profile":"worker","text":"DELEGATED_BEFORE_FAILURE"}),
+            )
+            .await?;
+            Err(crate::provider::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                ),
+            ))
+        },
+    )
+}
+
+/// A root turn that fails while its child is unfinished settles that child before finalizing.
+///
+/// Failure finalization previously stopped servicing child completions and went straight to the
+/// checkpoint, whose descendant guard rejected the unfinished child. The parent then stayed
+/// finalizing with that rejection, and the child's completion was never applied.
+#[tokio::test]
+async fn root_failure_settles_unfinished_children_before_finalizing() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(
+        failing_root_after_spawn(),
+    )?;
+    broker.provider = fixture.provider_handle();
+    broker.agent_coordinator.set_enabled(true);
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        broker.run_interaction(
+            "Delegate".into(),
+            PromptMode::Chat,
+            Some(ExchangeAdmission::chat("Delegate".into())),
+        ),
+    )
+    .await
+    .context("root failure finalization did not finish")?;
+    assert!(outcome.is_err(), "the root provider failure must surface");
+    let tasks = broker.store.list_agent_task(&broker.session.id)?;
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].completed_at_ms.is_some(), "{:?}", tasks[0]);
+    let root = broker
+        .store
+        .load_exchange(&tasks[0].parent_exchange_id)?
+        .context("root exchange retained")?;
+    assert_eq!(
+        (root.state(), root.finalization_error.as_deref()),
+        (ExchangeState::Failed, None)
+    );
+    Ok(())
+}
+
+/// A user grant reserved against one stop cannot commit after a newer stop became durable.
+///
+/// The coordinator reserves a user continuation against the stop it observed. Storage rechecks
+/// the persisted policy inside the admission transaction, so a newer stop rejects the grant and
+/// the failed admission leaves no task, delegation, policy change, or queued reservation behind.
+#[tokio::test]
+async fn continuation_authorization_cannot_clear_newer_stop() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    broker.agent_coordinator.set_enabled(true);
+    let mut parent = Exchange::agent_admission(
+        &broker.session.id,
+        broker.store.next_exchange_ordinal(&broker.session.id)?,
+        "Delegating parent".into(),
+        100,
+    );
+    let first = admit_model_task(
+        &mut broker,
+        &mut parent,
+        crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+            profile: Some("explorer".into()),
+            text: "Inspect".into(),
+        }),
+    )?;
+    let queued = admit_model_task(
+        &mut broker,
+        &mut parent,
+        crate::agent::AgentOperation::Followup {
+            target: first.agent.id.clone(),
+            message: "Inspect more".into(),
+        },
+    )?;
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(first.agent.id.clone())?,
+    )?;
+    let mut event = Vec::new();
+    broker
+        .complete_managed_agent(
+            owner,
+            first.task.id.clone(),
+            Err(anyhow::anyhow!("provider failed")),
+            Vec::new(),
+            None,
+            &mut event,
+        )
+        .await?;
+    // Persist a newer stop on the follow-up the first stop cancelled, as a concurrent owner would.
+    let mut newer = broker.agent_coordinator.resolve(&first.agent.id)?;
+    newer.continuation = crate::agent::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: queued.task.id.as_str().into(),
+    };
+    broker.store.save_agent_run(&newer)?;
+    let tasks_before = broker.store.list_agent_task(&broker.session.id)?.len();
+    let delegation_before = parent.clone();
+
+    let request = crate::agent::AgentRequest {
+        operation_id: "stale-grant".into(),
+        source: crate::agent::AgentSource::User,
+        operation: crate::agent::AgentOperation::Followup {
+            target: first.agent.id.clone(),
+            message: "Continue".into(),
+        },
+    };
+    let admission = broker.agent_coordinator.reserve_followup(
+        &request,
+        &first.agent.id,
+        "Continue",
+        &parent.id,
+        200,
+    )?;
+    assert_eq!(
+        admission
+            .continuation_authorization()
+            .map(|grant| grant.as_str()),
+        Some(first.task.id.as_str()),
+        "the coordinator granted the stop it observed"
+    );
+    let mut staged = parent.clone();
+    staged.append_agent_task(&admission.task)?;
+    let rejected = broker
+        .store
+        .admit_agent_task(
+            &admission.agent,
+            &admission.task,
+            &staged,
+            admission.continuation_authorization(),
+        )
+        .err()
+        .context("a grant for an older stop must not commit")?;
+    assert!(format!("{rejected:#}").contains("stale"), "{rejected:#}");
+    drop(admission);
+
+    assert_eq!(
+        broker.store.list_agent_task(&broker.session.id)?.len(),
+        tasks_before
+    );
+    let stored_parent = broker
+        .store
+        .load_exchange(&parent.id)?
+        .context("parent retained")?;
+    assert_eq!(
+        stored_parent.node_list.len(),
+        delegation_before.node_list.len(),
+        "the rejected grant left a delegation reference"
+    );
+    let durable = broker
+        .store
+        .list_agent_run(&broker.session.id)?
+        .into_iter()
+        .find(|agent| agent.id == first.agent.id)
+        .context("child retained")?;
+    assert_eq!(durable.continuation, newer.continuation);
+    let count = broker.agent_coordinator.collection_count();
+    assert_eq!((count.running, count.queued), (0, 0));
+    Ok(())
+}
+
+/// Recovery terminalizes a crashed parent's children without replay, then the parent settles;
+/// a delegation whose child exchange vanished is reported by identity instead.
+#[tokio::test]
+async fn recovery_settles_children_before_parent_checkpoint() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    broker.agent_coordinator.set_enabled(true);
+    let mut parent = Exchange::agent_admission(
+        &broker.session.id,
+        broker.store.next_exchange_ordinal(&broker.session.id)?,
+        "Delegating parent".into(),
+        100,
+    );
+    let running = admit_model_task(
+        &mut broker,
+        &mut parent,
+        crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+            profile: Some("explorer".into()),
+            text: "Inspect".into(),
+        }),
+    )?;
+    let queued = admit_model_task(
+        &mut broker,
+        &mut parent,
+        crate::agent::AgentOperation::Followup {
+            target: running.agent.id.clone(),
+            message: "Inspect more".into(),
+        },
+    )?;
+    // The host stopped while the parent was finalizing and both child tasks were unfinished.
+    parent.phase =
+        crate::exchange::ExchangePhase::Finalizing(crate::exchange::ExchangeOutcome::Complete);
+    broker.store.save_exchange(&parent)?;
+
+    broker
+        .store
+        .interrupt_detached_execution(&broker.session.id)?;
+    for task in broker.store.list_agent_task(&broker.session.id)? {
+        assert_eq!(task.state, ExchangeState::Interrupted, "{task:?}");
+        assert!(task.completed_at_ms.is_some() && task.parent_reported);
+        assert!(
+            broker
+                .store
+                .load_exchange(&task.id)?
+                .context("child exchange retained")?
+                .is_finished(),
+            "recovery left child exchange {} open",
+            task.id
+        );
+    }
+    for task in [&running.task, &queued.task] {
+        assert!(
+            broker
+                .store
+                .list_agent_task(&broker.session.id)?
+                .iter()
+                .any(|recovered| recovered.id == task.id),
+            "recovery dropped task {}",
+            task.id
+        );
+    }
+    assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), 2);
+    let mut event = Vec::new();
+    let mut prior = broker
+        .begin_prior_finalization()?
+        .context("the recovered parent remains finalizing")?;
+    assert!(matches!(
+        broker.advance_prior_finalization(&mut prior, &mut event)?,
+        super::super::prior_finalization::PriorFinalizationAction::Ready
+    ));
+    let settled = broker
+        .store
+        .load_exchange(&parent.id)?
+        .context("parent retained")?;
+    assert!(settled.is_finished());
+    assert_eq!(settled.finalization_error, None);
+
+    // A delegation whose child exchange is missing fails with that child's identity.
+    let mut orphaned = Exchange::agent_admission(
+        &broker.session.id,
+        broker.store.next_exchange_ordinal(&broker.session.id)?,
+        "Orphaned parent".into(),
+        200,
+    );
+    let missing = admit_model_task(
+        &mut broker,
+        &mut orphaned,
+        crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+            profile: Some("explorer".into()),
+            text: "Inspect elsewhere".into(),
+        }),
+    )?;
+    broker.store.delete_exchange(&missing.task.id)?;
+    let error = broker
+        .store
+        .require_settled_descendants(&orphaned)
+        .err()
+        .context("a missing child exchange cannot settle its parent")?;
+    let unsettled = error
+        .downcast_ref::<crate::storage::DescendantUnsettled>()
+        .context("the guard names the missing child")?;
+    assert_eq!(
+        (unsettled.agent_id.as_str(), unsettled.exchange_id.as_str()),
+        (missing.agent.id.as_str(), missing.task.id.as_str())
+    );
+    assert_eq!(format!("{:?}", unsettled.obligation), "Missing");
+    Ok(())
+}
+
+/// A write-off child selection stays write-off at dispatch: its request denies writes and takes
+/// the shared repository reservation, while an inherited selection keeps the root's writer.
+#[tokio::test]
+async fn write_off_child_dispatch_denies_writes_under_a_shared_reservation() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    broker.agent_coordinator.set_enabled(true);
+    assert_ne!(
+        broker.session.access.write_access,
+        crate::session::WriteScope::Off,
+        "the root must hold write scope for this case to distinguish the child"
+    );
+    let mut parent = Exchange::agent_admission(
+        &broker.session.id,
+        broker.store.next_exchange_ordinal(&broker.session.id)?,
+        "Delegating parent".into(),
+        100,
+    );
+    let admitted = admit_model_task(
+        &mut broker,
+        &mut parent,
+        crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+            profile: Some("explorer".into()),
+            text: "Inspect".into(),
+        }),
+    )?;
+    let root = broker.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?;
+    for (write_access, repository_access) in [
+        (None, crate::repository_access::RepositoryAccess::Write),
+        (
+            Some(crate::session::WriteScope::Off),
+            crate::repository_access::RepositoryAccess::Read,
+        ),
+    ] {
+        let mut agent = admitted.agent.clone();
+        if let Some(write_access) = write_access {
+            agent
+                .selection
+                .as_mut()
+                .context("admitted child has a selection")?
+                .access
+                .write_access = write_access;
+        }
+        let request = broker.agent_provider_factory.request(
+            &root,
+            &admitted_request_fixture(&broker, agent)?,
+            forge_provider_api::forge::AgentTask {
+                task_id: "dispatch".into(),
+                from: forge_provider_api::forge::ROOT_AGENT_PATH.into(),
+                text: "Inspect".into(),
+                messages: Vec::new(),
+            },
+        )?;
+        assert_eq!(
+            crate::agent::repository_access(&request.access),
+            repository_access
+        );
+        let scope = crate::provider::InvocationScope::new(request.owner()?, "child-dispatch");
+        let _directories = broker
+            .permission_coordinator
+            .directories(None, &request, &scope)?;
+        assert_eq!(
+            broker
+                .permission_coordinator
+                .writes_disabled(Some(&scope))?,
+            write_access.is_some(),
+            "dispatched write policy diverged from the child selection"
+        );
+    }
+    Ok(())
+}
+
+/// Cancelling admitted work that holds no execution slot terminalizes it durably, so the parent
+/// settles and the next prompt starts.
+///
+/// Collection once skipped child interruption whenever no execution slot was occupied, so a
+/// launch queued behind a fence stayed admitted and the parent's checkpoint guard rejected it.
+#[tokio::test]
+async fn cancel_collects_pending_children_without_execution_slots() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let provider = Arc::new(ResultReceivingProvider::default());
+    let fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = fixture.provider_handle();
+    broker.agent_coordinator.set_enabled(true);
+    let mut parent = Exchange::agent_admission(
+        &broker.session.id,
+        broker.store.next_exchange_ordinal(&broker.session.id)?,
+        "Delegating parent".into(),
+        100,
+    );
+    let spawn = crate::agent::SpawnAgentRequest {
+        profile: Some("explorer".into()),
+        text: "Inspect".into(),
+    };
+    let request = crate::agent::AgentRequest {
+        operation_id: "queued-spawn".into(),
+        source: crate::agent::AgentSource::Model,
+        operation: crate::agent::AgentOperation::Spawn(spawn.clone()),
+    };
+    let admission = broker.agent_coordinator.reserve_spawn(
+        &request,
+        &spawn,
+        crate::agent::AgentSelection {
+            profile: "worker".into(),
+            instructions: String::new(),
+            provider: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            model: "mock".into(),
+            reasoning_effort: "low".into(),
+            context_window: None,
+            service_tier: Default::default(),
+            access: broker.session.access.clone(),
+            approval_mode: broker.session.approval_mode,
+        },
+        &parent.id,
+        100,
+    )?;
+    // A launch fence that begins between reservation and commit queues the admitted task.
+    let quiescence = broker.agent_coordinator.begin_quiescence();
+    parent.append_agent_task(&admission.task)?;
+    broker.store.admit_agent_task(
+        &admission.agent,
+        &admission.task,
+        &parent,
+        admission.continuation_authorization(),
+    )?;
+    let queued = match admission.commit()? {
+        crate::agent::AgentCommit::Admitted(work) => work,
+        crate::agent::AgentCommit::Existing(_) => anyhow::bail!("fixture reused a child admission"),
+    };
+    broker.agent_registry.insert(queued.agent.clone());
+    assert!(!queued.launch);
+    let count = broker.agent_coordinator.collection_count();
+    assert_eq!((count.running, count.queued), (0, 1));
+
+    // The cancel transition's collection sends exactly this request when work is admitted.
+    let mut event = Vec::new();
+    broker
+        .handle_agent_request(
+            crate::agent::AgentRequest {
+                operation_id: "cancel:collect-children".into(),
+                source: crate::agent::AgentSource::User,
+                operation: crate::agent::AgentOperation::InterruptAll,
+            },
+            None,
+            &mut event,
+        )
+        .await?;
+    drop(quiescence);
+    assert!(!broker.agent_coordinator.collection_count().has_work());
+    assert!(broker.agent_coordinator.ready_launch()?.is_none());
+    let task = broker
+        .store
+        .list_agent_task(&broker.session.id)?
+        .into_iter()
+        .find(|task| task.id == queued.task.id)
+        .context("queued task retained")?;
+    assert_eq!(task.state, ExchangeState::Cancelled);
+    assert!(task.completed_at_ms.is_some());
+    assert_eq!(
+        broker
+            .store
+            .load_exchange(&queued.task.id)?
+            .context("queued exchange retained")?
+            .state(),
+        ExchangeState::Cancelled
+    );
+
+    parent.phase =
+        crate::exchange::ExchangePhase::Finalizing(crate::exchange::ExchangeOutcome::Cancelled);
+    broker.store.save_exchange(&parent)?;
+    let mut prior = broker
+        .begin_prior_finalization()?
+        .context("the cancelled parent remains finalizing")?;
+    assert!(matches!(
+        broker.advance_prior_finalization(&mut prior, &mut event)?,
+        super::super::prior_finalization::PriorFinalizationAction::Ready
+    ));
+    broker
+        .run_interaction(
+            "EXPLICIT_NEXT_TURN".into(),
+            PromptMode::Chat,
+            Some(ExchangeAdmission::chat("EXPLICIT_NEXT_TURN".into())),
+        )
+        .await?;
+    assert_eq!(provider.turn.load(Ordering::Acquire), 1);
     Ok(())
 }

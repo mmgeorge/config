@@ -162,12 +162,16 @@ pub struct AgentCommandSender {
 
 impl AgentCommandSender {
     /// Admit only the still-current queued task before it starts a provider process.
+    ///
+    /// `access` comes from the child's effective policy: shared readers coexist, and a writer
+    /// waits for every reader and writer. The reservation lasts until durable task publication.
     pub(crate) async fn repository_admit(
         &self,
         owner: &ThreadOwner,
         task_id: &str,
         root: &std::path::Path,
         workspace: &std::path::Path,
+        access: crate::repository_access::RepositoryAccess,
         mut cancelled: watch::Receiver<bool>,
     ) -> Result<Arc<crate::repository_access::RepositoryReservation>> {
         loop {
@@ -193,11 +197,8 @@ impl AgentCommandSender {
                 }
             }
             // No coordinator or broker lock is held while inspecting repository ownership.
-            match crate::repository_access::RepositoryReservation::acquire(
-                root,
-                workspace,
-                crate::repository_access::RepositoryAccess::Write,
-            ) {
+            match crate::repository_access::RepositoryReservation::acquire(root, workspace, access)
+            {
                 Ok(repository) => {
                     let repository = Arc::new(repository);
                     let mut state = self
@@ -591,13 +592,22 @@ pub struct AgentCoordinator {
     profiles: Mutex<Option<Arc<super::AgentProfileStore>>>,
 }
 
-/// Split live child executions by whether a collection can still wait for them to settle.
+/// Split admitted child work by whether a collection can still wait for it to settle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentCollectionCount {
     /// Executions whose turn has not settled.
     pub running: usize,
     /// Executions whose turn ended but whose process cleanup failed and stays retained.
     pub cleanup_failed: usize,
+    /// Admitted tasks waiting for an execution slot; collection cancels them durably.
+    pub queued: usize,
+}
+
+impl AgentCollectionCount {
+    /// Report whether any admitted work, running or queued, remains for collection.
+    pub fn has_work(&self) -> bool {
+        self.running + self.cleanup_failed + self.queued > 0
+    }
 }
 
 #[must_use]
@@ -1027,6 +1037,13 @@ impl AgentCoordinator {
                 work: existing.clone(),
             });
         }
+        // Only an explicit user grant clears a stopped task; queued work behind the gate could
+        // never launch and would leave its parent's delegation tree permanently unsettled.
+        if continuation_authorization.is_none()
+            && let Some(required) = super::ContinuationRequired::for_agent(&agent)
+        {
+            return Err(required.into());
+        }
         ensure!(
             state.quiescence_count == 0 && state.launch_hold_count == 0,
             "child admission is closed during checks, cancellation, or a policy transition"
@@ -1359,30 +1376,62 @@ impl AgentCoordinator {
         result
     }
 
-    /// Reports unfinished model-delegated work owned by this exchange that can still run.
+    /// Reports unfinished model-delegated work owned by this exchange.
     ///
-    /// A queued task whose child requires user authorization cannot launch until the user acts,
-    /// so a parent waiting on it would show Working indefinitely; it is left out.
+    /// Admission rejects work behind a stopped child's authorization gate, and a stop
+    /// terminalizes the follow-ups already queued behind it, so every unfinished task counted
+    /// here can still run to a durable outcome.
     pub fn has_active_task(&self, parent_exchange_id: &str) -> bool {
         let state = self.state.lock().expect("agent state poisoned");
         state.task_by_id.values().any(|task| {
             task.source == AgentSource::Model
                 && task.parent_exchange_id == parent_exchange_id
                 && task.completed_at_ms.is_none()
-                && !awaits_authorization(&state, task)
         })
     }
 
-    /// Reports model-delegated work of this exchange whose result the parent has yet to receive,
-    /// excluding queued work that cannot launch without user authorization.
+    /// Reports model-delegated work of this exchange whose result the parent has yet to receive.
     pub fn has_unresolved_task(&self, parent_exchange_id: &str) -> bool {
         let state = self.state.lock().expect("agent state poisoned");
         state.task_by_id.values().any(|task| {
             task.source == AgentSource::Model
                 && task.parent_exchange_id == parent_exchange_id
                 && !task.parent_reported
-                && !awaits_authorization(&state, task)
         })
+    }
+
+    /// List each child with an unfinished task delegated by this exchange, from any source.
+    ///
+    /// Checkpoint settlement requires every task in the exchange's delegation tree to be
+    /// terminal, including user-started ones, so collection targets all of them.
+    pub fn unfinished_task_agents(&self, parent_exchange_id: &str) -> Vec<String> {
+        let state = self.state.lock().expect("agent state poisoned");
+        let mut agents = state
+            .task_by_id
+            .values()
+            .filter(|task| {
+                task.parent_exchange_id == parent_exchange_id && task.completed_at_ms.is_none()
+            })
+            .map(|task| task.agent_id.clone())
+            .collect::<Vec<_>>();
+        agents.sort();
+        agents.dedup();
+        agents
+    }
+
+    /// List the admitted, undispatched follow-ups queued behind this child's running task.
+    pub fn queued_followups(&self, agent_id: &str) -> Vec<AgentTask> {
+        let state = self.state.lock().expect("agent state poisoned");
+        state
+            .execution_by_agent
+            .get(agent_id)
+            .into_iter()
+            .flat_map(|execution| execution.pending.iter())
+            .chain(state.pending_launches.iter())
+            .filter_map(|id| state.task_by_id.get(id))
+            .filter(|task| task.agent_id == agent_id && task.completed_at_ms.is_none())
+            .cloned()
+            .collect()
     }
 
     pub fn settled(
@@ -1432,8 +1481,23 @@ impl AgentCoordinator {
         execution.repository.take();
         if authorization_required {
             let pending = std::mem::take(&mut execution.pending);
+            // The broker terminalizes queued follow-ups in the stop's completion transaction;
+            // a follow-up still unfinished here would be stranded behind the stopped task.
+            if pending.iter().any(|id| {
+                state
+                    .task_by_id
+                    .get(id.as_str())
+                    .is_none_or(|task| task.completed_at_ms.is_none())
+            }) {
+                if let Some(execution) = state.execution_by_agent.get_mut(agent_id) {
+                    execution.pending = pending;
+                }
+                anyhow::bail!("stopped child still has an unsettled queued follow-up");
+            }
             state.execution_by_agent.remove(agent_id);
-            state.pending_launches.extend(pending);
+            for id in &pending {
+                state.pending_task_slots.remove(id);
+            }
             self.activity
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
             return Ok(None);
@@ -1503,6 +1567,7 @@ impl AgentCoordinator {
         AgentCollectionCount {
             running: state.execution_by_agent.len() - cleanup_failed,
             cleanup_failed,
+            queued: state.pending_launches.len(),
         }
     }
 
@@ -1629,18 +1694,6 @@ impl AgentCoordinator {
 ///
 /// `ready_launch` skips such a task, so nothing launches it until an explicit user admission
 /// acknowledges the child's stopped task.
-fn awaits_authorization(state: &AgentStateStore, task: &AgentTask) -> bool {
-    task.completed_at_ms.is_none()
-        && state
-            .pending_launches
-            .iter()
-            .any(|queued| *queued == task.id)
-        && state
-            .agent_by_id
-            .get(&task.agent_id)
-            .is_some_and(|agent| !matches!(agent.continuation, AgentContinuationPolicy::Ready))
-}
-
 fn pending_task_count(state: &AgentStateStore) -> usize {
     state.pending_launches.len()
         + state

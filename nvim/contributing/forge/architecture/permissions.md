@@ -24,6 +24,8 @@ Each operation passes through these stages in order:
 
 Write-off denies every write, including writes to unknown paths, regardless of rules or grants. Explicit denials and protected targets always win, and providers can never write the permission document itself. Automatic decisions never persist rules.
 
+A child agent's write scope is the stricter of its admitted selection and the current root, and a subagent profile with `write_access: "off"` produces a write-off selection. A write-off child holds a shared repository reservation instead of the exclusive writer reservation, so several can run at once. That reservation admits concurrency, not denial: this policy denies the child's reported writes, and the shared reservation is not an operating-system sandbox. See "Repository reservations" in [child-agents.md](child-agents.md).
+
 Before any of these stages, `ProviderPermissionContext` rejects a command containing a PowerShell file writer (`Set-Content`, `Add-Content`, or `Out-File`, found by `command::shell_file_writer` in any pipeline, sequence, or nested launcher) and tells the model to use its file-editing tool. A shell write reaches the approval layer only as an opaque command, so it can never be matched against write roots or path rules; a file-editing tool reports a concrete path that directory evaluation can authorize, including planning's authoring root. Saved allow rules and Allow mode do not lift this rejection.
 
 `PermissionStore` loads one validated document from `stdpath("config")/forge/permissions.json`, edited through `:ForgePermissions`, and compiles its matchers once.

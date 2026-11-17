@@ -174,10 +174,11 @@ pub(super) fn admit(
             );
         }
         (AgentContinuationPolicy::RequiresAuthorization { .. }, None) => {
-            ensure!(
-                incoming.continuation == stored.continuation,
-                "child admission cannot implicitly clear a stopped task policy"
-            );
+            // Rejecting here, inside the admission transaction, catches a stop that landed after
+            // the coordinator reserved the work as well as a caller that skipped the coordinator.
+            return Err(crate::agent::ContinuationRequired::for_agent(&stored)
+                .context("stopped child policy lost its task")?
+                .into());
         }
         (AgentContinuationPolicy::Ready, Some(_)) => {
             anyhow::bail!("child continuation authorization no longer matches a stopped task");
@@ -262,6 +263,22 @@ mod tests {
             [super::super::encode(&agent)?],
         )?;
         assert!(admit(&connection, &agent, &task, Some(&grant)).is_err());
+        Ok(())
+    }
+
+    /// Work without a grant cannot queue behind a stopped task, whatever its source.
+    #[test]
+    fn unauthorized_admission_against_stopped_policy_is_rejected() -> Result<()> {
+        let (connection, agent, mut task) = fixture()?;
+        for source in [AgentSource::Model, AgentSource::User] {
+            task.source = source;
+            let error = admit(&connection, &agent, &task, None).unwrap_err();
+            let required = error
+                .downcast_ref::<crate::agent::ContinuationRequired>()
+                .context("rejection names the stopped task")?;
+            assert_eq!(required.agent_id, agent.id);
+            assert_eq!(required.stopped_task_id.as_str(), "stopped-task");
+        }
         Ok(())
     }
 

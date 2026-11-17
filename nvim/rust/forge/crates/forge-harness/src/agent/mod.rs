@@ -26,12 +26,13 @@ pub use coordinator::{
 };
 pub use profile::{AgentProfile, AgentProfileDocument, AgentProfileStore};
 pub use selection::AgentSelection;
+pub(crate) use selection::{effective_access, repository_access};
 pub use task::{AgentMessage, AgentSource, AgentTask, MessageDelivery};
 
 pub use capability::AgentCapability;
 pub use delegation::Delegation;
 pub use forge_provider_api::agent::AgentLifecycleEvent;
-pub use identity::{Agent, AgentContinuationPolicy, AgentState};
+pub use identity::{Agent, AgentContinuationPolicy, AgentState, ContinuationRequired};
 pub use observed::{
     ObservedAgent, ObservedAgentAvailability, ObservedAgentKey, ObservedAgentState,
 };

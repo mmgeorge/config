@@ -16,6 +16,7 @@ mod ownership;
 pub(crate) mod preferences;
 mod question;
 mod reader;
+pub(crate) use ownership::DescendantUnsettled;
 pub(crate) use reader::HistoryReader;
 mod recovery;
 mod schema;
@@ -519,34 +520,53 @@ impl SqliteStore {
         task: &crate::agent::AgentTask,
         exchange: &Exchange,
     ) -> Result<()> {
-        anyhow::ensure!(
-            agent.session_id == task.session_id
-                && exchange.session_id == task.session_id
-                && agent.id == task.agent_id
-                && exchange.agent_id == task.agent_id
-                && exchange.id == task.id,
-            "child completion crosses execution ownership"
-        );
-        anyhow::ensure!(
-            task.completed_at_ms.is_some() && exchange.state() == task.state,
-            "child completion has inconsistent task and exchange outcomes"
-        );
+        self.complete_agent_tasks(agent, &[(task, exchange)])
+    }
+
+    /// Commit several terminal outcomes of one child together with its identity.
+    ///
+    /// A stop that requires authorization also cancels the follow-ups queued behind it; one
+    /// transaction keeps a reader from observing the stop while those follow-ups look runnable.
+    pub fn complete_agent_tasks(
+        &mut self,
+        agent: &Agent,
+        outcomes: &[(&crate::agent::AgentTask, &Exchange)],
+    ) -> Result<()> {
+        for (task, exchange) in outcomes {
+            anyhow::ensure!(
+                agent.session_id == task.session_id
+                    && exchange.session_id == task.session_id
+                    && agent.id == task.agent_id
+                    && exchange.agent_id == task.agent_id
+                    && exchange.id == task.id,
+                "child completion crosses execution ownership"
+            );
+            anyhow::ensure!(
+                task.completed_at_ms.is_some() && exchange.state() == task.state,
+                "child completion has inconsistent task and exchange outcomes"
+            );
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        Self::write_exchange(&transaction, exchange)?;
-        Self::write_agent_task(&transaction, task)?;
+        for (task, exchange) in outcomes {
+            Self::write_exchange(&transaction, exchange)?;
+            Self::write_agent_task(&transaction, task)?;
+        }
         let written = transaction.execute(
             "UPDATE agent_run_record SET payload=?1 WHERE id=?2 AND session_id=?3",
             params![encode(agent)?, agent.id, agent.session_id],
         )?;
         anyhow::ensure!(written == 1, "child completion has no admitted identity");
         transaction.commit()?;
-        self.publish_admission_exchange(
-            &exchange.session_id,
-            &exchange.id,
-            Some(exchange.awaiting_input() && exchange.elicitation().is_some()),
-        )
+        for (_, exchange) in outcomes {
+            self.publish_admission_exchange(
+                &exchange.session_id,
+                &exchange.id,
+                Some(exchange.awaiting_input() && exchange.elicitation().is_some()),
+            )?;
+        }
+        Ok(())
     }
 
     fn write_agent_task(

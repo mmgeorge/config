@@ -141,6 +141,7 @@ impl AgentProviderFactory {
                 serde_json::from_value(serde_json::json!(profile.approval_mode))?,
             )
         };
+        let denies_writes = profile.denies_writes();
         let mut selection = AgentSelection {
             profile: profile_name,
             instructions: profile.instructions,
@@ -158,6 +159,9 @@ impl AgentProviderFactory {
                 .resolve_access(root.access.clone()),
             approval_mode,
         };
+        if denies_writes {
+            selection.access.write_access = crate::session::WriteScope::Off;
+        }
         if profile.model != "inherit" || profile.reasoning_effort != "inherit" || !same_provider {
             ensure!(
                 same_provider || profile.model != "inherit" || root.model != "default",
@@ -239,9 +243,11 @@ impl AgentProviderFactory {
             effort: selection.reasoning_effort.clone(),
             context_window: selection.context_window.clone(),
             service_tier: selection.service_tier,
+            // Capability resolution runs after narrowing; it can drop unsupported sandboxing but
+            // never restores write scope, so the reservation chosen from it stays accurate.
             access: forge_providers::registry::resolve(&selection.provider)?
                 .capability
-                .resolve_access(root.access.clone()),
+                .resolve_access(super::effective_access(&root.access, &selection.access)),
             approval_mode: narrow_permission(root.approval_mode, selection.approval_mode),
             provider_session_id: agent
                 .provider_thread_id

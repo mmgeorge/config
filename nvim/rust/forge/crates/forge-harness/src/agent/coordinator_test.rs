@@ -183,11 +183,8 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
     );
 }
 
-/// A model follow-up queued behind a child that requires user authorization cannot launch, so
-/// its parent must not wait for it.
-#[test]
-fn parent_does_not_wait_for_followup_blocked_on_authorization() {
-    let coordinator = AgentCoordinator::new("root".into());
+/// Admit one model-delegated child and return its committed work.
+fn admitted_model_child(coordinator: &AgentCoordinator) -> super::AgentWork {
     let spawn = SpawnAgentRequest {
         profile: Some("review".into()),
         text: "bounded task".into(),
@@ -197,7 +194,7 @@ fn parent_does_not_wait_for_followup_blocked_on_authorization() {
         source: AgentSource::Model,
         operation: AgentOperation::Spawn(spawn.clone()),
     };
-    let first = match coordinator
+    match coordinator
         .reserve_spawn(
             &request,
             &spawn,
@@ -214,7 +211,26 @@ fn parent_does_not_wait_for_followup_blocked_on_authorization() {
     {
         AgentCommit::Admitted(work) => work,
         AgentCommit::Existing(_) => panic!("new request reused an admission"),
-    };
+    }
+}
+
+fn model_followup(operation_id: &str, target: &str) -> AgentRequest {
+    AgentRequest {
+        operation_id: operation_id.into(),
+        source: AgentSource::Model,
+        operation: AgentOperation::Followup {
+            target: target.into(),
+            message: "next task".into(),
+        },
+    }
+}
+
+/// A model retry of a stopped child is rejected before it reserves anything, so the parent has
+/// no queued descendant that only a user could release.
+#[test]
+fn model_followup_of_stopped_child_is_rejected_without_reservation() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let first = admitted_model_child(&coordinator);
     let mut stopped = first.task.clone();
     stopped.state = crate::exchange::ExchangeState::Interrupted;
     stopped.completed_at_ms = Some(2);
@@ -230,19 +246,101 @@ fn parent_does_not_wait_for_followup_blocked_on_authorization() {
             super::AgentSettlementDisposition::RequiresAuthorization,
         )
         .unwrap();
-    let followup = AgentRequest {
-        operation_id: "model-followup".into(),
-        source: AgentSource::Model,
+    let followup = model_followup("model-followup", &agent.id);
+    let error = coordinator
+        .reserve_followup(&followup, &agent.id, "next task", "parent", 3)
+        .err()
+        .expect("a stopped child rejects model work");
+    let required = error
+        .downcast_ref::<super::ContinuationRequired>()
+        .expect("rejection is typed");
+    assert_eq!(required.agent_id, agent.id);
+    assert_eq!(required.stopped_task_id.as_str(), stopped.id);
+    assert!(!coordinator.has_active_task("parent"));
+    assert!(coordinator.ready_launch().unwrap().is_none());
+    assert_eq!(coordinator.collection_count().queued, 0);
+    // A user grant naming the exact stopped task still admits one launchable task.
+    let user = AgentRequest {
+        operation_id: "user-followup".into(),
+        source: AgentSource::User,
         operation: AgentOperation::Followup {
             target: agent.id.clone(),
             message: "next task".into(),
         },
     };
+    let granted = coordinator
+        .reserve_followup(&user, &agent.id, "next task", "parent", 4)
+        .unwrap();
+    assert!(granted.launch);
+    assert_eq!(
+        granted.continuation_authorization().map(|id| id.as_str()),
+        Some(stopped.id.as_str())
+    );
+}
+
+/// A stop that requires authorization releases its execution only after every follow-up queued
+/// behind it is terminal; none moves to the launch queue where it could never start.
+#[test]
+fn child_stop_requires_settled_followups() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let first = admitted_model_child(&coordinator);
     let queued = coordinator
-        .reserve_followup(&followup, &agent.id, "next task", "parent", 3)
+        .reserve_followup(
+            &model_followup("queued-followup", &first.agent.id),
+            &first.agent.id,
+            "next task",
+            "parent",
+            2,
+        )
         .unwrap();
     assert!(!queued.launch);
-    queued.commit().unwrap();
-    assert!(coordinator.ready_launch().unwrap().is_none());
+    let queued = match queued.commit().unwrap() {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("new follow-up reused an admission"),
+    };
+    assert_eq!(
+        coordinator
+            .queued_followups(&first.agent.id)
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>(),
+        vec![queued.task.id.clone()]
+    );
+    let mut stopped = first.task.clone();
+    stopped.state = crate::exchange::ExchangeState::Failed;
+    stopped.completed_at_ms = Some(3);
+    let mut agent = first.agent.clone();
+    agent.continuation = super::AgentContinuationPolicy::RequiresAuthorization {
+        task_id: stopped.id.clone().into(),
+    };
+    coordinator.retain(agent.clone(), stopped.clone()).unwrap();
+    assert!(
+        coordinator
+            .settled(
+                &agent.id,
+                &stopped.id,
+                super::AgentSettlementDisposition::RequiresAuthorization,
+            )
+            .is_err(),
+        "an unsettled follow-up must not be stranded"
+    );
+    assert_eq!(coordinator.active_count(), 1);
+    let mut cancelled = queued.task.clone();
+    cancelled.state = crate::exchange::ExchangeState::Cancelled;
+    cancelled.completed_at_ms = Some(3);
+    coordinator.retain(agent.clone(), cancelled).unwrap();
+    assert!(
+        coordinator
+            .settled(
+                &agent.id,
+                &stopped.id,
+                super::AgentSettlementDisposition::RequiresAuthorization,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(coordinator.active_count(), 0);
+    assert_eq!(coordinator.collection_count().queued, 0);
     assert!(!coordinator.has_active_task("parent"));
+    assert!(coordinator.ready_launch().unwrap().is_none());
 }
