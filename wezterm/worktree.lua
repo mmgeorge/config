@@ -44,6 +44,32 @@ M.settings = {
     },
     -- Add repo-specific layouts here, keyed by the repo directory name.
     by_repo = {
+      ['ferrous'] = {
+        new_worktree_setup = {
+          -- Build output cloned from the main worktree before the workspace
+          -- opens. Only each profile's `build` directory is copied: it holds
+          -- every compiled crate with its fingerprint. The sibling
+          -- `incremental` directory is three quarters of the files and serves
+          -- only workspace crates, which rebuild in a new checkout anyway.
+          -- The host `target/debug` holds build scripts and proc macros, which
+          -- Cargo builds for the host even when `build.target` is set.
+          -- `.bin/mcp` is the staged MCP server: its store uses only relative
+          -- names, so the copy starts without building `tools/mcp`, whose
+          -- own build output is left out because that workspace rarely changes.
+          -- `.bin/cue` and `engine/.slang` are the pinned CUE and Slang
+          -- installs; copying them skips the downloads. `Cargo.lock` is
+          -- git-ignored, so without a copy Cargo resolves dependencies afresh
+          -- and any version drift would rebuild the seeded crates.
+          seed_paths = {
+            'Cargo.lock',
+            'target/debug/build',
+            'target/x86_64-pc-windows-msvc/debug/build',
+            '.bin/mcp',
+            '.bin/cue',
+            'engine/.slang',
+          },
+        },
+      },
       ['wasm'] = {
         tabs = {
           { title = 'main',
@@ -387,11 +413,14 @@ local function directory_exists(path)
   end
 
   if is_windows then
+    -- cmd.exe matches a trailing backslash only against directories, and only
+    -- when the whole path uses backslashes. The older `\NUL` probe reports
+    -- every directory as missing.
     local stdout = run_command({
       'cmd.exe',
       '/S',
       '/C',
-      'if exist "' .. path .. '\\NUL" (echo yes) else (echo no)',
+      'if exist "' .. path:gsub('/', '\\') .. '\\" (echo yes) else (echo no)',
     })
     return stdout ~= nil and trim(stdout) == 'yes'
   end
@@ -1498,17 +1527,26 @@ local function append_setup_specs(target_specs, source_specs)
   end
 end
 
+local function append_seed_paths(target_paths, source_paths)
+  for _, path in ipairs(source_paths or {}) do
+    table.insert(target_paths, path)
+  end
+end
+
 local function resolve_new_worktree_setup(repo)
   local setup = {
+    seed_paths = {},
     symlinks = {},
   }
 
   local default_setup = M.settings.new_worktree_setup or {}
   append_setup_specs(setup.symlinks, default_setup.symlinks)
+  append_seed_paths(setup.seed_paths, default_setup.seed_paths)
 
   local settings = repo_settings(repo.name)
   local repo_setup = settings.new_worktree_setup or {}
   append_setup_specs(setup.symlinks, repo_setup.symlinks)
+  append_seed_paths(setup.seed_paths, repo_setup.seed_paths)
 
   return setup
 end
@@ -1752,6 +1790,24 @@ local function finish_created_worktree(window, repo, opts)
   queue_layout(worktree, layout_options)
 end
 
+-- Seed only from the default-branch checkout, whose build output tracks the
+-- base most new branches start from. Without one, the worktree builds cold.
+-- The creation script checks each seed path itself, so a checkout whose
+-- directory is gone only produces skipped seeds.
+local function seed_source_path(repo, destination_path)
+  for _, branch in ipairs({ 'main', 'master' }) do
+    local worktree = checked_out_worktree(repo, branch)
+    if worktree
+      and not worktree.prunable
+      and normalize_path(worktree.path) ~= normalize_path(destination_path)
+    then
+      return worktree.path
+    end
+  end
+
+  return nil
+end
+
 local function worktree_creation_command(repo, opts, workspace_name)
   local command = {
     'nu',
@@ -1772,6 +1828,17 @@ local function worktree_creation_command(repo, opts, workspace_name)
   end
   table.insert(command, '--workspace-name')
   table.insert(command, workspace_name)
+
+  local seed_paths = resolve_new_worktree_setup(repo).seed_paths
+  local seed_source = #seed_paths > 0 and seed_source_path(repo, opts.path) or nil
+  if seed_source then
+    table.insert(command, '--seed-source')
+    table.insert(command, seed_source)
+    for _, path in ipairs(seed_paths) do
+      table.insert(command, path)
+    end
+  end
+
   return command
 end
 
@@ -1802,11 +1869,17 @@ local function start_visible_worktree_creation(window, pane, repo, opts)
     workspace_name = worktree.workspace_name,
   }
 
+  local creation_command = worktree_creation_command(repo, opts, worktree.workspace_name)
+  debug_log('worktree.create.spawn', {
+    args = creation_command,
+    cwd = repo.git_path,
+    workspace = worktree.workspace_name,
+  })
   window:perform_action(
     act.SwitchToWorkspace({
       name = worktree.workspace_name,
       spawn = {
-        args = worktree_creation_command(repo, opts, worktree.workspace_name),
+        args = creation_command,
         cwd = repo.git_path,
         label = worktree.workspace_name,
       },

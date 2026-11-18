@@ -658,10 +658,10 @@ exit ${PIPESTATUS[0]}' bash $log_path $repo_root (if $is_core_monorepo { "core-m
   let test_exit_code = $env.LAST_EXIT_CODE
   let sync_result = (screenshot-accept-local-references $screenshots_root $log_path)
 
-  print $"Accepted ($sync_result.accepted) local screenshot reference(s)"
+  print $"Accepted ($sync_result.accepted) local screenshot reference\(s\)"
 
   if $sync_result.missing > 0 {
-    print --stderr $"Skipped ($sync_result.missing) missing actual screenshot(s)"
+    print --stderr $"Skipped ($sync_result.missing) missing actual screenshot\(s\)"
   }
 
   if ($test_exit_code != 0) and ($sync_result.accepted == 0) {
