@@ -56,8 +56,7 @@ M.settings = {
           -- `.bin/mcp` is the staged MCP server: its store uses only relative
           -- names, so the copy starts without building `tools/mcp`, whose
           -- own build output is left out because that workspace rarely changes.
-          -- `.bin/cue` and `engine/.slang` are the pinned CUE and Slang
-          -- installs; copying them skips the downloads. `Cargo.lock` is
+          -- Slang and CUE use the per-user Ferrous cache. `Cargo.lock` is
           -- git-ignored, so without a copy Cargo resolves dependencies afresh
           -- and any version drift would rebuild the seeded crates.
           seed_paths = {
@@ -65,8 +64,6 @@ M.settings = {
             'target/debug/build',
             'target/x86_64-pc-windows-msvc/debug/build',
             '.bin/mcp',
-            '.bin/cue',
-            'engine/.slang',
           },
         },
       },

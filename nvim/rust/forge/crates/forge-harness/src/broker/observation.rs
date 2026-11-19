@@ -515,9 +515,10 @@ impl BrokerObserver {
             timeline,
             store.list_observed_agents(&source_session.id)?,
         )?;
+        let agents = crate::timeline::running_agents(&timeline, status_thoughts);
         timeline.push(TimelineEntry::Status {
             checks,
-            agent_count: self.agent_coordinator.active_count(),
+            agents,
             status_thoughts,
             id: format!("{}:status", source_session.id),
             created_at_ms: 0,

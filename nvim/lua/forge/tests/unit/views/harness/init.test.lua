@@ -131,6 +131,7 @@ T["replace_session_preserves_requesting_tab_and_handles_failure"] = function()
   source.timeline_tab = vim.api.nvim_get_current_tabpage()
   source.transcript_win = vim.api.nvim_get_current_win()
   source.composer_win = vim.api.nvim_get_current_win()
+  source.transcript_buf = vim.api.nvim_get_current_buf()
   local reply, activation, failure
   client.session_create = function(options, callback)
     eq(options.source_session_id, "source")

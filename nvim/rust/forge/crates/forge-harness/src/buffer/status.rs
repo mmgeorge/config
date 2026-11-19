@@ -12,6 +12,7 @@ use super::projection::TranscriptAction;
 use super::transcript::TranscriptRenderer;
 use crate::checks::{CheckActivity, CheckState};
 use crate::session::state_machine::{ExecutionStatus, SessionPhase, WorkflowActivity};
+use crate::timeline::StatusAgent;
 
 /// Complete status replacement, source removal, or an unrelated transcript update.
 #[derive(Default)]
@@ -36,7 +37,7 @@ impl StatusProjection {
         let crate::timeline::TimelineEntry::Status {
             id,
             status,
-            agent_count,
+            agents,
             status_thoughts,
             checks,
             ..
@@ -50,7 +51,7 @@ impl StatusProjection {
                 StatusView {
                     id,
                     status,
-                    agent_count: *agent_count,
+                    agents,
                     status_thoughts: *status_thoughts,
                     checks: checks.as_ref(),
                 }
@@ -174,8 +175,8 @@ pub(super) struct StatusView<'source> {
     pub id: &'source str,
     /// Provider or plan phase, unaffected by background check updates.
     pub status: &'source SessionPhase,
-    /// Active child executions across this session.
-    pub agent_count: usize,
+    /// Unfinished managed child exchanges across this session, in delegation order.
+    pub agents: &'source [StatusAgent],
     /// Whether the current reasoning preview is visible.
     pub status_thoughts: bool,
     /// Current check run without its retained output or historical events.
@@ -188,36 +189,34 @@ impl StatusView<'_> {
         let Self {
             id,
             status,
-            agent_count,
+            agents,
             status_thoughts,
             checks,
         } = *self;
-        if matches!(status, SessionPhase::Idle) && checks.is_none() && agent_count == 0 {
+        let idle = matches!(status, SessionPhase::Idle);
+        if idle && checks.is_none() && agents.is_empty() {
             return Ok(RenderedStatus {
                 block: None,
                 action: None,
             });
         }
-        let checking = checks.is_some() && matches!(status, SessionPhase::Idle);
+        let checking = checks.is_some() && idle;
+        // An idle root with only running children has no phase of its own to report, so the
+        // agents heading takes the primary row, as the check heading does for idle checks.
+        let delegating = idle && checks.is_none();
         let text = if checking {
             check_heading(checks.expect("checking requires check activity"), now_ms)
+        } else if delegating {
+            agents_heading(agents)
         } else {
             primary_text(status, now_ms)
-        };
-        let text = if agent_count > 0 && !matches!(status, SessionPhase::WaitingForAgent { .. }) {
-            format!(
-                "{text} · {agent_count} agent{} running",
-                if agent_count == 1 { "" } else { "s" }
-            )
-        } else {
-            text
         };
         let mut block =
             TranscriptRenderer::new(width)?.literal(BlockId(id.to_owned()), &text, 0)?;
         block.metadata.status = Some(StatusPresentation {
             row: 0,
-            animated: checking || status.animated(),
-            hint: if checking {
+            animated: checking || delegating || status.animated(),
+            hint: if checking || delegating {
                 Some(StatusHint::Working)
             } else {
                 match status {
@@ -234,7 +233,14 @@ impl StatusView<'_> {
         });
         let action = bind_action(&mut block, id, status);
         if let Some(checks) = checks {
-            append_checks(&mut block, width, checks, status, now_ms)?;
+            append_checks(&mut block, width, checks, status, agents.is_empty(), now_ms)?;
+        }
+        if !agents.is_empty() {
+            // The primary row already names running agents when the root is idle or waiting for
+            // them, so only a root with other work introduces the branch with its own heading.
+            let heading = !delegating
+                && (checks.is_some() || !matches!(status, SessionPhase::WaitingForAgent { .. }));
+            append_agents(&mut block, agents, heading, now_ms)?;
         }
         if status_thoughts
             && let SessionPhase::Working {
@@ -391,14 +397,21 @@ fn append_checks(
     width: &WidthProfile,
     checks: &CheckActivity,
     status: &SessionPhase,
+    last_branch: bool,
     now_ms: i64,
 ) -> Result<()> {
     let nested = !matches!(status, SessionPhase::Idle);
-    let root = if nested { "   " } else { "" };
+    // A following agents branch keeps the stem open beside the check commands.
+    let root = match (nested, last_branch) {
+        (false, _) => "",
+        (true, true) => "   ",
+        (true, false) => "│  ",
+    };
     let mut lines = Vec::new();
     let mut running_rows = Vec::new();
     if nested {
-        lines.push(format!("└─ {}", check_heading(checks, now_ms)));
+        let branch = if last_branch { "└─" } else { "├─" };
+        lines.push(format!("{branch} {}", check_heading(checks, now_ms)));
     }
     for (command_index, command) in checks.command_list.iter().enumerate() {
         let last = command_index + 1 == checks.command_list.len();
@@ -555,6 +568,118 @@ fn append_checks(
     Ok(())
 }
 
+/// Count running children for the agents branch heading.
+fn agents_heading(agents: &[StatusAgent]) -> String {
+    format!("Agents · {} running", agents.len())
+}
+
+/// Render one row per unfinished child: elapsed time, identity, tool progress, and reasoning.
+///
+/// Rows stay unwrapped so the spinner and reasoning columns keep exact byte positions; the
+/// editor clips each row carrying a reasoning segment to its window. The reasoning segment uses
+/// its own capture so the editor never merges a child's thought into the root preview.
+fn append_agents(
+    block: &mut BufferBlock,
+    agents: &[StatusAgent],
+    heading: bool,
+    now_ms: i64,
+) -> Result<()> {
+    let mut rows = block
+        .text
+        .wire_rows()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let start = rows.len();
+    let root = if heading {
+        rows.push(format!("└─ {}", agents_heading(agents)));
+        "   "
+    } else {
+        ""
+    };
+    for (index, agent) in agents.iter().enumerate() {
+        let last = agents[index + 1..]
+            .iter()
+            .take_while(|later| later.depth >= agent.depth)
+            .all(|later| later.depth > agent.depth);
+        let branch = if last { "└─" } else { "├─" };
+        let indent = "   ".repeat(agent.depth);
+        let elapsed = if agent.starting {
+            "starting".to_owned()
+        } else {
+            format!("{}s", agent.elapsed_ms(now_ms) / 1000)
+        };
+        let prefix = format!("{root}{indent}{branch} ");
+        let mut row = format!(
+            "{prefix}⠋ {elapsed} {}{}",
+            agent.label, agent.selection_label
+        );
+        if let Some(tools) = super::projection::tool_count_label(
+            agent.tool_completed,
+            agent.tool_total,
+            agent.tool_ms(now_ms),
+        ) {
+            row.push_str(&format!(" │ {tools}"));
+        }
+        let spinner = prefix.len();
+        block.metadata.decoration.push(Decoration {
+            range: TextRange {
+                start: TextPosition {
+                    row: rows.len(),
+                    column: spinner,
+                },
+                end: TextPosition {
+                    row: rows.len(),
+                    column: spinner + "⠋".len(),
+                },
+            },
+            capture: "ForgeTimelineStatusSpinner".into(),
+            priority: 110,
+        });
+        let thought = agent
+            .reasoning_summary
+            .as_deref()
+            .map(|summary| summary.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|summary| !summary.is_empty());
+        if let Some(thought) = thought {
+            row.push_str(" │ ");
+            let column = row.len();
+            row.push_str(&thought);
+            block.metadata.decoration.push(Decoration {
+                range: TextRange {
+                    start: TextPosition {
+                        row: rows.len(),
+                        column,
+                    },
+                    end: TextPosition {
+                        row: rows.len(),
+                        column: row.len(),
+                    },
+                },
+                capture: "ForgeHarnessAgentThought".into(),
+                priority: 105,
+            });
+        }
+        rows.push(row);
+    }
+    block.metadata.decoration.push(Decoration {
+        range: TextRange {
+            start: TextPosition {
+                row: start,
+                column: 0,
+            },
+            end: TextPosition {
+                row: rows.len(),
+                column: 0,
+            },
+        },
+        capture: "ForgeStatusHint".into(),
+        priority: 100,
+    });
+    block.text = BufferText::from_rows(rows)?;
+    Ok(())
+}
+
 fn finalization_label(exchange_outcome: Option<crate::exchange::ExchangeOutcome>) -> &'static str {
     if exchange_outcome == Some(crate::exchange::ExchangeOutcome::Cancelled) {
         "Stopping"
@@ -680,7 +805,7 @@ mod tests {
             let block = StatusView {
                 id: "status",
                 status: &SessionPhase::Idle,
-                agent_count: 0,
+                agents: &[],
                 status_thoughts: false,
                 checks: Some(&checks),
             }
@@ -754,7 +879,7 @@ mod tests {
             let rendered = StatusView {
                 id: "status",
                 status: &SessionPhase::Idle,
-                agent_count: 0,
+                agents: &[],
                 status_thoughts: false,
                 checks: Some(&checks),
             }
@@ -835,7 +960,7 @@ mod tests {
         let block = StatusView {
             id: "status",
             status: &status,
-            agent_count: 0,
+            agents: &[],
             status_thoughts: true,
             checks: Some(&checks),
         }
@@ -874,7 +999,7 @@ mod tests {
         let block = StatusView {
             id: "status",
             status: &SessionPhase::Idle,
-            agent_count: 0,
+            agents: &[],
             status_thoughts: false,
             checks: Some(&checks),
         }
@@ -912,6 +1037,187 @@ mod tests {
             checks.command_list[3].selection.as_deref(),
             Some("2 tests selected")
         );
+        Ok(())
+    }
+
+    fn running_agent(
+        label: &str,
+        depth: usize,
+        tools: (usize, usize),
+        reasoning: Option<&str>,
+    ) -> StatusAgent {
+        let mut metrics = crate::exchange::ExchangeMetrics::default();
+        metrics.timing_complete = true;
+        metrics.tool_duration_ms = 2_400;
+        StatusAgent {
+            exchange_id: format!("{label}:exchange"),
+            depth,
+            label: label.into(),
+            selection_label: " · codex · gpt-6-luna +".into(),
+            starting: false,
+            clock: crate::exchange::ExchangeClock::Running {
+                elapsed_ms: 0,
+                started_at_ms: 1_000,
+            },
+            metrics,
+            tool_completed: tools.0,
+            tool_total: tools.1,
+            reasoning_summary: reasoning.map(str::to_owned),
+        }
+    }
+
+    /// Render running children beside checks with their tool summary and reasoning only.
+    #[test]
+    fn running_agents_render_tool_summary_and_reasoning() -> Result<()> {
+        let agents = vec![
+            running_agent(
+                "code-explorer-1",
+                0,
+                (6, 6),
+                Some("Tracing   reservation admission"),
+            ),
+            running_agent("code-explorer-2", 0, (12, 13), None),
+            running_agent("nested-reviewer", 1, (0, 0), None),
+        ];
+        let status = SessionPhase::Working {
+            duration_ms: 0,
+            started_at_ms: Some(0),
+            activity: WorkflowActivity::Working,
+            reasoning_summary: Some("Waiting on the explorers".into()),
+            execution: None,
+        };
+        let block = StatusView {
+            id: "status",
+            status: &status,
+            agents: &agents,
+            status_thoughts: true,
+            checks: None,
+        }
+        .render(&WidthProfile::default(), 44_000)?
+        .block
+        .unwrap();
+        let rows = block.text.wire_rows();
+        assert_eq!(
+            &rows[..5],
+            &[
+                "Working · 44s",
+                "└─ Agents · 3 running",
+                "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4 s │ Tracing reservation admission",
+                "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4 s",
+                "      └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +",
+            ]
+        );
+        let thoughts = block
+            .metadata
+            .decoration
+            .iter()
+            .filter(|decoration| decoration.capture == "ForgeHarnessAgentThought")
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 1);
+        let thought = thoughts[0];
+        assert_eq!(
+            &rows[thought.range.start.row][thought.range.start.column..thought.range.end.column],
+            "Tracing reservation admission"
+        );
+        let spinners = block
+            .metadata
+            .decoration
+            .iter()
+            .filter(|decoration| decoration.capture == "ForgeTimelineStatusSpinner")
+            .collect::<Vec<_>>();
+        assert_eq!(spinners.len(), 3);
+        for spinner in spinners {
+            assert_eq!(
+                &rows[spinner.range.start.row]
+                    [spinner.range.start.column..spinner.range.end.column],
+                "⠋"
+            );
+        }
+        let document = BufferDocument::new(DocumentId("status-agents:status".into()), vec![block])?;
+        forge_recorded_fixtures::assert_matches_recording(
+            "status-agents.json",
+            &serde_json::to_value(document.snapshot())?,
+        );
+        Ok(())
+    }
+
+    /// Keep the check stem open when an agents branch follows it.
+    #[test]
+    fn agents_branch_follows_an_open_check_stem() -> Result<()> {
+        let checks = CheckActivity {
+            run_id: "run".into(),
+            duration_ms: 0,
+            started_at_ms: Some(0),
+            completed_count: 0,
+            total_count: 1,
+            command_list: vec![CheckCommandActivity {
+                title: "format".into(),
+                selection: None,
+                started_at_ms: Some(0),
+                completed_at_ms: None,
+                state: CheckState::Running,
+                output_line: None,
+                progress: None,
+            }],
+        };
+        let agents = vec![running_agent("explorer", 0, (1, 1), None)];
+        let status = SessionPhase::Working {
+            duration_ms: 0,
+            started_at_ms: Some(0),
+            activity: WorkflowActivity::Working,
+            reasoning_summary: None,
+            execution: None,
+        };
+        let block = StatusView {
+            id: "status",
+            status: &status,
+            agents: &agents,
+            status_thoughts: false,
+            checks: Some(&checks),
+        }
+        .render(&WidthProfile::default(), 3_000)?
+        .block
+        .unwrap();
+        assert_eq!(
+            block.text.wire_rows(),
+            [
+                "Working · 3s",
+                "├─ Checking · 0/1 finished · 3s",
+                "│  └─ ⠋ format · running · 3s",
+                "└─ Agents · 1 running",
+                "   └─ ⠋ 2s explorer · codex · gpt-6-luna + │ 1/1 tools · 2.4 s",
+            ]
+        );
+        Ok(())
+    }
+
+    /// Let the primary row name the agents when the root has no phase of its own to show.
+    #[test]
+    fn idle_and_waiting_roots_list_agents_without_a_second_heading() -> Result<()> {
+        let agents = vec![running_agent("explorer", 0, (0, 0), None)];
+        for (status, heading) in [
+            (SessionPhase::Idle, "Agents · 1 running"),
+            (
+                SessionPhase::WaitingForAgent { agent_count: 1 },
+                "Waiting for agents · 1 running",
+            ),
+        ] {
+            let block = StatusView {
+                id: "status",
+                status: &status,
+                agents: &agents,
+                status_thoughts: false,
+                checks: None,
+            }
+            .render(&WidthProfile::default(), 3_000)?
+            .block
+            .unwrap();
+            assert_eq!(
+                block.text.wire_rows(),
+                [heading, "└─ ⠋ 2s explorer · codex · gpt-6-luna +"]
+            );
+            assert!(block.metadata.status.as_ref().unwrap().animated);
+        }
         Ok(())
     }
 }

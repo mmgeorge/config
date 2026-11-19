@@ -118,6 +118,29 @@ function M.compose(snapshot, context, commands, width)
       end
       append_questions()
     end
+    -- A running child's reasoning stays on its own row, clipped to the window so the status
+    -- split never grows; the host leaves these rows unwrapped so the column is exact.
+    for _, decoration in ipairs(metadata.decoration or {}) do
+      local rendered_row = rendered_rows[decoration.range.start.row + 1]
+      if decoration.capture == "ForgeHarnessAgentThought" and rendered_row then
+        local line = content.lines[rendered_row + 1]
+        local column = decoration.range.start.column + 2 + (column_shift[rendered_row] or 0)
+        local head, thought = line:sub(1, column), line:sub(column + 1)
+        local available = (width or vim.o.columns) - vim.fn.strdisplaywidth(head)
+        if available <= vim.fn.strdisplaywidth("…") then
+          content.lines[rendered_row + 1] = (head:gsub(" │ $", ""))
+        else
+          if display_text.take_prefix(thought, available).remainder ~= "" then
+            thought = display_text.take_prefix(thought, available - vim.fn.strdisplaywidth("…")).prefix .. "…"
+          end
+          content.lines[rendered_row + 1] = head .. thought
+          content.highlights[#content.highlights + 1] = {
+            row = rendered_row, column = column, end_column = #content.lines[rendered_row + 1],
+            capture = "ForgeHarnessAgentThought",
+          }
+        end
+      end
+    end
     for _, decoration in ipairs(metadata.decoration or {}) do
       if decoration.capture == "ForgeTimelineStatusSpinner" then
         local rendered_row = rendered_rows[decoration.range.start.row + 1]
@@ -127,7 +150,7 @@ function M.compose(snapshot, context, commands, width)
         end
       end
       for row = decoration.range.start.row, decoration.range["end"].row - 1 do
-        local rendered_row = rendered_rows[row + 1]
+        local rendered_row = decoration.capture ~= "ForgeHarnessAgentThought" and rendered_rows[row + 1]
         if rendered_row then
           for _, highlight in ipairs(content.highlights) do
             if highlight.row == rendered_row and highlight.column == nil then highlight.capture = decoration.capture break end

@@ -25,4 +25,40 @@ T["thought_uses_space_after_controls"] = function()
   MiniTest.expect.equality(snapshot.block[1].text[2], "Reviewing 界界界 diagnostics")
 end
 
+
+T["agent_thought_stays_on_its_row_and_clips_to_width"] = function()
+  local commands = require("forge.shared.view_command_set").new()
+  local hint = require("forge.views.harness.status_hint")
+  local row = "└─ ⠋ 4s explorer │ 2/2 tools · 1.0 s │ Reading 界界界 the admission queue"
+  local column = #"└─ ⠋ 4s explorer │ 2/2 tools · 1.0 s │ "
+  local snapshot = { block = { { text = { "Agents · 1 running", row, "Root preview" }, metadata = {
+    status = { row = 0, animated = true },
+    decoration = {
+      { capture = "ForgeHarnessAgentThought", range = {
+        start = { row = 1, column = column }, ["end"] = { row = 1, column = #row },
+      } },
+      { capture = "ForgeHarnessCommentary", range = {
+        start = { row = 2, column = 0 }, ["end"] = { row = 3, column = 0 },
+      } },
+    },
+  } } } }
+  local full = hint.compose(snapshot, {}, commands, 200)
+  MiniTest.expect.equality(full.lines, {
+    "  Agents · 1 running │ Root preview",
+    "  " .. row,
+  })
+  local agent_highlight = vim.iter(full.highlights):find(function(highlight)
+    return highlight.capture == "ForgeHarnessAgentThought"
+  end)
+  MiniTest.expect.equality({ agent_highlight.row, agent_highlight.column, agent_highlight.end_column },
+    { 1, column + 2, #full.lines[2] })
+  local head = "  └─ ⠋ 4s explorer │ 2/2 tools · 1.0 s │ "
+  local width = vim.fn.strdisplaywidth(head .. "Reading 界…")
+  local narrow = hint.compose(snapshot, {}, commands, width)
+  MiniTest.expect.equality(narrow.lines[2], head .. "Reading 界…")
+  MiniTest.expect.equality(vim.fn.strdisplaywidth(narrow.lines[2]), width)
+  local cramped = hint.compose(snapshot, {}, commands, vim.fn.strdisplaywidth(head))
+  MiniTest.expect.equality(cramped.lines[2], "  └─ ⠋ 4s explorer │ 2/2 tools · 1.0 s")
+end
+
 return T

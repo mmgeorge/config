@@ -11,8 +11,11 @@ use std::collections::HashMap;
 
 pub(crate) mod ownership;
 mod planning;
+mod status_agent;
 pub mod stream;
 pub use ownership::{TimelineEvent, TimelineOwner};
+pub use status_agent::StatusAgent;
+pub(crate) use status_agent::running_agents;
 
 /// Records a durable session action at its captured session or exchange boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,8 +116,8 @@ pub enum TimelineEntry {
         status: SessionPhase,
         /// Controls the status preview independently of retained thought messages.
         status_thoughts: bool,
-        /// Active child executions across the root session, independent of its phase.
-        agent_count: usize,
+        /// Unfinished managed child exchanges across the root session, independent of its phase.
+        agents: Vec<StatusAgent>,
         /// Active checks independent of the main workflow phase.
         checks: Option<crate::checks::CheckActivity>,
     },

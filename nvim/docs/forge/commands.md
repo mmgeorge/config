@@ -369,6 +369,8 @@ Loaded skills appear as `≡ Skill · name`, aligned with commentary rather than
 
 The live check status shows a single selected test by name on a child row beneath its check. Multiple selected tests show a count; full paths and IDs remain available in check details.
 
+Child agents appear in three places. Each spawn adds a `◇ Spawned name · provider · model` row to the thought that started it. While a child runs, the status area shows its row with elapsed time, name, model, tool summary, and newest reasoning summary; a child that reports no reasoning summary leaves that column empty. Once children finish, an **Agents** summary beside **Checks** lists each finished child with its outcome, tool counts, and token usage. Enter on a spawn row or a summary row opens that child's own transcript.
+
 Thoughts with activity start collapsed and preserve the assistant's text in their heading.
 Expanding a thought shows its events first, then its tool summary, then its file changes,
 one indentation level deeper. Thoughts without activity keep the `○` marker. Your explicit

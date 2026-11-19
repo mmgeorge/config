@@ -346,6 +346,53 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   end, "check tree spinner did not advance")
 end
 
+T["status_agents_branch_coexists_with_question_branch"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  stub(vim.uv, "now", function() return 0 end)
+  stub(vim.uv, "new_timer", function()
+    return { start = function() end, stop = function() end, close = function() end }
+  end)
+  vim.o.columns = 200
+  local snapshot = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/status-agents.json"), "\n"))
+  local commands = require("forge.shared.view_command_set").new()
+  require("forge.shared.view_command_set").register(commands, "cancel", function() end)
+  require("forge.shared.view_command_set").register(commands, "reopen_question", function() end)
+  local transcript_buffer, transcript_window, _, composer_window = require("forge.views.harness.layout").open("status-agents")
+  local transcript = require("forge.buffer").open("status-agents", { buffer = transcript_buffer, generated = true,
+    expected_changedtick = vim.api.nvim_buf_get_changedtick(transcript_buffer), preserve_view = true })
+  local status = require("forge.views.harness.status_view").new({ transcript = transcript,
+    transcript_window = transcript_window, composer_window = composer_window, alive = function() return true end,
+    notice = function(message) error(message) end, recover = function() error("unexpected recovery") end })
+  MiniTest.finally(function() pcall(status.close, status) pcall(require("forge.buffer").close, transcript) end)
+  status:render({ questions = { revision = 1, questions = {
+    { content = { question = "Should this apply to all sessions?" }, resolution = { kind = "pending" } },
+  } } }, commands)
+  local applied
+  status:apply(snapshot, function(result) applied = result end)
+  wait_until(function() return applied ~= nil end, "status snapshot did not apply")
+  eq(applied, true)
+  local lines = status.content.lines
+  eq(lines[1]:find(" │ Waiting on the explorers", 1, true) ~= nil, true)
+  eq(lines[2], "  ├─ Agents · 3 running")
+  eq(lines[3], "  │  ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4 s │ Tracing reservation admission")
+  eq(lines[4], "  │  └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4 s")
+  eq(lines[5], "  │     └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +")
+  eq(lines[#lines], "  └─ Should this apply to all sessions?")
+  local thought = vim.iter(status.content.highlights):find(function(highlight)
+    return highlight.capture == "ForgeHarnessAgentThought"
+  end)
+  eq(lines[thought.row + 1]:sub(thought.column + 1, thought.end_column), "Tracing reservation admission")
+  local marks = vim.api.nvim_buf_get_extmarks(status.buffer, status.animation_namespace, 0, -1, { details = true })
+  local spinner_rows = {}
+  for _, mark in ipairs(marks) do
+    if mark[2] > 0 then
+      spinner_rows[#spinner_rows + 1] = mark[2]
+      eq(mark[3], lines[mark[2] + 1]:find("⠋", 1, true) - 1)
+    end
+  end
+  eq(spinner_rows, { 2, 3, 4 })
+end
+
 -- requires-forge-host
 T["rejected_tool_expands_reason_with_orange_marker"] = function()
   local approval = dofile("nvim/lua/forge/tests/support/approval.lua")
@@ -3131,19 +3178,19 @@ local option = spec.page_list[1].option_list[1]
 assert(option.id == 'chosen')
 local source_session = state.session
 state.session = { id = 'later-view', provider = 'fixture_alpha', workspace = 'workspace' }
-spec.on_change({ option = option })
+spec.on_change({ page = spec.page_list[1], option = option })
 state.session = source_session
 assert(previewed.preview == 'chosen')
 assert(preview_request_list[#preview_request_list].params.session_id == 'chosen',
   'the cross-provider candidate belongs in preview params')
 assert(selected == nil and state.session.id == 'source', 'preview must not switch sessions')
 defer_preview = true
-spec.on_change({ option = option })
-spec.on_change({ option = nil })
+spec.on_change({ page = spec.page_list[1], option = option })
+spec.on_change({ page = spec.page_list[1], option = nil })
 previewed = nil
 deferred_preview_list[#deferred_preview_list]()
 assert(previewed == nil, 'clearing selection must invalidate an outstanding preview')
-spec.on_change({ option = option })
+spec.on_change({ page = spec.page_list[1], option = option })
 local closed_preview = deferred_preview_list[#deferred_preview_list]
 defer_preview = false
 spec.on_confirm({ option = option })
@@ -3173,7 +3220,7 @@ state.session = nil
 session_picker.open({})
 local preview_request_count = #preview_request_list
 previewed, notifications = nil, nil
-spec.on_change({ option = spec.page_list[1].option_list[1] })
+spec.on_change({ page = spec.page_list[1], option = spec.page_list[1].option_list[1] })
 assert(#preview_request_list == preview_request_count,
   'an uninitialized caller must not route preview through the candidate')
 assert(previewed == nil and notifications ==

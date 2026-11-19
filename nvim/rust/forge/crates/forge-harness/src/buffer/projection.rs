@@ -373,15 +373,7 @@ pub(super) fn timing_blocks(
     tools: &HashMap<super::identity::DisplayId, ToolOutputView>,
     display: &crate::buffer::identity::DisplayRegistry,
 ) -> Result<Vec<BufferBlock>> {
-    fn exchanges<'source>(
-        entry: &'source TimelineEntry,
-        result: &mut Vec<&'source Exchange>,
-        headings: &mut Vec<(
-            &'source str,
-            &'source crate::agent::Agent,
-            Option<&'source Exchange>,
-        )>,
-    ) {
+    fn exchanges<'source>(entry: &'source TimelineEntry, result: &mut Vec<&'source Exchange>) {
         match entry {
             TimelineEntry::Exchange {
                 exchange,
@@ -389,56 +381,16 @@ pub(super) fn timing_blocks(
                 ..
             } => {
                 result.push(exchange);
-                for node in &exchange.node_list {
-                    if let ExchangeNode::AgentReference { agent } = node
-                        && let Some(TimelineEntry::AgentLifecycle { run, exchange, .. }) =
-                            agent_by_id
-                                .get(&agent.id)
-                                .or_else(|| agent_by_id.get(&agent.child_agent_id))
-                    {
-                        headings.push((
-                            &agent.id,
-                            run,
-                            exchange
-                                .iter()
-                                .find(|exchange| exchange.id == agent.child_exchange_id),
-                        ));
-                    }
-                }
                 for agent in agent_by_id.values() {
-                    exchanges(agent, result, headings);
+                    exchanges(agent, result);
                 }
             }
             TimelineEntry::AgentLifecycle {
-                id,
-                run,
-                exchange,
-                agent,
-                ..
+                exchange, agent, ..
             } => {
-                headings.push((id, run, None));
                 result.extend(exchange);
-                for source in exchange {
-                    for node in &source.node_list {
-                        if let ExchangeNode::AgentReference { agent: reference } = node
-                            && let Some(TimelineEntry::AgentLifecycle { run, exchange, .. }) =
-                                agent.iter().find(|agent| {
-                                    agent.id() == reference.id
-                                        || agent.id() == reference.child_agent_id
-                                })
-                        {
-                            headings.push((
-                                &reference.id,
-                                run,
-                                exchange
-                                    .iter()
-                                    .find(|exchange| exchange.id == reference.child_exchange_id),
-                            ));
-                        }
-                    }
-                }
                 for agent in agent {
-                    exchanges(agent, result, headings);
+                    exchanges(agent, result);
                 }
             }
             TimelineEntry::ObservedAgent {
@@ -448,7 +400,7 @@ pub(super) fn timing_blocks(
                     result.extend(agent.exchanges());
                 }
                 for child in children {
-                    exchanges(child, result, headings);
+                    exchanges(child, result);
                 }
             }
             _ => {}
@@ -461,42 +413,8 @@ pub(super) fn timing_blocks(
         return Ok(Vec::new());
     }
     let mut source = Vec::new();
-    let mut headings = Vec::new();
-    exchanges(entry, &mut source, &mut headings);
+    exchanges(entry, &mut source);
     let mut blocks = Vec::new();
-    let mut rendered = std::collections::HashSet::new();
-    for (id, run, exchange) in headings {
-        if !rendered.insert(id) {
-            continue;
-        }
-        let Some(previous) = document.block(&BlockId(id.into())) else {
-            continue;
-        };
-        let mut profile = width.clone();
-        profile.columns = profile
-            .columns
-            .saturating_sub(
-                previous
-                    .metadata
-                    .layout
-                    .as_ref()
-                    .map_or(0, |layout| layout.indent.saturating_sub(2)),
-            )
-            .max(1);
-        let mut block = TranscriptRenderer::new(&profile)?.literal(
-            previous.id.clone(),
-            &agent_summary(run, exchange, now_ms),
-            2,
-        )?;
-        block.metadata = previous.metadata.clone();
-        for span in &mut block.metadata.decoration {
-            if span.range.end.row == previous.text.row_count() {
-                span.range.end.row = block.text.row_count();
-            }
-        }
-        TranscriptRenderer::resolve_marker(&mut block)?;
-        blocks.push(block);
-    }
     for exchange in source {
         if exchange.is_finished() || exchange.state() != ExchangeState::Running {
             continue;
@@ -929,7 +847,13 @@ impl TimelineRenderer<'_> {
                 ..
             } => {
                 if interaction.is_empty() {
-                    self.agent_entry(id, run, interaction, agent, None, depth)?;
+                    self.literal(
+                        id,
+                        &agent_summary(run, None, self.now_ms),
+                        Some(TranscriptAction::Agent {
+                            run_id: run.id.clone(),
+                        }),
+                    )?;
                 } else {
                     let children = agent
                         .iter()
@@ -1233,93 +1157,160 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn agent_entry(
+    /// Summarize the children this exchange delegated once each reaches a terminal state.
+    ///
+    /// Running children belong to the status area, so the root lists only finished children and
+    /// its heading counts them against every delegation. Leaves keep the agent action, which
+    /// opens the child's own transcript, but never expand inline.
+    fn agent_results(
         &mut self,
-        id: &str,
-        run: &crate::agent::Agent,
-        interaction: &[Exchange],
-        agent: &[TimelineEntry],
-        exchange_id: Option<&str>,
-        depth: usize,
+        exchange: &Exchange,
+        agents: &HashMap<&str, &TimelineEntry>,
     ) -> Result<()> {
-        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-            self.agent_content(id, run, interaction, agent, exchange_id, depth)
-        })
+        let delegations = exchange
+            .node_list
+            .iter()
+            .filter_map(|node| match node {
+                ExchangeNode::AgentReference { agent } => Some(agent),
+                _ => None,
+            })
+            .filter_map(|delegation| {
+                agents
+                    .get(delegation.id.as_str())
+                    .or_else(|| agents.get(delegation.child_agent_id.as_str()))
+                    .and_then(|entry| DelegatedAgent::resolve(delegation, entry))
+            })
+            .collect::<Vec<_>>();
+        let identity = format!("{}:agents", exchange.id);
+        self.agent_group(&identity, &delegations, exchange.is_finished())
     }
 
-    fn agent_content(
+    fn agent_group(
         &mut self,
-        id: &str,
-        run: &crate::agent::Agent,
-        interaction: &[Exchange],
-        agent: &[TimelineEntry],
-        exchange_id: Option<&str>,
-        depth: usize,
+        identity: &str,
+        delegations: &[DelegatedAgent<'_>],
+        closed: bool,
     ) -> Result<()> {
-        let exchange = exchange_id
-            .and_then(|id| interaction.iter().find(|exchange| exchange.id == id))
-            .or_else(|| interaction.last());
-        let summary = agent_summary(run, exchange, self.now_ms);
-        self.literal(
-            id,
-            &summary,
-            Some(TranscriptAction::Agent {
-                run_id: run.id.clone(),
-            }),
-        )?;
+        let finished = delegations
+            .iter()
+            .filter(|delegated| delegated.exchange.is_finished())
+            .collect::<Vec<_>>();
+        let Some((first, rest)) = finished.split_first() else {
+            return Ok(());
+        };
+        let completed = finished
+            .iter()
+            .filter(|delegated| delegated.exchange.state() == ExchangeState::Complete)
+            .count();
+        // Children run concurrently, so the heading reports the span from the first child's
+        // creation to the last child's settlement rather than the sum of their durations.
+        let first_created_ms = finished
+            .iter()
+            .map(|delegated| delegated.exchange.created_at_ms)
+            .min();
+        let last_completed_ms = finished
+            .iter()
+            .filter_map(|delegated| delegated.exchange.completed_at_ms())
+            .max();
+        let longest_ms = finished
+            .iter()
+            .map(|delegated| delegated.exchange.elapsed(self.now_ms))
+            .max()
+            .unwrap_or_default();
+        let wall_ms = match (first_created_ms, last_completed_ms) {
+            (Some(created), Some(completed)) => u64::try_from(completed - created)
+                .unwrap_or_default()
+                .max(longest_ms),
+            _ => longest_ms,
+        };
+        let mut sections = vec![format!(
+            "Agents · {completed}/{} completed · {}s",
+            delegations.len(),
+            wall_ms / 1000
+        )];
+        let successful_tools = finished
+            .iter()
+            .map(|delegated| delegated.exchange.tool_counter.completed)
+            .sum();
+        let total_tools = finished
+            .iter()
+            .map(|delegated| delegated.exchange.tool_counter.total)
+            .sum();
+        let tool_ms = finished
+            .iter()
+            .map(|delegated| {
+                delegated
+                    .exchange
+                    .metrics
+                    .tool_ms(delegated.exchange.elapsed(self.now_ms))
+            })
+            .sum::<Option<u64>>();
+        if let Some(tools) = tool_count_label(successful_tools, total_tools, tool_ms) {
+            sections.push(tools);
+        }
+        let mut usage = first.exchange.usage();
+        for delegated in rest {
+            usage.accumulate(&delegated.exchange.usage());
+        }
+        if let Some(tokens) = token_usage_label(&usage) {
+            sections.push(tokens);
+        }
+        self.literal(identity, &sections.join(" │ "), None)?;
         let section = self.begin_section(2);
-        let completed = exchange.is_some_and(|exchange| exchange.is_finished());
-        if let Some(exchange) = exchange {
-            if completed {
-                let agents = agent
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        TimelineEntry::AgentLifecycle { id, .. } => Some((id.as_str(), entry)),
-                        _ => None,
-                    })
-                    .collect();
-                self.interaction(exchange, &agents, depth)?;
-            } else {
-                if let Some(message) = exchange.turn.iter().rev().find_map(|turn| {
-                    turn.messages().iter().rev().find(|message| {
-                        !message.text().is_empty()
-                            && message.delivery() != crate::turn::MessageDelivery::Final
-                            && message.kind() == crate::turn::MessageKind::Assistant
-                    })
-                }) {
-                    self.markdown(
-                        &format!("{id}:thought"),
-                        message.text(),
-                        MarkdownRole::Commentary,
-                    )?;
-                }
-                if let Some((turn, tool)) = exchange.turn.iter().rev().find_map(|turn| {
-                    exchange
-                        .tools_for_turn(turn.id())
-                        .last()
-                        .map(|tool| (turn, tool))
-                }) {
-                    let call = crate::exchange::ThoughtCall {
-                        id: &tool.id,
-                        turn,
-                        tool,
-                    };
-                    self.tool(&call, None, "", exchange)?;
-                }
-            }
+        for delegated in finished {
+            self.agent_result(identity, delegated)?;
         }
-        let heading = section.start;
-        self.finish_section(section, id, completed);
-        let heading = &mut self.block[heading];
-        if let Some(node) = heading.metadata.node.as_mut() {
-            node.kind = NodeKind::Exchange;
-            node.lifecycle = if completed {
-                NodeLifecycle::Settled
-            } else {
-                NodeLifecycle::Live
-            };
-        }
+        self.finish_section(section, identity, closed);
         Ok(())
+    }
+
+    fn agent_result(&mut self, identity: &str, delegated: &DelegatedAgent<'_>) -> Result<()> {
+        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+            let exchange = delegated.exchange;
+            let (marker, outcome) = match exchange.state() {
+                ExchangeState::Complete => ("✓", "Ran"),
+                ExchangeState::Cancelled => ("✗", "Cancelled"),
+                ExchangeState::Interrupted => ("✗", "Interrupted"),
+                _ => ("✗", "Failed"),
+            };
+            let heading = format!(
+                "{marker} {}{} · {outcome} {}s",
+                delegated.run.label(),
+                agent_selection_label(delegated.run),
+                exchange.elapsed(self.now_ms) / 1000,
+            );
+            let leaf = format!("{identity}:{}", delegated.delegation.id);
+            self.literal(
+                &leaf,
+                &exchange_metrics_summary(exchange, self.now_ms, heading),
+                Some(TranscriptAction::Agent {
+                    run_id: delegated.run.id.clone(),
+                }),
+            )?;
+            let nested = exchange
+                .node_list
+                .iter()
+                .filter_map(|node| match node {
+                    ExchangeNode::AgentReference { agent } => Some(agent),
+                    _ => None,
+                })
+                .filter_map(|delegation| {
+                    delegated
+                        .children
+                        .iter()
+                        .find(|entry| {
+                            entry.id() == delegation.id || entry.id() == delegation.child_agent_id
+                        })
+                        .and_then(|entry| DelegatedAgent::resolve(delegation, entry))
+                })
+                .collect::<Vec<_>>();
+            if nested.iter().any(|child| child.exchange.is_finished()) {
+                let section = self.begin_section(2);
+                self.agent_group(&format!("{leaf}:agents"), &nested, true)?;
+                self.finish_section(section, &leaf, false);
+            }
+            Ok(())
+        })
     }
 
     fn question(
@@ -1436,14 +1427,15 @@ impl TimelineRenderer<'_> {
             .any(|node| matches!(node, ExchangeNode::AgentReference { .. }))
             && interaction.turn.is_empty()
         {
-            return self.content(
+            self.content(
                 interaction,
                 agents,
                 depth,
                 interaction.content(&interaction.node_list.iter().collect::<Vec<_>>(), true)?,
                 None,
                 MarkdownRole::Response,
-            );
+            )?;
+            return self.agent_results(interaction, agents);
         }
         if depth == 0 && self.leading_separator {
             self.literal(&format!("{}:separator", interaction.id), "", None)?;
@@ -1537,6 +1529,7 @@ impl TimelineRenderer<'_> {
         }
         self.provider_checklist(interaction)?;
         self.host_file_changes(interaction)?;
+        self.agent_results(interaction, agents)?;
         self.interaction_results(interaction)?;
         self.content(
             interaction,
@@ -2202,37 +2195,27 @@ impl TimelineRenderer<'_> {
                     self.push(block)?;
                 }
                 ExchangeNode::AgentReference { agent } => {
-                    if let Some(entry) = agents
+                    let run = agents
                         .get(agent.id.as_str())
                         .or_else(|| agents.get(agent.child_agent_id.as_str()))
-                        .copied()
-                    {
-                        if let TimelineEntry::AgentLifecycle {
-                            id: _,
-                            run,
-                            exchange: interaction,
-                            agent: child,
-                            ..
-                        } = entry
-                        {
-                            self.agent_entry(
-                                &agent.id,
-                                run,
-                                interaction,
-                                child,
-                                Some(&agent.child_exchange_id),
-                                depth + 1,
-                            )?;
+                        .and_then(|entry| match entry {
+                            TimelineEntry::AgentLifecycle { run, .. } => Some(run.as_ref()),
+                            _ => None,
+                        });
+                    let text = match run {
+                        Some(run) => {
+                            format!("◇ Spawned {}{}", run.label(), agent_selection_label(run))
                         }
-                    } else {
-                        self.literal(
-                            &agent.id,
-                            "Agent",
-                            Some(TranscriptAction::Agent {
-                                run_id: agent.child_agent_id.clone(),
-                            }),
-                        )?;
-                    }
+                        None => "◇ Spawned agent".into(),
+                    };
+                    self.literal(
+                        &agent.id,
+                        &text,
+                        Some(TranscriptAction::Agent {
+                            run_id: run
+                                .map_or_else(|| agent.child_agent_id.clone(), |run| run.id.clone()),
+                        }),
+                    )?;
                 }
                 ExchangeNode::QuestionPresented {
                     id,
@@ -3375,6 +3358,60 @@ impl TimelineRenderer<'_> {
     }
 }
 
+/// A delegation resolved to its child agent, the exchange it delegated, and the child's own
+/// delegated children.
+struct DelegatedAgent<'source> {
+    delegation: &'source crate::agent::Delegation,
+    run: &'source crate::agent::Agent,
+    exchange: &'source Exchange,
+    children: &'source [TimelineEntry],
+}
+
+impl<'source> DelegatedAgent<'source> {
+    fn resolve(
+        delegation: &'source crate::agent::Delegation,
+        entry: &'source TimelineEntry,
+    ) -> Option<Self> {
+        let TimelineEntry::AgentLifecycle {
+            run,
+            exchange,
+            agent,
+            ..
+        } = entry
+        else {
+            return None;
+        };
+        let exchange = exchange
+            .iter()
+            .find(|exchange| exchange.id == delegation.child_exchange_id)?;
+        Some(Self {
+            delegation,
+            run,
+            exchange,
+            children: agent,
+        })
+    }
+}
+
+/// Format a child's resolved provider, model, and speed as ` · provider · model +`.
+pub(crate) fn agent_selection_label(run: &crate::agent::Agent) -> String {
+    run.selection
+        .as_ref()
+        .map(|selection| {
+            let speed = match selection.service_tier {
+                crate::provider::ServiceTier::Standard => "",
+                crate::provider::ServiceTier::Fast => " +",
+                crate::provider::ServiceTier::Ultrafast => " ++",
+            };
+            format!(
+                " · {} · {}{speed}",
+                selection.provider.as_str(),
+                selection.model
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms: i64) -> String {
     if let Some(exchange) = exchange {
         let lifecycle = if run.state == crate::agent::AgentState::Closing {
@@ -3413,22 +3450,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
                 ExchangeState::Interrupted => "Interrupted",
             }
         };
-        let selection = run
-            .selection
-            .as_ref()
-            .map(|selection| {
-                let speed = match selection.service_tier {
-                    crate::provider::ServiceTier::Standard => "",
-                    crate::provider::ServiceTier::Fast => " +",
-                    crate::provider::ServiceTier::Ultrafast => " ++",
-                };
-                format!(
-                    " · {} · {}{speed}",
-                    selection.provider.as_str(),
-                    selection.model
-                )
-            })
-            .unwrap_or_default();
+        let selection = agent_selection_label(run);
         let heading = format!(
             "● {lifecycle} {}s · {}{selection}",
             exchange.elapsed(now_ms) / 1000,
@@ -3581,38 +3603,13 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 }
 
 fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String) -> String {
-    let count = interaction.tool_counter.total;
     let mut sections = vec![summary];
-    if count > 0 {
-        let passed = interaction.tool_counter.completed;
-        let duration = interaction
-            .metrics
-            .tool_ms(interaction.elapsed(now_ms))
-            .map(|duration| {
-                let label = super::duration::duration_label(duration);
-                let value =
-                    label.trim_end_matches(|character: char| character.is_ascii_alphabetic());
-                format!(" · {value} {}", &label[value.len()..])
-            })
-            .unwrap_or_default();
-        sections.push(format!("{passed}/{count} tools{duration}"));
+    if let Some(tools) = exchange_tool_label(interaction, now_ms) {
+        sections.push(tools);
     }
-    let usage = interaction.usage();
     let mut tokens = Vec::new();
-    let input = usage.input.map(|input| {
-        let mut label = token_display(input);
-        // Input sums every request in the exchange, so a bare percentage beside it reads
-        // as context fill; name it as the cached share of that input.
-        if let Some(percent) = usage.cached_percent() {
-            label.push_str(&format!(" ({percent}% cached)"));
-        }
-        label
-    });
-    match (input, usage.output) {
-        (Some(input), Some(output)) => tokens.push(format!("{input} -> {}", token_display(output))),
-        (Some(input), None) => tokens.push(format!("in {input}")),
-        (None, Some(output)) => tokens.push(format!("out {}", token_display(output))),
-        (None, None) => {}
+    if let Some(usage) = token_usage_label(&interaction.usage()) {
+        tokens.push(usage);
     }
     if let Some((output, duration)) = interaction
         .metrics
@@ -3646,6 +3643,56 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
     summary
 }
 
+/// Format an exchange's successful and total tool calls with their union execution time.
+///
+/// The Thought heading, the Agents summary, and running-agent status rows share this label so a
+/// child's tool progress reads the same wherever it appears.
+pub(super) fn exchange_tool_label(interaction: &Exchange, now_ms: i64) -> Option<String> {
+    tool_count_label(
+        interaction.tool_counter.completed,
+        interaction.tool_counter.total,
+        interaction.metrics.tool_ms(interaction.elapsed(now_ms)),
+    )
+}
+
+/// Format `successful/total tools`, followed by the tool duration when one is known.
+pub(super) fn tool_count_label(
+    successful: usize,
+    total: usize,
+    tool_ms: Option<u64>,
+) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let duration = tool_ms
+        .map(|duration| {
+            let label = super::duration::duration_label(duration);
+            let value = label.trim_end_matches(|character: char| character.is_ascii_alphabetic());
+            format!(" · {value} {}", &label[value.len()..])
+        })
+        .unwrap_or_default();
+    Some(format!("{successful}/{total} tools{duration}"))
+}
+
+/// Format token expenditure as `input (N% cached) -> output`, omitting unavailable counts.
+fn token_usage_label(usage: &crate::provider::usage::TokenUsage) -> Option<String> {
+    let input = usage.input.map(|input| {
+        let mut label = token_display(input);
+        // Input sums every request in the exchange, so a bare percentage beside it reads
+        // as context fill; name it as the cached share of that input.
+        if let Some(percent) = usage.cached_percent() {
+            label.push_str(&format!(" ({percent}% cached)"));
+        }
+        label
+    });
+    match (input, usage.output) {
+        (Some(input), Some(output)) => Some(format!("{input} -> {}", token_display(output))),
+        (Some(input), None) => Some(format!("in {input}")),
+        (None, Some(output)) => Some(format!("out {}", token_display(output))),
+        (None, None) => None,
+    }
+}
+
 fn instruction_display_path(path: &str) -> String {
     use std::path::Path;
 
@@ -3668,7 +3715,7 @@ fn instruction_display_path(path: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     use super::project_at;
 
@@ -4609,6 +4656,169 @@ mod tests {
         assert!(
             settled.prompt.contains(&row.id),
             "prompt navigation skipped the row"
+        );
+        Ok(())
+    }
+
+    /// Project one timeline entry and return its transcript rows.
+    pub(crate) fn project_rows(entry: &TimelineEntry) -> anyhow::Result<Vec<String>> {
+        Ok(project_at(entry, &WidthProfile::default(), 6_000)?
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Build a delegated child record for agent presentation fixtures.
+    pub(crate) fn child_agent(id: &str, task_name: &str) -> crate::agent::Agent {
+        serde_json::from_value(json!({
+            "id": id,
+            "session_id": "session",
+            "provider_thread_id": null,
+            "definition": "code-explorer",
+            "nickname": null,
+            "task_name": task_name,
+            "task_path": format!("/root/{task_name}"),
+            "source": "model",
+            "selection": null,
+            "inbox": [],
+            "state": "ready",
+            "created_at_ms": 10,
+            "updated_at_ms": 10,
+        }))
+        .expect("child agent fixture")
+    }
+
+    /// Build a parent exchange that delegated one child per task name, returning the timeline
+    /// entry and each child's exchange identity in delegation order.
+    pub(crate) fn delegating_exchange(
+        task_names: &[&str],
+        child_outcome: &[Option<crate::exchange::ExchangeOutcome>],
+    ) -> anyhow::Result<TimelineEntry> {
+        let mut parent = crate::storage::test::running_exchange("parent");
+        let address = crate::turn::test_support::address(&parent, "turn");
+        parent.start_turn(address, 0)?;
+        let mut agent_by_id = HashMap::new();
+        for (index, (task_name, outcome)) in task_names.iter().zip(child_outcome).enumerate() {
+            let run_id = format!("child-{index}");
+            assert!(parent.append_delegation(&run_id, &format!("call-{index}"), "explore", 40)?);
+            let Some(crate::exchange::ExchangeNode::AgentReference { agent: delegation }) =
+                parent.node_list.last()
+            else {
+                unreachable!("delegation appends a reference")
+            };
+            let mut child = crate::storage::test::running_exchange(&delegation.child_exchange_id);
+            child.created_at_ms = 50 + index as i64;
+            if let Some(outcome) = outcome {
+                child.finish(*outcome, 5_000)?;
+            }
+            agent_by_id.insert(
+                run_id.clone(),
+                TimelineEntry::AgentLifecycle {
+                    id: run_id.clone(),
+                    created_at_ms: 50 + index as i64,
+                    run: Box::new(child_agent(&run_id, task_name)),
+                    exchange: vec![child],
+                    agent: Vec::new(),
+                },
+            );
+        }
+        Ok(TimelineEntry::Exchange {
+            id: parent.id.clone(),
+            created_at_ms: parent.created_at_ms,
+            exchange: parent.into(),
+            agent_by_id,
+        })
+    }
+
+    /// Record each delegation as one static event and summarize only finished children.
+    #[test]
+    fn delegations_render_spawn_events_and_summarize_finished_children() -> anyhow::Result<()> {
+        use crate::exchange::ExchangeOutcome;
+        let entry = delegating_exchange(
+            &["explorer-done", "explorer-running", "explorer-cancelled"],
+            &[
+                Some(ExchangeOutcome::Complete),
+                None,
+                Some(ExchangeOutcome::Cancelled),
+            ],
+        )?;
+        let projected = project_at(&entry, &WidthProfile::default(), 6_000)?;
+        let rows = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>();
+        for task_name in ["explorer-done", "explorer-running", "explorer-cancelled"] {
+            assert!(
+                rows.contains(&format!("◇ Spawned {task_name}").as_str()),
+                "{rows:#?}"
+            );
+        }
+        assert!(rows.contains(&"Agents · 1/3 completed · 4s"), "{rows:#?}");
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("✓ explorer-done · Ran "))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("✗ explorer-cancelled · Cancelled "))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("explorer-running") && !row.starts_with("◇ Spawned")),
+            "a running child appears only as its spawn event: {rows:#?}"
+        );
+        let spawn = rows
+            .iter()
+            .position(|row| *row == "◇ Spawned explorer-done")
+            .unwrap();
+        let summary = rows
+            .iter()
+            .position(|row| *row == "Agents · 1/3 completed · 4s")
+            .unwrap();
+        assert!(spawn < summary, "spawn events precede the exchange summary");
+        let agent_block = projected
+            .entry
+            .block
+            .iter()
+            .find(|block| block.id.0 == "parent:agents")
+            .expect("agents root block");
+        let node = agent_block
+            .metadata
+            .node
+            .as_ref()
+            .expect("agents root node");
+        assert_eq!(node.id.0, "parent:agents");
+        let opened = projected
+            .action
+            .values()
+            .filter_map(|action| match action {
+                super::TranscriptAction::Agent { run_id } => Some(run_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for run_id in ["child-0", "child-1", "child-2"] {
+            assert!(opened.contains(&run_id), "{opened:?}");
+        }
+        Ok(())
+    }
+
+    /// Keep the Agents root absent until a delegated child reaches a terminal state.
+    #[test]
+    fn agents_root_waits_for_a_finished_child() -> anyhow::Result<()> {
+        let entry = delegating_exchange(&["explorer"], &[None])?;
+        let projected = project_at(&entry, &WidthProfile::default(), 6_000)?;
+        assert!(
+            projected
+                .entry
+                .block
+                .iter()
+                .all(|block| block.id.0 != "parent:agents")
         );
         Ok(())
     }

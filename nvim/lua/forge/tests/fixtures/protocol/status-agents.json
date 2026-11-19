@@ -1,0 +1,126 @@
+{
+  "document": "status-agents:status",
+  "revision": 0,
+  "block": [
+    {
+      "id": "status",
+      "text": [
+        "Working · 44s",
+        "└─ Agents · 3 running",
+        "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4 s │ Tracing reservation admission",
+        "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4 s",
+        "      └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +",
+        "Waiting on the explorers"
+      ],
+      "metadata": {
+        "status": {
+          "row": 0,
+          "animated": true,
+          "hint": "working"
+        },
+        "target": [
+          {
+            "id": "status:working",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [
+          {
+            "range": {
+              "start": {
+                "row": 2,
+                "column": 10
+              },
+              "end": {
+                "row": 2,
+                "column": 13
+              }
+            },
+            "capture": "ForgeTimelineStatusSpinner",
+            "priority": 110
+          },
+          {
+            "range": {
+              "start": {
+                "row": 2,
+                "column": 86
+              },
+              "end": {
+                "row": 2,
+                "column": 115
+              }
+            },
+            "capture": "ForgeHarnessAgentThought",
+            "priority": 105
+          },
+          {
+            "range": {
+              "start": {
+                "row": 3,
+                "column": 10
+              },
+              "end": {
+                "row": 3,
+                "column": 13
+              }
+            },
+            "capture": "ForgeTimelineStatusSpinner",
+            "priority": 110
+          },
+          {
+            "range": {
+              "start": {
+                "row": 4,
+                "column": 13
+              },
+              "end": {
+                "row": 4,
+                "column": 16
+              }
+            },
+            "capture": "ForgeTimelineStatusSpinner",
+            "priority": 110
+          },
+          {
+            "range": {
+              "start": {
+                "row": 1,
+                "column": 0
+              },
+              "end": {
+                "row": 5,
+                "column": 0
+              }
+            },
+            "capture": "ForgeStatusHint",
+            "priority": 100
+          },
+          {
+            "range": {
+              "start": {
+                "row": 5,
+                "column": 0
+              },
+              "end": {
+                "row": 6,
+                "column": 0
+              }
+            },
+            "capture": "ForgeHarnessCommentary",
+            "priority": 100
+          }
+        ],
+        "editable_region": []
+      }
+    }
+  ]
+}

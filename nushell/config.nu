@@ -409,7 +409,7 @@ def --env www [] {
 }
 
 def --env eng [] {
-  cd D:/code/ferrous/blue/
+  cd D:/code/ferrous/
 }
 
 def --env sdk [] {

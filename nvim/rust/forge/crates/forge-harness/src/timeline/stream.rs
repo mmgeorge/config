@@ -174,24 +174,56 @@ impl TimelineStream {
             block_id: format!("{}:content:{}", source.id(), message.id()),
             message: message.clone(),
         }];
-        if main_exchange
-            && let Some(status_index) = self
-                .entry_index
-                .get(&format!("{}:status", self.session_id))
-                .copied()
-            && let TimelineEntry::Status {
-                status_thoughts,
-                status:
-                    crate::session::state_machine::SessionPhase::Working {
-                        reasoning_summary, ..
-                    },
-                ..
-            } = &mut self.entry_list[status_index]
+        if let Some(status_index) = self
+            .entry_index
+            .get(&format!("{}:status", self.session_id))
+            .copied()
         {
-            let summary = exchange.latest_reasoning_summary().map(str::to_owned);
-            if *reasoning_summary != summary {
-                *reasoning_summary = summary;
-                let visible = *status_thoughts;
+            let changed = if main_exchange {
+                if let TimelineEntry::Status {
+                    status:
+                        crate::session::state_machine::SessionPhase::Working {
+                            reasoning_summary, ..
+                        },
+                    ..
+                } = &mut self.entry_list[status_index]
+                {
+                    let summary = exchange.latest_reasoning_summary().map(str::to_owned);
+                    let changed = *reasoning_summary != summary;
+                    *reasoning_summary = summary;
+                    changed
+                } else {
+                    false
+                }
+            } else if let TimelineEntry::Status {
+                agents,
+                status_thoughts,
+                ..
+            } = &self.entry_list[status_index]
+            {
+                // A child's reasoning reaches only its own status row, never the root preview.
+                let running = super::running_agents(&self.entry_list, *status_thoughts);
+                let changed = running
+                    .iter()
+                    .map(|agent| (&agent.exchange_id, &agent.reasoning_summary))
+                    .ne(agents
+                        .iter()
+                        .map(|agent| (&agent.exchange_id, &agent.reasoning_summary)));
+                if let TimelineEntry::Status { agents, .. } = &mut self.entry_list[status_index] {
+                    *agents = running;
+                }
+                changed
+            } else {
+                false
+            };
+            if changed {
+                let visible = matches!(
+                    &self.entry_list[status_index],
+                    TimelineEntry::Status {
+                        status_thoughts: true,
+                        ..
+                    }
+                );
                 self.value_list[status_index] =
                     crate::codec::to_value(&self.entry_list[status_index])?;
                 if visible {
@@ -432,14 +464,6 @@ impl TimelineStream {
             })
             .transpose()?;
         let status_id = format!("{}:status", self.session_id);
-        let agent_count = self
-            .entry_list
-            .iter()
-            .find_map(|entry| match entry {
-                TimelineEntry::Status { agent_count, .. } => Some(*agent_count),
-                _ => None,
-            })
-            .unwrap_or(0);
         let checks =
             self.entry_index
                 .get(&status_id)
@@ -447,18 +471,9 @@ impl TimelineStream {
                     TimelineEntry::Status { checks, .. } => checks.clone(),
                     _ => None,
                 });
-        let next_status = TimelineEntry::Status {
-            checks,
-            agent_count,
-            status_thoughts,
-            id: status_id.clone(),
-            created_at_ms: 0,
-            status,
-        };
         let next_interaction = next_interaction
             .map(|entry| crate::codec::to_value(&entry).map(|value| (entry, value)))
             .transpose()?;
-        let status_value = crate::codec::to_value(&next_status)?;
         let base_revision = self.revision;
         let mut operation = Vec::new();
         if let Some(id) = removed {
@@ -483,6 +498,17 @@ impl TimelineStream {
                 .unwrap_or(self.entry_list.len());
             self.upsert(entry, value, insertion, &mut operation);
         }
+        // Child exchanges live inside their parent entries, so the running-agent rows are
+        // read only after the replacement above has landed.
+        let next_status = TimelineEntry::Status {
+            checks,
+            agents: super::running_agents(&self.entry_list, status_thoughts),
+            status_thoughts,
+            id: status_id.clone(),
+            created_at_ms: 0,
+            status,
+        };
+        let status_value = crate::codec::to_value(&next_status)?;
         self.upsert(
             next_status,
             status_value,
@@ -606,7 +632,7 @@ impl TimelineStream {
                 created_at_ms: 0,
                 status: crate::session::state_machine::SessionPhase::Idle,
                 status_thoughts: true,
-                agent_count: 0,
+                agents: Vec::new(),
                 checks: None,
             });
             if let TimelineEntry::Status { checks, .. } = &mut entry {
@@ -806,7 +832,12 @@ fn ticking(entry: &TimelineEntry) -> bool {
                 })
                 || children.iter().any(ticking)
         }
-        TimelineEntry::Status { status, checks, .. } => status.ticking() || checks.is_some(),
+        TimelineEntry::Status {
+            status,
+            checks,
+            agents,
+            ..
+        } => status.ticking() || checks.is_some() || !agents.is_empty(),
         TimelineEntry::Checks { .. } => false,
         _ => false,
     }
@@ -825,6 +856,82 @@ mod test {
     use super::{TimelineOperation, TimelineStream};
     use crate::timeline::TimelineEntry;
 
+    /// Deliver a child's reasoning to its own status row and keep the status ticking.
+    #[test]
+    fn child_reasoning_reaches_its_status_row() -> anyhow::Result<()> {
+        use forge_provider_api::{ItemEvent, ItemId, ItemStart, MessageItemEvent, ProviderEvent};
+        let mut entry =
+            crate::buffer::projection::tests::delegating_exchange(&["explorer"], &[None])?;
+        let TimelineEntry::Exchange { agent_by_id, .. } = &mut entry else {
+            unreachable!("fixture builds an exchange entry")
+        };
+        let Some(TimelineEntry::AgentLifecycle { exchange, .. }) = agent_by_id.get_mut("child-0")
+        else {
+            unreachable!("fixture delegates one child")
+        };
+        let child = &mut exchange[0];
+        let address = crate::turn::test_support::address(child, "child-turn");
+        child.start_turn(address.clone(), 60)?;
+        let item_id = ItemId::new("reasoning")?;
+        let event = |event: ItemEvent| ProviderEvent::Item {
+            thread_id: address.thread_id.clone(),
+            turn_id: address.turn_id.clone(),
+            item_id: item_id.clone(),
+            event,
+        };
+        let scope = crate::provider::EventScope::Invocation {
+            invocation: address.scope.clone(),
+        };
+        child.observe_provider_event(
+            &scope,
+            &event(ItemEvent::Started(ItemStart::Reasoning(
+                forge_provider_api::ReasoningStart {
+                    text: "Reading the coordinator".into(),
+                    kind: forge_provider_api::ReasoningKind::Summary,
+                },
+            ))),
+            61,
+        )?;
+        let mut live = child.clone();
+        let status = TimelineEntry::Status {
+            id: "session:status".into(),
+            created_at_ms: 0,
+            status: crate::session::state_machine::SessionPhase::WaitingForAgent { agent_count: 1 },
+            status_thoughts: true,
+            agents: crate::timeline::running_agents(std::slice::from_ref(&entry), true),
+            checks: None,
+        };
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(vec![entry, status])?;
+        assert!(
+            stream.ticking.contains(&1),
+            "running agents keep the status ticking"
+        );
+        let delta = event(ItemEvent::Message {
+            event: MessageItemEvent::Delta(" and its admission queue".into()),
+        });
+        assert!(live.observe_provider_event(&scope, &delta, 62)?);
+        let patch = stream
+            .update_message(&live, &delta)?
+            .expect("child message publishes a patch");
+        let replaced = patch
+            .operation
+            .iter()
+            .find_map(|operation| match operation {
+                TimelineOperation::Replace {
+                    entry: TimelineEntry::Status { agents, .. },
+                    ..
+                } => Some(agents),
+                _ => None,
+            })
+            .expect("status replacement");
+        assert_eq!(
+            replaced[0].reasoning_summary.as_deref(),
+            Some("Reading the coordinator and its admission queue")
+        );
+        Ok(())
+    }
+
     /// Keep same-run progress through handoff without lending it to another run.
     #[test]
     fn check_tree_survives_handoff_until_successor_starts() {
@@ -834,7 +941,7 @@ mod test {
             created_at_ms: 0,
             status: crate::session::state_machine::SessionPhase::Idle,
             status_thoughts: false,
-            agent_count: 0,
+            agents: Vec::new(),
             checks: Some(CheckActivity {
                 run_id: run.into(),
                 duration_ms: 0,

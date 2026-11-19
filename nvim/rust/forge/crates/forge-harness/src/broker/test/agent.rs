@@ -2086,3 +2086,78 @@ async fn cancel_collects_pending_children_without_execution_slots() -> Result<()
     assert_eq!(provider.turn.load(Ordering::Acquire), 1);
     Ok(())
 }
+
+/// Show an admitted child in status until it settles, then only in its parent's Agents summary.
+#[tokio::test]
+async fn running_children_move_from_status_to_the_agents_summary() -> Result<()> {
+    use crate::timeline::TimelineEntry;
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let work = admit_child_fixture(&mut broker, "status-child")?;
+    let label = work.agent.task_name.clone();
+    let status_agents = |timeline: &[TimelineEntry]| {
+        timeline
+            .iter()
+            .find_map(|entry| match entry {
+                TimelineEntry::Status { agents, .. } => Some(
+                    agents
+                        .iter()
+                        .map(|agent| agent.label.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    let transcript = |timeline: &[TimelineEntry]| -> Result<Vec<String>> {
+        let mut rows = Vec::new();
+        for entry in timeline {
+            rows.extend(crate::buffer::projection::tests::project_rows(entry)?);
+        }
+        Ok(rows)
+    };
+    let timeline = broker.snapshot()?.timeline;
+    assert_eq!(status_agents(&timeline), std::slice::from_ref(&label));
+    let rows = transcript(&timeline)?;
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with(&format!("◇ Spawned {label} · "))),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.starts_with("Agents · ")),
+        "a running child has no summary yet: {rows:#?}"
+    );
+
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(work.agent.id.clone())?,
+    )
+    .expect("registered session and agent identities are nonempty");
+    let mut event = Vec::new();
+    broker
+        .complete_managed_agent(
+            owner,
+            work.task.id.clone(),
+            Err(anyhow::anyhow!("provider failed")),
+            Vec::new(),
+            None,
+            &mut event,
+        )
+        .await?;
+    let timeline = broker.snapshot()?.timeline;
+    assert!(status_agents(&timeline).is_empty());
+    let rows = transcript(&timeline)?;
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("Agents · 0/1 completed")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with(&format!("✗ {label}")) && row.contains(" · Failed ")),
+        "{rows:#?}"
+    );
+    Ok(())
+}
