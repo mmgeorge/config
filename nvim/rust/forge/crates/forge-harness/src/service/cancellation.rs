@@ -124,4 +124,38 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Report no cancellation for a cancel that finds nothing to stop.
+    ///
+    /// An idle cancel still runs, because it pauses the queue and retracts an unclaimed prompt.
+    /// Recording its progress made every observer render `Stopping` for work that never existed.
+    #[tokio::test]
+    async fn idle_cancel_reports_no_cancellation_progress() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let controller = controller(fixture.path()).await?;
+        let (messages, mut output) = forge_protocol::outbound::channel();
+        controller
+            .exchange_owner
+            .execute_identified(command("cancel-idle")?, messages)
+            .await?;
+        let mut reported = Vec::new();
+        while let Ok(frame) = output.try_recv() {
+            let event: Value = serde_json::from_slice(frame.bytes())?;
+            let snapshot = &event["payload"]["snapshot"];
+            if event["event"] == "session_changed"
+                && (snapshot["status"]["kind"] == "stopping" || !snapshot["cancellation"].is_null())
+            {
+                reported.push(json!({
+                    "status": snapshot["status"], "cancellation": snapshot["cancellation"],
+                }));
+            }
+        }
+        let stored = crate::storage::HistoryReader::current(&controller.data_root)?
+            .cancellation_progress(controller.observer.session_id())?;
+        assert!(
+            stored.is_none() && reported.is_empty(),
+            "an idle cancel reported cancellation: stored {stored:?}, published {reported:#?}"
+        );
+        Ok(())
+    }
 }

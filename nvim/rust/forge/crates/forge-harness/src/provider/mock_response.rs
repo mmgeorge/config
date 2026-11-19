@@ -35,6 +35,10 @@ pub(crate) enum MockResponseCommand {
     RequireBindingModelCatalog,
     /// Read the turn checkpoints the session's native history retains, oldest first.
     History,
+    /// Fail every later close of the session's binding until it is terminated.
+    FailClose,
+    /// Never settle a later interrupt of the session's turn.
+    HoldInterrupt,
     /// Fire the session's pending timed approvals through their deadline path immediately.
     /// The session service owns the permission coordinator, so it handles this operation.
     ExpireApproval,
@@ -87,6 +91,8 @@ impl MockResponseControl {
             },
             MockResponseCommand::Script { script } => TestControlCommand::Script { script },
             MockResponseCommand::History => TestControlCommand::History,
+            MockResponseCommand::FailClose => TestControlCommand::FailClose,
+            MockResponseCommand::HoldInterrupt => TestControlCommand::HoldInterrupt,
             MockResponseCommand::RequireBindingModelCatalog => {
                 TestControlCommand::RequireBindingModelCatalog
             }

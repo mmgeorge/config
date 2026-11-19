@@ -68,6 +68,16 @@ impl ExchangeDriver {
             input_delivery: self.input_delivery.is_some() || !self.steering.is_empty(),
             recovery_jobs: !state.tasks.is_idle() || self.observation_recovery.active(),
         };
+        // A cancel that finds nothing to stop still runs, because it pauses the queue and
+        // retracts an unclaimed prompt, but it has no progress to report. Recording it made
+        // every observer show `Stopping` on an idle session. An operation reported once keeps
+        // reporting until it settles, so observers always see its end.
+        let reported = previous.is_some_and(|previous| {
+            previous.operation_id == operation_id && previous.phase.active()
+        });
+        if !reported && exchange_id.is_none() && !blockers.owns_work() && !response_timed_out {
+            return Ok(());
+        }
         if previous.is_some_and(|previous| {
             previous.operation_id == operation_id
                 && previous.phase == phase

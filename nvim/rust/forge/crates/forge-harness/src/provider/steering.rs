@@ -149,6 +149,9 @@ pub struct SteerCommand {
     publish_input: bool,
     task_start: Option<crate::exchange::TaskStart>,
     agent_result: Option<forge_provider_api::forge::AgentResult>,
+    /// How the input reached the provider; `complete_with` marks a steer resent as a
+    /// continuation's prompt.
+    delivery: super::session_execution::AcceptedInputDelivery,
 }
 
 /// Defines the active-turn operation carried over the shared provider process.
@@ -270,6 +273,7 @@ impl SteeringLane {
                 publish_input,
                 task_start,
                 agent_result,
+                delivery: super::session_execution::AcceptedInputDelivery::Steering,
             })
             .map_err(|_| not_admitted())?;
         if let Some(submission) = submission {
@@ -358,6 +362,8 @@ impl SteerCommand {
         event_sink: HarnessEventSink,
     ) -> Result<(super::retry::RetryAttempt, Option<Self>)> {
         self.event_sink = Some(event_sink);
+        // The provider receives this input as the new invocation's prompt, not as steering.
+        self.delivery = super::session_execution::AcceptedInputDelivery::TurnPrompt;
         let mut operation = Box::pin(operation);
         let result = if let Some(submission) = &self.submission {
             let mut acceptance = submission.acceptance();
@@ -475,6 +481,7 @@ impl SteerCommand {
                         InputPresentation::Message {
                             turn: receipt.record()?.request.input.turn().clone(),
                             text: self.text.clone(),
+                            delivery: self.delivery,
                         }
                     }
                 };

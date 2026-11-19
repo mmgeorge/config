@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 pub struct TurnOptions {
     pub scope: forge_provider_api::InvocationScope,
+    /// Project directory of the binding, against which reported paths become relative.
     pub workspace: String,
+    /// The binding's memory of unapplied notification types it has already warned about.
+    pub reported_event_types: super::event_decoder::ReportedEventTypes,
     pub model: Option<String>,
     pub capability: ProviderCapability,
     pub input: forge_provider_api::forge::TurnInput,
@@ -117,6 +120,7 @@ pub async fn run(
         CopilotEventDecoder::new(sink.invocation_scope()?.clone(), options.workspace.clone())
             .with_callbacks(native_callbacks)
             .with_instructions(owned_session.instructions.clone())
+            .with_reported_event_types(options.reported_event_types.clone())
             .with_turn_owner(owner_sink.clone());
     let retained_context = Arc::new(tokio::sync::Mutex::new(super::intake::TurnContext {
         decoder,
@@ -304,13 +308,6 @@ pub async fn run(
                     let provider_event = provider_event.map_err(|_| native_failure(ProviderOperation::ThreadClose, ProviderFailureKind::Transport))?;
                     let observed_at_ms = subscription.observed_at(&provider_event);
                     normalize_internal(turn_event.observe(&provider_event), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?;
-                    // An abort that discards still-queued input is terminal: Copilot emits no idle.
-                    if provider_event.agent_id.is_none()
-                        && provider_event.event_type == "abort"
-                        && normalize_internal(turn_event.accepted_inputs_unconsumed(), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?
-                    {
-                        return Ok(super::turn::IdleOutcome::Aborted);
-                    }
                     if provider_event.agent_id.is_none()
                         && provider_event.event_type == "user.message"
                         && let Some(submission) = provider_event
@@ -371,8 +368,11 @@ pub async fn run(
                         native_start.observed(observed_at_ms).await?;
                     }
                     decoder.decode_at(&provider_event, observed_at_ms, output, sink).await?;
-
-
+                    // An abort that discards still-queued input is terminal once no root turn runs;
+                    // Copilot reports no `user.message` for that input and need not emit an idle.
+                    if normalize_internal(turn_event.observe_abort_terminal(&provider_event, observed_at_ms), ProviderOperation::TurnStart, ProviderFailureKind::Protocol)? {
+                        return Ok(super::turn::IdleOutcome::Aborted);
+                    }
                 }
                 result = control.receive(&options.scope) => { result?; }
 

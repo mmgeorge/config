@@ -55,4 +55,33 @@ T["unconfirmed_steering_never_anchors_the_reveal"] = function()
   eq(revealed_row("ForgeHarnessUnconfirmedPrompt"), 1)
 end
 
+
+-- A queued successor replaces the finished exchange at the tail within a few owner steps, so
+-- revealing the finished prompt first moved the transcript twice at every long hand-off.
+T["settlement_with_a_pending_successor_is_never_revealed"] = function()
+  local Reveal = require("forge.views.harness.response_reveal")
+  local transcript = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(transcript, 0, -1, false, vim.tbl_map(tostring, vim.fn.range(1, 40)))
+  local function blocks(lifecycle)
+    return {
+      { id = "prompt", node = { id = "prompt", kind = "message" }, marker = "ForgeHarnessPrompt" },
+      { id = "exchange", node = { id = "exchange", kind = "exchange", lifecycle = lifecycle } },
+      { id = "response", node = { id = "response", kind = "message", display = "full" },
+        marker = "ForgeHarnessResponse", row_count = 38 },
+    }
+  end
+  local view_window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(view_window, transcript)
+  vim.api.nvim_win_set_height(view_window, 5)
+  vim.cmd("belowright new")
+  vim.api.nvim_win_set_cursor(view_window, { 40, 0 })
+  local reveal = Reveal.new()
+  reveal:publish(document(transcript, blocks("open")), { [view_window] = true })
+  reveal:publish(document(transcript, blocks("settled")), { [view_window] = true }, false, true)
+  eq(vim.api.nvim_win_get_cursor(view_window)[1], 40)
+  -- The skipped reveal stays skipped once the hand-off flag clears.
+  reveal:publish(document(transcript, blocks("settled")), { [view_window] = true })
+  eq(vim.api.nvim_win_get_cursor(view_window)[1], 40)
+end
+
 return T

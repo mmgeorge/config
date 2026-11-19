@@ -94,15 +94,9 @@ impl HarnessBroker {
         inspection_lease.bind_authority(task_authority.clone())?;
         lsp_lease.bind_authority(task_authority.clone())?;
         let (events, stream) = crate::provider::events::channel(scope.clone());
-        let tool_timeout = crate::settings::SettingsStore::read_only(&self.data_root)?
-            .get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.provider,
-            )?
-            .desired
-            .tool_timeout
-            .unwrap_or(self.session.tool_timeout);
+        // The session's own value, which its edits update; a change to the defaults reaches
+        // only sessions created afterwards.
+        let tool_timeout = self.session.tool_timeout;
         let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
             tool_timeout,
         )?);

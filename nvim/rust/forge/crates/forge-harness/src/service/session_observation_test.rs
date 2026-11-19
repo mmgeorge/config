@@ -136,8 +136,13 @@ async fn open_root_binding_through_prompt(
     .await
 }
 
+/// Bound each wait on the paused clock, which runs it out at once when the state never arrives.
+const OBSERVATION_LOSS_BOUND: std::time::Duration = std::time::Duration::from_secs(600);
+/// Poll on the paused clock, so a stuck owner exhausts the bound instead of starving it.
+const OBSERVATION_LOSS_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Settle accepted input and its open documents before releasing a failed foreground owner.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_delivery()
 -> Result<()> {
     use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
@@ -199,13 +204,13 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             })),
         },
     })?;
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(OBSERVATION_LOSS_BOUND, async {
         loop {
             // Working status can publish before deferred native open admits the invocation.
             if !foreground.active.load(Ordering::Acquire)
                 || engine.active_invocation_snapshot()?.is_none()
             {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(OBSERVATION_LOSS_POLL).await;
                 continue;
             }
             let broker = controller.broker.lock().await;
@@ -223,7 +228,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
                 }
             }
             drop(broker);
-            tokio::task::yield_now().await;
+            tokio::time::sleep(OBSERVATION_LOSS_POLL).await;
         }
     })
     .await
@@ -244,7 +249,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     let before_loss = delivered.lock().unwrap().len();
 
     foreground.fail.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(OBSERVATION_LOSS_BOUND, async {
         loop {
             // Observation loss closes the provider's event stream, so the owner fails the turn,
             // drains the input queue, and restarts the provider on its own initiative.
@@ -266,7 +271,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             {
                 break Ok::<(), anyhow::Error>(());
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(OBSERVATION_LOSS_POLL).await;
         }
     })
     .await

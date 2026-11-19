@@ -42,6 +42,13 @@ slow-timeout = { period = "10s", terminate-after = 1 }
 filter = "package(forge-git) & test(/^writer::/)"
 slow-timeout = { period = "10s", terminate-after = 1 }
 
+# PowerShell resolution suite: command resolution asks a real PowerShell which names it can
+# resolve, because PowerShell's own discovery is the oracle for that contract. Each test starts
+# `pwsh` without a profile, and that startup alone can pass two seconds under a parallel run.
+[[profile.default.overrides]]
+filter = "package(forge-shell) & test(/^resolution::tests::/)"
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 # Unified diff suite: these tests check that emitted patches apply and reverse byte-for-byte by
 # running real `git apply`, which is the oracle for the unified-diff format. They take about
 # 1.2 s alone.

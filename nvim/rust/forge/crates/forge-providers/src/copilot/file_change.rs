@@ -61,8 +61,36 @@ pub fn from_output(output: &str, workspace: &str) -> Result<ProviderChangeSet> {
                 (Some(old), Some(new)) if old != new => ProviderChangeKind::Move,
                 _ => ProviderChangeKind::Update,
             };
+            let mut hunks = file.hunk;
+            // Copilot splits created content on newlines and reports the empty remainder after
+            // the final newline as one more added row, which would count a line the file does
+            // not have. A sole row stays because a hunk cannot be empty.
+            if old_path.is_none()
+                && let Some(last) = hunks.last_mut()
+                && last.row.len() > 1
+                && last.row.last().is_some_and(|row| {
+                    row.kind() == RowKind::Added && row.text.is_empty() && !row.no_newline
+                })
+            {
+                let (old_range, trailing) = last
+                    .header
+                    .strip_prefix("@@ ")
+                    .and_then(|ranges| ranges.split_once(" @@"))
+                    .and_then(|(ranges, trailing)| {
+                        Some((ranges.split_once(' ')?.0.to_owned(), trailing.to_owned()))
+                    })
+                    .context("Copilot file diff has an unreadable hunk header")?;
+                last.row.pop();
+                last.new_lines.end -= 1;
+                last.header = format!(
+                    "@@ {old_range} +{},{} @@{trailing}",
+                    last.new_lines.start + 1,
+                    last.new_lines.len()
+                )
+                .into();
+            }
             let mut diff = String::new();
-            for hunk in file.hunk {
+            for hunk in hunks {
                 diff.push_str(&hunk.header);
                 diff.push('\n');
                 for row in hunk.row {
@@ -93,20 +121,44 @@ pub fn from_output(output: &str, workspace: &str) -> Result<ProviderChangeSet> {
     Ok(ProviderChangeSet { file })
 }
 
+/// Report a changed path relative to the workspace when inside it, with `/` separators.
 fn relative_path(path: &str, workspace: &str) -> String {
-    let path = path.replace('\\', "/");
-    let workspace = workspace.replace('\\', "/");
-    let workspace = workspace.trim_end_matches('/');
-    if !workspace.is_empty() {
-        // Preserve workspace-relative identity when Copilot drops the leading slash in Git headers.
-        for prefix in [workspace, workspace.trim_start_matches('/')] {
-            if let Some(relative) = path
-                .strip_prefix(prefix)
-                .and_then(|suffix| suffix.strip_prefix('/'))
-            {
-                return relative.to_owned();
-            }
-        }
+    crate::tool_display::workspace_relative(path, workspace)
+        .unwrap_or_else(|| path.replace('\\', "/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Copilot splits created content on newlines, so content ending in a newline reports one
+    /// empty row more than the file has lines.
+    #[test]
+    fn created_file_omits_the_empty_row_after_its_final_newline() -> Result<()> {
+        let workspace = "C:/work/project";
+        let output = "\ndiff --git a/C:/work/project/notes/wave.txt b/C:/work/project/notes/wave.txt\ncreate file mode 100644\nindex 0000000..0000000\n--- a/dev/null\n+++ b/C:/work/project/notes/wave.txt\n@@ -1,0 +1,4 @@\n+wave\n+\n+crest\n+\n\n";
+        let changes = from_output(output, workspace)?;
+        assert_eq!(changes.file.len(), 1);
+        let created = &changes.file[0];
+        assert_eq!(created.kind, ProviderChangeKind::Add);
+        assert_eq!(created.path, "notes/wave.txt");
+        assert_eq!(created.diff, "@@ -1,0 +1,3 @@\n+wave\n+\n+crest\n");
+        Ok(())
     }
-    path
+
+    /// An existing file's final empty added row is a real blank line, and a created file's only
+    /// row is the whole hunk, so neither is removed.
+    #[test]
+    fn final_empty_rows_outside_multirow_creations_are_preserved() -> Result<()> {
+        let updated = "diff --git a/notes/wave.txt b/notes/wave.txt\n--- a/notes/wave.txt\n+++ b/notes/wave.txt\n@@ -1,1 +1,3 @@\n wave\n+crest\n+\n";
+        let changes = from_output(updated, "")?;
+        assert_eq!(changes.file[0].kind, ProviderChangeKind::Update);
+        assert_eq!(changes.file[0].diff, "@@ -1,1 +1,3 @@\n wave\n+crest\n+\n");
+
+        let empty = "diff --git a/notes/empty.txt b/notes/empty.txt\ncreate file mode 100644\n--- a/dev/null\n+++ b/notes/empty.txt\n@@ -1,0 +1,1 @@\n+\n";
+        let changes = from_output(empty, "")?;
+        assert_eq!(changes.file[0].kind, ProviderChangeKind::Add);
+        assert_eq!(changes.file[0].diff, "@@ -1,0 +1,1 @@\n+\n");
+        Ok(())
+    }
 }

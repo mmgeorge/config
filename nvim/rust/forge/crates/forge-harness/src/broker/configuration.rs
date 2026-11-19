@@ -144,7 +144,11 @@ pub(super) struct ConfigurationAuthority {
     session: crate::session::HarnessSession,
     pub(super) task: Option<crate::task::Task>,
     provider: Arc<Provider>,
-    settings_revision: u64,
+    /// The settings revision a `settings_revision` application command must still apply.
+    ///
+    /// Ordinary patches carry explicit fields that commit merges at the current revision, so
+    /// another editor's settings change must not invalidate them while the provider works.
+    settings_revision: Option<u64>,
 }
 
 /// The validated host configuration held across provider reconciliation.
@@ -166,6 +170,8 @@ pub(crate) struct ConfigurationCandidate {
     reconciled: Arc<std::sync::atomic::AtomicBool>,
     uncertainty: Option<ConfigurationWriteGuard>,
     receipt: Option<crate::provider::ConfigureReceipt>,
+    /// The enclosing command's deadline, until which a busy settings or history write retries.
+    commit_deadline: Option<std::time::Instant>,
 }
 
 pub(crate) struct ConfigurationPreparation {
@@ -175,6 +181,11 @@ pub(crate) struct ConfigurationPreparation {
 }
 
 impl ConfigurationCandidate {
+    /// Retry storage contention during commit until the enclosing command's deadline.
+    pub(crate) fn retry_commit_until(&mut self, deadline: std::time::Instant) {
+        self.commit_deadline = Some(deadline);
+    }
+
     /// Report whether this candidate applies a resource selection that needs fresh launch notices.
     pub(crate) fn has_resource_selection(&self) -> bool {
         self.resource_selection.is_some()
@@ -184,10 +195,9 @@ impl ConfigurationCandidate {
     pub(crate) fn effect(&self) -> ConfigurationEffect {
         let previous = &self.authority.session;
         let selected = &self.configured;
-        if selected.access != previous.access
-            || selected.approval_mode != previous.approval_mode
-            || selected.shell != previous.shell
-        {
+        // The approval mode is Harness policy that every adapter leaves to Harness callbacks, so
+        // changing it alone is local: running callbacks and pending requests follow it at once.
+        if selected.access != previous.access || selected.shell != previous.shell {
             return ConfigurationEffect::ReplaceTree;
         }
         if selected.model != previous.model
@@ -755,8 +765,10 @@ impl HarnessBroker {
             )?;
             resource_selection = Some(settings.desired);
         }
+        let mut authority = self.capture_configuration_authority()?;
+        authority.settings_revision = params.get("settings_revision").and_then(Value::as_u64);
         Ok(Box::new(ConfigurationPreparation {
-            authority: self.capture_configuration_authority()?,
+            authority,
             params,
             resource_selection,
         }))
@@ -1081,6 +1093,7 @@ impl HarnessBroker {
             reconciled,
             uncertainty: None,
             receipt: None,
+            commit_deadline: None,
         }))
     }
 
@@ -1135,6 +1148,52 @@ impl HarnessBroker {
         Ok(Some(job))
     }
 
+    /// Apply a session's own timeout edit to its settings layer, its record, and its deadlines.
+    ///
+    /// The edit belongs to this session, so the global defaults that other and new sessions read
+    /// stay unchanged, and the in-memory session takes the values at once so that a later
+    /// configuration, which starts from this session, cannot restore the earlier ones.
+    pub(crate) fn owner_configure_input_timeouts(
+        &mut self,
+        approval_timeout: Option<crate::session::InputTimeout>,
+        tool_timeout: Option<crate::session::InputTimeout>,
+    ) -> Result<(crate::session::InputTimeout, crate::session::InputTimeout)> {
+        let approval_timeout = approval_timeout
+            .map(crate::session::InputTimeout::validate)
+            .transpose()?;
+        let tool_timeout = tool_timeout
+            .map(crate::session::InputTimeout::require_expiry)
+            .transpose()?;
+        crate::settings::SettingsStore::open(&self.data_root)?.patch(
+            crate::settings::SettingTarget {
+                scope: crate::settings::SettingScope::Session,
+                workspace: &self.session.workspace,
+                session: &self.session.id,
+            },
+            &crate::settings::PortableSettings {
+                approval_timeout,
+                tool_timeout,
+                ..Default::default()
+            },
+        )?;
+        let previous = self.session.clone();
+        if let Some(timeout) = approval_timeout {
+            self.session.approval_timeout = timeout;
+        }
+        if let Some(timeout) = tool_timeout {
+            self.session.tool_timeout = timeout;
+        }
+        self.permission_coordinator
+            .configure_timeout(&self.session.id, self.session.approval_timeout)?;
+        if let Err(error) = self.save_session() {
+            self.permission_coordinator
+                .configure_timeout(&previous.id, previous.approval_timeout)?;
+            self.session = previous;
+            return Err(error);
+        }
+        Ok((self.session.approval_timeout, self.session.tool_timeout))
+    }
+
     pub(crate) fn commit_configuration_candidate(
         &mut self,
         mut candidate: Box<ConfigurationCandidate>,
@@ -1179,14 +1238,21 @@ impl HarnessBroker {
         let refresh_check_policy =
             candidate.automatic_checks.is_some() || candidate.resource_selection.is_some();
         let mut uncertainty = candidate.uncertainty.take();
+        let commit_deadline = candidate.commit_deadline;
+        let previous_approval = candidate.authority.session.approval_mode;
         let expected_task = candidate.authority.task.clone();
         let controller = self.task_controller.clone();
         let expected_revision = candidate.authority.settings_revision;
         let workspace = candidate.configured.workspace.clone();
         let session_id = candidate.configured.id.clone();
         let provider_id = candidate.configured.provider.clone();
+        // Permissions edited in a session's /config belong to that session, as the slash
+        // commands' do; `settings.update` alone writes the global defaults new sessions start from.
         let scope = if candidate.params.get("auto_compaction").is_some()
             || candidate.params["session_policy"] == true
+            || candidate.params.get("access").is_some()
+            || candidate.params.get("approval_timeout").is_some()
+            || candidate.params.get("tool_timeout").is_some()
         {
             crate::settings::SettingScope::Session
         } else {
@@ -1270,6 +1336,14 @@ impl HarnessBroker {
             None
         };
         let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
+        let intent_revision = match expected_revision {
+            Some(revision) => revision,
+            None => {
+                settings
+                    .get(&workspace, &session_id, &provider_id)?
+                    .revision
+            }
+        };
         let target = crate::settings::SettingTarget {
             scope,
             workspace: &workspace,
@@ -1280,14 +1354,14 @@ impl HarnessBroker {
             session: session_id.clone(),
             workspace: workspace.clone(),
             provider: provider_id.clone(),
-            revision: expected_revision,
+            revision: intent_revision,
             scope,
             portable: changed.then_some(portable.clone()),
             provider_setting: provider_setting.clone(),
         };
         let committed = controller.with_task_snapshot(|current| {
         anyhow::ensure!(foreground_failure::same_retraction_task(current.as_ref(), expected_task.as_ref()), "configuration task authority changed before commit");
-        settings.commit_configuration(expected_revision, target, changed.then_some(&portable), provider_setting.as_ref().map(|value| (provider_id.as_str(), value)), Some(&intent), || {
+        settings.commit_configuration(expected_revision, target, changed.then_some(&portable), provider_setting.as_ref().map(|value| (provider_id.as_str(), value)), Some(crate::settings::IntentCommit { intent: &intent, retry_until: commit_deadline }), || {
         let ConfigurationCandidate {
             configured,
             subagent_tools,
@@ -1313,7 +1387,9 @@ impl HarnessBroker {
                 }
                 Some(preference)
             };
-            self.store.commit_configuration_intent(&session, &self.client_id, preference.as_ref(), &intent)
+            crate::storage::database::retry_while_busy(commit_deadline, || {
+                self.store.commit_configuration_intent(&session, &self.client_id, preference.as_ref(), &intent)
+            })
         })();
         if let Err(error) = persisted {
             self.permission_coordinator
@@ -1322,6 +1398,12 @@ impl HarnessBroker {
         }
         self.session = session;
         self.session.name = self.store.load_session(&self.session.id)?.context("owned session is missing")?.name;
+        if self.session.approval_mode != previous_approval {
+            self.permission_coordinator.apply_approval_mode(
+                &crate::provider::ThreadOwner::root(&self.session.id),
+                self.session.approval_mode,
+            )?;
+        }
         if let Some(enabled) = subagent_tools {
             self.agent_coordinator.set_enabled(enabled);
         }
@@ -1500,18 +1582,11 @@ impl HarnessBroker {
     }
 
     pub(super) fn capture_configuration_authority(&self) -> Result<Box<ConfigurationAuthority>> {
-        let revision = crate::settings::SettingsStore::read_only(&self.data_root)?
-            .get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.provider,
-            )?
-            .revision;
         Ok(Box::new(ConfigurationAuthority {
             session: self.session.clone(),
             task: self.task_controller.current()?,
             provider: Arc::clone(&self.provider),
-            settings_revision: revision,
+            settings_revision: None,
         }))
     }
 
@@ -1538,16 +1613,21 @@ impl HarnessBroker {
                 && current.shell == expected.shell
                 && current.approval_timeout == expected.approval_timeout
                 && current.tool_timeout == expected.tool_timeout
-                && crate::settings::SettingsStore::read_only(&self.data_root)?
-                    .get(&current.workspace, &current.id, &current.provider)?
-                    .revision
-                    == authority.settings_revision
                 && foreground_failure::same_retraction_task(
                     self.task_controller.current()?.as_ref(),
                     authority.task.as_ref()
                 ),
             "configuration authority changed during provider work"
         );
+        if let Some(expected) = authority.settings_revision {
+            let revision = crate::settings::SettingsStore::read_only(&self.data_root)?
+                .get(&current.workspace, &current.id, &current.provider)?
+                .revision;
+            anyhow::ensure!(
+                revision == expected,
+                ConfigurationRejection::SettingsChanged
+            );
+        }
         Ok(())
     }
 
@@ -1760,6 +1840,12 @@ impl HarnessBroker {
                 return Err(error);
             }
             self.save_preference(false)?;
+            if self.session.approval_mode != previous.approval_mode {
+                self.permission_coordinator.apply_approval_mode(
+                    &crate::provider::ThreadOwner::root(&self.session.id),
+                    self.session.approval_mode,
+                )?;
+            }
             if let Some(access) = captured.selected_access {
                 let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
                 let portable = crate::settings::PortableSettings {
@@ -2429,7 +2515,7 @@ mod owned_tests {
         let mut broker =
             super::super::test::planning_question_broker(workspace.path(), data.path(), false);
         let settings = crate::settings::SettingsStore::open(data.path())?;
-        settings.execute_test_sql("CREATE TABLE configuration_test_parent(id INTEGER PRIMARY KEY); CREATE TABLE configuration_test_child(id INTEGER REFERENCES configuration_test_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER configuration_test_fail AFTER INSERT ON setting_operation BEGIN INSERT INTO configuration_test_child VALUES(1); END;")?;
+        settings.execute_test_sql("CREATE TABLE preferences.configuration_test_parent(id INTEGER PRIMARY KEY); CREATE TABLE preferences.configuration_test_child(id INTEGER REFERENCES configuration_test_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER preferences.configuration_test_fail AFTER INSERT ON setting_operation BEGIN INSERT INTO configuration_test_child VALUES(1); END;")?;
         let preparation = broker
             .prepare_configuration(json!({"approval_mode":"allow","automatic_checks":true}))?;
         let candidate = broker.build_configuration_candidate(preparation, &[])?;
@@ -2455,7 +2541,7 @@ mod owned_tests {
                 .save_owned_session(&broker.session, &broker.client_id)
                 .is_err()
         );
-        settings.execute_test_sql("DROP TRIGGER configuration_test_fail;")?;
+        settings.execute_test_sql("DROP TRIGGER preferences.configuration_test_fail;")?;
         assert!(broker.recover_pending_configuration()?);
         let snapshot = settings.get(
             &broker.session.workspace,

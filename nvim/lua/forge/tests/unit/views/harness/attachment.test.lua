@@ -144,4 +144,32 @@ T["harness_attachments"] = function()
   eq(#attachment.capture(draft_buffer).attachments, 0)
 end
 
+
+-- The import replaces the pasted path asynchronously, from a callback that moves no cursor,
+-- so Neovim kept the statusline's cursor column of the longer pasted text until some later
+-- redraw. The replacement asks for the statusline of every window showing the draft.
+T["imported_attachment_redraws_the_statusline"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local attachment = require("forge.views.harness.attachment")
+  stub(vim.uv, "fs_stat", function(_, callback) callback(nil, { type = "file" }) end)
+  local requests = mock_client.respond({ ["session.attachment.import"] = function() end })
+  local redraws = {}
+  stub(vim.api, "nvim__redraw", function(options) redraws[#redraws + 1] = options end)
+  local draft_buffer = buffer.scratch()
+  vim.api.nvim_set_current_buf(draft_buffer)
+  attachment.attach(draft_buffer, "attachments")
+  vim.api.nvim_paste('"C:\\shots\\my image.png"', false, -1)
+  vim.wait(20, function() return #requests == 1 end, 5)
+  eq(#requests, 1)
+  redraws = {}
+  requests[1].callback({ id = string.rep("a", 64), label = "[Image #1]", name = "screen.png",
+    media_type = "image/png", start = 0, ["end"] = #"[Image #1]" })
+  vim.wait(20, function() return false end, 5)
+  eq(buffer.text(draft_buffer), "[Image #1]")
+  local requested = vim.tbl_filter(function(options)
+    return options.buf == draft_buffer and options.statusline == true
+  end, redraws)
+  eq(#requested, 1)
+end
+
 return T

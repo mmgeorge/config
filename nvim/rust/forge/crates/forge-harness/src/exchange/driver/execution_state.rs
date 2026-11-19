@@ -55,7 +55,7 @@ impl ExchangeDriver {
         services.execution.close();
         self.execution_state = ExecutionState::Failed;
         self.failure_reason
-            .get_or_insert_with(|| "Session execution failed; reopen the session to retry".into());
+            .get_or_insert_with(|| "Session execution failed. Select the session in /sessions and press Enter to reopen it.".into());
     }
 
     /// Preserve the first startup failure for UI status and rejected commands.

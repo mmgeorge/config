@@ -149,14 +149,56 @@ pub(crate) fn host_set<Value: serde::Serialize>(
     Ok(())
 }
 
-/// Attach canonical preferences for history transactions that save a user choice.
+/// Attach canonical preferences read-only for history transactions that read a user choice.
+///
+/// SQLite's `BEGIN IMMEDIATE` takes the write lock of every writable attached database in
+/// attachment order. A writable attachment would make every history write also lock the
+/// settings database that every other host's settings writer locks, and opposite lock orders
+/// between hosts then wait each other out until the busy timeout fails both.
 pub(super) fn attach(connection: &Connection, root: &Path) -> Result<()> {
+    drop(open(root)?);
+    connection.execute(
+        "ATTACH DATABASE ?1 AS preferences",
+        [read_only_uri(&root.join("settings.db"))],
+    )?;
+    Ok(())
+}
+
+/// Attach canonical preferences writable after the history main database.
+///
+/// The settings store writes both databases in one transaction. Opening history as the main
+/// database gives it index 0, so SQLite locks history before settings, the same order as every
+/// history transaction.
+pub(super) fn attach_writable(connection: &Connection, root: &Path) -> Result<()> {
     drop(open(root)?);
     connection.execute(
         "ATTACH DATABASE ?1 AS preferences",
         [root.join("settings.db").to_string_lossy().as_ref()],
     )?;
+    connection.pragma_update(Some("preferences"), "synchronous", "FULL")?;
     Ok(())
+}
+
+/// Build a read-only SQLite URI for `path`, escaping the characters URI syntax reserves.
+fn read_only_uri(path: &Path) -> String {
+    let path = dunce::simplified(path).to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(path.len());
+    for character in path.chars() {
+        match character {
+            '%' => encoded.push_str("%25"),
+            '?' => encoded.push_str("%3f"),
+            '#' => encoded.push_str("%23"),
+            character => encoded.push(character),
+        }
+    }
+    let authority = if encoded.starts_with('/') {
+        "file://"
+    } else if encoded.as_bytes().get(1) == Some(&b':') {
+        "file:///"
+    } else {
+        "file:"
+    };
+    format!("{authority}{encoded}?mode=ro")
 }
 
 /// Commit a recovered preference and its replay receipt in one persistent transaction.

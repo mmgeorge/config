@@ -49,9 +49,10 @@ T["input_state"] = function()
   local a, b = queued(first), queued(second)
   update(1, { a })
   update(2, { b })
-  assert(#state.queue == 2 and #state.pending_submit == 0 and #state.pending_steer == 0)
+  -- Only the explicitly queued message waits visibly; the automatic one awaits the host's claim.
+  assert(#state.queue == 1 and state.queue[1].id == b.id and #state.pending_submit == 1 and #state.pending_steer == 0)
   second.callback({ revision = 2, operation_id = second.spec.params.id, upsert = {}, removed = {} })
-  local identity = state.queue[1]
+  local identity = state.pending_submit[1]
   a.delivery, a.route, a.revision = "delivering", "steering", 2
   update(3, { a })
   assert(#state.pending_steer == 1 and state.pending_steer[1] == identity,
@@ -139,7 +140,9 @@ T["retracted_input"] = function()
   requests[1].callback({ revision = 0, suspended = false, messages = {} })
   state.composer_buf = buffer.scratch()
   local context = { document = "draft", buffer = state.composer_buf, is_current = function() return true end }
-  for _, scenario in ipairs({ { newer = false }, { newer = true }, { newer = false, late = true }, { newer = true, late = true }, { newer = false, claimed = true } }) do
+  local scenarios = { { newer = false }, { newer = true }, { newer = false, late = true }, { newer = true, late = true },
+    { newer = false, claimed = true } }
+  for index, scenario in ipairs(scenarios) do
     local newer_draft = scenario.newer
     buffer.set(state.composer_buf, { "Cancel this prompt" })
     submission.start(state, { context = context }, function() end)
@@ -152,39 +155,51 @@ T["retracted_input"] = function()
     if newer_draft then buffer.set(state.composer_buf, { "Newer unsent draft" }) end
     if scenario.claimed then
       -- The foreground claims and accepts the submission before the user cancels it.
-      local accepted = vim.tbl_extend("force", message, { delivery = "accepted" })
+      local accepted = vim.tbl_extend("force", message, { delivery = "accepted", revision = 2 })
       input.receive(state, { revision = revision + 1, suspended = false, upsert = { accepted }, removed = {} })
-      input.receive(state, { revision = revision + 2, suspended = false, upsert = {}, removed = { message.id } })
-      revision = revision + 2
+      revision = revision + 1
     end
+    -- The host retires the retracted identity and keeps the text as an unsent follow-up, so the
+    -- prompt survives an editor that exits before it restores the composer.
+    local unsent = { id = "retracted:" .. index, revision = 1, text = "Cancel this prompt", attachments = {},
+      purpose = { kind = "user" }, intent = "queue", delivery = "failed",
+      error = "Interrupted before the model replied. Retry to send it again." }
     local count = #requests
     local cancellation = { revision = revision + 1, suspended = true,
-      upsert = {}, removed = scenario.claimed and {} or { message.id }, retracted = message.id }
+      upsert = { unsent }, removed = { message.id }, retracted = message.id }
     if scenario.late then
       input.receive(state, { revision = revision + 2,
-        snapshot = { revision = revision + 2, control_revision = 9, suspended = true, messages = {} } })
+        snapshot = { revision = revision + 2, control_revision = 9, suspended = true, messages = { unsent } } })
     end
     input.receive(state, cancellation)
     input.receive(state, cancellation)
-    assert(#requests == count, "rendering a cancelled input issued another queue mutation")
-    assert(#state.input.confirmed == 0, "cancelled input remained in the queue")
     if scenario.late then
       assert(state.input.revision == revision + 2 and state.input.control_revision == 9,
         "late retraction regressed the authoritative input projection")
     end
     assert(buffer.line(state.composer_buf, 1)
       == (newer_draft and "Newer unsent draft" or "Cancel this prompt"), "cancellation overwrote or lost the draft")
-    -- A retraction the composer could not take stays recoverable as an editor-only draft.
-    local recovered = vim.tbl_filter(function(entry)
-      return entry.local_only and entry.text == "Cancel this prompt"
-    end, state.queue)
-    eq(#recovered, newer_draft and 1 or 0)
-    if newer_draft then
-      assert(recovered[1].draft_state == "rejected" and recovered[1].id ~= message.id,
-        "recovered retraction reused the retired host identity")
-      eq(#requests, count)
-      input.discard_rejected(state, recovered[1].id)
+    eq(#vim.tbl_filter(function(entry) return entry.local_only end, state.queue), 0)
+    local function held()
+      return vim.tbl_filter(function(entry) return entry.id == unsent.id end, state.queue)
     end
+    eq(#vim.tbl_filter(function(entry) return entry.id == message.id end, state.queue), 0)
+    if newer_draft then
+      -- The composer could not take the text, so the host's unsent entry stays for retry or edit.
+      eq(#requests, count)
+      eq(#held(), 1)
+      eq(held()[1].delivery, "failed")
+      input.receive(state, { revision = state.input.revision + 1, suspended = true, upsert = {}, removed = { unsent.id } })
+    else
+      -- The composer holds the text again, so the editor removes the host's copy exactly once.
+      eq(#requests, count + 1)
+      local removal = requests[#requests]
+      eq(removal.spec.method, "session.input.apply")
+      eq(removal.spec.params.action, { kind = "remove", id = unsent.id, revision = unsent.revision })
+      removal.callback({ operation_id = removal.spec.params.id, revision = state.input.revision + 1,
+        suspended = true, upsert = {}, removed = { unsent.id } })
+    end
+    eq(#held(), 0)
   end
 end
 
@@ -206,10 +221,14 @@ T["retraction_into_queue_edit"] = function()
   request.callback({ operation_id = request.spec.params.id, revision = 1, suspended = false, upsert = { message }, removed = {} })
   -- An empty queue edit owns the composer; the retraction must not write into it.
   state.queue_edit = { drafts = {}, entry = {} }
-  input.receive(state, { revision = 2, suspended = true, upsert = {}, removed = { message.id }, retracted = message.id })
+  local unsent = { id = "retracted:queue-edit", revision = 1, text = "Retract me", attachments = {},
+    purpose = { kind = "user" }, intent = "queue", delivery = "failed", error = "Interrupted before the model replied." }
+  local count = #requests
+  input.receive(state, { revision = 2, suspended = true, upsert = { unsent }, removed = { message.id }, retracted = message.id })
   eq(buffer.line(state.composer_buf, 1), "")
-  local recovered = vim.tbl_filter(function(entry) return entry.local_only and entry.text == "Retract me" end, state.queue)
-  eq(#recovered, 1)
+  -- The host's unsent entry is the only copy; the editor neither removes nor duplicates it.
+  eq(#requests, count)
+  eq(vim.tbl_map(function(entry) return { entry.id, entry.local_only } end, state.queue), { { unsent.id } })
 end
 
 T["perform_settles_after_ownership_change"] = function()
@@ -225,6 +244,234 @@ T["perform_settles_after_ownership_change"] = function()
   state.session = { id = "another-session" }
   request.callback({ operation_id = request.spec.params.id, revision = 1, suspended = false, upsert = {}, removed = {} })
   assert(type(settled) == "string", "a command settled after the view changed owner never answered its caller")
+end
+
+-- A session fixture whose every input render is recorded, so a case can assert on a placement
+-- that the coalesced status render would only show some of the time.
+local function placement_fixture(session_id, status_kind)
+  local input = require("forge.views.harness.input_state")
+  local requests = mock_client.record()
+  local state = { session = { id = session_id }, queue = {}, status = { kind = status_kind } }
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, status_kind ~= "idle")
+  local fixture = { input = input, state = state, requests = requests, renders = {} }
+  input.attach(state, function()
+    fixture.renders[#fixture.renders + 1] = { queue = #state.queue, handoff = #(state.pending_handoff or {}),
+      steering = #state.pending_steer }
+  end)
+  requests[1].callback({ revision = 0, suspended = false, messages = {} })
+  ---Answer the newest submission as the host does and return the committed message.
+  function fixture.commit()
+    local request = requests[#requests]
+    local message = vim.deepcopy(request.spec.params.action.message)
+    message.revision, message.delivery = 1, "queued"
+    request.callback({ operation_id = request.spec.params.id, revision = state.input.revision + 1,
+      suspended = false, upsert = { vim.deepcopy(message) }, removed = {} })
+    return message
+  end
+  ---Publish the next delivery state of `message`.
+  function fixture.deliver(message, delivery, route)
+    message.delivery, message.route, message.revision = delivery, route, message.revision + 1
+    input.receive(state, { revision = state.input.revision + 1, suspended = false,
+      upsert = { vim.deepcopy(message) }, removed = {} })
+  end
+  return fixture
+end
+
+T["idle_submission_never_renders_a_queue_row"] = function()
+  local fixture = placement_fixture("idle-submission", "idle")
+  fixture.input.submit(fixture.state, "Explain the module", {}, "auto")
+  local message = fixture.commit()
+  -- The host's hand-off phase can report working before the editor hears of the claim.
+  fixture.state.status = { kind = "working" }
+  fixture.deliver(message, "queued")
+  fixture.deliver(message, "delivering", "turn")
+  fixture.deliver(message, "accepted", "turn")
+  for _, render in ipairs(fixture.renders) do
+    eq(render, { queue = 0, handoff = 0, steering = 0 })
+  end
+  eq(#fixture.state.pending_submit, 0)
+end
+
+T["follow_up_stays_staged_until_its_turn_is_accepted"] = function()
+  local fixture = placement_fixture("follow-up-hand-off", "working")
+  local state = fixture.state
+  fixture.input.submit(state, "Then summarize it", {}, "queue")
+  local message = fixture.commit()
+  eq(#state.queue, 1)
+  local identity = state.queue[1]
+  -- The turn ended and the owner claimed the follow-up; its prompt is not in the transcript yet.
+  state.status = { kind = "idle" }
+  fixture.deliver(message, "delivering", "turn")
+  eq(#state.queue, 0)
+  eq(state.pending_handoff, { identity })
+  eq(#state.pending_submit, 0)
+  fixture.deliver(message, "accepted", "turn")
+  eq(#state.pending_handoff, 0)
+  eq(state.input.follow_up, {})
+end
+
+T["unanswered_submission_surfaces_after_the_notice_delay"] = function()
+  local deferred = dofile("nvim/lua/forge/tests/support/deferred.lua")
+  local fixture = placement_fixture("unanswered-submission", "idle")
+  local state, input = fixture.state, fixture.input
+  local timers = deferred.install({ input.submission_notice_delay_ms })
+  local staging = require("forge.views.harness.queue_editor").staging
+
+  -- A submission the host answers within the delay never gains a row, even after the delay.
+  input.submit(state, "Answered promptly", {}, "auto")
+  local prompt = fixture.commit()
+  fixture.deliver(prompt, "delivering", "turn")
+  fixture.deliver(prompt, "accepted", "turn")
+  local settled = #fixture.renders
+  timers.fire(input.submission_notice_delay_ms)
+  eq(#fixture.renders, settled)
+  for _, render in ipairs(fixture.renders) do eq(render.queue + render.handoff, 0) end
+
+  -- An owner holding commands leaves the request unanswered; the prompt must not stay hidden.
+  input.submit(state, "Held by a stop", {}, "auto")
+  eq(#state.queue, 0)
+  eq(#state.pending_submit, 1)
+  eq(timers.fire(input.submission_notice_delay_ms), 1)
+  eq(vim.tbl_map(function(staged) return staged.text end, staging(state, nil, state.queue)),
+    { "[submitting] Held by a stop" })
+  eq(#state.pending_submit, 0)
+  -- The row then follows the prompt until its turn shows it in the transcript.
+  local held = fixture.commit()
+  eq(vim.tbl_map(function(staged) return staged.text end, staging(state, nil, state.queue)), { "Held by a stop" })
+  fixture.deliver(held, "delivering", "turn")
+  eq(#state.queue, 0)
+  eq(#state.pending_handoff, 1)
+  fixture.deliver(held, "accepted", "turn")
+  eq(#state.pending_handoff, 0)
+
+  -- A committed prompt that no owner claims is as hidden as an unanswered one.
+  input.submit(state, "Committed but unclaimed", {}, "auto")
+  fixture.commit()
+  eq(#state.queue, 0)
+  timers.fire(input.submission_notice_delay_ms)
+  eq(#state.queue, 1)
+end
+
+T["submission_after_a_cancellation_never_renders_a_queue_row"] = function()
+  local fixture = placement_fixture("after-cancellation", "idle")
+  local state, input = fixture.state, fixture.input
+  -- A cancellation leaves the stopped prompt as a failed follow-up and the status not yet idle.
+  local stopped = { id = "retracted:stopped", revision = 1, text = "Stopped prompt", attachments = {},
+    purpose = { kind = "user" }, intent = "queue", delivery = "failed", error = "Interrupted before the model replied." }
+  input.receive(state, { revision = 1, suspended = false, upsert = { stopped }, removed = {} })
+  state.status = { kind = "stopping" }
+  local before = #fixture.renders
+  input.submit(state, "Start over", {}, "auto")
+  local message = fixture.commit()
+  state.status = { kind = "working" }
+  fixture.deliver(message, "delivering", "turn")
+  fixture.deliver(message, "accepted", "turn")
+  for index = before + 1, #fixture.renders do
+    eq(fixture.renders[index], { queue = 1, handoff = 0, steering = 0 })
+  end
+end
+
+T["steering_never_renders_as_a_queued_follow_up"] = function()
+  local fixture = placement_fixture("steering-placement", "working")
+  local state, input = fixture.state, fixture.input
+  input.submit(state, "Steer the essay", {}, "auto")
+  local message = fixture.commit()
+  fixture.deliver(message, "queued")
+  fixture.deliver(message, "delivering", "steering")
+  eq(#state.pending_steer, 1)
+  for _, render in ipairs(fixture.renders) do eq(render.queue, 0) end
+end
+
+-- The host reports a steer accepted before its exchange holds the acknowledged copy, so dropping
+-- the staged row at acceptance left the "Steering active turn" section without it for a frame.
+T["accepted_steer_stays_staged_until_the_turn_that_took_it_ends"] = function()
+  local fixture = placement_fixture("accepted-steer", "working")
+  local state, input = fixture.state, fixture.input
+  input.submit(state, "Steer the essay", {}, "auto")
+  local message = fixture.commit()
+  fixture.deliver(message, "delivering", "steering")
+  local first = #fixture.renders
+  fixture.deliver(message, "accepted", "steering")
+  for index = first, #fixture.renders do eq(fixture.renders[index].steering, 1) end
+  local activity = require("forge.views.harness.activity")
+  activity.receive(state, { phase = "idle", revision = state.activity.revision + 1 }, state.runtime_epoch)
+  eq(#state.pending_steer, 0)
+end
+
+T["withdrawn_entries_leave_the_queue_before_the_host_answers"] = function()
+  local fixture = placement_fixture("withdrawn-entries", "working")
+  local state, input, requests = fixture.state, fixture.input, fixture.requests
+  local queued = { id = "queued-entry", revision = 2, text = "Delete me", attachments = {},
+    purpose = { kind = "user" }, intent = "queue", delivery = "queued", reservation = "edit" }
+  input.receive(state, { revision = 1, suspended = false, upsert = { queued }, removed = {} })
+  eq(#state.queue, 1)
+  -- An empty edit deletes the message; the row must not return while the commit is in flight.
+  input.perform(state, { kind = "commit", reservation = "edit", edits = {
+    { id = queued.id, revision = 2, text = "", attachments = {} } } })
+  eq(#state.queue, 0)
+  local commit = requests[#requests]
+  notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  commit.callback(nil, "edit conflict")
+  eq(vim.tbl_map(function(entry) return entry.id end, state.queue), { queued.id })
+
+  -- A retraction the composer took back is removed by the editor; its host copy never renders.
+  state.composer_buf = buffer.scratch()
+  local shown = false
+  state.input.changed = function()
+    for _, entry in ipairs(state.queue) do if entry.id == "retracted:taken" then shown = true end end
+  end
+  input.submit(state, "Take me back", {}, "auto", nil, nil, function()
+    buffer.set(state.composer_buf, { "Take me back" })
+    return true
+  end)
+  local message = fixture.commit()
+  local unsent = { id = "retracted:taken", revision = 1, text = "Take me back", attachments = {},
+    purpose = { kind = "user" }, intent = "queue", delivery = "failed", error = "Interrupted before the model replied." }
+  input.receive(state, { revision = state.input.revision + 1, suspended = true, upsert = { unsent },
+    removed = { message.id }, retracted = message.id })
+  eq(requests[#requests].spec.params.action, { kind = "remove", id = unsent.id, revision = unsent.revision })
+  eq(shown, false)
+end
+
+T["failed_submission_returns_to_the_composer_or_its_row"] = function()
+  local input = require("forge.views.harness.input_state")
+  local submission = require("forge.views.harness.prompt_submission")
+  local requests = mock_client.record()
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local state = { session = { id = "failed-submission" }, queue = {} }
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 0, suspended = false, messages = {} })
+  state.composer_buf = buffer.scratch()
+  local context = { document = "composer", buffer = state.composer_buf, is_current = function() return true end }
+
+  -- The composer is still free, so the text returns there and no failed row duplicates it.
+  buffer.set(state.composer_buf, { "Restart failed" })
+  submission.start(state, { context = context }, function() end)
+  requests[#requests].callback(nil, "provider restart failed")
+  eq(buffer.line(state.composer_buf, 1), "Restart failed")
+  eq(#state.queue, 0)
+  eq(#errors, 1)
+
+  -- Newer typing keeps the composer; the text stays in a failed row with the host's reason.
+  submission.start(state, { context = context }, function() end)
+  local second = requests[#requests]
+  buffer.set(state.composer_buf, { "newer typing" })
+  second.callback({ revision = 1, upsert = {}, removed = {}, error = "Session unavailable" })
+  eq(buffer.line(state.composer_buf, 1), "newer typing")
+  eq(vim.tbl_map(function(entry) return { entry.text, entry.error } end, state.queue),
+    { { "Restart failed", "Session unavailable" } })
+
+  -- A session that became unavailable while the request was in flight still keeps the text.
+  input.discard_rejected(state, state.queue[1].id)
+  buffer.set(state.composer_buf, { "Lost in the restart" })
+  submission.start(state, { context = context }, function() end)
+  local third = requests[#requests]
+  buffer.set(state.composer_buf, { "typed meanwhile" })
+  state.host_error = "Provider restart failed"
+  third.callback(nil, "Provider restart failed")
+  eq(vim.tbl_map(function(entry) return { entry.text, entry.draft_state } end, state.queue),
+    { { "Lost in the restart", "rejected" } })
 end
 
 return T

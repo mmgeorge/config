@@ -8,7 +8,9 @@ mod owner_storage_failure;
 mod owner_transition;
 mod reconnect_overlap;
 mod session_lifecycle;
+mod session_reopen;
 mod settings_defaults;
+mod stop_backstop;
 mod task_state;
 
 use super::*;
@@ -997,6 +999,218 @@ async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> 
         drop(sink);
         reader.await??;
     }
+    Ok(())
+}
+
+/// Keep the session working from a finished turn until its queued follow-up starts.
+///
+/// The finished exchange alone resolves to an idle phase, and the follow-up's exchange is
+/// admitted a few owner steps later. Publishing the idle phase in between closed the editor's
+/// status row and reopened it, which scrolled the transcript twice at every hand-off.
+#[tokio::test]
+async fn queued_follow_up_hand_off_never_publishes_idle() -> Result<()> {
+    use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+    use crate::provider::mock_response::MockResponseCommand;
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let provider = controller.provider_handle();
+    let control = provider.mock_response_control().unwrap();
+    let hold = || MockResponseCommand::Hold {
+        mode: None,
+        any_session: false,
+    };
+    let held_id = |held: &Value| held["id"].as_str().unwrap().to_owned();
+    let first = held_id(&control.dispatch(&session_id, hold()).await?);
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let published = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = published.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            let event: Value = serde_json::from_slice(frame.bytes())?;
+            if event["event"] == "document_changed"
+                && let Some(kind) = event["payload"]["status"]["kind"].as_str()
+            {
+                // The hand-off is a working phase marked by its activity.
+                let phase = event["payload"]["status"]["activity"]
+                    .as_str()
+                    .filter(|activity| *activity == "handing_off")
+                    .unwrap_or(kind);
+                recorded.lock().unwrap().push(phase.to_owned());
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let submit = |id: &str, intent: InputIntent| InputOperation {
+        id: format!("operation-{id}"),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Submit {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
+                id: id.into(),
+                text: format!("input {id}"),
+                purpose: crate::input::InputPurpose::User,
+                intent,
+                attachments: vec![],
+                config: None,
+            })),
+        },
+    };
+    controller
+        .coordinator
+        .submissions
+        .apply(submit("active", InputIntent::Auto))?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Wait { id: first.clone() })
+        .await?;
+    let second = held_id(&control.dispatch(&session_id, hold()).await?);
+    controller
+        .coordinator
+        .submissions
+        .apply(submit("follow-up", InputIntent::Queue))?;
+    // The reader records frames asynchronously, so the idle phase that attachment published may
+    // still be queued behind this point. The channel is ordered, so once the reader has recorded
+    // the held exchange's working phase, every earlier idle frame precedes the hand-off window.
+    let hand_off = loop {
+        let working = {
+            let recorded = published.lock().unwrap();
+            recorded
+                .iter()
+                .any(|phase| phase != "idle")
+                .then_some(recorded.len())
+        };
+        if let Some(recorded) = working {
+            break recorded;
+        }
+        tokio::task::yield_now().await;
+    };
+    control
+        .dispatch(&session_id, MockResponseCommand::Release { id: first })
+        .await?;
+    control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Wait { id: second.clone() },
+        )
+        .await?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Release { id: second })
+        .await?;
+    // The last phase is idle only after the follow-up's own exchange settled, which orders
+    // every hand-off publication before it.
+    let phases = async {
+        loop {
+            let settled = SqliteStore::read_only(&controller.data_root)?
+                .list_exchange(&session_id)?
+                .iter()
+                .filter(|exchange| exchange.is_finished())
+                .count()
+                == 2;
+            let phases = published.lock().unwrap()[hand_off..].to_vec();
+            if settled && phases.last().is_some_and(|phase| phase == "idle") {
+                break Ok::<_, anyhow::Error>(phases);
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+    .await?;
+    let idle = phases
+        .iter()
+        .position(|phase| phase == "idle")
+        .context("the settled session published no idle phase")?;
+    assert!(
+        phases[idle..].iter().all(|phase| phase == "idle"),
+        "the session published an idle phase before its queued follow-up started: {phases:?}"
+    );
+    assert!(
+        phases[..idle].iter().any(|phase| phase == "handing_off"),
+        "the hand-off between the turns was not marked as one: {phases:?}"
+    );
+    service.shutdown(Duration::from_secs(5)).await?;
+    drop(sink);
+    reader.await??;
+    Ok(())
+}
+
+/// Re-project the predicted hand-off whenever a queue change adds or withdraws its message.
+///
+/// Between turns the status predicts the next queued turn as `Working`. An edit reservation
+/// that lands before the owner claims that message must return the status to idle, or the
+/// status row spins `Working · 0s` with nothing running for as long as the edit stays open.
+#[tokio::test]
+async fn reserving_the_predicted_follow_up_publishes_idle() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    // Holding the execution permit keeps the owner from claiming the follow-up, which is the
+    // interval between a settled turn and the next dispatch.
+    let _execution = Arc::clone(&controller.coordinator.execution)
+        .try_acquire_owned()
+        .unwrap();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let published = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = published.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            let event: Value = serde_json::from_slice(frame.bytes())?;
+            if event["event"] == "document_changed"
+                && let Some(kind) = event["payload"]["status"]["kind"].as_str()
+            {
+                recorded.lock().unwrap().push(kind.to_owned());
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    let published_phase = |expected: &'static str| {
+        let published = published.clone();
+        async move {
+            while published.lock().unwrap().last().map(String::as_str) != Some(expected) {
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 1,
+                method: "session.input.apply".into(),
+                params: json!({"id":"submit-follow-up","action":{"kind":"submit","message":{
+                    "id":"follow-up","text":"Queued follow-up","intent":"queue","attachments":[]}}}),
+            },
+            &sink,
+        )
+        .await?;
+    // The queued follow-up is the next turn, so the status predicts it as already working.
+    published_phase("working").await;
+    let revision = controller.coordinator.submissions.snapshot()?.messages[0].revision;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.input.apply".into(),
+                params: json!({"id":"reserve-follow-up","action":{"kind":"reserve",
+                    "id":"follow-up","revision":revision,"reservation":"editor"}}),
+            },
+            &sink,
+        )
+        .await?;
+    published_phase("idle").await;
+    service.shutdown(Duration::from_secs(5)).await?;
+    drop(sink);
+    reader.await??;
     Ok(())
 }
 

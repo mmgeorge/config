@@ -5,9 +5,55 @@ local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
 local mock_client = dofile("nvim/lua/forge/tests/support/mock_client.lua")
 local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
 local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
 local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
+
+---@class SessionPickerFixture
+---@field spec fun(): table the specification the session picker last gave the shared picker
+---@field is_open fun(): boolean whether the shared picker is still open
+---@field rendered table[] every preview render as `{ snapshot = ..., visible_height = ... }`
+---@field requests RecordedRequest[]
+---@field option fun(session_id: string): table the Workspace option that lists `session_id`
+
+---Open the session picker over a stubbed shared picker and preview, listing `entry_list`.
+---The case then drives the picker's own callbacks, which is the behavior these cases verify.
+---@param current_session table the session shown in the calling view
+---@param entry_list table[] the `session.list` reply
+---@return SessionPickerFixture
+local function open_session_picker(current_session, entry_list)
+  local picker = require("forge.views.picker")
+  local preview = require("forge.views.harness.session_preview")
+  local picker_spec, picker_open = nil, false
+  local rendered = {}
+  stub(picker, "open", function(spec) picker_spec, picker_open = spec, true end)
+  stub(picker, "update", function(spec) picker_spec = spec end)
+  stub(picker, "is_open", function() return picker_open end)
+  stub(picker, "close", function() picker_open = false end)
+  stub(preview, "open", function() end)
+  stub(preview, "close", function() end)
+  stub(preview, "render", function(snapshot, visible_height)
+    rendered[#rendered + 1] = { snapshot = snapshot, visible_height = visible_height }
+  end)
+  require("forge.session").harness.session = current_session
+  local requests = mock_client.respond({
+    ["session.list"] = entry_list,
+    ["session.preview"] = function(spec, callback) callback({ lines = { "preview " .. spec.params.session_id } }) end,
+  })
+  require("forge.views.harness.session_picker").open({ transcript_win = vim.api.nvim_get_current_win() })
+  return {
+    spec = function() return picker_spec end,
+    is_open = function() return picker_open end,
+    rendered = rendered,
+    requests = requests,
+    option = function(session_id)
+      return assert(vim.iter(picker_spec.page_list[1].option_list):find(function(option) return option.id == session_id end),
+        "session picker did not list " .. session_id)
+    end,
+  }
+end
 
 T["session_picker"] = function()
   local forge = require("forge")
@@ -197,20 +243,33 @@ T["session_picker"] = function()
   eq(vim.api.nvim_get_current_win(), active_picker.win, { fail_reason = "empty search should return focus to options" })
   search_mapping.callback()
   assert(active_picker.search_win ~= nil, "search should reopen after the empty row disappears")
-  assert(vim.api.nvim_win_get_buf(state.transcript_win) ~= original_transcript_buf,
-    "session search should display a separate preview buffer")
-  local preview_text = buffer.text(vim.api.nvim_win_get_buf(state.transcript_win))
-  assert(preview_text:find("Preview Architecture review", 1, true) ~= nil,
-    "initial selection should preview the active session timeline")
+  ---@return string text of the float that previews the highlighted session, empty when none shows
+  local function preview_text()
+    for _, window in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      local window_config = vim.api.nvim_win_get_config(window)
+      if window_config.relative ~= "" and window_config.focusable == false and window ~= active_picker.win then
+        return buffer.text(vim.api.nvim_win_get_buf(window))
+      end
+    end
+    return ""
+  end
+  eq(vim.api.nvim_win_get_buf(state.transcript_win), original_transcript_buf,
+    { fail_reason = "session search must draw its preview over the transcript, not in its window" })
+  eq(preview_text(), "", { fail_reason = "the current session's own transcript needs no preview" })
+  buffer.set(active_picker.search_buf, { "gamma" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
+  assert(preview_text():find("Preview Gamma migration", 1, true) ~= nil,
+    "the highlighted session should be previewed over the transcript")
   local live_record = interaction("active", "Live update while preview is open")
   state.interaction = { live_record }
   state.timeline = { { kind = "exchange", id = live_record.id, created_at_ms = 1, exchange = live_record } }
   controller.render(true)
-  assert(vim.api.nvim_buf_is_valid(original_transcript_buf),
-    "background Harness state updates should retain the hidden native transcript")
-  preview_text = buffer.text(vim.api.nvim_win_get_buf(state.transcript_win))
-  assert(preview_text:find("Preview Architecture review", 1, true) ~= nil,
+  eq(vim.api.nvim_win_get_buf(state.transcript_win), original_transcript_buf,
+    { fail_reason = "background Harness renders keep the transcript in its window" })
+  assert(preview_text():find("Preview Gamma migration", 1, true) ~= nil,
     "background Harness renders must not overwrite the visible session preview")
+  buffer.set(active_picker.search_buf, { "" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
   keymap.invoke("<C-j>", { mode = "i" })
   eq(deleted_session_id, nil, { fail_reason = "Ctrl-j should refuse to delete the active session" })
   assert(picker.is_open("sessions"), "refusing active-session deletion should keep search open")
@@ -219,8 +278,7 @@ T["session_picker"] = function()
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
   eq(vim.api.nvim_win_get_height(active_picker.win), expected_height,
     { fail_reason = "filtering sessions should preserve the fixed picker height" })
-  preview_text = buffer.text(vim.api.nvim_win_get_buf(state.transcript_win))
-  assert(preview_text:find("Preview Gamma migration", 1, true) ~= nil,
+  assert(preview_text():find("Preview Gamma migration", 1, true) ~= nil,
     "fuzzy filtering should preview the selected matching session")
   eq(last_request("session.preview").params.session_id, "gamma",
     { fail_reason = "same-provider preview must keep the candidate identity in params" })
@@ -240,8 +298,7 @@ T["session_picker"] = function()
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active_picker.search_buf })
   preview_callback_by_session.gamma()
   preview_callback_by_session.beta()
-  preview_text = buffer.text(vim.api.nvim_win_get_buf(state.transcript_win))
-  assert(preview_text:find("Preview Gamma migration", 1, true) ~= nil,
+  assert(preview_text():find("Preview Gamma migration", 1, true) ~= nil,
     "an older asynchronous preview must not replace the latest selection")
   defer_preview = false
 
@@ -291,7 +348,93 @@ T["session_picker"] = function()
   eq(#vim.api.nvim_list_tabpages(), original_tab_count,
     { fail_reason = "resuming a session should not create a tab" })
   eq(vim.api.nvim_win_get_buf(state.transcript_win), original_transcript_buf,
-    { fail_reason = "closing session search should restore the real Harness timeline buffer" })
+    { fail_reason = "closing session search should leave the real Harness timeline buffer in place" })
+end
+
+T["enter_on_another_provider_session_switches_provider"] = function()
+  local workspace = vim.fn.getcwd()
+  local warnings = notify.capture({ min_level = vim.log.levels.WARN, notifications = true })
+  local harness = require("forge.views.harness")
+  local switch_starts, switch_request = false, nil
+  stub(harness, "switch_provider", function(provider, destination)
+    switch_request = { provider = provider, destination = destination }
+    return switch_starts
+  end)
+  local fixture = open_session_picker(
+    { id = "current", provider = "fixture_alpha", workspace = workspace },
+    {
+      { id = "current", provider = "fixture_alpha", workspace = workspace, created_at_ms = 2, active = true },
+      { id = "other", provider = "fixture_beta", workspace = workspace, created_at_ms = 1 },
+    })
+
+  -- A switch that cannot start, such as one blocked by pending work, leaves the picker open.
+  eq(fixture.spec().on_confirm({ option = fixture.option("other") }), false)
+  eq(switch_request, {
+    provider = "fixture_beta",
+    destination = { kind = "resume", session_id = "other", persist_default = false },
+  }, { fail_reason = "Enter on another provider's session must resume it through the provider switch" })
+  eq(fixture.is_open(), true, { fail_reason = "a switch that did not start must keep the picker open" })
+
+  switch_starts = true
+  fixture.spec().on_confirm({ option = fixture.option("other") })
+  eq(fixture.is_open(), false, { fail_reason = "a started switch must close the picker" })
+  eq(require("forge.views.harness.session_picker")._state_for_test(), nil)
+  eq(vim.tbl_filter(function(request) return request.spec.method == "session.resume" end, fixture.requests), {},
+    { fail_reason = "the running host serves one provider and cannot resume another provider's session" })
+  eq(warnings:messages(), {})
+end
+
+T["preview_receives_the_rows_above_the_picker"] = function()
+  local workspace = vim.fn.getcwd()
+  local fixture = open_session_picker(
+    { id = "current", provider = "fixture_alpha", workspace = workspace },
+    { { id = "current", provider = "fixture_alpha", workspace = workspace, created_at_ms = 2, active = true },
+      { id = "saved", provider = "fixture_alpha", workspace = workspace, created_at_ms = 1 } })
+  fixture.spec().on_change({ page = { id = "repo" }, option = fixture.option("saved"), preview_height = 9 })
+  eq(fixture.rendered, { { snapshot = { lines = { "preview saved" } }, visible_height = 9 } },
+    { fail_reason = "the preview must learn how many rows the picker leaves uncovered" })
+end
+
+T["the current session shows its own transcript instead of a preview"] = function()
+  local workspace = vim.fn.getcwd()
+  local hidden = 0
+  stub(require("forge.views.harness.session_preview"), "hide", function() hidden = hidden + 1 end)
+  local fixture = open_session_picker(
+    { id = "current", provider = "fixture_alpha", workspace = workspace },
+    { { id = "current", provider = "fixture_alpha", workspace = workspace, created_at_ms = 1, active = true } })
+  fixture.spec().on_change({ page = { id = "repo" }, option = fixture.option("current"), preview_height = 9 })
+  eq({ fixture.rendered, hidden }, { {}, 1 })
+  eq(vim.tbl_filter(function(request) return request.spec.method == "session.preview" end, fixture.requests), {})
+end
+
+T["footer_and_help_describe_session_commands"] = function()
+  require("forge.infra.config").setup({})
+  local preview = require("forge.views.harness.session_preview")
+  stub(preview, "open", function() end)
+  stub(preview, "close", function() end)
+  stub(preview, "render", function() end)
+  local workspace = vim.fn.getcwd()
+  require("forge.session").harness.session = { id = "current", provider = "fixture_alpha", workspace = workspace }
+  mock_client.respond({
+    ["session.list"] = { { id = "current", provider = "fixture_alpha", workspace = workspace, created_at_ms = 1, active = true } },
+    ["session.preview"] = function(_, callback) callback({ lines = {} }) end,
+  })
+  local picker = require("forge.views.picker")
+  MiniTest.finally(function() pcall(picker.close, true) end)
+  require("forge.views.harness.session_picker").open({ transcript_win = vim.api.nvim_get_current_win() })
+  wait_until(function() return picker.is_open("sessions") end, "session picker did not open")
+  local instance = picker._state_for_test()
+  local footer = picker._navigation_footer(instance)
+  -- The footer names session commands only, never configuration-form commands it does not map.
+  for _, form_hint in ipairs({ " value", " toggle", " category", "edit/open" }) do
+    eq(footer:find(form_hint, 1, true), nil, { fail_reason = "footer advertised `" .. form_hint .. "`: " .. footer })
+  end
+  for _, session_hint in ipairs({ " scope", " open", " delete", " search" }) do
+    assert(footer:find(session_hint, 1, true), "footer omitted `" .. session_hint .. "`: " .. footer)
+  end
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(instance.buf, "n")) do
+    eq((mapping.desc or ""):find("planning", 1, true), nil, { fail_reason = mapping.lhs .. " says " .. tostring(mapping.desc) })
+  end
 end
 
 return T

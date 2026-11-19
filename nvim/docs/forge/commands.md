@@ -42,7 +42,7 @@ to start a new session. Breaking state versions select a new directory automatic
 so old editors do not prevent new hosts from starting. The one-time old-layout
 cleanup described below also belongs to this command.
 
-The first startup after the storage-layout change reports an incompatible layout and requires `:ForgeHistoryClear`; startup does not delete old content. That explicit command discards the old Harness root, including old preferences, and restores defaults. It refuses the reset while an old host or unresolved repository process owns the data. Later `:ForgeHistoryClear` runs preserve the new `settings.db`, provider selection, model pins, logging preferences, and external permission rules. An unknown layout or corrupt new settings database reports an error and never triggers another reset.
+The first startup after the storage-layout change reports an incompatible layout and requires `:ForgeHistoryClear`; startup does not delete old content. That explicit command discards the old Harness root, including old preferences, and restores defaults. The next Harness start reports the reset once, in one editor. It refuses the reset while an old host or unresolved repository process owns the data. Later `:ForgeHistoryClear` runs preserve the new `settings.db`, provider selection, model pins, logging preferences, and external permission rules. An unknown layout or corrupt new settings database reports an error and never triggers another reset.
 
 `harness_session_log` reads newest-first and returns up to 1,000 complete entries
 per page by default. Its optional positive integer `limit` selects another page
@@ -266,6 +266,11 @@ The suffix `x` means full filesystem scope for the preceding operation.
 | `/allow` | Apply saved rules and approve remaining tool requests once. |
 | `/yolo` | Toggle YOLO. Enter with full reads/writes, `allow`, and sandbox off. Exit with full reads/writes, `ask`, and sandbox enabled where supported. |
 
+`/ask`, `/deny`, and `/allow` take effect at once, even during a turn: they never stop or
+restart the response. A request already waiting for approval is decided as a new one would
+be: `/allow` approves it once, `/deny` rejects it with the reject-all reason, and `/ask`
+leaves it waiting. Access changes still restart the turn.
+
 Disabling full writes discards that full selection. The next `/write` enables
 workspace writes. Approval commands do not enable writes or change scope. Enabling
 the sandbox removes the `YOLO` indicator. Bare `/read`, `/mode`, and the `all` forms are removed.
@@ -339,7 +344,11 @@ Permission popups, like every Forge picker, close with `q` or `Esc` without
 approving or rejecting the tool; the request stays pending until you decide it.
 A permission popup opens with no decision selected, so an Enter typed into the
 composer just as the popup takes focus decides nothing; choose a decision with its
-key or the arrow keys first. When another picker replaces a pending permission
+key or the arrow keys first. A permission or question popup that opens while you
+are typing ignores your keys, except `q`, `Esc`, and `Ctrl-C`, until you have stopped
+typing for about a third of a second, and its footer reads **Waiting for typing to stop**
+meanwhile. When such a popup closes by itself just after you typed into it, keys typed in
+that moment are ignored too, rather than landing in the composer. When another picker replaces a pending permission
 popup, the popup returns once that picker closes.
 
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
@@ -359,9 +368,13 @@ answer. In that case, Forge also displays the last commentary as a final respons
 with the same text in both places. The original commentary keeps its tools.
 An explicitly empty final answer does not produce a replacement response.
 
-`Tools · successful/total` groups stay folded while calls run. Failed and denied counts
-appear in parentheses before the duration when nonzero. Expand a group to see its calls,
-then expand an individual call to read its output. Completion folds the group again.
+`Tools · successful/total` groups stay folded while calls run. Only a denied count
+appears in parentheses before the duration, when nonzero; failed, cancelled, and
+interrupted calls lower the successful count without a count of their own. Expand a
+group to see its calls, then expand an individual call to read its output. Each call's
+bullet shows its outcome: green for a successful or running call, red for a failed one,
+orange for a denied one, and gray for one that was cancelled or interrupted.
+Completion folds the group again.
 The group duration counts overlapping calls once and excludes gaps between calls.
 Individual rows show each call's duration, so their sum can exceed the group duration.
 
@@ -401,7 +414,9 @@ unfinished entries unchecked. Exchanges without a reported checklist show no sec
 A file created and deleted within the captured interval is absent from the workspace result
 but remains in Edits. An empty saved comparison produces no workspace-change row.
 Missing checkpoint evidence displays **Edits unavailable**, including non-Git
-workspaces. An active exchange without a saved comparison displays a pending indication.
+workspaces. An exchange that was running when Forge stopped gets its comparison when
+Harness next starts, so it shows the edits present at that start, including any made
+while Forge was not running. An active exchange without a saved comparison displays a pending indication.
 During recapture, a nonempty previous comparison remains visible as **previous capture**.
 Failed recapture retains that comparison with the
 failure reason. Checkpoints remain available through `/undo`.
@@ -463,8 +478,24 @@ the workspace path for each session.
 Within each scope, **Active** sessions loaded in this Forge host appear first,
 including sessions whose editor views are closed. Saved sessions that are not loaded
 appear under **Inactive**. Searching keeps this section order.
-In session search, Enter always shows the chosen session in the current tab. `Ctrl-J`
-deletes the selected saved session and closes every tab that shows it.
+The transcript area previews the highlighted session in a layer drawn over the transcript,
+below its winbar. The preview ends at the session's latest exchange, on the last row above
+the picker. Highlighting the current session removes the preview and shows its own
+transcript, and closing the picker leaves that transcript exactly as it was, including its
+scroll position and expanded sections. A session that no editor owns, such as
+one whose editor was killed mid-turn, previews its unfinished exchange as **Interrupted**
+at its last recorded active time, as resuming it will show. A session open in another
+editor previews its stored state, with a timer that does not advance.
+In session search, Enter shows the chosen session in the current tab. Its composer takes
+the mode yours had when you opened the picker, also when the session already had a tab and
+`/sessions` or `/provider` **Resume session** switches to it. A session of
+another provider opens through the same provider switch as `/provider`: Forge restarts
+its host on that session's provider, so the switch requires that no Harness tab has
+running, queued, or unsent work. A switch that cannot start reports why and leaves the
+picker open. Unlike `/provider`, opening a session this way leaves the saved default
+provider unchanged, so the next editor start still opens the default provider's session.
+A session of another worktree is history-only; open Harness from that worktree to
+resume it. `Ctrl-J` deletes the selected saved session and closes every tab that shows it.
 After selecting an interaction, choose **Conversation only** to keep current files,
 or **Conversation and files** to restore its checkpoint too. Conversation-only
 rollback works without a file checkpoint. Confirming conversation rollback collects
@@ -479,7 +510,12 @@ typed there since confirming it, and it does not move focus out of another windo
 Live status occupies a non-focusable split immediately above the composer. It stays visible
 while the transcript scrolls through history, and disappears when no work, pending
 message, or local notice remains. The split keeps **Working** visible while handing
-off to the next queued message. Check progress, queued messages, pending steering,
+off to the next queued message, and that message keeps its status row until its own
+turn shows it in the conversation. A prompt sent while nothing is running goes straight
+to the conversation and never appears as a queued message. If Harness cannot start it
+within half a second, as during a stop or a provider restart, it appears in status,
+marked `[submitting]` until Harness confirms it, and stays there until its turn starts.
+Check progress, queued messages, pending steering,
 and local notices share the status split. Paused queues remain visible.
 Normal window cycling skips status. Its viewport stays fixed at the first row,
 including during mouse-wheel input. Use `oS` for a scrollable view of full status
@@ -498,12 +534,27 @@ Shell-backed tool headings show the underlying command rather than the shell too
 wrapper, both while running and after completion. Expanding the call retains its
 full arguments. Native tools such as `rg` keep their structured call headings.
 The live status line shows the current phase, elapsed time, and interrupt key.
-When interruption begins, the execution timer stops and status changes to **Stopping**.
+Elapsed time counts active execution, not wall-clock time: the timer stops while an
+approval or question popup waits for you and resumes when you answer, so the status line
+and the exchange's final duration can read lower than the time since you submitted the
+prompt. An exchange cut off because Forge itself stopped reports the active time at its
+last recorded event.
+When interruption begins, the execution timer stops and status changes to **Stopping**,
+which stays unchanged until the stop settles.
 If cleanup outlives its response deadline, **Cleanup timed out - provider state uncertain**
 replaces the spinner. Harness retains ownership until cleanup settles; the timeout does not
 authorize another turn against uncertain provider state. Copilot force-stops its shared native
 runtime if the interrupted prompt does not settle within ten seconds, which also interrupts
 other sessions using that runtime.
+Interrupting a turn also stops a Copilot shell command that the turn is still waiting on,
+including the processes the command started, such as `nu -c "sleep 60sec"` under
+Copilot's PowerShell wrapper, and the command leaves the background-terminal count.
+Steering does not stop it. A command started in the
+background, or one that outlasted its initial wait, keeps running across turns; stop
+it with `ot`.
+The background-terminal count in the status line follows provider updates, and Harness
+re-reads it when a turn settles and when `ot` opens its list, so the count matches the
+list `ot` shows.
 Thought headers show successful/total tools and append changed-file counts when
 nonzero. Repeated successful edits to one file count once. Individual tool errors
 and compaction details remain available in the expanded timeline.
@@ -534,13 +585,20 @@ automatically scrolls the transcript to its end, exposing running tools and prog
 While the transcript is focused, updates preserve the cursor and reading position,
 including when the thought preview changes. Active selections retain both endpoints and their selection type.
 If selected text disappears, each endpoint moves to the nearest surviving position.
+The reading position holds while the cursor is outside the transcript's bottom scroll
+margin of three rows. A cursor on the last rows of the streaming exchange lies inside
+that margin, so Neovim advances the view as rows arrive below it to keep the margin
+visible; a cursor on an earlier line leaves the view where it is.
 Submitting a prompt positions the transcript at its tail once.
 When an exchange finishes, Harness reveals it if focus is outside that transcript.
 If the prompt and response fit in the visible transcript window, Harness aligns
 the exchange to the bottom. Otherwise, it places the prompt at the top so you can
 read the response from its beginning.
 This decision uses current focus, not previous scrolling or cursor movement.
-Focused transcripts and folded responses keep their reading position.
+An exchange that hands off to a queued message is not revealed, because that
+message's turn takes its place at the end of the transcript a moment later.
+Focused transcripts and folded responses keep their reading position, within the
+same scroll margin.
 Skipped reveals do not run later when focus changes.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
 Claude Code always streams summarized thinking. Antigravity retains provider-defined summary detail
@@ -557,25 +615,62 @@ resends a message whose delivery is uncertain.
 Consecutive messages sent to an active steering queue are handed off in order
 without waiting for earlier acknowledgments. Each keeps its own delivery status;
 explicitly queued follow-ups still wait for the active work to finish.
+While a tool approval is pending, every message you send, including one sent with
+`Ctrl-S`, waits under "Queued follow-up inputs" until the approval is answered or
+expires, on every provider; it is neither steered nor sent while the request is open.
+An explicitly queued follow-up likewise waits while a question is pending. After an
+approval expires, a waiting message steers into the automatic continuation turn when
+the provider accepts steering, or runs after it.
 `Ctrl-C` only interrupts active work. It never submits or steers the composer,
-including while editing a queued message. Drafts and queued follow-ups remain
-unsent while the task is paused. With a child timeline selected, it interrupts
+including while editing a queued message. Interrupting active work pauses the
+queue: drafts and queued follow-ups remain unsent, and the status split shows
+`Queued follow-up inputs · paused · <M-r> resume`, with the configured retry key. Press
+it to resume the queue in its order. Submitting a new prompt also resumes the queue;
+that prompt runs first, ahead of the explicitly queued follow-ups. `Ctrl-C` with
+nothing running pauses nothing. With a child timeline selected, it interrupts
 that child without sending the draft. A message or follow-up sent to a selected child
 leaves the composer at once and returns to it only if the child rejects it.
 Interrupting a prompt before the model shows any reply, reasoning, or tool activity
 removes that exchange and returns the prompt to the composer; the provider's echo of
 your own prompt does not count as activity. If the composer already holds newer text,
-the prompt stays in the queue as an unsent draft that you can retry or edit instead. After visible activity, the exchange stays
-in history as cancelled.
+the prompt stays in the queue as an unsent message that you can retry or edit instead.
+The prompt also survives leaving Neovim before the interrupt finishes: Harness keeps it
+in the session's queue as an unsent message, and reopening the session shows it there
+with the queue paused. After visible activity, the exchange stays in history as
+cancelled.
+Removing an exchange the provider has already accepted requires a provider that can
+drop a turn from its own history. Codex and Copilot can. Claude Code and Antigravity
+cannot, so with them the prompt returns only when the interrupt arrives before the
+provider accepts it, which is a moment after you submit; once the provider has
+accepted the prompt, the exchange stays in history as cancelled even when nothing was
+shown.
 Cancellation remains pending until native work and host settlement finish. Repeated
-`Ctrl-C` presses share the pending request. If its response times out, cleanup continues
-and the notice identifies the phase still running; another cancel is not required.
+`Ctrl-C` presses share the pending request. A stop that settles promptly shows only
+**Stopping**. If it is still pending after ten seconds, or its response times out, cleanup
+continues and a notice directly below the status line identifies the phase still running;
+another cancel is not required. The response times out after thirty seconds. If the
+provider still has not stopped twenty seconds after that, Harness force-ends the provider
+process or connection for this session and the exchange settles as cancelled, so a stop
+never needs an editor restart to leave **Stopping**. Work the provider was doing at that
+moment has an unknown outcome. `Ctrl-C` with nothing running changes no status.
 A reopened view restores that progress from the host snapshot.
 When a turn fails in a way that leaves the provider's state unknown, such as a send
 that ends without confirmation, Harness restarts the provider before it runs anything
 else. Commands, including `Ctrl-C`, wait until the restart finishes. If the provider
 cannot restart, the session shows an error, later commands fail immediately, and the
-session must be reopened.
+session must be reopened. Commands and prompts that were waiting for the restart fail
+at that moment with the same error rather than when you leave Neovim. To reopen the
+session, select it in `/sessions` and press `Enter`, even when it is the session you
+are viewing. Harness stops the failed session, rebuilds its own provider connection,
+and loads it again from storage; the transcript and the queue survive, and the queue
+stays paused until you send or resume. Choosing a working session only focuses it.
+A reopen cannot revive a provider process that Harness shares between sessions; when
+that process itself cannot start, switch the provider with `/provider`, which restarts
+Harness.
+An interrupt that Harness cannot confirm restarts the provider the same way and ends
+the interrupted exchange as failed. A prompt interrupted before it was sent stays in
+the queue marked failed, and Harness never resends it on its own; retry or edit it
+there.
 Pending steering appears above queued follow-ups in the status split, under
 "Steering active turn". A steered message stays there after the provider accepts it,
 until the provider reports that the message joined the running turn; it then moves
@@ -587,18 +682,32 @@ queued messages remain visible while execution is paused or idle. Direct submiss
 enter exchange history. The lower prompt buffer contains only the draft being edited.
 The prompt grows with visual wrapped rows up to its configured maximum height.
 Longer drafts scroll through wrapped rows without inserting newlines into the text.
-Queued prompts remain visible until accepted. If submission fails before acceptance,
-the message and its attachments remain visible in red. `Alt-R` retries the first
-failed message without changing the composer draft. For uncertain delivery, the
-same shortcut checks provider acceptance before permitting a resend. Recovery entries
-retained after a host restart require manual delivery confirmation and are not resent
-by this shortcut. Explicitly queued messages do not interrupt the active response or checks.
+Queued prompts remain visible until accepted. A submitted prompt that the session
+neither starts nor steers at once, because other work holds it, joins the queued
+messages after half a second; one that starts or steers at once never appears there.
+If Harness rejects a submission before accepting it, the prompt and its attachments
+return to the composer with the reason; when the composer already holds newer text,
+they remain visible in red with the reason instead. `Alt-R` retries the first
+failed message without changing the composer draft, and resumes a paused queue so
+the message is sent. A message Harness marked unsent, such as one interrupted before
+the model replied or before provider dispatch, is retried this way, including after a
+host restart. With no failed message, `Alt-R` resumes a paused queue. For uncertain
+delivery, the same shortcut checks provider acceptance before permitting a resend; an
+entry whose delivery is uncertain after a host restart requires manual delivery
+confirmation and is not resent by this shortcut. Explicitly queued messages do not
+interrupt the active response or checks.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
 question or approval, `op` for artifacts, `og` for agents, model selection, help,
 and closing Harness. These hotkeys also work with Read permissions.
 In Insert mode, `Ctrl-J` inserts a newline at the cursor and preserves the draft.
+`Ctrl-C` pressed in Insert mode keeps the composer in Insert mode at the same cursor,
+including when Neovim is busy and delivers the key as an interrupt rather than through
+the mapping.
+Closing a picker returns focus to the window and mode it was opened from. A chain of
+pickers, such as `/provider` followed by **Resume session…**, returns to the mode the
+first picker was opened from, and a provider switch keeps the composer in that mode.
 Press `Up` on the first draft line to recall submitted prompts. Repeated `Up` and
 `Down` browse history, and `Down` past the newest entry restores your unfinished
 draft and attachments. Inside a multiline draft, the arrows move between lines.
@@ -619,19 +728,24 @@ so `/plan inspect screenshot.png` starts planning rather than sending an ordinar
 `M-s` edits the newest queued prompt in place and leaves the composer in Normal mode.
 Repeating it moves backward through
 the queue, and `M-t` moves forward while editing. Navigation preserves message order
-and saved drafts. Earlier messages may execute, but the
-message being edited and all later messages wait. `Ctrl-S` saves the edit in its
+and saved drafts. Leaving a message unchanged releases it, so only messages you
+changed and the one open in the composer stay held. Earlier messages may execute,
+but the first held message and all later messages wait. `Ctrl-S` saves the edit in its
 reserved position. Submitting an empty edit deletes that message. Finishing restores
 any unqueued draft that was in the composer before editing began.
 While editing, `Ctrl-Q` instead removes the selected message from the queue and keeps
 its edited text and attachments in the normal prompt. It does not submit automatically,
-so you can steer that text into the active response or submit it later. The upper bar
+so you can steer that text into the active response or submit it later. Because the
+prompt now holds that message, a nonempty unqueued draft from before editing, with its
+attachments, becomes the newest prompt-history entry, and a notice says so: press `Up`
+to recall it, and `Down` to return to the unqueued message. The upper bar
 shows the configured unqueue and queue-navigation shortcuts during editing.
 Messages still being submitted cannot be edited until the host acknowledges them.
 The same applies while a previous edit is removing the message from the queue.
-If delivery wins the race with an edit reservation, submitting or navigating the
-unavailable edit exits editing and keeps nonempty text as a normal draft. Submit
-again to send that draft; recovery never sends it automatically.
+If delivery wins the race with an edit reservation, editing ends as soon as Harness
+reports the delivery. Unchanged text was already sent, so the composer returns to the
+draft it held before editing. Text you already changed stays as a normal draft, with a
+notice; submit it to send it as a new message. Recovery never sends it automatically.
 
 Paste an absolute file path into the Harness composer to attach the file. Terminal
 drag-and-drop works when the terminal pastes the dropped paths. Quoted paths,
@@ -653,6 +767,11 @@ native file attachments. PDFs and other files sent to Codex or ACP are retained
 file references for the agent to inspect with tools, rather than native document
 inputs. Import errors keep the original path and report the failure. Finish pending
 imports before submitting. Attempts during import retain the draft and show a notice.
+Submit, queue, steer, and queue-editing keys first let any paste that preceded them in
+the terminal input land, so a path pasted and submitted in one burst waits for its
+import. If the draft changes in any other way before the key takes effect, such as by
+keys typed right after it in the same burst, Harness sends nothing, keeps the draft,
+and shows a notice.
 
 `/config` includes an **LSP** toggle under **Tools**. It enables the
 [LSP tools](lsp-tools.md) for code exploration and permission-checked symbol,
@@ -663,6 +782,11 @@ change interactive plan navigation.
 `/config` opens the current session's configuration. `:ForgeConfig` uses that same
 session when invoked from its transcript or composer; elsewhere it edits global
 defaults without creating or changing a session. New sessions inherit those defaults.
+Changes made on the **Permissions** tab of a session's `/config` apply only to that
+session, as `/write`, `/ask`, and the other permission commands do: access scopes, extra
+directories, sandbox settings, Mode, and both timeouts. The tab shows the session's
+effective values. A running session never follows a change another editor makes to the
+defaults; only sessions started afterwards begin from it.
 
 The picker opens five tabs: **Models**, **Workflow**, **Permissions**, **Tools**, and
 **System**. The window occupies the bottom 80% of the host at full width.

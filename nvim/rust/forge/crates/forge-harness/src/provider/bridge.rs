@@ -2235,6 +2235,74 @@ impl ProviderBridge {
         self.retire_owner(owner).await
     }
 
+    /// End the owner's native process or connection while keeping its host session routable.
+    ///
+    /// A stop whose native collection never returned calls this, and the provider restart that
+    /// follows retires the host session as usual: the binding is marked retired, so that close
+    /// skips the native close that could not finish. This takes no admission, retirement, or
+    /// invocation lock, because the stuck operation may hold any of them.
+    pub async fn session_terminate_native(
+        &self,
+        owner: &ThreadOwner,
+    ) -> Result<Option<BindingId>, ProviderError> {
+        let Some(host) = self.sessions.lock().await.get(owner).cloned() else {
+            return Ok(None);
+        };
+        host.closing
+            .store(true, std::sync::atomic::Ordering::Release);
+        host.open_operation.cancel();
+        let Some(bound) = host.initialized.get() else {
+            host.changed.notify_waiters();
+            return Ok(None);
+        };
+        bound
+            .retiring
+            .store(true, std::sync::atomic::Ordering::Release);
+        let context = OperationControl::fresh(ProviderOperation::ThreadClose)?.context();
+        self.native
+            .thread_terminate(context, &bound.binding.id)
+            .await?;
+        if let Ok(mut retired) = bound.retired.try_lock() {
+            *retired = true;
+        }
+        // The relay keeps running, so the terminal result the adapter reports for the ended
+        // turn still reaches the owner and settles it.
+        if let Ok(invocations) = host.invocations.try_lock() {
+            for invocation in invocations.values() {
+                invocation.cancel();
+            }
+        }
+        host.changed.notify_waiters();
+        Ok(Some(bound.binding.id.clone()))
+    }
+
+    /// Force-end the owner's native binding after its bounded close attempts failed.
+    ///
+    /// Terminates the native side as `session_terminate_native` does, then stops the relay and
+    /// forgets the owner without the collection a normal close awaits. The caller must hold the
+    /// owner's session exclusively, so no replacement binding exists yet.
+    pub async fn session_terminate_owner(&self, owner: &ThreadOwner) -> Result<(), ProviderError> {
+        let retired_binding = self.session_terminate_native(owner).await?;
+        let Some(host) = self.sessions.lock().await.remove(owner) else {
+            return Ok(());
+        };
+        if let Some(bound) = host.initialized.get() {
+            bound
+                .relay_stop
+                .send_replace(Some(bound.registrations.watermark()));
+            if let Ok(mut relay) = bound.relay.try_lock()
+                && let Some(task) = relay.take()
+            {
+                task.abort();
+            }
+        }
+        self.retired_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(owner.clone(), retired_binding);
+        Ok(())
+    }
+
     /// Collect all bindings and preserve every distinct cleanup failure.
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
         self.closed

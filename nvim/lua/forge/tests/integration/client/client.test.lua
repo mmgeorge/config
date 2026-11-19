@@ -47,6 +47,12 @@ T["publication_replay"] = function()
       owner_publication = { receipt_id = "page-" .. revision, high_water = high_water,
         after = state.publication_cursor, through = high_water, more = false, events = entries } }
   end
+  -- The transport replays a page's retained events when the response carrying it arrives, before
+  -- the caller adopts the snapshot, so each delivery takes both steps in that order.
+  local function deliver(target, result)
+    client.replay_publication(result)
+    return snapshot.apply(target, result)
+  end
   local ready = false
   client.host_start(function(_, error) assert(not error) ready = true end)
   wait_until(function() return ready end, "mock host did not finish starting")
@@ -58,21 +64,21 @@ T["publication_replay"] = function()
   local historical_error = event(4, "background_error", { error = "historical failure" })
   local initial_page = page(state, 1, 5, { historical_error })
   initial_page.owner_publication.more, initial_page.owner_publication.through = true, 4
-  assert(snapshot.apply(state, initial_page))
+  assert(deliver(state, initial_page))
   assert(#errors == 0 and #received == 0, "initial attachment replayed historical one-shot effects")
   assert(state.publication_cursor == 3, "consumption advanced the durable acknowledgement cursor")
   emit(event(6))
   wait_until(function() return #received == 1 end, "live publication 6 was not delivered")
-  assert(snapshot.apply(state, page(state, 2, 5, { event(5) })))
+  assert(deliver(state, page(state, 2, 5, { event(5) })))
   assert(#received == 1, "later initial page replayed history or hid a new live event")
   local completion = event(7, "command_completed", { id = "missed-command", revision = 1 })
-  assert(snapshot.apply(state, page(state, 3, 7, { event(6), completion })))
+  assert(deliver(state, page(state, 3, 7, { event(6), completion })))
   assert(#received == 2 and received[2].sequence == 7 and received[2].name == "command_completed",
     "live/page duplication or missed command completion recovery failed")
   emit(completion)
   emit(event(9))
   wait_until(function() return #received == 3 end, "live publication 9 was not delivered")
-  assert(snapshot.apply(state, page(state, 4, 9, { event(8), event(9) })))
+  assert(deliver(state, page(state, 4, 9, { event(8), event(9) })))
   assert(#received == 4 and received[4].sequence == 8, "out-of-order live event swallowed a missing publication")
   -- Runtime changes preserve the session-wide sequence; final canonical state wins over replay.
   local final_state_seen
@@ -84,19 +90,19 @@ T["publication_replay"] = function()
   end)
   local replacement = page(state, 1, 10, { event(9), event(10) })
   replacement.runtime_epoch, replacement.status = "replacement", { kind = "idle" }
-  assert(snapshot.apply(state, replacement))
+  assert(deliver(state, replacement))
   assert(#received == 5 and final_state_seen == "first" and state.status.kind == "idle"
     and state.runtime_epoch == "replacement", "runtime replay did not precede its final canonical snapshot")
   -- A host generation change starts a fresh baseline without historical notifications.
   client._client.generation = client._client.generation + 1
   emit = function(message) client._client.receiver.options.dispatch(message) end
-  assert(snapshot.apply(state, page(state, 2, 12, { event(11, "background_error", { error = "old host failure" }), event(12) })))
+  assert(deliver(state, page(state, 2, 12, { event(11, "background_error", { error = "old host failure" }), event(12) })))
   assert(#received == 5 and #errors == 0, "new host replayed historical notifications")
   emit(event(13))
   wait_until(function() return #received == 6 end, "replacement host publication 13 was not delivered")
   assert(received[6].sequence == 13)
   local other = { session = { id = "other" }, runtime_epoch = "other" }
-  assert(snapshot.apply(other, page(other, 1, 2, { event(2, nil, nil, "other") })))
+  assert(deliver(other, page(other, 1, 2, { event(2, nil, nil, "other") })))
   emit(event(3, nil, nil, "other"))
   wait_until(function() return #received == 7 end, "other session's publication 3 was not delivered")
   assert(received[7].session_id == "other", "sessions shared a publication sequence gate")

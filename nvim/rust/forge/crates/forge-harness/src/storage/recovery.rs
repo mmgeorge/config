@@ -57,92 +57,19 @@ impl SqliteStore {
                 .query_map([session_id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let primary_agent_id = crate::session::HarnessSession::primary_agent_id(session_id);
         for payload in exchange {
             let mut exchange: Exchange = serde_json::from_str(&payload)?;
-            let running_turn = exchange
-                .turn
-                .iter()
-                .any(|turn| turn.state() == TurnState::Running);
-            // Recover only observed execution time, excluding the offline interval.
-            let observed_at = exchange.completed_at_ms().unwrap_or_else(|| {
-                exchange.execution_started_at_ms().map_or_else(
-                    || {
-                        exchange.created_at_ms.saturating_add(
-                            exchange
-                                .duration_ms()
-                                .max(exchange.metrics.observed_elapsed_ms)
-                                .min(i64::MAX as u64) as i64,
-                        )
-                    },
-                    |started| {
-                        let active = exchange
-                            .metrics
-                            .observed_elapsed_ms
-                            .saturating_sub(exchange.duration_ms());
-                        started.saturating_add(active.min(i64::MAX as u64) as i64)
-                    },
-                )
-            });
-            let background_changed = exchange.interrupt_detached_background_tools(observed_at)?;
-            // No provider survives recovery, so no open exchange can still receive consumption
-            // evidence. Settling it here covers the branches that never reach `Exchange::finish`,
-            // including a finalizing exchange without a running turn.
-            let consumption_changed = matches!(
-                exchange.state(),
-                ExchangeState::Running | ExchangeState::Finalizing
-            ) && exchange.close_input_consumption();
-            if (exchange.awaiting_input()
-                && !running_turn
-                && exchange.execution_started_at_ms().is_none())
-                || !matches!(
-                    exchange.state(),
-                    ExchangeState::Running | ExchangeState::Queued | ExchangeState::Finalizing
-                )
-                || (exchange.state() == ExchangeState::Finalizing && !running_turn)
-            {
-                if background_changed || consumption_changed {
-                    transaction.execute(
-                        "UPDATE exchange_record SET payload=?2 WHERE id=?1",
-                        params![exchange.id, serde_json::to_string(&exchange)?],
-                    )?;
-                }
-                continue;
+            if interrupt_detached_exchange(
+                &mut exchange,
+                &primary_agent_id,
+                DetachedSettlement::AwaitCheckpoint,
+            )? {
+                transaction.execute(
+                    "UPDATE exchange_record SET payload=?2 WHERE id=?1",
+                    params![exchange.id, serde_json::to_string(&exchange)?],
+                )?;
             }
-            if exchange.state() == ExchangeState::Finalizing {
-                let outcome = match exchange.finalization_outcome() {
-                    Some(crate::exchange::ExchangeOutcome::Cancelled) => TurnOutcome::Interrupted,
-                    Some(crate::exchange::ExchangeOutcome::Failed) => TurnOutcome::Failed {
-                        error: forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::TurnStart,
-                            forge_provider_api::ProviderFailureKind::Unknown,
-                        )
-                        .at_phase(
-                            forge_provider_api::ProviderPhase::Observation,
-                            forge_provider_api::FailureDisposition::Uncertain,
-                        ),
-                        retry: forge_provider_api::turn::RetryDecision::NotAllowed,
-                    },
-                    _ => TurnOutcome::Interrupted,
-                };
-                for turn in &mut exchange.turn {
-                    if turn.state() == TurnState::Running {
-                        turn.finish(outcome, observed_at)?;
-                    }
-                }
-                if exchange.finalization_outcome()
-                    == Some(crate::exchange::ExchangeOutcome::Complete)
-                {
-                    exchange.phase = crate::exchange::ExchangePhase::Finalizing(
-                        crate::exchange::ExchangeOutcome::Interrupted,
-                    );
-                }
-            } else {
-                exchange.finish(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
-            }
-            transaction.execute(
-                "UPDATE exchange_record SET payload=?2 WHERE id=?1",
-                params![exchange.id, serde_json::to_string(&exchange)?],
-            )?;
         }
         let agent = {
             let mut statement =
@@ -238,4 +165,116 @@ impl SqliteStore {
         transaction.commit()?;
         self.refresh_admission_membership(session_id)
     }
+}
+
+/// Choose how far an exchange without a runtime owner is settled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DetachedSettlement {
+    /// Recovery leaves a baselined or finalizing exchange finalizing, because only the next
+    /// live owner can capture its closing checkpoint.
+    AwaitCheckpoint,
+    /// A preview, which captures nothing, shows the outcome that finalization will record.
+    Outcome,
+}
+
+/// Settle one exchange that no runtime owner can still drive, as recovery records it.
+///
+/// No provider survives the owner, so a running or finalizing exchange is interrupted at its
+/// last observed execution time, excluding the offline interval. Recovery persists the result;
+/// a session preview applies it in memory to a session that no live owner holds, so the preview
+/// shows the interrupted exchange that resuming will show. Returns whether the exchange changed.
+pub(crate) fn interrupt_detached_exchange(
+    exchange: &mut Exchange,
+    primary_agent_id: &str,
+    settlement: DetachedSettlement,
+) -> Result<bool> {
+    let running_turn = exchange
+        .turn
+        .iter()
+        .any(|turn| turn.state() == TurnState::Running);
+    // Recover only observed execution time, excluding the offline interval.
+    let observed_at = exchange.completed_at_ms().unwrap_or_else(|| {
+        exchange.execution_started_at_ms().map_or_else(
+            || {
+                exchange.created_at_ms.saturating_add(
+                    exchange
+                        .duration_ms()
+                        .max(exchange.metrics.observed_elapsed_ms)
+                        .min(i64::MAX as u64) as i64,
+                )
+            },
+            |started| {
+                let active = exchange
+                    .metrics
+                    .observed_elapsed_ms
+                    .saturating_sub(exchange.duration_ms());
+                started.saturating_add(active.min(i64::MAX as u64) as i64)
+            },
+        )
+    });
+    let background_changed = exchange.interrupt_detached_background_tools(observed_at)?;
+    // No provider survives recovery, so no open exchange can still receive consumption
+    // evidence. Settling it here covers the branches that never reach `Exchange::finish`,
+    // including a finalizing exchange without a running turn.
+    let consumption_changed = matches!(
+        exchange.state(),
+        ExchangeState::Running | ExchangeState::Finalizing
+    ) && exchange.close_input_consumption();
+    if (exchange.awaiting_input() && !running_turn && exchange.execution_started_at_ms().is_none())
+        || !matches!(
+            exchange.state(),
+            ExchangeState::Running | ExchangeState::Queued | ExchangeState::Finalizing
+        )
+        || (exchange.state() == ExchangeState::Finalizing && !running_turn)
+    {
+        return Ok(background_changed || consumption_changed);
+    }
+    if exchange.state() == ExchangeState::Finalizing {
+        let outcome = match exchange.finalization_outcome() {
+            Some(crate::exchange::ExchangeOutcome::Cancelled) => TurnOutcome::Interrupted,
+            Some(crate::exchange::ExchangeOutcome::Failed) => TurnOutcome::Failed {
+                error: forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::TurnStart,
+                    forge_provider_api::ProviderFailureKind::Unknown,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                ),
+                retry: forge_provider_api::turn::RetryDecision::NotAllowed,
+            },
+            _ => TurnOutcome::Interrupted,
+        };
+        for turn in &mut exchange.turn {
+            if turn.state() == TurnState::Running {
+                turn.finish(outcome, observed_at)?;
+            }
+        }
+        if exchange.finalization_outcome() == Some(crate::exchange::ExchangeOutcome::Complete) {
+            exchange.phase = crate::exchange::ExchangePhase::Finalizing(
+                crate::exchange::ExchangeOutcome::Interrupted,
+            );
+        }
+        if settlement == DetachedSettlement::Outcome
+            && let Some(outcome) = exchange.finalization_outcome()
+        {
+            exchange.finish(outcome, observed_at)?;
+        }
+    } else if exchange.state() == ExchangeState::Running
+        && exchange.checkpoint_before.is_some()
+        && exchange.agent_id == primary_agent_id
+        && settlement == DetachedSettlement::AwaitCheckpoint
+    {
+        // A captured baseline obliges a closing checkpoint, which only a live owner can
+        // capture. The exchange therefore stays finalizing as interrupted, and session
+        // start retries that finalization. Finalization settles primary exchanges only,
+        // so a child exchange finishes here.
+        exchange
+            .settle_running_turns(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
+        exchange.begin_finalization(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
+        exchange.collection = None;
+    } else {
+        exchange.finish(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
+    }
+    Ok(true)
 }

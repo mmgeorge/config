@@ -39,6 +39,8 @@ local register_attachment = {}
 ---@field objects table[]
 ---@field undo table<integer, ForgeAttachmentSelection[]>
 ---@field undo_sequence? integer
+---@field paste_start_tick? integer Buffer change tick before the latest bracketed paste began.
+---@field paste_end_tick? integer Buffer change tick after the latest bracketed paste ended.
 
 ---@param buffer integer
 ---@param mark integer
@@ -155,6 +157,9 @@ local function pump(owner)
         vim.api.nvim_buf_set_text(owner.buffer, first[1], first[2], last[1], last[2], { result.label })
         bind(owner, result, first[1], first[2])
         M.capture(owner.buffer, true)
+        -- This callback moves no cursor itself, so Neovim keeps the statusline's cursor column
+        -- of the longer pasted text until another redraw.
+        vim.api.nvim__redraw({ buf = owner.buffer, statusline = true })
       end
     end
     release(owner, item)
@@ -327,6 +332,10 @@ local function install_paste()
     if phase == -1 or phase == 1 then
       paste_owner = owner_by_buffer[vim.api.nvim_get_current_buf()]
       if vim.fn.getcmdtype() ~= "" then paste_owner = nil end
+      if paste_owner then
+        paste_owner.paste_start_tick = vim.api.nvim_buf_get_changedtick(paste_owner.buffer)
+        paste_owner.paste_end_tick = nil
+      end
     end
     local accepted = previous(lines, phase)
     if phase == -1 or phase == 3 then
@@ -335,6 +344,9 @@ local function install_paste()
       if accepted and owner and vim.api.nvim_get_current_buf() == owner.buffer then
         local ok, failure = pcall(import_paste, owner)
         if not ok then notifications.error(tostring(failure), "Harness attachment") end
+      end
+      if owner and vim.api.nvim_buf_is_valid(owner.buffer) then
+        owner.paste_end_tick = vim.api.nvim_buf_get_changedtick(owner.buffer)
       end
     end
     return accepted
@@ -346,6 +358,27 @@ end
 function M.pending(buffer)
   local owner = owner_by_buffer[buffer]
   return owner ~= nil and (owner.active ~= nil or owner.queue[owner.head] ~= nil)
+end
+
+---Observe how the draft changes from this moment on.
+---
+---The returned function reports `"none"` while the buffer is unchanged, `"paste"` when one
+---complete bracketed paste is the only change, and `"edited"` for any other change, including a
+---paste still in progress.
+---@param buffer integer
+---@return fun(): "none"|"paste"|"edited"
+function M.observe_changes(buffer)
+  local observed_tick = vim.api.nvim_buf_get_changedtick(buffer)
+  return function()
+    if not vim.api.nvim_buf_is_valid(buffer) then return "edited" end
+    local current_tick = vim.api.nvim_buf_get_changedtick(buffer)
+    if current_tick == observed_tick then return "none" end
+    local owner = owner_by_buffer[buffer]
+    if owner and owner.paste_start_tick == observed_tick and owner.paste_end_tick == current_tick then
+      return "paste"
+    end
+    return "edited"
+  end
 end
 
 ---@param buffer integer

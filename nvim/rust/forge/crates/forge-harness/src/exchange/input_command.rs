@@ -52,6 +52,7 @@ impl InputCommandRun {
             | InputCommand::BeginEdit(_)
             | InputCommand::CommitEdit(_)
             | InputCommand::CancelEdit(_)
+            | InputCommand::ReleaseInput(_)
             | InputCommand::Remove(_) => InputStage::Ready(Ok(PreparedInput::Ordinary)),
         };
         Self { command, stage }

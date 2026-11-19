@@ -196,7 +196,7 @@ pub(in crate::broker) fn repository() -> tempfile::TempDir {
 /// tests that exercise checkpoints, rollback, or workspace changes. Under nextest the
 /// `fixture-root` setup script builds this repository once per run and exports its path, so each
 /// test copies it instead of launching Git. Other runners build it directly.
-pub(in crate::broker) fn git_repository() -> tempfile::TempDir {
+pub(crate) fn git_repository() -> tempfile::TempDir {
     let temporary = tempfile::tempdir().unwrap();
     if let Some(template) = std::env::var_os("FORGE_TEST_GIT_TEMPLATE") {
         copy_directory_tree(Path::new(&template), temporary.path());
@@ -274,6 +274,35 @@ pub(in crate::broker) fn planning_question_broker(
     .unwrap();
     broker.provider = plan_fixture_provider(&broker, PlanFixtureBehavior::Questions { structured });
     broker
+}
+
+/// Save the record a stopped host leaves behind: a primary exchange over a freshly captured
+/// workspace baseline whose provider turn never finished.
+pub(crate) async fn save_host_interrupted_exchange(
+    broker: &mut HarnessBroker,
+    id: &str,
+) -> Exchange {
+    let baseline = broker
+        .checkpoint
+        .as_ref()
+        .expect("the fixture workspace is a Git repository")
+        .capture(
+            &broker.store.objects,
+            &broker.repositories,
+            &broker.session.id,
+            1,
+        )
+        .await
+        .unwrap();
+    broker.store.save_checkpoint(&baseline).unwrap();
+    let mut exchange = super::completed_interaction(id, &broker.session.id, Vec::new());
+    exchange.phase = crate::exchange::ExchangePhase::Running;
+    exchange.checkpoint_before = Some(baseline.id);
+    exchange.resume(50).unwrap();
+    let address = crate::turn::test_support::address(&exchange, "turn");
+    exchange.start_turn(address, 60).unwrap();
+    broker.store.save_exchange(&exchange).unwrap();
+    exchange
 }
 
 /// Commit one child admission and its durable parent reference.

@@ -67,7 +67,7 @@ struct Fixture {
     peer: test_peer::SdkPeer,
     callbacks: Arc<Callbacks>,
     tasks: Arc<std::sync::Mutex<Vec<Value>>>,
-    _events: forge_provider_api::events::ProviderEventStream,
+    events: forge_provider_api::events::ProviderEventStream,
 }
 
 impl Fixture {
@@ -153,19 +153,24 @@ impl Fixture {
                 }
                 "session.permissions.handlePendingPermissionRequest" => {
                     let pending = pending.take().unwrap();
-                    let allowed = request["params"]["result"]["kind"] == "approve-once";
-                    if allowed {
+                    let decision = &request["params"]["result"];
+                    let outcome = if decision["kind"] == "approve-once" {
                         tasks.push(json!({"id":pending["params"]["arguments"]["shellId"],"type":"shell","status":"running","attachmentMode":"attached","executionMode":"background","command":"fixture command"}));
-                    }
+                        json!({"textResultForLlm":"permission outcome","resultType":"success"})
+                    } else {
+                        native_rejection(decision["feedback"].as_str())
+                    };
                     return vec![
                         test_peer::response(request, json!({})),
-                        test_peer::response(
-                            &pending,
-                            json!({"textResultForLlm":"permission outcome","resultType":if allowed {"success"} else {"failure"}}),
-                        ),
+                        test_peer::response(&pending, outcome),
                     ];
                 }
                 "session.tasks.list" => json!({"tasks":*tasks}),
+                // No process has this id, so the captured command tree is empty and the fixture
+                // observes only the request order.
+                "session.tasks.getProgress" => {
+                    json!({"progress":{"type":"shell","pid":u32::MAX - 1,"recentOutput":""}})
+                }
                 "session.tasks.cancel" => {
                     tasks.retain(|task| task["id"] != request["params"]["id"]);
                     json!({"cancelled":true})
@@ -202,8 +207,43 @@ impl Fixture {
             peer,
             callbacks,
             tasks,
-            _events: events,
+            events,
         }
+    }
+
+    /// Read the next combined inventory the shell owner published on its binding stream.
+    async fn next_inventory(&mut self) -> TerminalInventory {
+        loop {
+            let observation = self
+                .events
+                .recv()
+                .await
+                .unwrap()
+                .expect("the binding stream stays open while its shell owner lives");
+            if let forge_provider_api::ProviderEvent::Thread {
+                event: forge_provider_api::ThreadEvent::TerminalsUpdated(Ok(inventory)),
+                ..
+            } = observation.event
+            {
+                return inventory;
+            }
+        }
+    }
+
+    /// Start a launch whose default foreground wait stays owned by the calling invocation.
+    fn launch_foreground(
+        &self,
+    ) -> tokio::task::JoinHandle<Result<NativeToolResult, ProviderError>> {
+        let shell = self.shell.clone();
+        tokio::spawn(async move {
+            shell
+                .execute(
+                    "outer-call",
+                    command_tool(),
+                    json!({"command":"fixture command","description":"fixture","initial_wait":30}),
+                )
+                .await
+        })
     }
 
     /// Collect private history before releasing the native transport.
@@ -211,6 +251,24 @@ impl Fixture {
         self.shell.close().await.unwrap();
         self.client.stop().await.unwrap();
         self.peer.collected().await
+    }
+}
+
+/// Answer a rejected shell permission as Copilot runtime 1.0.103 does.
+///
+/// Its recorded `tool.execution_complete` events report a rejection that carries feedback as
+/// code `denied` with "The user rejected this tool call. User feedback: <feedback>", and one
+/// without feedback as code `rejected` with "The user rejected this tool call.".
+fn native_rejection(feedback: Option<&str>) -> Value {
+    match feedback {
+        Some(feedback) => {
+            let text = format!("The user rejected this tool call. User feedback: {feedback}");
+            json!({"textResultForLlm":text,"resultType":"denied","error":text})
+        }
+        None => json!({
+            "textResultForLlm":"The user rejected this tool call.","resultType":"rejected",
+            "error":"The user rejected this tool call."
+        }),
     }
 }
 
@@ -304,7 +362,14 @@ async fn paused_shell_routes_exact_permission_and_denial() {
             )
             .await
             .unwrap();
-        assert_eq!(result.result_type == NativeOutcome::Success, allowed);
+        assert!(
+            result.result_type
+                == if allowed {
+                    NativeOutcome::Success
+                } else {
+                    NativeOutcome::Denied
+                }
+        );
         {
             let permissions = fixture.callbacks.permissions.lock().unwrap();
             assert_eq!(permissions.len(), 1);
@@ -314,6 +379,56 @@ async fn paused_shell_routes_exact_permission_and_denial() {
                 matches!(&permissions[0].1.target_list[..], [PermissionTarget::Command { command, .. }] if command == "fixture command")
             );
         }
+        fixture.finish().await;
+    }
+}
+
+/// Keep the session's shell usable after a rejection, and hand the model the denial reason.
+///
+/// A denied, expired, or cancelled approval returns a native `denied` or `rejected` result.
+/// Each must reach the model as that kind with its text, and the next launch must reach
+/// native permission again instead of failing before it.
+#[tokio::test]
+async fn rejected_launch_keeps_later_launches_available() {
+    let reason = "Tool call rejected. Reason: Rejected by the user.";
+    for (decision, kind) in [
+        (
+            PermissionResponse::Deny {
+                reason: Some(reason.into()),
+            },
+            "denied",
+        ),
+        (PermissionResponse::Cancelled, "rejected"),
+    ] {
+        let fixture = Fixture::new(decision, false, true).await;
+        let launch = || {
+            fixture.shell.execute(
+                "outer-call",
+                command_tool(),
+                json!({"command":"fixture command","description":"fixture","mode":"async"}),
+            )
+        };
+        let rejected = launch().await.unwrap();
+        let delivered = serde_json::to_value(rejected.into_sdk()).unwrap();
+        assert_eq!(delivered["resultType"], kind);
+        let text = delivered["textResultForLlm"].as_str().unwrap();
+        assert!(
+            text.starts_with("The user rejected this tool call."),
+            "{text}"
+        );
+        if kind == "denied" {
+            assert!(
+                text.ends_with(reason),
+                "the model must receive the denial reason: {text}"
+            );
+        }
+        assert_eq!(delivered["error"], delivered["textResultForLlm"]);
+        launch().await.unwrap();
+        assert_eq!(
+            fixture.callbacks.permissions.lock().unwrap().len(),
+            2,
+            "the launch after a rejection must reach native permission"
+        );
         fixture.finish().await;
     }
 }
@@ -350,11 +465,72 @@ async fn paused_shell_cancel_during_permission_rejects_late_approval() {
     fixture.callbacks.cancelled.store(true, Ordering::SeqCst);
     fixture.callbacks.release_permission.send_replace(true);
     let result = call.await.unwrap().unwrap();
-    assert!(result.result_type == NativeOutcome::Failure);
+    assert!(result.result_type == NativeOutcome::Rejected);
     let requests = fixture.finish().await;
     let decision = requests
         .iter()
         .find(|request| request["method"] == "session.permissions.handlePendingPermissionRequest")
         .unwrap();
     assert_eq!(decision["params"]["result"]["kind"], "reject");
+}
+
+/// Stop the native task of a launch whose foreground wait the interrupted turn still owns.
+#[tokio::test]
+async fn interrupted_foreground_launch_cancels_its_native_task() {
+    // The woken launch can run before or after its invocation's callback authority is revoked.
+    for authority_revoked in [true, false] {
+        let mut fixture = Fixture::new(PermissionResponse::Allow, false, false).await;
+        let call = fixture.launch_foreground();
+        assert_eq!(fixture.next_inventory().await.terminal.len(), 1);
+        fixture
+            .callbacks
+            .cancelled
+            .store(authority_revoked, Ordering::SeqCst);
+        fixture.shell.cancel_waits();
+        assert!(matches!(call.await.unwrap(), Err(ProviderError::Cancelled)));
+        assert!(
+            fixture.tasks.lock().unwrap().is_empty(),
+            "an interrupted foreground launch must not keep its native task running"
+        );
+        assert!(fixture.next_inventory().await.terminal.is_empty());
+        fixture.shell.settle_revoked_launches().await;
+        let requests = fixture.finish().await;
+        assert!(
+            !requests.iter().any(|request| {
+                request["method"] == "session.tools.execute"
+                    && request["params"]["name"] == command_tool().read_name()
+            }),
+            "an interrupted launch must not read output for the stopped model turn"
+        );
+        // The wrapper's process id is read while the wrapper runs, before cancellation stops it.
+        let position = |method: &str| {
+            requests
+                .iter()
+                .position(|request| request["method"] == method)
+                .unwrap_or_else(|| panic!("the interrupted launch never sent {method}"))
+        };
+        assert!(position("session.tasks.getProgress") < position("session.tasks.cancel"));
+    }
+}
+
+/// Keep a command running when steering only releases its foreground wait.
+#[tokio::test]
+async fn steering_wake_keeps_foreground_launch_running() {
+    let mut fixture = Fixture::new(PermissionResponse::Allow, false, false).await;
+    let call = fixture.launch_foreground();
+    assert_eq!(fixture.next_inventory().await.terminal.len(), 1);
+    fixture.shell.interrupt_waits();
+    assert!(matches!(
+        call.await.unwrap(),
+        Ok(output) if output.result_type == NativeOutcome::Success
+    ));
+    assert_eq!(fixture.tasks.lock().unwrap().len(), 1);
+    assert_eq!(fixture.shell.snapshot().await.unwrap().terminal.len(), 1);
+    let requests = fixture.finish().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request["method"] == "session.tasks.getProgress"),
+        "steering must leave the running command's processes alone"
+    );
 }

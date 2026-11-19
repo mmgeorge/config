@@ -28,6 +28,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+/// How long a `get_context_usage` answer may take before the adapter goes without it.
+///
+/// The CLI answers from local state in milliseconds when healthy. The figure is a status-line
+/// decoration and the instruction sources are optional rows, so a few seconds is generous, and
+/// a turn never waits longer than that for either after the CLI has ended it.
+const CONTEXT_USAGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Record the session ids this provider minted under which the CLI has run no turn.
 ///
 /// Harness learns a session id when the session opens and resumes it after every provider
@@ -233,15 +240,47 @@ impl ClaudeConversation {
         .map(|_| ())
     }
 
-    /// Read the conversation's context-window usage.
-    pub(crate) async fn context_usage(&self) -> Option<forge_provider_api::context::ContextUsage> {
-        let usage = self
-            .request(
-                ProviderOperation::TurnStart,
-                OutboundControl::GetContextUsage {},
-            )
-            .await
-            .ok()?;
+    /// Ask the CLI for its context accounting, giving up when `cancellation` fires or the answer
+    /// outlives `CONTEXT_USAGE_DEADLINE`.
+    ///
+    /// Both readers of `get_context_usage` treat the answer as optional: the window figure only
+    /// decorates the status line, and missing instruction sources only omit initial read rows.
+    /// The CLI computes the answer itself and has once left it unanswered for ten minutes after
+    /// a turn's `result`, which held the finished turn, and every interrupt of it, until the
+    /// answer came. An abandoned request leaves its waiter registered, and the late answer then
+    /// finds no receiver.
+    async fn context_accounting(&self, cancellation: &CancellationToken) -> Option<Value> {
+        let request = self.request(
+            ProviderOperation::TurnStart,
+            OutboundControl::GetContextUsage {},
+        );
+        let answer = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return None,
+            answer = tokio::time::timeout(CONTEXT_USAGE_DEADLINE, request) => answer,
+        };
+        match answer {
+            Ok(Ok(usage)) => Some(usage),
+            Ok(Err(error)) => {
+                tracing::warn!(?error, "Claude context usage unavailable");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    deadline_ms = CONTEXT_USAGE_DEADLINE.as_millis() as u64,
+                    "Claude context usage did not arrive before its deadline"
+                );
+                None
+            }
+        }
+    }
+
+    /// Read the conversation's context-window usage, or nothing when the CLI does not answer.
+    pub(crate) async fn context_usage(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<forge_provider_api::context::ContextUsage> {
+        let usage = self.context_accounting(cancellation).await?;
         let used = usage["totalTokens"].as_u64()?;
         let size = usage["maxTokens"].as_u64()?;
         forge_provider_api::context::ContextUsage::reported(used, size)
@@ -252,15 +291,16 @@ impl ClaudeConversation {
         self.options.read().await.workspace.clone()
     }
 
-    /// Query files already included before SDK instruction callbacks could be registered.
-    pub(crate) async fn instruction_sources(&self) -> Result<Vec<String>, ProviderError> {
-        let usage = self
-            .request(
-                ProviderOperation::TurnStart,
-                OutboundControl::GetContextUsage {},
-            )
-            .await?;
-        Ok(usage
+    /// Query files already included before SDK instruction callbacks could be registered, or
+    /// none when the CLI does not answer.
+    pub(crate) async fn instruction_sources(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Vec<String> {
+        let Some(usage) = self.context_accounting(cancellation).await else {
+            return Vec::new();
+        };
+        usage
             .get("memoryFiles")
             .and_then(serde_json::Value::as_array)
             .into_iter()
@@ -270,7 +310,7 @@ impl ClaudeConversation {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             })
-            .collect())
+            .collect()
     }
 
     /// Apply the model, effort, and permission mode of the next turn.

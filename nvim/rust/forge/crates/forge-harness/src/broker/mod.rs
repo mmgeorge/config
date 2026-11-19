@@ -206,13 +206,15 @@ fn agent_summaries(
     }).collect()
 }
 
+/// Render the final rows of a session's most recent timeline entries for the session picker.
 fn preview_lines(timeline: &[TimelineEntry], now_ms: i64) -> Result<Vec<String>> {
     let mut display = crate::buffer::identity::DisplayRegistry::default();
     let width = forge_buffer::width::WidthProfile {
         columns: 100,
         ..Default::default()
     };
-    let mut lines = Vec::new();
+    // A preview shows where the session stopped, so later rows displace earlier ones.
+    let mut lines = std::collections::VecDeque::new();
     for (index, entry) in timeline.iter().rev().take(20).rev().enumerate() {
         let projected = crate::buffer::projection::project(
             entry,
@@ -225,14 +227,14 @@ fn preview_lines(timeline: &[TimelineEntry], now_ms: i64) -> Result<Vec<String>>
         )?;
         for block in crate::buffer::sections::preview(projected.entry)?.block {
             for row in block.text.wire_rows() {
-                if lines.len() >= 200 {
-                    return Ok(lines);
+                if lines.len() == 200 {
+                    lines.pop_front();
                 }
-                lines.push(row.chars().take(1000).collect());
+                lines.push_back(row.chars().take(1000).collect());
             }
         }
     }
-    Ok(lines)
+    Ok(lines.into())
 }
 
 /// Represents the complete client-visible state for one active session.
@@ -1802,6 +1804,31 @@ pub(crate) enum ProviderAttempt {
     },
 }
 
+/// Signature shared by the exchange methods that record accepted typed input.
+type AcceptedInputAppend = fn(
+    &mut Exchange,
+    &crate::provider::InvocationScope,
+    Option<String>,
+    Option<forge_provider_api::SubmissionId>,
+    crate::exchange::InputIntent,
+    String,
+    i64,
+) -> Result<crate::exchange::ExchangeInput>;
+
+/// Choose how an accepted input joins its exchange from how it reached the provider.
+///
+/// Steering waits for the provider's report that the model read it. A continuation's prompt is
+/// read when its turn starts, so its acceptance records it consumed.
+fn accepted_input_append(
+    delivery: crate::provider::session_execution::AcceptedInputDelivery,
+) -> AcceptedInputAppend {
+    use crate::provider::session_execution::AcceptedInputDelivery;
+    match delivery {
+        AcceptedInputDelivery::Steering => Exchange::append_acknowledged_input,
+        AcceptedInputDelivery::TurnPrompt => Exchange::append_dispatched_input,
+    }
+}
+
 pub(crate) struct ProviderSubmission {
     request: ProviderRequest,
     engine: Arc<crate::provider::session_execution::SessionExecution>,
@@ -2242,6 +2269,12 @@ pub fn request_failure_code(error: &anyhow::Error) -> &'static str {
         "tool_timeout"
     } else if error.is::<SessionNotFound>() {
         "session_not_found"
+    } else if matches!(
+        error.downcast_ref::<crate::exchange::provider_lifecycle::ProviderLifecycleFailure>(),
+        Some(crate::exchange::provider_lifecycle::ProviderLifecycleFailure::SessionUnavailable(_))
+    ) {
+        // The same code a command rejected by a failed owner carries.
+        "session_unavailable"
     } else {
         "request_failed"
     }
@@ -2337,7 +2370,8 @@ pub struct HarnessBroker {
     permission_coordinator: Arc<PermissionCoordinator>,
     pub(crate) trace: Arc<TraceStore>,
     event_sink: Option<publication::SessionUpdateSink>,
-    clock: Box<dyn Clock>,
+    /// Shared with the session presentation, which renders running elapsed labels from it.
+    clock: Arc<dyn Clock>,
     exchange_runtime: Option<ExchangeRuntime>,
     host_settlement: host_settlement::HostSettlementFence,
     pending_host_settlement: Option<Arc<crate::provider::session_execution::SettlementCell>>,
@@ -2446,6 +2480,9 @@ impl HarnessBroker {
         runtime: Arc<BrokerRuntime>,
         clock: Box<dyn Clock>,
     ) -> Result<Self> {
+        // One clock measures both the exchange's pauses and the labels the presentation renders,
+        // so a label can never be measured on a different timeline than the duration it shows.
+        let clock: Arc<dyn Clock> = Arc::from(clock);
         let startup_started = std::time::Instant::now();
         let mut startup_timing = std::collections::BTreeMap::new();
         let data_root = PathBuf::from(&request.data_root);
@@ -2705,8 +2742,9 @@ impl HarnessBroker {
         );
         agent_provider_factory.profiles = runtime.profiles.clone();
         agent_coordinator.set_profiles(agent_provider_factory.profiles.clone());
-        let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
+        let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::with_clock(
             session.id.clone(),
+            Arc::clone(&clock),
         )));
         let check_runner = crate::checks::CheckSupervisor::open(
             crate::checks::CheckSupervisorContext {
@@ -5452,8 +5490,18 @@ impl HarnessBroker {
                 self.store.save_plan(plan)?;
             }
         }
+        // A usage report measures the native context rather than the retracted prompt, so one
+        // received during this turn supersedes the figure saved before the prompt. It predates
+        // the history truncation, so it cannot authorize maintenance until a later report.
+        let reported_usage = self
+            .context_usage_fresh
+            .then(|| self.session.context_usage.clone());
         self.session = snapshot.session;
         self.session.active_task = current;
+        if let Some(reported_usage) = reported_usage {
+            self.session.context_usage = reported_usage;
+            self.context_usage_fresh = false;
+        }
         self.save_session()?;
         Ok(())
     }
@@ -6716,6 +6764,47 @@ impl HarnessBroker {
                 json!({"id":exchange.id,"state":exchange.state()}),
             )?],
         ))
+    }
+
+    /// Finish every exchange that recovery left finalizing before the session is published.
+    ///
+    /// Recovery runs inside a storage transaction and cannot capture a workspace checkpoint, so
+    /// an exchange interrupted by host loss reaches session start still finalizing. No provider
+    /// work remains, and the ordinary finalization retry captures its closing checkpoint here.
+    /// Without this step the restored transcript shows the exchange saving until the next
+    /// prompt. A failed capture stays on the exchange as its finalization error, where
+    /// cancellation and the next prompt retry it, so the session still starts.
+    pub(crate) async fn settle_recovered_finalization(&mut self) {
+        let mut settled = false;
+        let mut previous = None;
+        let result: Result<()> = async {
+            while let Some(exchange) = self
+                .store
+                .exchange_in_state(&self.session.id, ExchangeState::Finalizing)?
+            {
+                anyhow::ensure!(
+                    previous.as_ref() != Some(&exchange.id),
+                    "recovered exchange {} remained finalizing",
+                    exchange.id
+                );
+                self.retry_finalization().await?;
+                settled = true;
+                previous = Some(exchange.id);
+            }
+            Ok(())
+        }
+        .await;
+        // The presentation was built from the recovered records before this capture.
+        let result = result.and(if settled {
+            self.reconcile_timeline().map(|_| ())
+        } else {
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(target: "forge::harness",
+                event_name = "exchange.recovered_finalization.failed",
+                session_id = %self.session.id, error = %format_args!("{error:#}"));
+        }
     }
 
     async fn capture_final_checkpoint(
@@ -8911,7 +9000,11 @@ impl HarnessBroker {
                     &displayed,
                 )?);
             }
-            InputPresentation::Message { turn, text } => {
+            InputPresentation::Message {
+                turn,
+                text,
+                delivery,
+            } => {
                 let content =
                     crate::question::input_content(turn, text, &self.questions.snapshot()?)?;
                 let (intent, text) = content.exchange_input();
@@ -8924,7 +9017,8 @@ impl HarnessBroker {
                 // The wait ends when the input reaches the provider, before the model reads it.
                 interaction.observe_blocker("agent_wait".into(), false, now_ms);
                 runtime.active_wait = None;
-                let prompt = interaction.append_acknowledged_input(
+                let prompt = accepted_input_append(*delivery)(
+                    interaction,
                     scope,
                     input_id.clone(),
                     Some(receipt.receipt_id().clone()),
@@ -8978,12 +9072,16 @@ impl HarnessBroker {
             .unwrap_or_else(|| receipt.receipt_id().as_str().to_owned());
         let now_ms = self.clock.now_ms();
         match presentation {
-            InputPresentation::Message { turn, text } => {
+            InputPresentation::Message {
+                turn,
+                text,
+                delivery,
+            } => {
                 let content =
                     crate::question::input_content(turn, text, &self.questions.snapshot()?)?;
                 let (intent, text) = content.exchange_input();
                 if !interaction.node_list.iter().any(|node| matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == id)) {
-                    interaction.append_acknowledged_input(scope, Some(id), Some(receipt.receipt_id().clone()), intent, text, now_ms)?;
+                    accepted_input_append(*delivery)(interaction, scope, Some(id), Some(receipt.receipt_id().clone()), intent, text, now_ms)?;
                 }
             }
             InputPresentation::TaskStarted { start, prompt } => {
@@ -9512,6 +9610,33 @@ impl HarnessBroker {
             )
     }
 
+    /// Stop `exchange`'s clock and show the stopped clock in one presentation critical section.
+    ///
+    /// The presentation renders running elapsed labels from its last snapshot and the shared
+    /// clock while it holds its lock. A pause measured outside that lock lets a refresh between
+    /// the measurement and the paused snapshot extend a label past the duration the exchange
+    /// keeps, and the settled heading then reads lower than one the editor already showed.
+    /// Measuring under the lock orders every refresh before the pause instant, where its label
+    /// cannot exceed the kept duration, or after the paused snapshot, which no longer ticks.
+    pub(crate) fn present_clock_stop(
+        &mut self,
+        exchange: &mut Exchange,
+        stop: impl FnOnce(&mut Exchange, i64),
+    ) -> Result<TimelinePatch> {
+        let presentation = Arc::clone(&self.presentation);
+        let mut presentation = presentation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?;
+        stop(exchange, self.clock.now_ms());
+        let status = self.live_interaction_status(Some(exchange))?;
+        presentation.update_live(
+            Some(exchange),
+            None,
+            status,
+            self.observer.status_thoughts.load(Ordering::Relaxed),
+        )
+    }
+
     fn live_interaction_status(
         &self,
         interaction: Option<&Exchange>,
@@ -9541,7 +9666,7 @@ impl HarnessBroker {
                 _ => {}
             }
         }
-        Ok(status)
+        self.observer.hand_off_phase(status)
     }
 
     #[cfg(test)]
@@ -9624,17 +9749,23 @@ impl HarnessBroker {
         }
         let event = Vec::new();
         let mut effects = Vec::new();
-        if let Some(previous) = current.latest.as_ref()
-            && previous.state == ExchangeState::Running
-        {
+        let mut metrics = crate::exchange::ExchangeMetrics::default();
+        if let Some(latest) = current.latest.as_ref() {
             let mut previous = self
                 .store
-                .load_exchange(&previous.id)?
-                .context("previous running exchange disappeared")?;
-            self.close_superseded_exchange(&mut previous, now_ms)?;
-            effects.push(
-                self.prepare_live_interaction(publication::LiveUpdate::StateChanged, &previous)?,
-            );
+                .load_exchange(&latest.id)?
+                .context("previous exchange disappeared")?;
+            // The provider can repeat a thread's cumulative token total into the next turn.
+            metrics = crate::exchange::ExchangeMetrics::following(&previous.metrics);
+            if latest.state == ExchangeState::Running {
+                self.close_superseded_exchange(&mut previous, now_ms)?;
+                effects.push(
+                    self.prepare_live_interaction(
+                        publication::LiveUpdate::StateChanged,
+                        &previous,
+                    )?,
+                );
+            }
         }
         Ok((
             Exchange {
@@ -9660,6 +9791,7 @@ impl HarnessBroker {
                 attributed_matches_checkpoint: false,
                 provider_checkpoint_id: None,
                 approval_resolution: Vec::new(),
+                tool_timeout: Vec::new(),
                 host_file_changes: Vec::new(),
                 check_setup: None,
                 turn: Vec::new(),
@@ -9667,7 +9799,7 @@ impl HarnessBroker {
                 tool_counter: Default::default(),
                 entry: Vec::new(),
                 node_list: Vec::new(),
-                metrics: crate::exchange::ExchangeMetrics::default(),
+                metrics,
                 comment: Vec::new(),
                 checklist: None,
                 closed_input_consumption: Vec::new(),
@@ -10557,6 +10689,7 @@ impl HarnessBroker {
         self.session = session;
         self.agent_registry = load_agent_registry(&self.store, &self.session.id)?;
         self.child_exchange_runtime_by_agent.clear();
+        self.settle_recovered_finalization().await;
         self.capability.native_fork = self.session.native_fork;
         self.capability.native_compact = self.session.native_compact;
         self.capability = self.provider.descriptor().capability;
@@ -11382,4 +11515,4 @@ fn parent_message(text: String) -> forge_provider_api::forge::AgentMessage {
 pub use forge_provider_api::error::TurnCancelled;
 
 #[cfg(test)]
-mod test;
+pub(crate) mod test;

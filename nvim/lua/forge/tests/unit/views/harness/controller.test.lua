@@ -641,6 +641,29 @@ T["task_command_clears_composer_before_reply"] = function()
   eq(buffer.text(state.composer_buf), "newer draft")
 end
 
+-- Enter submits the composer rather than accepting a completion, so every submission closes the
+-- menu; a rejected bare `/read` kept its text and left the menu open with `/read full` ghost text.
+T["rejected_command_closes_the_completion_menu"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  controller.render, controller.refresh_winbar = function() end, function() end
+  state.session = { id = "rejected-command", model = "test" }
+  state.host_error, state.execution_notice = nil, nil
+  state.queue, state.pending_steer, state.capability = {}, {}, {}
+  state.composer_buf = buffer.scratch()
+  vim.api.nvim_win_set_buf(0, state.composer_buf)
+  local failures = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  mock_client.record()
+  local hidden = 0
+  package.loaded["blink.cmp"] = { hide = function() hidden = hidden + 1 end }
+  MiniTest.finally(function() package.loaded["blink.cmp"] = nil end)
+  buffer.set(state.composer_buf, { "/read" })
+  controller.submit()
+  eq(#failures, 1)
+  eq(buffer.text(state.composer_buf), "/read")
+  eq(hidden, 1)
+end
+
 T["mode_restart"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")
@@ -899,6 +922,96 @@ T["unavailable_queue_edit_submit"] = function()
   eq(buffer.text(state.composer_buf), "")
 end
 
+T["retry_input_resumes_a_paused_queue"] = function()
+  -- After an interrupt the queue stays paused with ordinary queued rows and no failed one. The
+  -- retry key is the documented way to resume it; a failed row is still retried first.
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local input = require("forge.views.harness.input_state")
+  local requests = mock_client.record()
+  state.session = { id = "paused-queue", provider = "mock" }
+  state.composer_buf = buffer.scratch()
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 1, control_revision = 4, suspended = true, messages = {
+    { id = "queued", revision = 1, text = "follow-up", delivery = "queued", intent = "queue", attachments = {} },
+  } })
+  local retry = require("forge.shared.view_command_set").action(controller.command_set(), "retry_input").run
+  retry({})
+  local action = requests[#requests].spec.params
+  eq({ action.action.kind, action.control_revision }, { "resume", 4 })
+  requests[1].callback({ revision = 2, control_revision = 4, suspended = true, messages = {
+    { id = "queued", revision = 1, text = "follow-up", delivery = "queued", intent = "queue", attachments = {} },
+    { id = "failed", revision = 2, text = "unsent", delivery = "failed", error = "Interrupted before provider dispatch",
+      intent = "auto", attachments = {} },
+  } })
+  retry({})
+  eq({ requests[#requests].spec.params.action.kind, requests[#requests].spec.params.action.id }, { "retry", "failed" })
+end
+
+T["paused_queue_heading_names_the_resume_key"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local input = require("forge.views.harness.input_state")
+  local requests = mock_client.record()
+  local paused = {}
+  state.session = { id = "paused-heading", provider = "mock", model = "test" }
+  state.composer_buf = buffer.scratch()
+  state.command_set = controller.command_set()
+  state.presentation = { transcript = {}, status_view = { render = function() end },
+    set_staging = function(_, _, hint) paused[#paused + 1] = hint or false end }
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 1, suspended = true, messages = {
+    { id = "queued", revision = 1, text = "follow-up", delivery = "queued", intent = "queue", attachments = {} },
+  } })
+  controller.refresh_winbar()
+  eq(paused[#paused], "<M-r> resume")
+  input.receive(state, { revision = 2, suspended = false, upsert = {}, removed = {} })
+  controller.refresh_winbar()
+  eq(paused[#paused], false)
+end
+
+T["delivered_queue_edit_settles_without_a_keypress"] = function()
+  -- When delivery wins the race with an edit reservation, the composer must not keep the sent text
+  -- as an edit nobody can save. Unchanged text gives way to the earlier draft; changed text stays.
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local warnings, infos = {}, {}
+  require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
+  require("forge.infra.notifications").info = function(message) infos[#infos + 1] = message end
+  for _, case in ipairs({
+    { typed = nil, composer = "earlier draft", notices = { 0, 1 } },
+    { typed = "my changed text", composer = "my changed text", notices = { 1, 0 } },
+  }) do
+    warnings, infos = {}, {}
+    local requests = mock_client.record()
+    local receive
+    client.session_events_subscribe = function(callback) receive = callback return function() end end
+    controller.render = function() end
+    controller.refresh_winbar = function() end
+    controller.attach_transcript = function() end
+    require("forge.views.harness.workspace").attach = function() end
+    require("forge.views.harness.prompt_history").attach = function() end
+    state.input, state.queue_edit, state.presentation = nil, nil, nil
+    state.session = { id = "delivered-edit", provider = "mock" }
+    state.composer_buf, state.transcript_buf = buffer.scratch(), buffer.scratch()
+    controller.attach()
+    requests[1].callback({ revision = 1, suspended = false, messages = {
+      { id = "queued", revision = 1, text = "original", delivery = "queued", intent = "queue", attachments = {} },
+    } })
+    buffer.set(state.composer_buf, "earlier draft")
+    controller.edit_queued(-1)
+    eq(buffer.text(state.composer_buf), "original")
+    if case.typed then buffer.set(state.composer_buf, case.typed) end
+    receive("input_changed", { revision = 2, removed = {}, upsert = {
+      { id = "queued", revision = 2, text = "original", delivery = "delivering", route = "turn", attachments = {} },
+    } }, state.session.id)
+    wait_until(function() return state.queue_edit == nil end, "the delivered edit stayed open")
+    eq(buffer.text(state.composer_buf), case.composer)
+    eq({ #warnings, #infos }, case.notices)
+  end
+end
+
 T["session_name"] = function()
   local client = require("forge.client")
   local controller = require("forge.views.harness.controller")
@@ -1095,6 +1208,26 @@ T["undo_requires_native_conversation_rewind"] = function()
   controller.open_undo_picker()
   eq(methods, { "session.exchange.recovery", "session.exchange.list" })
   eq(warnings, {})
+end
+
+T["background_picker_reconciles_status_with_the_inventory_it_lists"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  state.session = { id = "terminal-inventory", model = "test" }
+  state.capability = { background_terminals = true }
+  local adopted, opened = {}, {}
+  state.presentation = { terminals = { adopt = function(inventory) adopted[#adopted + 1] = inventory end } }
+  local picker = require("forge.views.picker")
+  local open = picker.open
+  picker.open = function(options) opened[#opened + 1] = options.page_list[1] end
+  MiniTest.finally(function() picker.open = open end)
+  local inventory = { supported = true, terminal = {} }
+  mock_client.respond({ ["session.document"] = inventory })
+  controller.open_background_picker()
+  -- The status count follows the same read the picker lists, rather than an earlier push.
+  eq(adopted, { inventory })
+  eq(#opened, 1)
+  eq(opened[1].option_list, {})
 end
 
 ---Stub the collaborators a state read reaches after it applies a snapshot.
@@ -1341,21 +1474,6 @@ T["select_agent_reverts_on_failure"] = function()
   controller.select_agent("child")
   settle(nil)
   eq(state.selected_agent_run_id, "child")
-end
-
-T["preview_close_renders_its_view"] = function()
-  local state = require("forge.session").harness
-  local controller = require("forge.views.harness.controller")
-  local preview = require("forge.views.harness.session_preview")
-  local rendered = 0
-  controller.render = function() rendered = rendered + 1 end
-  state.transcript_buf = buffer.scratch()
-  state.transcript_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(state.transcript_win, state.transcript_buf)
-  preview.open(state.transcript_win)
-  preview.close()
-  eq(rendered, 1)
-  eq(vim.api.nvim_win_get_buf(state.transcript_win), state.transcript_buf)
 end
 
 T["with_state_restores_after_failure"] = function()

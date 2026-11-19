@@ -1,6 +1,76 @@
 //! Decode and redact native tool arguments for normalized display titles.
 
+use forge_provider_api::tool::ToolSemantics;
 use serde_json::Value;
+
+/// Recognize a native read tool by its normalized lowercase name.
+///
+/// Returns the read's semantics and, when it names any path, its display title: `Read` followed
+/// by each path, relative to `workspace` when inside it and as reported otherwise. Native titles
+/// such as `view({"path":"C:\\…"})` repeat the arguments as escaped JSON, so every adapter titles
+/// reads here instead.
+pub(crate) fn read_tool(
+    name: &str,
+    arguments: &Value,
+    directory: Option<String>,
+    workspace: &str,
+) -> Option<(Option<String>, ToolSemantics)> {
+    if !matches!(
+        name,
+        "read" | "read_file" | "readfile" | "view" | "view_file" | "viewfile"
+    ) {
+        return None;
+    }
+    let mut paths = [
+        "path",
+        "file_path",
+        "filePath",
+        "absolute_path",
+        "AbsolutePath",
+        "TargetFile",
+    ]
+    .iter()
+    .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+    .map(str::to_owned)
+    .into_iter()
+    .collect::<Vec<_>>();
+    if let Some(locations) = arguments.get("locations").and_then(Value::as_array) {
+        paths.extend(
+            locations
+                .iter()
+                .filter_map(|value| value.get("path").and_then(Value::as_str))
+                .map(str::to_owned),
+        );
+    }
+    let title = (!paths.is_empty()).then(|| {
+        let shown = paths
+            .iter()
+            .map(|path| workspace_relative(path, workspace).unwrap_or_else(|| path.clone()))
+            .collect::<Vec<_>>();
+        format!("Read {}", shown.join(", "))
+    });
+    Some((title, ToolSemantics::Read { paths, directory }))
+}
+
+/// Express a reported path relative to the workspace, with `/` separators, when it is inside.
+///
+/// Copilot sometimes drops the leading `/` of a workspace path in Git headers, so a path that
+/// starts with the workspace minus that slash also counts as inside.
+pub(crate) fn workspace_relative(path: &str, workspace: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    let workspace = workspace.replace('\\', "/");
+    let workspace = workspace.trim_end_matches('/');
+    if workspace.is_empty() {
+        return None;
+    }
+    [workspace, workspace.trim_start_matches('/')]
+        .into_iter()
+        .find_map(|prefix| {
+            path.strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .map(str::to_owned)
+        })
+}
 
 /// Format native arguments after decoding and redacting credential fields.
 /// Reject empty names and invalid encoded JSON.
@@ -62,4 +132,48 @@ fn sensitive_argument(key: &str) -> bool {
             | "clientsecret"
             | "privatekey"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_provider_api::tool::ToolSemantics;
+    use serde_json::json;
+
+    /// A read inside the workspace is titled by its workspace-relative path.
+    #[test]
+    fn read_title_uses_the_workspace_relative_path() {
+        let (title, semantics) = read_tool(
+            "view",
+            &json!({"path":"C:\\work\\project\\src\\money.ts"}),
+            None,
+            "C:\\work\\project",
+        )
+        .expect("view is a read tool");
+        assert_eq!(title.as_deref(), Some("Read src/money.ts"));
+        assert_eq!(
+            semantics,
+            ToolSemantics::Read {
+                paths: vec!["C:\\work\\project\\src\\money.ts".into()],
+                directory: None,
+            }
+        );
+    }
+
+    /// A read outside the workspace keeps its absolute path, and other tools are not reads.
+    #[test]
+    fn read_title_keeps_paths_outside_the_workspace() {
+        let (title, _) = read_tool(
+            "read_file",
+            &json!({"file_path":"C:/elsewhere/notes.md"}),
+            None,
+            "C:/work/project",
+        )
+        .expect("read_file is a read tool");
+        assert_eq!(title.as_deref(), Some("Read C:/elsewhere/notes.md"));
+        let (title, _) =
+            read_tool("view", &json!({}), None, "C:/work/project").expect("view is a read tool");
+        assert_eq!(title, None);
+        assert!(read_tool("grep", &json!({"path":"src"}), None, "C:/work/project").is_none());
+    }
 }

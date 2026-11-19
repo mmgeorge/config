@@ -32,6 +32,7 @@ pub(super) async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionControlle
         attributed_matches_checkpoint: false,
         provider_checkpoint_id: None,
         approval_resolution: Vec::new(),
+        tool_timeout: Vec::new(),
         host_file_changes: Vec::new(),
         check_setup: None,
         turn: Vec::new(),

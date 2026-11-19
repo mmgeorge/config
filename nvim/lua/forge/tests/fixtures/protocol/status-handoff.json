@@ -1,0 +1,37 @@
+{
+  "document": "status-handoff:status",
+  "revision": 0,
+  "block": [
+    {
+      "id": "status",
+      "text": [
+        "Working · 0s"
+      ],
+      "metadata": {
+        "status": {
+          "row": 0,
+          "animated": true,
+          "hint": "working",
+          "handoff": true
+        },
+        "target": [
+          {
+            "id": "status:working",
+            "range": {
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
+            }
+          }
+        ],
+        "decoration": [],
+        "editable_region": []
+      }
+    }
+  ]
+}

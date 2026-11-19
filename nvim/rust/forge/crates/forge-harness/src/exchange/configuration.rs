@@ -10,8 +10,9 @@ use super::services::OwnerServices;
 pub(super) fn apply_configuration(
     command: &QueuedCommand,
     services: &OwnerServices,
+    broker: &mut crate::broker::HarnessBroker,
 ) -> Result<ConfigurationOutcome, ConfigurationCommitError> {
-    let outcome = commit_configuration(command, services)?;
+    let outcome = commit_configuration(command, services, broker)?;
     let snapshot = services
         .observer
         .snapshot()
@@ -34,6 +35,7 @@ pub(super) fn apply_configuration(
 fn commit_configuration(
     command: &QueuedCommand,
     services: &OwnerServices,
+    broker: &mut crate::broker::HarnessBroker,
 ) -> Result<ConfigurationOutcome, ConfigurationCommitError> {
     let change = match &command.record.request.command {
         Command::ConfigureSession(change) => change,
@@ -171,37 +173,9 @@ fn commit_configuration(
             })
         }
         ConfigurationChange::InputTimeouts(patch) => {
-            let session = crate::storage::HistoryReader::current(&services.root)
-                .map_err(ConfigurationCommitError::Session)?
-                .load_session(services.observer.session_id())
-                .map_err(ConfigurationCommitError::Session)?
-                .ok_or(ConfigurationCommitError::MissingSession)?;
-            let mut settings = crate::settings::SettingsStore::open(&services.root)
+            let (approval_timeout, tool_timeout) = broker
+                .owner_configure_input_timeouts(patch.approval_timeout(), patch.tool_timeout())
                 .map_err(ConfigurationCommitError::Settings)?;
-            settings
-                .patch(
-                    crate::settings::SettingTarget {
-                        scope: crate::settings::SettingScope::Global,
-                        workspace: &session.workspace,
-                        session: &session.id,
-                    },
-                    &crate::settings::PortableSettings {
-                        approval_timeout: patch.approval_timeout(),
-                        tool_timeout: patch.tool_timeout(),
-                        ..Default::default()
-                    },
-                )
-                .map_err(ConfigurationCommitError::Settings)?;
-            let effective = settings
-                .get(&session.workspace, &session.id, &session.provider)
-                .map_err(ConfigurationCommitError::Settings)?
-                .desired;
-            let approval_timeout = effective.approval_timeout.unwrap_or_default();
-            let tool_timeout = effective.tool_timeout.unwrap_or_default();
-            services
-                .permissions
-                .configure_timeout(&session.id, approval_timeout)
-                .map_err(ConfigurationCommitError::Permissions)?;
             Ok(ConfigurationOutcome::InputTimeouts {
                 approval_timeout,
                 tool_timeout,
@@ -231,9 +205,6 @@ pub(super) enum ConfigurationCommitError {
     /// The existing settings store could not commit or read back the selected policy.
     #[error("configuration settings commit failed: {0}")]
     Settings(#[source] anyhow::Error),
-    /// Runtime permission policy could not be synchronized with committed settings.
-    #[error("configuration permission publication failed: {0}")]
-    Permissions(#[source] anyhow::Error),
     /// Automatic-check admission state could not reflect the committed policy.
     #[error("configuration check policy commit failed: {0}")]
     CheckPolicy(#[source] anyhow::Error),

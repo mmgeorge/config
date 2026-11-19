@@ -25,6 +25,16 @@ use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 use crate::task::command as session_command;
 
+/// Bound each phase of stopping a failed owner before it is reopened.
+///
+/// A failed owner's provider has already stopped, so no phase waits on native work that could
+/// still finish usefully. Ten seconds is the shortest cleanup boundary the provider API defines,
+/// the point at which a cancellation is first reported as pending, and it covers the five-second
+/// exit grace a CLI adapter gives its process before killing it.
+const FAILED_OWNER_STOP_BOUND: Duration = Duration::from_secs(10);
+/// Retire a failed owner's binding this many times before force-terminating it.
+const FAILED_OWNER_RETIREMENT_ATTEMPTS: u32 = 2;
+
 mod cancellation;
 mod check_completion;
 mod command;
@@ -1342,10 +1352,7 @@ impl HarnessService {
         );
         let snapshot = controller.observer.snapshot()?;
         let mut result = serde_json::to_value(&snapshot)?;
-        let notice = PathBuf::from(&initialize.data_root).join("reset-notice.txt");
-        if notice.try_exists()? {
-            result["storage_notice"] = json!(std::fs::read_to_string(notice)?);
-        }
+        let data_root = PathBuf::from(&initialize.data_root);
         startup_timing.insert(
             "snapshot_serialized_ms".into(),
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
@@ -1377,6 +1384,16 @@ impl HarnessService {
             json!(startup_started.elapsed().as_secs_f64() * 1000.0),
         );
         result["startup_timing"] = json!({"phases":startup_timing,"broker":broker_timing});
+        // The session is registered, so no later failure can discard a notice this start took.
+        // A failed take leaves the session usable and the notice pending for the next start.
+        match crate::storage::layout::take_reset_notice(&data_root) {
+            Ok(Some(notice)) => result["storage_notice"] = json!(notice),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target: "forge::harness", event_name = "storage.reset_notice.failed",
+                    error = %format_args!("{error:#}"));
+            }
+        }
         Ok(result)
     }
 }
@@ -1506,6 +1523,13 @@ impl SessionController {
             session_id, phase = "model_validation", success = result.is_ok(),
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         result?;
+        // Recovery leaves an exchange interrupted by host loss finalizing; capture its closing
+        // checkpoint before the first snapshot, so no client observes it as still saving.
+        let started = Instant::now();
+        broker.settle_recovered_finalization().await;
+        tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
+            session_id, phase = "recovered_finalization",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         let started = Instant::now();
         broker.snapshot()?;
         tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
@@ -1607,6 +1631,160 @@ impl SessionController {
     }
 
     /// Drain the persistent transition owner before releasing its broker lease.
+    /// Get whether the owner has failed for good and refuses all execution.
+    fn execution_failed(&self) -> bool {
+        self.observer
+            .activity
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .phase
+            == crate::exchange::ActivityPhase::Unavailable
+    }
+
+    /// Stop a failed owner and release its session, so a fresh controller can resume it.
+    ///
+    /// A failed owner never executes again, so its shutdown commits nothing: the exchange task is
+    /// aborted rather than closed, which drops the broker lock and every resource it retained, and
+    /// storage keeps the transcript and input queue as last committed. Retirement of the provider
+    /// binding is retried `FAILED_OWNER_RETIREMENT_ATTEMPTS` times, each bounded by
+    /// `FAILED_OWNER_STOP_BOUND`; when none succeeds the binding is force-terminated, so the
+    /// replacement controller never shares the native conversation with a live old binding.
+    ///
+    /// Only a binding that could be neither retired nor terminated fails the stop. A lease that
+    /// cannot be released is reported and left to the replacement, which takes over a lease this
+    /// client holds once the old broker drops its runtime lock.
+    async fn stop_failed_owner(&self) -> Result<()> {
+        let session_id = self.observer.session_id().to_owned();
+        if let Some(mut task) = self.provider_startup.lock().await.take()
+            && tokio::time::timeout(FAILED_OWNER_STOP_BOUND, &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+        }
+        self.input_stopping.store(true, Ordering::Release);
+        self.coordinator.submissions.changed.notify_one();
+        self.plan_review.close_all()?;
+        if let Some(task) = self.exchange_task.lock().await.take() {
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                tracing::warn!(target: "forge::harness", event_name = "service.reopen.owner_panicked",
+                    session_id = %session_id, error = %error);
+            }
+        }
+        for (stage, stopped) in [
+            (
+                "prompt_workers",
+                tokio::time::timeout(FAILED_OWNER_STOP_BOUND, self.finish_prompt_workers())
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|stopped| stopped),
+            ),
+            (
+                "session_tasks",
+                tokio::time::timeout(
+                    FAILED_OWNER_STOP_BOUND,
+                    self.stop_session_tasks("before reopening"),
+                )
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|stopped| stopped),
+            ),
+        ] {
+            if let Err(error) = stopped {
+                tracing::warn!(target: "forge::harness", event_name = "service.reopen.task_unfinished",
+                    session_id = %session_id, stage, error = %format_args!("{error:#}"));
+            }
+        }
+        let owner = crate::provider::ThreadOwner::root(&session_id);
+        let registry = self.broker.lock().await.execution_registry();
+        let mut retired = false;
+        for attempt in 1..=FAILED_OWNER_RETIREMENT_ATTEMPTS {
+            match tokio::time::timeout(FAILED_OWNER_STOP_BOUND, registry.forget(&owner)).await {
+                Ok(Ok(())) => {
+                    retired = true;
+                    break;
+                }
+                Ok(Err(error)) => self.trace.record(
+                    &session_id,
+                    "service.session.reopen.retirement_failed",
+                    json!({"attempt": attempt, "cause": "provider_error",
+                        "kind": format!("{:?}", crate::provider::lifecycle_error::diagnostic(
+                            forge_provider_api::ProviderOperation::ThreadClose, &error).kind())}),
+                ),
+                Err(_) => self.trace.record(
+                    &session_id,
+                    "service.session.reopen.retirement_failed",
+                    json!({"attempt": attempt, "cause": "timeout"}),
+                ),
+            }
+        }
+        if !retired {
+            self.trace.record(
+                &session_id,
+                "service.session.reopen.terminated",
+                json!({"attempts": FAILED_OWNER_RETIREMENT_ATTEMPTS}),
+            );
+            tokio::time::timeout(FAILED_OWNER_STOP_BOUND, registry.terminate(&owner))
+                .await
+                .context("the failed provider binding did not terminate in time")?
+                .context("terminate the failed provider binding")?;
+        }
+        self.presentation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+            .close_all()?;
+        if let Err(error) = self.broker.lock().await.release_lease() {
+            tracing::warn!(target: "forge::harness", event_name = "service.reopen.lease_retained",
+                session_id = %session_id, error = %format_args!("{error:#}"));
+        }
+        self.coordinator.execution.close();
+        self.coordinator.control.close();
+        Ok(())
+    }
+
+    /// Join the input worker and stop the session's subscriptions and observation listener.
+    ///
+    /// The caller has marked input as stopping and collected the exchange owner, so the input
+    /// worker ends by itself. The listeners have no work to finish and are aborted. `stage`
+    /// names the caller's purpose in each failure, such as "before deletion".
+    async fn stop_session_tasks(&self, stage: &str) -> Result<()> {
+        {
+            let mut input = self.input_task.lock().await;
+            if let Some(task) = input.as_mut() {
+                task.await
+                    .with_context(|| format!("input worker failed {stage}"))?;
+                input.take();
+            }
+        }
+        for subscription in [&self.timeout_task, &self.agent_task] {
+            let mut slot = subscription.lock().await;
+            if let Some(task) = slot.as_mut() {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    return Err(error)
+                        .with_context(|| format!("session subscription failed {stage}"));
+                }
+                slot.take();
+            }
+        }
+        let mut observation = self.session_event_task.lock().await;
+        if let Some(task) = observation.as_mut() {
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                return Err(error).with_context(|| format!("session observation failed {stage}"));
+            }
+            observation.take();
+        }
+        Ok(())
+    }
+
     async fn finish_exchange_owner(&self) -> Result<()> {
         let mut task = self.exchange_task.lock().await;
         if let Some(pending) = task.as_mut() {
@@ -1759,6 +1937,8 @@ impl Drop for SessionController {
 /// Stores live session controllers for one persistent broker process.
 struct SessionControllerRegistry {
     controller_by_id: RwLock<HashMap<String, Arc<SessionController>>>,
+    /// Serialize replacing failed owners, so concurrent resumes stop one controller once.
+    reopen: Mutex<()>,
     provider_fork_by_id: RwLock<HashMap<String, Arc<ProviderForkGate>>>,
     fork_task: Mutex<JoinSet<()>>,
     /// The editor connection, retained from requests so work no request started, such as a
@@ -1833,6 +2013,7 @@ impl SessionControllerRegistry {
         }
         let registry = Arc::new(Self {
             controller_by_id: RwLock::new(initial.into_iter().collect()),
+            reopen: Mutex::new(()),
             provider_fork_by_id: RwLock::new(HashMap::new()),
             fork_task: Mutex::new(JoinSet::new()),
             client_sink: std::sync::Mutex::new(None),
@@ -1987,6 +2168,41 @@ impl SessionControllerRegistry {
             .await?;
         controller_by_id.insert(session_id.to_owned(), Arc::clone(&controller));
         Ok(controller)
+    }
+
+    /// Resolve a session for the editor to show, reopening a loaded owner that has failed.
+    ///
+    /// An owner whose provider stopped and could not be restarted never executes again, and the
+    /// cached controller would keep answering every prompt with that failure. Resuming such a
+    /// session stops its controller, retires its binding, and resolves a fresh controller from
+    /// storage, which keeps the transcript and the saved input queue. A healthy owner is returned
+    /// unchanged. Only this session's binding is rebuilt: a provider runtime that the host shares
+    /// between sessions and that cannot start again stays failed until the host restarts.
+    async fn resolve_reopening(&self, session_id: &str) -> Result<Arc<SessionController>> {
+        let _reopen = self.reopen.lock().await;
+        let controller = self.resolve(session_id).await?;
+        if !controller.execution_failed() {
+            return Ok(controller);
+        }
+        controller
+            .trace
+            .record(session_id, "service.session.reopen", json!({}));
+        // Every phase of the stop is bounded inside it, so it cannot hold the reopen lock forever.
+        let stopped = controller.stop_failed_owner().await;
+        // A stopping controller refuses every request whether or not it stopped cleanly, so it is
+        // evicted either way, as a failed deletion evicts its controller.
+        {
+            let mut controllers = self.controller_by_id.write().await;
+            if controllers
+                .get(session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &controller))
+            {
+                controllers.remove(session_id);
+            }
+        }
+        stopped.context("reopen the failed session")?;
+        drop(controller);
+        self.resolve(session_id).await
     }
 
     /// Record a `Preparing` fork that has no live gate as failed.
@@ -2462,26 +2678,33 @@ async fn route_request(
         drop(admission.take());
         return reconnect::respond(&controller, request, message_sink).await;
     }
-    let new_queued_submission = if method == RuntimeMethod::SessionInputApply {
+    // A submission, retry, or queue resume can start delivery, so it recovers a closed or
+    // uncertain provider generation first, as a prompt does. A resumed queue in a session
+    // loaded with an uncertain configuration otherwise waits for a later submission.
+    let starts_delivery = if method == RuntimeMethod::SessionInputApply {
         let operation: crate::input::InputOperation =
             crate::codec::from_value(request.params.clone())?;
-        matches!(&operation.action, crate::input::InputAction::Submit { .. })
-            && controller
-                .coordinator
-                .submissions
-                .operation(&operation.id)?
-                .is_none()
+        matches!(
+            &operation.action,
+            crate::input::InputAction::Submit { .. }
+                | crate::input::InputAction::Retry { .. }
+                | crate::input::InputAction::Resume
+        ) && controller
+            .coordinator
+            .submissions
+            .operation(&operation.id)?
+            .is_none()
     } else {
         false
     };
     // Provider-bound child work waits for its native fork, or it would open fresh history.
-    if method.requires_provider_fork() || new_queued_submission {
+    if method.requires_provider_fork() || starts_delivery {
         registry
             .await_provider_fork(&session_id, &controller, message_sink)
             .await?;
     }
     if method == RuntimeMethod::SessionPromptSubmit
-        || new_queued_submission
+        || starts_delivery
         || (method == RuntimeMethod::SessionConfigure
             && controller.task_controller.configuration_is_uncertain())
     {
@@ -3091,37 +3314,7 @@ async fn delete_stopping_session(
             .context("session owner did not settle before deletion")??;
         controller.finish_prompt_workers().await?;
         require_idle_deletion(controller)?;
-        {
-            let mut input = controller.input_task.lock().await;
-            if let Some(task) = input.as_mut() {
-                task.await.context("input worker failed before deletion")?;
-                input.take();
-            }
-        }
-        for subscription in [&controller.timeout_task, &controller.agent_task] {
-            let mut slot = subscription.lock().await;
-            if let Some(task) = slot.as_mut() {
-                task.abort();
-                if let Err(error) = task.await
-                    && !error.is_cancelled()
-                {
-                    return Err(error).context("session subscription failed before deletion");
-                }
-                slot.take();
-            }
-        }
-        {
-            let mut observation = controller.session_event_task.lock().await;
-            if let Some(task) = observation.as_mut() {
-                task.abort();
-                if let Err(error) = task.await
-                    && !error.is_cancelled()
-                {
-                    return Err(error).context("session observation failed before deletion");
-                }
-                observation.take();
-            }
-        }
+        controller.stop_session_tasks("before deletion").await?;
     }
     let mut controllers = registry.controller_by_id.write().await;
     ensure!(
@@ -3216,7 +3409,7 @@ async fn resume_session(
         .get("session_id")
         .and_then(Value::as_str)
         .context("session.resume requires session_id")?;
-    let controller = registry.resolve(target_session_id).await?;
+    let controller = registry.resolve_reopening(target_session_id).await?;
     let snapshot = controller.observer.snapshot()?;
     message_sink
         .send_response(Response::success(request.id, snapshot)?)

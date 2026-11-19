@@ -102,12 +102,14 @@ impl NodeMap {
         };
         self.anchor.insert(source.id.0.clone(), block.id.clone());
         let previous = self.state.get(&source.id.0);
+        // Live activity opens by default and folds when it settles, so a choice made while it
+        // ran gives way to that fold. A Tools group is folded whether live or settled, so its
+        // only open state is the reader's own choice, which settling must not undo.
         if matches!(
             source.kind,
             forge_buffer::node::NodeKind::Exchange
                 | forge_buffer::node::NodeKind::Message
                 | forge_buffer::node::NodeKind::Thought
-                | forge_buffer::node::NodeKind::ToolGroup
         ) && source.lifecycle == forge_buffer::node::NodeLifecycle::Settled
             && previous
                 .is_some_and(|state| state.lifecycle == forge_buffer::node::NodeLifecycle::Live)
@@ -253,5 +255,47 @@ pub(super) fn link(blocks: &mut [BufferBlock]) {
                 ancestor.push((node.id.clone(), *end));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use forge_buffer::block::{BlockMetadata, BufferBlock};
+    use forge_buffer::identity::{BlockId, FoldId};
+    use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle, NodeState};
+    use forge_buffer::text::BufferText;
+
+    fn block(kind: NodeKind, lifecycle: NodeLifecycle) -> anyhow::Result<BufferBlock> {
+        let mut node = NodeState::new(FoldId("node".into()), kind, NodeDisplay::Heading);
+        node.lifecycle = lifecycle;
+        Ok(BufferBlock {
+            id: BlockId("node".into()),
+            text: BufferText::from_rows(["▸ Tools · 1/1"])?,
+            metadata: BlockMetadata {
+                node: Some(node),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// A Tools group the reader opened while it ran stays open when it settles.
+    ///
+    /// Settling used to clear the choice for Tools groups as it does for live commentary, so a
+    /// group opened just before its calls finished folded again about a tenth of a second later.
+    #[test]
+    fn settling_keeps_an_opened_tools_group_open_and_clears_live_commentary() -> anyhow::Result<()>
+    {
+        for (kind, kept) in [(NodeKind::ToolGroup, true), (NodeKind::Thought, false)] {
+            let mut nodes = super::NodeMap::default();
+            nodes.register(&block(kind, NodeLifecycle::Live)?)?;
+            nodes.choice.insert("node".into(), true);
+            nodes.register(&block(kind, NodeLifecycle::Settled)?)?;
+            assert_eq!(
+                nodes.choice.get("node").copied() == Some(true),
+                kept,
+                "{kind:?}"
+            );
+        }
+        Ok(())
     }
 }

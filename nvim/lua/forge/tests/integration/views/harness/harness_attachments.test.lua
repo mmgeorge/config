@@ -148,6 +148,63 @@ if vim.g.forge_attachments_grid then
   return
 end
 
+if vim.g.forge_attachments_burst then
+  -- Child half of `paste_and_submit_in_one_write`: open Harness on MockProvider and expose the
+  -- composer, every submission sent to the host, and the warnings, for the parent to inspect.
+  local root = vim.fn.getcwd()
+  local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+  local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
+  local workspace, data = vim.fn.tempname(), vim.fn.tempname()
+  vim.fn.mkdir(workspace, "p")
+  vim.fn.mkdir(data, "p")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  local file_path = workspace .. "/notes.txt"
+  vim.fn.writefile({ "attachment fixture" }, file_path)
+  local binary = dofile("nvim/lua/forge/tests/support/host_executable.lua")()
+  local original_stdpath = vim.fn.stdpath
+  vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
+  package.loaded["forge.builder"] = { ensure = function(callback) callback({ ok = true, path = binary }) return function() end end }
+  local client = require("forge.client")
+  client._host_set_launcher_for_test(vim.system)
+  local state = require("forge.session").harness
+  local attachment = require("forge.views.harness.attachment")
+  local failures, warnings, submitted = {}, {}, {}
+  require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
+  require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
+  local request = client.request
+  client.request = function(spec, callback)
+    local action = spec.method == "session.input.apply" and spec.params.action
+    if action and action.kind == "submit" then submitted[#submitted + 1] = action.message.text end
+    return request(spec, callback)
+  end
+  vim.fn.chdir(workspace)
+  require("forge").setup({ harness = { provider = "mock" } })
+  require("forge").open_harness()
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not open", { timeout_ms = 4000, errors = failures })
+  vim.api.nvim_set_current_win(state.composer_win)
+  _G.forge_burst = {
+    file_path = file_path,
+    compose = function(text)
+      buffer.set(state.composer_buf, { text })
+      warnings, submitted = {}, {}
+    end,
+    observe = function()
+      return { text = buffer.text(state.composer_buf), pending = attachment.pending(state.composer_buf),
+        attachments = #attachment.capture(state.composer_buf).attachments, submitted = submitted,
+        warnings = warnings, failures = failures }
+    end,
+    stop = function()
+      require("forge.views.harness.workspace").release(state)
+      if state.presentation then state.presentation.close() end
+      client.host_stop()
+      vim.wait(4000, function() return client._client.process == nil end, 10)
+      vim.fn.chdir(root)
+    end,
+  }
+  return
+end
+
 local MiniTest = require("mini.test")
 local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 
@@ -164,6 +221,59 @@ T["harness_attachments"] = function()
     vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim')
     dofile('nvim/lua/forge/tests/integration/views/harness/harness_attachments.test.lua')
   ]])
+end
+
+-- The terminal UI sends a bracketed paste as a queued `nvim_paste` event and the keys after it
+-- through `nvim_input`, which writes the typeahead on arrival. RPC notifications from the parent
+-- reproduce one terminal write that holds both.
+-- requires-forge-host
+T["paste_and_submit_in_one_write"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
+  MiniTest.finally(function()
+    pcall(child.lua, "_G.forge_burst.stop()")
+    pcall(child.stop)
+  end)
+  child.api.nvim_ui_attach(100, 32, { rgb = true })
+  child.lua([[
+    vim.g.forge_attachments_burst = true
+    vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim')
+    dofile('nvim/lua/forge/tests/integration/views/harness/harness_attachments.test.lua')
+  ]])
+  local function settle(done)
+    local observed
+    vim.wait(4000, function()
+      observed = child.lua_get("_G.forge_burst.observe()")
+      return done(observed)
+    end, 20)
+    return observed
+  end
+  local file_path = child.lua_get("_G.forge_burst.file_path")
+
+  -- A path pasted before Ctrl-S belongs to the draft: the submit waits for its import.
+  child.lua([[_G.forge_burst.compose("Name this file: ")]])
+  child.type_keys("A")
+  child.api_notify.nvim_paste(file_path, false, -1)
+  child.api_notify.nvim_input("<C-s>")
+  local observed = settle(function(state) return not state.pending and #state.warnings > 0 end)
+  MiniTest.expect.equality({ observed.text:match("^Name this file: %[File #%d+%]$") ~= nil, observed.attachments,
+    observed.submitted, observed.warnings }, { true, 1, {}, { "Wait for the attachment import to finish" } })
+
+  -- Keys typed after Ctrl-S in the same write never join the submitted text.
+  child.type_keys("<Esc>")
+  child.lua([[_G.forge_burst.compose("Send this")]])
+  child.type_keys("A")
+  child.api_notify.nvim_input("<C-s>later")
+  observed = settle(function(state) return #state.warnings > 0 or #state.submitted > 0 end)
+  MiniTest.expect.equality({ observed.text, observed.submitted }, { "Send thislater", {} })
+
+  -- A Ctrl-S with nothing after it still submits the draft.
+  child.type_keys("<Esc>")
+  child.lua([[_G.forge_burst.compose("Send now")]])
+  child.type_keys("A")
+  child.api_notify.nvim_input("<C-s>")
+  observed = settle(function(state) return #state.submitted > 0 end)
+  MiniTest.expect.equality({ observed.submitted, observed.failures }, { { "Send now" }, {} })
 end
 
 return T

@@ -700,8 +700,11 @@ T["publication"] = function()
   end))
   local initial_publications = publications
   requests[2].callback({ patch = patch })
-  wait_until(function() return owner.transcript.revision == 64 end, "patch backlog did not reach its final revision")
-  assert(publications == initial_publications + 1, "batch notified before its final revision")
+  -- The transcript reaches revision 64 before the status document of the same reply is applied, so
+  -- the case awaits the batch's one publication and then checks that it came after the final patch.
+  wait_until(function() return publications > initial_publications end, "patch backlog was never published")
+  assert(owner.transcript.revision == 64, "batch notified before its final revision")
+  assert(publications == initial_publications + 1, "one batch notified more than once")
   wait_until(function() return #requests == 3 end, "in-flight burst lost its trailing update")
   assert(requests[3].params.revision == 64, "trailing refresh did not request the applied revision")
   requests[3].callback({ patch = {} })

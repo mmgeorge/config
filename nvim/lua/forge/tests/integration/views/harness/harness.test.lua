@@ -374,8 +374,8 @@ T["status_agents_branch_coexists_with_question_branch"] = function()
   local lines = status.content.lines
   eq(lines[1]:find(" │ Waiting on the explorers", 1, true) ~= nil, true)
   eq(lines[2], "  ├─ Agents · 3 running")
-  eq(lines[3], "  │  ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4 s │ Tracing reservation admission")
-  eq(lines[4], "  │  └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4 s")
+  eq(lines[3], "  │  ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4s │ Tracing reservation admission")
+  eq(lines[4], "  │  └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4s")
   eq(lines[5], "  │     └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +")
   eq(lines[#lines], "  └─ Should this apply to all sessions?")
   local thought = vim.iter(status.content.highlights):find(function(highlight)
@@ -504,31 +504,32 @@ T["approval_timeout_shows_original_request"] = function()
   wait_until(function() return require("forge.views.harness.approval").is_open() end, "approval did not open",
     { context = function() return buffer.text(state.transcript_buf) .. vim.inspect(state.approval) end })
   eq(mock_provider.expire_approval(state.session.id), 1)
-  wait_until(function() return buffer.text(state.transcript_buf):find("An approval timed out", 1, true) end,
-    "timeout notice did not arrive")
-  eq(buffer.text(state.transcript_buf):find("No user decision was recorded.", 1, true), nil)
   local transcript = state.presentation.transcript
-  for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    if line:find("An approval timed out", 1, true) then
-      local location = require("forge.buffer").locate(transcript, row - 1, 0)
-      local node = transcript.sequence.node[location.block].entry.metadata.node
-      eq(node.display, "heading")
-      state.presentation.set_section(node.id, true, false)
-      break
+  -- Open every folded heading until the expiry row's details show; the row sits beneath the
+  -- request's Tools group inside the exchange's Thought, which folds once the turn completes.
+  local function expand_all()
+    for index = 0, transcript.sequence:count() - 1 do
+      local node = transcript.sequence:at(index).entry.metadata.node
+      if node and node ~= vim.NIL and node.display == "heading" then
+        state.presentation.set_section(node.id, true, false)
+      end
     end
   end
-  wait_until(function() return buffer.text(state.transcript_buf):find("No user decision was recorded.", 1, true) end,
-    "expanded timeout details did not arrive")
+  wait_until(function()
+    expand_all()
+    return buffer.text(state.transcript_buf):find("No user decision was recorded.", 1, true)
+  end, "expanded timeout details did not arrive", { context = function() return buffer.text(state.transcript_buf) end })
   local text = buffer.text(state.transcript_buf)
+  eq(text:find("An approval timed out", 1, true) ~= nil, true)
   eq(text:find("Request", 1, true) ~= nil, true)
   eq(text:find("Action", 1, true) ~= nil, true)
   eq(text:find("check_definition_edit", 1, true) ~= nil, true)
   eq(text:find('"operation": "inspect-timeout"', 1, true) ~= nil, true)
-  eq(text:find("No user decision was recorded.", 1, true) ~= nil, true)
   eq(text:find("Continue authorized work", 1, true), nil)
+  -- The turn completed after the expiry, so the model already answered it: no continuation.
   local exchanges = call("session.exchange.list")
-  eq(exchanges[#exchanges].prompt:find("No user decision was recorded.", 1, true) ~= nil, true)
-  eq(exchanges[#exchanges].prompt:find("Continue authorized work", 1, true), nil)
+  eq(#exchanges, 1)
+  eq(exchanges[1].prompt, "Configure project checks")
   wait_until(function()
     local orange = false
     for index = 0, transcript.sequence:count() - 1 do
@@ -846,6 +847,8 @@ local function rows()
   return buffer.text(state.transcript_buf)
 end
 -- Live check progress belongs to the status split; completed results stay in the transcript.
+-- The shortcuts act on a check the host reports running, so the case waits for that published
+-- state and the check's status row rather than for the check process to produce output.
 local function status_rows()
   local status = state.presentation and state.presentation.status_view
   return table.concat(status and status.content and status.content.lines or {}, "\n")
@@ -853,7 +856,7 @@ end
 local function start_check()
   local run_id = check_tool.start(request, { check = { "slow" } }).run_id
   wait_until(function()
-    return state.checks_running and state.active_check_run == run_id and status_rows():find("Shortcut check is running", 1, true)
+    return state.checks_running and state.active_check_run == run_id and status_rows():find("Shortcut check", 1, true)
   end, "check did not become active", { timeout_ms = 4000, context = function()
     return vim.inspect({ run_id = run_id, checks_running = state.checks_running,
       active_check_run = state.active_check_run, errors = errors, status = status_rows(), transcript = rows() })
@@ -869,7 +872,7 @@ local function compose(text)
   buffer.set(state.composer_buf, { text })
 end
 vim.fn.writefile({ vim.json.encode({ checks = {
-["slow"] = { trigger = { auto = false }, action = { command = "print 'Shortcut check is running'; sleep 30sec", label = "Shortcut check", category = "custom" } }
+["slow"] = { trigger = { auto = false }, action = { command = "sleep 30sec", label = "Shortcut check", category = "custom" } }
 } }) }, workspace .. "/.forge.json")
 vim.api.nvim_set_current_dir(workspace)
 require("forge").setup({ diff_logging = false, harness_logging = false,
@@ -877,37 +880,30 @@ require("forge").setup({ diff_logging = false, harness_logging = false,
 require("forge.views.harness").open()
 wait_until(function() return state.session ~= nil end, "startup timed out", { timeout_ms = 4000 })
 request("session.configure", { shell = "nushell" })
+-- Each real check costs a shell start, so the case runs one live check through both shortcuts:
+-- Ctrl-C starts a pause of the running check, and Ctrl-S during that pause interrupts the check
+-- and runs the replacement.
 local run_id = start_check()
 compose("")
 keymap.invoke("<C-c>", { window = state.composer_win })
-wait_until(function() return not state.checks_running end, "Ctrl-C did not stop the check", { timeout_ms = 3000,
-  context = function() return vim.inspect({ operation = state.cleanup_operation_id, notice = state.execution_notice }) end })
-assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-C did not interrupt check history")
-wait_until(settled, "Ctrl-C did not settle its pause", { timeout_ms = 3000 })
-for _, pause_first in ipairs({ false, true }) do
-  run_id = start_check()
-  if pause_first then
-    compose("")
-    keymap.invoke("<C-c>", { window = state.composer_win })
-    -- The interruption owns cleanup_operation_id from Ctrl-C until its host settlement.
-    assert(state.cleanup_operation_id, "Ctrl-C did not start a pause")
-  end
-  local text = pause_first and "Replacement during pause" or "Replacement during check"
-  compose(text)
-  keymap.invoke("<C-s>", { window = state.composer_win })
-  assert(buffer.line(state.composer_buf, 1) == "",
-    "Ctrl-S did not capture the replacement")
-  wait_until(function() return settled() and rows():find(text, 1, true) end,
-    "Ctrl-S did not complete its replacement", { timeout_ms = 4000, context = function()
-      return vim.inspect({ operation = state.cleanup_operation_id,
-        drafts = state.input.drafts, notice = state.execution_notice, busy = require("forge.views.harness.activity").busy(state),
-        pause_first = pause_first, input = request("session.input.get"), queue = state.queue,
-        steering = state.pending_steer, submitting = state.pending_submit, errors = errors,
-        transcript = rows() })
-    end })
-  assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
-  assert(buffer.line(state.composer_buf, 1) == "", "Ctrl-S left the submitted draft")
-end
+-- The interruption owns cleanup_operation_id from Ctrl-C until its host settlement.
+assert(state.cleanup_operation_id, "Ctrl-C did not start a pause")
+local text = "Replacement during pause"
+compose(text)
+keymap.invoke("<C-s>", { window = state.composer_win })
+-- Ctrl-S acts one scheduled step later, after any paste that preceded it.
+wait_until(function() return buffer.line(state.composer_buf, 1) == "" end,
+  "Ctrl-S did not capture the replacement", { timeout_ms = 1000 })
+wait_until(function() return settled() and rows():find(text, 1, true) end,
+  "Ctrl-S did not complete its replacement", { timeout_ms = 4000, context = function()
+    return vim.inspect({ operation = state.cleanup_operation_id,
+      drafts = state.input.drafts, notice = state.execution_notice, busy = require("forge.views.harness.activity").busy(state),
+      input = request("session.input.get"), queue = state.queue,
+      steering = state.pending_steer, submitting = state.pending_submit, errors = errors,
+      transcript = rows() })
+  end })
+assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
+assert(buffer.line(state.composer_buf, 1) == "", "Ctrl-S left the submitted draft")
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
 assert(host.stop(), "host did not stop")
@@ -1617,13 +1613,14 @@ do
     "optimistic submission did not refresh the native transcript", { timeout_ms = 2500 })
   assert(#staged_request.queue == 0 and #staged_request.steering == 0, "idle submission flashed in the visual queue")
   assert(buffer.line(state.composer_buf, 1) == "")
+  -- Newer typing holds the composer, so the rejected prompt stays as a failed row to retry.
+  buffer.set(state.composer_buf, { "newer unsent draft" })
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
     suspended = false, upsert = {}, removed = {}, error = "simulated admission failure" })
   assert(#state.input.drafts == 1, "failed input draft was not retained")
-  assert(buffer.line(state.composer_buf, 1) == "native draft")
+  assert(buffer.line(state.composer_buf, 1) == "newer unsent draft")
   local input_state = require("forge.views.harness.input_state")
   local failed_id = state.input.drafts[1].id
-  buffer.set(state.composer_buf, { "newer unsent draft" })
   keymap.invoke("<M-r>", { mode = "i" })
   assert(submitted.action.message.id == failed_id, "retry shortcut changed message identity")
   assert(buffer.line(state.composer_buf, 1) == "newer unsent draft",
@@ -1660,7 +1657,9 @@ do
   steering_message.delivery = "accepted"
   receive("input_changed", { revision = state.input.revision + 1, suspended = false,
     upsert = { steering_message }, removed = {} }, "native-controller")
-  assert(#state.pending_steer == 0 and #state.queue == 1, "steering acceptance changed the explicit queue")
+  -- An accepted steer stays staged while its turn runs, until the exchange's acknowledged copy
+  -- replaces it in the status section.
+  assert(#state.pending_steer == 1 and #state.queue == 1, "steering acceptance changed the explicit queue")
   receive("input_changed", { revision = state.input.revision + 1, suspended = false,
     upsert = {}, removed = { steering_message.id, queued_message.id } }, "native-controller")
   buffer.set(state.composer_buf, { "" })
@@ -1805,6 +1804,8 @@ do
   buffer.set(state.composer_buf, { "explicit follow-up" })
   require("forge.shared.keymaps").setup_view_keymaps(state.composer_buf, "harness", controller.command_set())
   keymap.invoke("<C-q>", { mode = "i" })
+  -- The queue key acts one scheduled step later, after any paste that preceded it.
+  wait_until(function() return state.queue[1] ~= nil end, "queue key did not act", { timeout_ms = 1000 })
   assert(state.queue[1].text == "explicit follow-up", "queue key steered an active wait or selected child")
   assert(buffer.line(state.composer_buf, 1) == "")
   assert(keymap.get("<C-s>", { mode = "i" }).desc == "Submit the composer")
@@ -2656,25 +2657,58 @@ T["cancellation_restores_prompt_and_clears_status"] = function()
     keymap.invoke("<C-s>")
     request({ operation = "wait", id = barrier })
     if scenario.newer then buffer.set(state.composer_buf, { scenario.newer }) end
+    -- The status row reads `Stopping` for the whole stop, so a stop that settles at once adds
+    -- no notice; one notice per phase replaced the row's text four times within a second.
+    local notices = {}
+    local diagnostic = require("forge.views.harness.diagnostic")
+    local set_diagnostic = diagnostic.set
+    diagnostic.set = function(owner, key, text, ...)
+      if key == "cleanup_notice" and text then notices[#notices + 1] = text end
+      return set_diagnostic(owner, key, text, ...)
+    end
     controller.cancel_turn()
     local operation = state.cleanup_request_id
     controller.cancel_turn()
     eq(state.cleanup_request_id, operation)
+    -- The host keeps the retracted prompt as an unsent entry. The editor removes that entry once
+    -- its composer holds the text again, and leaves it queued when the composer holds newer text.
+    -- The submitted prompt can still be queued in this view when the wait starts, so the newer-text
+    -- scenario waits for the unsent entry itself instead of for a count the prompt also satisfies.
     wait_until(function()
-      return state.cancellation and state.cancellation.phase == "settled" and #state.input.confirmed == 0
+      if not (state.cancellation and state.cancellation.phase == "settled") then return false end
+      if not scenario.newer then return #state.input.confirmed == 0 end
+      return #state.input.confirmed == 1 and state.input.confirmed[1].delivery == "failed"
     end, "Cancellation did not settle its input")
     eq(buffer.text(state.composer_buf), scenario.newer or scenario.prompt)
     if scenario.newer then
-      eq(#state.queue, 1)
-      eq(state.queue[1].text, scenario.prompt)
-      eq(state.queue[1].local_only, true)
-      require("forge.views.harness.input_state").discard_rejected(state, state.queue[1].id)
-    else eq(#state.queue, 0) end
+      local unsent = state.queue[1]
+      eq({ unsent.text, unsent.delivery, unsent.local_only }, { scenario.prompt, "failed" })
+      require("forge.views.harness.input_state").perform(state,
+        { kind = "remove", id = unsent.id, revision = unsent.revision })
+      wait_until(function() return #state.input.confirmed == 0 end, "Removing the unsent prompt did not settle")
+    end
+    eq(#state.queue, 0)
     wait_until(function() return not pending_status() end, "Settled cancellation retained its pending status")
     eq(state.status.kind, "idle")
+    eq(notices, {})
+    -- A cancel that finds nothing to stop reports no operation, so no observer shows `Stopping`
+    -- for work that never existed.
+    local settled = vim.deepcopy(state.cancellation)
+    local phases = {}
+    local unsubscribe = client.session_events_subscribe(function(event, payload)
+      if event == "document_changed" and type(payload.status) == "table" then
+        phases[#phases + 1] = payload.status.kind
+      end
+    end)
     controller.cancel_turn()
     wait_until(function() return state.cleanup_request_id == nil and not pending_status() end,
       "Repeated cancellation did not settle")
+    unsubscribe()
+    diagnostic.set = set_diagnostic
+    eq(vim.tbl_contains(phases, "stopping"), false)
+    eq(state.cancellation, settled)
+    eq(notices, {})
+    eq(state.status.kind, "idle")
     eq(buffer.text(state.composer_buf), scenario.newer or scenario.prompt)
   end
   local held = mock_provider.hold(state.session.id)
@@ -2723,6 +2757,7 @@ client.request = function(request_specification, callback)
   controls[#controls + 1] = { method = method, parameters = parameters, callback = callback }
 end
 input.attach(state, function() end)
+local notice_timers = deferred.install({ input.submission_notice_delay_ms })
 local function compose(text)
   buffer.set(state.composer_buf, vim.split(text, "\n", { plain = true }))
 end
@@ -2730,7 +2765,7 @@ local function composer_text() return buffer.text(state.composer_buf) end
 ---@param text string
 ---@return {id: string, text: string, delivery?: string}?
 local function retained_message(text)
-  for _, messages in ipairs({ state.queue, state.pending_steer }) do
+  for _, messages in ipairs({ state.queue, state.pending_steer, state.pending_submit }) do
     for _, message in ipairs(messages or {}) do
       if type(message) == "table" then
         ---@cast message {id: string, text: string, delivery?: string}
@@ -2770,7 +2805,11 @@ compose("newer draft")
 current = false
 host.flush()
 assert(composer_text() == "newer draft", "retired capture overwrote the replacement composer")
-assert(#state.queue == 3 and #state.pending_submit == 0, "host queued receipts must replace pending drafts")
+assert(#state.queue == 2 and #state.pending_submit == 1 and not state.pending_submit[1].local_only,
+  "host queued receipts must replace pending drafts")
+-- This fixture host commits input and never claims it, so the direct prompt surfaces as waiting.
+eq(notice_timers.fire(input.submission_notice_delay_ms), 1)
+assert(#state.queue == 3 and #state.pending_submit == 0, "an unclaimed prompt stayed hidden past the notice delay")
 host.complete(first)
 assert(#state.queue == 3 and #state.pending_submit == 0 and #host.messages == 3,
   "duplicate receipt removed another message or duplicated host input")
@@ -2830,18 +2869,20 @@ compose("retract before output")
 submission.start(state, { text = "retract before output", context = state.presentation.capture_prompt() }, function() end)
 host.flush()
 local retracted = assert(retained_message("retract before output"))
-host.revision = host.revision + 1
-input.receive(state, { revision = host.revision, suspended = true, upsert = {}, removed = {}, retracted = retracted.id })
+host.retract(retracted.id)
 assert(composer_text() == "retract before output", "retraction did not restore the unchanged composer")
 host.flush()
+assert(not retained_message("retract before output"), "the restored prompt also stayed in the queue")
 compose("retract while typing")
 submission.start(state, { text = "retract while typing", context = state.presentation.capture_prompt() }, function() end)
 host.flush()
 retracted = assert(retained_message("retract while typing"))
 compose("preserve this")
-host.revision = host.revision + 1
-input.receive(state, { revision = host.revision, suspended = true, upsert = {}, removed = {}, retracted = retracted.id })
-assert(composer_text() == "preserve this" and assert(retained_message("retract while typing")).id == retracted.id)
+local request_count = #host.requests
+host.retract(retracted.id)
+local unsent = assert(retained_message("retract while typing"), "retraction over newer text lost the prompt")
+assert(composer_text() == "preserve this" and unsent.id ~= retracted.id and unsent.delivery == "failed")
+assert(#host.requests == request_count, "the editor removed an unsent prompt its composer never took")
 errors:assert_none()
 end
 -- requires-forge-host
@@ -3276,8 +3317,19 @@ do
     providers = { mock = { command = { "mock" }, selectable = true } } } })
   require("forge.views.harness").open()
   wait_until(function() return state.ready and state.presentation and state.presentation.ready and state.input end, "startup", wait_options)
-  controller.cancel_turn()
-  wait_until(function() return not state.task_operation and not state.request_busy end, "pause", wait_options)
+  -- A turn the mock holds keeps the queued follow-ups waiting; a cancel with nothing running
+  -- pauses nothing.
+  local function mock_response(params)
+    local result, done
+    require("forge.client").request({ session_id = state.session.id, method = "session.provider.mock_response",
+      params = params }, function(value) result, done = value, true end)
+    wait_until(function() return done end, "mock response " .. params.operation, wait_options)
+    return result
+  end
+  local hold = mock_response({ operation = "hold" })
+  compose("Hold this turn")
+  controller.submit()
+  mock_response({ operation = "wait", id = hold.id })
   local original = "first queued line\nfirst hidden line"
   local selected = "second queued line\n" .. string.rep("complete draft line 界\n", 12) .. "last draft line"
   compose(original)
@@ -3290,7 +3342,7 @@ do
   assert(status:find("first queued line", 1, true) and status:find("second queued line", 1, true))
   assert(not status:find("first hidden line", 1, true) and not status:find("last draft line", 1, true))
   assert(not transcript:find("first queued line", 1, true) and not transcript:find("second queued line", 1, true))
-  assert(state.presentation.status_view.window ~= nil, "paused queue did not keep the split visible")
+  assert(state.presentation.status_view.window ~= nil, "waiting queue did not keep the split visible")
   controller.edit_queued(-1)
   assert(text() == selected, "editing waited for acknowledgement or lost the complete draft")
   settled()
@@ -3317,6 +3369,10 @@ do
   end, "edit commit never released its reservation", wait_options)
   settled()
   assert(not state.queue_edit and #state.queue == 2)
+  -- Unqueueing while an unqueued draft waits keeps both: the message in the composer and the
+  -- earlier draft as the newest prompt-history entry, which Up recalls.
+  local saved_draft = "earlier unqueued draft"
+  compose(saved_draft)
   controller.edit_queued(-1)
   controller.queue_submit()
   -- Unqueueing is a host input mutation rather than a draft, so wait for the published queue.
@@ -3324,6 +3380,12 @@ do
   settled()
   assert(not state.queue_edit and #state.queue == 1 and text() == selected,
     "unqueue lost the complete message or removed another entry")
+  assert(state.prompt_history[1] and state.prompt_history[1].text == saved_draft, "unqueue discarded the saved draft")
+  vim.api.nvim_win_set_cursor(state.composer_win, { 1, 0 })
+  require("forge.views.harness.prompt_history").previous()
+  assert(text() == saved_draft, "Up did not recall the saved draft")
+  require("forge.views.harness.prompt_history").next()
+  assert(text() == selected, "Down did not return to the unqueued message")
 end
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
@@ -3495,6 +3557,95 @@ do
     ("opening a tab-closed session in the current tab changed the tab count from %d to %d")
       :format(tab_count, #vim.api.nvim_list_tabpages()))
   assert(vim.api.nvim_get_current_tabpage() == foxtrot_tab, "the tab-closed session opened outside the current tab")
+
+  -- Choosing a session that already has a tab returns the composer to the mode it had when the
+  -- picker opened, as opening a session without a tab does. Entering the other composer runs its
+  -- Normal-mode entry guard, so the mode must be restored after the switch.
+  local golf = create_session("golf")
+  local hotel = create_session("hotel")
+  local mode_command_list = {}
+  local original_cmd = vim.cmd
+  vim.cmd = setmetatable({}, {
+    __index = original_cmd,
+    __call = function(_, command)
+      if type(command) == "string" and command:find("insert", 1, true) then
+        mode_command_list[#mode_command_list + 1] = { command = command, window = vim.api.nvim_get_current_win() }
+      end
+      return original_cmd(command)
+    end,
+  })
+  MiniTest.finally(function() vim.cmd = original_cmd end)
+  local original_mode = vim.fn.mode
+  vim.fn.mode = function() return "i" end
+  vim.api.nvim_set_current_win(golf.composer_win)
+  controller.open_session_picker()
+  wait_until(function() return picker.is_open("sessions") end, "session picker did not open")
+  vim.fn.mode = original_mode
+  keymap.invoke("/")
+  local hotel_picker = picker._state_for_test()
+  buffer.set(hotel_picker.search_buf, { "hotel" })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = hotel_picker.search_buf })
+  mode_command_list = {}
+  keymap.invoke("<CR>", { mode = "i" })
+  wait_until(function() return session.harness == hotel and not picker.is_open() end, "hotel did not open")
+  local last = mode_command_list[#mode_command_list]
+  assert(last and last.command:find("^startinsert") and last.window == hotel.composer_win
+    and vim.api.nvim_get_current_win() == hotel.composer_win,
+    "the composer of the chosen session did not return to Insert mode: " .. vim.inspect(mode_command_list))
+  vim.cmd = original_cmd
+
+  -- The preview draws over the transcript and leaves its window alone. Swapping the window's
+  -- buffer closed the transcript's view, and the host discards a closed view's expanded sections,
+  -- so closing the picker redrew the transcript with the user's expansions folded again.
+  local india = create_session("india")
+  create_session("juliet")
+  local view_close_count = 0
+  local request = client.request
+  client.request = function(spec, callback)
+    if spec.session_id == "india" and spec.method == "session.document" and (spec.params or {}).operation == "close_view" then
+      view_close_count = view_close_count + 1
+    end
+    return request(spec, callback)
+  end
+  vim.api.nvim_win_call(india.transcript_win, function() vim.fn.winrestview({ topline = 1, lnum = 1, col = 2 }) end)
+  local india_view = vim.api.nvim_win_call(india.transcript_win, vim.fn.winsaveview)
+  local window_buffer_list = {}
+  local leave_group = vim.api.nvim_create_augroup("PreviewKeepsTranscript", { clear = true })
+  vim.api.nvim_create_autocmd("BufWinLeave", { group = leave_group, buffer = india.transcript_buf,
+    callback = function() window_buffer_list[#window_buffer_list + 1] = "left" end })
+  ---@return string[]? lines of the float that previews a session, when one is shown
+  local function preview_lines()
+    for _, window in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(window), 0, -1, false)
+      if vim.api.nvim_win_get_config(window).relative ~= "" and (lines[1] or ""):find("^preview ") then return lines end
+    end
+  end
+  local function highlight(session_id)
+    local search = picker._state_for_test().search_buf
+    buffer.set(search, { session_id })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = search })
+  end
+  vim.api.nvim_set_current_win(india.composer_win)
+  controller.open_session_picker()
+  wait_until(function() return picker.is_open("sessions") end, "session picker did not open")
+  keymap.invoke("/")
+  highlight("juliet")
+  wait_until(function() return vim.deep_equal(preview_lines(), { "preview juliet" }) end,
+    "the highlighted session was not previewed")
+  eq(vim.api.nvim_win_get_buf(india.transcript_win), india.transcript_buf)
+  -- The current session's own transcript is already on screen, so its entry shows no preview.
+  highlight("india")
+  wait_until(function() return preview_lines() == nil end, "the current session was previewed over itself")
+  highlight("juliet")
+  wait_until(function() return preview_lines() ~= nil end, "the preview did not return")
+  picker.close(true)
+  eq(preview_lines(), nil)
+  client.request = request
+  vim.api.nvim_del_augroup_by_id(leave_group)
+  eq({ window_buffer_list, view_close_count }, { {}, 0 })
+  eq(vim.api.nvim_win_get_buf(india.transcript_win), india.transcript_buf)
+  local restored_view = vim.api.nvim_win_call(india.transcript_win, vim.fn.winsaveview)
+  eq({ restored_view.topline, restored_view.lnum, restored_view.col }, { india_view.topline, india_view.lnum, india_view.col })
   failures:assert_none()
 end
 end
@@ -3909,7 +4060,10 @@ T["question_answers_never_become_steering"] = function()
       end)
     end
     send()
-    wait_until(function() return done end, message, { context = function() return vim.inspect(result) end })
+    -- Each wait ends when the host publishes the awaited state; the limit only bounds a hung host,
+    -- which a loaded machine can slow well past the one-second default for a full provider hop.
+    wait_until(function() return done end, message, { timeout_ms = 4000,
+      context = function() return vim.inspect(result) end })
     active = false
     eq(failure, nil)
     return result
@@ -4148,6 +4302,363 @@ T["batched_answers_share_one_transcript_group"] = function()
   verify_answered_question_group(true)
 end
 
+-- A prompt submitted to an idle session starts its turn at once, so it never belongs in the
+-- "Queued follow-up inputs" section; showing it there opened the status split for one frame. A
+-- prompt that does wait keeps its row from the moment it is queued until its own turn shows it,
+-- and the session never reports idle in between, because either gap closed the split and reopened
+-- it. Every input render is sampled, since the coalesced screen render shows only some of them.
+-- requires-forge-host
+T["submitted_prompts_stage_without_a_flash_or_a_gap"] = function()
+  local workspace = temp.directory("staging-continuity")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  host.start({ config = true })
+  local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
+  local session = require("forge.session")
+  local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  vim.fn.chdir(workspace)
+  require("forge").setup({ diff_logging = false, harness = { provider = "mock" } })
+  require("forge.views.harness").open()
+  local state = session.harness
+  MiniTest.finally(function()
+    pcall(require("forge.views.harness.workspace").release, session.harness)
+    if session.harness.presentation then pcall(session.harness.presentation.close) end
+  end)
+  wait_until(function()
+    return state.ready and state.session ~= nil and state.presentation and state.presentation.ready
+      and state.input ~= nil
+  end, "Harness did not start")
+  local controller = require("forge.views.harness.controller")
+  local function status_text()
+    local status = state.presentation.status_view
+    return status and vim.api.nvim_buf_is_valid(status.buffer) and buffer.text(status.buffer) or ""
+  end
+  local function texts(entries)
+    return vim.tbl_map(function(entry) return entry.text end, entries)
+  end
+  local samples = {}
+  local changed = state.input.changed
+  state.input.changed = function()
+    samples[#samples + 1] = { queue = texts(state.queue), handoff = texts(state.pending_handoff),
+      status = state.status and state.status.kind or "idle" }
+    changed()
+  end
+
+  local first = mock_provider.hold(state.session.id)
+  buffer.set(state.composer_buf, { "Start the task" })
+  controller.submit()
+  eq(first:wait().prompt, "Start the task")
+  wait_until(function() return #state.pending_submit == 0 end, "the started prompt never left the input projection")
+  for _, sample in ipairs(samples) do
+    eq({ sample.queue, sample.handoff }, { {}, {} })
+  end
+  eq(status_text():find("Queued follow-up inputs", 1, true), nil)
+
+  local second = mock_provider.hold(state.session.id)
+  buffer.set(state.composer_buf, { "Then summarize it" })
+  controller.queue_submit()
+  -- The local draft is staged before the host commits it; the hand-off needs the committed entry.
+  wait_until(function()
+    return #state.queue == 1 and not state.queue[1].local_only
+      and status_text():find("Then summarize it", 1, true) ~= nil
+  end, "the queued follow-up never reached the status section")
+  samples = {}
+  first:release()
+  eq(second:wait().prompt, "Then summarize it")
+  wait_until(function() return #state.pending_handoff == 0 and #state.queue == 0 end,
+    "the started follow-up never left the input projection")
+  -- The row leaves once, at the acceptance that follows the transcript row, and never returns.
+  local handed_off, left = false, false
+  for _, sample in ipairs(samples) do
+    local staged = vim.list_extend(vim.list_slice(sample.handoff), sample.queue)
+    if #staged == 0 then left = true else eq({ left, staged }, { false, { "Then summarize it" } }) end
+    handed_off = handed_off or #sample.handoff == 1
+    eq(sample.status ~= "idle", true)
+  end
+  eq({ handed_off, left }, { true, true })
+  wait_until(function()
+    return buffer.text(state.transcript_buf):find("Then summarize it", 1, true) ~= nil
+      and status_text():find("Queued follow-up inputs", 1, true) == nil
+  end, "the started follow-up stayed in the status section")
+  second:release()
+  wait_until(function()
+    return state.status.kind == "idle" and not require("forge.views.harness.activity").busy(state)
+  end, "the follow-up turn did not settle")
+  diagnostics:assert_none()
+  eq(host.stop(), true)
+end
+
+-- A long finished exchange that hands off to a queued follow-up stays at the tail while the
+-- composer follows the stream. Revealing its prompt at the top of the window, as a final
+-- settlement does, moved the transcript up and back down within a tenth of a second.
+-- requires-forge-host
+T["queued_hand_off_never_reveals_the_finished_prompt"] = function()
+  vim.o.lines, vim.o.columns = 30, 80
+  local workspace = temp.directory("hand-off-reveal")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  host.start({ config = true })
+  local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
+  local session = require("forge.session")
+  local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  vim.fn.chdir(workspace)
+  require("forge").setup({ diff_logging = false, harness = { provider = "mock" } })
+  -- The reveal owns the move, so the top row is sampled after each of its publications.
+  local top_lines
+  local Reveal = require("forge.views.harness.response_reveal")
+  local publish = Reveal.publish
+  Reveal.publish = function(self, document, views, reset, handoff)
+    publish(self, document, views, reset, handoff)
+    if not top_lines then return end
+    local top = vim.fn.line("w0", session.harness.transcript_win)
+    top_lines[#top_lines + 1] = vim.api.nvim_buf_get_lines(document.buffer, top - 1, top, false)[1]
+  end
+  require("forge.views.harness").open()
+  local state = session.harness
+  MiniTest.finally(function()
+    pcall(require("forge.views.harness.workspace").release, session.harness)
+    if session.harness.presentation then pcall(session.harness.presentation.close) end
+  end)
+  wait_until(function()
+    return state.ready and state.session ~= nil and state.presentation and state.presentation.ready
+      and state.input ~= nil
+  end, "Harness did not start")
+  local controller = require("forge.views.harness.controller")
+  local function mock_response(params)
+    local done, failure
+    require("forge.client").request({ session_id = state.session.id, method = "session.provider.mock_response",
+      params = params }, function(_, diagnostic) done, failure = true, diagnostic end)
+    wait_until(function() return done end, "mock response " .. params.operation)
+    assert(not failure, failure)
+  end
+  local paragraphs = {}
+  for index = 1, 15 do paragraphs[index] = "Paragraph " .. index .. " of the long reply." end
+  mock_response({ operation = "script", script = { steps = {
+    { kind = "message", content = "response", text = table.concat(paragraphs, "\n\n") },
+    { kind = "barrier", id = "long-reply-end" },
+  }, terminal = "completed" } })
+  buffer.set(state.composer_buf, { "Write the long reply" })
+  controller.submit()
+  mock_response({ operation = "wait", id = "long-reply-end" })
+  wait_until(function()
+    return buffer.text(state.transcript_buf):find("Paragraph 15 of the long reply.", 1, true) ~= nil
+  end, "the long reply never reached the transcript")
+  local follow_up = mock_provider.hold(state.session.id)
+  buffer.set(state.composer_buf, { "Then reply briefly" })
+  controller.queue_submit()
+  wait_until(function() return #state.queue == 1 and not state.queue[1].local_only end,
+    "the queued follow-up never reached the host")
+  eq(vim.api.nvim_get_current_win(), state.composer_win)
+  top_lines = {}
+  mock_response({ operation = "release", id = "long-reply-end" })
+  eq(follow_up:wait().prompt, "Then reply briefly")
+  wait_until(function()
+    return buffer.text(state.transcript_buf):find("Then reply briefly", 1, true) ~= nil
+      and not state.presentation.syncing and not state.presentation.pending
+  end, "the follow-up never reached the transcript")
+  eq(#top_lines > 0, true)
+  for _, line in ipairs(top_lines) do
+    eq(line:find("Write the long reply", 1, true), nil)
+  end
+  follow_up:release()
+  wait_until(function()
+    return state.status.kind == "idle" and not require("forge.views.harness.activity").busy(state)
+  end, "the follow-up turn did not settle")
+  diagnostics:assert_none()
+  eq(host.stop(), true)
+end
+
+-- While the composer follows a stream, every committed revision keeps the rows the previous one
+-- showed at the tail of the live exchange. A revision that dropped a tail row for one frame and
+-- restored it in the next bounced the followed view up and back.
+-- requires-forge-host
+T["first_reply_never_drops_a_tail_row_between_revisions"] = function()
+  vim.o.lines, vim.o.columns = 30, 80
+  local workspace = temp.directory("first-reply-tail")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  host.start({ config = true })
+  local session = require("forge.session")
+  local diagnostics = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  vim.fn.chdir(workspace)
+  require("forge").setup({ diff_logging = false, harness = { provider = "mock" } })
+  require("forge.views.harness").open()
+  local state = session.harness
+  MiniTest.finally(function()
+    pcall(require("forge.views.harness.workspace").release, session.harness)
+    if session.harness.presentation then pcall(session.harness.presentation.close) end
+  end)
+  wait_until(function()
+    return state.ready and state.session ~= nil and state.presentation and state.presentation.ready
+      and state.input ~= nil
+  end, "Harness did not start")
+  local controller = require("forge.views.harness.controller")
+  local function mock_response(params)
+    local done, failure
+    require("forge.client").request({ session_id = state.session.id, method = "session.provider.mock_response",
+      params = params }, function(_, diagnostic) done, failure = true, diagnostic end)
+    wait_until(function() return done end, "mock response " .. params.operation)
+    assert(not failure, failure)
+  end
+  -- Each committed revision is sampled from the prompt down, which is what a followed window
+  -- shows at its bottom.
+  local samples = {}
+  local replica = require("forge.buffer")
+  local apply_patch, apply_snapshot = replica.apply_patch, replica.apply_snapshot
+  local function sample(document)
+    if document.buffer == state.transcript_buf then
+      local lines = vim.api.nvim_buf_get_lines(document.buffer, 0, -1, false)
+      local tail = {}
+      for index = #lines, 1, -1 do
+        table.insert(tail, 1, lines[index])
+        if lines[index]:find("Explain the first reply", 1, true) then break end
+      end
+      samples[#samples + 1] = tail
+    end
+  end
+  -- Patches and the snapshots of a full reflow both commit revisions the window can draw.
+  replica.apply_patch = function(document, patch)
+    local result = apply_patch(document, patch)
+    sample(document)
+    return result
+  end
+  replica.apply_snapshot = function(document, snapshot, render_source)
+    local result = apply_snapshot(document, snapshot, render_source)
+    sample(document)
+    return result
+  end
+  -- Copilot streams prose before its role is known and names the phase only in the final
+  -- snapshot, so the reply is unclassified while it arrives and classified at completion.
+  local barriers, steps = {}, {
+    { kind = "message", content = { reasoning = "summary" }, text = "Weighing the request" },
+    { kind = "unclassified_message_start", item = "reply", text = "The first reply" },
+  }
+  local function barrier(id)
+    barriers[#barriers + 1] = id
+    steps[#steps + 1] = { kind = "barrier", id = id }
+  end
+  barrier("after-start")
+  steps[#steps + 1] = { kind = "message_delta", item = "reply", text = " begins here." }
+  barrier("after-first-delta")
+  -- The reply grows past the folded preview while it streams, one paragraph per delta.
+  for paragraph = 1, 8 do
+    -- Copilot's concise reasoning stream interleaves with the message it accompanies.
+    steps[#steps + 1] = { kind = "message", content = { reasoning = "summary" }, text = "Checking paragraph " .. paragraph }
+    steps[#steps + 1] = { kind = "message_delta", item = "reply",
+      text = "\n\nParagraph " .. paragraph .. " of the streamed reply." }
+    barrier("after-paragraph-" .. paragraph)
+  end
+  steps[#steps + 1] = { kind = "message_completion", item = "reply", content = "response" }
+  barrier("after-reply")
+  mock_response({ operation = "script", script = { steps = steps, terminal = "completed" } })
+  buffer.set(state.composer_buf, { "Explain the first reply" })
+  controller.submit()
+  for _, barrier in ipairs(barriers) do
+    mock_response({ operation = "wait", id = barrier })
+    wait_until(function()
+      return not state.presentation.syncing and not state.presentation.pending and not state.presentation.applying
+    end, "the transcript never settled at " .. barrier)
+    local paragraph = barrier:match("^after%-paragraph%-(%d+)$")
+    if paragraph then
+      wait_until(function()
+        return buffer.text(state.transcript_buf):find("Paragraph " .. paragraph .. " of the streamed reply.", 1, true) ~= nil
+      end, "streamed paragraph " .. paragraph .. " never reached the transcript")
+    end
+    if barrier ~= "after-reply" then mock_response({ operation = "release", id = barrier }) end
+  end
+  wait_until(function()
+    return buffer.text(state.transcript_buf):find("The first reply begins here.", 1, true) ~= nil
+  end, "the first reply never reached the transcript")
+  replica.apply_patch, replica.apply_snapshot = apply_patch, apply_snapshot
+  -- The samples reach the reply, so the comparison below covers its arrival.
+  eq(table.concat(samples[#samples], "\n"):find("The first reply begins here.", 1, true) ~= nil, true)
+  -- A row present in one revision stays in the next, so the tail grows or changes in place.
+  local first = 1
+  while first <= #samples and #samples[first] <= 1 do first = first + 1 end
+  for index = first + 1, #samples do
+    local previous, current = samples[index - 1], samples[index]
+    if #current < #previous then
+      error(("revision %d dropped tail rows:\n%s\n--- became ---\n%s"):format(index,
+        table.concat(previous, "\n"), table.concat(current, "\n")))
+    end
+  end
+  mock_response({ operation = "release", id = "after-reply" })
+  wait_until(function()
+    return state.status.kind == "idle" and not require("forge.views.harness.activity").busy(state)
+  end, "the reply turn did not settle")
+  diagnostics:assert_none()
+  eq(host.stop(), true)
+end
+
+-- A followed transcript that started inside a wrapped line bounced between that partial row and
+-- the paragraph start on every update while the composer stayed in Insert mode. The transcript
+-- window positions in whole lines, so its view only ever moves forward while a paragraph grows.
+T["followed_transcript_view_only_moves_forward_while_a_wrapped_paragraph_grows"] = function()
+  vim.o.lines, vim.o.columns = 24, 60
+  -- An earlier Harness tab or the user's own setting can leave smooth scrolling on globally.
+  local global_smoothscroll = vim.go.smoothscroll
+  MiniTest.finally(function() vim.go.smoothscroll = global_smoothscroll end)
+  vim.go.smoothscroll = true
+  local workspace = temp.directory("wrapped-tail")
+  vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
+  host.start({ config = true })
+  local session = require("forge.session")
+  vim.fn.chdir(workspace)
+  require("forge").setup({ diff_logging = false, harness = { provider = "mock" } })
+  require("forge.views.harness").open()
+  local state = session.harness
+  MiniTest.finally(function()
+    pcall(vim.cmd.stopinsert)
+    pcall(require("forge.views.harness.workspace").release, session.harness)
+    if session.harness.presentation then pcall(session.harness.presentation.close) end
+  end)
+  wait_until(function()
+    return state.ready and state.session ~= nil and state.presentation and state.presentation.ready
+      and state.input ~= nil
+  end, "Harness did not start")
+  eq(vim.wo[state.transcript_win].smoothscroll, false)
+  local function mock_response(params)
+    local done, failure
+    require("forge.client").request({ session_id = state.session.id, method = "session.provider.mock_response",
+      params = params }, function(_, diagnostic) done, failure = true, diagnostic end)
+    wait_until(function() return done end, "mock response " .. params.operation)
+    assert(not failure, failure)
+  end
+  local barriers, steps = {}, {
+    { kind = "unclassified_message_start", item = "reply", text = "Growing reply begins" },
+  }
+  for chunk = 1, 24 do
+    steps[#steps + 1] = { kind = "message_delta", item = "reply",
+      text = (" chunk %02d widens the one paragraph that keeps wrapping"):format(chunk) }
+    barriers[#barriers + 1] = "after-chunk-" .. chunk
+    steps[#steps + 1] = { kind = "barrier", id = barriers[#barriers] }
+  end
+  steps[#steps + 1] = { kind = "message_completion", item = "reply", content = "response" }
+  mock_response({ operation = "script", script = { steps = steps, terminal = "completed" } })
+  buffer.set(state.composer_buf, { "Write one long paragraph" })
+  vim.api.nvim_set_current_win(state.composer_win)
+  require("forge.views.harness.controller").submit()
+  vim.api.nvim_feedkeys("A", "xn!", false)
+  eq(vim.fn.mode(), "i")
+  local previous
+  for index, barrier in ipairs(barriers) do
+    mock_response({ operation = "wait", id = barrier })
+    local marker = ("chunk %02d"):format(index)
+    wait_until(function()
+      return buffer.text(state.transcript_buf):find(marker, 1, true) ~= nil
+        and not state.presentation.syncing and not state.presentation.pending and not state.presentation.applying
+    end, "the transcript never showed " .. marker)
+    vim.cmd("redraw")
+    local view = vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)
+    local current = { view.topline, view.skipcol }
+    if previous and (current[1] < previous[1] or current[1] == previous[1] and current[2] < previous[2]) then
+      error(("the transcript view moved back at %s: %s after %s"):format(barrier, vim.inspect(current), vim.inspect(previous)))
+    end
+    previous = current
+    mock_response({ operation = "release", id = barrier })
+  end
+  eq(vim.fn.mode(), "i")
+  eq(vim.go.smoothscroll, true)
+  eq(host.stop(), true)
+end
+
 -- An acknowledged steer has reached the provider but not the model. MockProvider consumes
 -- steering only when its held response begins, so until then the message belongs in the
 -- "Steering active turn" status section, and the transcript row appears at consumption.
@@ -4212,9 +4723,18 @@ T["steering_waits_for_consumption"] = function()
   buffer.set(state.composer_buf, { "Start the task" })
   controller.submit()
   eq(hold:wait().prompt, "Start the task")
+  -- The steer is drawn as steering or not at all; it never passes through the follow-up queue.
+  local queued_steer = false
+  local changed = state.input.changed
+  state.input.changed = function()
+    for _, entry in ipairs(state.queue) do queued_steer = queued_steer or entry.text == steer_text end
+    changed()
+  end
   buffer.set(state.composer_buf, { steer_text })
   controller.steer_submit()
   wait_until(waiting_in_status, "acknowledged steering left the status section before consumption", wait_options)
+  eq(queued_steer, false)
+  state.input.changed = changed
 
   -- Closing the panes and reopening the retained session keeps the steer waiting.
   vim.cmd("aboveleft new")

@@ -31,6 +31,8 @@ pub struct StatusAgent {
     pub(crate) metrics: ExchangeMetrics,
     /// Successfully completed tool calls in the child exchange.
     pub tool_completed: usize,
+    /// Tool calls a permission decision refused before they ran.
+    pub tool_denied: usize,
     /// Every tool call in the child exchange, including running and failed calls.
     pub tool_total: usize,
     /// Newest readable reasoning summary of the child's running turn, when shown.
@@ -146,6 +148,7 @@ fn snapshot(
         clock: exchange.clock.clone(),
         metrics: exchange.metrics.clone(),
         tool_completed: exchange.tool_counter.completed,
+        tool_denied: exchange.tool_counter.denied,
         tool_total: exchange.tool_counter.total,
         reasoning_summary: status_thoughts
             .then(|| exchange.latest_reasoning_summary().map(str::to_owned))

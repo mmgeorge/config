@@ -104,9 +104,7 @@ pub fn spawn_owned(
 ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
     #[cfg(windows)]
     {
-        let mut command = command;
-        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-        process_wrap::tokio::JobObject::spawn(&mut command)
+        spawn_contained(command, None)
     }
     #[cfg(not(windows))]
     {
@@ -119,5 +117,87 @@ pub fn spawn_owned(
     }
 }
 
+/// Launch into a kill-on-close job, nested in `parent` when the caller registered one.
+///
+/// The job is attached at process creation. Windows refuses that creation attribute with
+/// `ERROR_ACCESS_DENIED` for a packaged app's execution alias, such as the Store build of
+/// `pwsh`, while another launch of that app is in flight, so a refused launch is repeated
+/// suspended and assigned to `parent` and then to its own job before its first instruction runs,
+/// which gives the same containment.
+#[cfg(windows)]
+pub(crate) fn spawn_contained(
+    command: Command,
+    parent: Option<std::os::windows::io::BorrowedHandle<'_>>,
+) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+    use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+    let mut command = command;
+    command.creation_flags(CREATE_NO_WINDOW.0);
+    let launched = match parent {
+        Some(parent) => JobObject::spawn_in(&mut command, parent),
+        None => JobObject::spawn(&mut command),
+    };
+    match launched {
+        Err(error) if job_attribute_refused(&error) => {
+            let mut suspended = CommandWrap::from(command);
+            suspended.wrap(CreationFlags(CREATE_NO_WINDOW));
+            if let Some(parent) = parent {
+                suspended.wrap(ParentJob(parent.as_raw_handle() as isize));
+            }
+            suspended.wrap(JobObject).wrap(KillOnDrop);
+            suspended.spawn()
+        }
+        launched => launched,
+    }
+}
+
+/// Report whether Windows refused the job-list creation attribute rather than the launch.
+#[cfg(windows)]
+fn job_attribute_refused(error: &std::io::Error) -> bool {
+    error.raw_os_error() == i32::try_from(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0).ok()
+}
+
+/// Assign a suspended child to a registered parent job before `JobObject` nests its own job.
+///
+/// Holds the raw handle value because wrappers must be `'static`; the caller's borrowed handle
+/// outlives the spawn call that uses it.
+#[cfg(windows)]
+#[derive(Debug)]
+struct ParentJob(isize);
+
+#[cfg(windows)]
+impl process_wrap::tokio::CommandWrapper for ParentJob {
+    fn post_spawn(
+        &mut self,
+        _command: &mut Command,
+        child: &mut tokio::process::Child,
+        _core: &process_wrap::tokio::CommandWrap,
+    ) -> std::io::Result<()> {
+        use windows::Win32::{Foundation::HANDLE, System::JobObjects::AssignProcessToJobObject};
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| std::io::Error::other("suspended child has no process handle"))?;
+        // SAFETY: the parent job handle is live for the spawn call, and the child is suspended
+        // until `JobObject` resumes it after both assignments.
+        unsafe { AssignProcessToJobObject(HANDLE(self.0 as _), HANDLE(process)) }
+            .map_err(std::io::Error::other)
+    }
+}
+
 #[cfg(all(test, windows))]
-mod tests {}
+mod tests {
+    use super::job_attribute_refused;
+
+    /// Only an access-denied refusal repeats the launch suspended; other failures stand.
+    #[test]
+    fn only_access_denied_falls_back_to_a_suspended_launch() {
+        assert!(job_attribute_refused(&std::io::Error::from_raw_os_error(5)));
+        assert!(!job_attribute_refused(&std::io::Error::from_raw_os_error(
+            2
+        )));
+        assert!(!job_attribute_refused(&std::io::Error::other(
+            "access denied"
+        )));
+    }
+}

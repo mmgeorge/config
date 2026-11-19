@@ -122,9 +122,10 @@ M.view_specs = {
         queue_edit = function(state) if state.queue_edit then return "unqueue" end end } },
     { id = "steer", label = "steer", desc = "Send the composer into the active provider turn", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if require("forge.views.harness.activity").busy(state) and state.capability and state.capability.native_steer then return "steer" end end } },
-    { id = "retry_input", label = "retry input", desc = "Retry the first failed input, or reconcile unconfirmed delivery", modes = { "n", "i" }, pinned = false,
+    { id = "retry_input", label = "retry input", desc = "Retry the first failed input, resume a paused queue, or reconcile unconfirmed delivery", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state)
         for _, entry in ipairs(state.queue or {}) do if entry.error then return "retry input" end end
+        if state.input and state.input.suspended and #(state.queue or {}) > 0 then return "resume queue" end
       end } },
     { id = "cancel", label = "cancel", desc = "Interrupt without sending the composer (restore prompt if output-free)", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if require("forge.views.harness.activity").busy(state) then return "cancel" end end,
@@ -186,9 +187,9 @@ M.view_specs = {
   },
   picker = {
     { id = "help", label = "help", desc = "Show picker help", modes = "n", pinned = true },
-    { id = "previous", label = "previous", desc = "Highlight the previous planning option", modes = "n", pinned = false },
-    { id = "next", label = "next", desc = "Highlight the next planning option", modes = "n", pinned = false },
-    { id = "select", label = "select", desc = "Select the highlighted planning option", modes = "n", pinned = false },
+    { id = "previous", label = "previous", desc = "Highlight the previous option", modes = "n", pinned = false },
+    { id = "next", label = "next", desc = "Highlight the next option", modes = "n", pinned = false },
+    { id = "select", label = "select", desc = "Select the highlighted option", modes = "n", pinned = false },
     { id = "feedback", label = "feedback", desc = "Select with additional feedback", modes = "n", pinned = false },
     { id = "page_previous", label = "previous page", desc = "Show the previous picker page", modes = "n", pinned = false },
     { id = "page_next", label = "next page", desc = "Show the next picker page", modes = "n", pinned = false },

@@ -1332,7 +1332,7 @@ impl HarnessBroker {
             request
                 .input
                 .push_notice(forge_provider_api::forge::Notice::PermissionTimeout {
-                    feedback: feedback.feedback().to_owned(),
+                    feedback: feedback.feedback(),
                 });
         }
         let policy = request
@@ -2325,6 +2325,38 @@ impl HarnessBroker {
 }
 
 impl HarnessBroker {
+    /// Drop approval-timeout feedback that a normally completed exchange already answered.
+    ///
+    /// The provider receives an expiry as the tool's rejection inside the running turn. When
+    /// that turn then completes normally, the model has already answered it, and a continuation
+    /// would start a second exchange that repeats the answer. The exchange's own transcript keeps
+    /// the timed-out request beside its tool row.
+    pub(crate) fn discard_answered_timeout_feedback(
+        &self,
+        interaction: &crate::exchange::Exchange,
+    ) -> Result<()> {
+        if interaction.state() != crate::exchange::ExchangeState::Complete
+            || !crate::task::latest_turn_completed_normally(interaction)
+        {
+            return Ok(());
+        }
+        let turns = interaction
+            .turn
+            .iter()
+            .map(|turn| {
+                (
+                    turn.provider().thread_id.clone(),
+                    turn.provider().turn_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.permission_coordinator
+            .discard_settled_timeout_feedback(
+                &crate::provider::ThreadOwner::root(&self.session.id),
+                &turns,
+            )
+    }
+
     /// Stage approval-timeout feedback without borrowing broker state across provider work.
     pub(crate) fn begin_approval_timeout_dispatch(
         &mut self,
@@ -2335,7 +2367,7 @@ impl HarnessBroker {
         let mut dispatch = None;
         if let Some(feedback) = feedback {
             let display = feedback.display(&self.store.list_exchange(&self.session.id)?)?;
-            let feedback = feedback.feedback().to_owned();
+            let feedback = feedback.feedback();
             if let Some(task) = self.task_controller.current()? {
                 if matches!(
                     task.status(),

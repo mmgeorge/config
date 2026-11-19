@@ -61,6 +61,34 @@ impl StatusProjection {
     }
 }
 
+impl StatusProjection {
+    /// Record when a running label of a status entry next shows a new value.
+    pub fn label_due(
+        entry: &crate::timeline::TimelineEntry,
+        now_ms: i64,
+        due: &mut super::duration::LabelDue,
+    ) {
+        if let crate::timeline::TimelineEntry::Status {
+            id,
+            status,
+            agents,
+            status_thoughts,
+            checks,
+            ..
+        } = entry
+        {
+            StatusView {
+                id,
+                status,
+                agents,
+                status_thoughts: *status_thoughts,
+                checks: checks.as_ref(),
+            }
+            .label_due(now_ms, due);
+        }
+    }
+}
+
 /// Native status and action targets retired with their parent presentation.
 pub(super) struct StatusDocument {
     id: DocumentId,
@@ -216,6 +244,13 @@ impl StatusView<'_> {
         block.metadata.status = Some(StatusPresentation {
             row: 0,
             animated: checking || delegating || status.animated(),
+            handoff: matches!(
+                status,
+                SessionPhase::Working {
+                    activity: WorkflowActivity::HandingOff,
+                    ..
+                }
+            ),
             hint: if checking || delegating {
                 Some(StatusHint::Working)
             } else {
@@ -254,6 +289,58 @@ impl StatusView<'_> {
             block: Some(block),
             action,
         })
+    }
+}
+
+impl StatusView<'_> {
+    /// Record the next change of each running clock that `render` formats.
+    ///
+    /// Each clause names the clock of one label: the primary phase row, the provider retry
+    /// countdown, the check heading and running commands, and each child agent with its tools.
+    fn label_due(&self, now_ms: i64, due: &mut super::duration::LabelDue) {
+        match self.status {
+            SessionPhase::Working {
+                started_at_ms: Some(_),
+                ..
+            }
+            | SessionPhase::RetryingPlanGeneration {
+                started_at_ms: Some(_),
+                ..
+            }
+            | SessionPhase::Compacting { .. } => {
+                due.elapsed(now_ms, self.status.elapsed_ms(now_ms));
+            }
+            SessionPhase::RetryingProvider {
+                retry:
+                    crate::provider::retry::ProviderRetry {
+                        retry_at_ms: Some(deadline),
+                        ..
+                    },
+                ..
+            } => due.countdown(now_ms, *deadline),
+            _ => {}
+        }
+        if let Some(checks) = self.checks {
+            if checks.started_at_ms.is_some() {
+                due.elapsed(now_ms, checks.elapsed_ms(now_ms));
+            }
+            for command in &checks.command_list {
+                if command.state == CheckState::Running
+                    && let Some(elapsed) = command.elapsed_ms(now_ms)
+                {
+                    due.elapsed(now_ms, elapsed);
+                }
+            }
+        }
+        for agent in self.agents {
+            if agent.starting {
+                continue;
+            }
+            due.elapsed(now_ms, agent.elapsed_ms(now_ms));
+            if let Some(tool_ms) = agent.tool_ms(now_ms) {
+                due.elapsed(now_ms, tool_ms);
+            }
+        }
     }
 }
 
@@ -615,8 +702,11 @@ fn append_agents(
             agent.label, agent.selection_label
         );
         if let Some(tools) = super::projection::tool_count_label(
-            agent.tool_completed,
-            agent.tool_total,
+            super::projection::ToolTally {
+                successful: agent.tool_completed,
+                denied: agent.tool_denied,
+                total: agent.tool_total,
+            },
             agent.tool_ms(now_ms),
         ) {
             row.push_str(&format!(" │ {tools}"));
@@ -1061,6 +1151,7 @@ mod tests {
             },
             metrics,
             tool_completed: tools.0,
+            tool_denied: 0,
             tool_total: tools.1,
             reasoning_summary: reasoning.map(str::to_owned),
         }
@@ -1102,8 +1193,8 @@ mod tests {
             &[
                 "Working · 44s",
                 "└─ Agents · 3 running",
-                "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4 s │ Tracing reservation admission",
-                "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4 s",
+                "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4s │ Tracing reservation admission",
+                "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4s",
                 "      └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +",
             ]
         );
@@ -1185,7 +1276,7 @@ mod tests {
                 "├─ Checking · 0/1 finished · 3s",
                 "│  └─ ⠋ format · running · 3s",
                 "└─ Agents · 1 running",
-                "   └─ ⠋ 2s explorer · codex · gpt-6-luna + │ 1/1 tools · 2.4 s",
+                "   └─ ⠋ 2s explorer · codex · gpt-6-luna + │ 1/1 tools · 2.4s",
             ]
         );
         Ok(())
@@ -1218,6 +1309,81 @@ mod tests {
             );
             assert!(block.metadata.status.as_ref().unwrap().animated);
         }
+        Ok(())
+    }
+
+    /// Keep one animated row from the interrupt until settlement.
+    ///
+    /// Native collection usually ends within a few hundred milliseconds, so a row that renamed
+    /// itself and dropped its spinner when host settlement began changed twice under the reader.
+    /// A cleanup that outlives its response deadline is the only state that reads differently.
+    #[test]
+    fn stopping_reads_the_same_through_collection_and_settlement() -> Result<()> {
+        use crate::exchange::ExchangeCollection;
+        for (collection, text, animated) in [
+            (ExchangeCollection::Pending, "Stopping", true),
+            (ExchangeCollection::Settling, "Stopping", true),
+            (
+                ExchangeCollection::TimedOut,
+                "Cleanup timed out - provider state uncertain",
+                false,
+            ),
+        ] {
+            let status = SessionPhase::Stopping { collection };
+            let block = StatusView {
+                id: "status",
+                status: &status,
+                agents: &[],
+                status_thoughts: false,
+                checks: None,
+            }
+            .render(&WidthProfile::default(), 3_000)?
+            .block
+            .unwrap();
+            assert_eq!(block.text.wire_rows(), [text]);
+            assert_eq!(block.metadata.status.as_ref().unwrap().animated, animated);
+        }
+        Ok(())
+    }
+
+    /// Mark the predicted hand-off so the editor can tell it from ordinary work.
+    ///
+    /// The hand-off reads exactly like the admitted turn's first frame, `Working · 0s`, so the
+    /// status row never changes under the reader. Only the flag tells the editor that the
+    /// exchange that just settled is followed by a queued turn, which keeps the editor from
+    /// revealing the finished exchange a moment before the successor's output replaces it.
+    #[test]
+    fn hand_off_renders_as_working_and_carries_the_hand_off_flag() -> Result<()> {
+        let render = |activity| -> Result<BufferBlock> {
+            let status = SessionPhase::Working {
+                duration_ms: 0,
+                started_at_ms: None,
+                activity,
+                reasoning_summary: None,
+                execution: None,
+            };
+            Ok(StatusView {
+                id: "status",
+                status: &status,
+                agents: &[],
+                status_thoughts: false,
+                checks: None,
+            }
+            .render(&WidthProfile::default(), 3_000)?
+            .block
+            .unwrap())
+        };
+        let hand_off = render(WorkflowActivity::HandingOff)?;
+        let working = render(WorkflowActivity::Working)?;
+        assert_eq!(hand_off.text.wire_rows(), working.text.wire_rows());
+        assert!(hand_off.metadata.status.as_ref().unwrap().handoff);
+        assert!(!working.metadata.status.as_ref().unwrap().handoff);
+        let document =
+            BufferDocument::new(DocumentId("status-handoff:status".into()), vec![hand_off])?;
+        forge_recorded_fixtures::assert_matches_recording(
+            "status-handoff.json",
+            &serde_json::to_value(document.snapshot())?,
+        );
         Ok(())
     }
 }

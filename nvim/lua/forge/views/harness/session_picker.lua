@@ -36,11 +36,21 @@ local function option(entry, scope)
   }
 end
 
+---Preview `entry`, or invalidate the preview in flight when there is none.
+---The calling session's own transcript is already on screen beneath the picker, so its entry
+---removes the preview instead of drawing a copy of that transcript over it.
 ---@param instance table
-local function request_preview(instance, entry)
+---@param entry? table
+---@param visible_height? integer Rows of the transcript window that the picker leaves uncovered.
+local function request_preview(instance, entry, visible_height)
+  instance.preview_height = visible_height
   instance.preview_generation = instance.preview_generation + 1
   local generation = instance.preview_generation
   if not entry then return end
+  if entry.id == instance.owner_session_id then
+    session_preview.hide()
+    return
+  end
   if not instance.owner_session_id then
     notifications.warn("Wait for the calling session to initialize before previewing saved sessions.", "ForgeSessions")
     return
@@ -51,7 +61,7 @@ local function request_preview(instance, entry)
       notifications.error(request_error, "Session preview")
       return
     end
-    session_preview.render(result or {})
+    session_preview.render(result or {}, instance.preview_height)
   end)
 end
 
@@ -64,6 +74,13 @@ local function same_workspace(left, right)
 end
 
 ---@param instance table
+local function dismiss(instance)
+  picker.close(false)
+  session_preview.close()
+  if active == instance then active = nil end
+end
+
+---@param instance table
 ---@param entry table
 local function resume_session(instance, entry)
   local current_session = session.harness.session or {}
@@ -72,14 +89,18 @@ local function resume_session(instance, entry)
     return
   end
   if entry.provider ~= (instance.provider or current_session.provider) then
-    notifications.warn("This session uses a different configured provider.", "ForgeSessions")
+    -- The host serves one provider, so it cannot resume this session beside the current one. The
+    -- provider switch replaces the host and resumes the session there. Choosing a session is not
+    -- choosing a default provider, so the switch leaves the saved default alone. A switch that
+    -- cannot start reports its own reason, and the picker stays open on the selection.
+    local started = require("forge.views.harness").switch_provider(entry.provider,
+      { kind = "resume", session_id = entry.id, persist_default = false })
+    if started then dismiss(instance) end
     return
   end
-  picker.close(false)
-  session_preview.close()
-  active = nil
+  dismiss(instance)
   if instance.on_select then instance.on_select(entry)
-  else session_navigation.resume(entry.id, { open_mode = "current" }) end
+  else session_navigation.resume(entry.id, { open_mode = "current", insert = instance.composer_insert }) end
 end
 
 local build_spec
@@ -132,8 +153,7 @@ build_spec = function(instance)
       wrap_selection = false,
       empty_text = instance.entry_list_by_scope[scope] and "No matching Harness sessions." or "Loading sessions...",
       search = { start_in_normal = true, preserve_sections = true },
-      footer = instance.provider and "↑↓ select  / search  Enter resume  q back"
-        or "Tab scope  ↑↓ select  / search  Enter open  C-j delete  q close",
+      confirm_label = instance.provider and "resume" or "open",
     }
   end
   local function switch_scope()
@@ -149,12 +169,16 @@ build_spec = function(instance)
     width_ratio = 1,
     placement = "bottom",
     page_navigation = not instance.provider and "tabs" or nil,
+    -- The footer derives its hints from the effective bindings, which tabs switch between scopes.
+    command_footer = true,
+    page_hint = "scope",
     wrap_pages = true,
     page_list = page_list,
     action_list = instance.provider and {} or {
       {
         id = "scope",
         key = "<Tab>",
+        label = "scope",
         modes = { "n", "i" },
         desc = "Switch Workspace and All sessions",
         callback = switch_scope,
@@ -162,6 +186,7 @@ build_spec = function(instance)
       {
         id = "delete",
         key = "<C-j>",
+        label = "delete",
         modes = { "n", "i" },
         desc = "Delete selected Harness session",
         callback = function(context) delete_session(instance, context.option and context.option.value) end,
@@ -177,11 +202,11 @@ build_spec = function(instance)
     on_change = function(context)
       if instance.scope ~= context.page.id then
         instance.scope = context.page.id
-        request_preview(instance, nil)
+        request_preview(instance, nil, context.preview_height)
         load_session_list(instance)
         return
       end
-      request_preview(instance, context.option and context.option.value)
+      request_preview(instance, context.option and context.option.value, context.preview_height)
     end,
     on_confirm = function(result)
       resume_session(instance, result.option.value)
@@ -241,6 +266,9 @@ function SessionPicker.open(host, options)
     workspace = session.harness.session and session.harness.session.workspace,
     on_select = options.on_select,
     on_cancel = options.on_cancel,
+    -- The picker returns focus to the composer in this mode, and a chosen session's composer
+    -- takes it over.
+    composer_insert = vim.fn.mode(1):sub(1, 1) == "i",
   }
   active = instance
   load_session_list(instance)

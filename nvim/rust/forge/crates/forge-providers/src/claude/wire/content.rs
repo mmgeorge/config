@@ -155,6 +155,9 @@ pub(crate) struct AssistantMessage {
     pub content: Vec<ContentBlock>,
     #[serde(default)]
     pub stop_reason: Option<String>,
+    /// Usage of this API message as of the frame, including a message the client aborted.
+    #[serde(default)]
+    pub usage: Option<Usage>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -179,6 +182,46 @@ pub(crate) struct Usage {
 }
 
 impl Usage {
+    /// Apply a later report for the same API message; each reported field is cumulative.
+    pub(crate) fn update(&mut self, later: &Self) {
+        self.input_tokens = later.input_tokens.or(self.input_tokens);
+        self.output_tokens = later.output_tokens.or(self.output_tokens);
+        self.cache_creation_input_tokens = later
+            .cache_creation_input_tokens
+            .or(self.cache_creation_input_tokens);
+        self.cache_read_input_tokens = later
+            .cache_read_input_tokens
+            .or(self.cache_read_input_tokens);
+    }
+
+    /// Add another API message's usage, keeping a count only some messages reported.
+    pub(crate) fn accumulate(&mut self, other: &Self) {
+        let sum = |left: Option<u64>, right: Option<u64>| match (left, right) {
+            (Some(left), Some(right)) => left.checked_add(right),
+            (left, right) => left.or(right),
+        };
+        self.input_tokens = sum(self.input_tokens, other.input_tokens);
+        self.output_tokens = sum(self.output_tokens, other.output_tokens);
+        self.cache_creation_input_tokens = sum(
+            self.cache_creation_input_tokens,
+            other.cache_creation_input_tokens,
+        );
+        self.cache_read_input_tokens =
+            sum(self.cache_read_input_tokens, other.cache_read_input_tokens);
+    }
+
+    /// Report whether no token was counted, as on a result the client aborted mid-stream.
+    pub(crate) fn is_empty(&self) -> bool {
+        [
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+        ]
+        .into_iter()
+        .all(|count| count.unwrap_or(0) == 0)
+    }
+
     /// Get total prompt tokens including cache reads and writes.
     pub(crate) fn total_input(&self) -> Option<u64> {
         self.input_tokens?

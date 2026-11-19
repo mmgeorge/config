@@ -62,6 +62,11 @@ struct IdleEvidence {
     completed_at_ms: i64,
     outcome: IdleOutcome,
     root_turns: Vec<RootTurnEvidence>,
+    /// Accepted inputs that Copilot still queued when the root abort arrived.
+    ///
+    /// Copilot delivers a queued message only at its next turn boundary, and an abort discards
+    /// the queue without a `user.message`, so these inputs end interrupted without a turn.
+    discarded_inputs: HashSet<String>,
 }
 
 /// Coordinates prompt admission, interruption, and rewind identity for one Copilot runtime.
@@ -202,23 +207,62 @@ impl CopilotTurnEvent {
             );
             return Ok(());
         }
-        match &mut state.delivery {
-            TurnDelivery::Active(delivery) | TurnDelivery::Retained(delivery) => {
-                delivery.admission = SendAdmission::Closed
-            }
-            TurnDelivery::Idle => {}
-        }
-        state.terminal_inputs = Some(state.observed_inputs.clone());
         state.observed_idles.insert(event.id.clone(), outcome);
-        state.terminal_event = Some(IdleEvidence {
-            event_id: event.id.clone(),
-            completed_at_ms,
-            outcome,
-            root_turns: state.root_turns.clone(),
-        });
+        record_terminal(&mut state, &event.id, completed_at_ms, outcome);
         drop(state);
         self.sends_changed.notify_waiters();
         Ok(())
+    }
+
+    /// Settle an interrupted execution on its root abort when Copilot discarded queued input.
+    ///
+    /// Copilot queues a sent message until its next turn boundary, for example a steer during a
+    /// model call or input sent while a foreground MCP load is in flight. An abort discards that
+    /// queue and reports no `user.message` for it, and whether an idle follows is not part of the
+    /// native contract. Once every send has settled and no root turn is still running after the
+    /// abort, the abort is terminal evidence: each accepted input that never reached a turn ends
+    /// interrupted. Returns whether this event established that terminal state.
+    pub(crate) fn observe_abort_terminal(
+        &self,
+        event: &SessionEvent,
+        completed_at_ms: i64,
+    ) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+        let settles = event.agent_id.is_none()
+            && state.live_events.contains(&event.id)
+            && state.abort_event.is_some()
+            && state.terminal_event.is_none()
+            && state.pending_sends == 0
+            && !state.uncertain_send
+            && state
+                .root_turns
+                .iter()
+                .all(|root| matches!(root.phase, RootTurnPhase::Finished { .. }))
+            && state
+                .accepted_inputs
+                .iter()
+                .any(|message| !state.observed_inputs.contains(message))
+            && state
+                .accepted_inputs
+                .iter()
+                .filter(|message| state.observed_inputs.contains(*message))
+                .all(|message| {
+                    state
+                        .input_turns
+                        .get(message)
+                        .and_then(|input| input_root(&state.root_turns, input))
+                        .is_some()
+                });
+        if !settles {
+            return Ok(false);
+        }
+        record_terminal(&mut state, &event.id, completed_at_ms, IdleOutcome::Aborted);
+        drop(state);
+        self.sends_changed.notify_waiters();
+        Ok(true)
     }
 
     /// Retain a host-checked input attempt before its native send can be admitted.
@@ -369,7 +413,9 @@ impl CopilotTurnEvent {
             forge_provider_api::turn::TurnOutcome,
         )> = Vec::new();
         for (message, submission) in &state.accepted_submissions {
-            if cancelled_before_start(&state, idle, message) {
+            if cancelled_before_start(&state, idle, message)
+                || idle.discarded_inputs.contains(message)
+            {
                 continue;
             }
             let input = state
@@ -451,6 +497,7 @@ impl CopilotTurnEvent {
                                             || matches!(root.phase, RootTurnPhase::Finished { .. })
                                     })
                                     || cancelled_before_start(&state, idle, message)
+                                    || idle.discarded_inputs.contains(message)
                             })
                     })
                 {
@@ -459,25 +506,6 @@ impl CopilotTurnEvent {
             }
             changed.await;
         }
-    }
-
-    /// Report whether every accepted input is still queued natively, with no root turn started.
-    ///
-    /// Copilot queues a sent message until the session can process it, for example while a
-    /// foreground MCP load is in flight. An abort in that window discards the queue and emits only
-    /// `abort`: no `user.message` and no idle follow, so the turn must settle on the abort itself.
-    pub fn accepted_inputs_unconsumed(&self) -> Result<bool> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        Ok(state.pending_sends == 0
-            && !state.accepted_inputs.is_empty()
-            && state.root_turns.is_empty()
-            && state
-                .accepted_inputs
-                .iter()
-                .all(|message| !state.observed_inputs.contains(message)))
     }
 
     /// Resolve the host submission whose accepted native message this user event consumes.
@@ -732,6 +760,9 @@ impl CopilotTurnEvent {
         if !envelope_root || child_lifecycle {
             state.child_events.insert(event.id.clone());
         }
+        if root && event.event_type == "abort" && state.abort_event.is_none() {
+            state.abort_event = Some(event.id.clone());
+        }
 
         // Bind consumption to an already-running instance, or retain the input for its later start.
         // Root inputs may carry parentAgentTaskId; only envelope/causal child ownership excludes them.
@@ -874,7 +905,46 @@ struct CopilotTurnState {
     event_parents: HashMap<String, Option<String>>,
     observed_inputs: HashSet<String>,
     terminal_inputs: Option<HashSet<String>>,
+    /// The live root `abort`, after which Copilot never delivers still-queued input.
+    abort_event: Option<String>,
     uncertain_send: bool,
+}
+
+/// Close admission and freeze one terminal boundary with the inputs it covers.
+///
+/// After a root abort, every accepted input that no `user.message` reported was discarded from
+/// Copilot's queue; the boundary covers it as interrupted rather than waiting for a turn.
+fn record_terminal(
+    state: &mut CopilotTurnState,
+    event_id: &str,
+    completed_at_ms: i64,
+    outcome: IdleOutcome,
+) {
+    match &mut state.delivery {
+        TurnDelivery::Active(delivery) | TurnDelivery::Retained(delivery) => {
+            delivery.admission = SendAdmission::Closed
+        }
+        TurnDelivery::Idle => {}
+    }
+    let discarded_inputs = if outcome == IdleOutcome::Aborted && state.abort_event.is_some() {
+        state
+            .accepted_inputs
+            .difference(&state.observed_inputs)
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut covered = state.observed_inputs.clone();
+    covered.extend(discarded_inputs.iter().cloned());
+    state.terminal_inputs = Some(covered);
+    state.terminal_event = Some(IdleEvidence {
+        event_id: event_id.to_owned(),
+        completed_at_ms,
+        outcome,
+        root_turns: state.root_turns.clone(),
+        discarded_inputs,
+    });
 }
 
 #[derive(Default)]
@@ -1188,7 +1258,8 @@ fn terminal_coverage(state: &CopilotTurnState) -> Result<Vec<forge_provider_api:
             && (root.is_some_and(|root| match idle.outcome {
                 IdleOutcome::Completed => matches!(root.phase, RootTurnPhase::Finished { .. }),
                 IdleOutcome::Aborted => true,
-            }) || cancelled_before_start(state, idle, message));
+            }) || cancelled_before_start(state, idle, message)
+                || idle.discarded_inputs.contains(message));
         anyhow::ensure!(
             proven,
             "Copilot idle {} does not cover the accepted input's completed turn",
@@ -1292,6 +1363,156 @@ mod tests {
         assert_eq!(executions[0].1, vec![first]);
         assert_eq!(executions[1].0, "start-b");
         assert_eq!(executions[1].1, vec![second]);
+        Ok(())
+    }
+
+    /// Record a prompt whose steer Copilot still queues when the abort arrives.
+    async fn queued_steer_at_abort(
+        turn: &CopilotTurnEvent,
+        guard: &CopilotTurnEventGuard<'_>,
+    ) -> Result<(
+        forge_provider_api::SubmissionId,
+        forge_provider_api::SubmissionId,
+    )> {
+        let prompt = forge_provider_api::SubmissionId::try_from("prompt")?;
+        let steer = forge_provider_api::SubmissionId::try_from("steer")?;
+        guard
+            .send("cursor".into(), Some(prompt.clone()), async {
+                Ok("native-prompt".into())
+            })
+            .await?;
+        turn.steer(Some(steer.clone()), async { Ok("native-steer".into()) })
+            .await?;
+        turn.observe(&live_event(
+            "user",
+            None,
+            "user.message",
+            serde_json::json!({"messageId":"native-prompt", "turnId":"0"}),
+        )?)?;
+        turn.observe(&live_event(
+            "start",
+            Some("user"),
+            "assistant.turn_start",
+            serde_json::json!({"turnId":"0"}),
+        )?)?;
+        Ok((prompt, steer))
+    }
+
+    /// An abort discards the queued steer, so the aborted idle covers it as interrupted.
+    #[tokio::test(start_paused = true)]
+    async fn aborted_idle_covers_steer_discarded_by_abort() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        let (prompt, steer) = queued_steer_at_abort(&turn, &guard).await?;
+        turn.observe(&live_event(
+            "abort",
+            Some("start"),
+            "abort",
+            serde_json::json!({"reason":"user_initiated"}),
+        )?)?;
+        turn.observe(&live_event(
+            "end",
+            Some("abort"),
+            "assistant.turn_end",
+            serde_json::json!({"turnId":"0"}),
+        )?)?;
+        let idle = live_event(
+            "idle",
+            Some("end"),
+            "session.idle",
+            serde_json::json!({"aborted":true}),
+        )?;
+        turn.observe(&idle)?;
+        turn.observe_idle_at(&idle, IdleOutcome::Aborted)?;
+        tokio::time::timeout(std::time::Duration::from_secs(60), turn.idle_settled())
+            .await
+            .expect("an aborted idle left the discarded steer unsettled")?;
+        let covered = turn.covered_submissions()?;
+        assert_eq!(covered.len(), 2);
+        assert!(covered.contains(&prompt) && covered.contains(&steer));
+        Ok(())
+    }
+
+    /// Without any idle, the root finish after the abort settles the discarded steer as interrupted.
+    #[tokio::test(start_paused = true)]
+    async fn abort_settles_discarded_steer_without_idle() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        let (prompt, steer) = queued_steer_at_abort(&turn, &guard).await?;
+        let abort = live_event(
+            "abort",
+            Some("start"),
+            "abort",
+            serde_json::json!({"reason":"user_initiated"}),
+        )?;
+        turn.observe(&abort)?;
+        assert!(
+            !turn.observe_abort_terminal(&abort, 1)?,
+            "the abort settled while its root turn was still running"
+        );
+        let end = live_event(
+            "end",
+            Some("abort"),
+            "assistant.turn_end",
+            serde_json::json!({"turnId":"0"}),
+        )?;
+        turn.observe(&end)?;
+        assert!(turn.observe_abort_terminal(&end, 2)?);
+        tokio::time::timeout(std::time::Duration::from_secs(60), turn.idle_settled())
+            .await
+            .expect("the abort terminal left the discarded steer unsettled")?;
+        assert_eq!(turn.terminal_outcome()?, IdleOutcome::Aborted);
+        assert_eq!(turn.completed_at_ms()?, 2);
+        let covered = turn.covered_submissions()?;
+        assert_eq!(covered.len(), 2);
+        assert!(covered.contains(&prompt) && covered.contains(&steer));
+        let roots = turn.terminal_native_roots()?;
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].1, vec![prompt]);
+        assert_eq!(
+            roots[0].2,
+            forge_provider_api::turn::TurnOutcome::Interrupted
+        );
+        Ok(())
+    }
+
+    /// An abort with every input already in a turn still settles through its aborted idle.
+    #[tokio::test]
+    async fn abort_without_discarded_input_waits_for_idle() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        guard
+            .send(
+                "cursor".into(),
+                Some(forge_provider_api::SubmissionId::try_from("prompt")?),
+                async { Ok("native-prompt".into()) },
+            )
+            .await?;
+        for (id, parent, kind, data) in [
+            (
+                "user",
+                None,
+                "user.message",
+                serde_json::json!({"messageId":"native-prompt", "turnId":"0"}),
+            ),
+            (
+                "start",
+                Some("user"),
+                "assistant.turn_start",
+                serde_json::json!({"turnId":"0"}),
+            ),
+            ("abort", Some("start"), "abort", serde_json::json!({})),
+            (
+                "end",
+                Some("abort"),
+                "assistant.turn_end",
+                serde_json::json!({"turnId":"0"}),
+            ),
+        ] {
+            let event = live_event(id, parent, kind, data)?;
+            turn.observe(&event)?;
+            assert!(!turn.observe_abort_terminal(&event, 1)?);
+        }
         Ok(())
     }
 

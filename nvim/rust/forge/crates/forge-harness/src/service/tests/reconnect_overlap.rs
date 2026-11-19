@@ -36,6 +36,18 @@ async fn owner_reconnect_captures_latest_input_after_held_cancellation_publicati
             .await?;
         let (initial_state, held_publication) = initial.into_parts();
         let cursor = initial_state["owner_publication"]["high_water"].as_u64();
+        // A cancel pauses the queue only when it stops something, so an unfinished task gives
+        // each idle cancel a task to pause and a pause to publish.
+        controller.task_controller.change(
+            &mut crate::storage::SqliteStore::open(&controller.data_root)?,
+            None,
+            crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+                "Hold the queue across reconnect".into(),
+                Default::default(),
+                1,
+            ))),
+            1,
+        )?;
         let before = controller.coordinator.submissions.snapshot()?;
         for index in 0..3 {
             controller

@@ -11,6 +11,9 @@ use crate::{
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowActivity {
     Working,
+    /// A finished turn's queued successor is about to start. Status shows the work continuing,
+    /// and the editor reads the hand-off to leave the finished exchange where it is.
+    HandingOff,
     Planning,
     Revising,
     Implementing,
@@ -24,7 +27,7 @@ impl WorkflowActivity {
     /// Label an active exchange and its live status with the same activity.
     pub fn active_label(self) -> &'static str {
         match self {
-            Self::Working | Self::Goal => "Working",
+            Self::Working | Self::HandingOff | Self::Goal => "Working",
             Self::Planning => "Planning",
             Self::Revising => "Revising plan",
             Self::Implementing => "Implementing",
@@ -37,7 +40,7 @@ impl WorkflowActivity {
     /// Label an exchange whose activity finished.
     pub fn completed_label(self) -> &'static str {
         match self {
-            Self::Working | Self::Goal => "Thought",
+            Self::Working | Self::HandingOff | Self::Goal => "Thought",
             Self::Planning | Self::Revising => "Planned",
             Self::Implementing => "Implemented",
             Self::Checking => "Checked",
@@ -49,7 +52,7 @@ impl WorkflowActivity {
     /// Name the task phase independently of its transition.
     pub fn lifecycle_label(self) -> &'static str {
         match self {
-            Self::Working => "Work",
+            Self::Working | Self::HandingOff => "Work",
             Self::Planning => "Planning",
             Self::Revising => "Plan revision",
             Self::Implementing => "Plan implementation",
@@ -478,6 +481,7 @@ impl SessionPhase {
                 | Self::Finalizing { error: None, .. }
                 | Self::Stopping {
                     collection: crate::exchange::ExchangeCollection::Pending
+                        | crate::exchange::ExchangeCollection::Settling
                 }
         )
     }

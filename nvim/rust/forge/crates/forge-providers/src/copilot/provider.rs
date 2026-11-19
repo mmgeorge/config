@@ -1302,6 +1302,7 @@ struct BindingState {
     owner: forge_provider_api::ThreadId,
     session: RwLock<Arc<CopilotSession>>,
     request: Mutex<SessionRequest>,
+    reported_event_types: super::event_decoder::ReportedEventTypes,
     sink: ProviderEventSink,
     stream: Mutex<Option<ProviderEventStream>>,
     turn: Arc<CopilotTurnEvent>,
@@ -1433,6 +1434,11 @@ impl crate::turn_runner::NativeTurnDriver for CopilotTurnDriver {
         }
         self.state.callbacks.revoke();
         self.state.callbacks.collect_foreground_callbacks().await;
+        // A stopped turn's foreground shell launches stop their native tasks and publish the
+        // inventory without them before this turn may report completion.
+        if let Some(shell) = self.state.callbacks.shell() {
+            shell.settle_revoked_launches().await;
+        }
         let has_children = !self.state.callbacks.observed_agents.read().await.is_empty();
         let callbacks = if !has_children {
             self.state.callbacks.collect_callbacks().await;
@@ -1993,6 +1999,15 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
             },
         )
         .await
+    }
+
+    async fn thread_terminate(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::ThreadClose)?;
+        self.terminate_binding(binding).await
     }
 
     async fn turn_interrupt(
@@ -2917,6 +2932,7 @@ impl CopilotProvider {
             owner: request.thread_id.clone(),
             session: RwLock::new(session),
             request: Mutex::new(request.clone()),
+            reported_event_types: Default::default(),
             sink,
             stream: Mutex::new(Some(stream)),
             turn,
@@ -3541,11 +3557,7 @@ impl CopilotProvider {
             shell.interrupt_waits();
         }
         let session = state.session.read().await.clone();
-        let workspace = session
-            .workspace_path()
-            .unwrap_or(Path::new("."))
-            .to_string_lossy()
-            .into_owned();
+        let workspace = state.request.lock().await.workspace.clone();
         state
             .turn
             .steer_native(
@@ -3572,6 +3584,10 @@ impl CopilotProvider {
     }
 
     async fn close_binding(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        // A force-stopped client cannot answer terminal or session teardown, and every native
+        // RPC on it reports the generation's sticky observation failure. Its bindings are
+        // collected with the failed generation instead, which also removes this one.
+        self.collect_failed_runtime().await?;
         let pending_preparation = self.pending_inputs.fence_binding(binding);
         let Some(state) = self.bindings.lock().await.get(binding).cloned() else {
             return super::operation::wait(pending_preparation)
@@ -3769,6 +3785,51 @@ impl CopilotProvider {
             .insert(binding.clone());
         self.bindings.lock().await.remove(binding);
         self.owners.lock().await.remove(&state.owner);
+        Ok(())
+    }
+
+    /// Sever one binding from the shared CLI without awaiting its native settlement.
+    ///
+    /// One CLI process serves every binding of this provider, so termination detaches only this
+    /// binding's native session: it revokes the binding's callbacks, stops its event delivery,
+    /// requests an abort, and disconnects the session. When the disconnect does not finish within
+    /// `SEVER_BOUND`, the shared client generation is failed instead, which force-stops the CLI and
+    /// moves its sibling bindings through ordinary generation recovery; a binding that cannot be
+    /// detached otherwise could keep writing to the conversation a replacement resumes.
+    async fn terminate_binding(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        /// Bound each native request a severed binding still sends to the shared CLI.
+        const SEVER_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        let Some(state) = self.bindings.lock().await.get(binding).cloned() else {
+            return Ok(());
+        };
+        state.closing.store(true, Ordering::Release);
+        state.callbacks.close_admission();
+        drop(self.pending_inputs.fence_binding(binding));
+        state.callbacks.retire_all(&state.binding.id).await?;
+        state.sink.fail(events::EventDeliveryError::Closed);
+        let session = state.session.read().await.clone();
+        let _ = tokio::time::timeout(SEVER_BOUND, session.abort()).await;
+        let detached = matches!(
+            tokio::time::timeout(SEVER_BOUND, self.sessions.retire(&state.owner)).await,
+            Ok(Ok(()))
+        );
+        if !detached {
+            tracing::error!(target: "forge::provider", event_name = "provider.terminate.client_stopped",
+                provider = "copilot",
+                "A terminated binding did not detach, so the shared client generation was stopped");
+            session
+                .generation
+                .fail(forge_provider_api::ObservationFailure::LifecycleUnavailable);
+        }
+        self.closed_bindings
+            .lock()
+            .expect("closed binding registry is not poisoned")
+            .insert(binding.clone());
+        self.bindings.lock().await.remove(binding);
+        let mut owners = self.owners.lock().await;
+        if owners.get(&state.owner) == Some(binding) {
+            owners.remove(&state.owner);
+        }
         Ok(())
     }
 
@@ -4427,11 +4488,9 @@ impl CopilotProvider {
         }
         let event_sink = state.sink.invocation_sink(&request.scope)?;
         let session = state.session.read().await.clone();
-        let workspace = session
-            .workspace_path()
-            .unwrap_or(Path::new("."))
-            .to_string_lossy()
-            .into_owned();
+        // The SDK session's own workspace path is Copilot's session-state directory, so the
+        // project directory comes from the request that opened this binding.
+        let workspace = state.request.lock().await.workspace.clone();
         let client = self.runtime.client(&workspace).await?;
         let models = tokio::select! {
             biased;
@@ -4495,10 +4554,8 @@ impl CopilotProvider {
         }
         let instructions = request.user_message_block();
         let options = super::prompt::TurnOptions {
-            workspace: session
-                .workspace_path()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            workspace,
+            reported_event_types: state.reported_event_types.clone(),
             model: selected_model,
             capability: self.descriptor().capability,
             input: request.input,
@@ -5314,6 +5371,124 @@ mod retained_recovery_tests {
         .await;
     }
 
+    /// Run one fixture turn to settlement and collect every event it published.
+    async fn completed_turn_events(
+        provider: &CopilotProvider,
+        binding: &BindingId,
+        events: &mut ProviderEventStream,
+        label: &str,
+    ) -> Vec<ProviderEvent> {
+        let state = provider
+            .binding(binding, ProviderOperation::TurnStart)
+            .await
+            .unwrap();
+        let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), label);
+        let receipt = Arc::new(AcceptedReceipt {
+            id: format!("{label}-input").as_str().try_into().unwrap(),
+            attempt: forge_provider_api::DeliveryAttemptId::new(format!("{label}-attempt"))
+                .unwrap(),
+            accepted: AtomicU64::new(0),
+        });
+        let request = queued_request(
+            binding,
+            scope,
+            state.request.lock().await.configuration.clone(),
+            receipt,
+        );
+        provider
+            .turn_start(context(&format!("{label}-submit")), binding, request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.collect_execution().await.unwrap(),
+            Some(Ok(()))
+        ));
+        let mut published = Vec::new();
+        while let Some(envelope) = events.try_next().unwrap() {
+            published.push(envelope.event);
+        }
+        published
+    }
+
+    /// Copilot's own session directory is not the project, so reported paths resolve against the
+    /// workspace the binding was opened with.
+    #[tokio::test(start_paused = true)]
+    async fn reported_file_paths_resolve_against_the_binding_workspace() {
+        let (provider, opened, _root, _peer) = opened_helper_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+            HelperBehavior::CreatedFile,
+        )
+        .await;
+        let binding = opened.binding.id;
+        let mut events = opened.events;
+        let published = completed_turn_events(&provider, &binding, &mut events, "created").await;
+        let changed_paths = published
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Item {
+                    event:
+                        forge_provider_api::ItemEvent::Tool {
+                            event: forge_provider_api::ToolItemEvent::Changes(changes),
+                        },
+                    ..
+                } => Some(changes.file.iter().map(|file| file.path.as_str())),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(changed_paths, ["notes/wave.txt"]);
+        provider
+            .thread_close(context("created-close"), &binding)
+            .await
+            .unwrap();
+        provider
+            .shutdown(context("created-shutdown"))
+            .await
+            .unwrap();
+    }
+
+    /// Each turn builds its own decoder, so the reported-type memory belongs to the binding.
+    #[tokio::test(start_paused = true)]
+    async fn unapplied_notification_type_warns_once_per_binding() {
+        let (provider, opened, _root, _peer) = opened_helper_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+            HelperBehavior::CreatedFile,
+        )
+        .await;
+        let binding = opened.binding.id;
+        let mut events = opened.events;
+        let mut warning_count = 0;
+        for label in ["first", "second"] {
+            warning_count += completed_turn_events(&provider, &binding, &mut events, label)
+                .await
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        ProviderEvent::Provider {
+                            event: forge_provider_api::ProviderConnectionEvent::Warning(warning)
+                        } if matches!(
+                            warning.kind,
+                            forge_provider_api::ProviderWarningKind::UnsupportedNativeEvent
+                        )
+                    )
+                })
+                .count();
+        }
+        assert_eq!(warning_count, 1);
+        provider
+            .thread_close(context("warned-close"), &binding)
+            .await
+            .unwrap();
+        provider.shutdown(context("warned-shutdown")).await.unwrap();
+    }
+
     #[derive(Clone, Copy)]
     enum AbortAcknowledgement {
         Success,
@@ -5323,12 +5498,17 @@ mod retained_recovery_tests {
     enum HelperBehavior {
         CompleteTurn,
         StalledTurn,
+        /// Create `notes/wave.txt` in the binding's workspace and report a notification type the
+        /// adapter does not apply, then complete.
+        CreatedFile,
     }
 
-    /// An acknowledged abort without terminal evidence must fence the runtime rather than hang collection.
+    /// An acknowledged abort without terminal evidence must fence the runtime rather than hang
+    /// collection, and closing its binding must collect the force-stopped client so the same
+    /// thread opens again on a replacement client.
     #[tokio::test(start_paused = true)]
     async fn acknowledged_abort_without_terminal_evidence_fences_runtime() {
-        let (provider, opened, _root, _peer) = opened_helper_fixture(
+        let (provider, opened, root, _peer) = opened_helper_fixture(
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             AbortAcknowledgement::Success,
@@ -5405,9 +5585,75 @@ mod retained_recovery_tests {
                 other => panic!("missing explicit lifecycle failure: {other:?}"),
             }
         }
-        provider.collect_failed_runtime().await.unwrap();
+        // Host restart retires the owner through `thread_close` before it opens a replacement.
+        let closed = provider
+            .thread_close(context("stalled-close"), &binding)
+            .await;
+        assert!(
+            closed.is_ok(),
+            "closing a binding of the force-stopped client failed: {closed:?}"
+        );
         assert!(provider.bindings.lock().await.is_empty());
         drop(state);
+        // The restarted provider opens the same thread on a replacement client.
+        let (reader, writer, _replacement) = super::super::test_peer::streams(|request| {
+            let result = match request["method"].as_str().unwrap() {
+                "status.get" => json!({"version":"1.0.103"}),
+                "models.list" => {
+                    json!({"models":[{"id":"auto", "name":"Auto", "capabilities":{}}]})
+                }
+                "mcp.discover" | "session.mcp.listConfigured" => json!({"servers":[]}),
+                "session.skills.list" => json!({"skills":[]}),
+                "session.create" | "session.resume" => {
+                    json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                }
+                "session.skills.reload"
+                | "session.queue.setDrainPaused"
+                | "session.tasks.refresh"
+                | "session.delete" => json!({}),
+                "session.options.update" | "session.detach" | "session.abort" => {
+                    json!({"success":true})
+                }
+                "session.tasks.list" => json!({"tasks":[]}),
+                method => panic!("unexpected replacement method: {method}"),
+            };
+            vec![super::super::test_peer::response(request, result)]
+        });
+        provider
+            .runtime
+            .attach_streams(reader, writer, root.path().to_owned())
+            .await
+            .unwrap();
+        let reopened = provider
+            .thread_open(
+                context("reopen"),
+                SessionRequest {
+                    thread_id: forge_provider_api::testing::root_thread("lifecycle-fixture"),
+                    mode: forge_provider_api::SessionMode::Interactive,
+                    workspace: root.path().to_string_lossy().into_owned(),
+                    history: SessionHistory::Durable { resume: None },
+                    configuration: SessionConfiguration {
+                        model: ModelSelection::default(),
+                        access: forge_provider_api::access::AccessPolicy {
+                            sandbox: false,
+                            ..Default::default()
+                        },
+                        approval: forge_provider_api::approval::ApprovalMode::Deny,
+                        resources: forge_provider_api::ResourceSelection::default(),
+                    },
+                    resource_lease: None,
+                    tools: Vec::new(),
+                    tool_endpoint: None,
+                    system_instructions: String::new(),
+                    trace: Arc::new(NullTrace),
+                },
+            )
+            .await;
+        assert!(
+            reopened.is_ok(),
+            "the thread did not reopen after its failed client was collected: {:?}",
+            reopened.err()
+        );
         provider
             .shutdown(context("stalled-shutdown"))
             .await
@@ -5433,6 +5679,13 @@ mod retained_recovery_tests {
         let mut held_terminal = None;
         let mut helper_ids = HashSet::new();
         let mut helper_tasks = Vec::<Value>::new();
+        let root = tempfile::tempdir().unwrap();
+        let created_file = root
+            .path()
+            .join("notes/wave.txt")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut send_count = 0_usize;
         let (reader, writer, peer) = super::super::test_peer::streams(move |request| {
             let result = match request["method"].as_str().unwrap() {
                 "status.get" => json!({"version":"1.0.103"}),
@@ -5442,6 +5695,8 @@ mod retained_recovery_tests {
                 },{"id":"alternate","name":"Alternate","capabilities":{}}]}),
                 "mcp.discover" | "session.mcp.listConfigured" => json!({"servers":[]}),
                 "session.skills.list" => json!({"skills":[]}),
+                // A binding's first turn reads its instruction sources once.
+                "session.instructions.getSources" => json!({"sources":[]}),
                 "session.create" | "session.resume" => {
                     if request["params"]["availableTools"]
                         .as_array()
@@ -5455,6 +5710,69 @@ mod retained_recovery_tests {
                             .insert(request["params"]["sessionId"].as_str().unwrap().to_owned());
                     }
                     json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                }
+                "session.send" if matches!(helper_behavior, HelperBehavior::CreatedFile) => {
+                    send_count += 1;
+                    let id = |name: &str| format!("{name}-{send_count}");
+                    let notification = |name: &str, parent: Value, kind: &str, data: Value| {
+                        json!({"jsonrpc":"2.0","method":"session.event",
+                        "params":{"sessionId":request["params"]["sessionId"],"event":{"id":id(name),"parentId":parent,
+                            "type":kind,"timestamp":"2026-11-02T00:00:00Z","data":data}}})
+                    };
+                    // Copilot reports a created file with absolute paths and one added row per
+                    // newline-separated segment of its content.
+                    let diff = format!(
+                        "\ndiff --git a/{created_file} b/{created_file}\ncreate file mode 100644\nindex 0000000..0000000\n--- a/dev/null\n+++ b/{created_file}\n@@ -1,0 +1,2 @@\n+wave\n+\n\n"
+                    );
+                    return vec![
+                        super::super::test_peer::response(
+                            request,
+                            json!({"messageId":id("input")}),
+                        ),
+                        notification(
+                            "user",
+                            Value::Null,
+                            "user.message",
+                            json!({"messageId":id("input"),"turnId":"0"}),
+                        ),
+                        notification(
+                            "start",
+                            json!(id("user")),
+                            "assistant.turn_start",
+                            json!({"turnId":"0"}),
+                        ),
+                        notification(
+                            "warning",
+                            json!(id("start")),
+                            "session.warning",
+                            json!({"warningType":"fixture","message":"fixture warning"}),
+                        ),
+                        notification(
+                            "tool-start",
+                            json!(id("warning")),
+                            "tool.execution_start",
+                            json!({"toolCallId":id("create"),"toolName":"apply_patch","arguments":"*** Begin Patch\n*** Add File: notes/wave.txt\n+wave\n*** End Patch\n"}),
+                        ),
+                        notification(
+                            "tool-complete",
+                            json!(id("tool-start")),
+                            "tool.execution_complete",
+                            json!({"toolCallId":id("create"),"success":true,"result":{"content":"Added 1 file(s): notes/wave.txt","detailedContent":diff}}),
+                        ),
+                        notification(
+                            "answer",
+                            json!(id("tool-complete")),
+                            "assistant.message",
+                            json!({"messageId":id("answer"),"content":"Created the file","phase":"final_answer"}),
+                        ),
+                        notification(
+                            "end",
+                            json!(id("answer")),
+                            "assistant.turn_end",
+                            json!({"turnId":"0"}),
+                        ),
+                        notification("idle", json!(id("end")), "session.idle", json!({})),
+                    ];
                 }
                 "session.send" => {
                     let notification = |id, parent, kind, data| {
@@ -5559,7 +5877,6 @@ mod retained_recovery_tests {
             };
             vec![super::super::test_peer::response(request, result)]
         });
-        let root = tempfile::tempdir().unwrap();
         let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
         provider
             .runtime

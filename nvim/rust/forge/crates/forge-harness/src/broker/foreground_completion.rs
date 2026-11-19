@@ -545,6 +545,15 @@ impl HarnessBroker {
                 .is_some_and(|cell| Arc::ptr_eq(cell, &transaction.settlement)),
             "foreground settlement owner changed"
         );
+        // Native work is over, so the exchange's clock stops here. Finalization still captures
+        // a checkpoint before the exchange settles, and an unpublished pause would leave the
+        // editor counting from the last running snapshot until then, above the settled duration.
+        // The paused snapshot is published before host effects run, which wait for it to drain.
+        let paused =
+            self.present_clock_stop(&mut transaction.state.interaction, Exchange::pause)?;
+        self.store.save_exchange(&transaction.state.interaction)?;
+        let paused = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(paused))?;
+        transaction.observation_publication_in_flight = true;
         if let Some(finalization) = transaction.finalization.as_mut() {
             finalization.mode = transaction.mode;
             finalization.resume_native(output, question_override)?;
@@ -573,6 +582,8 @@ impl HarnessBroker {
             transaction,
             admission,
         };
-        Ok(ForegroundAction::Wait)
+        Ok(ForegroundAction::Effect(
+            ForegroundJob::ObservationPublication(paused),
+        ))
     }
 }

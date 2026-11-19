@@ -443,7 +443,19 @@ impl HarnessBroker {
                 if transaction.failure.is_some() {
                     return self.advance_foreground_failure(dispatch);
                 }
-                Ok(ForegroundAction::Wait)
+                // A cleanup already in flight records the turn's failure when it completes, and
+                // a finalizing turn already holds its native result and settles on its own.
+                if transaction.failure_cleanup_active || already_finalizing {
+                    return Ok(ForegroundAction::Wait);
+                }
+                // The owner restarts the provider after a failed collection, and that restart
+                // waits for this turn to settle. A running turn with no failure of its own may
+                // never receive one: a prompt cancelled before dispatch has no native turn left
+                // to report a terminal result. The failed collection therefore ends the turn.
+                self.fail_foreground(
+                    transaction,
+                    crate::exchange::command::CommandFailure::StopFailed.into(),
+                )
             }
             ForegroundSignal::SessionObservationsReady
                 if transaction.observation_publication_in_flight =>

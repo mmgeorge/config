@@ -18,6 +18,12 @@ use tokio::sync::Mutex;
 pub(crate) trait NativeResource: Send + Sync {
     /// Collect the process tree and reader tasks, retaining handles so a failed attempt can retry.
     async fn shutdown(&self) -> Result<(), ProviderError>;
+    /// Kill the process tree without the exit grace `shutdown` allows, then join its readers.
+    ///
+    /// A resource without a graceful phase collects exactly as `shutdown` does.
+    async fn terminate(&self) -> Result<(), ProviderError> {
+        self.shutdown().await
+    }
     /// Report positive collection evidence without awaiting a collection in progress.
     fn is_collected(&self) -> bool;
 }
@@ -126,6 +132,25 @@ impl ResourceCleanup {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(resource);
+    }
+
+    /// Kill every native process at once, then collect profiles and leases as `shutdown` does.
+    pub(crate) async fn terminate(&self) -> Result<(), ProviderError> {
+        self.close_admission();
+        let natives = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|resource| match resource {
+                RetainedResource::Native(native) => Some(native.clone()),
+                RetainedResource::Profile(_) | RetainedResource::Lease(_) => None,
+            })
+            .collect::<Vec<_>>();
+        for native in natives {
+            native.terminate().await?;
+        }
+        self.shutdown().await
     }
 
     /// Retry processes first, then profiles and callback leases only after native collection.

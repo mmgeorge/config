@@ -95,6 +95,9 @@ function M.configure_transcript_window(win)
   vim.wo[win].breakindentopt = M.transcript_wrapping.options
   vim.wo[win].foldmethod = "manual"
   vim.wo[win].foldenable = false
+  -- Tail following positions the window in whole lines; smooth scrolling would let Neovim's own
+  -- cursor scroll start the window inside a wrapped line, and the two would alternate per update.
+  vim.api.nvim_set_option_value("smoothscroll", false, { scope = "local", win = win })
   M.configure_gutterless_window(win)
 end
 
@@ -130,7 +133,9 @@ function M.open(timeline_key, open_mode)
   vim.wo[composer_win].wrap = true
   vim.wo[composer_win].linebreak = true
   vim.wo[composer_win].showbreak = ""
-  vim.wo[composer_win].smoothscroll = true
+  -- Local scope only: assigning through `vim.wo[win]` also sets the global value, which every
+  -- later window, including another Harness tab's transcript, would inherit.
+  vim.api.nvim_set_option_value("smoothscroll", true, { scope = "local", win = composer_win })
   vim.wo[composer_win].winfixheight = true
   input_gutter.apply(composer_win)
   keep_composer_normal_on_entry(composer_buf)
@@ -192,21 +197,32 @@ function M.resize_composer(composer_buf, composer_win, text_edit)
 end
 
 ---Align the final display row without changing the focused window.
+---With `visible_height`, the final row rests on the last row an overlay leaves uncovered instead
+---of on the window's last row, where the overlay would hide it.
 ---@param transcript_buf integer
 ---@param transcript_win integer
-function M.position_tail(transcript_buf, transcript_win)
+---@param visible_height? integer Rows from the window's top edge that an overlay leaves uncovered.
+function M.position_tail(transcript_buf, transcript_win, visible_height)
   vim.api.nvim_win_set_cursor(transcript_win, { vim.api.nvim_buf_line_count(transcript_buf), 0 })
   vim.api.nvim_win_call(transcript_win, function() vim.cmd("normal! $zb") end)
+  if not visible_height then return end
+  local topline = M.maximum_content_topline(transcript_buf, transcript_win, visible_height)
+  vim.api.nvim_win_call(transcript_win, function()
+    if vim.fn.line("w0") < topline then vim.fn.winrestview({ topline = topline }) end
+  end)
 end
 
+---Find the topline that puts the final display row on the last text row of the window, or of the
+---`visible_height` rows an overlay such as the session picker leaves uncovered.
 ---@param transcript_buf integer
 ---@param transcript_win integer
+---@param visible_height? integer Rows from the window's top edge that an overlay leaves uncovered.
 ---@return integer
-function M.maximum_content_topline(transcript_buf, transcript_win)
+function M.maximum_content_topline(transcript_buf, transcript_win, visible_height)
   local line_count = vim.api.nvim_buf_line_count(transcript_buf)
   local window_height = vim.api.nvim_win_get_height(transcript_win)
-    - (vim.wo[transcript_win].winbar ~= "" and 1 or 0)
-  window_height = math.max(1, window_height)
+  if visible_height then window_height = math.min(window_height, visible_height) end
+  window_height = math.max(1, window_height - (vim.wo[transcript_win].winbar ~= "" and 1 or 0))
   local function tail_height(start_row)
     local ok, height = pcall(vim.api.nvim_win_text_height, transcript_win, {
       start_row = start_row,
@@ -243,10 +259,11 @@ end
 ---without a scroll, such as when Markdown finishes rendering rows that entered the window.
 ---@param transcript_buf integer
 ---@param transcript_win integer
-function M.clamp_scroll(transcript_buf, transcript_win)
+---@param visible_height? integer Rows from the window's top edge that an overlay leaves uncovered.
+function M.clamp_scroll(transcript_buf, transcript_win, visible_height)
   if not vim.api.nvim_win_is_valid(transcript_win)
     or vim.api.nvim_win_get_buf(transcript_win) ~= transcript_buf then return end
-  local maximum_topline = M.maximum_content_topline(transcript_buf, transcript_win)
+  local maximum_topline = M.maximum_content_topline(transcript_buf, transcript_win, visible_height)
   vim.api.nvim_win_call(transcript_win, function()
     local view = vim.fn.winsaveview()
     if view.topline <= maximum_topline then return end
@@ -257,12 +274,16 @@ end
 
 ---@param transcript_buf integer
 ---@param transcript_win integer
-function M.attach_scroll_boundary(transcript_buf, transcript_win)
+---@param visible_height? fun(): integer? Reads the rows an overlay currently leaves uncovered, for a
+---  window an overlay partly covers; the boundary then follows the overlay as it resizes.
+function M.attach_scroll_boundary(transcript_buf, transcript_win, visible_height)
   local group = vim.api.nvim_create_augroup("ForgeHarnessScroll" .. transcript_buf, { clear = true })
   vim.api.nvim_create_autocmd("WinScrolled", {
     group = group,
     buffer = transcript_buf,
-    callback = function() M.clamp_scroll(transcript_buf, transcript_win) end,
+    callback = function()
+      M.clamp_scroll(transcript_buf, transcript_win, visible_height and visible_height() or nil)
+    end,
   })
 end
 

@@ -373,6 +373,8 @@ pub enum ProviderFeature {
     NativeConversationRewind,
     /// Admitted image attachment input.
     ImageInput,
+    /// Forced termination of one binding's native process or connection.
+    ForcedTermination,
 }
 
 impl std::fmt::Display for UnsupportedCapability {

@@ -4,21 +4,75 @@ use anyhow::Result;
 /// Retain the expired requests separately from the instructions sent to their execution owner.
 #[derive(Default)]
 pub(crate) struct ApprovalTimeoutFeedback {
-    feedback: String,
     request: Vec<PermissionApprovalRequest>,
 }
 
 impl ApprovalTimeoutFeedback {
     pub(super) fn request_push(&mut self, request: PermissionApprovalRequest) {
-        if !self.feedback.is_empty() {
-            self.feedback.push('\n');
-        }
-        self.feedback.push_str(&format!("Approval {} was automatically rejected because its timeout expired. This was not an explicit user rejection. The existing user instruction and permissions remain in effect. Continue authorized work, avoid repeating the expired request, and do not ask whether to continue work the user already requested.", request.request_id.as_str()));
         self.request.push(request);
     }
 
-    pub(crate) fn feedback(&self) -> &str {
-        &self.feedback
+    pub(super) fn is_empty(&self) -> bool {
+        self.request.is_empty()
+    }
+
+    /// Forget requests that expired during a turn which then completed normally.
+    ///
+    /// The provider received each expiry as that turn's tool rejection and answered it before
+    /// finishing, so a continuation would only make the model repeat the answer. Requests scoped
+    /// to the thread name no turn and stay for the next continuation boundary. Returns whether
+    /// any request was dropped.
+    pub(super) fn discard_settled_turns(
+        &mut self,
+        turns: &[(forge_provider_api::ThreadId, forge_provider_api::TurnId)],
+    ) -> bool {
+        let retained = self.request.len();
+        self.request.retain(|request| {
+            let turn = match &request.scope {
+                ApprovalScope::Item {
+                    thread_id, turn_id, ..
+                }
+                | ApprovalScope::Turn { thread_id, turn_id } => Some((thread_id, turn_id)),
+                ApprovalScope::Thread { .. } | ApprovalScope::Operation { .. } => None,
+            };
+            turn.is_none_or(|(thread_id, turn_id)| {
+                !turns.iter().any(|(settled_thread, settled_turn)| {
+                    settled_thread == thread_id && settled_turn == turn_id
+                })
+            })
+        });
+        self.request.len() != retained
+    }
+
+    /// Tell the execution owner that each expired operation did not run and is not approved.
+    ///
+    /// An expiry is not a user rejection, and the model once read "not an explicit rejection" as
+    /// permission to run the same command through a terminal tool. The guidance therefore names
+    /// the operation, states that it is not approved, and forbids every other route to its effect.
+    pub(crate) fn feedback(&self) -> String {
+        self.request
+            .iter()
+            .map(|request| {
+                let operation = request
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        let detail = target.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+                        if detail.is_empty() {
+                            target.title.clone()
+                        } else {
+                            format!("{}: {detail}", target.title)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "Approval {} ({operation}) expired before the user answered, so Harness rejected it and the operation did not run. It is not approved: do not perform it, or anything with the same effect such as another shell, a terminal or MCP tool, or a script, unless the user approves a new request. Continue the parts of the user's request that do not depend on it, and report that this operation still needs the user's approval. Do not ask whether to continue work the user already requested.",
+                    request.request_id.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Format the human notice from original request records and their exact admitted tool items.
@@ -78,24 +132,35 @@ impl ApprovalTimeoutFeedback {
                             && execution.address.turn_id == *turn_id
                     });
                 if let Some(execution) = execution {
-                    display.push_str(&format!(
-                        "\n  {}\n    {}",
-                        execution.descriptor.name,
-                        serde_json::to_string_pretty(execution.descriptor.arguments.value())?
-                            .replace('\n', "\n    ")
-                    ));
-                    if !execution.input.is_empty() {
-                        display.push_str(&format!(
-                            "\n    {}",
-                            execution.input.replace('\n', "\n    ")
-                        ));
-                    }
+                    display.push_str(&execution_display(execution)?);
                 }
             }
-            display.push_str("\n\nAutomatically rejected when the timeout expired.\nNo user decision was recorded.");
+            display.push_str("\n\n");
+            display.push_str(TIMEOUT_OUTCOME);
         }
         Ok(display)
     }
+}
+
+/// The closing lines of every expired-approval notice, distinguishing expiry from a user rejection.
+pub(crate) const TIMEOUT_OUTCOME: &str =
+    "Automatically rejected when the timeout expired.\nNo user decision was recorded.";
+
+/// Format the tool call an expired approval gated: its tool name, arguments, and input.
+pub(crate) fn execution_display(execution: &crate::turn::ToolExecution) -> Result<String> {
+    let mut display = format!(
+        "\n  {}\n    {}",
+        execution.descriptor.name,
+        serde_json::to_string_pretty(execution.descriptor.arguments.value())?
+            .replace('\n', "\n    ")
+    );
+    if !execution.input.is_empty() {
+        display.push_str(&format!(
+            "\n    {}",
+            execution.input.replace('\n', "\n    ")
+        ));
+    }
+    Ok(display)
 }
 
 #[cfg(test)]

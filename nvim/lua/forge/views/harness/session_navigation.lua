@@ -33,11 +33,16 @@ local function activate_state(state)
 end
 
 ---@param state ForgeHarnessPresentationState
-local function focus_state(state)
+---@param insert? boolean Return the composer to Insert mode, as the picker that chose the session
+---  was invoked from it. Entering a composer otherwise leaves Insert mode.
+local function focus_state(state, insert)
   if not valid_view(state) then return false end
   vim.api.nvim_set_current_tabpage(state.timeline_tab)
   local target = state.composer_win
-  if target and vim.api.nvim_win_is_valid(target) then vim.api.nvim_set_current_win(target) end
+  if target and vim.api.nvim_win_is_valid(target) then
+    vim.api.nvim_set_current_win(target)
+    if insert then vim.cmd("startinsert!") end
+  end
   activate_state(state)
   return true
 end
@@ -168,6 +173,8 @@ end
 ---@field focus? boolean Preserve the selected session when completing a background request.
 ---@field source_state? ForgeHarnessPresentationState The view that issued the request, captured when it
 ---  was issued; defaults to `state`, then to the selected view at completion.
+---@field insert? boolean The composer was in Insert mode when the user chose this session, so the
+---  composer that ends focused returns to Insert mode.
 
 ---@param result table
 ---@param options? ForgeHarnessSessionActivation
@@ -232,7 +239,7 @@ function M.activate(result, options)
   controller().attach()
   controller().attach_transcript(state.transcript_buf)
   controller().refresh_winbar()
-  if options.focus == false then session.activate_harness(selected_state) else focus_state(state) end
+  if options.focus == false then session.activate_harness(selected_state) else focus_state(state, options.insert) end
 
   if options.open_mode == "current"
     and source_state ~= state
@@ -341,8 +348,11 @@ end
 function M.resume(session_id, options)
   local source_state = session.harness
   local existing = state_by_session_id[session_id] or session.harness_by_id[session_id]
-  if existing and (existing == source_state or not options or options.open_mode ~= "current")
-    and focus_state(existing) then return end
+  -- An unavailable session's owner failed for good, so choosing it asks the host to reopen the
+  -- session from storage instead of focusing the view that can no longer run anything.
+  local reopen = existing and require("forge.views.harness.activity").unavailable_reason(existing) ~= nil
+  if existing and not reopen and (existing == source_state or not options or options.open_mode ~= "current")
+    and focus_state(existing, options and options.insert) then return end
   client.request({ session_id = session_id, method = "session.resume", params = { session_id = session_id } }, function(result, request_error)
     if request_error then
       notifications.error(request_error, "Harness session")

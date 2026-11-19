@@ -840,6 +840,7 @@ Select `operation = "staging"`. The native declaration is in [PresentationReques
 | `sequence` | `u64` | Required |
 | `queue` | `Vec<StagedInput>` | Optional, declared default |
 | `steering` | `Vec<StagedInput>` | Optional, declared default |
+| `queue_paused` | `Option<String>` | Optional, declared default. Present while queued delivery is paused: the resume hint the queue heading shows, or empty when no key resumes the queue |
 
 Producer: [nvim/lua/forge/views/harness/presentation.lua:289](../../../../nvim/lua/forge/views/harness/presentation.lua).
 

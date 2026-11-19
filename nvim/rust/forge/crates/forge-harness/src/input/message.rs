@@ -158,6 +158,44 @@ impl InputMessage {
         message
     }
 
+    /// Create the unsent entry that keeps a retracted prompt's content under a new identity.
+    ///
+    /// The provider journal answers a later preparation of an identity it has seen with that
+    /// identity's record, and a retracted prompt's record can be `Accepted`, so a retry under the
+    /// old identity would never be sent. The entry stays failed, which no owner delivers, until
+    /// the user retries, edits, or removes it. It becomes a follow-up whatever the prompt's
+    /// intent was, because the user stopped the prompt: a retry must wait its turn in the queue
+    /// instead of steering active work, and a newer prompt must not wait behind it.
+    pub(super) fn retracted_copy(&self, id: String) -> Self {
+        let Self {
+            id: _,
+            revision: _,
+            text,
+            purpose,
+            attachments,
+            config,
+            intent: _,
+            turn,
+            state: _,
+        } = self;
+        Self {
+            id,
+            revision: 1,
+            text: text.clone(),
+            purpose: purpose.clone(),
+            attachments: attachments.clone(),
+            config: config.clone(),
+            intent: InputIntent::Queue,
+            turn: turn.clone(),
+            state: DeliveryState::Failed {
+                route: None,
+                submission: None,
+                reservation: None,
+                error: "Interrupted before the model replied. Retry to send it again.".into(),
+            },
+        }
+    }
+
     /// Consume content independently of the queue's delivery authority.
     pub(crate) fn into_draft(self) -> InputDraft {
         let Self {

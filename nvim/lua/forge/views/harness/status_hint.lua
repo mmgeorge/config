@@ -53,6 +53,18 @@ function M.compose(snapshot, context, commands, width)
       for line_index = 1, math.min(2, #lines) do append(lines[line_index], "ForgeStatusHint") end
     end
   end
+  local notice = context.status_notice
+  ---Append the local notice, which takes the status row's icon because it explains that row.
+  local function append_notice()
+    if not notice then return end
+    content.animated, content.waiting = nil, nil
+    local row = #content.lines
+    local suffix = notice.hint and hints(notice.hint .. "_status") or ""
+    append(notice.text .. (suffix ~= "" and " · " .. suffix or ""), notice.failed and "ForgeHarnessToolFailure" or "ForgeStatusHint")
+    if notice.animated then content.animated = row end
+    if notice.waiting then content.waiting = row end
+    notice = nil
+  end
   for _, block in ipairs(snapshot.block or {}) do
     local metadata = block.metadata or {}
     local status = metadata.status
@@ -158,16 +170,11 @@ function M.compose(snapshot, context, commands, width)
         end
       end
     end
+    -- The notice explains the phase row, so it follows that block. Appended after every block,
+    -- it sat below the staged input and moved whenever a queued row came or went.
+    if type(status) == "table" then append_notice() end
   end
-  local notice = context.status_notice
-  if notice then
-    content.animated, content.waiting = nil, nil
-    local row = #content.lines
-    local suffix = notice.hint and hints(notice.hint .. "_status") or ""
-    append(notice.text .. (suffix ~= "" and " · " .. suffix or ""), notice.failed and "ForgeHarnessToolFailure" or "ForgeStatusHint")
-    if notice.animated then content.animated = row end
-    if notice.waiting then content.waiting = row end
-  end
+  append_notice()
   if not questions_drawn and #pending_questions > 0 then
     local suffix = hints("pending_question_status")
     append("Questions" .. (suffix ~= "" and " · " .. suffix or ""), "ForgeStatusHint")

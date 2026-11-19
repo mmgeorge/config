@@ -51,12 +51,17 @@ local input_state = require("forge.views.harness.input_state")
 
 ---@class ForgeQueueEdit
 ---@field entry ForgeQueuedPrompt Entry currently displayed in the composer.
----@field barrier ForgeQueuedPrompt Earliest unfinished edit, retained when validation focuses a later entry.
 ---@field drafts table<ForgeQueuedPrompt, string> Edits retained while moving through the queue.
 ---@field original_draft string Composer draft restored when editing finishes.
 ---@field attachments table<ForgeQueuedPrompt, ForgeAttachmentSelection[]>
 ---@field original_attachments ForgeAttachmentSelection[]
 ---@field buffer? integer Composer buffer currently displaying the active edit.
+---@field reservation string Edit identity the host records on every message this edit holds.
+---@field reserving? table<string, true> Messages whose reservation awaits the host's answer.
+---@field releasing? table<string, fun()|false> Messages whose release awaits the host's answer,
+---  with the reservation to send once it lands when navigation returned to the message meanwhile.
+---@field release_after? table<string, true> Messages left unchanged while their reservation was
+---  still in flight, released once the host acknowledges it.
 
 ---@param queue (string|ForgeQueuedPrompt)[]
 ---@param entry ForgeQueuedPrompt
@@ -77,14 +82,82 @@ local function queued_text(entry)
   return text
 end
 
----Move through queued entries without changing order or advancing the earliest edit barrier.
+---Get whether the composer still shows `entry` exactly as it is queued.
+---@param entry ForgeQueuedPrompt
+---@param draft string
+---@param attachments? ForgeAttachmentSelection[]
+---@return boolean
+local function unchanged(entry, draft, attachments)
+  return draft == queued_text(entry) and vim.deep_equal(attachments or {}, entry.attachments or {})
+end
+
+---Reserve `entry` for this edit once any earlier commit of it has settled.
+---@param state table
+---@param edit ForgeQueueEdit
+---@param entry ForgeQueuedPrompt
+local function reserve(state, edit, entry)
+  edit.reserving = edit.reserving or {}
+  edit.reserving[entry.id] = true
+  -- An earlier edit of this message may still await its host result. Read the revision only
+  -- after it settles, because the displayed revision is stale until then.
+  input_state.after_commit(state, entry.id, function()
+    input_state.perform(state, { kind = "reserve", id = entry.id, revision = entry.revision or 0,
+      reservation = edit.reservation }, function(failure)
+      edit.reserving[entry.id] = nil
+      if edit.release_after and edit.release_after[entry.id] then
+        edit.release_after[entry.id] = nil
+        if not failure then M.release(state, edit, entry) end
+      elseif failure then edit.failure = failure end
+      if edit.commit and not next(edit.reserving) then
+        local commit = edit.commit
+        edit.commit = nil
+        commit()
+      end
+    end)
+  end)
+end
+
+---Release one message from the edit while the edit keeps every other message it holds.
+---
+---Navigation reserves each message it visits, and a reserved message waits. Releasing a message the
+---user left unchanged lets it run while a later message stays open in the composer.
+---@param state table
+---@param edit ForgeQueueEdit
+---@param entry ForgeQueuedPrompt
+function M.release(state, edit, entry)
+  edit.drafts[entry], edit.attachments[entry] = nil, nil
+  if edit.reserving and edit.reserving[entry.id] then
+    edit.release_after = edit.release_after or {}
+    edit.release_after[entry.id] = true
+    return
+  end
+  edit.releasing = edit.releasing or {}
+  edit.releasing[entry.id] = false
+  input_state.perform(state, { kind = "release", reservation = edit.reservation, id = entry.id }, function()
+    local returned = edit.releasing[entry.id]
+    edit.releasing[entry.id] = nil
+    if returned then returned() end
+  end)
+end
+
+---Get whether the message being edited left the queue without this editor removing it, as it does
+---when delivery wins the race with the edit's reservation.
+---@param state table
+---@return boolean
+function M.delivered(state)
+  local edit = state.queue_edit
+  if not edit or edit.entry.local_only or position(state.queue, edit.entry) then return false end
+  return not (state.input and state.input.removing[edit.entry.id])
+end
+
+---Move through queued entries without changing order, releasing an entry left unchanged.
 ---@param state table
 ---@param draft string
 ---@param direction integer
 ---@return string? text
 ---@return string? failure
 ---@return ForgeAttachmentSelection[]? attachments
----@return boolean? recovered
+---@return ("sent"|"edited")? recovered See `M.finish`.
 function M.move(state, draft, direction)
   local edit = state.queue_edit
   if not edit and state.failed_queue_edit then
@@ -120,32 +193,28 @@ function M.move(state, draft, direction)
     return nil, "Delivery has started. The original message cannot be edited."
   end
   if edit then
-    edit.drafts[edit.entry] = draft
-    edit.attachments[edit.entry] = attachment.capture(state.composer_buf).attachments
-  else edit = { entry = entry, barrier = entry, drafts = {}, attachments = {}, original_draft = draft,
+    local left = edit.entry
+    local left_attachments = attachment.capture(state.composer_buf).attachments
+    if not left.local_only and unchanged(left, draft, left_attachments) then
+      M.release(state, edit, left)
+    else
+      edit.drafts[left], edit.attachments[left] = draft, left_attachments
+    end
+  else edit = { entry = entry, drafts = {}, attachments = {}, original_draft = draft,
     reservation = input_state.reservation(),
     original_attachments = attachment.capture(state.composer_buf).attachments, buffer = state.composer_buf } end
-  if index < (position(state.queue, edit.barrier) or index) then edit.barrier = entry end
   edit.entry = entry
   state.queue_edit = edit
-  if entry.reservation ~= edit.reservation and not entry.local_only then
-    edit.reserving = edit.reserving or {}
-    if edit.reserving[entry.id] then return edit.drafts[entry] or queued_text(entry), nil, edit.attachments[entry] or entry.attachments end
-    edit.reserving[entry.id] = true
-    -- An earlier edit of this message may still await its host result. Read the revision only
-    -- after it settles, because the displayed revision is stale until then.
-    input_state.after_commit(state, entry.id, function()
-      input_state.perform(state, { kind = "reserve", id = entry.id, revision = entry.revision or 0,
-        reservation = edit.reservation }, function(failure)
-        edit.reserving[entry.id] = nil
-        if failure then edit.failure = failure end
-        if edit.commit and not next(edit.reserving) then
-          local commit = edit.commit
-          edit.commit = nil
-          commit()
-        end
-      end)
-    end)
+  if edit.release_after then edit.release_after[entry.id] = nil end
+  if not entry.local_only and not (edit.reserving and edit.reserving[entry.id]) then
+    if edit.releasing and edit.releasing[entry.id] ~= nil then
+      -- The release is still in flight; reserve again once the host has answered it.
+      edit.releasing[entry.id] = function()
+        if state.queue_edit == edit and edit.entry == entry then reserve(state, edit, entry) end
+      end
+    elseif entry.reservation ~= edit.reservation then
+      reserve(state, edit, entry)
+    end
   end
   return edit.drafts[entry] or queued_text(entry), nil, edit.attachments[entry] or entry.attachments
 end
@@ -166,7 +235,8 @@ end
 ---@return string? original_draft
 ---@return string? failure
 ---@return ForgeAttachmentSelection[]? attachments
----@return boolean? recovered Whether an unavailable edit became an ordinary draft.
+---@return ("sent"|"edited")? recovered Why an edit whose message left the queue ended: its
+---  unchanged text gave way to the earlier draft, or its changed text became an ordinary draft.
 function M.finish(state, draft)
   local edit = state.queue_edit
   if not edit then
@@ -180,8 +250,13 @@ function M.finish(state, draft)
     local attachments = attachment.capture(state.composer_buf).attachments
     state.queue_edit = nil
     input_state.perform(state, { kind = "release", reservation = edit.reservation })
-    if draft ~= "" then return draft, nil, attachments, true end
-    return edit.original_draft, nil, edit.original_attachments
+    if draft == "" then return edit.original_draft, nil, edit.original_attachments end
+    -- Text the host already sent would only be sent twice, so it gives way to the earlier draft.
+    -- Text the user changed is new work and stays as an ordinary draft.
+    if unchanged(edit.entry, draft, attachments) then
+      return edit.original_draft, nil, edit.original_attachments, "sent"
+    end
+    return draft, nil, attachments, "edited"
   end
   if edit.failure and draft ~= "" then return nil, edit.failure .. ". Unqueue to retain this draft separately." end
   edit.drafts[edit.entry] = draft

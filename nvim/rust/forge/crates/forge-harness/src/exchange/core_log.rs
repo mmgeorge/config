@@ -312,7 +312,8 @@ impl CoreOutcome {
                 | CommandFailure::Rollback(_)
                 | CommandFailure::Task(_)
                 | CommandFailure::TaskSynchronization { .. }
-                | CommandFailure::Compaction(_),
+                | CommandFailure::Compaction(_)
+                | CommandFailure::StorageBusy,
             ) => Self::Failed,
             Err(
                 CommandFailure::Input(_)

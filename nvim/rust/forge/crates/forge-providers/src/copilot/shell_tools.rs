@@ -176,7 +176,7 @@ pub(super) fn tools(shell: Arc<ShellSession>) -> Vec<Tool> {
     let stop =
         json!({"type":"object","properties":{"shellId":{"type":"string"}},"required":["shellId"]});
     [
-        (name.to_owned(), "Run a shell command. Sync waits up to initial_wait seconds (default 30) for initial output; this soft wait never terminates the command. Async returns a shellId immediately. Running commands remain available across turns. Use read to retrieve output and stop to terminate a command. Completion updates the terminal inventory without starting a new model turn.", command),
+        (name.to_owned(), "Run a shell command. Sync waits up to initial_wait seconds (default 30) for initial output; the end of this soft wait never terminates the command, but a user interruption during it stops the command. Async returns a shellId immediately. Commands that outlive their wait and async commands remain available across turns. Use read to retrieve output and stop to terminate a command. Completion updates the terminal inventory without starting a new model turn.", command),
         (format!("read_{name}"), "Read output from a shellId returned by the shell command tool; delay controls how long to wait for new output.", read),
         (format!("stop_{name}"), "Stop the command identified by shellId.", stop),
         (format!("list_{name}"), "List shell commands owned by this conversation.", json!({"type":"object","properties":{}})),

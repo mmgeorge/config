@@ -1248,33 +1248,27 @@ impl InputDeliveryRun {
                 )
                 .map_err(|error| OperationFailure::Domain(error.into()))?
         } else {
-            let delivery = match reason {
-                InputAbandonment::Paused | InputAbandonment::Reconfigured => {
-                    Some(InputDelivery::Queued)
-                }
-                InputAbandonment::Cancelled
-                | InputAbandonment::Superseded
-                | InputAbandonment::Retracted => None,
-            };
-            let mut input = services
+            let store = services
                 .input_store(self.input.id.as_str())
-                .map_err(OperationFailure::Domain)?
-                .delivery_if_current(
-                    self.input.id.as_str(),
-                    InputDeliveryGuard::Claimed(self.input.revision),
-                    delivery,
-                    None,
-                    None,
-                )
                 .map_err(OperationFailure::Domain)?;
-            if matches!(
-                reason,
-                InputAbandonment::Cancelled | InputAbandonment::Retracted
-            ) && let Some(update) = &mut input
-            {
-                update.retracted = Some(self.input.id.as_str().into());
+            let guard = InputDeliveryGuard::Claimed(self.input.revision);
+            match reason {
+                InputAbandonment::Cancelled | InputAbandonment::Retracted => {
+                    store.retract(self.input.id.as_str(), guard)
+                }
+                InputAbandonment::Paused | InputAbandonment::Reconfigured => store
+                    .delivery_if_current(
+                        self.input.id.as_str(),
+                        guard,
+                        Some(InputDelivery::Queued),
+                        None,
+                        None,
+                    ),
+                InputAbandonment::Superseded => {
+                    store.delivery_if_current(self.input.id.as_str(), guard, None, None, None)
+                }
             }
-            input
+            .map_err(OperationFailure::Domain)?
         };
         self.release_steering_order(services);
         self.release_preparation();

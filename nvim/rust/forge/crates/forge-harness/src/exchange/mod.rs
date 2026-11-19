@@ -24,7 +24,8 @@ pub(crate) use input_delivery::SteeringDeliveryOffer;
 mod input_readiness;
 mod input_receipts;
 pub(crate) use input_readiness::{
-    InputQueuePolicy, InputReadiness, PendingInput, questions_block_task_work, select_pending_input,
+    InputQueuePolicy, InputReadiness, PendingInput, TurnOfferGates, questions_block_task_work,
+    select_pending_input, successor_turn_pending,
 };
 #[cfg(test)]
 pub(crate) use input_receipts::InputReceiptFact;

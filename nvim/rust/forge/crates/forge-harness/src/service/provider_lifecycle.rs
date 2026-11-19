@@ -229,6 +229,13 @@ impl SessionController {
                         let Some(controller) = controller.upgrade() else {
                             return Ok(());
                         };
+                        // A restart replaces the inbox only after the owner consumed this one,
+                        // and from then on the owner drains only the replacement. A failed
+                        // generation's inbox reports its failure as pending for good, so serving
+                        // it after the replacement would wake the owner without end.
+                        if !Arc::ptr_eq(&events, &controller.observer.session_events()) {
+                            return Ok(());
+                        }
                         match controller
                             .exchange_owner
                             .observe_provider_retained(messages.clone())

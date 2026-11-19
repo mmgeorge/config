@@ -13,7 +13,8 @@ use std::time::Duration;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CollectionBoundary {
     Active,
-    /// Hold native execution after the provider echoes the submitted user message, as Codex does.
+    /// Hold native execution after the provider reports context usage and then echoes the
+    /// submitted user message, as Codex does.
     ActiveAfterUserEcho,
     /// Hold native execution inside a started shell tool until its deadline stops the turn.
     ActiveInTool,
@@ -21,6 +22,9 @@ enum CollectionBoundary {
     /// provider's lifecycle observation and fail the interrupt's collection, as a binding does
     /// when it is invalidated because its interrupt was never answered.
     ActiveLosesObservation,
+    /// Hold the prompt before dispatch, as the host's baseline checkpoint does, then fail every
+    /// interrupt that collects it, as an adapter does when it cannot prove its turn ended.
+    HeldBeforeDispatch,
 }
 
 /// Hold one real owner at a selected boundary while native collection remains delayed.
@@ -46,6 +50,7 @@ async fn slow_collection_fixture(
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let held_started = started.clone();
     let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let steered_submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed_steering = steered_submissions.clone();
@@ -80,6 +85,12 @@ async fn slow_collection_fixture(
                     start.observed(1).await?;
                 }
                 if echo_user_message {
+                    // Ordered delivery applies this report before the echo a scenario waits for.
+                    sink.send_wait(forge_provider_api::AdapterActivity::Thread {
+                        thread_id: request.thread_id.clone(),
+                        event: forge_provider_api::ThreadEvent::ContextUsage(echoed_turn_usage()),
+                    })
+                    .await?;
                     let item_id = forge_provider_api::ItemId::new("echoed-user-message")
                         .expect("fixture item ID is valid");
                     let text = match request.input.user_input() {
@@ -227,6 +238,43 @@ async fn slow_collection_fixture(
             Ok(())
         }
     });
+    if boundary == CollectionBoundary::HeldBeforeDispatch {
+        let held_prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = held_started.clone();
+        native.with_pre_dispatch(move |_| {
+            let first = held_prompts.fetch_add(1, Ordering::AcqRel) == 0;
+            let held = held.clone();
+            async move {
+                if first {
+                    let _ = held.send(());
+                    // Only the interrupt ends this hold; the prompt is never dispatched.
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        });
+        // The held turn settles as a rejection its adapter cannot certify, so every interrupt of
+        // the first binding fails alike. The restarted provider's binding interrupts normally.
+        let held_binding: Arc<std::sync::Mutex<Option<forge_provider_api::BindingId>>> =
+            Arc::default();
+        native.with_interrupt_settlement(move |binding| {
+            let uncertified = held_binding
+                .lock()
+                .expect("fixture binding lock poisoned")
+                .get_or_insert_with(|| binding.clone())
+                == &binding;
+            async move {
+                if uncertified {
+                    return Err(forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TurnInterrupt,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
+                    .into());
+                }
+                Ok(())
+            }
+        });
+    }
     native.with_models(vec![serde_json::from_value(json!({
         "id":"fixture-model", "reasoning":["low","medium","high"],
         "context_window":[], "vision":false, "is_default":true,
@@ -323,7 +371,7 @@ async fn slow_collection_fixture(
     starts
         .recv()
         .await
-        .context("first input never emitted its native start observation")?;
+        .context("first input never reached its held boundary")?;
     let engine = controller
         .broker
         .lock()
@@ -347,7 +395,64 @@ async fn slow_collection_fixture(
     })
 }
 
+/// Get the context usage the fixture provider reports before it echoes the user message.
+fn echoed_turn_usage() -> forge_provider_api::context::ContextUsage {
+    forge_provider_api::context::ContextUsage::reported(40_000, 200_000)
+        .expect("fixture window has capacity")
+}
+
 impl SlowCollectionFixture {
+    /// Cancel the echoed, output-free prompt with restoration and wait for its retraction.
+    ///
+    /// Returns the provisional exchange the echo created.
+    async fn retract_echoed_prompt(&self) -> Result<String> {
+        use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
+        // The echo precedes the fixture's start signal, so wait until the broker applied it.
+        let exchange_id = loop {
+            let changed = self.events_changed.notified();
+            let echoed = SqliteStore::read_only(&self.controller.data_root)?
+                .list_exchange(self.controller.observer.session_id())?
+                .into_iter()
+                .find(|exchange| {
+                    exchange
+                        .turn
+                        .iter()
+                        .flat_map(|turn| turn.messages())
+                        .next()
+                        .is_some()
+                })
+                .map(|exchange| exchange.id);
+            if let Some(exchange_id) = echoed {
+                break exchange_id;
+            }
+            changed.await;
+        };
+        self.controller
+            .exchange_owner
+            .execute_command(Command::CancelExchange(CancelExchangeRequest {
+                input: CancelledInputPolicy::RestoreIfUnconsumed,
+            }))
+            .await
+            .context("restoring cancellation failed")?;
+        // Input settlement publishes after the cancellation command commits its outcome.
+        loop {
+            let changed = self.events_changed.notified();
+            let retracted = self
+                .events
+                .lock()
+                .expect("fixture events poisoned")
+                .iter()
+                .any(|(_, event)| {
+                    event["event"] == "input_changed" && event["payload"]["retracted"].is_string()
+                });
+            if retracted {
+                break;
+            }
+            changed.await;
+        }
+        Ok(exchange_id)
+    }
+
     /// Stop owner work and provider collection after a scenario, preserving the scenario result.
     async fn finish(self, scenario: Result<()>) -> Result<()> {
         let teardown = async {
@@ -359,7 +464,17 @@ impl SlowCollectionFixture {
             self.provider.provider_handle().shutdown().await?;
             self.controller.finish_session_events().await
         };
-        let teardown = teardown.await;
+        // A failed scenario can leave an owner that never stops. Bounding its teardown reports
+        // the scenario's failure instead of a hang; a paused clock runs the bound out at once.
+        let teardown = if scenario.is_err() {
+            tokio::time::timeout(Duration::from_secs(120), teardown)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("the failed scenario's owner never stopped"))
+                })
+        } else {
+            teardown.await
+        };
         let trace_tail = scenario.is_err().then(|| {
             let session = self.controller.observer.session_id();
             let _ = self.controller.trace.flush();
@@ -386,82 +501,36 @@ impl SlowCollectionFixture {
 /// Codex reports the submitted prompt as a native user-message item before any assistant
 /// output. That echo is not provider activity, so a restoring cancellation must still retract
 /// the native turn, delete the provisional exchange, and publish `retracted` for the input.
+/// The context usage reported during the retracted turn survives the restoration.
 #[tokio::test]
 async fn owner_cancel_after_user_message_echo_retracts_output_free_prompt() -> Result<()> {
-    use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
     let mut fixture =
         slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveAfterUserEcho).await?;
     let scenario = async {
-        // The echo precedes the fixture's start signal, so wait until the broker applied it.
-        let exchange_id = async {
-            loop {
-                let changed = fixture.events_changed.notified();
-                let echoed = SqliteStore::read_only(&fixture.controller.data_root)?
-                    .list_exchange(fixture.controller.observer.session_id())?
-                    .into_iter()
-                    .find(|exchange| {
-                        exchange
-                            .turn
-                            .iter()
-                            .flat_map(|turn| turn.messages())
-                            .next()
-                            .is_some()
-                    })
-                    .map(|exchange| exchange.id);
-                if let Some(exchange_id) = echoed {
-                    break Ok::<_, anyhow::Error>(exchange_id);
-                }
-                changed.await;
-            }
-        }
-        .await?;
-        fixture
-            .controller
-            .exchange_owner
-            .execute_command(Command::CancelExchange(CancelExchangeRequest {
-                input: CancelledInputPolicy::RestoreIfUnconsumed,
-            }))
-            .await
-            .context("restoring cancellation failed")?;
-        // Input settlement publishes after the cancellation command commits its outcome.
-        let input_updates = || {
-            fixture
-                .events
-                .lock()
-                .expect("fixture events poisoned")
-                .iter()
-                .filter(|(_, event)| event["event"] == "input_changed")
-                .map(|(_, event)| event["payload"].clone())
-                .collect::<Vec<_>>()
-        };
-        async {
-            loop {
-                let changed = fixture.events_changed.notified();
-                if input_updates()
-                    .iter()
-                    .any(|update| update["retracted"].is_string())
-                {
-                    break;
-                }
-                changed.await;
-            }
-        }
-        .await;
+        let exchange_id = fixture.retract_echoed_prompt().await?;
         ensure!(
             SqliteStore::read_only(&fixture.controller.data_root)?
                 .load_exchange(&exchange_id)?
                 .is_none(),
             "retracted prompt retained its provisional exchange"
         );
-        let retained_name = crate::session::SessionStore::load_session(
+        let restored_session = crate::session::SessionStore::load_session(
             &SqliteStore::read_only(&fixture.controller.data_root)?,
             fixture.controller.observer.session_id(),
         )?
-        .context("fixture session is missing")?
-        .name;
+        .context("fixture session is missing")?;
         ensure!(
-            retained_name.is_empty(),
-            "retracted first prompt still names the session: {retained_name:?}"
+            restored_session.name.is_empty(),
+            "retracted first prompt still names the session: {:?}",
+            restored_session.name
+        );
+        // The report measures the native context rather than the prompt, so restoring the
+        // session as it stood before the prompt must not bring back a superseded figure.
+        ensure!(
+            restored_session.context_usage
+                == crate::session::ContextUsage::from_report(&echoed_turn_usage()),
+            "retraction replaced the reported context usage with {:?}",
+            restored_session.context_usage
         );
         // Retraction commits the collected invocation, so the execution owner admits new work.
         prompt::apply(
@@ -744,4 +813,232 @@ async fn cancels_queued_behind_a_failed_stop_are_answered() -> Result<()> {
     }
     .await;
     fixture.finish(scenario).await
+}
+
+/// A stop that fails while the prompt is still held before dispatch leaves the session usable.
+///
+/// The host holds a prompt before dispatch until its baseline checkpoint is captured. A cancel
+/// in that window retires the journal entry and asks the adapter to collect its preparation. When
+/// that collection fails, the stop fails and the owner must restart the provider, but the turn
+/// has no failure of its own yet: no dispatch was attempted and no terminal event will arrive.
+/// The failed collection must therefore end the turn, or the restart waits for a turn that never
+/// settles and every later prompt and cancel queues behind it.
+///
+/// Nothing proved the provider left the prompt unconsumed, so the prompt returns to the queue as
+/// failed instead of being restored or resent. Retrying it is the user's decision, and the
+/// restarted provider must then run it.
+#[tokio::test(start_paused = true)]
+async fn failed_stop_of_a_prompt_held_before_dispatch_restarts_the_provider() -> Result<()> {
+    use crate::exchange::command::{
+        CancelExchangeRequest, CancelledInputPolicy, Command, CommandFailure, CommandId,
+        CommandRequest, ExecuteCommandError, InputControl,
+    };
+    use crate::input::InputDelivery;
+    use crate::protocol::RuntimeMethod;
+    let mut fixture =
+        slow_collection_fixture(Duration::ZERO, CollectionBoundary::HeldBeforeDispatch).await?;
+    let scenario = async {
+        // The paused clock runs each bound below out at once when nothing else can progress.
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(120),
+            fixture.controller.exchange_owner.execute_identified(
+                CommandRequest {
+                    id: CommandId::new("cancel-before-dispatch")?,
+                    command: Command::CancelExchange(CancelExchangeRequest {
+                        input: CancelledInputPolicy::RestoreIfUnconsumed,
+                    }),
+                    input_control: InputControl::AtExecution,
+                },
+                fixture.sink.clone(),
+            ),
+        )
+        .await
+        .context("the stop was never answered")?;
+        ensure!(
+            matches!(
+                stopped,
+                Err(ExecuteCommandError::Failed(CommandFailure::StopFailed))
+            ),
+            "a stop whose collection failed did not report the failed stop: {stopped:?}"
+        );
+        let (held_revision, control_revision) =
+            tokio::time::timeout(Duration::from_secs(120), async {
+                loop {
+                    let changed = fixture.events_changed.notified();
+                    let snapshot = fixture.controller.coordinator.submissions.snapshot()?;
+                    let held = snapshot
+                        .messages
+                        .iter()
+                        .find(|message| message.id == "prompt-input:slow-first")
+                        .context("the cancelled prompt left the queue")?;
+                    if held.delivery() == InputDelivery::Failed {
+                        break Ok::<_, anyhow::Error>((held.revision, snapshot.control_revision));
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .context("the turn held before dispatch never settled after the failed stop")??;
+        // The cancel paused the queue, so the user retries the prompt and resumes delivery. A
+        // session that never leaves the stop holds both requests, so the bound covers them.
+        let input = tokio::time::timeout(Duration::from_secs(120), async {
+            for (request_id, params) in [
+                (
+                    804,
+                    json!({"id":"retry-held-prompt","action":{
+                        "kind":"retry","id":"prompt-input:slow-first","revision":held_revision}}),
+                ),
+                (
+                    805,
+                    json!({"id":"resume-queue","control_revision":control_revision,
+                        "action":{"kind":"resume"}}),
+                ),
+            ] {
+                fixture
+                    .controller
+                    .input_request(
+                        Request {
+                            id: request_id,
+                            method: "session.input.apply".into(),
+                            params,
+                        },
+                        RuntimeMethod::SessionInputApply,
+                        &fixture.sink,
+                    )
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(fixture.dispatches.recv().await)
+        })
+        .await
+        .context("the restarted provider ran no prompt after the failed stop")??;
+        ensure!(
+            matches!(&input, Some(forge_provider_api::input::PromptInput::Text(text))
+                if text == "First prompt"),
+            "the restarted provider ran another prompt: {input:?}"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    fixture.finish(scenario).await
+}
+
+/// Keep the queue running when `Ctrl-C` arrives with nothing to stop.
+///
+/// The status row can still read `Working` for a moment after a turn ends, so an idle session
+/// receives interrupts. With no exchange running and no task to pause, such a cancel has nothing
+/// to stop; pausing the queue there stranded a message held for editing, which nothing resent
+/// once the edit was saved.
+#[tokio::test]
+async fn idle_cancel_leaves_a_held_follow_up_deliverable() -> Result<()> {
+    use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let controller =
+        SessionController::new(HarnessBroker::initialize(serde_json::from_value(json!({
+            "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"idle-cancel",
+            "provider":{"kind":"mock","command":[]},
+        }))?)?)
+        .await?;
+    let session = controller.observer.session_id().to_owned();
+    // Queue and reserve the follow-up before input dispatch starts, as an editor holding it
+    // open in the composer does.
+    let input = &controller.coordinator.submissions;
+    input.apply(InputOperation {
+        id: "submit-held".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Submit {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
+                id: "held".into(),
+                text: "Original follow-up".into(),
+                purpose: crate::input::InputPurpose::User,
+                attachments: Vec::new(),
+                config: None,
+                intent: InputIntent::Queue,
+            })),
+        },
+    })?;
+    input.apply(InputOperation {
+        id: "reserve-held".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Reserve {
+            id: "held".into(),
+            revision: 1,
+            reservation: "editor".into(),
+        },
+    })?;
+    let control = controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock control")?;
+    let hold = control
+        .dispatch(
+            &session,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<_, anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    super::super::cancellation::apply(
+        &controller,
+        &Request {
+            id: 1,
+            method: "session.turn.cancel".into(),
+            params: json!({"operation_id":"idle-cancel","restore_prompt_if_no_output":true}),
+        },
+        &sink,
+    )
+    .await?;
+    ensure!(
+        !input.snapshot()?.suspended,
+        "a cancel with nothing running paused the queue"
+    );
+    let revision = input.snapshot()?.messages[0].revision;
+    controller
+        .input_request(
+            Request {
+                id: 2,
+                method: "session.input.apply".into(),
+                params: json!({"id":"commit-held","action":{"kind":"commit","reservation":"editor",
+                    "edits":[{"id":"held","revision":revision,"text":"Edited follow-up","config":null}]}}),
+            },
+            crate::protocol::RuntimeMethod::SessionInputApply,
+            &sink,
+        )
+        .await?;
+    let delivered = control
+        .dispatch(
+            &session,
+            MockResponseCommand::Wait {
+                id: hold["id"].as_str().context("hold identity")?.into(),
+            },
+        )
+        .await?;
+    ensure!(
+        delivered["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("Edited follow-up")),
+        "the saved follow-up never reached the provider: {delivered}"
+    );
+    control
+        .dispatch(
+            &session,
+            MockResponseCommand::Release {
+                id: hold["id"].as_str().context("hold identity")?.into(),
+            },
+        )
+        .await?;
+    controller.finish_exchange_owner().await?;
+    drop(sink);
+    reader.abort();
+    Ok(())
 }

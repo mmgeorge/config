@@ -162,13 +162,28 @@ impl ActiveCommand {
                 broker
                     .cancel_question_delivery()
                     .map_err(super::transition::TransitionFailure::Domain)?;
-                let mut input = services
-                    .input
-                    .suspend(true, Some(command.record.request.id.as_str()))
-                    .map_err(super::transition::TransitionFailure::Domain)?;
+                // A cancel pauses the queue only when it stops something: foreground work or an
+                // unfinished task, which `owner_cancel_local` pauses below. With neither, the
+                // status row may still have read `Working` after a turn ended, and pausing would
+                // strand every queued message, including one held open for editing, with
+                // nothing left to resume delivery.
+                let task_pauses = services
+                    .tasks
+                    .current()
+                    .map_err(super::transition::TransitionFailure::Domain)?
+                    .is_some_and(|task| !task.status().terminal());
+                let mut input = if foreground_absent && !task_pauses {
+                    None
+                } else {
+                    Some(
+                        services
+                            .input
+                            .suspend(true, Some(command.record.request.id.as_str()))
+                            .map_err(super::transition::TransitionFailure::Domain)?,
+                    )
+                };
                 // Without foreground work, a restoring cancel targets the prompt that was
-                // submitted but not yet claimed; only retraction keeps it from being
-                // stranded behind the suspension.
+                // submitted but not yet claimed, and returns it to the composer.
                 if foreground_absent
                     && request.input == super::command::CancelledInputPolicy::RestoreIfUnconsumed
                     && let Some(retracted) = services
@@ -176,7 +191,7 @@ impl ActiveCommand {
                         .retract_unclaimed_submission(command.record.request.id.as_str())
                         .map_err(super::transition::TransitionFailure::Domain)?
                 {
-                    input = retracted;
+                    input = Some(retracted);
                 }
                 let (prior, events) = broker
                     .owner_cancel_local(None)
@@ -185,7 +200,7 @@ impl ActiveCommand {
                     prior.is_none(),
                     "task-only cancellation has no exchange finalization"
                 );
-                Ok((events, Some(input)))
+                Ok((events, input))
             }
             Self::Agent(_)
             | Self::Rollback(_)

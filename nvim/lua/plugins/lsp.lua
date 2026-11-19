@@ -216,7 +216,8 @@ return {
             cargo = {
               allTargets = true,
               features = "all",
-              targetDir = true,
+              -- Use a separate target subdirectory to avoid blocking normal Cargo builds.
+              -- targetDir = true,
             },
             check = {
               allTargets = true,

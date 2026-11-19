@@ -406,12 +406,14 @@ impl InputReceipts {
                         unreachable!("settlement selects only terminal or safely queued delivery")
                     }
                 };
-                let mut update = tracked.commit_delivery(services, delivery, error)?;
-                if matches!(result, InputExecutionResult::Cancelled)
+                // A cancelled turn whose input never reached the provider retracts that input.
+                let update = if matches!(result, InputExecutionResult::Cancelled)
                     && retirement == SubmissionRetirement::Cancelled
                 {
-                    update.retracted = Some(tracked.input.id.as_str().into());
-                }
+                    tracked.commit_retraction(services)?
+                } else {
+                    tracked.commit_delivery(services, delivery, error)?
+                };
                 if retirement == SubmissionRetirement::Sending {
                     tracked.work = ReceiptWork::DeliveryUncertain;
                 } else {
@@ -445,7 +447,7 @@ impl InputReceipts {
                     },
                 };
                 // Confirmed native history retraction removes an accepted prompt as completely as
-                // journal retirement removes an unsent one, so both restore the composer draft.
+                // journal retirement removes an unsent one, so both return the prompt to the user.
                 let retracted = match reason {
                     InputAbandonment::Cancelled => retirement == SubmissionRetirement::Cancelled,
                     InputAbandonment::Retracted => matches!(
@@ -456,15 +458,16 @@ impl InputReceipts {
                     | InputAbandonment::Reconfigured
                     | InputAbandonment::Superseded => false,
                 };
-                let mut update = tracked.commit_delivery(
-                    services,
-                    delivery,
-                    (retirement == SubmissionRetirement::Sending)
-                        .then(|| "Delivery unconfirmed. Reconcile before retrying.".into()),
-                )?;
-                if retracted {
-                    update.retracted = Some(tracked.input.id.as_str().into());
-                }
+                let update = if retracted {
+                    tracked.commit_retraction(services)?
+                } else {
+                    tracked.commit_delivery(
+                        services,
+                        delivery,
+                        (retirement == SubmissionRetirement::Sending)
+                            .then(|| "Delivery unconfirmed. Reconcile before retrying.".into()),
+                    )?
+                };
                 if retirement == SubmissionRetirement::Sending {
                     tracked.work = ReceiptWork::DeliveryUncertain;
                 } else {
@@ -675,16 +678,12 @@ impl TrackedInput {
         delivery: Option<InputDelivery>,
         error: Option<String>,
     ) -> Result<InputUpdate, InputReceiptError> {
-        let guard = match self.binding {
-            ReceiptBinding::Claimed => InputDeliveryGuard::Claimed(self.input.revision),
-            ReceiptBinding::Bound => InputDeliveryGuard::Receipt(self.submission.receipt_id()),
-        };
         let update = services
             .input_store(self.input.id.as_str())
             .map_err(InputReceiptError::Queue)?
             .delivery_if_current(
                 self.input.id.as_str(),
-                guard,
+                self.guard(),
                 delivery,
                 Some(self.submission.id().into()),
                 error,
@@ -693,6 +692,29 @@ impl TrackedInput {
             .ok_or(InputReceiptError::StaleInput)?;
         self.binding = ReceiptBinding::Bound;
         Ok(update)
+    }
+
+    /// Retire the retracted input and keep a user prompt as an unsent queue entry.
+    fn commit_retraction(
+        &mut self,
+        services: &OwnerServices,
+    ) -> Result<InputUpdate, InputReceiptError> {
+        let update = services
+            .input_store(self.input.id.as_str())
+            .map_err(InputReceiptError::Queue)?
+            .retract(self.input.id.as_str(), self.guard())
+            .map_err(InputReceiptError::Queue)?
+            .ok_or(InputReceiptError::StaleInput)?;
+        self.binding = ReceiptBinding::Bound;
+        Ok(update)
+    }
+
+    /// Get the queue authority this receipt holds before and after its binding commits.
+    fn guard(&self) -> InputDeliveryGuard<'_> {
+        match self.binding {
+            ReceiptBinding::Claimed => InputDeliveryGuard::Claimed(self.input.revision),
+            ReceiptBinding::Bound => InputDeliveryGuard::Receipt(self.submission.receipt_id()),
+        }
     }
 
     /// Commit task activation before exposing native acceptance to host reducers.

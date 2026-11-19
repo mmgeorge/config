@@ -331,6 +331,7 @@ pub struct EventFixtureProvider {
     session_identity: std::sync::RwLock<Option<Arc<IdentityHandler>>>,
     cleanup: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
     cleanup_request: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
+    interrupt_settlement: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
     shutdown: std::sync::RwLock<Option<Arc<ShutdownHandler>>>,
     thread_close: std::sync::RwLock<Option<Arc<CleanupHandler>>>,
     mcp: std::sync::RwLock<Option<Arc<McpHandler>>>,
@@ -370,6 +371,7 @@ impl EventFixtureProvider {
             session_identity: Default::default(),
             cleanup: Default::default(),
             cleanup_request: Default::default(),
+            interrupt_settlement: Default::default(),
             shutdown: Default::default(),
             thread_close: Default::default(),
             mcp: Default::default(),
@@ -528,6 +530,23 @@ impl EventFixtureProvider {
             .cleanup
             .write()
             .expect("fixture cleanup lock is not poisoned") =
+            Some(Arc::new(move |binding| Box::pin(handler(binding))));
+        self.clone()
+    }
+
+    /// Decide every interrupt's result after its invocation settled.
+    ///
+    /// An adapter whose settled turn cannot certify collection fails each repeated interrupt of
+    /// that turn alike, unlike `with_cleanup_request`, whose failure a retry clears.
+    pub fn with_interrupt_settlement<F, Fut>(self: &Arc<Self>, handler: F) -> Arc<Self>
+    where
+        F: Fn(BindingId) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
+    {
+        *self
+            .interrupt_settlement
+            .write()
+            .expect("fixture interrupt settlement lock is not poisoned") =
             Some(Arc::new(move |binding| Box::pin(handler(binding))));
         self.clone()
     }
@@ -936,6 +955,14 @@ impl EventFixtureProvider {
                     && invocation.collected.load(Ordering::Acquire) => {}
             Err(_) if invocation.collected.load(Ordering::Acquire) => {}
             Err(error) => return Err(error),
+        }
+        let interrupt_settlement = self
+            .interrupt_settlement
+            .read()
+            .expect("fixture interrupt settlement lock is not poisoned")
+            .clone();
+        if let Some(interrupt_settlement) = interrupt_settlement {
+            interrupt_settlement(binding.clone()).await?;
         }
         Ok(TurnInterruptResult {
             operation_id: context.id().clone(),

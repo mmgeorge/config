@@ -61,4 +61,22 @@ T["agent_thought_stays_on_its_row_and_clips_to_width"] = function()
   MiniTest.expect.equality(cramped.lines[2], "  └─ ⠋ 4s explorer │ 2/2 tools · 1.0 s")
 end
 
+T["notice_follows_the_status_row_ahead_of_staged_input"] = function()
+  local commands = require("forge.shared.view_command_set").new()
+  local hint = require("forge.views.harness.status_hint")
+  local snapshot = { block = {
+    { text = { "Stopping" }, metadata = { status = { row = 0, animated = true } } },
+    { text = { "" } },
+    { text = { "Queued follow-up inputs", "└─ Then summarize it" } },
+  } }
+  local content = hint.compose(snapshot, { status_notice = { text = "Cancellation still pending" } }, commands, 80)
+  -- The notice explains the phase row, so staged input below it must not separate the two.
+  MiniTest.expect.equality(content.lines, {
+    "  Stopping", "  Cancellation still pending", "  ", "  Queued follow-up inputs", "  └─ Then summarize it",
+  })
+  MiniTest.expect.equality(content.animated, nil)
+  local animated = hint.compose(snapshot, { status_notice = { text = "Reconnecting", animated = true } }, commands, 80)
+  MiniTest.expect.equality(animated.animated, 1)
+end
+
 return T

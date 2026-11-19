@@ -24,6 +24,8 @@ enum AcpMessageRole {
 /// Owns native ACP events and conversation state, delegating policy to the host.
 pub struct AcpSessionState {
     kind: ProviderKind,
+    /// The binding's workspace, against which tool titles show workspace-relative paths.
+    workspace: String,
     admission: AtomicBool,
     admission_revocation: tokio_util::sync::CancellationToken,
     collected: AtomicBool,
@@ -117,20 +119,29 @@ impl Drop for HistoryReplayGuard<'_> {
 
 impl AcpSessionState {
     /// Create session state whose permission authority is installed with each invocation.
-    pub fn new_native(kind: ProviderKind) -> Self {
-        Self::with_permission(kind, None)
+    pub fn new_native(kind: ProviderKind, workspace: String) -> Self {
+        Self::with_permission(kind, None, workspace)
     }
 
     /// Create native callback state sharing the provider's immediate shutdown admission gate.
-    pub(super) fn new_binding(kind: ProviderKind, provider_admission: Arc<AtomicBool>) -> Self {
-        let mut state = Self::new_native(kind);
+    pub(super) fn new_binding(
+        kind: ProviderKind,
+        provider_admission: Arc<AtomicBool>,
+        workspace: String,
+    ) -> Self {
+        let mut state = Self::new_native(kind, workspace);
         state.provider_admission = Some(provider_admission);
         state
     }
 
-    fn with_permission(kind: ProviderKind, permission: Option<Arc<dyn ScopedPermissions>>) -> Self {
+    fn with_permission(
+        kind: ProviderKind,
+        permission: Option<Arc<dyn ScopedPermissions>>,
+        workspace: String,
+    ) -> Self {
         Self {
             kind,
+            workspace,
             admission: AtomicBool::new(true),
             admission_revocation: tokio_util::sync::CancellationToken::new(),
             collected: AtomicBool::new(false),
@@ -736,14 +747,12 @@ impl AcpSessionState {
         address: &TurnAddress,
         outcome: forge_provider_api::turn::TurnOutcome,
     ) -> Result<(), ProviderError> {
-        if matches!(
-            outcome,
-            forge_provider_api::turn::TurnOutcome::Completed { .. }
-        ) {
-            self.classify_messages(address, AcpMessageRole::Response)
-                .await
-                .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
-        }
+        // The end of the turn settles every pending role, whatever the outcome. Harness hides an
+        // interrupted response and keeps other prose, so a reply left unclassified at an
+        // interruption would stay in the transcript as no other provider's does.
+        self.classify_messages(address, AcpMessageRole::Response)
+            .await
+            .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
         let updates = {
             let mut messages = self.message.lock().await;
             messages
@@ -803,7 +812,7 @@ impl AcpSessionState {
                 .get(&key)
                 .cloned()
                 .ok_or_else(|| provider_failure(ProviderFailureKind::Protocol))?;
-            let (kind, descriptor) = normalize_tool_descriptor(&snapshot);
+            let (kind, descriptor) = normalize_tool_descriptor(&snapshot, &self.workspace);
             let (item_id, admitted) = {
                 let mut items = self.admitted_tool.lock().await;
                 if let Some(item) = items.get(&key) {
@@ -1392,7 +1401,7 @@ impl AcpSessionState {
                 if update.get("kind").is_none_or(Value::is_null) && status == ToolStatus::Running {
                     return Ok(());
                 }
-                let (kind, descriptor) = normalize_tool_descriptor(update);
+                let (kind, descriptor) = normalize_tool_descriptor(update, &self.workspace);
                 let (item_id, admitted) = {
                     let mut items = self.admitted_tool.lock().await;
                     match items.entry(native_key.clone()) {
@@ -2003,7 +2012,7 @@ fn merge_tool_snapshot(snapshot: &mut Value, update: &Value) -> Result<bool, Pro
 }
 
 /// Normalize one complete native snapshot before publishing its immutable item type and descriptor.
-fn normalize_tool_descriptor(snapshot: &Value) -> (ToolKind, ToolDescriptor) {
+fn normalize_tool_descriptor(snapshot: &Value, workspace: &str) -> (ToolKind, ToolDescriptor) {
     normalize_descriptor(
         normalized_tool_kind(&snapshot["kind"]),
         ToolDescriptor {
@@ -2014,6 +2023,7 @@ fn normalize_tool_descriptor(snapshot: &Value) -> (ToolKind, ToolDescriptor) {
                 snapshot.get("rawInput").cloned().unwrap_or(Value::Null),
             ),
         },
+        workspace,
     )
 }
 

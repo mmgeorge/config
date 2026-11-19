@@ -84,6 +84,32 @@ impl PendingInputSelection {
     }
 }
 
+/// Hold the session facts that keep a queued message from starting a turn of its own.
+///
+/// The owner applies these gates when it is offered a message, and the status projection applies
+/// them when it predicts that offer, so the two cannot disagree about which message starts.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnOfferGates {
+    pub checks_running: bool,
+    pub has_approval: bool,
+    pub has_elicitation: bool,
+}
+
+impl TurnOfferGates {
+    /// Get whether `message` may start its own turn while these facts hold.
+    pub(crate) fn admit(self, message: &InputMessage) -> bool {
+        let Self {
+            checks_running,
+            has_approval,
+            has_elicitation,
+        } = self;
+        let held_for_checks =
+            checks_running && !matches!(message.purpose, InputPurpose::CheckResult { .. });
+        let held_for_answer = message.intent == InputIntent::Queue && has_elicitation;
+        !(held_for_checks || has_approval || held_for_answer)
+    }
+}
+
 /// Keep automatic task work behind required questions and committed answers still awaiting delivery.
 pub(crate) fn questions_block_task_work(
     input: &InputSnapshot,
@@ -227,4 +253,110 @@ pub(crate) fn select_pending_input(
         message: Box::new(message),
         command: command.map(Box::new),
     }))
+}
+
+/// Report whether a user turn is about to start with no further user action.
+///
+/// A finished exchange leaves the session idle until the owner claims the next queued message and
+/// admits its exchange. This reports that interval: a user message already claimed for its own
+/// turn, or the message the scheduler would offer next when `gates` admit it. A directive that
+/// runs as a local command is excluded, because it may start no turn.
+pub(crate) fn successor_turn_pending(
+    input: InputSnapshot,
+    questions: &QuestionController,
+    gates: TurnOfferGates,
+) -> Result<bool, InputOfferError> {
+    let claimed = input.messages.iter().any(|message| {
+        matches!(message.purpose, InputPurpose::User)
+            && message.delivery() == InputDelivery::Delivering
+            && message.route() == Some(crate::input::InputRoute::Turn)
+    });
+    if claimed {
+        return Ok(true);
+    }
+    let PendingInput::Ready(selection) =
+        select_pending_input(input, questions, InputQueuePolicy::Ordered)?
+    else {
+        return Ok(false);
+    };
+    let (message, command) = selection.into_parts();
+    Ok(command.is_none() && matches!(message.purpose, InputPurpose::User) && gates.admit(&message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Predict a successor turn only for a message the owner would start without the user.
+    ///
+    /// A prediction that outlives its turn leaves the status row reading `Working` on a session
+    /// that will never start, so every fact that holds a message back must clear it.
+    #[test]
+    fn successor_turn_is_pending_only_for_a_message_the_owner_would_start() -> anyhow::Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let questions = QuestionController::open(root.path(), "session")?;
+        let queued = |intent: InputIntent| {
+            InputMessage::queued(crate::input::InputDraft {
+                id: "follow-up".into(),
+                text: "Continue".into(),
+                purpose: InputPurpose::User,
+                intent,
+                attachments: vec![],
+                config: None,
+            })
+        };
+        let snapshot = |intent: InputIntent, suspended: bool| InputSnapshot {
+            revision: 1,
+            messages: vec![queued(intent)],
+            suspended,
+            control_revision: 0,
+            control_operation_id: None,
+        };
+        let open = TurnOfferGates {
+            checks_running: false,
+            has_approval: false,
+            has_elicitation: false,
+        };
+        let pending = |input: InputSnapshot, gates: TurnOfferGates| {
+            successor_turn_pending(input, &questions, gates)
+        };
+        assert!(pending(snapshot(InputIntent::Queue, false), open)?);
+        assert!(!pending(snapshot(InputIntent::Queue, true), open)?);
+        assert!(!pending(
+            snapshot(InputIntent::Auto, false),
+            TurnOfferGates {
+                checks_running: true,
+                ..open
+            }
+        )?);
+        assert!(!pending(
+            snapshot(InputIntent::Auto, false),
+            TurnOfferGates {
+                has_approval: true,
+                ..open
+            }
+        )?);
+        assert!(!pending(
+            snapshot(InputIntent::Queue, false),
+            TurnOfferGates {
+                has_elicitation: true,
+                ..open
+            }
+        )?);
+        assert!(pending(
+            snapshot(InputIntent::Auto, false),
+            TurnOfferGates {
+                has_elicitation: true,
+                ..open
+            }
+        )?);
+        assert!(!pending(
+            InputSnapshot {
+                messages: vec![],
+                ..snapshot(InputIntent::Queue, false)
+            },
+            open
+        )?);
+        Ok(())
+    }
 }

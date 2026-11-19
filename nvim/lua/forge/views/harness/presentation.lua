@@ -337,7 +337,7 @@ function M.open(options, callback)
     owner.staging_inflight = true
     owner.staging_sequence = (owner.staging_sequence or 0) + 1
     request({ operation = "staging", document = identity, sequence = owner.staging_sequence,
-      queue = pending.queue, steering = pending.steering }, function(_, failure)
+      queue = pending.queue, steering = pending.steering, queue_paused = pending.paused }, function(_, failure)
       owner.staging_inflight = false
       if failure then fail("Staging update failed: " .. tostring(failure)) return end
       owner.applied_staging = pending
@@ -352,9 +352,10 @@ function M.open(options, callback)
   ---Replace transient staged messages without changing the composer or durable history.
   ---@param queue (string|ForgeStagedInput)[]?
   ---@param steering ForgeStagedInput[]?
-  function owner.set_staging(queue, steering)
+  ---@param paused? string Resume hint shown with the queue heading while delivery is paused.
+  function owner.set_staging(queue, steering, paused)
     if not alive() then return end
-    local staged = { queue = {}, steering = {} }
+    local staged = { queue = {}, steering = {}, paused = paused }
     for _, entry in ipairs(queue or {}) do
       staged.queue[#staged.queue + 1] = type(entry) == "table" and entry.id
         and { id = entry.id, text = entry.text, failed = entry.failed == true, content = entry.content } or type(entry) == "table" and entry.text or entry
@@ -394,6 +395,7 @@ function M.open(options, callback)
     owner.status_view:apply(opened.status, guard(function(applied)
     if not applied then reject_open("Harness status could not be adopted") return end
     owner.ready = true
+    owner.status_view:schedule_refresh(opened.activity_due_in_ms)
     response_reveal:publish(owner.transcript, owner.views, true)
     owner.diff_view = opened.diff_view and opened.diff_view ~= vim.NIL and opened.diff_view or { visibility = "all", presentation = "full" }
     flush_staging()
@@ -613,6 +615,7 @@ function M.open(options, callback)
       owner.applying = true
       local function complete(status_applied)
         owner.applying, owner.syncing = false, false
+        owner.status_view:schedule_refresh(result.activity_due_in_ms)
         if result.diff_view and result.diff_view ~= vim.NIL then owner.diff_view = result.diff_view end
         publish_openings()
         local switched_timeline = owner.restore_timeline ~= nil
@@ -630,7 +633,8 @@ function M.open(options, callback)
         local revision = owner.transcript.revision
         markdown.after_render(options.transcript_buffer, guard(function(rendered)
           if owner.transcript.revision ~= revision then return end
-          response_reveal:publish(owner.transcript, owner.views, switched_timeline or not status_applied or not rendered)
+          response_reveal:publish(owner.transcript, owner.views, switched_timeline or not status_applied or not rendered,
+            owner.status_view:handoff())
         end))
         if result.syntax_pending then owner.highlight() end
         if owner.pending then owner.sync() end

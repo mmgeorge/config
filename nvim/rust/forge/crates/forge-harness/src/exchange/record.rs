@@ -9,6 +9,8 @@ enum InputAppend {
     User,
     /// The provider acknowledged receipt under this invocation.
     Acknowledged(forge_provider_api::InvocationScope),
+    /// The provider accepted the input as the prompt of this invocation.
+    Dispatched(forge_provider_api::InvocationScope),
 }
 
 /// Reports the effect of one native observation on the exchange record.
@@ -90,10 +92,14 @@ pub enum ExchangeCollection {
 
 impl ExchangeCollection {
     /// Describe cleanup without claiming productive execution or successful cancellation.
+    ///
+    /// Collection and settlement share one label. Native collection usually ends within a few
+    /// hundred milliseconds, so naming the settlement step renamed the status row and the
+    /// exchange heading under the reader on every interrupt. The cancellation notice names the
+    /// step once cleanup outlives a reporting boundary.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Pending => "Stopping",
-            Self::Settling => "Cancellation pending - settling host work",
+            Self::Pending | Self::Settling => "Stopping",
             Self::TimedOut => "Cleanup timed out - provider state uncertain",
         }
     }
@@ -147,6 +153,10 @@ pub struct Exchange {
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
     pub approval_resolution: Vec<crate::provider::PermissionApprovalEvent>,
+    /// Invocations whose tool deadline stopped this exchange, which providers report only as
+    /// interrupted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tool_timeout: Vec<crate::provider::tool_timeout::ToolTimeoutRecord>,
     /// Committed host file operations retain their own callback identity.
     #[serde(default)]
     pub(crate) host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
@@ -226,6 +236,8 @@ struct ExchangeRecord {
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
     pub approval_resolution: Vec<crate::provider::PermissionApprovalEvent>,
+    #[serde(default)]
+    pub(crate) tool_timeout: Vec<crate::provider::tool_timeout::ToolTimeoutRecord>,
     /// Committed host file operations retain their own callback identity.
     #[serde(default)]
     pub(crate) host_file_changes: Vec<crate::tools::lsp::HostFileChange>,
@@ -430,6 +442,7 @@ impl Exchange {
             attributed_matches_checkpoint: false,
             provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
+            tool_timeout: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,
             created_at_ms: delegation.created_at_ms,
@@ -486,6 +499,7 @@ impl Exchange {
             attributed_matches_checkpoint: false,
             provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
+            tool_timeout: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,
             created_at_ms: started_at_ms,
@@ -1531,6 +1545,32 @@ impl Exchange {
         )
     }
 
+    /// Record accepted input that the provider received as the prompt of `invocation`.
+    ///
+    /// A steer the provider refused before dispatch is resent as the next invocation's prompt.
+    /// The model reads a turn's prompt when that turn starts, and providers echo only steering,
+    /// so the input is consumed on acceptance: its row closes the running message and precedes
+    /// the output of the turn it starts, or replaces an echo that arrived first.
+    pub(crate) fn append_dispatched_input(
+        &mut self,
+        invocation: &forge_provider_api::InvocationScope,
+        id: Option<String>,
+        submission_id: Option<forge_provider_api::SubmissionId>,
+        intent: InputIntent,
+        text: String,
+        now_ms: i64,
+    ) -> anyhow::Result<ExchangeInput> {
+        self.record_input(
+            InputAppend::Dispatched(invocation.clone()),
+            id,
+            submission_id,
+            intent,
+            text,
+            None,
+            now_ms,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record_input(
         &mut self,
@@ -1544,7 +1584,7 @@ impl Exchange {
     ) -> anyhow::Result<ExchangeInput> {
         let accepts_input = match admission {
             InputAppend::User => self.state() == ExchangeState::Running,
-            InputAppend::Acknowledged(_) => matches!(
+            InputAppend::Acknowledged(_) | InputAppend::Dispatched(_) => matches!(
                 self.state(),
                 ExchangeState::Running | ExchangeState::Finalizing
             ),
@@ -1577,7 +1617,14 @@ impl Exchange {
             }
             _ => None,
         };
+        let dispatched = match (&admission, &submission_id) {
+            (InputAppend::Dispatched(invocation), Some(submission)) => {
+                Some((invocation, submission))
+            }
+            _ => None,
+        };
         let anchor = steering
+            .or(dispatched)
             .and_then(|(invocation, submission)| self.consumption_anchor(invocation, submission));
         let consumption = match steering {
             None => InputConsumption::Consumed,
@@ -1947,6 +1994,7 @@ mod test {
             attributed_matches_checkpoint: false,
             provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
+            tool_timeout: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),

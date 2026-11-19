@@ -26,8 +26,9 @@ function M.start(state, prompt, completed)
     restore = require("forge.views.harness.composer_draft").take(context.buffer, assert(source), attachments,
       composer_owns_draft)
   end
+  -- Input state returns a rejected prompt to the composer through `restore`, or keeps it as a
+  -- failed row when the composer holds newer work.
   input_state.submit(state, text, attachments, "auto", nil, function(failure)
-    if failure then restore() end
     completed(failure and nil or {}, failure)
   end, restore)
 end

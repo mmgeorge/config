@@ -8,6 +8,17 @@ pub(crate) struct InputReadiness {
     pub native_steer: bool,
 }
 
+impl InputReadiness {
+    /// Get the facts that hold a queued message back from starting a turn of its own.
+    pub(crate) fn turn_offer_gates(&self) -> crate::exchange::TurnOfferGates {
+        crate::exchange::TurnOfferGates {
+            checks_running: self.checks_running,
+            has_approval: self.has_approval,
+            has_elicitation: self.has_elicitation,
+        }
+    }
+}
+
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
     pub(crate) input: Arc<crate::input::SessionInputQueue>,
@@ -103,6 +114,54 @@ impl BrokerObserver {
             has_approval,
             checks_running: self.check_runner.active()?.is_some(),
             native_steer,
+        })
+    }
+    /// Keep an idle phase working while a queued user turn is about to start.
+    ///
+    /// The finished exchange resolves to idle a few owner steps before the next queued message
+    /// is claimed and admitted. Publishing that idle phase closed the status row and reopened it
+    /// at every hand-off. The substitute carries no running clock, so it reads `Working · 0s`,
+    /// which is also what the admitted exchange first publishes. Its `HandingOff` activity tells
+    /// the editor that the settled exchange is followed by a queued turn, so the editor does not
+    /// reveal the finished exchange a moment before the successor replaces it at the tail. An
+    /// owner that cannot execute is excluded, because it would never start the turn and the row
+    /// would never clear.
+    pub(crate) fn hand_off_phase(
+        &self,
+        status: crate::session::state_machine::SessionPhase,
+    ) -> Result<crate::session::state_machine::SessionPhase> {
+        use crate::session::state_machine::{SessionPhase, WorkflowActivity};
+        if status != SessionPhase::Idle {
+            return Ok(status);
+        }
+        let unavailable = self
+            .activity
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .phase
+            == crate::exchange::ActivityPhase::Unavailable;
+        let input = self.input.snapshot()?;
+        if unavailable || input.messages.is_empty() {
+            return Ok(status);
+        }
+        // Unreadable admission state fails the owner's own offer, which reports it; no turn
+        // starts, so the idle phase stands.
+        let Ok(readiness) = self.input_readiness() else {
+            return Ok(status);
+        };
+        if !crate::exchange::successor_turn_pending(
+            input,
+            &self.questions,
+            readiness.turn_offer_gates(),
+        )? {
+            return Ok(status);
+        }
+        Ok(SessionPhase::Working {
+            duration_ms: 0,
+            started_at_ms: None,
+            activity: WorkflowActivity::HandingOff,
+            reasoning_summary: None,
+            execution: None,
         })
     }
     pub(crate) fn session_id(&self) -> &str {
@@ -320,17 +379,23 @@ impl BrokerObserver {
     ) -> Result<BrokerSnapshot> {
         let status_thoughts = self.status_thoughts.load(Ordering::Relaxed);
         let mut session = source_session.clone();
-        let snapshot = crate::settings::SettingsStore::read_only(&self.data_root)?.get(
-            &session.workspace,
-            &session.id,
-            &session.provider,
-        )?;
+        let settings_store = crate::settings::SettingsStore::read_only(&self.data_root)?;
+        let snapshot = settings_store.get(&session.workspace, &session.id, &session.provider)?;
+        // The Permissions tab shows this session's own choice: its session layer, or the access
+        // it opened with. Another editor's change to the defaults never reaches it.
+        let access_preference = settings_store
+            .layer_settings(
+                crate::settings::SettingScope::Session,
+                &session.workspace,
+                &session.id,
+            )?
+            .access
+            .unwrap_or_else(|| session.access.clone());
         let ask_model = snapshot.ask_model()?;
         let settings = snapshot.desired;
         let check_timing = settings.check_timing.unwrap_or_default();
         let automatic_checks = settings.automatic_checks_enabled();
         session.approval_timeout = self.permission_coordinator.approval_timeout(&session.id)?;
-        session.tool_timeout = settings.tool_timeout.unwrap_or(session.tool_timeout);
         let task = source_session.active_task.as_ref();
         let active_plan = match task.map(|task| &task.workflow) {
             Some(crate::task::WorkflowSnapshot::Plan { plan }) => Some(plan.artifact.clone()),
@@ -459,10 +524,19 @@ impl BrokerObserver {
             };
         }
         let cancellation = store.cancellation_progress(&source_session.id)?;
-        if let Some(progress) = cancellation
-            .as_ref()
-            .filter(|progress| progress.phase.active())
-        {
+        // The owner commits the cancelled exchange inside a command step but records the settled
+        // phase only when its next step begins. The exchange heading reads that committed record,
+        // so a phase that only settles the target exchange yields to the record once it finishes;
+        // provider recovery still stops the session after the exchange has settled.
+        if let Some(progress) = cancellation.as_ref().filter(|progress| {
+            progress.phase.active()
+                && (progress.phase == crate::exchange::CancellationPhase::Recovering
+                    || !progress.exchange_id.as_ref().is_some_and(|target| {
+                        interaction.iter().any(|exchange| {
+                            exchange.id == target.as_str() && exchange.is_finished()
+                        })
+                    }))
+        }) {
             status = crate::session::state_machine::SessionPhase::Stopping {
                 collection: match progress.phase {
                     crate::exchange::CancellationPhase::Acquiring
@@ -473,6 +547,7 @@ impl BrokerObserver {
                 },
             };
         }
+        let status = self.hand_off_phase(status)?;
         self.trace.record(
             &source_session.id,
             "status_projected",
@@ -544,10 +619,7 @@ impl BrokerObserver {
                 .clone(),
             questions: self.questions.snapshot()?,
             ask_model,
-            access_preference: settings
-                .access
-                .clone()
-                .unwrap_or_else(|| session.access.clone()),
+            access_preference,
             access_abbreviation: session.access.abbreviation().into(),
             subagent_tools: self.agent_coordinator.enabled(),
             lsp_tools: self.lsp.enabled(&source_session.id),
@@ -706,15 +778,27 @@ impl BrokerObserver {
         let session_id = required_text(&params, "session_id")?;
         let preview_session =
             super::SessionNotFound::require(store.load_session(&session_id)?, &session_id)?;
-        let interaction = store.list_exchange_metadata(&session_id)?;
+        let mut interaction = store.list_exchange_metadata(&session_id)?;
         let plan_list = store.list_plan(&session_id)?;
         let agent_run_list = store
             .list_agent_run(&session_id)?
             .into_iter()
             .filter(|agent| !agent.is_primary())
             .collect::<Vec<_>>();
-        let agent_exchange_list =
+        let mut agent_exchange_list =
             store.list_session_agent_exchange_metadata(&session_id, &agent_run_list)?;
+        // A session nobody owns keeps the running exchange its killed owner left in storage.
+        // Show what resuming will show, not a clock that runs to the preview instant.
+        if !store.session_owner_live(&session_id)? {
+            let primary_agent_id = crate::session::HarnessSession::primary_agent_id(&session_id);
+            for exchange in interaction.iter_mut().chain(agent_exchange_list.iter_mut()) {
+                crate::storage::interrupt_detached_exchange(
+                    exchange,
+                    &primary_agent_id,
+                    crate::storage::DetachedSettlement::Outcome,
+                )?;
+            }
+        }
         let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: interaction.clone(),
             plan_list: &plan_list,

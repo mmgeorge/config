@@ -8,6 +8,8 @@ use anyhow::{Context, Result, ensure};
 
 const MARKER: &str = "{\"layout\":\"harness-settings-and-versioned-state\"}\n";
 const RESET_NOTICE: &str = "Forge reset the old Harness storage layout. Previous sessions, settings, and preferences were discarded; defaults now apply.";
+/// Holds the reset notice at the Harness root until one session start takes it.
+const RESET_NOTICE_FILE: &str = "reset-notice.txt";
 
 /// Initialize the canonical layout under a gate outside the reset boundary.
 pub(crate) fn prepare(root: &Path) -> Result<()> {
@@ -19,6 +21,52 @@ pub(crate) fn clear_legacy(root: &Path) -> Result<bool> {
     initialize(root, Initialization::HistoryClear)
 }
 
+/// Take the pending reset notice so that exactly one Harness session start reports it.
+///
+/// The reset leaves the notice at the root because the editor that ran the reset has no host to
+/// receive it. Taking it under the layout gate lets one of several concurrently starting hosts
+/// report it. The notice is removed before it is returned, so a process that stops between the
+/// read and the removal leaves it for the next start, and no start can report it twice.
+pub(crate) fn take_reset_notice(root: &Path) -> Result<Option<String>> {
+    let gate = LayoutGate::acquire(root)?;
+    let notice = gate.root.join(RESET_NOTICE_FILE);
+    let text = match fs::read_to_string(&notice) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", notice.display()));
+        }
+    };
+    fs::remove_file(&notice).with_context(|| format!("remove {}", notice.display()))?;
+    Ok(Some(text))
+}
+
+/// Serializes layout initialization, reset, and notice delivery for one canonical root.
+///
+/// The lock and the interrupted-reset record live beside the root, outside the reset boundary.
+struct LayoutGate {
+    root: PathBuf,
+    interrupted_reset: PathBuf,
+    _lock: File,
+}
+
+impl LayoutGate {
+    fn acquire(root: &Path) -> Result<Self> {
+        let root = checked_root(root)?;
+        let identity = crate::plan::digest(root.to_string_lossy().as_bytes());
+        let parent = root.parent().context("Harness root has no parent")?;
+        let lock = super::exclusive_file_lock(
+            &parent.join(format!(".harness-{identity}.lock")),
+            "Harness layout initialization",
+        )?;
+        Ok(Self {
+            interrupted_reset: parent.join(format!(".harness-{identity}.reset")),
+            root,
+            _lock: lock,
+        })
+    }
+}
+
 /// Distinguish read-only startup detection from user-requested destructive cleanup.
 #[derive(Clone, Copy, PartialEq)]
 enum Initialization {
@@ -28,12 +76,9 @@ enum Initialization {
 
 /// Serialize layout initialization and explicit cutover under the same stable gate.
 fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
-    let root = checked_root(root)?;
-    let identity = crate::plan::digest(root.to_string_lossy().as_bytes());
-    let parent = root.parent().context("Harness root has no parent")?;
-    let gate = parent.join(format!(".harness-{identity}.lock"));
-    let _gate = super::exclusive_file_lock(&gate, "Harness layout initialization")?;
-    let pending = parent.join(format!(".harness-{identity}.reset"));
+    let gate = LayoutGate::acquire(root)?;
+    let root = gate.root.as_path();
+    let pending = gate.interrupted_reset.as_path();
     let marker = root.join("layout.json");
     if marker.try_exists()? {
         ensure!(
@@ -47,25 +92,25 @@ fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
                 "Harness cleanup was interrupted. Run :ForgeHistoryClear before starting Harness."
             );
             ensure!(
-                fs::read_to_string(&pending)? == root.to_string_lossy(),
+                fs::read_to_string(pending)? == root.to_string_lossy(),
                 "Harness reset record belongs to another root"
             );
-            super::preferences::initialize(&root)?;
+            super::preferences::initialize(root)?;
             fs::remove_file(pending)?;
         }
         return Ok(false);
     }
 
-    let entries = fs::read_dir(&root)?.collect::<std::io::Result<Vec<_>>>()?;
+    let entries = fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
     let resetting = pending.try_exists()?;
     if resetting {
         ensure!(
-            fs::read_to_string(&pending)? == root.to_string_lossy(),
+            fs::read_to_string(pending)? == root.to_string_lossy(),
             "Harness reset record belongs to another root"
         );
     } else if !entries.is_empty() {
         ensure!(
-            legacy(&root)?,
+            legacy(root)?,
             "unknown Harness layout at {}; refusing to reset",
             root.display()
         );
@@ -80,17 +125,17 @@ fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
     if resetting {
         // Resolve every ownership boundary before deleting the first dependent file.
         let retired = crate::repository_access::reset_preflight()?;
-        owners.inspect(&root)?;
-        fs::write(&pending, root.to_string_lossy().as_bytes())?;
+        owners.inspect(root)?;
+        fs::write(pending, root.to_string_lossy().as_bytes())?;
         fs::OpenOptions::new()
             .write(true)
-            .open(&pending)?
+            .open(pending)?
             .sync_all()?;
         for journal in retired {
             crate::repository_access::clear_retired(&journal)?;
         }
         owners.close_databases();
-        for entry in fs::read_dir(&root)? {
+        for entry in fs::read_dir(root)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 fs::remove_dir_all(entry.path())
@@ -104,9 +149,9 @@ fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
     }
 
     // Publish settings before disposable storage opens, so logging can diagnose history failures.
-    super::preferences::initialize(&root)?;
+    super::preferences::initialize(root)?;
     if resetting {
-        fs::write(root.join("reset-notice.txt"), RESET_NOTICE)?;
+        fs::write(root.join(RESET_NOTICE_FILE), RESET_NOTICE)?;
         eprintln!("{RESET_NOTICE}");
     }
     fs::write(&marker, MARKER)?;
@@ -115,7 +160,7 @@ fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
         .open(&marker)?
         .sync_all()?;
     if resetting {
-        fs::remove_file(&pending)?;
+        fs::remove_file(pending)?;
     }
     Ok(resetting)
 }
@@ -343,6 +388,27 @@ mod tests {
         assert!(!root.path().join("unknown").exists());
         assert!(!root.path().join("provider.json").exists());
         assert!(root.path().join("reset-notice.txt").exists());
+        Ok(())
+    }
+
+    /// A reset leaves one notice: the first taker receives it, and later takers find none.
+    #[test]
+    fn reset_notice_is_taken_once() -> Result<()> {
+        let fresh_root = tempfile::tempdir()?;
+        prepare(fresh_root.path())?;
+        assert_eq!(take_reset_notice(fresh_root.path())?, None);
+        let retired_root = tempfile::tempdir()?;
+        fs::write(retired_root.path().join("provider.json"), "old choice")?;
+        assert!(clear_legacy(retired_root.path())?);
+        assert_eq!(
+            take_reset_notice(retired_root.path())?.as_deref(),
+            Some(RESET_NOTICE)
+        );
+        assert!(!retired_root.path().join(RESET_NOTICE_FILE).exists());
+        assert_eq!(take_reset_notice(retired_root.path())?, None);
+        // Taking the notice leaves a canonical layout that needs no further reset.
+        prepare(retired_root.path())?;
+        assert!(!clear_legacy(retired_root.path())?);
         Ok(())
     }
 

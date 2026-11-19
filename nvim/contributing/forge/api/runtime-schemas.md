@@ -594,8 +594,14 @@ pub enum InputAction {
         reservation: String,
         edits: Vec<InputEdit>,
     },
+    /// Release the edit identity from every message it holds, or only from `id`.
+    ///
+    /// Queue navigation reserves each message it visits. A message the editor leaves
+    /// unchanged is released alone, so it can be delivered while the edit continues.
     Release {
         reservation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     Remove {
         id: String,
@@ -635,6 +641,8 @@ pub struct InputUpdate {
     pub control_revision: u64,
     pub error: Option<String>,
     pub prepend: bool,
+    /// Identity of the input this update retracted. A retracted user prompt's unsent copy is the
+    /// update's only upsert, which the editor removes once its composer holds the text.
     pub retracted: Option<String>,
 }
 ```

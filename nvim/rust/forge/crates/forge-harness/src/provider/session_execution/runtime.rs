@@ -250,6 +250,49 @@ impl SessionExecutionRegistry {
         Ok(())
     }
 
+    /// Retire one owner's binding and forget its slot, so its next controller opens fresh.
+    ///
+    /// Retirement closes the slot's observer and engine but keeps the slot, and a controller
+    /// that later resolves the same session adopts the slot's observer. A reopened session
+    /// therefore needs the slot removed, or it would start against a closed observation stream.
+    /// The provider runtime and sibling owners are untouched. The slot is kept on any failure, so
+    /// a later close still collects it.
+    pub(crate) async fn forget(&self, owner: &ThreadOwner) -> Result<(), ProviderError> {
+        self.retire(owner, OwnerCloseReason::Shutdown).await?;
+        let _gate = self.gate.write().await;
+        let removed = self
+            .owners
+            .lock()
+            .map_err(|_| protocol("execution registry poisoned"))?
+            .remove(owner);
+        if let Some(slot) = removed {
+            slot.observer.retire_background().await?;
+        }
+        Ok(())
+    }
+
+    /// Force-end one owner's binding after bounded retirement failed, then forget its slot.
+    ///
+    /// Takes no registry gate, because a stuck retirement may still hold it. The provider
+    /// terminates the binding first, and the slot is removed only once that succeeds, so a failed
+    /// termination keeps the slot for a later close. The caller must hold the owner's session
+    /// exclusively, so no replacement generation can be installed while this runs.
+    pub(crate) async fn terminate(&self, owner: &ThreadOwner) -> Result<(), ProviderError> {
+        self.provider.session_terminate_owner(owner).await?;
+        let removed = self
+            .owners
+            .lock()
+            .map_err(|_| protocol("execution registry poisoned"))?
+            .remove(owner);
+        if let Some(slot) = removed {
+            if let Some(engine) = slot.engine.get() {
+                engine.begin_orderly_shutdown();
+            }
+            slot.observer.close_collected(OwnerCloseReason::Shutdown);
+        }
+        Ok(())
+    }
+
     /// Replace one failed owner only after cleanup and consumption of its observation failure.
     pub(crate) async fn replace(
         &self,

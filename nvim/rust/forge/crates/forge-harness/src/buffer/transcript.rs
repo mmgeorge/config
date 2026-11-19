@@ -26,10 +26,28 @@ pub struct ToolHeading<'call> {
     pub kind: &'call str,
     pub shell: Option<&'call str>,
     pub elapsed_ms: Option<u64>,
-    pub failed: bool,
-    pub denied: bool,
+    /// Typed lifecycle that selects the row marker; display strings never decide it.
+    pub state: crate::turn::ToolState,
     pub title: &'call str,
     pub expanded: bool,
+}
+
+impl<'call> ToolHeading<'call> {
+    /// Describe a retained call at one instant on its own clock.
+    pub fn of(
+        call: &'call crate::turn::ToolCall,
+        now: crate::turn::ToolInstant,
+        expanded: bool,
+    ) -> Self {
+        Self {
+            kind: &call.kind,
+            shell: call.command_shell.as_deref(),
+            elapsed_ms: call.elapsed_ms(now),
+            state: call.state(),
+            title: &call.title,
+            expanded,
+        }
+    }
 }
 
 impl<'profile> TranscriptRenderer<'profile> {
@@ -418,8 +436,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             shell,
             kind,
             elapsed_ms,
-            failed,
-            denied,
+            state,
             title,
             expanded,
         } = heading;
@@ -449,7 +466,7 @@ impl<'profile> TranscriptRenderer<'profile> {
                 ..BlockMetadata::default()
             },
         };
-        decorate_tool_heading(&mut block, title_rows, kind, failed, denied);
+        decorate_tool_heading(&mut block, title_rows, kind, state);
         Self::heading_marker(&mut block, "Normal");
         if block.text.row_count() > title_rows {
             block.metadata.decoration.push(Decoration {
@@ -603,13 +620,14 @@ fn tool_source_rows(profile: &WidthProfile, kind: &str, title: &str) -> Result<V
     tool_body_rows(profile, &format!("Command: {title}"), true)
 }
 
+/// Color the row marker by the call's outcome; a stopped call is neither a success nor a failure.
 fn decorate_tool_heading(
     block: &mut BufferBlock,
     title_rows: usize,
     kind: &str,
-    failed: bool,
-    denied: bool,
+    state: crate::turn::ToolState,
 ) {
+    use crate::turn::ToolState;
     if let Some(column) = block.text.row(0).and_then(|text| text.find('•')) {
         block.metadata.decoration.push(Decoration {
             range: TextRange {
@@ -619,13 +637,13 @@ fn decorate_tool_heading(
                     column: column + '•'.len_utf8(),
                 },
             },
-            capture: if denied {
-                "ForgeHarnessToolDenied".into()
-            } else if failed {
-                "ForgeHarnessToolFailure".into()
-            } else {
-                "ForgeHarnessToolSuccess".into()
-            },
+            capture: match state {
+                ToolState::Denied => "ForgeHarnessToolDenied",
+                ToolState::Failed => "ForgeHarnessToolFailure",
+                ToolState::Cancelled | ToolState::Interrupted => "ForgeHarnessToolInterrupted",
+                ToolState::Running | ToolState::Completed => "ForgeHarnessToolSuccess",
+            }
+            .into(),
             priority: 100,
         });
     }

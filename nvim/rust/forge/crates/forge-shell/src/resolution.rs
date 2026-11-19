@@ -32,6 +32,22 @@ if ($missing.Count -gt 0) {
 Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject $missing -Compress
 "#;
 
+/// Separates a command that analysis rejects from a discovery process that could not answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolutionFailure {
+    /// The command itself is malformed, unsupported, or names unresolved commands.
+    Analysis(CommandAnalysisFailure),
+    /// The discovery interpreter could not be launched or did not produce a usable answer, so
+    /// the command was not checked; this says nothing about the command.
+    DiscoveryUnavailable(String),
+}
+
+impl From<CommandAnalysisFailure> for ResolutionFailure {
+    fn from(failure: CommandAnalysisFailure) -> Self {
+        Self::Analysis(failure)
+    }
+}
+
 /// Resolve literal PowerShell commands without executing the submitted source or loading profiles.
 ///
 /// Discover built-in aliases, imported commands, installed module exports, and executables in
@@ -41,10 +57,10 @@ pub async fn validate_command_resolution(
     command: &str,
     shell: CommandShell,
     working_directory: &Path,
-) -> Result<(), CommandAnalysisFailure> {
+) -> Result<(), ResolutionFailure> {
     let normalized = normalize_command_in(command, shell);
     if let Some(failure) = normalized.failure {
-        return Err(failure);
+        return Err(failure.into());
     }
     let mut names = BTreeSet::new();
     for invocation in normalized.invocation_list {
@@ -65,9 +81,9 @@ pub async fn validate_command_resolution(
     if names.is_empty() {
         return Ok(());
     }
-    let executable = powershell_executable().ok_or_else(|| {
-        CommandAnalysisFailure::Incomplete("PowerShell command discovery is unavailable".into())
-    })?;
+    let unavailable = ResolutionFailure::DiscoveryUnavailable;
+    let executable = powershell_executable()
+        .ok_or_else(|| unavailable("PowerShell command discovery is unavailable".into()))?;
     let mut probe = tokio::process::Command::new(executable);
     probe
         .args([
@@ -86,9 +102,8 @@ pub async fn validate_command_resolution(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = crate::process::spawn_owned(probe).map_err(|error| {
-        CommandAnalysisFailure::Incomplete(format!("PowerShell discovery launch failed: {error}"))
-    })?;
+    let mut child = crate::process::spawn_owned(probe)
+        .map_err(|error| unavailable(format!("PowerShell discovery launch failed: {error}")))?;
     let output = tokio::time::timeout(Duration::from_secs(5), async {
         let mut output = Vec::new();
         child
@@ -102,26 +117,19 @@ pub async fn validate_command_resolution(
         Ok::<_, std::io::Error>((status, output))
     })
     .await
-    .map_err(|_| {
-        CommandAnalysisFailure::Incomplete("PowerShell command discovery timed out".into())
-    })?
-    .map_err(|error| {
-        CommandAnalysisFailure::Incomplete(format!("PowerShell command discovery failed: {error}"))
-    })?;
+    .map_err(|_| unavailable("PowerShell command discovery timed out".into()))?
+    .map_err(|error| unavailable(format!("PowerShell command discovery failed: {error}")))?;
     if !output.0.success() {
-        return Err(CommandAnalysisFailure::Incomplete(
+        return Err(unavailable(
             "PowerShell command discovery exited unsuccessfully".into(),
         ));
     }
-    let missing: Vec<String> = serde_json::from_slice(&output.1).map_err(|error| {
-        CommandAnalysisFailure::Incomplete(format!(
-            "invalid PowerShell discovery response: {error}"
-        ))
-    })?;
+    let missing: Vec<String> = serde_json::from_slice(&output.1)
+        .map_err(|error| unavailable(format!("invalid PowerShell discovery response: {error}")))?;
     if missing.is_empty() {
         return Ok(());
     }
-    Err(CommandAnalysisFailure::UnresolvedCommands(missing))
+    Err(CommandAnalysisFailure::UnresolvedCommands(missing).into())
 }
 
 /// Find the discovery interpreter on the host PATH without searching the working directory.
@@ -155,7 +163,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             failure,
-            CommandAnalysisFailure::UnresolvedCommands(vec!["%ad".into(), "%s".into()])
+            CommandAnalysisFailure::UnresolvedCommands(vec!["%ad".into(), "%s".into()]).into()
         );
     }
 

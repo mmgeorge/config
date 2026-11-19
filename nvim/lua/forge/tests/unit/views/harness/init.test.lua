@@ -94,6 +94,48 @@ T["provider_switch"] = function()
   assert(activation_options.state == state and activation_options.open_mode == 'current')
 end
 
+T["provider_switch_reports_its_start_and_can_keep_the_default"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+  local activity = dofile("nvim/lua/forge/tests/support/activity.lua")
+  dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local harness = require("forge.views.harness")
+  notify.capture({ notifications = true })
+  local saved_provider, pending_stop, pending_start = nil, nil, nil
+  stub(require("forge.harness.provider_preference"), "save", function(provider, callback)
+    saved_provider = provider
+    callback(true)
+  end)
+  stub(require("forge.views.harness.session_navigation"), "activate", function(result) state.session = result.session end)
+  stub(client, "host_stop", function(_, callback) pending_stop = callback end)
+  stub(client, "session_initialize", function(callback) pending_start = callback end)
+  state.session = { id = "source", provider = "fixture_alpha" }
+  require("forge.infra.config").options.harness.provider = "fixture_alpha"
+
+  -- A caller such as the session picker dismisses its own view only once the switch has started.
+  activity.set_busy(state, true)
+  eq(harness.switch_provider("fixture_beta", { kind = "resume", session_id = "chosen" }), false)
+  eq(pending_stop, nil)
+  activity.set_busy(state, false)
+  eq(harness.switch_provider("unregistered", { kind = "resume", session_id = "chosen" }), false)
+  eq(harness.switch_provider("fixture_beta", { kind = "resume" }), false)
+  eq(pending_stop, nil)
+
+  -- Resuming a session is not a choice of default provider, so its switch leaves the saved default.
+  eq(harness.switch_provider("fixture_beta", { kind = "resume", session_id = "chosen", persist_default = false }), true)
+  pending_stop()
+  pending_start({ session = { id = "chosen", provider = "fixture_beta" } })
+  eq({ state.session.id, state.switching_provider, saved_provider }, { "chosen", false, nil })
+
+  -- An explicit provider choice keeps saving the default.
+  eq(harness.switch_provider("fixture_alpha", { kind = "resume", session_id = "source" }), true)
+  pending_stop()
+  pending_start({ session = { id = "source", provider = "fixture_alpha" } })
+  eq({ state.session.id, saved_provider }, { "source", "fixture_alpha" })
+end
+
 T["provider_switch_checks_every_tab"] = function()
   local session = require("forge.session")
   local activity = dofile("nvim/lua/forge/tests/support/activity.lua")

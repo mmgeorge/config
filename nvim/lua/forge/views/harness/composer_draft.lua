@@ -42,4 +42,32 @@ function M.take(buffer, source, attachments, is_current)
   end
 end
 
+---Run a composer action after the input events that preceded its key.
+---
+---Neovim's terminal UI sends a bracketed paste as a queued `nvim_paste` event, but the keys after
+---it through `nvim_input`, which writes the typeahead as soon as the message arrives. A paste and a
+---submit key sent in one terminal write therefore reach the mapping before the paste reaches the
+---buffer, and the submit sent the draft without the pasted file. The paste event is queued before
+---the key is read, so one scheduled step runs every such paste first; the action then sees the
+---pasted text and any import it started. A draft changed in any other way during that step, such as
+---by keys typed after the submit key, is not sent, so later typing never joins the submitted text.
+---@param buffer_of fun(): integer?
+---@param action fun()
+---@return fun()
+function M.after_pending_paste(buffer_of, action)
+  return function()
+    local buffer = buffer_of()
+    if not (buffer and vim.api.nvim_buf_is_valid(buffer)) then action() return end
+    local changes = attachment.observe_changes(buffer)
+    vim.schedule(function()
+      if changes() == "edited" then
+        require("forge.infra.notifications").warn("The draft changed while it was being sent. Review it and send it again.",
+          "ForgeHarness")
+        return
+      end
+      action()
+    end)
+  end
+end
+
 return M

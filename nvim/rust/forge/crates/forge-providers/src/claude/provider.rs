@@ -26,6 +26,14 @@ use tokio::sync::{Mutex, Notify, RwLock};
 /// How long an interrupted turn may take to end before its process is treated as wedged.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long an interrupt waits for its turn to settle before it reports the stop failed.
+///
+/// The CLI gets `INTERRUPT_GRACE` to end the turn and each written input the same to be
+/// acknowledged, so a healthy settlement fits well inside twice that. The bound stays under the
+/// 30-second response deadline Harness gives a stop, so a wedged turn surfaces as a failed stop,
+/// which restarts the provider, rather than as a stop that never ends.
+const INTERRUPT_SETTLEMENT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// One completed root turn in the binding's native history.
 #[derive(Clone, Debug)]
 struct LedgerTurn {
@@ -1315,19 +1323,22 @@ impl ClaudeProvider {
         session
             .state
             .ensure_admission(ProviderOperation::TurnSteer)?;
-        if request.scope.thread_id != session.owner
-            || session
-                .active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_none_or(|active| active.scope != request.scope)
-        {
-            return Err(failure(
-                ProviderOperation::TurnSteer,
-                ProviderFailureKind::WrongInvocation,
-            ));
-        }
+        // The steered turn's interrupt bounds the steer's delivery as it bounds the prompt's.
+        let cancellation = session
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|active| {
+                request.scope.thread_id == session.owner && active.scope == request.scope
+            })
+            .map(|active| active.cancellation.clone())
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::TurnSteer,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?;
         // A steered input carries its own elements, such as a question response, and no
         // standing context.
         let content = super::conversation::input_blocks(
@@ -1392,12 +1403,20 @@ impl ClaudeProvider {
             UserInput::composed(uuid.clone(), content),
             &session_id,
             receipt.as_ref(),
-            None,
+            DeliveryTurn {
+                dispatch: None,
+                cancellation: &cancellation,
+            },
             &mut observer,
         )
         .await;
         if let Err(error) = delivered {
             session.state.forget_command(&uuid).await;
+            // A written steer the CLI never acknowledged leaves its consumption unknown.
+            if matches!(&error, ProviderError::Failure(failure) if failure.disposition() == FailureDisposition::Invalidated)
+            {
+                session.invalidate(error.clone()).await;
+            }
             return Err(error);
         }
         if let Some(input) = covered_input
@@ -1501,10 +1520,7 @@ impl ClaudeProvider {
                 )
             })?;
         if let Some(result) = record.result.lock().await.clone() {
-            return match result {
-                Ok(_) | Err(ProviderError::Cancelled) => Ok(()),
-                Err(error) => Err(error),
-            };
+            return crate::turn_runner::interrupt_outcome(result);
         }
         let task = session
             .active
@@ -1516,9 +1532,24 @@ impl ClaudeProvider {
         if let Some(task) = task {
             task.interrupt().await?;
         }
-        match session.settlement(&request.scope).await {
-            Ok(_) | Err(ProviderError::Cancelled) => Ok(()),
-            Err(error) => Err(error),
+        match tokio::time::timeout(
+            INTERRUPT_SETTLEMENT_GRACE,
+            session.settlement(&request.scope),
+        )
+        .await
+        {
+            Ok(settlement) => crate::turn_runner::interrupt_outcome(settlement),
+            Err(_) => {
+                // Every wait the interrupt reaches is bounded, so a turn still unsettled here is
+                // held by something the adapter cannot name. Invalidating the binding fails the
+                // stop, and Harness restarts the provider instead of staying `Stopping`.
+                tracing::error!(
+                    grace_ms = INTERRUPT_SETTLEMENT_GRACE.as_millis() as u64,
+                    "Claude turn did not settle after its interrupt"
+                );
+                session.invalidate(unanswered_interrupt()).await;
+                Err(unanswered_interrupt())
+            }
         }
     }
 
@@ -1959,6 +1990,40 @@ impl forge_provider_api::provider::Provider for ClaudeProvider {
                 },
             )
             .await
+    }
+
+    /// Kill the binding's CLI process tree, which serves this binding alone.
+    ///
+    /// Ending the process ends its output and every tool it could run, so the guarantee is a
+    /// process-level one. The transcript keeps what the CLI had flushed before the kill.
+    async fn thread_terminate(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::ThreadClose)?;
+        let Ok(session) = self.binding(binding, ProviderOperation::ThreadClose) else {
+            return Ok(());
+        };
+        session.state.close_admission();
+        drop(self.pending_inputs.fence_binding(binding));
+        if let Some(active) = session
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            active.cancelled = true;
+            active.cancellation.cancel();
+        }
+        session.cleanup.terminate().await?;
+        session.state.mark_collected();
+        session.history_released.store(true, Ordering::Release);
+        let mut owners = self.owners.lock().await;
+        if owners.get(&session.owner) == Some(binding) {
+            owners.remove(&session.owner);
+        }
+        Ok(())
     }
 
     async fn turn_interrupt(
@@ -2440,26 +2505,28 @@ fn unanswered_interrupt() -> ProviderError {
     .into()
 }
 
-/// Carry what only a prompt's delivery owns; a steer joins a turn that already owns both.
-struct PromptDelivery<'a> {
-    /// Reports that the prompt was written to the CLI.
-    dispatch: &'a forge_provider_api::submission::DispatchReporter,
-    /// Fires when the prompt's turn is interrupted.
+/// The turn one written input belongs to, as its delivery sees it.
+struct DeliveryTurn<'a> {
+    /// Reports that the turn's prompt was written; a steer joins a turn that already reported.
+    dispatch: Option<&'a forge_provider_api::submission::DispatchReporter>,
+    /// Fires when the turn is interrupted.
     cancellation: &'a tokio_util::sync::CancellationToken,
 }
 
 /// Write one user input and commit its delivery evidence through the host receipt.
 ///
 /// The CLI reports `command_lifecycle queued` once it owns the input, which is the acceptance
-/// evidence; the write alone proves nothing. A prompt's cancellation that fires while the CLI has
-/// not acknowledged the written prompt bounds that wait by `INTERRUPT_GRACE`.
+/// evidence; the write alone proves nothing. When the turn's cancellation fires while the CLI has
+/// not acknowledged the written input, `INTERRUPT_GRACE` bounds the rest of that wait. A steer
+/// needs the bound as much as a prompt: the turn ends only after every steer's delivery settles,
+/// so an unanswered steer would otherwise hold the interrupted turn open.
 async fn deliver_input(
     session: &ClaudeBinding,
     operation: ProviderOperation,
     input: UserInput,
     session_id: &str,
     receipt: Option<&Arc<dyn forge_provider_api::submission::InputReceipt>>,
-    prompt: Option<PromptDelivery<'_>>,
+    turn: DeliveryTurn<'_>,
     observer: &mut tokio::sync::watch::Receiver<CommandState>,
 ) -> Result<(), ProviderError> {
     let sending = receipt
@@ -2479,26 +2546,21 @@ async fn deliver_input(
     }
     let result = async {
         session.conversation.write(&input).await?;
-        if let Some(prompt) = &prompt {
-            prompt.dispatch.confirm();
+        if let Some(dispatch) = turn.dispatch {
+            dispatch.confirm();
         }
         let acknowledged = wait_command(observer, |state| state != CommandState::Other, operation);
-        match prompt.map(|prompt| prompt.cancellation) {
-            None => acknowledged.await?,
-            Some(cancellation) => {
-                tokio::pin!(acknowledged);
-                tokio::select! {
-                    biased;
-                    state = &mut acknowledged => state?,
-                    // The input is written, so only the CLI's silence keeps this wait open. A CLI
-                    // that stays silent for the interrupt grace period is wedged; the caller
-                    // invalidates the binding on this failure so Harness can restart it.
-                    _ = cancellation.cancelled() => {
-                        tokio::time::timeout(INTERRUPT_GRACE, acknowledged)
-                            .await
-                            .map_err(|_| unanswered_interrupt())??
-                    }
-                }
+        tokio::pin!(acknowledged);
+        tokio::select! {
+            biased;
+            state = &mut acknowledged => state?,
+            // The input is written, so only the CLI's silence keeps this wait open. A CLI that
+            // stays silent for the interrupt grace period is wedged; the caller invalidates the
+            // binding on this failure so Harness can restart it.
+            _ = turn.cancellation.cancelled() => {
+                tokio::time::timeout(INTERRUPT_GRACE, acknowledged)
+                    .await
+                    .map_err(|_| unanswered_interrupt())??
             }
         };
         if let Some(receipt) = receipt {
@@ -2606,13 +2668,11 @@ async fn run_prompt(
         *session.native_model.lock().await = request.configuration.model.clone();
         if !session.state.instructions_initialized().await {
             let workspace = session.conversation.workspace().await;
-            match session.conversation.instruction_sources().await {
-                Ok(paths) => session.state.initialize_instructions(paths, &workspace).await,
-                Err(error) => {
-                    tracing::warn!(?error, "Claude initial instruction sources unavailable");
-                    session.state.initialize_instructions(Vec::new(), &workspace).await;
-                }
-            }
+            let paths = session
+                .conversation
+                .instruction_sources(&cancellation)
+                .await;
+            session.state.initialize_instructions(paths, &workspace).await;
         }
         let event_sink = session.sink.invocation_sink(&request.scope)?;
         let address = forge_provider_api::TurnAddress {
@@ -2663,10 +2723,10 @@ async fn run_prompt(
             input,
             &session_id,
             Some(&receipt),
-            Some(PromptDelivery {
-                dispatch: &request.dispatch,
+            DeliveryTurn {
+                dispatch: Some(&request.dispatch),
                 cancellation: &cancellation,
-            }),
+            },
             &mut observer,
         )
         .await
@@ -2728,12 +2788,14 @@ async fn run_prompt(
         }
         session.conversation.observe_turn();
         session.state.observe_native_start(end.completed_at_ms).await?;
+        // The `result` already ended the turn, so its reply is classified before the optional
+        // context query, which an interrupt or its deadline abandons.
+        session.state.finish(end.outcome).await?;
         if !session.conversation.is_closed().await
-            && let Some(usage) = session.conversation.context_usage().await
+            && let Some(usage) = session.conversation.context_usage(&cancellation).await
         {
             session.state.publish_context_usage(usage).await?;
         }
-        session.state.finish(end.outcome).await?;
         let _ = session.state.take_completion().await;
         if let Some(prompt) = end.commands.first() {
             session.ledger.lock().await.push(LedgerTurn {

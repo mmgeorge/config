@@ -50,30 +50,43 @@ impl ExchangeDriver {
         if admission.start_approval_timeout
             && let Some(revision) = self.pending_approval_timeout.take()
         {
-            let staged = match broker.try_lock() {
-                Ok(mut broker) => match broker.approval_timeout_ready(revision) {
-                    Ok(true) => {
-                        let (sink, updates) = crate::broker::publication::channel();
-                        Some(
-                            broker
-                                .with_publication_sink(&sink, |broker| {
-                                    broker.begin_approval_timeout_dispatch(sink.clone())
-                                })
-                                .map(|(transaction, delivery)| (transaction, delivery, updates)),
-                        )
+            // The continuation is root work like any other turn, so it holds the root execution
+            // permit from staging through settlement. Without it, queued input would see an idle
+            // owner and start a second foreground delivery that collects the continuation.
+            let staged = match services.execution.clone().try_acquire_owned() {
+                Ok(execution) => match broker.try_lock() {
+                    Ok(mut broker) => match broker.approval_timeout_ready(revision) {
+                        Ok(true) => {
+                            let (sink, updates) = crate::broker::publication::channel();
+                            Some(
+                                broker
+                                    .with_publication_sink(&sink, |broker| {
+                                        broker.begin_approval_timeout_dispatch(sink.clone())
+                                    })
+                                    .map(|(transaction, delivery)| {
+                                        (transaction, delivery, updates, execution)
+                                    }),
+                            )
+                        }
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                    Err(_) => {
+                        self.pending_approval_timeout = Some(revision);
+                        *broker_deferred = true;
+                        None
                     }
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
                 },
+                // Root input holds the permit; the continuation waits for it to settle, and a
+                // turn that input starts first carries the timeout feedback itself.
                 Err(_) => {
                     self.pending_approval_timeout = Some(revision);
-                    *broker_deferred = true;
                     None
                 }
             };
             if let Some(staged) = staged {
                 match staged {
-                    Ok((transaction, delivery, updates)) => {
+                    Ok((transaction, delivery, updates, execution)) => {
                         publish_updates(
                             deferred_publications,
                             &mut self.commands,
@@ -93,7 +106,7 @@ impl ExchangeDriver {
                                     messages: command_messages.clone(),
                                 },
                                 updates: Some(updates),
-                                execution: None,
+                                execution,
                             });
                         }
                     }
@@ -251,7 +264,7 @@ impl ExchangeDriver {
                                         initial: None,
                                         completion: ForegroundCompletion::Caller(completion),
                                         updates: None,
-                                        execution: Some(execution),
+                                        execution,
                                     });
                                     *automatic_repair = Some(response);
                                 }

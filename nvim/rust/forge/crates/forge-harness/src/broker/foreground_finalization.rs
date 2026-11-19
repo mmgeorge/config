@@ -1237,6 +1237,7 @@ impl HarnessBroker {
                 )?;
                 settlement_stage("host_settlement_release");
                 self.clear_host_settlement(&transaction.settlement)?;
+                self.discard_answered_timeout_feedback(&transaction.state.interaction)?;
                 let response = finalization
                     .prepared_response
                     .take()

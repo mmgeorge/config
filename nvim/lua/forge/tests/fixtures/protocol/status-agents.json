@@ -7,8 +7,8 @@
       "text": [
         "Working · 44s",
         "└─ Agents · 3 running",
-        "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4 s │ Tracing reservation admission",
-        "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4 s",
+        "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4s │ Tracing reservation admission",
+        "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4s",
         "      └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +",
         "Waiting on the explorers"
       ],
@@ -52,11 +52,11 @@
             "range": {
               "start": {
                 "row": 2,
-                "column": 86
+                "column": 85
               },
               "end": {
                 "row": 2,
-                "column": 115
+                "column": 114
               }
             },
             "capture": "ForgeHarnessAgentThought",

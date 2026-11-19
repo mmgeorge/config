@@ -69,6 +69,8 @@ struct RetainedCall {
     abort: tokio::task::AbortHandle,
     tool: super::shell_tools::ShellTool,
     launch: watch::Receiver<LaunchDisposition>,
+    /// Never marked seen, so it reports any revocation published after this call was admitted.
+    revocation: watch::Receiver<()>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -226,32 +228,62 @@ impl NativeCallbackRouter for HelperCallbacks {
     }
 }
 
+/// Classify a native shell result with the runtime's `ToolResultType` vocabulary.
+///
+/// A rejected permission returns `denied` when the rejection carries feedback, such as the
+/// reason Harness gives for a user denial, an expired approval, or an approval mode, and
+/// `rejected` without feedback, as for a cancelled request.
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum NativeOutcome {
     Success,
     Failure,
+    Timeout,
+    Rejected,
+    Denied,
+    /// A kind newer than this adapter, reported to the model as a failure.
+    #[serde(other)]
+    Unrecognized,
 }
 
-/// Retain actual command output separately from its native success/failure classification.
+impl NativeOutcome {
+    /// Name the outcome on the model session's tool-result wire.
+    fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure | Self::Unrecognized => "failure",
+            Self::Timeout => "timeout",
+            Self::Rejected => "rejected",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+/// Retain actual command output separately from its native classification.
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct NativeToolResult {
     text_result_for_llm: String,
     result_type: NativeOutcome,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 impl NativeToolResult {
-    /// Preserve native command failures as failures in the model-facing tool response.
+    /// Hand the model the native classification and text unchanged.
+    ///
+    /// The model session reports the kind as the completed tool's error code, so a rejected
+    /// launch keeps `denied` or `rejected`, which the event decoder records as a denial, and
+    /// its text keeps the rejection feedback.
     pub(super) fn into_sdk(self) -> github_copilot_sdk::ToolResult {
-        let kind = match self.result_type {
-            NativeOutcome::Success => "success",
-            NativeOutcome::Failure => "failure",
-        };
-        github_copilot_sdk::ToolResult::Expanded(github_copilot_sdk::ToolResultExpanded::new(
+        let result = github_copilot_sdk::ToolResultExpanded::new(
             self.text_result_for_llm,
-            kind,
-        ))
+            self.result_type.wire_name(),
+        );
+        github_copilot_sdk::ToolResult::Expanded(match self.error {
+            Some(error) => result.with_error(error),
+            None => result,
+        })
     }
 }
 
@@ -331,8 +363,30 @@ impl ShellSession {
 
     /// Revoke a pending native permission independently of its host response future.
     pub(super) fn cancel_waits(&self) {
-        self.interrupt_waits();
+        // Publish the revocation before the wake, so a launch released from its foreground
+        // wait always observes that its invocation was stopped rather than steered.
         self.cancellation.send_replace(());
+        self.interrupt_waits();
+    }
+
+    /// Wait for the launches a stopped invocation still owned to stop their native tasks.
+    ///
+    /// The turn's collection calls this before it reports completion, so the inventory
+    /// without those tasks is published first. Launches no revocation reached are not
+    /// awaited: their foreground waits belong to a live invocation.
+    pub(super) async fn settle_revoked_launches(&self) {
+        let revoked = self
+            .state
+            .lock()
+            .await
+            .calls
+            .iter()
+            .filter(|call| call.tool.is_command() && call.revocation.has_changed().unwrap_or(true))
+            .map(|call| call.result.clone())
+            .collect::<Vec<_>>();
+        for call in revoked {
+            let _ = call.await;
+        }
     }
 
     /// Observe cancellation without lending a callback authority from another invocation.
@@ -377,22 +431,34 @@ impl ShellSession {
                 ProviderFailureKind::Rejected,
             ));
         }
-        shell
+        self.stop_task(
+            &shell,
+            &target.native_id,
+            ProviderOperation::TerminalTerminate,
+        )
+        .await
+    }
+
+    /// Stop one native task of this helper and publish the inventory without it.
+    async fn stop_task(
+        &self,
+        shell: &PausedShell,
+        native_id: &str,
+        operation: ProviderOperation,
+    ) -> Result<(), ProviderError> {
+        let stopped = shell
             .session
             .rpc()
             .tasks()
             .cancel(github_copilot_sdk::rpc::TasksCancelRequest {
-                id: target.native_id,
+                id: native_id.to_owned(),
             })
             .await
-            .map_err(|_| {
-                failure(
-                    ProviderOperation::TerminalTerminate,
-                    ProviderFailureKind::Runtime,
-                )
-            })?;
-        self.refresh(&shell).await?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|_| failure(operation, ProviderFailureKind::Runtime));
+        // The inventory is re-read even after a failed stop, so it reports what still runs.
+        let refreshed = self.refresh(shell).await;
+        stopped.and(refreshed)
     }
 
     /// Check only this helper's issued handles before resolving a terminal operation.
@@ -691,23 +757,17 @@ impl ShellSession {
                     ProviderFailureKind::BindingClosed,
                 ));
             }
-            if state.calls.iter().any(|call| {
-                let disposition = *call.launch.borrow();
-                disposition == LaunchDisposition::Uncertain
-                    || (disposition == LaunchDisposition::InFlight
-                        && call.launch.has_changed().is_err())
-            }) {
-                return Err(ProviderError::Observation(
-                    forge_provider_api::ObservationFailure::DeliveryUncertain,
-                ));
-            }
+            // A launch whose delivery is uncertain stays retained for collection at close, but it
+            // does not refuse later launches, which carry their own identities.
             let owner = self.clone();
             let call_id = call_id.to_owned();
             let id = uuid::Uuid::new_v4();
             let (launch, disposition) = watch::channel(LaunchDisposition::NotDispatched);
+            let revocation = self.cancellation.subscribe();
+            let revoked = revocation.clone();
             let task = tokio::spawn(async move {
                 let result = owner
-                    .execute_owned(&call_id, tool, arguments, &launch)
+                    .execute_owned(&call_id, tool, arguments, &launch, revoked)
                     .await;
                 if *launch.borrow() != LaunchDisposition::Uncertain {
                     owner
@@ -733,6 +793,7 @@ impl ShellSession {
                 abort,
                 tool,
                 launch: disposition,
+                revocation,
             });
             call
         };
@@ -746,6 +807,7 @@ impl ShellSession {
         tool: super::shell_tools::ShellTool,
         mut arguments: Value,
         launch: &watch::Sender<LaunchDisposition>,
+        revoked: watch::Receiver<()>,
     ) -> Result<NativeToolResult, ProviderError> {
         let callbacks = self.callbacks.upgrade().ok_or_else(|| {
             failure(
@@ -879,6 +941,25 @@ impl ShellSession {
                 _ = tokio::time::sleep(wait) => {},
                 _ = interrupted.changed() => {},
             }
+            // A stopped invocation still owns this foreground wait, so its command stops with
+            // it. Steering only releases the wait, and a launch whose wait already ended is a
+            // background terminal that outlives the turn.
+            if revoked.has_changed().unwrap_or(true) {
+                let running = shell
+                    .inventory
+                    .borrow()
+                    .terminal
+                    .iter()
+                    .any(|task| task.id.as_str() == id);
+                // A command that already exited has no task left to stop.
+                if running {
+                    let processes = command_processes(&shell, id).await;
+                    self.stop_task(&shell, id, ProviderOperation::TurnInterrupt)
+                        .await?;
+                    stop_surviving_processes(processes).await;
+                }
+                return Err(ProviderError::Cancelled);
+            }
             callbacks.before_shell_native(call_id).await?;
             let result = self
                 .invoke(
@@ -1011,19 +1092,20 @@ impl ShellSession {
                 launch.send_replace(LaunchDisposition::InFlight);
             }
         }
-        let result = async {
-            let value = shell.client.inner.call("session.tools.execute", Some(json!({"sessionId":shell.session.id(),"name":name,"arguments":arguments,"toolCallId":call_id}))).await
-                .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))?;
-            serde_json::from_value(value).map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
-        }.await;
+        let reply = shell.client.inner.call("session.tools.execute", Some(json!({"sessionId":shell.session.id(),"name":name,"arguments":arguments,"toolCallId":call_id}))).await;
+        // Any reply settles the launch, even one this adapter cannot decode; only a lost reply
+        // leaves unknown whether the runtime started the command.
         if let Some(launch) = launch {
-            launch.send_replace(if result.is_ok() {
+            launch.send_replace(if reply.is_ok() {
                 LaunchDisposition::Acknowledged
             } else {
                 LaunchDisposition::Uncertain
             });
         }
-        result
+        let value = reply
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Transport))?;
+        serde_json::from_value(value)
+            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))
     }
 
     /// Publish binding-owned task changes without admitting a model execution.
@@ -1271,6 +1353,67 @@ async fn native_tasks(shell: &PausedShell) -> Result<Vec<TerminalId>, ProviderEr
         )
         .into()
     })
+}
+
+/// Capture a running command's own processes while its wrapper is still alive.
+///
+/// Copilot runs each command through a per-command wrapper (`pwsh -Command` on Windows) and
+/// reports that wrapper's id as the shell task's `pid`. `session.tasks.cancel` stops the wrapper
+/// but not what it started, so a command such as `nu -c "sleep 60sec"` outlives its interrupted
+/// turn with a dead parent. The tree can be found only before the wrapper exits. Any failure to
+/// read it leaves the command to Copilot's own cancellation, which is the behavior without this.
+async fn command_processes(
+    shell: &PausedShell,
+    native_id: &str,
+) -> Vec<forge_shell::process_tree::ProcessIdentity> {
+    let progress = shell
+        .session
+        .rpc()
+        .tasks()
+        .get_progress(github_copilot_sdk::rpc::TasksGetProgressRequest {
+            id: native_id.to_owned(),
+        })
+        .await;
+    let Some(wrapper) = progress
+        .ok()
+        .and_then(|progress| progress.progress.get("pid").and_then(Value::as_u64))
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return Vec::new();
+    };
+    let owner = std::process::id();
+    let selected = tokio::task::spawn_blocking(move || {
+        forge_shell::process_tree::snapshot()
+            .map(|table| forge_shell::process_tree::command_descendants(&table, wrapper, owner))
+    })
+    .await;
+    match selected {
+        Ok(Ok(processes)) => processes,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "forge::provider", event_name = "provider.shell.tree_unavailable",
+                provider = "copilot", error = %error,
+                "Interrupted command's processes could not be read");
+            Vec::new()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Stop captured command processes that outlived their wrapper's cancellation, deepest first.
+async fn stop_surviving_processes(processes: Vec<forge_shell::process_tree::ProcessIdentity>) {
+    if processes.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for process in processes {
+            if let Err(error) = forge_shell::process_tree::terminate(process) {
+                tracing::warn!(target: "forge::provider", event_name = "provider.shell.process_survived",
+                    provider = "copilot", process_id = process.id, error = %error,
+                    "Interrupted command's process could not be stopped");
+            }
+        }
+    })
+    .await;
 }
 
 /// Collect every currently visible task and require a fresh absence proof after cancellation.

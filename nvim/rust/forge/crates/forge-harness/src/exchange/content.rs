@@ -65,6 +65,24 @@ pub struct ToolCounter {
     pub completed: usize,
     pub running: usize,
     pub failed: usize,
+    /// Calls a permission decision refused before they ran.
+    pub denied: usize,
+}
+
+impl ToolCounter {
+    /// Count calls by outcome; every tool summary, heading or group, counts through this.
+    pub(crate) fn of<'tool>(calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>) -> Self {
+        let mut counter = Self::default();
+        for tool in calls {
+            counter.total += 1;
+            counter.failed += usize::from(tool.failed);
+            counter.completed +=
+                usize::from(tool.state() == crate::turn::ToolState::Completed && !tool.failed);
+            counter.running += usize::from(tool.state() == crate::turn::ToolState::Running);
+            counter.denied += usize::from(tool.state() == crate::turn::ToolState::Denied);
+        }
+        counter
+    }
 }
 
 impl Exchange {
@@ -91,15 +109,7 @@ impl Exchange {
     }
 
     pub(crate) fn rebuild_tool_counter(&mut self) {
-        let mut counter = ToolCounter::default();
-        for (_, tool) in self.tools() {
-            counter.total += 1;
-            counter.failed += usize::from(tool.failed);
-            counter.completed +=
-                usize::from(tool.state() == crate::turn::ToolState::Completed && !tool.failed);
-            counter.running += usize::from(tool.state() == crate::turn::ToolState::Running);
-        }
-        self.tool_counter = counter;
+        self.tool_counter = ToolCounter::of(self.tools().map(|(_, tool)| tool));
     }
 
     pub(crate) fn settle_tools(&mut self, now_ms: i64) {

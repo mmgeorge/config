@@ -77,6 +77,12 @@ pub enum TestControlCommand {
     RequireBindingModelCatalog,
     /// Read the turn checkpoints the selected owner's native history retains, oldest first.
     History,
+    /// Fail every later close of the selected owner's binding, as a native side that cannot
+    /// collect its process does; only forced termination then removes the binding.
+    FailClose,
+    /// Never settle a later interrupt of the selected owner's turn, as a native side that
+    /// stopped answering does; only forced termination then ends the turn.
+    HoldInterrupt,
 }
 
 /// Select native fixture content without treating reasoning as an assistant prose role.
@@ -102,6 +108,18 @@ pub enum TestPromptStep {
     Message {
         content: TestMessageContent,
         text: String,
+    },
+    /// Start assistant prose that arrives before its role is known, as Copilot streams a
+    /// message until its final snapshot names the phase. `item` names the message for the
+    /// steps that continue it.
+    UnclassifiedMessageStart { item: String, text: String },
+    /// Append streamed text to a message the script started.
+    MessageDelta { item: String, text: String },
+    /// Classify a streamed message and freeze its accumulated text, as a final native
+    /// snapshot does.
+    MessageCompletion {
+        item: String,
+        content: TestMessageContent,
     },
     ToolCall {
         name: String,

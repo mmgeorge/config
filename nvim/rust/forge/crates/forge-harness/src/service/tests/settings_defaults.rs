@@ -125,3 +125,161 @@ async fn global_defaults_do_not_create_or_modify_sessions() -> Result<()> {
     service.shutdown(Duration::from_secs(5)).await?;
     Ok(())
 }
+
+/// Start a controller over a provider whose turns complete at once.
+async fn permissions_fixture(
+    root: &tempfile::TempDir,
+) -> Result<(
+    std::sync::Arc<super::super::SessionController>,
+    crate::provider::test_support::ProviderTestSession,
+    forge_protocol::outbound::MessageSender,
+    tokio::task::JoinHandle<Result<()>>,
+)> {
+    crate::checks::configure_fixture(root.path());
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().unwrap(),
+    )
+    .unwrap();
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |_request, _sink, _start, _cancelled| async move {
+            Err(crate::provider::ProviderError::Cancelled)
+        },
+    );
+    super::approval_deadline::start_controller(root, native).await
+}
+
+/// Run one session command through the owner, as the editor's command path does.
+async fn execute(
+    controller: &super::super::SessionController,
+    sink: &forge_protocol::outbound::MessageSender,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    let request = Request {
+        id: 1,
+        method: method.into(),
+        params,
+    };
+    let command = if method == "session.configure" {
+        super::super::native_settings::decode_command(&request)?
+    } else {
+        super::super::native_permission::decode_command(&request)?
+    };
+    controller
+        .exchange_owner
+        .execute_identified(command, sink.clone())
+        .await
+        .with_context(|| format!("{method} failed"))?;
+    Ok(())
+}
+
+/// The Permissions tab edits the current session, as the slash commands do, so the dialog's
+/// saved access agrees with the session's effective scope after mixing both.
+#[tokio::test]
+async fn config_write_scope_after_yolo_shows_the_session_scope() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (controller, provider, sink, reader) = permissions_fixture(&root).await?;
+    let scenario = async {
+        let yolo = json!({"action":"permission","change":{"kind":"enable_yolo"}});
+        execute(&controller, &sink, "session.command.apply", yolo.clone()).await?;
+        execute(&controller, &sink, "session.command.apply", yolo).await?;
+        let mut access = serde_json::to_value(controller.observer.snapshot()?.session.access)?;
+        access["write_access"] = json!("workspace");
+        execute(
+            &controller,
+            &sink,
+            "session.configure",
+            json!({"access": access}),
+        )
+        .await?;
+        execute(
+            &controller,
+            &sink,
+            "session.command.apply",
+            json!({"action":"permission","change":{"kind":"set_approval","mode":"ask"}}),
+        )
+        .await?;
+        let snapshot = controller.broker.lock().await.snapshot()?;
+        anyhow::ensure!(
+            snapshot.session.access.write_access == crate::session::WriteScope::Workspace,
+            "the session's write scope is {:?}",
+            snapshot.session.access.write_access
+        );
+        anyhow::ensure!(
+            snapshot.access_preference.write_access == crate::session::WriteScope::Workspace,
+            "/config shows write scope {:?} for a workspace session",
+            snapshot.access_preference.write_access
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let teardown = super::approval_deadline::stop_controller(controller, provider, reader).await;
+    scenario?;
+    teardown
+}
+
+/// A session's timeout edit stays with that session: the global defaults that other sessions
+/// and new sessions read are unchanged, and the session's own approval deadline follows it.
+#[tokio::test]
+async fn session_timeout_edit_stays_out_of_the_global_defaults() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (controller, provider, sink, reader) = permissions_fixture(&root).await?;
+    let scenario = async {
+        let session_id = controller.observer.session_id().to_owned();
+        let workspace = controller.observer.snapshot()?.session.workspace;
+        let request = Request {
+            id: 1,
+            method: "session.input.timeout.configure".into(),
+            params: json!({"approval_timeout":{"amount":45,"unit":"s"}}),
+        };
+        super::super::local_configuration::apply(&controller, &request, &sink).await?;
+        let settings = crate::settings::SettingsStore::open(&controller.data_root)?;
+        let global = settings
+            .layer_settings(
+                crate::settings::SettingScope::Global,
+                &workspace,
+                &session_id,
+            )?
+            .approval_timeout;
+        anyhow::ensure!(
+            global.is_none(),
+            "the session's timeout edit changed the global defaults: {global:?}"
+        );
+        let other = settings
+            .get(&workspace, "other-session", "mock")?
+            .desired
+            .approval_timeout;
+        anyhow::ensure!(
+            other.is_none(),
+            "another session sees this session's timeout: {other:?}"
+        );
+        let expected = crate::session::InputTimeout {
+            amount: 45,
+            unit: crate::session::TimeoutUnit::S,
+        };
+        anyhow::ensure!(
+            controller.permission.approval_timeout(&session_id)? == expected,
+            "the session's approval deadline did not follow its edit"
+        );
+        // A later configuration must not restore the timeout the session started with.
+        execute(
+            &controller,
+            &sink,
+            "session.command.apply",
+            json!({"action":"permission","change":{"kind":"set_approval","mode":"deny"}}),
+        )
+        .await?;
+        let snapshot = controller.broker.lock().await.snapshot()?;
+        anyhow::ensure!(
+            controller.permission.approval_timeout(&session_id)? == expected
+                && snapshot.session.approval_timeout == expected,
+            "a later configuration restored a stale approval timeout"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let teardown = super::approval_deadline::stop_controller(controller, provider, reader).await;
+    scenario?;
+    teardown
+}

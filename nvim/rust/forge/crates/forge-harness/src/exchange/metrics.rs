@@ -35,6 +35,9 @@ pub struct ExchangeMetrics {
     blocker: BTreeSet<String>,
     reports: Vec<UsageSample>,
     completed_timing: Vec<TurnDuration>,
+    /// Cumulative totals the provider threads had reported before this exchange began.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    usage_baseline: Vec<ThreadUsageBaseline>,
 }
 
 /// Validate the retained accounting ledger before restoring persisted metrics.
@@ -54,6 +57,7 @@ struct StoredExchangeMetrics {
     blocker: BTreeSet<String>,
     reports: Vec<UsageSample>,
     completed_timing: Vec<TurnDuration>,
+    usage_baseline: Vec<ThreadUsageBaseline>,
 }
 
 impl Default for StoredExchangeMetrics {
@@ -73,6 +77,7 @@ impl Default for StoredExchangeMetrics {
             blocker: Default::default(),
             reports: Vec::new(),
             completed_timing: Vec::new(),
+            usage_baseline: Vec::new(),
         }
     }
 }
@@ -96,6 +101,7 @@ impl TryFrom<StoredExchangeMetrics> for ExchangeMetrics {
             blocker,
             reports,
             completed_timing,
+            usage_baseline,
         } = stored;
         let mut metrics = Self {
             observed_elapsed_ms,
@@ -112,6 +118,7 @@ impl TryFrom<StoredExchangeMetrics> for ExchangeMetrics {
             blocker,
             reports: Vec::new(),
             completed_timing: Vec::new(),
+            usage_baseline,
         };
         for sample in reports {
             metrics.usage_report(&sample.address, &sample.report)?;
@@ -140,6 +147,29 @@ impl TryFrom<StoredExchangeMetrics> for ExchangeMetrics {
 struct UsageSample {
     address: TurnAddress,
     report: TurnUsageReport,
+}
+
+/// Retain the latest cumulative token total one provider thread reported.
+///
+/// A provider that reports cumulative thread totals can repeat its latest total into a later
+/// turn; Codex does so when a turn opens on a resumed thread. The exchange that first received
+/// a total owns its tokens, so the next exchange inherits the total as a baseline and charges
+/// nothing for a report that only repeats it. The baseline is durable because the repeat also
+/// follows a host restart, when no process remembers the earlier total.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ThreadUsageBaseline {
+    thread_id: forge_provider_api::ThreadId,
+    cumulative: TokenUsage,
+    cumulative_total: Option<u64>,
+}
+
+/// Hold the accounting derived from one exchange's retained reports.
+struct UsageLedger {
+    request_count: u64,
+    turn: Vec<TurnUsageTotal>,
+    timing: Vec<TurnTimingTotal>,
+    /// Latest cumulative total per thread, including totals inherited and never superseded.
+    cumulative: Vec<ThreadUsageBaseline>,
 }
 
 /// Aggregate a positively identified model call across complementary native report IDs.
@@ -305,9 +335,9 @@ impl ExchangeMetrics {
 
     /// Get canonical token expenditure for the addressed turn without counting repeated snapshots.
     pub(crate) fn turn_usage(&self, address: &TurnAddress) -> Option<TokenUsage> {
-        usage_totals(&self.reports)
+        usage_totals(&self.usage_baseline, &self.reports)
             .expect("validated accounting ledger has no conflicting call measurements")
-            .1
+            .turn
             .into_iter()
             .find(|total| total.address == *address)
             .map(|total| total.usage)
@@ -315,9 +345,9 @@ impl ExchangeMetrics {
 
     /// Sum canonical expenditure while retaining unavailable categories across distinct calls.
     pub(crate) fn usage(&self) -> TokenUsage {
-        let (_, totals, _) = usage_totals(&self.reports)
+        let ledger = usage_totals(&self.usage_baseline, &self.reports)
             .expect("validated accounting ledger has no conflicting call measurements");
-        let mut totals = totals.into_iter().map(|total| total.usage);
+        let mut totals = ledger.turn.into_iter().map(|total| total.usage);
         let Some(mut usage) = totals.next() else {
             return Default::default();
         };
@@ -325,6 +355,20 @@ impl ExchangeMetrics {
             usage.accumulate(&incoming);
         }
         usage
+    }
+
+    /// Create the metrics of the exchange that follows `previous` on the same provider threads.
+    ///
+    /// The new exchange inherits each thread's latest cumulative total, including a total
+    /// `previous` itself inherited and never superseded, so a provider's repeat of that total
+    /// stays charged to the exchange that first received it.
+    pub(crate) fn following(previous: &Self) -> Self {
+        Self {
+            usage_baseline: usage_totals(&previous.usage_baseline, &previous.reports)
+                .expect("validated accounting ledger has no conflicting call measurements")
+                .cumulative,
+            ..Self::default()
+        }
     }
 
     /// Reject mismatched typed relationships before changing retained measurements.
@@ -345,7 +389,12 @@ impl ExchangeMetrics {
 
     /// Rebuild aggregate tokens and native timing exclusively from retained canonical observations.
     fn refresh_accounting(&mut self) -> Result<(), UsageReportError> {
-        let (request_count, totals, timings) = usage_totals(&self.reports)?;
+        let UsageLedger {
+            request_count,
+            turn: totals,
+            timing: timings,
+            cumulative: _,
+        } = usage_totals(&self.usage_baseline, &self.reports)?;
         let mut usages = totals.iter().map(|total| &total.usage);
         let usage = usages.next().cloned().map(|mut usage| {
             for incoming in usages {
@@ -417,14 +466,21 @@ impl Default for ExchangeMetrics {
             blocker: BTreeSet::new(),
             reports: Vec::new(),
             completed_timing: Vec::new(),
+            usage_baseline: Vec::new(),
         }
     }
 }
 
 /// Coalesce identified calls before deriving chronological cumulative increments.
+///
+/// `baseline` holds the totals earlier exchanges already charged. It only identifies a report
+/// that repeats such a total: the native thread behind a Harness thread can be replaced between
+/// exchanges, so a changed total is no evidence of what the new exchange spent, and its first
+/// report keeps the provider's own per-call breakdown.
 fn usage_totals(
+    baseline: &[ThreadUsageBaseline],
     samples: &[UsageSample],
-) -> Result<(u64, Vec<TurnUsageTotal>, Vec<TurnTimingTotal>), UsageReportError> {
+) -> Result<UsageLedger, UsageReportError> {
     let mut calls: Vec<UsageCall> = Vec::new();
     let mut ordered = samples.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|sample| *sample.report.observed_at_ms());
@@ -464,6 +520,12 @@ fn usage_totals(
                 if !unchanged_snapshot && !reset {
                     usage = Some(cumulative_increment(cumulative, previous, usage.as_ref()));
                 }
+            } else {
+                unchanged_snapshot = baseline.iter().any(|inherited| {
+                    inherited.thread_id == call.address.thread_id
+                        && inherited.cumulative == *cumulative
+                        && inherited.cumulative_total == *report.cumulative_total()
+                });
             }
             cursor.insert(
                 call.address.thread_id.clone(),
@@ -473,10 +535,12 @@ fn usage_totals(
         if unchanged_snapshot && report.model_call_id().is_none() {
             continue;
         }
+        // One endpoint that no call identity, token count, or duration accompanies cannot be
+        // attributed to a call. Counting it as a call without timing would erase the duration
+        // of the call it actually ends, as Copilot's call-end event did.
         let identified_call = report.model_call_id().is_some()
             || report.reported_duration_ms().is_some()
-            || report.started_at_ms().is_some()
-            || report.completed_at_ms().is_some()
+            || (report.started_at_ms().is_some() && report.completed_at_ms().is_some())
             || (report.usage().is_some() && !unchanged_snapshot);
         if identified_call {
             request_count = request_count
@@ -534,7 +598,27 @@ fn usage_totals(
             }
         }
     }
-    Ok((request_count, totals, timings))
+    let mut cumulative = baseline
+        .iter()
+        .filter(|inherited| !cursor.contains_key(&inherited.thread_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    cumulative.extend(
+        cursor.into_iter().map(
+            |(thread_id, (cumulative, cumulative_total))| ThreadUsageBaseline {
+                thread_id,
+                cumulative,
+                cumulative_total,
+            },
+        ),
+    );
+    cumulative.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    Ok(UsageLedger {
+        request_count,
+        turn: totals,
+        timing: timings,
+        cumulative,
+    })
 }
 
 /// Preserve per-call observations when a cumulative category has no trustworthy monotonic baseline.

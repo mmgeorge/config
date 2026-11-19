@@ -71,8 +71,8 @@ T["reopen_pending_removal"] = function()
   eq(editor.finish(state, ""), "original draft")
   local removal = requests[3]
   eq(removal.spec.params.action.edits[1].text, "")
-  -- The stale displayed entry remains while the host processes removal.
-  eq(#state.queue, 1)
+  -- The removed entry leaves the queue at once and cannot become an edit target meanwhile.
+  eq(#state.queue, 0)
   local text, failure = editor.move(state, "new draft", -1)
   eq(text, nil)
   eq(type(failure), "string")
@@ -141,7 +141,7 @@ T["unavailable_edit"] = function()
     -- Delivery wins before the edit reservation is acknowledged.
     input.receive(state, { revision = 2, removed = { "queued" }, upsert = {} })
     local text, failure, attachments, recovered = action(state, "keep my edits")
-    eq({ text, failure, attachments, recovered }, { "keep my edits", nil, {}, true })
+    eq({ text, failure, attachments, recovered }, { "keep my edits", nil, {}, "edited" })
     eq(state.queue_edit, nil)
     eq(requests[#requests].spec.params.action.kind, "release")
     -- A late reservation failure must not re-enter editing.
@@ -150,6 +150,77 @@ T["unavailable_edit"] = function()
     eq(state.queue_edit, nil)
     eq(state.failed_queue_edit, nil)
   end
+end
+
+T["delivered_unchanged_edit_restores_earlier_draft"] = function()
+  -- Delivery can win the race with the reservation. The composer then holds text the host already
+  -- sent, and keeping it as a draft invites sending it twice, so unchanged text gives way to the
+  -- draft the composer held before editing began.
+  local input = require("forge.views.harness.input_state")
+  local editor = require("forge.views.harness.queue_editor")
+  local requests = mock_client.record()
+  local state = { session = { id = "delivered-edit" }, queue = {}, composer_buf = buffer.scratch() }
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 1, messages = {
+    { id = "queued", revision = 1, text = "original", delivery = "queued", attachments = {} },
+  }, suspended = false })
+  eq(editor.move(state, "earlier draft", -1), "original")
+  input.receive(state, { revision = 2, removed = {}, upsert = {
+    { id = "queued", revision = 2, text = "original", delivery = "delivering", route = "turn", attachments = {} },
+  } })
+  eq(editor.delivered(state), true)
+  local text, failure, attachments, recovered = editor.finish(state, "original")
+  eq({ text, failure, attachments, recovered }, { "earlier draft", nil, {}, "sent" })
+  eq(state.queue_edit, nil)
+  eq(requests[#requests].spec.params.action.kind, "release")
+end
+
+T["navigation_releases_unchanged_entries"] = function()
+  -- Navigation reserves each message it visits. A message left unchanged is released alone, so
+  -- an earlier message the user only looked at can still run while a later one is edited.
+  local input = require("forge.views.harness.input_state")
+  local editor = require("forge.views.harness.queue_editor")
+  local requests = mock_client.record()
+  local state = { session = { id = "navigate-edit" }, queue = {}, composer_buf = buffer.scratch() }
+  input.attach(state, function() end)
+  local two = { id = "two", revision = 1, text = "two", delivery = "queued", attachments = {} }
+  local three = { id = "three", revision = 1, text = "three", delivery = "queued", attachments = {} }
+  requests[1].callback({ revision = 1, messages = { two, three }, suspended = false })
+  local function acknowledge(request, entry, revision)
+    local reserved = vim.deepcopy(entry)
+    reserved.revision, reserved.reservation = revision, request.spec.params.action.reservation
+    request.callback({ revision = revision, operation_id = request.spec.params.id, upsert = { reserved }, removed = {} })
+  end
+  eq(editor.move(state, "", -1), "three")
+  local reserve_three = requests[2]
+  eq(reserve_three.spec.params.action.id, "three")
+  acknowledge(reserve_three, three, 2)
+  -- Leaving "three" unchanged for "two" releases "three" and reserves "two".
+  eq(editor.move(state, "three", -1), "two")
+  local actions = vim.tbl_map(function(request) return request.spec.params.action end, { unpack(requests, 3) })
+  eq(vim.tbl_map(function(action) return { action.kind, action.id } end, actions),
+    { { "release", "three" }, { "reserve", "two" } })
+  eq(actions[1].reservation, reserve_three.spec.params.action.reservation)
+  local released = vim.deepcopy(three)
+  released.revision = 3
+  requests[3].callback({ revision = 3, operation_id = requests[3].spec.params.id, upsert = { released }, removed = {} })
+  -- Returning to "three" before the host acknowledges "two" reserves "three" at once, and releases
+  -- the unchanged "two" only after its reservation lands.
+  eq(editor.move(state, "two", 1), "three")
+  eq(#requests, 5)
+  eq({ requests[5].spec.params.action.kind, requests[5].spec.params.action.id, requests[5].spec.params.action.revision },
+    { "reserve", "three", 3 })
+  acknowledge(requests[4], two, 4)
+  eq({ requests[6].spec.params.action.kind, requests[6].spec.params.action.id }, { "release", "two" })
+  eq(state.queue_edit.drafts[state.queue[1]], nil)
+  -- Only the edited entry is committed.
+  local reserved = vim.deepcopy(released)
+  reserved.revision, reserved.reservation = 5, requests[5].spec.params.action.reservation
+  requests[5].callback({ revision = 5, upsert = { reserved }, removed = {} })
+  editor.finish(state, "trois")
+  local commit = requests[#requests].spec.params.action
+  eq(commit.kind, "commit")
+  eq(vim.tbl_map(function(edit) return { edit.id, edit.text } end, commit.edits), { { "three", "trois" } })
 end
 
 T["question_staging_preserves_typed_responses"] = function()

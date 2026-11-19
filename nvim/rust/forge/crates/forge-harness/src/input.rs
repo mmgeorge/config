@@ -61,6 +61,24 @@ pub(crate) enum InputDeliveryGuard<'a> {
     Receipt(&'a forge_provider_api::SubmissionId),
 }
 
+impl InputDeliveryGuard<'_> {
+    /// Get whether the message still holds the authority this guard observed.
+    fn admits(&self, message: &InputMessage) -> bool {
+        match self {
+            Self::Queued(revision) => {
+                message.revision == *revision
+                    && message.delivery() == InputDelivery::Queued
+                    && message.reservation().is_none()
+                    && message.submission_id().is_none()
+            }
+            Self::Claimed(revision) => {
+                message.revision == *revision && message.delivery() == InputDelivery::Delivering
+            }
+            Self::Receipt(receipt) => message.submission_id() == Some(receipt.as_str()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputDelivery {
@@ -149,8 +167,14 @@ pub enum InputAction {
         reservation: String,
         edits: Vec<InputEdit>,
     },
+    /// Release the edit identity from every message it holds, or only from `id`.
+    ///
+    /// Queue navigation reserves each message it visits. A message the editor leaves
+    /// unchanged is released alone, so it can be delivered while the edit continues.
     Release {
         reservation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     Remove {
         id: String,
@@ -181,6 +205,8 @@ pub struct InputUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error_code: Option<InputRejection>,
     pub prepend: bool,
+    /// Identity of the input this update retracted. A retracted user prompt's unsent copy is the
+    /// update's only upsert, which the editor removes once its composer holds the text.
     pub retracted: Option<String>,
 }
 
@@ -828,6 +854,12 @@ impl SessionInputQueue {
                 message.queue();
                 message.revision += 1;
                 update.upsert.push(message.clone());
+                // A retry asks to send this message now. A paused queue would hold it with
+                // nothing left to resume delivery, so the retry resumes the queue as well.
+                if snapshot.suspended {
+                    snapshot.suspended = false;
+                    snapshot.control_revision += 1;
+                }
             }
             InputAction::Resume => {
                 snapshot.suspended = false;
@@ -894,9 +926,11 @@ impl SessionInputQueue {
                         update.upsert.push(message.clone());
                     }
                 }
-                Self::release(snapshot, &reservation, update);
+                Self::release(snapshot, &reservation, None, update);
             }
-            InputAction::Release { reservation } => Self::release(snapshot, &reservation, update),
+            InputAction::Release { reservation, id } => {
+                Self::release(snapshot, &reservation, id.as_deref(), update)
+            }
             InputAction::Remove { id, .. } => {
                 snapshot.messages.retain(|message| message.id != id);
                 update.removed.push(id);
@@ -904,9 +938,15 @@ impl SessionInputQueue {
         }
     }
 
-    fn release(snapshot: &mut InputSnapshot, reservation: &str, update: &mut InputUpdate) {
+    /// Clear `reservation` from every message it holds, or only from the message `id`.
+    fn release(
+        snapshot: &mut InputSnapshot,
+        reservation: &str,
+        id: Option<&str>,
+        update: &mut InputUpdate,
+    ) {
         for message in &mut snapshot.messages {
-            if message.reservation() == Some(reservation) {
+            if message.reservation() == Some(reservation) && id.is_none_or(|id| message.id == id) {
                 message.reserve(None).expect("reserved input is editable");
                 message.revision += 1;
                 update.upsert.push(message.clone());
@@ -938,9 +978,10 @@ impl SessionInputQueue {
     /// Retract the newest user prompt that no owner has claimed yet.
     ///
     /// A cancel can run before the owner claims a just-submitted prompt. That cancel
-    /// finds no foreground work, yet its suspension would refuse every later claim and
-    /// strand the prompt in the queue. Retracting it returns the draft to the composer
-    /// as a cancel of started work does. Deliberately queued follow-ups stay queued.
+    /// finds no foreground work to stop, so without retraction the prompt would start
+    /// right after the user interrupted it. Retracting it returns the draft to the composer
+    /// as a cancel of started work does, through the unsent copy [`Self::retract`] describes.
+    /// Deliberately queued follow-ups stay queued.
     pub(crate) fn retract_unclaimed_submission(
         &self,
         operation_id: &str,
@@ -959,18 +1000,80 @@ impl SessionInputQueue {
         }) else {
             return Ok(None);
         };
-        let message = state.snapshot.messages.remove(index);
-        let mut update = InputUpdate {
-            operation_id: Some(operation_id.to_owned()),
-            removed: vec![message.id.clone()],
-            retracted: Some(message.id),
-            ..InputUpdate::default()
-        };
-        Self::advance(&mut state.snapshot, &mut update);
+        let mut update = Self::retract_at(&mut state, index);
+        update.operation_id = Some(operation_id.to_owned());
         self.commit(&mut retained, state)?;
         drop(retained);
         self.changed.notify_one();
         Ok(Some(update))
+    }
+
+    /// Retire a retracted input while its original authority still matches.
+    ///
+    /// Restoring a retracted prompt is the editor's work, and the editor can exit before it
+    /// hears of the retraction. The same commit that retires the input therefore keeps a user
+    /// prompt as an unsent entry, which an editor removes once its composer holds the text and
+    /// which a restart otherwise restores.
+    pub(crate) fn retract(
+        &self,
+        id: &str,
+        guard: InputDeliveryGuard<'_>,
+    ) -> Result<Option<InputUpdate>> {
+        let mut retained = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let mut state = retained.clone();
+        let Some(index) = state
+            .snapshot
+            .messages
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return Ok(None);
+        };
+        if !guard.admits(&state.snapshot.messages[index]) {
+            return Ok(None);
+        }
+        let update = Self::retract_at(&mut state, index);
+        self.commit(&mut retained, state)?;
+        drop(retained);
+        self.changed.notify_one();
+        Ok(Some(update))
+    }
+
+    /// Remove the retracted message at `index`, queue its unsent copy, and describe the change.
+    ///
+    /// Harness-produced input carries no user text, and its task or question keeps the authority
+    /// to produce it again, so only a user prompt leaves a copy behind.
+    fn retract_at(state: &mut InputState, index: usize) -> InputUpdate {
+        let retracted = state.snapshot.messages.remove(index);
+        let mut update = InputUpdate {
+            removed: vec![retracted.id.clone()],
+            retracted: Some(retracted.id.clone()),
+            ..InputUpdate::default()
+        };
+        match &retracted.purpose {
+            InputPurpose::User => {
+                let unsent =
+                    retracted.retracted_copy(format!("retracted:{}", uuid::Uuid::new_v4()));
+                state.submitted.insert(unsent.id.clone());
+                update.upsert.push(unsent.clone());
+                // A failed entry blocks every claim behind it. At the back of the queue the copy
+                // blocks neither the follow-ups already queued nor a newer prompt, which enters
+                // ahead of follow-ups.
+                state.snapshot.messages.push(unsent);
+            }
+            InputPurpose::CheckResult { .. }
+            | InputPurpose::Clarification { .. }
+            | InputPurpose::Question { .. }
+            | InputPurpose::WorkflowContinuation { .. }
+            | InputPurpose::QuestionContinuation { .. }
+            | InputPurpose::TaskEntry { .. }
+            | InputPurpose::TaskContinuation { .. } => {}
+        }
+        Self::advance(&mut state.snapshot, &mut update);
+        update
     }
 
     pub fn claim(
@@ -1121,25 +1224,8 @@ impl SessionInputQueue {
                 ..Default::default()
             }));
         };
-        if let Some(guard) = guard {
-            let message = &state.snapshot.messages[index];
-            let matches = match guard {
-                InputDeliveryGuard::Queued(revision) => {
-                    message.revision == revision
-                        && message.delivery() == InputDelivery::Queued
-                        && message.reservation().is_none()
-                        && message.submission_id().is_none()
-                }
-                InputDeliveryGuard::Claimed(revision) => {
-                    message.revision == revision && message.delivery() == InputDelivery::Delivering
-                }
-                InputDeliveryGuard::Receipt(receipt) => {
-                    message.submission_id() == Some(receipt.as_str())
-                }
-            };
-            if !matches {
-                return Ok(None);
-            }
+        if guard.is_some_and(|guard| !guard.admits(&state.snapshot.messages[index])) {
+            return Ok(None);
         }
         let mut update = InputUpdate::default();
         if state.snapshot.messages[index].delivery() == InputDelivery::Accepted

@@ -10,6 +10,13 @@ use super::services::{OwnerServices, ProviderGenerationPermit};
 use crate::broker::{HarnessBroker, PriorFinalization, PriorFinalizationAction};
 use crate::provider::{ExchangeId, ProviderError};
 
+/// Bound retained stop collection after its command already answered at the stop deadline.
+///
+/// Twenty seconds is the longest interrupt settlement grace any adapter allows (Claude's), so
+/// a collection retained at the thirty-second stop deadline has had every adapter's full grace
+/// before the backstop ends its binding; a stop leaves `Stopping` within fifty seconds at most.
+pub(super) const STOP_COLLECTION_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Report the owner's actual foreground availability, without inspecting semaphore counts.
 #[derive(Clone)]
 pub(super) enum TurnStatus {
@@ -108,6 +115,51 @@ pub(super) struct ExchangeStop {
     uncommitted: Option<TransitionEvent>,
     foreground_signals: std::collections::VecDeque<crate::broker::ForegroundSignal>,
     reporting: TransitionReporting,
+    backstop: StopBackstop,
+}
+
+/// Reach the session's root binding when a stop's collection outlives `STOP_COLLECTION_BACKSTOP`.
+struct StopBackstop {
+    provider: std::sync::Arc<std::sync::RwLock<std::sync::Arc<crate::provider::Provider>>>,
+    owner: crate::provider::ThreadOwner,
+}
+
+impl StopBackstop {
+    fn new(services: &OwnerServices) -> Self {
+        Self {
+            provider: services.provider.clone(),
+            owner: crate::provider::ThreadOwner::root(services.observer.session_id()),
+        }
+    }
+
+    /// Force-end the root binding so its stuck native collection returns or is abandoned.
+    async fn terminate(&self) -> bool {
+        let provider = self
+            .provider
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let terminated = provider.session_terminate_native(&self.owner).await;
+        tracing::error!(target: "forge::harness", event_name = "exchange.stop.backstop",
+            reason = "collection_unsettled",
+            backstop_ms = STOP_COLLECTION_BACKSTOP.as_millis() as u64,
+            terminated = terminated.is_ok(),
+            "Stop collection never returned, so the binding was force-terminated");
+        terminated.is_ok()
+    }
+}
+
+/// Report a stop whose native collection the backstop abandoned.
+fn abandoned_collection() -> ProviderError {
+    forge_provider_api::ProviderFailure::new(
+        forge_provider_api::ProviderOperation::TurnInterrupt,
+        forge_provider_api::ProviderFailureKind::Timeout,
+    )
+    .at_phase(
+        forge_provider_api::ProviderPhase::Collection,
+        forge_provider_api::FailureDisposition::Invalidated,
+    )
+    .into()
 }
 
 impl ExchangeStop {
@@ -384,6 +436,7 @@ impl ExchangeStop {
             }
         });
         Self {
+            backstop: StopBackstop::new(services),
             id,
             intent,
             stage: TransitionStage::Acquiring(task),
@@ -404,7 +457,47 @@ impl ExchangeStop {
     /// Await identified facts while the driver keeps processing native events and queued intent.
     pub(super) async fn next(&mut self, foreground: TurnStatus) -> TransitionEvent {
         if self.reporting.response_expired {
-            return self.next_stage(foreground).await;
+            if matches!(self.stage, TransitionStage::Draining { .. }) {
+                // A turn whose collection completed, including by termination, settles from its
+                // adapter's terminal report. One that has not settled two backstops after the
+                // deadline never will, and the stop fails so the provider restart ends it.
+                let unavailable_at = self.reporting.response_at() + 2 * STOP_COLLECTION_BACKSTOP;
+                return tokio::select! {
+                    biased;
+                    event = self.next_stage(foreground) => event,
+                    () = tokio::time::sleep_until(unavailable_at) => {
+                        TransitionEvent::ForegroundUnavailable
+                    }
+                };
+            }
+            if !matches!(self.stage, TransitionStage::Collecting { .. }) {
+                return self.next_stage(foreground).await;
+            }
+            // The command already answered at the stop deadline. Collection still pending a
+            // backstop later never returns by itself, so the binding is terminated and the
+            // collection gets one more backstop to observe that before it is abandoned. Both
+            // boundaries are absolute, because the driver re-polls this future after other wakes.
+            let terminate_at = self.reporting.response_at() + STOP_COLLECTION_BACKSTOP;
+            tokio::select! {
+                biased;
+                event = self.next_stage(foreground.clone()) => return event,
+                () = tokio::time::sleep_until(terminate_at) => {}
+            }
+            let terminated = self.backstop.terminate().await;
+            let event = tokio::select! {
+                biased;
+                event = self.next_stage(foreground) => event,
+                () = tokio::time::sleep_until(terminate_at + STOP_COLLECTION_BACKSTOP) => {
+                    TransitionEvent::Collected(Err(abandoned_collection()))
+                }
+            };
+            // Termination ends everything the binding owned, which is the collection the stop
+            // waited for, so the cancellation settles normally; the interrupt's own error then
+            // only reports that its binding is gone.
+            return match event {
+                TransitionEvent::Collected(_) if terminated => TransitionEvent::Collected(Ok(())),
+                event => event,
+            };
         }
         let report_at = self.reporting.next_at();
         tokio::select! {
@@ -1002,8 +1095,26 @@ impl RetainedTransition {
         self.generation = generation;
     }
 
-    /// Collect an overdue native job while leaving lifecycle decisions with the driver.
+    /// Collect an overdue native job, force-ending the binding when it never returns.
+    ///
+    /// Collection that is still pending `STOP_COLLECTION_BACKSTOP` after it was retained can no
+    /// longer be waiting on a bounded adapter interrupt, so the session would otherwise stay
+    /// stopping until the editor restarts. The backstop terminates the root binding's native
+    /// process or connection, gives the retained work the same bound again to observe that, and
+    /// reports a failed stop either way, which restarts the provider and settles the exchange.
     pub(super) async fn collect(&mut self, services: &OwnerServices) -> Result<(), ProviderError> {
+        if let Ok(result) =
+            tokio::time::timeout(STOP_COLLECTION_BACKSTOP, self.collect_native(services)).await
+        {
+            return result;
+        }
+        let _ = StopBackstop::new(services).terminate().await;
+        let _ = tokio::time::timeout(STOP_COLLECTION_BACKSTOP, self.collect_native(services)).await;
+        Err(abandoned_collection())
+    }
+
+    /// Collect an overdue native job while leaving lifecycle decisions with the driver.
+    async fn collect_native(&mut self, services: &OwnerServices) -> Result<(), ProviderError> {
         let mut retained_failure = false;
         // A yielded join result has already consumed its handle; retain its evidence without awaiting it again.
         if let Some(event) = self.uncommitted.take() {

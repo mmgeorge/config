@@ -38,6 +38,41 @@ T["scroll_clamp_measures_the_tail"] = function()
   MiniTest.expect.equality(layout.maximum_content_topline(buffer, window), 1)
 end
 
+T["tail_and_scroll_clamp_honor_the_rows_an_overlay_leaves_uncovered"] = function()
+  local layout = require("forge.views.harness.layout")
+  local buffer = vim.api.nvim_create_buf(false, true)
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, buffer)
+  MiniTest.finally(function() pcall(vim.api.nvim_buf_delete, buffer, { force = true }) end)
+  local rows = {}
+  for index = 1, 60 do rows[index] = "row " .. index end
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, true, rows)
+  vim.wo[window].wrap, vim.wo[window].winbar = false, ""
+  local height = vim.api.nvim_win_get_height(window)
+  assert(height > 12, "the fixture window is too short to be partly covered")
+  ---@return integer topline
+  local function topline() return vim.fn.line("w0", window) end
+
+  -- An overlay that leaves eight rows uncovered moves the boundary to the eighth row.
+  MiniTest.expect.equality(layout.maximum_content_topline(buffer, window, 8), 53)
+  layout.position_tail(buffer, window, 8)
+  MiniTest.expect.equality(topline(), 53)
+  layout.clamp_scroll(buffer, window, 8)
+  MiniTest.expect.equality(topline(), 53)
+
+  -- The winbar takes one of the uncovered rows.
+  vim.wo[window].winbar = "transcript"
+  MiniTest.expect.equality(layout.maximum_content_topline(buffer, window, 8), 54)
+  vim.wo[window].winbar = ""
+
+  -- More uncovered rows than the window has change nothing.
+  MiniTest.expect.equality(layout.maximum_content_topline(buffer, window, height + 10), 60 - height + 1)
+
+  -- Without an overlay the boundary is the window's last row again.
+  layout.clamp_scroll(buffer, window)
+  MiniTest.expect.equality(topline(), 60 - height + 1)
+end
+
 T["composer_edit_notifies_geometry_only_on_height_change"] = function()
   local layout = require("forge.views.harness.layout")
   local composer = vim.api.nvim_create_buf(false, true)
@@ -60,6 +95,24 @@ T["composer_edit_notifies_geometry_only_on_height_change"] = function()
   layout.resize_composer(composer, window, true)
   assert(vim.api.nvim_win_get_height(window) > height, "six rows did not grow the composer")
   MiniTest.expect.equality(notified, 2)
+end
+
+-- Smooth scrolling lets a window start inside a wrapped line. Two owners that position a following
+-- transcript, one by screen rows and one by whole lines, then alternate its first row.
+T["transcript_never_scrolls_smoothly_and_composer_leaves_global_untouched"] = function()
+  require("forge.infra.config").setup({})
+  local layout = require("forge.views.harness.layout")
+  local global = vim.go.smoothscroll
+  MiniTest.finally(function() vim.go.smoothscroll = global end)
+  vim.go.smoothscroll = false
+  local _, first_transcript = layout.open("first", "tab")
+  MiniTest.expect.equality(vim.go.smoothscroll, false)
+  MiniTest.expect.equality(vim.wo[first_transcript].smoothscroll, false)
+  vim.go.smoothscroll = true
+  local _, second_transcript, _, second_composer = layout.open("second", "tab")
+  MiniTest.expect.equality(vim.wo[second_transcript].smoothscroll, false)
+  MiniTest.expect.equality(vim.wo[second_composer].smoothscroll, true)
+  MiniTest.expect.equality(vim.go.smoothscroll, true)
 end
 
 return T

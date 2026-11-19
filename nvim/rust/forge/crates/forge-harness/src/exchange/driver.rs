@@ -533,10 +533,11 @@ impl ExchangeDriver {
     }
 
     /// Consume input evidence, commit domain state, then notify completion observers.
-    fn finish_input(
+    async fn finish_input(
         &mut self,
         run: InputCommandRun,
         prepared: Result<PreparedInput, super::command::CommandFailure>,
+        broker: &Mutex<crate::broker::HarnessBroker>,
         messages: Option<&MessageSender>,
         context: OwnerUpdateContext<'_>,
     ) {
@@ -596,6 +597,21 @@ impl ExchangeDriver {
                     }
                 }
                 publish_input_observation(update.clone(), messages, services, trace, session, step);
+                // The change can withdraw or supply the message an idle status predicts, so the
+                // status is re-projected before the command completes.
+                let refreshed = broker.lock().await.owner_refresh_idle_status();
+                let published = refreshed.and_then(|events| {
+                    if !events.is_empty() {
+                        services.publications.publish_batch(events)?;
+                    }
+                    Ok(())
+                });
+                match published {
+                    Ok(()) => {}
+                    Err(error) => trace.record(session, "exchange.input.status_refresh_failed", serde_json::json!({
+                        "command_id":run.command.record.request.id.as_str(),"update_step":step,"reason":error.to_string(),
+                    })),
+                }
                 services.input.changed.notify_one();
                 match self.commands.committed(&run.command.record.request.id) {
                     Ok(Some(record)) if record.completion().is_some() => {
@@ -1649,7 +1665,9 @@ struct QueuedTurn {
     initial: Option<ForegroundJob>,
     completion: ForegroundCompletion,
     updates: Option<crate::broker::publication::SessionUpdateStream>,
-    execution: Option<crate::command::ExecutionPermit>,
+    /// Hold the root execution permit from admission through settlement, so queued input sees
+    /// the turn as active work and steers into it or waits rather than starting beside it.
+    execution: crate::command::ExecutionPermit,
 }
 
 enum ForegroundProgress {
@@ -1736,7 +1754,7 @@ struct ActiveTurn {
     settled: bool,
     handoff: TurnDispatch,
     updates: Option<crate::broker::publication::SessionUpdateStream>,
-    _execution: Option<crate::command::ExecutionPermit>,
+    _execution: crate::command::ExecutionPermit,
 }
 
 impl ActiveTurn {

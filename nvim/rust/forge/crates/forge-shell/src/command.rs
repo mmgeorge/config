@@ -330,63 +330,14 @@ pub fn display_command(command: &str, shell: CommandShell) -> CommandDisplay {
         shell,
         byte_range_list: (0..command.len()).map(|index| index..index + 1).collect(),
     };
+    // Permission analysis unwraps exactly the launchers `shell_script` accepts, so the display
+    // never hides a launcher whose script is not the whole command that runs.
     for _ in 0..16 {
-        let Ok(mut tokens) = shell_tokens(&display.source, display.shell) else {
+        let Some(script) = shell_script(&display.source, display.shell) else {
             break;
         };
-        let Some(first) = tokens.first() else {
-            break;
-        };
-        let executable = first
-            .text
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&first.text)
-            .to_ascii_lowercase();
-        let interpreter = CommandShell::from_executable(&executable);
-        let fish = executable.trim_end_matches(".exe") == "fish";
-        let cmd = executable.trim_end_matches(".exe") == "cmd";
-        if interpreter == CommandShell::Nushell
-            && nushell_file_arguments(tokens.iter().skip(1).map(|token| token.text.as_str()))
-        {
-            break;
-        }
-        if interpreter == CommandShell::Unknown && !fish && !cmd {
-            break;
-        }
-        let Some(marker) = tokens
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find_map(|(index, token)| {
-                let argument = token.text.to_ascii_lowercase();
-                let command_switch = match interpreter {
-                    CommandShell::PowerShell => {
-                        matches!(argument.as_str(), "-command" | "-c" | "-file" | "-f")
-                    }
-                    CommandShell::Nushell => matches!(argument.as_str(), "-c" | "--commands"),
-                    _ if cmd => matches!(argument.as_str(), "/c" | "/k"),
-                    _ => matches!(argument.as_str(), "-c" | "-lc" | "-ic" | "-lic"),
-                };
-                command_switch.then_some(index)
-            })
-        else {
-            break;
-        };
-        let Some(payload) = tokens.get(marker + 1) else {
-            break;
-        };
-        let (source, mapping) = if marker + 2 == tokens.len() {
-            let payload = tokens.swap_remove(marker + 1);
-            (payload.text, payload.byte_range_list)
-        } else {
-            let range = payload.range.start..display.source.trim_end().len();
-            (
-                display.source[range.clone()].to_owned(),
-                range.map(|index| index..index + 1).collect(),
-            )
-        };
-        let mapping = mapping
+        let byte_range_list = script
+            .byte_range_list
             .into_iter()
             .map(|range| {
                 display.byte_range_list[range.start].start
@@ -394,13 +345,9 @@ pub fn display_command(command: &str, shell: CommandShell) -> CommandDisplay {
             })
             .collect();
         display = CommandDisplay {
-            source,
-            shell: if fish {
-                CommandShell::Bash
-            } else {
-                interpreter
-            },
-            byte_range_list: mapping,
+            source: script.source,
+            shell: script.shell,
+            byte_range_list,
         };
     }
     display
@@ -455,6 +402,8 @@ struct ShellToken {
     text: String,
     range: Range<usize>,
     byte_range_list: Vec<Range<usize>>,
+    /// Holds an unquoted control or grouping operator, so the token ends or nests a command.
+    bare_operator: bool,
 }
 
 impl ShellToken {
@@ -553,6 +502,10 @@ fn shell_tokens(command: &str, shell: CommandShell) -> Result<Vec<ShellToken>> {
                 started = false;
             }
         } else {
+            current.bare_operator |= matches!(
+                character,
+                ';' | '&' | '|' | '<' | '>' | '(' | ')' | '{' | '}'
+            );
             current.append(character, offset..offset + character.len_utf8());
             started = true;
         }
@@ -747,8 +700,15 @@ pub fn shell_script_argument(tokens: &[String]) -> Option<(usize, CommandShell)>
     Some((marker, shell))
 }
 
+/// Recover the script of a launcher that is the whole command, such as `bash -lc '...'`.
+///
+/// An unquoted operator anywhere in the source ends or nests a command in the outer shell, so
+/// text after it belongs to that shell and the launcher is not the whole command.
 fn shell_script(source: &str, input_shell: CommandShell) -> Option<ShellScript> {
     let mut tokens = shell_tokens(source, input_shell).ok()?;
+    if tokens.iter().any(|token| token.bare_operator) {
+        return None;
+    }
     let token_text = tokens
         .iter()
         .map(|token| token.text.clone())
@@ -827,6 +787,54 @@ mod test {
             assert!(display.summary().is_none(), "{source}");
             assert_eq!(display.source, source);
         }
+    }
+
+    /// A launcher is hidden only when it is the whole command, so the display matches execution.
+    #[test]
+    fn display_strips_only_launchers_that_are_the_whole_command() {
+        for (shell, source) in [
+            (
+                CommandShell::PowerShell,
+                r#"nu -c "sleep 45sec"; "exit code: $LASTEXITCODE""#,
+            ),
+            (
+                CommandShell::Bash,
+                r#"nu -c "sleep 45sec"; echo "exit code: $?""#,
+            ),
+            (CommandShell::PowerShell, r#"nu -c "sleep 45sec";"#),
+            (CommandShell::Bash, "bash -c 'git status'|tee out.txt"),
+            (CommandShell::Bash, "bash -c echo hi"),
+            (CommandShell::PowerShell, "pwsh -Command git status"),
+        ] {
+            assert_eq!(display_command(source, shell).source, source, "{source}");
+        }
+        for (shell, source, expected) in [
+            (
+                CommandShell::PowerShell,
+                r#"pwsh -NoProfile -Command "git status""#,
+                "git status",
+            ),
+            (CommandShell::Bash, "bash -lc 'git status'", "git status"),
+            (
+                CommandShell::PowerShell,
+                r#"nu -c "sleep 45sec""#,
+                "sleep 45sec",
+            ),
+        ] {
+            assert_eq!(display_command(source, shell).source, expected, "{source}");
+        }
+    }
+
+    /// Text after an unquoted operator belongs to the outer shell, not to the launched script.
+    #[test]
+    fn analyzes_commands_after_a_launcher_in_the_outer_shell() {
+        let result = normalize_command_in("nu -c 'ls';ri", CommandShell::PowerShell);
+        let alias = result
+            .invocation_list
+            .iter()
+            .find(|invocation| invocation.command_name.eq_ignore_ascii_case("ri"))
+            .unwrap_or_else(|| panic!("ri was not analyzed: {result:?}"));
+        assert_eq!(alias.shell, CommandShell::PowerShell);
     }
 
     #[test]

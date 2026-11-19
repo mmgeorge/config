@@ -296,6 +296,20 @@ function M.refresh_winbar()
   render_status_hint(state)
 end
 
+---Get the resume hint for the queued follow-up heading while delivery is paused and idle.
+---
+---An interrupt pauses the queue, and nothing sends its messages until the user resumes it. The
+---heading names the retry key, which resumes a paused queue that holds no failed message.
+---@param state table
+---@return string? hint Absent while delivery runs; empty when the retry key is unbound.
+function M.paused_queue_hint(state)
+  if not (state.input and state.input.suspended) or #(state.queue or {}) == 0 or activity.busy(state) then
+    return nil
+  end
+  local key = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")[1]
+  return key and (key .. " resume") or ""
+end
+
 ---@return integer?
 local function working_seconds()
   local state = harness_state()
@@ -321,8 +335,12 @@ render_status_hint = function(state)
       questions = state.questions,
     }
     if state.presentation.set_staging then
-      state.presentation.set_staging(queue_editor.staging(state, composer_text(state.composer_buf), state.queue or {}),
-        queue_editor.staging(state, nil, state.pending_steer or {}))
+      -- A claimed follow-up keeps its row until the transcript shows its prompt, where the host
+      -- drops the staged copy in the same publication; hiding it at the claim closed the split
+      -- and reopened it one frame later.
+      local follow_ups = vim.list_extend(vim.list_slice(state.pending_handoff or {}), state.queue or {})
+      state.presentation.set_staging(queue_editor.staging(state, composer_text(state.composer_buf), follow_ups),
+        queue_editor.staging(state, nil, state.pending_steer or {}), M.paused_queue_hint(state))
     end
     if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
       state.presentation.status_view:render(status_context, M.command_set())
@@ -339,10 +357,6 @@ local function render()
   if not (state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf)
       and state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)) then return end
   if not (state.session and state.session.id) then
-    M.refresh_winbar()
-    return
-  end
-  if require("forge.views.harness.session_preview").is_open(state.transcript_win) then
     M.refresh_winbar()
     return
   end
@@ -406,19 +420,6 @@ local function schedule_render()
     state.render_pending = false
     M.with_state(state, M.render)
   end)
-end
-
----Render the Harness view whose transcript window is `window`, such as after a session preview
----returns that window to its transcript. Rendering skips the transcript while a preview covers it,
----so a snapshot that arrived during the preview is presented only by this call.
----@param window integer
-function M.render_window(window)
-  local owner
-  if session.harness.transcript_win == window then owner = session.harness end
-  for _, candidate in pairs(session.harness_by_id) do
-    if not owner and candidate.transcript_win == window then owner = candidate end
-  end
-  if owner then M.with_state(owner, M.render) end
 end
 
 local function remove_approval(state, approval_id)
@@ -1641,6 +1642,8 @@ function M.open_background_picker()
   client.request({ session_id = session_id, method = "session.document", params = { operation = "background_terminals" } }, function(inventory, failure)
     if not current() then return end
     if failure then notifications.error(failure, "Select Background Terminal") return end
+    -- The picker lists this live read, so the status count adopts it rather than a stale push.
+    if state.presentation and state.presentation.terminals then state.presentation.terminals.adopt(inventory) end
     if not inventory.supported then
       notifications.warn("The current provider does not support background terminals", "ForgeHarness")
       return
@@ -1658,6 +1661,33 @@ function M.open_background_picker()
       end)
     end, "No background terminals are running.")
   end)
+end
+
+---Explain how an edit ended when its message left the queue before the edit took hold.
+---@param recovered ("sent"|"edited")?
+function M.report_recovered_edit(recovered)
+  if recovered == "sent" then
+    notifications.info("The queued message was sent before the edit took hold. The composer shows your earlier draft again.", "ForgeHarness")
+  elseif recovered == "edited" then
+    notifications.warn("The queued message was sent before the edit took hold. Your changed text is now a normal draft; submit it to send it as a new message.", "ForgeHarness")
+  end
+end
+
+---End an edit whose message the host delivered before the edit's reservation took hold.
+---
+---Unchanged text was already sent, so the composer returns to the draft it held before editing;
+---changed text stays as an ordinary draft. Waiting for the next key instead left an edit that no
+---save could apply.
+---@param state table
+function M.settle_delivered_edit(state)
+  if not queue_editor.delivered(state) then return end
+  local original, _, attachments, recovered = queue_editor.finish(state, composer_text(state.composer_buf))
+  set_composer_text(state.composer_buf, original, attachments)
+  if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+    layout.resize_composer(state.composer_buf, state.composer_win)
+  end
+  M.refresh_winbar()
+  M.report_recovered_edit(recovered)
 end
 
 local function finish_queue_edit(state, text, unqueue)
@@ -1685,7 +1715,15 @@ local function finish_queue_edit(state, text, unqueue)
   local selected_attachments = edit.attachments[edit.entry]
   local original, failure, attachments, recovered = queue_editor.finish(state, unqueue and "" or text)
   if failure then notifications.warn(failure, "ForgeHarness") return end
-  if unqueue then original, attachments = text, selected_attachments
+  local saved_draft
+  if unqueue then
+    -- The composer takes the unqueued message, so the draft it held before editing moves into prompt
+    -- history, where Up recalls it.
+    if original and original:find("%S") then
+      saved_draft = { text = original, attachments = attachments or {} }
+      prompt_history.record(saved_draft)
+    end
+    original, attachments = text, selected_attachments
   elseif text ~= "" and not recovered then prompt_history.record(text) end
   set_composer_text(state.composer_buf, original, attachments)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
@@ -1693,8 +1731,9 @@ local function finish_queue_edit(state, text, unqueue)
     if unqueue then vim.api.nvim_set_current_win(state.composer_win) end
   end
   M.refresh_winbar()
-  if recovered then
-    notifications.warn("The queued message is no longer available. Your text is now a normal draft; submit again to send it.", "ForgeHarness")
+  M.report_recovered_edit(recovered)
+  if saved_draft then
+    notifications.info("Your earlier draft was saved to prompt history; press Up to recall it.", "ForgeHarness")
   end
   if state.presentation then state.presentation.follow_tail() end
 end
@@ -1736,6 +1775,9 @@ end
 function M.submit()
   local state = harness_state()
   if not admit_composer_input(state) then return end
+  -- Enter submitted instead of accepting a completion, so the menu closes on every outcome,
+  -- including a rejected command that leaves its text in the composer.
+  dismiss_composer_completion(state.composer_buf)
   require("forge.text").invalidate(state.composer_buf)
   if not attachments_ready(state.composer_buf) then return end
   state.execution_notice = nil
@@ -2111,8 +2153,10 @@ function M.queue_submit()
   if failure then report_configuration_error(failure) return end
   prompt_history.record(text)
   local attachments = attachment.capture(state.composer_buf).attachments
-  set_composer_text(state.composer_buf, "")
-  input_state.submit(state, prompt or text, attachments, "queue", captured_config)
+  dismiss_composer_completion(state.composer_buf)
+  local restore = require("forge.views.harness.composer_draft").take(state.composer_buf,
+    vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), attachments, function() return not state.queue_edit end)
+  input_state.submit(state, prompt or text, attachments, "queue", captured_config, nil, restore)
   M.refresh_winbar()
 end
 
@@ -2130,9 +2174,7 @@ function M.edit_queued(direction)
     vim.api.nvim_set_current_win(state.composer_win)
   end
   M.refresh_winbar()
-  if recovered then
-    notifications.warn("The queued message is no longer available. Your text is now a normal draft; submit again to send it.", "ForgeHarness")
-  end
+  M.report_recovered_edit(recovered)
   if state.presentation then state.presentation.follow_tail() end
 end
 
@@ -2550,11 +2592,17 @@ function M.command_set()
       or not presentation.ready or presentation.closed or presentation.failure then return end
     presentation.selection.start()
   end)
-  command_set.register(set, "edit_queued", function() M.edit_queued(-1) end)
-  command_set.register(set, "next_queued", function() M.edit_queued(1) end)
-  command_set.register(set, "submit", M.submit)
-  command_set.register(set, "queue", M.queue_submit)
-  command_set.register(set, "steer", M.steer_submit)
+  -- Keys that read the draft wait for any paste that preceded them in the terminal stream.
+  local function after_paste(action)
+    return require("forge.views.harness.composer_draft").after_pending_paste(function()
+      return harness_state().composer_buf
+    end, action)
+  end
+  command_set.register(set, "edit_queued", after_paste(function() M.edit_queued(-1) end))
+  command_set.register(set, "next_queued", after_paste(function() M.edit_queued(1) end))
+  command_set.register(set, "submit", after_paste(M.submit))
+  command_set.register(set, "queue", after_paste(M.queue_submit))
+  command_set.register(set, "steer", after_paste(M.steer_submit))
   command_set.register(set, "retry_input", function()
     local state = harness_state()
     if state.queue_edit then
@@ -2567,6 +2615,8 @@ function M.command_set()
         return
       end
     end
+    -- An interrupt pauses the queue; with no failed message to retry, the key resumes it.
+    if state.input and state.input.suspended and #(state.queue or {}) > 0 then input_state.resume(state) end
   end)
   command_set.register(set, "cancel", M.cancel_turn)
   command_set.register(set, "toggle_write", M.toggle_write)
@@ -2628,6 +2678,9 @@ function M.attach()
     local active = session.harness
     session.activate_harness(state)
     schedule_render()
+    if queue_editor.delivered(state) then
+      vim.schedule(function() M.with_state(state, function() M.settle_delivered_edit(state) end) end)
+    end
     if active ~= state then session.activate_harness(active) end
   end)
   local composer_buffer = state.composer_buf

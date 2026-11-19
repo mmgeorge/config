@@ -77,4 +77,7 @@ pub(crate) enum ProviderLifecycleFailure {
     /// A normalized adapter failure prevented native preparation.
     #[error(transparent)]
     Provider(#[from] crate::provider::ProviderError),
+    /// The session owner failed for its lifetime, so no recovery can start; carries the cause.
+    #[error("session unavailable: {0}")]
+    SessionUnavailable(String),
 }

@@ -363,6 +363,11 @@ impl HarnessBroker {
         }
         transaction.failure_cleanup_active = true;
         transaction.failure_inbox_open = true;
+        // A failing turn consumes no further input. Its transaction can outlive this failure,
+        // retained unread until the provider restarts, and that restart waits for every input
+        // delivery to settle. Closing the lane now refuses steering prepared while the turn
+        // fails, so the delivery settles as undispatched instead of waiting on this turn.
+        transaction.steering.active.retire();
         transaction
             .native
             .cancellation
@@ -561,6 +566,12 @@ impl HarnessBroker {
     ) -> Result<ForegroundAction> {
         if !expired.claim_report() {
             return self.fail_foreground(transaction, expired.into());
+        }
+        // The provider reports the stopped invocation only as interrupted, so the exchange keeps
+        // the deadline as the reason its tool failed and its execution stopped.
+        let record = expired.record();
+        if !transaction.state.interaction.tool_timeout.contains(&record) {
+            transaction.state.interaction.tool_timeout.push(record);
         }
         let observation = crate::provider::HarnessEvent::Host {
             scope: expired.address.turn.scope.clone().into(),
@@ -1637,9 +1648,11 @@ impl HarnessBroker {
                     .failure
                     .as_ref()
                     .context("failure state missing")?;
+                // A requested cancellation, retraction, or reconfiguration restart succeeded at
+                // what it asked for, so the transcript's cancelled heading reports it and no
+                // error diagnostic does.
                 if failure.original.downcast_ref::<TurnRetracted>().is_some()
-                    || (failure.original.is::<TurnCancelled>()
-                        && admission.owner_collection_restarts())
+                    || failure.original.is::<TurnCancelled>()
                 {
                     effects
                 } else {
@@ -1923,6 +1936,16 @@ impl HarnessBroker {
             }
             Ok(())
         })();
+        // Steering admitted before the lane closed and never read by the native turn stays
+        // `Prepared`. Release it now: its delivery observes the closed lane and returns the
+        // message to the queue, rather than waiting for a transaction that a restart retains.
+        if let TurnTransaction::Running { transaction, .. }
+        | TurnTransaction::Finalizing { transaction, .. } = &mut *dispatch
+        {
+            transaction.steering.active.retire();
+            transaction.steering.deferred.clear();
+            while transaction.steering.active.try_receive().is_some() {}
+        }
         let admission = match dispatch {
             TurnTransaction::Admitting(admission)
             | TurnTransaction::Running { admission, .. }

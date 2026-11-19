@@ -97,6 +97,9 @@ pub struct CodexNormalization {
     agents: HashMap<String, forge_provider_api::AgentId>,
     pending_agents: HashMap<(TurnId, String), forge_provider_api::AgentId>,
     delegations: HashMap<String, AgentDelegation>,
+    /// Host reasons for refused approvals, by host turn and native item. Codex's decline reply
+    /// has no reason field, so the declined item reports the reason retained here.
+    denial_reasons: HashMap<(TurnId, String), SanitizedMessage>,
     pub replay_sensitive: bool,
 }
 
@@ -210,6 +213,17 @@ impl CodexNormalization {
         self.items
             .get(&(turn_id.clone(), native_item_id.to_owned(), ItemPart::Tool))
             .map(|item| item.id.clone())
+    }
+
+    /// Retain why the host refused a native item's approval until Codex reports the item declined.
+    pub(super) fn denial_record(
+        &mut self,
+        turn_id: &TurnId,
+        native_item_id: &str,
+        reason: SanitizedMessage,
+    ) {
+        self.denial_reasons
+            .insert((turn_id.clone(), native_item_id.to_owned()), reason);
     }
 
     /// Identify a native turn that a host session operation, not an invocation, owns.
@@ -583,6 +597,41 @@ impl CodexNormalization {
                     && matches!(item.start, ItemStart::CommandExecution(_))
                     && item.lifetime == NativeItemLifetime::Foreground
                     && (item.completed.is_none() || item.completion_synthesized())
+            })
+            .map(|((_, native, _), _)| native.clone())
+            .collect()
+    }
+
+    /// Name the native command items of `thread_id` that are foreground work rather than
+    /// background terminals: commands a turn still waits on, and commands an interrupted turn
+    /// leaves for `stop_foreground_commands` to terminate.
+    ///
+    /// Codex lists the interrupted turn's command among its background terminals from
+    /// `turn/interrupt` until the adapter terminates it. A command still running after its turn
+    /// completed normally has outlasted its wait and remains a background terminal.
+    pub(super) fn thread_foreground_command_items(
+        &self,
+        thread_id: &str,
+    ) -> std::collections::HashSet<String> {
+        let turns = self
+            .turns
+            .iter()
+            .filter(|((thread, _), _)| thread == thread_id)
+            .map(|(_, address)| &address.turn_id)
+            .collect::<Vec<_>>();
+        self.items
+            .iter()
+            .filter(|((turn, _, part), item)| {
+                turns.contains(&turn)
+                    && *part == ItemPart::Tool
+                    && matches!(item.start, ItemStart::CommandExecution(_))
+                    && item.lifetime == NativeItemLifetime::Foreground
+                    && (item.completed.is_none()
+                        || item.completion_synthesized()
+                            && matches!(
+                                self.terminal.get(turn),
+                                Some((forge_provider_api::turn::TurnOutcome::Interrupted, _))
+                            ))
             })
             .map(|((_, native, _), _)| native.clone())
             .collect()
@@ -1098,6 +1147,14 @@ impl CodexNormalization {
         } else if is_tool_lifecycle_event(&method.to_ascii_lowercase(), params) {
             let snapshot =
                 normalize_tool_activity(method, params, workspace)?.ok_or_else(protocol_error)?;
+            // Replayed snapshots must derive the same outcome signature, so the reason stays.
+            let denial_reason = self
+                .denial_reasons
+                .get(&(address.turn_id.clone(), snapshot.id.clone()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    SanitizedMessage::new("Provider denied this tool call").expect("static text")
+                });
             let key = (address.turn_id.clone(), snapshot.id, ItemPart::Tool);
             let mut descriptor = super::tool_semantics::normalize_descriptor(
                 forge_provider_api::tool::ToolDescriptor {
@@ -1109,6 +1166,7 @@ impl CodexNormalization {
                     ),
                 },
                 snapshot.kind,
+                workspace,
             );
             let first = !self.items.contains_key(&key);
             if first && self.terminal.contains_key(&address.turn_id) {
@@ -1223,8 +1281,7 @@ impl CodexNormalization {
                         },
                     },
                     Some(ToolStatus::Denied) => ToolOutcome::Denied {
-                        reason: SanitizedMessage::new("Provider denied this tool call")
-                            .expect("static text"),
+                        reason: denial_reason,
                     },
                     Some(ToolStatus::Running) | None => return Err(protocol_error().into()),
                 };
@@ -1316,8 +1373,7 @@ impl CodexNormalization {
                         },
                     }),
                     ToolStatus::Denied => Some(ToolOutcome::Denied {
-                        reason: SanitizedMessage::new("Provider denied this tool call")
-                            .expect("static text"),
+                        reason: denial_reason,
                     }),
                 };
                 if let Some(outcome) = outcome {

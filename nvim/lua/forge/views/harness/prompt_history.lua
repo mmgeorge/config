@@ -75,12 +75,20 @@ function M.reset_navigation()
   harness.prompt_history_draft = nil
 end
 
----@param text string
+---Record a prompt as the newest history entry.
+---
+---A string takes its attachments from the composer when the composer still shows that text. A
+---draft, such as one saved outside the composer, is recorded as given.
+---@param entry string|ForgePromptDraft
 ---@return nil
-function M.record(text)
+function M.record(entry)
   local harness = state()
-  local draft = attachment.capture(harness.composer_buf)
-  if draft.text ~= text then draft = { text = text, attachments = {} } end
+  local draft
+  if type(entry) == "table" then draft = { text = entry.text, attachments = entry.attachments or {} }
+  else
+    draft = attachment.capture(harness.composer_buf)
+    if draft.text ~= entry then draft = { text = entry, attachments = {} } end
+  end
   table.insert(harness.prompt_history, 1, draft)
   M.reset_navigation()
   client.request({ session_id = harness.session.id, method = "session.prompt.history.record", params = draft }, function(result, request_error)

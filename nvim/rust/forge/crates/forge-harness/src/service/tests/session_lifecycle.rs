@@ -300,3 +300,109 @@ async fn full_initialization_adopts_a_session_owned_by_services() -> Result<()> 
     service.shutdown(Duration::from_secs(5)).await?;
     Ok(())
 }
+
+/// The storage-reset notice reaches exactly one Harness session start: services-only
+/// initialization leaves it pending, the first session start reports it, and a restarted host
+/// finds none.
+#[tokio::test]
+async fn reset_notice_is_reported_by_one_session_start() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let data_root = fixture.path().join("data");
+    crate::storage::layout::prepare(&data_root)?;
+    let pending = data_root.join("reset-notice.txt");
+    std::fs::write(&pending, "Forge reset the old Harness storage layout.")?;
+
+    let first = service();
+    let services = first
+        .initialize_services(1, initialize(&fixture, "mock"))
+        .await?;
+    let services = services
+        .result()
+        .context("services initialization failed")?;
+    assert!(services.get("storage_notice").is_none(), "{services}");
+    assert!(
+        pending.exists(),
+        "services-only startup consumed the notice"
+    );
+    let opened = first.open_session(2, initialize(&fixture, "mock")).await?;
+    let opened = opened.result().context("first session start failed")?;
+    assert_eq!(
+        opened["storage_notice"],
+        "Forge reset the old Harness storage layout."
+    );
+    let session_id = opened["session"]["id"]
+        .as_str()
+        .context("session id missing")?
+        .to_owned();
+    first.shutdown(Duration::from_secs(5)).await?;
+
+    let restarted = service();
+    let mut options = initialize(&fixture, "mock");
+    options.session_id = Some(session_id);
+    let reopened = restarted.open_session(3, options).await?;
+    let reopened = reopened.result().context("second session start failed")?;
+    assert!(
+        reopened.get("storage_notice").is_none(),
+        "the reset notice was reported again: {}",
+        reopened["storage_notice"]
+    );
+    assert!(!pending.exists());
+    restarted.shutdown(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+/// An exchange that was running when its host stopped holds a baseline and no closing
+/// checkpoint. The next session start captures that checkpoint before it publishes the session,
+/// so the restored exchange reports the interruption with the edit made before the stop instead
+/// of waiting in finalization for the next prompt.
+#[tokio::test]
+async fn session_start_captures_the_closing_checkpoint_of_a_host_interrupted_exchange() -> Result<()>
+{
+    let workspace = crate::broker::test::git_repository();
+    crate::checks::configure_fixture(workspace.path());
+    let data = tempfile::tempdir()?;
+    let request = |session_id: Option<String>| {
+        let mut request: super::super::InitializeRequest = serde_json::from_value(json!({
+            "workspace":workspace.path(),
+            "data_root":data.path(),
+            "client_id":"service-test",
+            "provider":{"kind":"mock","command":["mock"]},
+        }))
+        .unwrap();
+        request.session_id = session_id;
+        request
+    };
+    // The first host is dropped without shutdown, which leaves what a killed host leaves.
+    let session_id = {
+        let mut stopped = super::super::HarnessBroker::initialize(request(None))?;
+        crate::broker::test::save_host_interrupted_exchange(&mut stopped, "host-interrupted").await;
+        stopped.snapshot()?.session.id
+    };
+    std::fs::write(
+        workspace.path().join("seed.txt"),
+        "edited before the stop\n",
+    )?;
+
+    let restarted = service();
+    let reopened = restarted
+        .open_session(2, request(Some(session_id.clone())))
+        .await?;
+    assert!(reopened.error().is_none(), "{:?}", reopened.error());
+    let restored = SqliteStore::open(data.path())?
+        .load_exchange("host-interrupted")?
+        .context("the interrupted exchange is missing")?;
+    assert_eq!(
+        restored.state(),
+        crate::exchange::ExchangeState::Interrupted
+    );
+    assert!(
+        restored
+            .checkpoint_diff_text
+            .as_deref()
+            .is_some_and(|diff| diff.contains("edited before the stop")),
+        "session start left the exchange without its closing comparison: {:?}",
+        restored.checkpoint_diff_text
+    );
+    restarted.shutdown(Duration::from_secs(5)).await?;
+    Ok(())
+}

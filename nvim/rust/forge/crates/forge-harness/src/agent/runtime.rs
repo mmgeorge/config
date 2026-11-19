@@ -235,7 +235,7 @@ impl AgentRuntime {
                 // timeout preface rather than bare feedback that reads as user text.
                 request.input = crate::provider::ProviderInput::kind(
                     forge_provider_api::forge::TurnKind::PermissionTimeout {
-                        feedback: feedback.feedback().to_owned(),
+                        feedback: feedback.feedback(),
                     },
                 );
                 request.submission = None;

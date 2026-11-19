@@ -293,26 +293,11 @@ fn tool_group_label<'tool>(
     now: crate::turn::ToolInstant,
 ) -> String {
     let calls: Vec<_> = calls.into_iter().collect();
-    let count = calls.len();
-    let successful = calls
-        .iter()
-        .filter(|tool| tool.state() == crate::turn::ToolState::Completed && !tool.failed)
-        .count();
-    let denied = calls
-        .iter()
-        .filter(|tool| tool.state() == crate::turn::ToolState::Denied)
-        .count();
-    let mut label = format!("▸ Tools · {successful}/{count}");
-    if denied > 0 {
-        label.push_str(&format!(" · ({denied} denied)"));
-    }
-    if let Some(elapsed) = tool_group_elapsed(&calls, now) {
-        label.push_str(&format!(
-            " · {}",
-            super::duration::tool_duration(Some(elapsed)).trim()
-        ));
-    }
-    label
+    let tally = ToolTally::from(crate::exchange::ToolCounter::of(calls.iter().copied()));
+    format!(
+        "▸ Tools · {}",
+        tool_tally_label(tally, tool_group_elapsed(&calls, now), "")
+    )
 }
 
 /// Get occupied group time on a shared active clock, falling back to a shared wall clock.
@@ -364,6 +349,41 @@ fn tool_group_elapsed(
     Some(elapsed)
 }
 
+/// Collect every exchange whose running labels an entry displays, including child agents.
+fn timing_exchanges<'source>(entry: &'source TimelineEntry, result: &mut Vec<&'source Exchange>) {
+    match entry {
+        TimelineEntry::Exchange {
+            exchange,
+            agent_by_id,
+            ..
+        } => {
+            result.push(exchange);
+            for agent in agent_by_id.values() {
+                timing_exchanges(agent, result);
+            }
+        }
+        TimelineEntry::AgentLifecycle {
+            exchange, agent, ..
+        } => {
+            result.extend(exchange);
+            for agent in agent {
+                timing_exchanges(agent, result);
+            }
+        }
+        TimelineEntry::ObservedAgent {
+            agent, children, ..
+        } => {
+            if agent.availability() == crate::agent::ObservedAgentAvailability::Available {
+                result.extend(agent.exchanges());
+            }
+            for child in children {
+                timing_exchanges(child, result);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn timing_blocks(
     entry: &TimelineEntry,
     width: &WidthProfile,
@@ -373,39 +393,6 @@ pub(super) fn timing_blocks(
     tools: &HashMap<super::identity::DisplayId, ToolOutputView>,
     display: &crate::buffer::identity::DisplayRegistry,
 ) -> Result<Vec<BufferBlock>> {
-    fn exchanges<'source>(entry: &'source TimelineEntry, result: &mut Vec<&'source Exchange>) {
-        match entry {
-            TimelineEntry::Exchange {
-                exchange,
-                agent_by_id,
-                ..
-            } => {
-                result.push(exchange);
-                for agent in agent_by_id.values() {
-                    exchanges(agent, result);
-                }
-            }
-            TimelineEntry::AgentLifecycle {
-                exchange, agent, ..
-            } => {
-                result.extend(exchange);
-                for agent in agent {
-                    exchanges(agent, result);
-                }
-            }
-            TimelineEntry::ObservedAgent {
-                agent, children, ..
-            } => {
-                if agent.availability() == crate::agent::ObservedAgentAvailability::Available {
-                    result.extend(agent.exchanges());
-                }
-                for child in children {
-                    exchanges(child, result);
-                }
-            }
-            _ => {}
-        }
-    }
     if matches!(entry, TimelineEntry::Status { .. }) {
         return Ok(Vec::new());
     }
@@ -413,7 +400,7 @@ pub(super) fn timing_blocks(
         return Ok(Vec::new());
     }
     let mut source = Vec::new();
-    exchanges(entry, &mut source);
+    timing_exchanges(entry, &mut source);
     let mut blocks = Vec::new();
     for exchange in source {
         if exchange.is_finished() || exchange.state() != ExchangeState::Running {
@@ -481,15 +468,11 @@ pub(super) fn timing_blocks(
                                 .max(1);
                             blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
                                 previous,
-                                crate::buffer::transcript::ToolHeading {
-                                    kind: &tool.kind,
-                                    elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
-                                    failed: tool.failed,
-                                    denied: tool.state() == crate::turn::ToolState::Denied,
-                                    title: &tool.title,
-                                    expanded: false,
-                                    shell: tool.command_shell.as_deref(),
-                                },
+                                crate::buffer::transcript::ToolHeading::of(
+                                    tool,
+                                    exchange.tool_instant(now_ms),
+                                    false,
+                                ),
                             )?);
                         }
                     } else {
@@ -533,15 +516,11 @@ pub(super) fn timing_blocks(
                     .max(1);
                 blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
                     previous,
-                    crate::buffer::transcript::ToolHeading {
-                        kind: &tool.kind,
-                        elapsed_ms: tool.elapsed_ms(exchange.tool_instant(now_ms)),
-                        failed: tool.failed,
-                        denied: tool.state() == crate::turn::ToolState::Denied,
-                        title: &tool.title,
-                        expanded: expanded.get(&format!("{call_id}:tool")) == Some(&true),
-                        shell: tool.command_shell.as_deref(),
-                    },
+                    crate::buffer::transcript::ToolHeading::of(
+                        tool,
+                        exchange.tool_instant(now_ms),
+                        expanded.get(&format!("{call_id}:tool")) == Some(&true),
+                    ),
                 )?);
             }
             let Some(previous) = document.block(&BlockId(id.into())) else {
@@ -576,6 +555,70 @@ pub(super) fn timing_blocks(
         }
     }
     Ok(blocks)
+}
+
+/// Record when a running label that `timing_blocks` refreshes next shows a new value.
+///
+/// It reads the same clocks the refreshed labels format: the exchange heading's elapsed and
+/// tool time, each running tool heading, and each tool group with a running call.
+pub(super) fn timing_label_due(
+    entry: &TimelineEntry,
+    now_ms: i64,
+    tools: &HashMap<super::identity::DisplayId, ToolOutputView>,
+    display: &crate::buffer::identity::DisplayRegistry,
+    due: &mut super::duration::LabelDue,
+) {
+    let mut source = Vec::new();
+    timing_exchanges(entry, &mut source);
+    for exchange in source {
+        if exchange.is_finished() || exchange.state() != ExchangeState::Running {
+            continue;
+        }
+        let instant = exchange.tool_instant(now_ms);
+        let mut tool_running = false;
+        let mut groups: BTreeMap<&str, Vec<&crate::turn::ToolCall>> = BTreeMap::new();
+        for turn in &exchange.turn {
+            for tool in exchange.tools_for_turn(turn.id()) {
+                if tool.state() == crate::turn::ToolState::Running {
+                    tool_running = true;
+                    if let Some(elapsed) = tool.elapsed_ms(instant) {
+                        due.elapsed(now_ms, elapsed);
+                    }
+                }
+                let Some(call_id) = display.tool(
+                    &entry.id(),
+                    &crate::turn::ToolAddress {
+                        turn: turn.provider().clone(),
+                        item_id: forge_provider_api::ItemId::new(tool.id.clone())
+                            .expect("retained tool has a validated item identity"),
+                    },
+                ) else {
+                    continue;
+                };
+                if let Some(output) = tools.get(&call_id)
+                    && !output.group.is_empty()
+                {
+                    groups.entry(&output.group).or_default().push(tool);
+                }
+            }
+        }
+        for calls in groups.values() {
+            if calls
+                .iter()
+                .any(|tool| tool.state() == crate::turn::ToolState::Running)
+                && let Some(elapsed) = tool_group_elapsed(calls, instant)
+            {
+                due.elapsed(now_ms, elapsed);
+            }
+        }
+        if exchange.execution_started_at_ms().is_some() {
+            let elapsed = exchange.elapsed(now_ms);
+            due.elapsed(now_ms, elapsed);
+            if tool_running && let Some(tool_ms) = exchange.metrics.tool_ms(elapsed) {
+                due.elapsed(now_ms, tool_ms);
+            }
+        }
+    }
 }
 
 pub(super) fn message_block(
@@ -1228,14 +1271,13 @@ impl TimelineRenderer<'_> {
             delegations.len(),
             wall_ms / 1000
         )];
-        let successful_tools = finished
+        let tally = finished
             .iter()
-            .map(|delegated| delegated.exchange.tool_counter.completed)
-            .sum();
-        let total_tools = finished
-            .iter()
-            .map(|delegated| delegated.exchange.tool_counter.total)
-            .sum();
+            .fold(ToolTally::default(), |tally, delegated| ToolTally {
+                successful: tally.successful + delegated.exchange.tool_counter.completed,
+                denied: tally.denied + delegated.exchange.tool_counter.denied,
+                total: tally.total + delegated.exchange.tool_counter.total,
+            });
         let tool_ms = finished
             .iter()
             .map(|delegated| {
@@ -1245,7 +1287,7 @@ impl TimelineRenderer<'_> {
                     .tool_ms(delegated.exchange.elapsed(self.now_ms))
             })
             .sum::<Option<u64>>();
-        if let Some(tools) = tool_count_label(successful_tools, total_tools, tool_ms) {
+        if let Some(tools) = tool_count_label(tally, tool_ms) {
             sections.push(tools);
         }
         let mut usage = first.exchange.usage();
@@ -1571,6 +1613,17 @@ impl TimelineRenderer<'_> {
             drop(margin);
             self.offset_layout(start, indent / 2);
             continuation = remaining;
+        }
+        for (index, record) in interaction.tool_timeout.iter().enumerate() {
+            self.literal(
+                &format!("{}:tool-timeout:{index}", interaction.id),
+                &format!(
+                    "Stopped: `{}` exceeded its {} tool timeout.",
+                    record.title,
+                    record.timeout_label()
+                ),
+                None,
+            )?;
         }
         for turn in &interaction.turn {
             for (index, error) in turn.errors().iter().enumerate() {
@@ -2000,6 +2053,7 @@ impl TimelineRenderer<'_> {
             Some(self.begin_section(2))
         };
         self.tool_group(&thought.tools, interaction)?;
+        self.approval_timeouts(&thought.tools, interaction)?;
         if let Some(first) = thought.writes.call.first() {
             let calls = thought.writes.call.iter().collect::<Vec<_>>();
             self.file_change_group(first.id, &calls, interaction)?;
@@ -2014,6 +2068,74 @@ impl TimelineRenderer<'_> {
             } else {
                 NodeLifecycle::Settled
             };
+        }
+        Ok(())
+    }
+
+    /// Record each approval that expired for a call in this group directly beneath the group.
+    ///
+    /// The expiry belongs with the request that asked for it. A continuation turn, when one
+    /// follows, opens later with the same notice; when the turn completed normally there is no
+    /// continuation, and this row is the transcript's only record of the expiry.
+    fn approval_timeouts(
+        &mut self,
+        group: &crate::exchange::ThoughtGroup<'_>,
+        exchange: &Exchange,
+    ) -> Result<()> {
+        for call in &group.call {
+            for event in &exchange.approval_resolution {
+                let crate::provider::PermissionApprovalEvent::Resolved(resolution) = event else {
+                    continue;
+                };
+                let crate::provider::ApprovalScope::Item {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                } = &resolution.scope
+                else {
+                    continue;
+                };
+                if thread_id != &call.turn.provider().thread_id
+                    || turn_id != &call.turn.provider().turn_id
+                    || item_id.as_str() != call.tool.id
+                    || !resolution.targets.iter().any(|target| {
+                        matches!(
+                            target.decision,
+                            crate::provider::PermissionDecision::TimedOut
+                        )
+                    })
+                {
+                    continue;
+                }
+                let identity = format!("{}:approval-timeout", resolution.request_id.as_str());
+                let mut detail = format!(
+                    "Request
+  {}
+
+Action",
+                    call.tool.title
+                );
+                if let Some(execution) = super::tool_outcome::execution(exchange, call) {
+                    detail.push_str(&crate::provider::approval_timeout::execution_display(
+                        execution,
+                    )?);
+                }
+                detail.push_str(
+                    "
+
+",
+                );
+                detail.push_str(crate::provider::approval_timeout::TIMEOUT_OUTCOME);
+                // An event row with a body folds closed on its own, as task notices do.
+                self.literal(
+                    &identity,
+                    &format!(
+                        "◇ An approval timed out
+{detail}"
+                    ),
+                    None,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2908,10 +3030,15 @@ impl TimelineRenderer<'_> {
             .iter()
             .filter(|call| call.tool.state() == ToolState::Running)
             .count();
+        // A change refused by a permission decision never ran, so it is denied, not unsuccessful.
+        let denied = calls
+            .iter()
+            .filter(|call| call.tool.state() == ToolState::Denied)
+            .count();
         let unsuccessful = calls
             .iter()
             .filter(|call| {
-                call.tool.state() != ToolState::Running
+                !matches!(call.tool.state(), ToolState::Running | ToolState::Denied)
                     && (call.tool.failed || call.tool.state() != ToolState::Completed)
             })
             .count();
@@ -2926,6 +3053,9 @@ impl TimelineRenderer<'_> {
         );
         if running > 0 {
             label.push_str(&format!(" · {running} running"));
+        }
+        if denied > 0 {
+            label.push_str(&format!(" · {denied} denied"));
         }
         if unsuccessful > 0 {
             label.push_str(&format!(" · {unsuccessful} unsuccessful"));
@@ -3049,9 +3179,10 @@ impl TimelineRenderer<'_> {
             scope,
         );
         let call_id = display;
-        let rejection = super::tool_outcome::rejection(exchange, call);
+        let outcome = super::tool_outcome::outcome_line(exchange, call);
+        let timed_out = super::tool_outcome::timed_out(exchange, call).is_some();
         let mut output = if tool.state() == crate::turn::ToolState::Denied {
-            ToolOutputView::new(call_id, rejection.as_deref().unwrap_or("Permission denied"))
+            ToolOutputView::new(call_id, outcome.as_deref().unwrap_or("Permission denied"))
         } else if let Some((root, object)) = exchange.output_store.as_ref().zip(
             exchange
                 .archived_output
@@ -3070,24 +3201,20 @@ impl TimelineRenderer<'_> {
         output.group = group.to_owned();
         let id = format!("{call_id}:tool");
         let target = TargetId(id.clone());
-        let label = tool.title.clone();
         let width = self.content_width();
         let renderer = TranscriptRenderer::new(&width)?;
         let choice = self.expansion.get(&format!("{call_id}:tool")).copied();
         let expanded = !group.is_empty() && choice == Some(true);
-        let block = renderer.tool_header(
-            BlockId(id),
-            target.clone(),
-            crate::buffer::transcript::ToolHeading {
-                shell: tool.command_shell.as_deref(),
-                kind: &tool.kind,
-                elapsed_ms: tool.elapsed_ms(exchange.tool_instant(self.now_ms)),
-                failed: tool.failed,
-                denied: tool.state() == crate::turn::ToolState::Denied,
-                title: &label,
-                expanded,
-            },
-        )?;
+        let mut heading = crate::buffer::transcript::ToolHeading::of(
+            tool,
+            exchange.tool_instant(self.now_ms),
+            expanded,
+        );
+        // The provider reports a call its deadline stopped as interrupted; Harness knows it failed.
+        if timed_out {
+            heading.state = crate::turn::ToolState::Failed;
+        }
+        let block = renderer.tool_header(BlockId(id), target.clone(), heading)?;
         self.action
             .insert(target, TranscriptAction::Tool { call_id });
         self.push(block)?;
@@ -3112,6 +3239,13 @@ impl TimelineRenderer<'_> {
                     .insert(target.id.clone(), TranscriptAction::Tool { call_id });
             }
             self.push(hidden)?;
+            // A denial already shows its reason as the body; any other unsuccessful end keeps
+            // its output and states how the call ended beneath it.
+            if tool.state() != crate::turn::ToolState::Denied
+                && let Some(outcome) = &outcome
+            {
+                self.literal(&format!("{call_id}:outcome"), outcome, None)?;
+            }
         } else {
             for suffix in ["preview", "hidden"] {
                 self.push(BufferBlock {
@@ -3648,30 +3782,55 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
 /// The Thought heading, the Agents summary, and running-agent status rows share this label so a
 /// child's tool progress reads the same wherever it appears.
 pub(super) fn exchange_tool_label(interaction: &Exchange, now_ms: i64) -> Option<String> {
+    // The heading measures the same occupied intervals its Tools groups show, so the two agree.
+    let calls = interaction
+        .tools()
+        .map(|(_, tool)| tool)
+        .collect::<Vec<_>>();
     tool_count_label(
-        interaction.tool_counter.completed,
-        interaction.tool_counter.total,
-        interaction.metrics.tool_ms(interaction.elapsed(now_ms)),
+        ToolTally::from(interaction.tool_counter.clone()),
+        tool_group_elapsed(&calls, interaction.tool_instant(now_ms)),
     )
 }
 
-/// Format `successful/total tools`, followed by the tool duration when one is known.
-pub(super) fn tool_count_label(
-    successful: usize,
-    total: usize,
-    tool_ms: Option<u64>,
-) -> Option<String> {
-    if total == 0 {
-        return None;
+/// Count a set of tool calls the way every tool summary reports them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ToolTally {
+    pub(super) successful: usize,
+    pub(super) denied: usize,
+    pub(super) total: usize,
+}
+
+impl From<crate::exchange::ToolCounter> for ToolTally {
+    fn from(counter: crate::exchange::ToolCounter) -> Self {
+        Self {
+            successful: counter.completed,
+            denied: counter.denied,
+            total: counter.total,
+        }
     }
-    let duration = tool_ms
-        .map(|duration| {
-            let label = super::duration::duration_label(duration);
-            let value = label.trim_end_matches(|character: char| character.is_ascii_alphabetic());
-            format!(" · {value} {}", &label[value.len()..])
-        })
-        .unwrap_or_default();
-    Some(format!("{successful}/{total} tools{duration}"))
+}
+
+/// Format `successful/total tools`, the denied count when any, and the tool duration when known.
+///
+/// Durations use the same formatter as the Tools group label, so a heading and its group never
+/// disagree on units or spacing.
+pub(super) fn tool_count_label(tally: ToolTally, tool_ms: Option<u64>) -> Option<String> {
+    (tally.total > 0).then(|| tool_tally_label(tally, tool_ms, " tools"))
+}
+
+/// The one formatter behind every tool summary: `successful/total{noun}`, then the denied
+/// count when any, then the occupied duration when known. The Thought heading and its Tools
+/// group differ only in `noun`, so their counts and durations cannot drift apart.
+fn tool_tally_label(tally: ToolTally, tool_ms: Option<u64>, noun: &str) -> String {
+    let mut label = format!("{}/{}{noun}", tally.successful, tally.total);
+    if tally.denied > 0 {
+        label.push_str(&format!(" · ({} denied)", tally.denied));
+    }
+    if let Some(duration) = tool_ms {
+        label.push_str(&format!(" · {}", super::duration::duration_label(duration)));
+    }
+    label
 }
 
 /// Format token expenditure as `input (N% cached) -> output`, omitting unavailable counts.
@@ -4082,6 +4241,247 @@ pub(crate) mod tests {
         assert!(!calls[0].failed);
     }
 
+    /// Explain each stopped call on its own row, and count a denial the same way in the Thought
+    /// heading and its Tools group.
+    ///
+    /// A call the user cancelled used to show only an interrupted marker with no line saying the
+    /// turn stopped, and a call interrupted before it finished had no line at all. The heading
+    /// counted denials as unsuccessful calls while the group named them, so the two disagreed.
+    #[test]
+    fn stopped_and_denied_calls_explain_themselves_and_agree_in_every_summary() -> anyhow::Result<()>
+    {
+        use crate::provider::ToolStatus;
+        use forge_provider_api::ItemStart;
+
+        let outcomes = [
+            ToolStatus::Succeeded,
+            ToolStatus::Denied,
+            ToolStatus::Interrupted,
+            ToolStatus::Cancelled,
+        ];
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"stopped-calls", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Inspect", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        for (index, status) in outcomes.iter().enumerate() {
+            let start = ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: "command".into(),
+                title: format!("Run {index}"),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            });
+            let updates =
+                crate::turn::test_support::tool_updates(&start, *status, None, Default::default());
+            crate::turn::test_support::tool(
+                &mut exchange,
+                &address,
+                &index.to_string(),
+                start,
+                updates,
+                1,
+            )?;
+        }
+        exchange
+            .approval_resolution
+            .push(crate::provider::PermissionApprovalEvent::Cancelled(
+                crate::provider::PermissionApprovalCancellation {
+                    request_id: crate::provider::ApprovalRequestId::new("cancelled")?,
+                    scope: crate::provider::ApprovalScope::Item {
+                        thread_id: address.thread_id.clone(),
+                        turn_id: address.turn_id.clone(),
+                        item_id: forge_provider_api::ItemId::new("3")?,
+                    },
+                    reason: crate::provider::ApprovalCancellationReason::UserCancelled,
+                    cancelled_at_ms: 1,
+                },
+            ));
+        exchange.rebuild_tool_counter();
+        let project = |expansion: &HashMap<String, bool>| {
+            super::project(
+                super::ProjectionSource::Exchange(&exchange),
+                &WidthProfile::default(),
+                2,
+                false,
+                expansion,
+                &HashMap::new(),
+                &mut crate::buffer::identity::DisplayRegistry::default(),
+            )
+        };
+        let folded = project(&HashMap::new())?;
+        let expansion = folded
+            .entry
+            .block
+            .iter()
+            .filter_map(|block| block.metadata.node.as_ref())
+            .map(|node| (node.id.0.clone(), true))
+            .collect::<HashMap<_, _>>();
+        let rows = project(&expansion)?
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for line in [
+            "Interrupted before it finished.",
+            "Cancelled by you; the turn stopped.",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.contains(line)),
+                "missing {line:?}: {rows:#?}"
+            );
+        }
+        let heading = super::exchange_tool_label(&exchange, 2).expect("tools are counted");
+        assert!(heading.starts_with("1/4 tools · (1 denied)"), "{heading}");
+        let group = rows
+            .iter()
+            .find(|row| row.contains("Tools ·"))
+            .expect("the group has a heading");
+        assert!(group.contains("Tools · 1/4 · (1 denied)"), "{group}");
+        Ok(())
+    }
+
+    /// A file change that policy refused counts as denied in its Edits group, not unsuccessful.
+    ///
+    /// A refused change never ran, and the Edits group used to count it with failed changes, so a
+    /// Harness policy denial read as an edit that had broken.
+    #[test]
+    fn denied_file_change_counts_as_denied_in_its_edits_group() -> anyhow::Result<()> {
+        use crate::provider::ToolStatus;
+        use forge_provider_api::ItemStart;
+
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"denied-change", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Edit", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let start = ItemStart::FileChange(forge_provider_api::ToolDescriptor {
+            semantics: Default::default(),
+            name: "apply_patch".into(),
+            title: "Edit notes.txt".into(),
+            arguments: forge_provider_api::InspectableArguments::new(json!({})),
+        });
+        let updates = crate::turn::test_support::tool_updates(
+            &start,
+            ToolStatus::Denied,
+            None,
+            Default::default(),
+        );
+        crate::turn::test_support::tool(&mut exchange, &address, "change", start, updates, 1)?;
+        exchange.rebuild_tool_counter();
+        let rows = project_rows(&crate::timeline::TimelineEntry::Exchange {
+            id: "denied-change".into(),
+            created_at_ms: 0,
+            exchange: Box::new(exchange),
+            agent_by_id: HashMap::new(),
+        })?;
+        let edits = rows
+            .iter()
+            .find(|row| row.contains("Edits ·"))
+            .unwrap_or_else(|| panic!("no Edits group: {rows:#?}"));
+        assert!(edits.contains("1 denied"), "{edits}");
+        assert!(!edits.contains("unsuccessful"), "{edits}");
+        Ok(())
+    }
+
+    /// Mark each tool row by its own outcome, so a stopped call never reads as a success.
+    #[test]
+    fn tool_rows_mark_each_terminal_outcome() -> anyhow::Result<()> {
+        use crate::provider::ToolStatus;
+        use forge_buffer::node::NodeKind;
+        use forge_provider_api::ItemStart;
+
+        let outcomes = [
+            (ToolStatus::Succeeded, "ForgeHarnessToolSuccess"),
+            (ToolStatus::Failed, "ForgeHarnessToolFailure"),
+            (ToolStatus::Denied, "ForgeHarnessToolDenied"),
+            (ToolStatus::Cancelled, "ForgeHarnessToolInterrupted"),
+            (ToolStatus::Interrupted, "ForgeHarnessToolInterrupted"),
+            // The provider reports a call its tool deadline stopped as interrupted; the host's
+            // timeout record marks it failed.
+            (ToolStatus::Interrupted, "ForgeHarnessToolFailure"),
+        ];
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"tool-outcomes", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Inspect", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        for (index, (status, _)) in outcomes.iter().enumerate() {
+            let start = ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: "command".into(),
+                title: format!("Run {index}"),
+                arguments: forge_provider_api::InspectableArguments::new(json!({})),
+            });
+            let updates =
+                crate::turn::test_support::tool_updates(&start, *status, None, Default::default());
+            crate::turn::test_support::tool(
+                &mut exchange,
+                &address,
+                &index.to_string(),
+                start,
+                updates,
+                1,
+            )?;
+        }
+        exchange
+            .tool_timeout
+            .push(crate::provider::tool_timeout::ToolTimeoutRecord {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                item_id: forge_provider_api::ItemId::new((outcomes.len() - 1).to_string())?,
+                title: format!("Run {}", outcomes.len() - 1),
+                timeout_ms: 600_000,
+            });
+        let projected = super::project(
+            super::ProjectionSource::Exchange(&exchange),
+            &WidthProfile::default(),
+            2,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
+        )?;
+        let markers = projected
+            .entry
+            .block
+            .iter()
+            .filter(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == NodeKind::Tool)
+            })
+            .map(|block| {
+                block
+                    .metadata
+                    .decoration
+                    .iter()
+                    .find(|decoration| decoration.capture.starts_with("ForgeHarnessTool"))
+                    .map(|decoration| decoration.capture.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            outcomes
+                .iter()
+                .map(|(_, capture)| Some(*capture))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
     /// Freeze completed intervals and measure live overlap on the approval-paused clock.
     #[test]
     fn tool_group_duration_uses_active_clock_for_live_and_completed_calls() {
@@ -4149,7 +4549,10 @@ pub(crate) mod tests {
         };
         assert_eq!(super::tool_group_label(&calls, now), "▸ Tools · 1/2 · 3s",);
         calls[1].started_at_ms = None;
-        assert_eq!(super::tool_group_label(&calls, now), "▸ Tools · 1/2 · 0.1s",);
+        assert_eq!(
+            super::tool_group_label(&calls, now),
+            "▸ Tools · 1/2 · 100ms",
+        );
     }
 
     /// Announcing a tool cannot erase elapsed execution from the rest of its group.
@@ -4472,6 +4875,68 @@ pub(crate) mod tests {
         }
     }
 
+    /// Keep a call's throughput when its end arrives as an endpoint no call identity claims.
+    ///
+    /// Copilot reports a model call's tokens and duration under the call's identity, then ends
+    /// the call with an event that carries neither. Counting that endpoint as a second call
+    /// without timing erased the first call's duration, so the heading lost its rate.
+    #[test]
+    fn throughput_survives_a_call_end_without_call_identity() -> anyhow::Result<()> {
+        use forge_provider_api::{ModelCallId, TurnUsageReport, UsageReportId};
+        let mut exchange = crate::storage::test::running_exchange("throughput");
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let usage = |report| {
+            crate::provider::test_support::native_event(
+                crate::provider::EventScope::Invocation {
+                    invocation: address.scope.clone(),
+                },
+                forge_provider_api::ProviderEvent::Turn {
+                    thread_id: address.thread_id.clone(),
+                    turn_id: address.turn_id.clone(),
+                    event: forge_provider_api::TurnEvent::Usage(report),
+                },
+            )
+        };
+        let heading = |exchange: &Exchange| -> anyhow::Result<String> {
+            Ok(project_rows(&TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange: exchange.clone().into(),
+                agent_by_id: HashMap::new(),
+            })?
+            .join("\n"))
+        };
+        exchange.observe_event(
+            &usage(TurnUsageReport::call(
+                UsageReportId::new("call-1")?,
+                Some(ModelCallId::new("call-1")?),
+                1_000,
+                Some(forge_provider_api::usage::TokenUsage {
+                    output: Some(6),
+                    ..Default::default()
+                }),
+                Some(2_000),
+            )?),
+            1_000,
+        )?;
+        let reported = heading(&exchange)?;
+        assert!(reported.contains("· 3 tps"), "{reported}");
+        exchange.observe_event(
+            &usage(TurnUsageReport::interval(
+                UsageReportId::new("copilot:call-end:event")?,
+                None,
+                1_060,
+                None,
+                Some(1_060),
+            )?),
+            1_060,
+        )?;
+        let ended = heading(&exchange)?;
+        assert!(ended.contains("· 3 tps"), "{ended}");
+        Ok(())
+    }
+
     /// A native user item echoing a Forge submission must not repeat the admitted prompt row.
     #[test]
     fn native_echo_of_a_submission_renders_one_prompt_row() -> anyhow::Result<()> {
@@ -4669,6 +5134,41 @@ pub(crate) mod tests {
             .flat_map(|block| block.text.wire_rows())
             .map(str::to_owned)
             .collect())
+    }
+
+    /// Project one timeline entry with every fold open, as a reader who expanded each row sees it.
+    pub(crate) fn project_rows_expanded(entry: &TimelineEntry) -> anyhow::Result<Vec<String>> {
+        let mut expansion = HashMap::new();
+        loop {
+            let projected = super::project_at_with_separator(
+                super::ProjectionSource::Entry(entry),
+                &WidthProfile::default(),
+                6_000,
+                false,
+                &expansion,
+                &HashMap::new(),
+                &mut crate::buffer::identity::DisplayRegistry::default(),
+            )?;
+            let opened = expansion.len();
+            for node in projected
+                .entry
+                .block
+                .iter()
+                .filter_map(|block| block.metadata.node.as_ref())
+            {
+                expansion.insert(node.id.0.clone(), true);
+            }
+            // Opening a fold can reveal folds nested inside it, so stop once nothing new appears.
+            if expansion.len() == opened {
+                return Ok(projected
+                    .entry
+                    .block
+                    .iter()
+                    .flat_map(|block| block.text.wire_rows())
+                    .map(str::to_owned)
+                    .collect());
+            }
+        }
     }
 
     /// Build a delegated child record for agent presentation fixtures.

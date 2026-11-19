@@ -120,14 +120,25 @@ fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
             _ => {}
         }
     }
-    let Some(boundary) = pending.values().copied().min() else {
-        return Ok(None);
-    };
     let primary_events = history
         .iter()
         .filter(|event| event.agent_id.is_none())
         .map(|event| (event.id.as_str(), event))
         .collect::<HashMap<_, _>>();
+    // Copilot never records a completion for a call its abort interrupted, yet the abort closes
+    // that call's turn and the session continues after it. Such a call is settled history; only a
+    // call that no aborted turn closed can form the incomplete suffix of a lost process.
+    pending.retain(|_, index| {
+        let declaration = history[*index].id.as_str();
+        !history.iter().skip(*index + 1).any(|event| {
+            event.agent_id.is_none()
+                && event.parsed_type() == SessionEventType::AssistantTurnEnd
+                && interrupted_turn(&primary_events, event, declaration)
+        })
+    });
+    let Some(boundary) = pending.values().copied().min() else {
+        return Ok(None);
+    };
     for event in history
         .iter()
         .skip(boundary + 1)
@@ -242,6 +253,118 @@ mod tests {
             json!({"toolCallId":"pending","success":false}),
         ));
         assert_eq!(incomplete_suffix(&history)?, None);
+        Ok(())
+    }
+
+    /// Build a persisted event with its native parent, as Copilot chains each record.
+    fn child(id: &str, parent: &str, kind: &str, data: serde_json::Value) -> SessionEvent {
+        serde_json::from_value(json!({
+            "id":id,"parentId":parent,"type":kind,"timestamp":"2026-10-30T00:00:00Z","data":data
+        }))
+        .unwrap()
+    }
+
+    /// Append one turn whose external shell call was interrupted: Copilot records the abort and
+    /// closes the turn but never writes a completion for the call.
+    fn interrupted_shell_turn(history: &mut Vec<SessionEvent>, turn: &str, parent: &str) {
+        let id = |name: &str| format!("{turn}-{name}");
+        history.extend([
+            child(&id("user"), parent, "user.message", json!({"content":turn})),
+            child(
+                &id("start"),
+                &id("user"),
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                &id("request"),
+                &id("start"),
+                "assistant.message",
+                json!({"messageId":id("request"),"content":"","toolRequests":[{"name":"powershell","toolCallId":id("call")}]}),
+            ),
+            child(
+                &id("tool"),
+                &id("request"),
+                "tool.execution_start",
+                json!({"toolCallId":id("call"),"toolName":"powershell"}),
+            ),
+            child(
+                &id("external"),
+                &id("tool"),
+                "external_tool.requested",
+                json!({"requestId":id("external")}),
+            ),
+            child(
+                &id("abort"),
+                &id("external"),
+                "abort",
+                json!({"reason":"user_initiated"}),
+            ),
+            child(
+                &id("released"),
+                &id("abort"),
+                "external_tool.completed",
+                json!({"requestId":id("external")}),
+            ),
+            child(
+                &id("end"),
+                &id("released"),
+                "assistant.turn_end",
+                json!({"turnId":"0"}),
+            ),
+        ]);
+    }
+
+    /// A call that an abort closed earlier is settled history, not an incomplete suffix.
+    #[test]
+    fn interrupted_calls_before_later_turns_need_no_repair() -> Result<()> {
+        let mut history = Vec::new();
+        interrupted_shell_turn(&mut history, "first", "root");
+        interrupted_shell_turn(&mut history, "second", "first-end");
+        history.extend([
+            child(
+                "later-user",
+                "second-end",
+                "user.message",
+                json!({"content":"later"}),
+            ),
+            child(
+                "later-start",
+                "later-user",
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "later-answer",
+                "later-start",
+                "assistant.message",
+                json!({"messageId":"later-answer","content":"done"}),
+            ),
+            child(
+                "later-end",
+                "later-answer",
+                "assistant.turn_end",
+                json!({"turnId":"0"}),
+            ),
+        ]);
+        assert_eq!(incomplete_suffix(&history)?, None);
+        // A trailing call that no abort closed is still repaired, at its own declaration.
+        history.extend([
+            child("tail-user", "later-end", "user.message", json!({"content":"tail"})),
+            child(
+                "tail-start",
+                "tail-user",
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "tail-request",
+                "tail-start",
+                "assistant.message",
+                json!({"messageId":"tail-request","content":"","toolRequests":[{"name":"powershell","toolCallId":"tail-call"}]}),
+            ),
+        ]);
+        assert_eq!(incomplete_suffix(&history)?, Some("tail-request".into()));
         Ok(())
     }
 

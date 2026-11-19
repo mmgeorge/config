@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -270,9 +270,13 @@ pub(crate) struct CatalogSnapshot {
 }
 
 /// Owns Forge preference persistence separately from provider configuration files.
+///
+/// The connection opens history as its main database and attaches settings as `preferences`,
+/// so the session layer and application snapshots it writes beside portable settings commit in
+/// one transaction that locks history before settings. The connection also retains the state
+/// version lease.
 pub struct SettingsStore {
-    connection: Connection,
-    _state: crate::storage::database::HistoryConnection,
+    connection: crate::storage::database::HistoryConnection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -282,6 +286,12 @@ pub(crate) struct SettingsMutation {
     pub(crate) revision: u64,
     /// Lists changed field names without recording preference values in the timeline.
     pub(crate) field: Vec<String>,
+}
+
+/// Carry a configuration's recovery intent and how long its settings half may retry contention.
+pub(crate) struct IntentCommit<'intent> {
+    pub(crate) intent: &'intent crate::storage::configuration::ConfigurationIntent,
+    pub(crate) retry_until: Option<std::time::Instant>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -299,54 +309,28 @@ impl SettingsStore {
     /// Read persistent settings without creating or repairing their schema.
     pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
         crate::storage::layout::prepare(data_root)?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "read-only canonical settings boundary"
-        )]
-        let connection = Connection::open_with_flags(
-            data_root.join("settings.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        crate::storage::preferences::validate(&connection)?;
-        Self::attach_state(
-            connection,
-            crate::storage::database::HistoryConnection::read_only(data_root)?,
+        Self::with_layer_view(crate::storage::database::HistoryConnection::read_only(
             data_root,
-        )
+        )?)
     }
 
-    /// Open persistent settings and attach their disposable application state.
+    /// Open persistent settings writable beside their disposable application state.
     pub fn open(data_root: &Path) -> Result<Self> {
-        Self::attach_state(
-            crate::storage::preferences::open(data_root)?,
-            crate::storage::database::HistoryConnection::open(data_root)?,
-            data_root,
+        Self::with_layer_view(
+            crate::storage::database::HistoryConnection::open_settings_writer(data_root)?,
         )
     }
 
-    /// Keep session application snapshots under the current state lease.
-    fn attach_state(
-        connection: Connection,
-        state: crate::storage::database::HistoryConnection,
-        data_root: &Path,
-    ) -> Result<Self> {
-        connection.execute(
-            "ATTACH DATABASE ?1 AS runtime",
-            [crate::storage::state::database(data_root)
-                .to_string_lossy()
-                .as_ref()],
-        )?;
-        connection.execute_batch("CREATE TEMP VIEW setting_layer AS SELECT * FROM persistent_setting_layer UNION ALL SELECT * FROM runtime.session_setting_layer;
+    /// Present persistent and session layers as one table for reads and writes.
+    fn with_layer_view(connection: crate::storage::database::HistoryConnection) -> Result<Self> {
+        connection.execute_batch("CREATE TEMP VIEW setting_layer AS SELECT * FROM preferences.persistent_setting_layer UNION ALL SELECT * FROM main.session_setting_layer;
             CREATE TEMP TRIGGER setting_layer_insert INSTEAD OF INSERT ON setting_layer BEGIN
             INSERT INTO persistent_setting_layer SELECT NEW.scope,NEW.identity,NEW.payload WHERE NEW.scope <> 'session'
                 ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload;
             INSERT INTO session_setting_layer SELECT NEW.scope,NEW.identity,NEW.payload WHERE NEW.scope = 'session'
                 ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload;
             END;")?;
-        Ok(Self {
-            connection,
-            _state: state,
-        })
+        Ok(Self { connection })
     }
 
     /// Register the physical dotfiles root without importing native preference state.
@@ -566,27 +550,40 @@ impl SettingsStore {
     }
 
     /// Commit the host's recovery intent before writing settings without holding either database lock across the other writer.
+    ///
+    /// Only a command that applies an external settings revision passes `expected_revision`;
+    /// every other configuration merges its explicit fields at the current revision.
     pub(crate) fn commit_configuration<T>(
         &mut self,
-        expected_revision: u64,
+        expected_revision: Option<u64>,
         target: SettingTarget<'_>,
         portable: Option<&PortableSettings>,
         provider: Option<(&str, &Value)>,
-        intent: Option<&crate::storage::configuration::ConfigurationIntent>,
+        intent: Option<IntentCommit<'_>>,
         apply: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let revision = u64::try_from(self.connection.query_row(
-            "SELECT revision FROM setting_revision WHERE id=1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?)?;
-        ensure!(
-            revision == expected_revision,
-            "settings revision conflict: expected {expected_revision}, current {revision}"
-        );
+        if let Some(expected_revision) = expected_revision {
+            let revision = u64::try_from(self.connection.query_row(
+                "SELECT revision FROM setting_revision WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)?;
+            ensure!(
+                revision == expected_revision,
+                "settings revision conflict: expected {expected_revision}, current {revision}"
+            );
+        }
         let value = apply()?;
-        if let Some(intent) = intent {
-            self.recover_configuration(intent)?;
+        if let Some(IntentCommit {
+            intent,
+            retry_until,
+        }) = intent
+        {
+            // The host half has committed, and replaying an intent is idempotent, so contention
+            // retries without risking a second application.
+            crate::storage::database::retry_while_busy(retry_until, || {
+                self.recover_configuration(intent)
+            })?;
         } else {
             let transaction = self
                 .connection
@@ -1189,7 +1186,7 @@ impl SettingsStore {
         let payload = self
             .connection
             .query_row(
-                "SELECT payload FROM runtime.setting_application WHERE session_id=?1",
+                "SELECT payload FROM main.setting_application WHERE session_id=?1",
                 [session],
                 |row| row.get::<_, String>(0),
             )
@@ -1253,7 +1250,7 @@ impl SettingsStore {
     }
 
     fn save_application(&self, session: &str, application: &SettingsApplication) -> Result<()> {
-        self.connection.execute("INSERT INTO runtime.setting_application VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",
+        self.connection.execute("INSERT INTO main.setting_application VALUES (?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload",
             params![session,SettingsRecord::encode(application)?])?;
         Ok(())
     }
@@ -1273,7 +1270,7 @@ mod test {
             ..Default::default()
         };
         let result = store.commit_configuration(
-            expected,
+            Some(expected),
             SettingTarget {
                 scope: SettingScope::Session,
                 workspace: "workspace",
@@ -1355,6 +1352,56 @@ mod test {
                 .contains("unsupported")
         );
         assert_eq!(store.layer("global", "")?.as_deref(), Some(obsolete));
+        Ok(())
+    }
+
+    /// A history write transaction must never take the settings write lock: every history
+    /// handle attaches settings read-only, so SQLite opens only a read transaction there.
+    #[test]
+    fn history_connections_attach_settings_read_only() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        drop(SettingsStore::open(fixture.path())?);
+        let history = crate::storage::database::HistoryConnection::open(fixture.path())?;
+        let error = history
+            .execute(
+                "INSERT INTO preferences.host_preference VALUES ('probe','1')",
+                [],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ReadOnly),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// Settings writes that span both databases lock history before settings, the same order
+    /// every history transaction uses, because SQLite locks attached databases in index order.
+    #[test]
+    fn settings_writes_lock_history_before_settings() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let store = SettingsStore::open(fixture.path())?;
+        let database_list = store
+            .connection
+            .prepare("SELECT seq, name, file FROM pragma_database_list ORDER BY seq")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let history = database_list
+            .iter()
+            .find(|(_, _, file)| file.ends_with("harness.sqlite3"))
+            .expect("settings store attaches history");
+        let settings = database_list
+            .iter()
+            .find(|(_, _, file)| file.ends_with("settings.db"))
+            .expect("settings store opens settings");
+        assert!(history.0 < settings.0, "{database_list:?}");
         Ok(())
     }
 

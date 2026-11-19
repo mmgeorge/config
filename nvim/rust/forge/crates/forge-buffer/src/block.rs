@@ -162,6 +162,10 @@ pub struct StatusPresentation {
     pub row: usize,
     pub animated: bool,
     pub hint: Option<StatusHint>,
+    /// The finished exchange's queued successor is about to start, so the editor treats the
+    /// settlement as a hand-off rather than the end of the session's work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handoff: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

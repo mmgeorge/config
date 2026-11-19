@@ -227,6 +227,8 @@ pub(crate) struct StreamEventFrame {
 pub(crate) enum StreamEvent {
     MessageStart {
         message_id: String,
+        /// Prompt usage the API reports once it accepts the request.
+        usage: Option<Usage>,
     },
     ContentBlockStart {
         index: u64,
@@ -279,6 +281,11 @@ impl<'de> Deserialize<'de> for StreamEvent {
                     .and_then(Value::as_str)
                     .ok_or_else(|| D::Error::custom("message_start has no message id"))?
                     .to_owned(),
+                usage: value
+                    .pointer("/message/usage")
+                    .map(|usage| serde_json::from_value(usage.clone()))
+                    .transpose()
+                    .map_err(D::Error::custom)?,
             },
             "content_block_start" => Self::ContentBlockStart {
                 index: index()?,

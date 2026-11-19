@@ -617,7 +617,7 @@ Apply an input or queue lifecycle operation.
 
 Accepts [InputOperation](runtime-schemas.md#inputoperation): nonempty `id`, integer `control_revision` defaulting to zero, optional string `after_control`, and a required tagged [InputAction](runtime-schemas.md#inputaction). The seven action variants are `submit`, `retry`, `resume`, `reserve`, `status::commit`, `release`, and `remove`. Their exact fields and nested message/edit types are in the linked declarations.
 
-`submit` accepts user-purpose input only. It requires a new nonempty message identity and nonblank text unless model configuration is present. `intent` is `auto` or `queue`. Client configuration can select only `model`, `effort`, `service_tier`, and `context_window`. Harness alone generates task-entry and task-continuation purposes. `reserve` captures a message revision for editing, `status::commit` validates every edit before changing the queue, and `release` drops that reservation. `remove` and `retry` require the captured editable revision. `resume` requires the current control revision.
+`submit` accepts user-purpose input only. It requires a new nonempty message identity and nonblank text unless model configuration is present. `intent` is `auto` or `queue`. Client configuration can select only `model`, `effort`, `service_tier`, and `context_window`. Harness alone generates task-entry and task-continuation purposes. `reserve` captures a message revision for editing, `status::commit` validates every edit before changing the queue, and `release` drops that reservation from every message it holds, or with `id` from that message alone. `remove` and `retry` require the captured editable revision. A `retry` also resumes a paused queue, because it asks to send the message now. `resume` requires the current control revision.
 
 A clarification uses the same `submit` operation with a top-level `target`.
 For independent questions, supply `{ "owner": "question", "question_id": "...", "revision": 1 }`.
@@ -973,7 +973,7 @@ Read a saved session preview.
 
 ### Contract
 
-Requires parameter `session_id` (string) identifying the saved session to preview. This target is distinct from the required calling-session envelope. Returns [SessionPreview](runtime-schemas.md#sessionpreview): rendered `lines`, saved `session`, and child-agent state. Its skipped native exchange/timeline collections are not serialized. Missing saved sessions fail. Reading the preview does not acquire the target's lease, select it, resume it, or invoke a provider. It emits no progress.
+Requires parameter `session_id` (string) identifying the saved session to preview. This target is distinct from the required calling-session envelope. Returns [SessionPreview](runtime-schemas.md#sessionpreview): rendered `lines`, saved `session`, and child-agent state. Its skipped native exchange/timeline collections are not serialized. Missing saved sessions fail. Reading the preview does not acquire the target's lease, select it, resume it, or invoke a provider. It emits no progress. `lines` hold the final 200 rows of the session's last 20 timeline entries, so they always end at the session's latest row. The editor shows the end of `lines`, resting the final row on the last row its session picker leaves uncovered.
 
 ## `session.prompt.history.record`
 
@@ -1221,7 +1221,7 @@ Open an explicitly identified saved session.
 
 ### Contract
 
-Requires the saved target `session_id` in parameters and explicit outer context for routing. Returns [BrokerSnapshot](runtime-schemas.md#brokersnapshot) from the target controller, resolving it from durable storage when necessary. It does not issue a provider prompt or change unrelated controllers. Unknown sessions, conflicting ownership/leases, and incompatible runtime configuration fail. The caller adopts the returned identity/epoch only if it still owns the original UI request.
+Requires the saved target `session_id` in parameters and explicit outer context for routing. Returns [BrokerSnapshot](runtime-schemas.md#brokersnapshot) from the target controller, resolving it from durable storage when necessary. It does not issue a provider prompt or change unrelated controllers. Unknown sessions, conflicting ownership/leases, and incompatible runtime configuration fail. A session saved under another provider is such a configuration, because one host serves one provider; the editor's session picker therefore opens that session by replacing the host through its provider switch instead of sending this request. The caller adopts the returned identity/epoch only if it still owns the original UI request.
 
 ## `session.state.get`
 
@@ -1285,7 +1285,7 @@ Cancel the selected session's current execution.
 
 ### Contract
 
-Accepts optional root `target` and `restore_prompt_if_no_output` (boolean, default false). It validates root control ownership, quiesces managed children, cancels root approvals, and collects provider cleanup before acknowledging cancellation. Returns `{ "cancel_requested": true }` for an active provider turn, or the settled broker cancellation result when already idle. Prompt restoration only applies when the turn can be retracted before output. Cleanup failure remains an error and prevents pretending the provider stopped. Pausing the selected task/input queue is a separate state action used by the UI before cancellation.
+Accepts optional root `target` and `restore_prompt_if_no_output` (boolean, default false). It validates root control ownership, quiesces managed children, cancels root approvals, and collects provider cleanup before acknowledging cancellation. Returns `{ "cancel_requested": true }` for an active provider turn, or the settled broker cancellation result when already idle. Prompt restoration only applies when the turn can be retracted before output. Cleanup failure remains an error and prevents pretending the provider stopped. A cancel that stops foreground work or pauses an unfinished task also pauses queued input; one that finds neither leaves the queue running, so an interrupt sent while the status still read `Working` cannot strand queued messages. Pausing the selected task/input queue is a separate state action used by the UI before cancellation.
 
 The retired `session.turn.restart` method is unsupported. Configuration commands
 own any required collection and replacement dispatch through the session FIFO.

@@ -13,7 +13,7 @@ local picker = require("forge.views.picker")
 
 local function valid_window(win) return win and vim.api.nvim_win_is_valid(win) end
 
-local function apply_snapshot(state, result, open_mode)
+local function apply_snapshot(state, result, open_mode, insert)
   -- `state` issued the request, so it is the activation's source even when the user has selected
   -- another tab meanwhile; focus follows only when it is still selected.
   session_navigation.activate(result, {
@@ -22,6 +22,7 @@ local function apply_snapshot(state, result, open_mode)
     interaction_mode = "reconcile",
     open_mode = open_mode,
     focus = session.harness == state,
+    insert = insert,
   })
 end
 
@@ -95,7 +96,7 @@ local function finish_start(state, result, start_error, error_detail, callback)
   end
   state.start_failure = nil
   if startup then startup.mark("snapshot.apply.begin") end
-  apply_snapshot(state, result, callback and callback.open_mode)
+  apply_snapshot(state, result, callback and callback.open_mode, callback and callback.insert)
   if startup then startup.mark("snapshot.apply.end") end
   if callback and callback.on_ready then callback.on_ready(result) end
 end
@@ -136,7 +137,7 @@ function M.session_has_pending_work(state)
   return activity.busy(state) or state.switching_provider == true
     or (state.status and state.status.kind == "finalizing") == true
     or #(state.queue or {}) > 0 or #(state.pending_steer or {}) > 0
-    or #(state.pending_submit or {}) > 0
+    or #(state.pending_submit or {}) > 0 or #(state.pending_handoff or {}) > 0
 end
 
 ---Switching provider stops the one host that serves every Harness tab, so it waits until no
@@ -157,38 +158,51 @@ end
 ---@class ForgeHarnessProviderDestination
 ---@field kind "new"|"resume"
 ---@field session_id? string
+---@field persist_default? boolean Save `provider` as the default provider once the switch succeeds.
+---  Defaults to true, for an explicit provider choice. A caller that only follows a chosen
+---  session to its provider passes false, so resuming a session never changes the default.
 
+---Replace the host with one that serves `provider`, then open `destination` in the current view.
 ---@param provider string
 ---@param destination ForgeHarnessProviderDestination
+---@return boolean started False when no switch started: a refused switch has reported its reason,
+---  and a provider that already serves the view needs none. A caller dismisses its own picker
+---  only for a started switch.
 function M.switch_provider(provider, destination)
   local state = session.harness
   local provider_config = client.provider_map()[provider]
   if not provider_config or provider_config.selectable == false then
     notifications.error("Unknown Harness provider: " .. tostring(provider), "Harness provider")
-    return
+    return false
   end
   if not M.provider_switch_available() then
     notifications.warn("Finish or cancel pending work before switching providers", "Harness provider")
-    return
+    return false
   end
   if not destination or (destination.kind ~= "new" and destination.kind ~= "resume")
     or (destination.kind == "resume" and not destination.session_id) then
     notifications.error("Select a new chat or a session to resume", "Harness provider")
-    return
+    return false
   end
   local previous_provider = state.session.provider
   local previous_session_id = state.session.id
   local previous_mode = state.session.approval_mode
   local previous_access = vim.deepcopy(state.session.access)
-  if provider == previous_provider then return end
+  if provider == previous_provider then return false end
   local initialize_options = destination.kind == "new" and { new_session_name = "" }
     or { session_id = destination.session_id }
   state.switching_provider = true
   client.host_stop(nil, function()
     config.options.harness.provider = provider
+    -- The pickers that chose this switch have returned focus to the composer by now. Replacing the
+    -- session swaps its buffers or focuses the chosen session's own tab, either of which leaves
+    -- Insert mode, so the activation restores the mode the composer had when the switch began.
+    local composer_insert = state.composer_win ~= nil and vim.api.nvim_get_current_win() == state.composer_win
+      and vim.fn.mode(1):sub(1, 1) == "i"
     client.session_initialize(function(result, start_error, error_detail)
       finish_start(state, result, start_error, error_detail, {
         open_mode = "current",
+        insert = composer_insert,
         on_ready = function()
           state.switching_provider = false
           -- The reply can arrive after the user selected another tab, so the configuration and
@@ -199,9 +213,11 @@ function M.switch_provider(provider, destination)
             end
             controller.render()
           end)
-          provider_preference.save(provider, function(saved, save_error)
-            if not saved then notifications.error(save_error or "Failed to save provider preference", "Harness provider") end
-          end)
+          if destination.persist_default ~= false then
+            provider_preference.save(provider, function(saved, save_error)
+              if not saved then notifications.error(save_error or "Failed to save provider preference", "Harness provider") end
+            end)
+          end
         end,
         on_error = function(switch_error)
           notifications.error("Failed to switch Harness provider: " .. switch_error, "Harness provider")
@@ -216,6 +232,7 @@ function M.switch_provider(provider, destination)
       })
     end, initialize_options)
   end)
+  return true
 end
 
 ---@param name? string

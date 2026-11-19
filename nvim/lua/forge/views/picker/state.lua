@@ -8,6 +8,8 @@ local picker_filter = require("forge.views.picker.filter")
 ---@field owner? string Identity used to isolate resumed state.
 ---@field page_list ForgePickerPage[] Pages in display order.
 ---@field page_navigation? "tabs" Optional horizontal category navigation.
+---@field page_hint? string Footer name for what the page keys switch between; defaults to `category`.
+---@field command_footer? boolean Derive the footer from the effective bindings without page navigation.
 ---@field wrap_pages? boolean Wrap category navigation at the first and last pages.
 ---@field hint_mode? "help" Show only the help shortcut instead of inline command hints.
 ---@field size_ratio? number Fixed fraction of host width and height, including borders; centers the popup.
@@ -17,6 +19,7 @@ local picker_filter = require("forge.views.picker.filter")
 ---@field on_field_submit? fun(context: ForgePickerSelectionContext, value: string|number, complete: fun(error?: string)) Save an edited field and report completion.
 ---@field resume_state? ForgePickerResumeState Detached state captured before departure.
 ---@field initial_page? integer Explicit initial page, overriding a resumed page.
+---@field input_settle_ms? integer Discard typed keys while the keyboard has been active within this interval, for a picker that takes focus by itself.
 ---@field [string] any Existing host, callback, sizing, and input options.
 
 --- Caller-owned page and its existing content and interaction options.
@@ -28,6 +31,7 @@ local picker_filter = require("forge.views.picker.filter")
 ---@field field_description_height? integer Reserve this many rows for focused-field help, clipping overflow with an ellipsis.
 ---@field toggle_on_confirm? boolean Also toggle boolean fields with the confirm command.
 ---@field confirm_description? string Explain the page's confirmation behavior in shared key help.
+---@field confirm_label? string Footer name for what confirming a row does.
 ---@field [string] any Existing field, search, and input options.
 
 --- Detached view state for re-entry into the same logical picker.

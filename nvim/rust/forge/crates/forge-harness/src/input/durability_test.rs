@@ -448,6 +448,10 @@ fn removing_uncertain_input_discards_its_record_without_replay() -> Result<()> {
 /// Classify every crash cut without ever replaying uncertain or accepted provider input.
 #[test]
 fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
+    // One store serves every cut under its own session, because creating and syncing a fresh
+    // set of databases per cut made the test's duration follow disk load rather than its logic.
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
     for boundary in [
         DispatchCut::NoSubmission,
         DispatchCut::Prepared,
@@ -455,9 +459,8 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
         DispatchCut::Accepted,
         DispatchCut::Cancelled,
     ] {
-        let root = tempfile::tempdir()?;
-        let submissions = submission_store(root.path())?;
-        let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+        let session = format!("session-{boundary:?}");
+        let queue = SessionInputQueue::open(root.path(), &session, &submissions)?;
         queue.apply(queued_operation("message"))?;
         queue
             .claim("message", 1, InputRoute::Turn)?
@@ -466,7 +469,7 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
             let request = crate::provider::ProviderRequest {
                 dispatch: forge_provider_api::submission::DispatchTracker::default(),
                 execution_owner: None,
-                harness_session_id: "session".into(),
+                harness_session_id: session.clone(),
                 workspace: "workspace".into(),
                 input: crate::provider::ProviderInput::from_user_text("draft message"),
                 mode: crate::provider::PromptMode::Chat,
@@ -506,7 +509,7 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
             )?;
         }
         drop(queue);
-        let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+        let queue = SessionInputQueue::open(root.path(), &session, &submissions)?;
         let restored = queue.snapshot()?;
         assert_eq!(
             restored.suspended,

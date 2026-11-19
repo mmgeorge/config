@@ -43,7 +43,14 @@ impl ExchangeDriver {
                 let Some(ActiveCommand::Input(run)) = command.take() else {
                     unreachable!("input evidence belongs to the active input command")
                 };
-                self.finish_input(run, prepared, command_messages.as_ref(), env.context(step));
+                self.finish_input(
+                    run,
+                    prepared,
+                    broker,
+                    command_messages.as_ref(),
+                    env.context(step),
+                )
+                .await;
             }
             CommandEvent::Configuration => {
                 let Some(ActiveCommand::Configuration(queued)) = command.take() else {
@@ -56,7 +63,12 @@ impl ExchangeDriver {
                     self.commands
                         .lose_observation(&mut queued, trace, session_id, step);
                 } else {
-                    match crate::exchange::configuration::apply_configuration(&queued, services) {
+                    let applied = crate::exchange::configuration::apply_configuration(
+                        &queued,
+                        services,
+                        &mut *broker.lock().await,
+                    );
+                    match applied {
                         Ok(outcome) => self.commands.finish(
                             queued,
                             Ok(CommandOutcome::Configured(outcome)),
@@ -72,6 +84,24 @@ impl ExchangeDriver {
                             self.commands.finish(
                                 queued,
                                 Err(CommandFailure::ConfigurationRejected(reason)),
+                                trace,
+                                session_id,
+                                step,
+                            );
+                        }
+                        Err(
+                            crate::exchange::configuration::ConfigurationCommitError::Settings(
+                                error,
+                            ),
+                        ) if crate::storage::database::storage_busy(&error) => {
+                            // Contention rolled the settings write back, so nothing is unknown.
+                            trace.record(session_id, "exchange.configuration.commit_failed", serde_json::json!({
+                                    "command_id":queued.record.request.id.as_str(),"update_step":step,
+                                    "storage_cause":crate::storage::database::storage_cause(&error),
+                                }));
+                            self.commands.finish(
+                                queued,
+                                Err(CommandFailure::StorageBusy),
                                 trace,
                                 session_id,
                                 step,
@@ -209,7 +239,7 @@ impl ExchangeDriver {
                     }
                     Err(error) => {
                         trace.record(session_id, "exchange.command.effect_failed", serde_json::json!({
-                                "command_id":id.as_str(),"code":error.code(),"reason":error.diagnostic(),"update_step":step,
+                                "command_id":id.as_str(),"code":error.code(),"storage_cause":error.storage_cause(),"reason":error.diagnostic(),"update_step":step,
                             }));
                         let (queued, recovery) = run.into_recovery();
                         self.execution_stop_begin(services);
@@ -480,7 +510,7 @@ impl ExchangeDriver {
                             .finish(queued, Err(failure), trace, session_id, step);
                     }
                     Err(error) => {
-                        trace.record(session_id, "exchange.command.effect_failed", serde_json::json!({"command_id":id.as_str(),"code":error.code(),"reason":error.diagnostic(),"update_step":step}));
+                        trace.record(session_id, "exchange.command.effect_failed", serde_json::json!({"command_id":id.as_str(),"code":error.code(),"storage_cause":error.storage_cause(),"reason":error.diagnostic(),"update_step":step}));
                         let checkpoint = run.checkpoint().cloned();
                         let preparation_overdue =
                             run.preparing() && matches!(&error, OperationFailure::JobDeadline);
@@ -593,7 +623,7 @@ impl ExchangeDriver {
                             initial: None,
                             completion: ForegroundCompletion::Caller(completion),
                             updates: Some(replacement.updates),
-                            execution: Some(replacement.execution),
+                            execution: replacement.execution,
                         });
                         *command = Some(ActiveCommand::NativeCommand(run));
                     }
@@ -604,7 +634,7 @@ impl ExchangeDriver {
                     }
                     Err(error) => {
                         trace.record(session_id, "exchange.configuration.effect_failed", serde_json::json!({
-                                "command_id":id.as_str(),"code":error.code(),"reason":error.diagnostic(),"update_step":step,
+                                "command_id":id.as_str(),"code":error.code(),"storage_cause":error.storage_cause(),"reason":error.diagnostic(),"update_step":step,
                             }));
                         if let OperationFailure::Validation(error) = error {
                             if error

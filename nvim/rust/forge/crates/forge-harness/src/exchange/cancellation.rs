@@ -36,6 +36,33 @@ pub struct CancellationBlockers {
     pub recovery_jobs: bool,
 }
 
+impl CancellationBlockers {
+    /// Get whether any blocker is work that a cancellation stops or waits for.
+    ///
+    /// Queued and active publications are excluded: they deliver output already committed, and an
+    /// idle owner flushes them whether or not anyone cancels.
+    pub(crate) fn owns_work(&self) -> bool {
+        let Self {
+            foreground,
+            running_jobs,
+            staged_effects,
+            queued_publications: _,
+            publication_active: _,
+            checks_running,
+            children,
+            input_delivery,
+            recovery_jobs,
+        } = self;
+        *foreground
+            || *running_jobs > 0
+            || !staged_effects.is_empty()
+            || *checks_running
+            || *children > 0
+            || *input_delivery
+            || *recovery_jobs
+    }
+}
+
 /// Keep operation progress separate from the immutable response to each cancel command.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CancellationProgress {

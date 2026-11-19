@@ -427,15 +427,7 @@ impl ExchangeDriver {
                             .observer
                             .input_readiness()
                             .map_err(InputOfferError::Queue)?;
-                        if ready.checks_running
-                            && !matches!(
-                                message.purpose,
-                                crate::input::InputPurpose::CheckResult { .. }
-                            )
-                            || ready.has_approval
-                            || message.intent == crate::input::InputIntent::Queue
-                                && ready.has_elicitation
-                        {
+                        if !ready.turn_offer_gates().admit(message) {
                             return Ok(None);
                         }
                         Ok(Some(message.clone()))
@@ -683,7 +675,7 @@ impl ExchangeDriver {
                             root: services.root.clone(),
                         },
                         updates: None,
-                        execution: Some(execution),
+                        execution,
                     }),
                     Err(error) => {
                         let _ = reply.send(Err(error));
@@ -752,6 +744,20 @@ impl ExchangeDriver {
                 self.pending_approval_timeout = Some(schedule_revision);
             }
             OwnerEvent::RecoverObservation { inbox, reply } => {
+                // A failed owner never reopens execution, so a recovery would restart the
+                // provider for nothing and leave the caller waiting on it; report the cause.
+                if self.execution_state == ExecutionState::Failed {
+                    let reason = self
+                        .failure_reason
+                        .clone()
+                        .expect("failed execution retains its cause");
+                    let _ = reply.send(Err(
+                        crate::exchange::provider_lifecycle::ProviderLifecycleFailure::SessionUnavailable(
+                            reason,
+                        ),
+                    ));
+                    return;
+                }
                 self.observation_recovery.request(
                     inbox,
                     &services.observer.session_events(),

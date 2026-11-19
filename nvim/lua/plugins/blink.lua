@@ -236,7 +236,9 @@ return {
           auto_show = false,
         },
         ghost_text = {
-          enabled = true,
+          -- Hide ghost text for items whose inserted text does not begin with the typed text,
+          -- which blink.cmp would render with the typed prefix duplicated.
+          enabled = function() return require("forge.views.harness.completion.ghost_text").enabled() end,
           show_with_menu = true
         },
         menu = {

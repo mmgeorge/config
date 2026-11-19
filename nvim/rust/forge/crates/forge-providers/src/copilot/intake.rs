@@ -515,6 +515,43 @@ mod tests {
         Ok(())
     }
 
+    /// The retraction request owns its truncation result, so the echoed notification is silent.
+    #[tokio::test]
+    async fn history_truncation_echo_is_not_reported_as_unsupported() -> anyhow::Result<()> {
+        let (context, mut stream) = context("rewind").await;
+        {
+            let mut context = context.lock().await;
+            let TurnContext {
+                decoder,
+                output,
+                sink,
+            } = &mut *context;
+            decoder
+                .decode(
+                    &event(
+                        "rewind",
+                        "session.snapshot_rewind",
+                        json!({"upToEventId":"input","eventsRemoved":2,"eventIds":["input","answer"]}),
+                    ),
+                    output,
+                    sink,
+                )
+                .await?;
+        }
+        while let Some(envelope) = stream.try_next()? {
+            assert!(
+                !matches!(
+                    envelope.event,
+                    forge_provider_api::ProviderEvent::Provider {
+                        event: forge_provider_api::ProviderConnectionEvent::Warning(_)
+                    }
+                ),
+                "the adapter's own history truncation produced a warning"
+            );
+        }
+        Ok(())
+    }
+
     /// Create a session reader whose producer remains owned until explicit close.
     async fn fixture() -> (SessionIntake, mpsc::Sender<SessionEvent>) {
         let (read, _read_peer) = tokio::io::duplex(4096);

@@ -4,7 +4,7 @@ use crate::buffer::{
     projection::SavedCheckpoint,
 };
 use forge_buffer::{
-    block::{BlockAnchor, BufferBlock, TextPosition},
+    block::{BlockAnchor, BufferBlock, ContentLayout, TextPosition},
     identity::{BlockId, FoldId},
     node::{NodeDisplay, NodeKind, NodeState},
 };
@@ -21,6 +21,9 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+
+/// Content column of a block that carries no layout: the reserved marker column alone.
+const UNNESTED_INDENT: usize = 2;
 
 pub(super) struct TimelineDiffStore {
     pub view: DiffViewState,
@@ -653,10 +656,27 @@ fn replace_tree(
         block: boundary.id.clone(),
         position: TextPosition { row: 0, column: 0 },
     };
-    block.splice(
-        start + 1..=end,
-        replacement.iter().cloned().chain(std::iter::once(boundary)),
-    );
+    // Saved diff rows are rendered without transcript nesting, and the section offsets of the
+    // rows they replace are gone with those rows. Without this shift an expanded diff under a
+    // nested heading starts left of that heading.
+    let nesting = block[start]
+        .metadata
+        .layout
+        .as_ref()
+        .map_or(UNNESTED_INDENT, |layout| layout.indent);
+    let nested = replacement.iter().cloned().map(|mut block| {
+        block
+            .metadata
+            .layout
+            .get_or_insert(ContentLayout {
+                indent: UNNESTED_INDENT,
+                marker: None,
+                source_indent: 0,
+            })
+            .indent += nesting;
+        block
+    });
+    block.splice(start + 1..=end, nested.chain(std::iter::once(boundary)));
     let replacement_end = start + replacement.len() + 1;
     for (index, block) in block.iter_mut().enumerate() {
         if index > start && index <= replacement_end {
@@ -687,4 +707,82 @@ async fn worker<Value: Send + 'static>(
     let result = receiver.await.context("timeline projection worker ended");
     ticket.completed().await;
     result?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_buffer::block::{BlockMetadata, FoldRange};
+    use forge_buffer::text::BufferText;
+
+    /// Build one block whose content column is `indent`, or unset when absent.
+    fn laid_out_block(id: &str, row: &str, indent: Option<usize>) -> Result<BufferBlock> {
+        Ok(BufferBlock {
+            id: BlockId(id.into()),
+            text: BufferText::from_rows([row])?,
+            metadata: BlockMetadata {
+                layout: indent.map(|indent| ContentLayout {
+                    indent,
+                    marker: None,
+                    source_indent: 0,
+                }),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Saved diff rows carry no transcript nesting, so the splice places them one level under
+    /// the heading they replace the body of, wherever that heading sits.
+    #[test]
+    fn replacement_rows_nest_under_their_heading() -> Result<()> {
+        let mut heading = laid_out_block("changes", "▸ Changed 1 file +1 -0", Some(4))?;
+        heading.metadata.fold.push(FoldRange {
+            collapsed_suffix: None,
+            heading_start: None,
+            id: FoldId("changes".into()),
+            start: TextPosition { row: 0, column: 0 },
+            end: BlockAnchor {
+                block: BlockId("changes:body".into()),
+                position: TextPosition { row: 1, column: 0 },
+            },
+            closed: false,
+            collapse_children: false,
+            expand_children: false,
+            heading_marker: false,
+        });
+        let mut block = vec![
+            heading,
+            laid_out_block("changes:body", "Created notes/wave.txt +1 -0", Some(6))?,
+            laid_out_block("following", "● Next row", Some(2))?,
+        ];
+        let replacement = [
+            laid_out_block(
+                "changes:shared:file:0",
+                "Created notes/wave.txt +1 -0",
+                None,
+            )?,
+            laid_out_block("changes:shared:file:0:source", "wave", Some(4))?,
+        ];
+        replace_tree(&mut block, &TargetId("changes".into()), &replacement)?;
+        let indent = block
+            .iter()
+            .map(|block| {
+                (
+                    block.id.0.as_str(),
+                    block.metadata.layout.as_ref().map(|layout| layout.indent),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indent,
+            [
+                ("changes", Some(4)),
+                ("changes:shared:file:0", Some(6)),
+                ("changes:shared:file:0:source", Some(8)),
+                ("changes:shared:boundary", None),
+                ("following", Some(2)),
+            ]
+        );
+        Ok(())
+    }
 }

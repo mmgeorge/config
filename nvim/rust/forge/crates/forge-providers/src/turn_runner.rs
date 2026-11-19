@@ -152,6 +152,34 @@ impl RetainedTurn {
     }
 }
 
+/// Classify a turn's settlement for the interrupt that waited on it.
+///
+/// An interrupt succeeds when the turn left no native work running. A turn that completed, ended
+/// as cancelled, or was cancelled before dispatch meets that: a pre-dispatch cancellation wrote
+/// nothing to the provider, so no native turn exists to stop. The host retires a prepared
+/// submission before it interrupts the turn, so the journal refuses the adapter's own rejection
+/// record and the turn settles as `PreparationCleanup`; that refusal leaves the binding unchanged
+/// and is not an interrupt failure. Every other settlement stays the interrupt's error.
+pub(crate) fn interrupt_outcome<Settled>(
+    settlement: Result<Settled, ProviderError>,
+) -> Result<(), ProviderError> {
+    match settlement {
+        Ok(_) => Ok(()),
+        Err(error) if left_no_native_work(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Identify a settlement whose turn stopped cleanly or never reached the provider.
+fn left_no_native_work(error: &ProviderError) -> bool {
+    match error {
+        ProviderError::PreparationCleanup { cause, cleanup } => {
+            cause.is_clean_cancellation() && !invalidates_binding(cleanup)
+        }
+        error => error.is_clean_cancellation(),
+    }
+}
+
 /// Preserve explicit invalidation while leaving ordinary pre-start operation errors local.
 fn invalidates_binding(error: &ProviderError) -> bool {
     match error {
@@ -352,5 +380,63 @@ mod tests {
             }
         ));
         assert!(stream.recv().await.is_err());
+    }
+
+    /// An interrupt reports a turn collected when it stopped cleanly or never reached the provider.
+    ///
+    /// A cancellation before dispatch settles as a preparation failure, and as a preparation
+    /// cleanup failure once the host has retired the journal entry that the adapter then tries
+    /// to reject. Neither left native work behind. A cleanup failure that invalidates the
+    /// binding, a preparation that failed for another reason, and a native failure all remain
+    /// interrupt failures.
+    #[test]
+    fn interrupt_outcome_accepts_only_turns_that_left_no_native_work() {
+        let journal_refusal: ProviderError = ProviderFailure::new(
+            ProviderOperation::TurnStart,
+            ProviderFailureKind::Persistence,
+        )
+        .at_phase(ProviderPhase::Persistence, FailureDisposition::Unchanged)
+        .into();
+        let invalidation: ProviderError =
+            ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Transport)
+                .at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated)
+                .into();
+        let cancelled_before_dispatch =
+            || ProviderError::PreparationFailed(Box::new(ProviderError::Cancelled));
+        let collected = [
+            ProviderError::Cancelled,
+            cancelled_before_dispatch(),
+            ProviderError::PreparationCleanup {
+                cause: Box::new(ProviderError::Cancelled),
+                cleanup: Box::new(journal_refusal.clone()),
+            },
+        ];
+        for settlement in collected {
+            assert!(
+                interrupt_outcome::<()>(Err(settlement.clone())).is_ok(),
+                "{settlement:?} left native work to stop"
+            );
+        }
+        assert!(interrupt_outcome(Ok(())).is_ok());
+
+        let uncollected = [
+            ProviderError::PreparationCleanup {
+                cause: Box::new(ProviderError::Cancelled),
+                cleanup: Box::new(invalidation.clone()),
+            },
+            ProviderError::PreparationFailed(Box::new(journal_refusal.clone())),
+            ProviderError::PreparationCleanup {
+                cause: Box::new(journal_refusal),
+                cleanup: Box::new(ProviderError::Cancelled),
+            },
+            ProviderError::NotConsumed,
+            invalidation,
+        ];
+        for settlement in uncollected {
+            assert!(
+                interrupt_outcome::<()>(Err(settlement.clone())).is_err(),
+                "{settlement:?} was reported collected"
+            );
+        }
     }
 }

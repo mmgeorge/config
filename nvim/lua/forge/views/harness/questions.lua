@@ -202,6 +202,7 @@ build_spec = function(state, host)
   if #pages == 0 then pages = { { id = "empty", title = "Questions", content_list = { { text = "No questions need answers.", group = "ForgePickerHint" } }, option_list = {} } } end
   return { owner = "questions", title = "Questions", host = host, page_list = pages,
     page_navigation = "tabs", wrap_pages = true, hint_mode = "help", preserve_input = true,
+    input_settle_ms = picker.focus_taking_settle_ms,
     keymaps = { page_next = { "<Tab>", "<Right>", "]" }, page_previous = { "<S-Tab>", "<Left>", "[" }, feedback = "<C-f>" },
     resume_state = state.question_picker_resume,
     read_input_draft = function(id, kind) return ((state.question_drafts or {})[id] or {})[kind] or "" end,

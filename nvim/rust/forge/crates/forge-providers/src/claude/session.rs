@@ -8,7 +8,7 @@
 
 use super::tool_targets::{self, HOST_TOOL_SERVER, ToolKind};
 use super::transport::{FrameHandler, TransportFailure};
-use super::wire::content::{ContentBlock, ToolResultBlock, ToolUseBlock, UserContent};
+use super::wire::content::{ContentBlock, ToolResultBlock, ToolUseBlock, Usage, UserContent};
 use super::wire::control::{CanUseTool, InboundControl, InboundControlRequest, PermissionDecision};
 use super::wire::stdout::{
     AssistantFrame, CommandLifecycleFrame, CommandState, ResultFrame, StdoutFrame, StreamDelta,
@@ -23,6 +23,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
+
+/// Whether the client had asked the CLI to stop the turn when a tool's result arrived.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnProgress {
+    Running,
+    Interrupting,
+}
 
 /// The native end of one Forge turn.
 #[derive(Clone, Debug)]
@@ -101,6 +108,33 @@ struct TurnDecoder {
     checkpoint: Option<String>,
     model_resolved: bool,
     last_result: Option<ResultFrame>,
+    /// Latest usage of each API message in the current CLI turn, in arrival order.
+    ///
+    /// A result the client aborted mid-stream reports zero usage although its messages already
+    /// consumed their prompts; these figures stand in for it. Each result clears them, so the
+    /// next CLI turn of a steered Forge turn starts empty.
+    message_usage: Vec<MessageUsage>,
+}
+
+/// One API message's latest usage report and whether its output count is final.
+///
+/// Input counts are fixed when the message starts. The output count is final only in the
+/// message's `message_delta` or in an assistant frame carrying a `stop_reason`; the CLI copies
+/// the `message_start` count into the assistant frames of a message still streaming, so an
+/// earlier count is the few tokens generated before the stream began, not an estimate.
+struct MessageUsage {
+    message_id: String,
+    usage: Usage,
+    output_final: bool,
+}
+
+/// How far a usage report's output count can be trusted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputCount {
+    /// The count as of a frame sent while the message still streamed.
+    Provisional,
+    /// The message's completed output count.
+    Final,
 }
 
 /// A journaled steering input written to the CLI that has not yet joined processing.
@@ -536,13 +570,14 @@ impl ClaudeSessionState {
         let mut events = Vec::new();
         {
             let mut decoder = self.decoder.lock().await;
-            if completed {
-                events.extend(classify_pending(
-                    &mut decoder,
-                    &active.address,
-                    Some(AgentMessageRole::Response),
-                ));
-            }
+            // The end of the turn settles every pending role, whatever the outcome. Harness
+            // hides an interrupted response and keeps other prose, so a reply left unclassified
+            // at an interruption would stay in the transcript as no other provider's does.
+            events.extend(classify_pending(
+                &mut decoder,
+                &active.address,
+                Some(AgentMessageRole::Response),
+            ));
             for message in std::mem::take(&mut decoder.messages) {
                 let completion = MessageCompletion {
                     text: message.text,
@@ -602,14 +637,26 @@ impl ClaudeSessionState {
     }
 
     /// Record context usage for the finished turn and publish it on the thread.
+    ///
+    /// The query runs after `finish` retired the turn, so the retained turn names the thread
+    /// when no successor is active.
     pub(crate) async fn publish_context_usage(
         &self,
         usage: context::ContextUsage,
     ) -> Result<(), ProviderError> {
         self.output.lock().await.metrics.context_usage = Some(usage.clone());
-        let thread_id = match self.active.read().await.as_ref() {
-            Some(active) => active.address.thread_id.clone(),
-            None => return Ok(()),
+        let active = self
+            .active
+            .read()
+            .await
+            .as_ref()
+            .map(|active| active.address.thread_id.clone());
+        let thread_id = match active {
+            Some(thread_id) => thread_id,
+            None => match self.retained.read().await.as_ref() {
+                Some(retained) => retained.address.thread_id.clone(),
+                None => return Ok(()),
+            },
         };
         self.publish(AdapterActivity::Thread {
             thread_id,
@@ -955,7 +1002,15 @@ impl ClaudeSessionState {
         let events = {
             let mut decoder = self.decoder.lock().await;
             match event {
-                StreamEvent::MessageStart { message_id } => {
+                StreamEvent::MessageStart { message_id, usage } => {
+                    if let Some(usage) = &usage {
+                        record_message_usage(
+                            &mut decoder,
+                            &message_id,
+                            usage,
+                            OutputCount::Provisional,
+                        );
+                    }
                     decoder.current_api_message = Some(message_id);
                     Vec::new()
                 }
@@ -979,7 +1034,12 @@ impl ClaudeSessionState {
                         StreamDelta::Other => Vec::new(),
                     }
                 }
-                StreamEvent::MessageDelta { stop_reason, .. } => {
+                StreamEvent::MessageDelta { stop_reason, usage } => {
+                    if let (Some(message), Some(usage)) =
+                        (decoder.current_api_message.clone(), &usage)
+                    {
+                        record_message_usage(&mut decoder, &message, usage, OutputCount::Final);
+                    }
                     // Text in an API message that stopped to call a tool precedes that call.
                     if stop_reason.as_deref() == Some("tool_use") {
                         classify_pending(&mut decoder, &address, Some(AgentMessageRole::Commentary))
@@ -1016,6 +1076,14 @@ impl ClaudeSessionState {
             }
             if decoder.current_api_message.is_none() {
                 decoder.current_api_message = Some(message_id.clone());
+            }
+            if let Some(usage) = &frame.message.usage {
+                let count = if frame.message.stop_reason.is_some() {
+                    OutputCount::Final
+                } else {
+                    OutputCount::Provisional
+                };
+                record_message_usage(&mut decoder, &message_id, usage, count);
             }
             for block in frame.message.content {
                 let index = {
@@ -1092,7 +1160,16 @@ impl ClaudeSessionState {
             // The CLI reports the compaction summary as the first message of the new context.
             operation.compaction.result.summary_content = Some(text.clone());
         }
-        let Some(address) = self.active_address().await else {
+        let Some((address, turn_progress)) = self.active.read().await.as_ref().map(|active| {
+            (
+                active.address.clone(),
+                if active.interrupting {
+                    TurnProgress::Interrupting
+                } else {
+                    TurnProgress::Running
+                },
+            )
+        }) else {
             return Ok(());
         };
         let UserContent::Blocks(blocks) = frame.message.content else {
@@ -1113,6 +1190,7 @@ impl ClaudeSessionState {
                 let (completion_events, changed) = finish_tool(
                     &mut decoder,
                     &address,
+                    turn_progress,
                     &result,
                     frame.tool_use_result.as_ref(),
                 );
@@ -1263,7 +1341,31 @@ impl ClaudeSessionState {
             }
             return Ok(());
         };
-        if let Some(usage) = result.usage {
+        let streamed_usage = std::mem::take(&mut self.decoder.lock().await.message_usage);
+        let usage = match result.usage {
+            Some(usage) if !usage.is_empty() => Some(usage),
+            // An aborted result counts nothing, so its messages' own reports supply the figures,
+            // or none when no message reported any. A message cut off before its final output
+            // count leaves the turn's output unknown rather than understated.
+            _ if result.interrupted() || active.interrupting => {
+                let output_known = streamed_usage.iter().all(|message| message.output_final);
+                streamed_usage
+                    .into_iter()
+                    .map(|message| message.usage)
+                    .reduce(|mut total, usage| {
+                        total.accumulate(&usage);
+                        total
+                    })
+                    .map(|mut total| {
+                        if !output_known {
+                            total.output_tokens = None;
+                        }
+                        total
+                    })
+            }
+            usage => usage,
+        };
+        if let Some(usage) = usage {
             let report = TurnUsageReport::accounting(
                 identity::UsageReportId::new(result.uuid.clone())
                     .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?,
@@ -1655,6 +1757,33 @@ fn append_text(
 }
 
 /// Reconcile a block's streamed text with its complete text from the `assistant` frame.
+/// Apply one frame's usage report to its API message, keeping messages in arrival order.
+fn record_message_usage(
+    decoder: &mut TurnDecoder,
+    message_id: &str,
+    usage: &Usage,
+    count: OutputCount,
+) {
+    let output_final = count == OutputCount::Final;
+    match decoder
+        .message_usage
+        .iter_mut()
+        .find(|message| message.message_id == message_id)
+    {
+        // A provisional report never replaces the final count of the same message.
+        Some(retained) if retained.output_final && !output_final => {}
+        Some(retained) => {
+            retained.usage.update(usage);
+            retained.output_final |= output_final;
+        }
+        None => decoder.message_usage.push(MessageUsage {
+            message_id: message_id.to_owned(),
+            usage: *usage,
+            output_final,
+        }),
+    }
+}
+
 fn complete_text(
     decoder: &mut TurnDecoder,
     address: &TurnAddress,
@@ -1691,8 +1820,9 @@ fn complete_text(
 
 /// Classify every unclassified prose item of the turn.
 ///
-/// `Some(Commentary)` marks prose that preceded a tool call. `Some(Response)` runs at
-/// completion: the last unclassified prose item is the answer and earlier ones are commentary.
+/// `Some(Commentary)` marks prose that preceded a tool call. `Some(Response)` runs when the turn
+/// ends, completed or not: the last unclassified prose item is the answer and earlier ones are
+/// commentary.
 fn classify_pending(
     decoder: &mut TurnDecoder,
     address: &TurnAddress,
@@ -1773,6 +1903,7 @@ fn start_tool(
 fn finish_tool(
     decoder: &mut TurnDecoder,
     address: &TurnAddress,
+    turn_progress: TurnProgress,
     result: &ToolResultBlock,
     tool_use_result: Option<&Value>,
 ) -> (Vec<AdapterActivity>, bool) {
@@ -1797,6 +1928,10 @@ fn finish_tool(
                     .expect("static denial is nonempty")
             }),
         }
+    } else if failed && turn_progress == TurnProgress::Interrupting {
+        // The CLI closes each running tool with an error result when the client interrupts the
+        // turn. That result reports the interruption, not a failure of the tool.
+        ToolOutcome::Interrupted
     } else if failed {
         ToolOutcome::Failed {
             diagnostic: tool::ToolDiagnostic {

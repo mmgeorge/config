@@ -31,7 +31,7 @@ impl ProcessContainment {
         }
     }
 
-    /// Launch directly into registered containment without a post-spawn assignment gap.
+    /// Launch into registered containment before the child runs any instruction.
     pub fn spawn(
         &self,
         command: tokio::process::Command,
@@ -39,9 +39,7 @@ impl ProcessContainment {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsHandle;
-            let mut command = command;
-            command.creation_flags(::windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-            process_wrap::tokio::JobObject::spawn_in(&mut command, self.handle.as_handle())
+            crate::process::spawn_contained(command, Some(self.handle.as_handle()))
         }
         #[cfg(not(windows))]
         {

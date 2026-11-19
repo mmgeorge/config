@@ -34,7 +34,7 @@ async fn activate(
     Arc<FixturePermissions>,
     events::ProviderEventStream,
 ) {
-    let state = Arc::new(AcpSessionState::new_native(kind));
+    let state = Arc::new(AcpSessionState::new_native(kind, String::new()));
     let permission = Arc::new(FixturePermissions::default());
     let scope = InvocationScope::new(
         forge_provider_api::testing::root_thread("fixture"),
@@ -202,6 +202,49 @@ async fn late_update_for_an_earlier_tool_keeps_the_final_answer_a_response() {
             ("final answer".to_owned(), vec![response]),
         ]
     );
+}
+
+/// An interrupted turn settles its pending prose as a completed turn does.
+///
+/// Harness hides an interrupted response and keeps other prose, so prose left unclassified at
+/// an interruption stayed in the transcript while other providers' interrupted replies left it.
+#[tokio::test]
+async fn interrupted_turn_classifies_its_last_prose_as_the_response() {
+    let (state, _, mut stream) = activate(AcpKind::Antigravity).await;
+    for (native_message_id, text) in [("msg-1", "progress"), ("msg-2", "partial answer")] {
+        state
+            .notification(
+                "session/update",
+                json!({"sessionId":"root","update":{
+                    "sessionUpdate":"agent_message_chunk","messageId":native_message_id,
+                    "content":{"type":"text","text":text}
+                }}),
+            )
+            .await
+            .unwrap();
+    }
+    state
+        .finish(forge_provider_api::turn::TurnOutcome::Interrupted)
+        .await
+        .unwrap();
+
+    let events = drain(&mut stream);
+    let commentary = forge_provider_api::MessageClassification::Known(
+        forge_provider_api::AgentMessageRole::Commentary,
+    );
+    let response = forge_provider_api::MessageClassification::Known(
+        forge_provider_api::AgentMessageRole::Response,
+    );
+    assert_eq!(
+        message_classifications(&events),
+        vec![
+            ("progress".to_owned(), vec![commentary]),
+            ("partial answer".to_owned(), vec![response]),
+        ]
+    );
+    assert!(events.iter().any(|event| matches!(event,
+        forge_provider_api::ProviderEvent::Item { event: forge_provider_api::ItemEvent::Completed(forge_provider_api::ItemCompletion::AgentMessage(forge_provider_api::MessageCompletion { text, outcome })), .. }
+            if text == "partial answer" && *outcome == forge_provider_api::MessageOutcome::Interrupted)));
 }
 
 #[tokio::test]

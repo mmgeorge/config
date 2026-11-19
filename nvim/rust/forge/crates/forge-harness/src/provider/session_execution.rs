@@ -109,6 +109,17 @@ impl OwnerObservation {
         }
     }
 }
+/// How accepted typed input reached its provider, which decides what proves it was read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptedInputDelivery {
+    /// The input joined a running native turn, which reports when the model reads it.
+    Steering,
+    /// The input is the prompt of the invocation that carried it, as when a steer the provider
+    /// refused before dispatch is resent as the next turn's prompt. The model reads a turn's
+    /// prompt when that turn starts, and no provider echoes it, so acceptance is the evidence.
+    TurnPrompt,
+}
+
 /// Preserve the user-visible role of an accepted input independently of provider notifications.
 #[derive(Clone, Debug)]
 pub enum InputPresentation {
@@ -116,6 +127,7 @@ pub enum InputPresentation {
     Message {
         turn: forge_provider_api::forge::TurnInput,
         text: String,
+        delivery: AcceptedInputDelivery,
     },
     /// Append the accepted workflow entry and its original instruction.
     TaskStarted {

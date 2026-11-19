@@ -144,7 +144,7 @@ local function build_spec(instance)
   end
   for _, key in ipairs(interrupt_keys) do
     actions[#actions + 1] = {
-      key = key, modes = { "n", "i" }, desc = request.execution_kind == "native_observed" and "Cancel permission request" or "Interrupt Harness task",
+      key = key, modes = { "n", "i" }, interrupt = true, desc = request.execution_kind == "native_observed" and "Cancel permission request" or "Interrupt Harness task",
       callback = function()
         if request.execution_kind == "native_observed" then submit(instance, true)
         else picker.close(true, "user") host.interrupt() end
@@ -192,7 +192,7 @@ local function build_spec(instance)
       }
     end
   return {
-    owner = "approval", action_list = actions,
+    owner = "approval", action_list = actions, input_settle_ms = picker.focus_taking_settle_ms,
     deadline = request.deadline,
     host = {
       window_list = host.window_list or { host.transcript_win },

@@ -1201,6 +1201,183 @@ async fn controller_reopens_acknowledged_queue_suspended() -> Result<()> {
     Ok(())
 }
 
+/// Keep a retracted prompt in the durable queue until an editor takes it back or retries it.
+///
+/// Interrupting a prompt before any model output retracts it and deletes its exchange. The
+/// editor that would restore the text can exit before it hears of the retraction, so the host
+/// must hold the text as an unsent entry instead of trusting that restoration. Reopening pauses
+/// the queue, and an explicit retry of the entry must still send it.
+#[tokio::test]
+async fn retracted_prompt_survives_restart_and_runs_after_retry() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let controller = receipt_test_controller(root.path()).await?;
+    let session = controller.observer.session_id().to_owned();
+    let control = controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock control")?;
+    // The mock holds the turn before any output, which is where an interrupt may retract it.
+    let hold = control
+        .dispatch(
+            &session,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let (frames, mut received) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            let _ = frames.send(serde_json::from_slice(frame.bytes())?);
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    controller
+        .input_request(
+            Request {
+                id: 1,
+                method: "session.input.apply".into(),
+                params: json!({"id":"submit-retracted","action":{"kind":"submit","message":{
+                    "id":"retracted-prompt","text":"Explain ring buffers at length","intent":"auto"
+                }}}),
+            },
+            RuntimeMethod::SessionInputApply,
+            &sink,
+        )
+        .await?;
+    control
+        .dispatch(
+            &session,
+            MockResponseCommand::Wait {
+                id: hold["id"].as_str().context("hold identity")?.into(),
+            },
+        )
+        .await?;
+    cancellation::apply(
+        &controller,
+        &Request {
+            id: 2,
+            method: "session.turn.cancel".into(),
+            params: json!({"operation_id":"cancel-retracted","restore_prompt_if_no_output":true}),
+        },
+        &sink,
+    )
+    .await?;
+    loop {
+        let frame = received
+            .recv()
+            .await
+            .context("input observation channel closed before the retraction")?;
+        if frame["event"] == "input_changed" && frame["payload"]["retracted"] == "retracted-prompt"
+        {
+            break;
+        }
+    }
+    assert!(
+        SqliteStore::read_only(&controller.data_root)?
+            .list_exchange(&session)?
+            .is_empty(),
+        "retraction kept the provisional exchange"
+    );
+    // No editor acknowledges the retraction: the owner stops as it does when Neovim exits.
+    controller.finish_exchange_owner().await?;
+    drop(sink);
+    drop(controller);
+    reader.abort();
+    let reopened = receipt_test_controller_with_session(root.path(), &session).await?;
+    let restored = reopened.coordinator.submissions.snapshot()?;
+    let [unsent] = restored.messages.as_slice() else {
+        anyhow::bail!(
+            "retracted prompt left the durable queue: {:?}",
+            restored.messages
+        );
+    };
+    assert_eq!(unsent.text, "Explain ring buffers at length");
+    assert_eq!(unsent.delivery(), crate::input::InputDelivery::Failed);
+    assert_eq!(
+        unsent.submission_id(),
+        None,
+        "the unsent entry kept the retracted provider receipt"
+    );
+    assert_ne!(
+        unsent.id, "retracted-prompt",
+        "the unsent entry reused an identity whose provider record was accepted"
+    );
+    assert!(
+        restored.suspended,
+        "recovered unsent input resumed delivery"
+    );
+    // Retrying the unsent entry is the user's request to send it, so it must reach the provider
+    // although the restart left the queue paused.
+    let control = reopened
+        .provider_handle()
+        .mock_response_control()
+        .context("mock control")?;
+    let hold = control
+        .dispatch(
+            &session,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<_, anyhow::Error>(())
+    });
+    reopened.attach_input(&sink).await?;
+    reopened
+        .input_request(
+            Request {
+                id: 3,
+                method: "session.input.apply".into(),
+                params: json!({"id":"retry-unsent","action":{
+                    "kind":"retry","id":unsent.id,"revision":unsent.revision,
+                }}),
+            },
+            RuntimeMethod::SessionInputApply,
+            &sink,
+        )
+        .await?;
+    assert!(
+        !reopened.coordinator.submissions.snapshot()?.suspended,
+        "the retry left the recovered queue paused"
+    );
+    let delivered = control
+        .dispatch(
+            &session,
+            MockResponseCommand::Wait {
+                id: hold["id"].as_str().context("hold identity")?.into(),
+            },
+        )
+        .await?;
+    assert!(
+        delivered["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("Explain ring buffers at length")),
+        "the retried entry never reached the provider: {delivered}"
+    );
+    control
+        .dispatch(
+            &session,
+            MockResponseCommand::Release {
+                id: hold["id"].as_str().context("hold identity")?.into(),
+            },
+        )
+        .await?;
+    reopened.finish_exchange_owner().await?;
+    drop(sink);
+    reader.abort();
+    Ok(())
+}
+
 /// Reuse preparation after a crash before the queue can link its submission ID.
 #[tokio::test]
 async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Result<()> {

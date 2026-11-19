@@ -12,6 +12,7 @@
 ---@field animation_namespace integer
 ---@field group integer
 ---@field timer? uv.uv_timer_t
+---@field label_timer? uv.uv_timer_t Requests the synchronization that brings the next elapsed label.
 ---@field release_geometry? fun()
 ---@field closed boolean
 ---@field suspended boolean
@@ -100,6 +101,16 @@ function StatusView:apply(snapshot, done)
   end)
 end
 
+---Report whether the host marks the current status as the hand-off to a queued turn.
+---@return boolean
+function StatusView:handoff()
+  for _, block in ipairs(self.snapshot and self.snapshot.block or {}) do
+    local status = block.metadata and block.metadata.status
+    if type(status) == "table" and status.handoff == true then return true end
+  end
+  return false
+end
+
 ---@param context? HarnessStatusContext
 ---@param commands? ForgeViewCommandSet
 function StatusView:render(context, commands)
@@ -146,7 +157,6 @@ function StatusView:update_animation()
   end
   if content and (content.animated or #(content.spinners or {}) > 0) and visible then
     local timer = vim.uv.new_timer()
-    local refreshed_at = vim.uv.now()
     -- A tick scheduled before this timer stopped must not overwrite the next state's icon.
     local function draw()
       if self.timer ~= timer or self.closed or self.suspended or not self.options.alive() then return end
@@ -160,19 +170,33 @@ function StatusView:update_animation()
         vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, marker.row, marker.column,
           { id = index + 1, virt_text = { { circle_frame, "ForgeStatusHint" } }, virt_text_pos = "overlay" })
       end
-      -- Rust renders elapsed labels and refreshes them only when a sync arrives. A silent
-      -- tool produces no host events, so request one sync per second while Rust reports
-      -- active work; Rust's own ticking gate decides whether any text changes.
-      if self.options.refresh and vim.uv.now() - refreshed_at >= 1000 then
-        refreshed_at = vim.uv.now()
-        self.options.refresh()
-      end
     end
     self.timer = timer
     draw()
     local interval = math.ceil(spinner.frame_interval_ms)
     timer:start(interval, interval, vim.schedule_wrap(draw))
   end
+end
+
+---Request one synchronization after `delay_ms`, when the host reports that a running elapsed
+---label shows its next value. Rust renders the labels and a silent tool produces no host events,
+---so this request is what advances them; `nil` cancels a pending request because no clock runs.
+---@param delay_ms? integer
+function StatusView:schedule_refresh(delay_ms)
+  if self.label_timer then
+    self.label_timer:stop()
+    self.label_timer:close()
+    self.label_timer = nil
+  end
+  if self.closed or not self.options.refresh or type(delay_ms) ~= "number" then return end
+  local timer = vim.uv.new_timer()
+  self.label_timer = timer
+  timer:start(math.max(0, math.ceil(delay_ms)), 0, vim.schedule_wrap(function()
+    if self.label_timer ~= timer then return end
+    self.label_timer = nil
+    timer:close()
+    if not self.closed and self.options.alive() then self.options.refresh() end
+  end))
 end
 
 function StatusView:resize()
@@ -285,6 +309,7 @@ function StatusView:close(wiping)
   self.closed = true
   if self.release_geometry then self.release_geometry() end
   if self.timer then self.timer:stop() self.timer:close() self.timer = nil end
+  self:schedule_refresh(nil)
   vim.api.nvim_del_augroup_by_id(self.group)
   if self.details and vim.api.nvim_win_is_valid(self.details.window) then vim.api.nvim_win_close(self.details.window, true) end
   if self.native then replica.close(self.native) end

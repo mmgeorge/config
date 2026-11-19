@@ -810,20 +810,15 @@ fn tool_title(value: &Value) -> Option<String> {
         Value::Array(part_list) => {
             let arguments = part_list
                 .iter()
-                .map(Value::as_str)
+                .map(|part| part.as_str().map(str::to_owned))
                 .collect::<Option<Vec<_>>>()?;
-            let interpreter = forge_shell::shell::CommandShell::from_executable(arguments.first()?);
-            if interpreter != forge_shell::shell::CommandShell::Unknown
-                && let Some(marker) = arguments.iter().position(|argument| {
-                    matches!(
-                        argument.to_ascii_lowercase().as_str(),
-                        "-command" | "--commands" | "-c" | "-lc" | "-ic" | "-lic"
-                    )
-                })
-                && let Some(script) = arguments.get(marker + 1)
-                && marker + 2 == arguments.len()
+            // An argv launcher passes its script as one argument, so no outer shell can append
+            // commands; the same launcher test as permission analysis decides what to hide.
+            if let Some((marker, interpreter)) =
+                forge_shell::command::shell_script_argument(&arguments)
             {
-                let display = forge_shell::command::display_command(script, interpreter);
+                let display =
+                    forge_shell::command::display_command(&arguments[marker + 1], interpreter);
                 return compact_tool_title(&display.source);
             }
             let title = part_list

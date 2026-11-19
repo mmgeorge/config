@@ -390,8 +390,101 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         assert_eq!(exchange[0].node_list.iter().filter(|node| matches!(node,
             crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.text == "boundary correction" && prompt.id == "boundary-message")).count(), 1);
         assert_eq!(*provider.input.lock().unwrap(), ["initial request", "boundary correction"]);
+        // The deferred steer became the continuation's own prompt, which the model reads when
+        // that turn starts, so its row is consumed at the turn boundary, before the output that
+        // answers it, rather than settled as steering nobody reported reading.
+        let input_position = exchange[0].node_list.iter().position(|node| matches!(node,
+            crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.id == "boundary-message")).unwrap();
+        let crate::exchange::ExchangeNode::ExchangeInput { prompt } = &exchange[0].node_list[input_position] else {
+            unreachable!("position matched an input node");
+        };
+        assert_eq!(prompt.consumption, crate::exchange::InputConsumption::Consumed);
+        if !fail_response {
+            let answer_position = exchange[0].node_list.iter().position(|node| {
+                let crate::exchange::ExchangeNode::TurnContent { turn_id, item: crate::turn::TurnItem::Message { id }, .. } = node else {
+                    return false;
+                };
+                exchange[0].turn.iter().filter(|turn| turn.id() == turn_id).flat_map(|turn| turn.messages())
+                    .any(|message| message.id() == id && message.text() == "handled boundary correction")
+            }).expect("the continuation answered the steer");
+            assert!(input_position < answer_position, "the steer's row follows the answer to it");
+        }
         Ok::<(), anyhow::Error>(())
     }.await
+}
+
+/// Publish the exchange's stopped clock before finalization captures its checkpoint.
+///
+/// The owner paused the exchange when native work ended but published nothing until the
+/// exchange settled, after the final checkpoint. The presentation kept counting from the last
+/// running snapshot meanwhile, so a heading that read `Thinking 5s` settled as `Thought 4s`.
+#[tokio::test]
+async fn finalization_publishes_the_stopped_clock_before_the_settled_exchange() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let provider = Arc::new(BoundarySteeringProvider::new());
+    let session =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = session.provider_handle();
+    let (sink, mut stream) = publication::channel();
+    broker.event_sink = Some(sink);
+    let snapshots = tokio::spawn(async move {
+        let mut snapshots = Vec::new();
+        while let Ok(Some(update)) = stream.recv().await {
+            let publication::SessionUpdate::DocumentChanged { patch } = update else {
+                continue;
+            };
+            for operation in patch.operation {
+                if let crate::timeline::stream::TimelineOperation::Insert { entry, .. }
+                | crate::timeline::stream::TimelineOperation::Replace { entry, .. } = operation
+                    && let crate::timeline::TimelineEntry::Exchange { exchange, .. } = entry
+                {
+                    snapshots.push(*exchange);
+                }
+            }
+        }
+        snapshots
+    });
+    let running = tokio::spawn(async move {
+        let result = broker
+            .run_interaction(
+                "initial request".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("initial request".into())),
+            )
+            .await;
+        (broker, result)
+    });
+    await_boundary_barrier(&provider.initial_started).await?;
+    provider.initial_release.add_permits(1);
+    let (broker, result) = running.await?;
+    result?;
+    drop(broker);
+    let snapshots = snapshots.await?;
+    let settled = snapshots
+        .iter()
+        .position(crate::exchange::Exchange::is_finished)
+        .expect("the settled exchange was published");
+    let before = &snapshots[..settled];
+    let last = before.last().expect("the running exchange was published");
+    assert!(
+        !last.is_finished() && last.execution_started_at_ms().is_none(),
+        "the exchange settled before any publication showed its stopped clock: {:?}",
+        before
+            .iter()
+            .map(|exchange| &exchange.clock)
+            .collect::<Vec<_>>()
+    );
+    let settled_ms = snapshots[settled].duration_ms();
+    assert_eq!(last.duration_ms(), settled_ms);
+    assert!(
+        before
+            .iter()
+            .all(|exchange| exchange.duration_ms() <= settled_ms),
+        "a publication carried more time than the settled exchange kept"
+    );
+    Ok(())
 }
 
 /// When the fixture reports the steered input's consumption relative to its acknowledgement.

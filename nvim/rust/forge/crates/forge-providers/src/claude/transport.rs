@@ -347,6 +347,36 @@ impl crate::resource_cleanup::NativeResource for TransportResources {
         Ok(())
     }
 
+    async fn terminate(&self) -> Result<(), ProviderError> {
+        let mut state = self.state.lock().await;
+        self.shared.writer.lock().await.take();
+        if !state.process_collected {
+            if let Some(process) = state.process.as_mut() {
+                Box::into_pin(process.kill()).await.map_err(|_| {
+                    ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::ThreadClose,
+                            forge_provider_api::ProviderFailureKind::Runtime,
+                        )
+                        .at_phase(
+                            forge_provider_api::ProviderPhase::Collection,
+                            forge_provider_api::FailureDisposition::Invalidated,
+                        ),
+                    )
+                })?;
+            }
+            state.process_collected = true;
+        }
+        // The reader of a killed CLI has nothing further to deliver to an abandoned binding.
+        if let Some(reader) = state.reader.take() {
+            reader.abort();
+            let _ = reader.await;
+        }
+        self.shared.closed.cancel();
+        self.collected.store(true, Ordering::Release);
+        Ok(())
+    }
+
     fn is_collected(&self) -> bool {
         self.collected.load(Ordering::Acquire)
     }

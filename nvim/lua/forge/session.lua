@@ -110,7 +110,8 @@ M.empty_diff_rows = {}
 ---@field configuration_revision? integer
 ---@field configuration_error? string
 ---@field pending_steer table[]
----@field pending_submit table[]
+---@field pending_handoff table[] Shown follow-ups the owner claimed for a turn the transcript does not hold yet.
+---@field pending_submit table[] Unclaimed prompts that have not demonstrably waited, which no view stages.
 ---@field question_draft? {owner_id?:string, question_set_id:string, question_id:string, text:string} Rejected clarification retained for retry.
 ---@field transcript_buf integer?
 ---@field transcript_win integer?
@@ -168,6 +169,7 @@ local function new_harness_state()
   render_fold_signature = nil,
   queue = {},
   pending_steer = {},
+  pending_handoff = {},
   pending_submit = {},
   transcript_buf = nil,
   transcript_win = nil,

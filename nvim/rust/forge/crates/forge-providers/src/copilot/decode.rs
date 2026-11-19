@@ -200,3 +200,29 @@ pub fn is_denied(data: &Value) -> bool {
             Some("denied" | "rejected")
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    /// Record the completion payloads Copilot runtime 1.0.103 reports for rejected shell calls.
+    ///
+    /// A rejection with feedback arrives as code `denied` and one without feedback as
+    /// `rejected`; an ordinary failure, including the adapter's own shell failure, is not one.
+    #[test]
+    fn rejected_shell_completions_are_denials() {
+        let completion = |message: &str, code: &str| json!({"toolCallId":"call","success":false,"error":{"message":message,"code":code}});
+        assert!(super::is_denied(&completion(
+            "The user rejected this tool call. User feedback: Tool call rejected. Reason: Rejected by the user.",
+            "denied",
+        )));
+        assert!(super::is_denied(&completion(
+            "The user rejected this tool call.",
+            "rejected"
+        )));
+        assert!(!super::is_denied(&completion(
+            "Shell operation failed",
+            "failure"
+        )));
+    }
+}

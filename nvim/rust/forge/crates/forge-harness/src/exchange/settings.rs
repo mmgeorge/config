@@ -155,7 +155,8 @@ impl SettingsRun {
                     }
                     self.validate(broker, purpose, preparation, &[])
                 }
-                SettingsStage::Committing(candidate) => {
+                SettingsStage::Committing(mut candidate) => {
+                    candidate.retry_commit_until(self.operation_deadline().into_std());
                     broker
                         .commit_configuration_candidate(candidate)
                         .map_err(OperationFailure::Domain)?;

@@ -118,6 +118,27 @@ pub trait Provider: Send + Sync + 'static {
         binding: &BindingId,
     ) -> Result<(), ProviderError>;
 
+    /// End the binding's native process or connection at once, after a bounded close failed.
+    ///
+    /// The host calls this only for a binding it is abandoning: after `thread_close` retries
+    /// failed or a cancellation never settled. It must not await native settlement, transcript
+    /// flushing, or any reply from the native side. Success guarantees that nothing the binding
+    /// owned can deliver output to the host or run a tool on its behalf, so a replacement binding
+    /// can resume the same native conversation without two live writers. Each adapter documents
+    /// whether it reaches that by ending a process the binding owns alone or, where a native
+    /// process serves several bindings, by severing only this binding's session from it. Durable
+    /// native history is retained; work the native side was doing has an unknown outcome. Removes
+    /// the binding, so a later close of it succeeds without native effects.
+    async fn thread_terminate(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::ThreadClose)?;
+        let _ = binding;
+        Err(UnsupportedCapability(ProviderFeature::ForcedTermination).into())
+    }
+
     /// Interrupt the exact invocation and await its retained native foreground settlement.
     /// Leave the binding reusable only after successful collection, preserving independent background
     /// terminals. A completed target keeps its true terminal outcome; repeats observe that same

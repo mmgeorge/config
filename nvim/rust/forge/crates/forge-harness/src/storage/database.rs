@@ -24,6 +24,21 @@ pub(crate) struct HistoryConnection {
 impl HistoryConnection {
     /// Open only this executable's history version, leaving older hosts undisturbed.
     pub(crate) fn open(root: &Path) -> Result<Self, DatabaseError> {
+        Self::open_attaching(root, super::preferences::attach)
+    }
+
+    /// Open history as the main database with settings attached writable after it.
+    ///
+    /// Only the settings store writes both databases in one transaction; attachment order makes
+    /// its transactions lock history before settings, as every history transaction does.
+    pub(crate) fn open_settings_writer(root: &Path) -> Result<Self, DatabaseError> {
+        Self::open_attaching(root, super::preferences::attach_writable)
+    }
+
+    fn open_attaching(
+        root: &Path,
+        attach: fn(&Connection, &Path) -> anyhow::Result<()>,
+    ) -> Result<Self, DatabaseError> {
         let lease = super::state::StateLease::open(root).map_err(DatabaseError::Initialization)?;
         let directory = super::state::directory(root);
         let _bootstrap = super::schema::bootstrap_lock(&directory, "harness")
@@ -49,7 +64,7 @@ impl HistoryConnection {
                 directory.display()
             )));
         }
-        super::preferences::attach(&connection, root).map_err(DatabaseError::Initialization)?;
+        attach(&connection, root).map_err(DatabaseError::Initialization)?;
         Ok(Self {
             connection,
             _lease: lease,
@@ -59,7 +74,10 @@ impl HistoryConnection {
     /// Read current history without admitting schema writes.
     pub(crate) fn read_only(root: &Path) -> Result<Self, DatabaseError> {
         let lease = super::state::StateLease::open(root).map_err(DatabaseError::Initialization)?;
-        let connection = connection_open(root, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let connection = connection_open(
+            root,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
         if super::schema::validate(&connection).map_err(DatabaseError::Initialization)?
             != super::schema::VERSION
         {
@@ -87,6 +105,69 @@ impl DerefMut for HistoryConnection {
     /// Borrow SQLite mutably while retaining its version lease.
     fn deref_mut(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+}
+
+/// Report whether `error` is SQLite contention whose transaction committed nothing.
+///
+/// SQLite reports `SQLITE_BUSY` or `SQLITE_LOCKED` before a write transaction holds its lock or
+/// when its commit could not take it, and in both cases the transaction rolled back.
+pub(crate) fn storage_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    })
+}
+
+/// Classify the SQLite cause of a storage failure without its message text.
+///
+/// Trace records keep only allowlisted metadata, because error text can quote user content;
+/// this stable code still tells a reader why a commit failed.
+pub(crate) fn storage_cause(error: &anyhow::Error) -> Option<&'static str> {
+    error.chain().find_map(|cause| {
+        if let Some(error) = cause.downcast_ref::<rusqlite::Error>() {
+            return Some(match error.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy) => "sqlite_busy",
+                Some(rusqlite::ErrorCode::DatabaseLocked) => "sqlite_locked",
+                Some(rusqlite::ErrorCode::ReadOnly) => "sqlite_read_only",
+                Some(rusqlite::ErrorCode::DiskFull) => "sqlite_disk_full",
+                Some(rusqlite::ErrorCode::SystemIoFailure) => "sqlite_io",
+                Some(rusqlite::ErrorCode::DatabaseCorrupt) => "sqlite_corrupt",
+                Some(rusqlite::ErrorCode::ConstraintViolation) => "sqlite_constraint",
+                Some(_) => "sqlite_other",
+                None => "sqlite_api",
+            });
+        }
+        cause.downcast_ref::<std::io::Error>().map(|_| "io")
+    })
+}
+
+/// Repeat a rolled-back write while another writer holds the lock, until `deadline` passes.
+///
+/// Each attempt already waits up to the busy timeout inside SQLite before it reports contention,
+/// and the writes retried here begin immediate transactions, which never report a stale WAL
+/// snapshot at once, so the loop needs no pause of its own.
+pub(crate) fn retry_while_busy<Value>(
+    deadline: Option<std::time::Instant>,
+    mut attempt: impl FnMut() -> anyhow::Result<Value>,
+) -> anyhow::Result<Value> {
+    loop {
+        match attempt() {
+            Err(error)
+                if storage_busy(&error)
+                    && deadline.is_some_and(|deadline| std::time::Instant::now() < deadline) =>
+            {
+                continue;
+            }
+            result => return result,
+        }
     }
 }
 

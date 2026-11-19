@@ -21,7 +21,7 @@ use forge_provider_api::{
     *,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 use tokio::sync::{Mutex, watch};
@@ -681,6 +681,15 @@ impl Provider for MockProvider {
                 },
             )
             .await
+    }
+
+    async fn thread_terminate(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::ThreadClose)?;
+        self.terminate_binding(binding).await
     }
 
     async fn turn_interrupt(
@@ -1515,6 +1524,21 @@ impl MockProvider {
         let session = self
             .binding(binding, ProviderOperation::ThreadClose)
             .await?;
+        if self
+            .control
+            .failing_close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&session.owner)
+        {
+            return Err(ProviderError::Failure(
+                ProviderFailure::new(ProviderOperation::ThreadClose, ProviderFailureKind::Runtime)
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Collection,
+                        FailureDisposition::Invalidated,
+                    ),
+            ));
+        }
         *session
             .state
             .lock()
@@ -1559,6 +1583,81 @@ impl MockProvider {
         result
     }
 
+    /// Hold an interrupt of a binding whose owner asked for unsettled interrupts.
+    ///
+    /// A held interrupt answers only once termination has removed its binding, as a killed
+    /// process ends the requests still waiting on it.
+    async fn hold_interrupt(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        let Some(owner) = self
+            .bindings
+            .lock()
+            .await
+            .get(binding)
+            .map(|session| session.owner.clone())
+        else {
+            return Ok(());
+        };
+        if !self
+            .control
+            .held_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&owner)
+        {
+            return Ok(());
+        }
+        loop {
+            let terminated = self.control.terminated.notified();
+            tokio::pin!(terminated);
+            terminated.as_mut().enable();
+            if !self.bindings.lock().await.contains_key(binding) {
+                return Err(failure(
+                    ProviderOperation::TurnInterrupt,
+                    ProviderFailureKind::BindingClosed,
+                ));
+            }
+            terminated.await;
+        }
+    }
+
+    /// Forget a binding at once: cancel its turn and release its owner without settlement.
+    ///
+    /// The mock has no process, so ending the binding's state is the whole guarantee.
+    async fn terminate_binding(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        let Some(session) = self.bindings.lock().await.remove(binding) else {
+            return Ok(());
+        };
+        *session
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = MockBindingState::Closing;
+        drop(self.pending_inputs.cancel_binding(binding));
+        if let Some(invocation) = session.active.lock().await.as_ref() {
+            invocation.cancelled.send_replace(true);
+        }
+        self.control.cancel_thread(Some(&session.owner));
+        self.control
+            .failing_close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session.owner);
+        self.control
+            .held_interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session.owner);
+        self.closed_bindings
+            .lock()
+            .await
+            .insert(binding.clone(), Ok(()));
+        let mut owners = self.owners.lock().await;
+        if owners.get(&session.owner) == Some(binding) {
+            owners.remove(&session.owner);
+        }
+        self.control.terminated.notify_waiters();
+        Ok(())
+    }
+
     /// Retain exact native cancellation independently of the observer deadline.
     async fn cancel_native(
         &self,
@@ -1568,6 +1667,7 @@ impl MockProvider {
     ) -> Result<TurnInterruptResult, ProviderError> {
         operation.dispatch(ProviderOperation::TurnInterrupt)?;
         let scope = request.scope.clone();
+        self.hold_interrupt(binding).await?;
         self.cancel_exact(binding, request).await?;
         let session = self
             .binding(binding, ProviderOperation::TurnInterrupt)
@@ -2377,6 +2477,12 @@ struct MockControl {
     binding_model_catalog: std::sync::atomic::AtomicBool,
     /// Retain each owner's completed turn checkpoints across bindings, as durable native history.
     histories: std::sync::Mutex<HashMap<ThreadId, Vec<CheckpointId>>>,
+    /// Owners whose binding close fails until the binding is terminated.
+    failing_close: std::sync::Mutex<HashSet<ThreadId>>,
+    /// Owners whose turn interrupt never settles.
+    held_interrupt: std::sync::Mutex<HashSet<ThreadId>>,
+    /// Wake held interrupts when a binding is terminated, as a killed process ends its requests.
+    terminated: tokio::sync::Notify,
 }
 
 impl MockControl {
@@ -2511,6 +2617,14 @@ impl ProviderTestControl for MockControl {
             TestControlCommand::RequireBindingModelCatalog => {
                 self.binding_model_catalog
                     .store(true, std::sync::atomic::Ordering::Release);
+                Ok(TestControlResult::Configured)
+            }
+            TestControlCommand::FailClose => {
+                self.failing_close.lock().unwrap().insert(owner.clone());
+                Ok(TestControlResult::Configured)
+            }
+            TestControlCommand::HoldInterrupt => {
+                self.held_interrupt.lock().unwrap().insert(owner.clone());
                 Ok(TestControlResult::Configured)
             }
             TestControlCommand::History => Ok(TestControlResult::History {
@@ -2925,10 +3039,74 @@ async fn run_prompt_inner(
             return Err(error);
         }
     }
+    // Streamed messages the script started, by its own name, with their accumulated text.
+    let mut streamed: HashMap<String, (ItemId, String)> = HashMap::new();
     for step in steps {
         match step {
             TestPromptStep::CollectionBarrier { id } => {
                 *session.collection_barrier.lock().await = Some(id);
+            }
+            TestPromptStep::UnclassifiedMessageStart { item, text } => {
+                let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())
+                    .expect("allocated item ID is nonempty");
+                if streamed
+                    .insert(item, (item_id.clone(), text.clone()))
+                    .is_some()
+                {
+                    return Err(scripted_message_failure());
+                }
+                sink.send_wait(AdapterActivity::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id,
+                    event: ItemEvent::Started(ItemStart::AgentMessage(AgentMessageStart {
+                        text,
+                        classification: MessageClassification::Unclassified,
+                    })),
+                })
+                .await?;
+            }
+            TestPromptStep::MessageDelta { item, text } => {
+                let (item_id, accumulated) = streamed
+                    .get_mut(&item)
+                    .ok_or_else(scripted_message_failure)?;
+                accumulated.push_str(&text);
+                sink.send_wait(AdapterActivity::Item {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    item_id: item_id.clone(),
+                    event: ItemEvent::Message {
+                        event: MessageItemEvent::Delta(text),
+                    },
+                })
+                .await?;
+            }
+            TestPromptStep::MessageCompletion { item, content } => {
+                let (item_id, text) = streamed
+                    .remove(&item)
+                    .ok_or_else(scripted_message_failure)?;
+                let role = match content {
+                    TestMessageContent::Commentary => AgentMessageRole::Commentary,
+                    TestMessageContent::Response => AgentMessageRole::Response,
+                    TestMessageContent::Reasoning(_) => return Err(scripted_message_failure()),
+                };
+                for event in [
+                    ItemEvent::Message {
+                        event: MessageItemEvent::Classified(MessageClassification::Known(role)),
+                    },
+                    ItemEvent::Completed(ItemCompletion::AgentMessage(MessageCompletion {
+                        text: text.clone(),
+                        outcome: MessageOutcome::Completed,
+                    })),
+                ] {
+                    sink.send_wait(AdapterActivity::Item {
+                        thread_id: turn.thread_id.clone(),
+                        turn_id: turn.turn_id.clone(),
+                        item_id: item_id.clone(),
+                        event,
+                    })
+                    .await?;
+                }
             }
             TestPromptStep::Barrier { id } => {
                 let hold = control.find(&owner, &id)?;
@@ -3734,6 +3912,12 @@ fn now_ms() -> i64 {
 fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
+/// Reject a scripted message step that names no started message, restarts one, or classifies
+/// prose as reasoning.
+fn scripted_message_failure() -> ProviderError {
+    ProviderFailure::new(ProviderOperation::TurnStart, ProviderFailureKind::Protocol).into()
+}
+
 /// Wait on retained collection evidence without holding adapter admission.
 async fn wait_settlement(
     receiver: &mut watch::Receiver<Option<SettlementResult>>,

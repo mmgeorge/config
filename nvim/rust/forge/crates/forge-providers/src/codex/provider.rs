@@ -2582,6 +2582,42 @@ impl CodexProvider {
         Ok(())
     }
 
+    /// Kill the binding's own app-server and forget the binding without native settlement.
+    ///
+    /// `thread_open` starts one app-server per binding, and that binding's subagent threads run
+    /// inside it, so ending the process ends every native thread and tool the binding owns.
+    async fn terminate_binding(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        let session = match self.bindings.lock().await.get(binding).cloned() {
+            Some(session) => session,
+            None => return Ok(()),
+        };
+        session.closing.store(true, Ordering::Release);
+        session.fenced.store(true, Ordering::Release);
+        let runtime = session.runtime.lock().await.clone();
+        runtime
+            .shutdown()
+            .await
+            .map_err(|_| failure(ProviderOperation::ThreadClose, ProviderFailureKind::Runtime))?;
+        if let Some(profile) = session.profile.lock().await.as_mut()
+            && let Err(error) = profile.close()
+        {
+            tracing::warn!(target: "forge::provider", event_name = "provider.terminate.profile_retained",
+                provider = "codex", error = %error);
+        }
+        session.sink.fail(events::EventDeliveryError::Closed);
+        self.closed_bindings.lock().await.insert(binding.clone());
+        self.bindings.lock().await.remove(binding);
+        self.fork_targets
+            .lock()
+            .await
+            .retain(|_, target| target.source_binding.as_ref() != Some(binding));
+        let mut owners = self.owners.lock().await;
+        if owners.get(&session.owner) == Some(binding) {
+            owners.remove(&session.owner);
+        }
+        Ok(())
+    }
+
     /// Select a read-only native connection without opening a live history binding.
     async fn query_connection(
         &self,
@@ -2860,6 +2896,15 @@ impl Provider for CodexProvider {
                 move |reason| cleanup_provider.operation_interruption(native, target, reason),
             )
             .await
+    }
+
+    async fn thread_terminate(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::ThreadClose)?;
+        self.terminate_binding(binding).await
     }
 
     async fn turn_interrupt(
@@ -4404,6 +4449,11 @@ async fn read_binding_terminals(
             ProviderFailureKind::SessionMissing,
         ));
     }
+    let waited = session
+        .normalization
+        .lock()
+        .await
+        .thread_foreground_command_items(session.history_id().as_str());
     async {
         let _observation = observation;
         let thread_id = session.history_id();
@@ -4423,7 +4473,15 @@ async fn read_binding_terminals(
                     ProviderOperation::TerminalList,
                 )
                 .await?;
-            let parsed = crate::terminal::parse_snapshot(&page, false).map_err(|error| {
+            let mut background = page.clone();
+            if let Some(rows) = background.get_mut("data").and_then(Value::as_array_mut) {
+                rows.retain(|row| {
+                    !row.get("itemId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|item| waited.contains(item))
+                });
+            }
+            let parsed = crate::terminal::parse_snapshot(&background, false).map_err(|error| {
                 forge_provider_api::ProviderFailure::terminal_inventory(
                     ProviderOperation::TerminalList,
                     error,
@@ -5693,6 +5751,19 @@ async fn dispatch_native_request(
 /// Codex callbacks carry only the native item ID, which the normalizer mapped to a host
 /// `ItemId` when the item started. A callback without a native item, or one whose item was never
 /// admitted, gates no host tool item.
+/// Resolve the host turn that owns a native callback's items.
+fn callback_turn_id(
+    request: &PromptRequest,
+    owner: &super::normalization::NativeCallbackOwner,
+) -> Option<forge_provider_api::TurnId> {
+    match owner {
+        super::normalization::NativeCallbackOwner::Root => request.scope.turn_id().ok(),
+        super::normalization::NativeCallbackOwner::ObservedChild(child) => {
+            Some(child.turn_id.clone())
+        }
+    }
+}
+
 async fn callback_subject(
     session: &CodexBinding,
     request: &PromptRequest,
@@ -5702,13 +5773,7 @@ async fn callback_subject(
     let Some(native_item_id) = native_item_id else {
         return PermissionSubject::Unattached;
     };
-    let turn_id = match owner {
-        super::normalization::NativeCallbackOwner::Root => request.scope.turn_id().ok(),
-        super::normalization::NativeCallbackOwner::ObservedChild(child) => {
-            Some(child.turn_id.clone())
-        }
-    };
-    let Some(turn_id) = turn_id else {
+    let Some(turn_id) = callback_turn_id(request, owner) else {
         return PermissionSubject::Unattached;
     };
     session
@@ -5856,6 +5921,21 @@ async fn handle_native_request(
             };
             if session.is_fenced() {
                 return Err(ProviderError::Cancelled);
+            }
+            // Codex's decline reply carries no reason, so the declined item would otherwise
+            // report a generic denial to the user.
+            if let PermissionResponse::Deny {
+                reason: Some(reason),
+            } = &decision
+                && let Some(native_item_id) = params["itemId"].as_str()
+                && let Some(turn_id) = callback_turn_id(&request, &owner)
+                && let Ok(reason) = forge_provider_api::SanitizedMessage::new(reason.as_str())
+            {
+                session
+                    .normalization
+                    .lock()
+                    .await
+                    .denial_record(&turn_id, native_item_id, reason);
             }
             prepared.validate().map_err(|_| {
                 ProviderError::from(
@@ -7017,6 +7097,169 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert_eq!(*authority.calls.lock().unwrap(), ["before","authorize","call","before","authorize","call"]);
             session.rpc.lock().await.close().await.unwrap();
         }.await;
+    }
+
+    /// Refuse every approval with the reason Harness gives for a shell file write.
+    struct ReasonedDenial;
+
+    const SHELL_WRITE_REASON: &str = "Set-Content writes files through the shell.";
+
+    #[async_trait]
+    impl ProviderPermissions for ReasonedDenial {
+        async fn authorize(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            PermissionResponse::Deny {
+                reason: Some(SHELL_WRITE_REASON.into()),
+            }
+        }
+
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// Codex's decline reply has no reason field, so the declined item reports the host's reason.
+    #[tokio::test]
+    async fn host_denial_reason_reaches_the_declined_command() {
+        use super::super::normalization::CodexOutput;
+        use forge_provider_api::{ItemCompletion, ItemEvent};
+        use futures_util::StreamExt;
+        async {
+            let (_, session, _events, mut socket) =
+                compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None })
+                    .await;
+            let mut request = request();
+            request.permissions = Arc::new(ReasonedDenial);
+            let command = |status: &str| {
+                json!({"threadId":"compaction-thread","turnId":"native-turn","item":{
+                    "type":"commandExecution","id":"shell-write","cwd":".",
+                    "command":"Set-Content notes.txt wave","status":status}})
+            };
+            {
+                let mut normalization = session.normalization.lock().await;
+                normalization
+                    .admit_turn("compaction-thread", "native-turn", &request.scope)
+                    .unwrap();
+                normalization
+                    .normalize(
+                        &json!({"method":"item/started","params":command("inProgress")}),
+                        &mut CodexOutput::default(),
+                        None,
+                        "",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let approval = json!({"id":21,"method":"item/commandExecution/requestApproval","params":{
+                "threadId":"compaction-thread","turnId":"native-turn","itemId":"shell-write",
+                "command":"Set-Content notes.txt wave","cwd":"."}});
+            handle_native_request(&session, &request, &approval)
+                .await
+                .unwrap();
+            let reply: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(reply["result"], json!({"decision":"decline"}));
+            let mut output = CodexOutput::default();
+            session
+                .normalization
+                .lock()
+                .await
+                .normalize(
+                    &json!({"method":"item/completed","params":command("declined")}),
+                    &mut output,
+                    None,
+                    "",
+                )
+                .await
+                .unwrap();
+            let denial_reasons = output
+                .event
+                .iter()
+                .filter_map(|activity| match activity {
+                    AdapterActivity::Item {
+                        event:
+                            ItemEvent::Completed(ItemCompletion::CommandExecution(
+                                forge_provider_api::tool::ToolCompletion {
+                                    outcome: forge_provider_api::tool::ToolOutcome::Denied { reason },
+                                    ..
+                                },
+                            )),
+                        ..
+                    } => Some(reason.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(denial_reasons, [SHELL_WRITE_REASON]);
+            session.rpc.lock().await.close().await.unwrap();
+        }
+        .await;
+    }
+
+    /// A command the turn still waits on is foreground work, never a background terminal.
+    ///
+    /// Codex lists the interrupted turn's command with its background terminals from
+    /// `turn/interrupt` until the adapter terminates it, so the status split once showed
+    /// `1 terminal running` for a few hundred milliseconds of every stop of a shell command.
+    #[tokio::test]
+    async fn terminal_inventory_omits_commands_of_unfinished_turns() {
+        use super::super::normalization::CodexOutput;
+        use futures_util::{SinkExt, StreamExt};
+        let (_, session, _events, mut socket) =
+            compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
+        let request = request();
+        {
+            let mut normalization = session.normalization.lock().await;
+            normalization
+                .admit_turn("compaction-thread", "native-turn", &request.scope)
+                .unwrap();
+            normalization
+                .normalize(
+                    &json!({"method":"item/started","params":{
+                        "threadId":"compaction-thread","turnId":"native-turn","item":{
+                            "type":"commandExecution","id":"waited-command","cwd":".",
+                            "command":"nu -c \"sleep 45sec\"","status":"inProgress"}}}),
+                    &mut CodexOutput::default(),
+                    None,
+                    "",
+                )
+                .await
+                .unwrap();
+        }
+        let reader = tokio::spawn({
+            let session = session.clone();
+            async move { read_binding_terminals(&session).await }
+        });
+        let list: Value =
+            serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(list["method"], "thread/backgroundTerminals/list");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"id":list["id"],"result":{"data":[
+                    {"processId":"waited","itemId":"waited-command","command":"nu -c \"sleep 45sec\""},
+                    {"processId":"server","itemId":"earlier-command","command":"npm run dev"},
+                ],"nextCursor":null}})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let inventory = reader.await.unwrap().unwrap();
+        assert_eq!(
+            inventory
+                .terminal
+                .iter()
+                .map(|terminal| terminal.command.as_str())
+                .collect::<Vec<_>>(),
+            ["npm run dev"]
+        );
+        session.rpc.lock().await.close().await.unwrap();
     }
 
     struct FixtureAuthority;

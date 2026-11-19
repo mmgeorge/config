@@ -21,7 +21,8 @@ use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, proj
 
 const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
 /// Elapsed labels show whole seconds, so a faster refresh would publish identical text.
-const ACTIVITY_REFRESH_INTERVAL_MS: u64 = 1_000;
+/// Elapsed labels show whole seconds, so no label waits longer than this for its next value.
+const ACTIVITY_LABEL_INTERVAL_MS: i64 = 1_000;
 
 pub(crate) mod diff_view;
 
@@ -31,7 +32,9 @@ pub struct SessionPresentation {
     open: Option<OpenPresentation>,
     /// Supplies one presentation time to elapsed labels and the activity refresh cadence.
     clock: Arc<dyn crate::broker::Clock>,
-    activity_refreshed_ms: i64,
+    /// The instant at which a running elapsed label next shows a new value, measured at each
+    /// synchronization; `None` while no label clock runs.
+    activity_due_ms: Option<i64>,
 }
 
 struct OpenPresentation {
@@ -70,6 +73,8 @@ struct OpenPresentation {
 struct StagingContent {
     queue: Vec<PresentedInput>,
     steering: Vec<PresentedInput>,
+    /// Resume hint for the queue heading while delivery is paused.
+    queue_paused: Option<String>,
 }
 
 /// Keep staging semantics identical to admitted input after decoding the editor payload.
@@ -171,6 +176,8 @@ pub struct PresentationOpen {
     pub syntax_pending: bool,
     pub transcript: BufferSnapshot,
     pub startup_timing: std::collections::BTreeMap<&'static str, f64>,
+    /// Milliseconds until a running elapsed label changes, as in `PresentationSync`.
+    pub activity_due_in_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -180,6 +187,9 @@ pub struct PresentationSync {
     pub syntax_pending: bool,
     pub patch: Vec<BufferPatch>,
     pub snapshot: Option<BufferSnapshot>,
+    /// Milliseconds until a running elapsed label changes, absent while no clock runs. The
+    /// editor synchronizes again after this delay, so a silent turn still counts every second.
+    pub activity_due_in_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -261,6 +271,10 @@ pub enum PresentationRequest {
         queue: Vec<StagedInput>,
         #[serde(default)]
         steering: Vec<StagedInput>,
+        /// Resume hint the editor shows with the queue heading while delivery is paused,
+        /// empty when no key resumes it; absent while delivery runs.
+        #[serde(default)]
+        queue_paused: Option<String>,
     },
     Snapshot {
         document: DocumentId,
@@ -574,8 +588,16 @@ impl SessionPresentation {
                 sequence,
                 queue,
                 steering,
+                queue_paused,
             } => {
-                self.set_staging(&document, sequence, queue, steering, questions)?;
+                self.set_staging(
+                    &document,
+                    sequence,
+                    queue,
+                    steering,
+                    queue_paused,
+                    questions,
+                )?;
                 Ok(json!({"updated":true}))
             }
             PresentationRequest::Snapshot { document } => {
@@ -634,13 +656,12 @@ impl SessionPresentation {
 
     /// Render elapsed labels and pace activity refreshes from an injected clock.
     pub(crate) fn with_clock(session_id: String, clock: Arc<dyn crate::broker::Clock>) -> Self {
-        let activity_refreshed_ms = clock.now_ms();
         Self {
             timeline: TimelineStream::new(session_id.clone()),
             session_id,
             open: None,
             clock,
-            activity_refreshed_ms,
+            activity_due_ms: None,
         }
     }
 
@@ -735,6 +756,9 @@ impl SessionPresentation {
                     "reuse_ms",
                     started.elapsed().as_secs_f64() * 1000.0,
                 )]),
+                activity_due_in_ms: self
+                    .activity_due_ms
+                    .map(|due_ms| due_ms.saturating_sub(now_ms).max(0) as u64),
             });
         }
         let mut projected = Vec::new();
@@ -844,12 +868,16 @@ impl SessionPresentation {
         // A reopened presentation shows steering still waiting for its provider, which no
         // editor staging describes anymore.
         update_staging_block(&mut open)?;
+        self.activity_due_ms = activity_label_due(&open, self.timeline.ticking_entries(), now_ms);
         let opened = PresentationOpen {
             diff_view: forge_diff::view::DiffViewOptions::default(),
             status: open.status.snapshot(),
             syntax_pending,
             transcript: snapshot,
             startup_timing,
+            activity_due_in_ms: self
+                .activity_due_ms
+                .map(|due_ms| due_ms.saturating_sub(now_ms).max(0) as u64),
         };
         self.open = Some(open);
         Ok(opened)
@@ -864,17 +892,21 @@ impl SessionPresentation {
             return Err(super::TranscriptProjectionFailure::new(failure.clone()).into());
         }
         let now_ms = self.clock.now_ms();
-        // Either direction counts, so a wall-clock correction cannot stall the counters.
-        if now_ms.abs_diff(self.activity_refreshed_ms) >= ACTIVITY_REFRESH_INTERVAL_MS
-            && self.timeline.ticking_entries().next().is_some()
-        {
-            let open = self
-                .open
-                .as_mut()
-                .context("session presentation is not open")?;
+        let open = self
+            .open
+            .as_mut()
+            .context("session presentation is not open")?;
+        // Labels rendered with their entries are current until the measured instant. A clock set
+        // backward cannot postpone the refresh past one label interval.
+        if self.activity_due_ms.is_some_and(|due_ms| {
+            now_ms >= due_ms || due_ms.saturating_sub(now_ms) > ACTIVITY_LABEL_INTERVAL_MS
+        }) {
             refresh_activity(open, self.timeline.ticking_entries(), now_ms)?;
-            self.activity_refreshed_ms = now_ms;
         }
+        self.activity_due_ms = activity_label_due(open, self.timeline.ticking_entries(), now_ms);
+        let activity_due_in_ms = self
+            .activity_due_ms
+            .map(|due_ms| due_ms.saturating_sub(now_ms).max(0) as u64);
         let open = self.document(document)?;
         let current = open.sections.document.document.revision();
         ensure!(
@@ -900,6 +932,7 @@ impl SessionPresentation {
                 syntax_pending: syntax_pending(open),
                 patch,
                 snapshot: None,
+                activity_due_in_ms,
             })
         } else {
             Ok(PresentationSync {
@@ -908,6 +941,7 @@ impl SessionPresentation {
                 syntax_pending: syntax_pending(open),
                 patch: Vec::new(),
                 snapshot: Some(open.sections.document.snapshot()?),
+                activity_due_in_ms,
             })
         }
     }
@@ -918,6 +952,7 @@ impl SessionPresentation {
         sequence: u64,
         queue: Vec<StagedInput>,
         steering: Vec<StagedInput>,
+        queue_paused: Option<String>,
         questions: &crate::question::QuestionSnapshot,
     ) -> Result<()> {
         let open = self
@@ -939,7 +974,11 @@ impl SessionPresentation {
             .into_iter()
             .map(|input| PresentedInput::resolve(input, questions))
             .collect::<Result<Vec<_>>>()?;
-        let staging = StagingContent { queue, steering };
+        let staging = StagingContent {
+            queue,
+            steering,
+            queue_paused,
+        };
         if open.staging.as_ref() == Some(&staging) {
             open.staging_sequence = sequence;
             return Ok(());
@@ -1547,6 +1586,28 @@ fn find_agent_exchanges<'source>(
     None
 }
 
+/// Find when a running elapsed label of `source` next shows a new value.
+fn activity_label_due<'source>(
+    open: &OpenPresentation,
+    source: impl IntoIterator<Item = &'source TimelineEntry>,
+    now_ms: i64,
+) -> Option<i64> {
+    let mut due = super::duration::LabelDue::default();
+    for entry in source {
+        if open.agent_scope.is_none() {
+            super::status::StatusProjection::label_due(entry, now_ms, &mut due);
+        }
+        super::projection::timing_label_due(
+            entry,
+            now_ms,
+            &open.sections.nodes.tool,
+            &open.display,
+            &mut due,
+        );
+    }
+    due.due_ms()
+}
+
 fn refresh_activity<'source>(
     open: &mut OpenPresentation,
     source: impl IntoIterator<Item = &'source TimelineEntry>,
@@ -1642,18 +1703,14 @@ fn toggle_inline_output(
     let mut heading = renderer.tool_header(
         heading_id,
         previous_heading.metadata.target[0].id.clone(),
-        crate::buffer::transcript::ToolHeading {
-            shell: call.command_shell.as_deref(),
-            kind: &call.kind,
-            elapsed_ms: call.elapsed_ms(crate::turn::ToolInstant {
+        crate::buffer::transcript::ToolHeading::of(
+            call,
+            crate::turn::ToolInstant {
                 wall_ms: now_ms,
                 active_ms: captured.active_ms,
-            }),
-            failed: call.failed,
-            denied: call.state() == crate::turn::ToolState::Denied,
-            title: &call.title,
+            },
             expanded,
-        },
+        ),
     )?;
     heading.metadata.layout = layout.clone();
     heading.metadata.fold = previous_heading.metadata.fold.clone();
@@ -2321,6 +2378,11 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
         .as_ref()
         .map(|staging| (staged(&staging.steering), staged(&staging.queue)))
         .unwrap_or_default();
+    let queue_heading = queue_heading(
+        open.staging
+            .as_ref()
+            .and_then(|staging| staging.queue_paused.as_deref()),
+    );
     let questions = staged_steering
         .iter()
         .chain(staged_queue.iter())
@@ -2349,7 +2411,7 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
         )?;
         append_staging_section(
             &mut rows,
-            "Queued follow-up inputs",
+            &queue_heading,
             &staged_queue,
             width,
             true,
@@ -2387,6 +2449,15 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
         open.status.set_staging(block)
     } else {
         open.status.set_staging(None)
+    }
+}
+
+/// Name the queued follow-up section, marking a paused queue with the key that resumes it.
+fn queue_heading(paused: Option<&str>) -> String {
+    match paused {
+        None => "Queued follow-up inputs".into(),
+        Some("") => "Queued follow-up inputs · paused".into(),
+        Some(hint) => format!("Queued follow-up inputs · paused · {hint}"),
     }
 }
 
@@ -2985,6 +3056,71 @@ mod tests {
         Ok(())
     }
 
+    /// Presentation time the test sets explicitly.
+    struct ManualClock(std::sync::atomic::AtomicI64);
+    impl crate::broker::Clock for ManualClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Change each elapsed label at its own second boundary, whenever the editor asks.
+    ///
+    /// The host refreshed labels only one second after its previous refresh, and the editor
+    /// asked once a second on its own schedule. Two independent one-second gates sample the
+    /// clock every 1.04 to 1.08 seconds, so a displayed second was skipped whenever the drift
+    /// crossed a boundary. The host now refreshes as soon as any label is due and tells the
+    /// editor when the next one is.
+    #[test]
+    fn elapsed_labels_change_at_every_second_boundary() -> Result<()> {
+        let clock = Arc::new(ManualClock(std::sync::atomic::AtomicI64::new(0)));
+        let mut owner = SessionPresentation::with_clock("session".into(), clock.clone());
+        owner.initialize(vec![TimelineEntry::Status {
+            id: "session:status".into(),
+            created_at_ms: 0,
+            status: crate::session::state_machine::SessionPhase::Working {
+                duration_ms: 0,
+                started_at_ms: Some(0),
+                activity: crate::session::state_machine::WorkflowActivity::Working,
+                reasoning_summary: None,
+                execution: None,
+            },
+            status_thoughts: false,
+            agents: Vec::new(),
+            checks: None,
+        }])?;
+        let document = DocumentId("elapsed-labels".into());
+        owner.open(
+            document.clone(),
+            ViewId("elapsed-view".into()),
+            WidthProfile::default(),
+        )?;
+        let mut samples = Vec::new();
+        for now_ms in [990, 1_010, 2_005, 2_990, 3_000] {
+            clock.0.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+            let revision = owner
+                .document(&document)?
+                .sections
+                .document
+                .document
+                .revision();
+            let synced = owner.sync(&document, revision)?;
+            let label = synced.status.block[0].text.wire_rows()[0].to_owned();
+            samples.push((now_ms, label, synced.activity_due_in_ms));
+        }
+        assert_eq!(
+            samples,
+            [
+                (990, "Working · 0s".to_owned(), Some(10)),
+                (1_010, "Working · 1s".to_owned(), Some(990)),
+                (2_005, "Working · 2s".to_owned(), Some(995)),
+                (2_990, "Working · 2s".to_owned(), Some(10)),
+                (3_000, "Working · 3s".to_owned(), Some(1_000)),
+            ]
+        );
+        Ok(())
+    }
+
     fn interaction_entry(identity: &str) -> TimelineEntry {
         let mut interaction = Exchange {
             finalization_error: None,
@@ -3011,6 +3147,7 @@ mod tests {
             attributed_matches_checkpoint: false,
             provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
+            tool_timeout: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
@@ -3135,7 +3272,14 @@ mod tests {
             }]
         };
 
-        owner.set_staging(&document, 1, Vec::new(), staged(), &Default::default())?;
+        owner.set_staging(
+            &document,
+            1,
+            Vec::new(),
+            staged(),
+            None,
+            &Default::default(),
+        )?;
         assert_eq!(visible(&owner)?, (1, 0));
         let submission = forge_provider_api::SubmissionId::try_from("steer-submission".to_owned())?;
         exchange.append_acknowledged_input(
@@ -3152,7 +3296,14 @@ mod tests {
             (1, 0),
             "acknowledgement duplicated or dropped"
         );
-        owner.set_staging(&document, 2, Vec::new(), Vec::new(), &Default::default())?;
+        owner.set_staging(
+            &document,
+            2,
+            Vec::new(),
+            Vec::new(),
+            None,
+            &Default::default(),
+        )?;
         assert_eq!(
             visible(&owner)?,
             (1, 0),
@@ -3198,6 +3349,67 @@ mod tests {
         Ok(())
     }
 
+    /// Mark a paused queue in its heading with the key that resumes it.
+    ///
+    /// An interrupt pauses delivery and leaves follow-ups looking like ordinary queued rows, so
+    /// nothing told the user the queue would not run or how to resume it.
+    #[test]
+    fn paused_queue_heading_names_the_resume_hint() -> Result<()> {
+        let mut owner = SessionPresentation::new("session".into());
+        let document = DocumentId("paused-staging".into());
+        owner.open(
+            document.clone(),
+            ViewId("paused-view".into()),
+            WidthProfile::default(),
+        )?;
+        let queued = || -> Result<Vec<StagedInput>> {
+            Ok(vec![serde_json::from_value(serde_json::json!({
+                "id":"queued", "text":"Follow-up", "failed":false, "content":{"kind":"message"},
+            }))?])
+        };
+        let status = |owner: &SessionPresentation| -> Result<String> {
+            Ok(owner
+                .open
+                .as_ref()
+                .context("open")?
+                .status
+                .snapshot()
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                ))
+        };
+        owner.set_staging(
+            &document,
+            1,
+            queued()?,
+            Vec::new(),
+            Some("<M-r> resume".into()),
+            &Default::default(),
+        )?;
+        let paused = status(&owner)?;
+        assert!(
+            paused.contains("Queued follow-up inputs · paused · <M-r> resume"),
+            "{paused}"
+        );
+        owner.set_staging(
+            &document,
+            2,
+            queued()?,
+            Vec::new(),
+            None,
+            &Default::default(),
+        )?;
+        let running = status(&owner)?;
+        assert!(running.contains("Queued follow-up inputs"), "{running}");
+        assert!(!running.contains("paused"), "{running}");
+        Ok(())
+    }
+
     #[test]
     fn question_staging_requires_category_and_preserves_failed_delivery() -> Result<()> {
         assert!(
@@ -3233,7 +3445,7 @@ mod tests {
                 "previous":[], "resolution":{"kind":"pending"}, "discussion":[]
             }]
         }))?;
-        owner.set_staging(&document, 1, Vec::new(), vec![staged], &questions)?;
+        owner.set_staging(&document, 1, Vec::new(), vec![staged], None, &questions)?;
         let snapshot = owner.open.as_ref().context("open")?.status.snapshot();
         let text = snapshot
             .block

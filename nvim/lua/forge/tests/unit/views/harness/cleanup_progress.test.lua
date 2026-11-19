@@ -48,4 +48,26 @@ T["authoritative_progress_survives_timeout_and_ignores_older_revisions"] = funct
   eq(state.cleanup_notice, nil)
 end
 
+T["prompt_cancellation_adds_no_notice_until_it_is_reported_slow"] = function()
+  local progress = require("forge.views.harness.cleanup_progress")
+  local state = { runtime_epoch = "host-one" }
+  progress.begin(state, "cancel-one")
+  -- The status row already reads `Stopping`; a notice per phase showed four texts in one second.
+  for revision, phase in ipairs({ "acquiring", "collecting", "draining", "settling" }) do
+    progress.apply(state, { operation_id = "cancel-one", revision = revision, phase = phase })
+    eq(state.cancellation.phase, phase)
+    eq(state.cleanup_notice, nil)
+  end
+  -- Once the owner reports the stop as slow, the notice names the boundary still open.
+  progress.receive(state, { operation_id = "cancel-one", state = "pending", message = "Cancellation still pending" })
+  eq(state.cleanup_notice, "Cancellation pending - committing settlement")
+  progress.apply(state, { operation_id = "cancel-one", revision = 5, phase = "recovering" })
+  eq(state.cleanup_notice, "Cancellation pending - recovering provider")
+  progress.apply(state, { operation_id = "cancel-one", revision = 6, phase = "settled" })
+  eq(state.cleanup_notice, nil)
+  -- The report belonged to the settled operation, so the next stop starts without a notice.
+  progress.apply(state, { operation_id = "cancel-two", revision = 7, phase = "collecting" })
+  eq(state.cleanup_notice, nil)
+end
+
 return T

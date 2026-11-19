@@ -8,9 +8,14 @@ local client = require("forge.client")
 ---@field update fun(snapshot: table?)
 ---@field notice fun(message: string)
 
----Subscribe to terminal inventory; query once on attachment or explicit refresh.
+---Subscribe to terminal inventory, and re-read it on attachment, explicit refresh, and each
+---time the session goes idle.
+---
+---Pushes report edges, and a provider reports an edge only when one of its own notifications
+---prompts it to look. A terminal that ends without such a notification would otherwise stay
+---counted until the next push, so a settled turn reads the level instead.
 ---@param options ForgeTerminalObserverOptions
----@return {refresh: fun(), close: fun()}
+---@return {refresh: fun(), adopt: fun(inventory: table), close: fun()}
 function M.watch(options)
   local closed, pending, last_error = false, false, nil
   local revision = 0
@@ -47,6 +52,15 @@ function M.watch(options)
       end
     end)
   end
+  ---Adopt an inventory that another reader just fetched from the live list, so the status
+  ---count never contradicts what that reader shows. An older read still in flight is dropped.
+  ---@param inventory table
+  function observer.adopt(inventory)
+    if closed or not options.alive() then return end
+    revision = revision + 1
+    last_error = nil
+    options.update(inventory)
+  end
   function observer.close()
     if closed then return end
     closed = true
@@ -60,6 +74,8 @@ function M.watch(options)
       last_error = nil
       options.update(payload.data)
     elseif event == "session_configured" or event == "state_invalidated" then
+      observer.refresh()
+    elseif event == "activity_changed" and type(payload.activity) == "table" and payload.activity.phase == "idle" then
       observer.refresh()
     end
   end)

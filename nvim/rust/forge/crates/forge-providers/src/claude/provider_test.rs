@@ -17,6 +17,8 @@ struct ReceiptState {
     sending: bool,
     accepted: bool,
     rejected: bool,
+    /// The journal owner already retired this attempt, so it refuses a later rejection.
+    retired: bool,
 }
 
 struct FixtureReceipt {
@@ -57,7 +59,19 @@ impl InputReceipt for FixtureReceipt {
         Ok(())
     }
     async fn record_rejected(self: Arc<Self>, _: ProviderError) -> Result<(), ProviderError> {
-        self.state.lock().unwrap().rejected = true;
+        let mut state = self.state.lock().unwrap();
+        if state.retired {
+            return Err(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::TurnStart,
+                forge_provider_api::ProviderFailureKind::Persistence,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Persistence,
+                forge_provider_api::FailureDisposition::Unchanged,
+            )
+            .into());
+        }
+        state.rejected = true;
         Ok(())
     }
     async fn record_failure(self: Arc<Self>, _: ProviderError) -> Result<(), ProviderError> {
@@ -126,6 +140,40 @@ impl forge_provider_api::turn_control::TurnControl for OpenTurnControl {
     }
 }
 
+/// Hold every prompt before dispatch, as the host does while its baseline checkpoint is captured.
+#[derive(Default)]
+struct HeldTurnControl {
+    /// Signals that a prompt reached the hold.
+    entered: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl forge_provider_api::turn_control::TurnControl for HeldTurnControl {
+    async fn before_send(
+        &self,
+        _: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+    async fn receive(&self, _: &forge_provider_api::InvocationScope) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn close(&self, _: &forge_provider_api::InvocationScope) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn status(
+        &self,
+        _: &forge_provider_api::InvocationScope,
+    ) -> Result<forge_provider_api::turn_control::HostTurnStatus, ProviderError> {
+        Ok(forge_provider_api::turn_control::HostTurnStatus {
+            replay_safe: false,
+            cancelled: false,
+            error: None,
+        })
+    }
+}
+
 struct SettledHostEffects;
 
 #[async_trait]
@@ -153,6 +201,16 @@ fn operation_context() -> forge_provider_api::OperationContext {
         cancellation,
     )
     .unwrap()
+}
+
+/// Build the context Harness gives a stop's collection and a steer, which carry no deadline of
+/// their own, so only the adapter's bounds can end them.
+fn unbounded_context() -> forge_provider_api::OperationContext {
+    let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+    forge_provider_api::OperationContext::unbounded(
+        forge_provider_api::OperationId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+        cancellation,
+    )
 }
 
 fn session_request(workspace: &std::path::Path) -> forge_provider_api::SessionRequest {
@@ -710,6 +768,357 @@ async fn interrupt_ends_the_turn_as_interrupted() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// Collect the token usage the adapter reported for a turn.
+fn reported_usage(
+    events: &[forge_provider_api::ProviderEvent],
+) -> Vec<forge_provider_api::usage::TokenUsage> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            forge_provider_api::ProviderEvent::Turn {
+                event: forge_provider_api::TurnEvent::Usage(report),
+                ..
+            } => report.usage().clone(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run one turn whose streamed API messages are `frames`, interrupt it, and answer the
+/// interrupt with `result`, returning the turn's events.
+async fn interrupted_turn_events(
+    frames: Vec<Value>,
+    result: Value,
+) -> Vec<forge_provider_api::ProviderEvent> {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(move || {
+        let frames = frames.clone();
+        let result = result.clone();
+        Box::new(move |frame| {
+            if let Some(uuid) = user_uuid(frame) {
+                let mut reply = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+                reply.extend(frames.clone());
+                return Some(reply);
+            }
+            if frame["request"]["subtype"] == "interrupt" {
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    result.clone(),
+                ]);
+            }
+            None
+        })
+    });
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let request = prompt_request(
+        &binding,
+        "turn-1",
+        receipt("first"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    provider
+        .turn_start(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    until_message(&mut opened.events).await;
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    let (events, _) = until_completed(&mut opened.events).await;
+    provider.shutdown(operation_context()).await.unwrap();
+    events
+}
+
+/// Build the stream events that start one API message's text, with optional reported usage.
+fn started_text_message(message_id: &str, usage: Option<Value>) -> Vec<Value> {
+    let event = |event: Value| {
+        json!({"type": "stream_event", "event": event, "parent_tool_use_id": null,
+            "uuid": uuid::Uuid::new_v4().to_string()})
+    };
+    let mut message = json!({"id": message_id, "type": "message", "role": "assistant",
+        "content": []});
+    if let Some(usage) = usage {
+        message["usage"] = usage;
+    }
+    vec![
+        event(json!({"type": "message_start", "message": message})),
+        event(json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}})),
+        event(json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "partial"}})),
+    ]
+}
+
+/// The CLI reports zero usage on a result it aborted mid-stream, although the aborted API
+/// message already consumed its prompt; the adapter reports what that message's frames carried.
+///
+/// Input counts are fixed when the message starts, but its output count is final only in its
+/// `message_delta` or in an assistant frame that carries a `stop_reason`. The CLI copies the
+/// `message_start` count into the assistant frames of a message still streaming, so a message cut
+/// off before either final report has no output figure, and the turn reports none.
+#[tokio::test]
+async fn interrupted_result_without_usage_reports_the_streamed_message_usage() {
+    let aborted = json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+        "duration_ms": 10, "num_turns": 1, "terminal_reason": "aborted_streaming",
+        "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0, "output_tokens": 0},
+        "uuid": uuid::Uuid::new_v4().to_string()});
+    let start_usage = || {
+        json!({"input_tokens": 4, "cache_creation_input_tokens": 1173,
+            "cache_read_input_tokens": 42936, "output_tokens": 3})
+    };
+    let assistant = |message_id: &str, stop_reason: Value| {
+        json!({"type": "assistant", "parent_tool_use_id": null,
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "message": {"id": message_id, "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "partial"}], "stop_reason": stop_reason,
+                "usage": {"input_tokens": 4, "cache_creation_input_tokens": 1173,
+                    "cache_read_input_tokens": 42936, "output_tokens": 3}}})
+    };
+    let usage = |output: Option<u64>| {
+        vec![forge_provider_api::usage::TokenUsage {
+            input: Some(44113),
+            cached_input: Some(42936),
+            reasoning: None,
+            output,
+        }]
+    };
+
+    // The assistant frame of a message still streaming repeats the start count.
+    let mut streaming = started_text_message("msg-1", Some(start_usage()));
+    streaming.push(assistant("msg-1", Value::Null));
+    let events = interrupted_turn_events(streaming, aborted.clone()).await;
+    assert_eq!(reported_usage(&events), usage(None));
+
+    // A message that finished before the abort reported its final count.
+    let mut finished = started_text_message("msg-1", Some(start_usage()));
+    finished.push(json!({"type": "stream_event", "parent_tool_use_id": null,
+        "uuid": uuid::Uuid::new_v4().to_string(),
+        "event": {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 412}}}));
+    let events = interrupted_turn_events(finished, aborted.clone()).await;
+    assert_eq!(reported_usage(&events), usage(Some(412)));
+
+    // An assistant frame with a stop reason is final as well.
+    let mut stopped = started_text_message("msg-1", Some(start_usage()));
+    stopped.push(assistant("msg-1", json!("end_turn")));
+    let events = interrupted_turn_events(stopped, aborted.clone()).await;
+    assert_eq!(reported_usage(&events), usage(Some(3)));
+
+    // A turn aborted before any API message reported usage has no figures to show.
+    let events = interrupted_turn_events(started_text_message("msg-1", None), aborted).await;
+    assert_eq!(reported_usage(&events), []);
+}
+
+/// A completed turn reports the result's usage once, not again from its message frames.
+#[tokio::test]
+async fn completed_result_reports_only_its_own_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        Box::new(move |frame| {
+            let uuid = user_uuid(frame)?;
+            let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            frames.extend(text_message("msg-1", &["done"]));
+            frames.push(lifecycle(&uuid, "completed"));
+            frames.push(result_success());
+            Some(frames)
+        })
+    });
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    provider
+        .turn_start(
+            operation_context(),
+            &binding,
+            prompt_request(
+                &binding,
+                "turn-1",
+                receipt("first"),
+                forge_provider_api::permissions::PermissionResponse::Allow,
+            ),
+        )
+        .await
+        .unwrap();
+    let (events, _) = until_completed(&mut opened.events).await;
+    assert_eq!(
+        reported_usage(&events),
+        [forge_provider_api::usage::TokenUsage {
+            input: Some(1),
+            cached_input: None,
+            reasoning: None,
+            output: Some(2),
+        }]
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// An interrupted reply ends as the turn's response, as a completed one does.
+///
+/// Harness hides an interrupted response and keeps other prose, so prose the adapter left
+/// unclassified stayed in the transcript after Ctrl-C while Codex and Copilot replies left it.
+/// The end of a turn settles each pending prose item's role whatever the turn's outcome.
+#[tokio::test]
+async fn interrupted_reply_is_classified_as_the_response() {
+    use forge_provider_api::message::{ItemCompletion, ItemEvent, MessageOutcome};
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        Box::new(move |frame| {
+            if let Some(uuid) = user_uuid(frame) {
+                let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+                frames.extend(text_message("msg-1", &["partial reply"]));
+                return Some(frames);
+            }
+            if frame["request"]["subtype"] == "interrupt" {
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    result_interrupted(),
+                ]);
+            }
+            None
+        })
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let request = prompt_request(
+        &binding,
+        "turn-1",
+        receipt("first"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    provider
+        .turn_start(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    until_message(&mut opened.events).await;
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    let (events, completed) = until_completed(&mut opened.events).await;
+
+    assert_eq!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Interrupted
+    );
+    assert_eq!(classifications(&events), ["Known(Response)"]);
+    let outcomes = events
+        .iter()
+        .filter_map(|event| match event {
+            forge_provider_api::ProviderEvent::Item {
+                event: ItemEvent::Completed(ItemCompletion::AgentMessage(completion)),
+                ..
+            } => Some((completion.text.as_str(), completion.outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, [("partial reply", MessageOutcome::Interrupted)]);
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// The CLI closes a running tool with an error result when the client interrupts the turn.
+///
+/// That result reports no failure of the tool itself, so the tool ends as interrupted, as the
+/// tools the CLI leaves without any result do.
+#[tokio::test]
+async fn interrupted_tool_result_ends_the_tool_as_interrupted() {
+    use forge_provider_api::message::{ItemCompletion, ItemEvent, ItemStart};
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        Box::new(move |frame| {
+            if let Some(uuid) = user_uuid(frame) {
+                return Some(vec![
+                    lifecycle(&uuid, "queued"),
+                    lifecycle(&uuid, "started"),
+                    json!({"type": "assistant", "message": {"id": "msg-1", "model": "claude-haiku-5-5",
+                        "type": "message", "role": "assistant", "content": [{"type": "tool_use",
+                            "id": "toolu_1", "name": "Bash", "input": {"command": "sleep 60"}}],
+                        "usage": {"input_tokens": 1, "output_tokens": 2}},
+                        "parent_tool_use_id": null, "uuid": uuid::Uuid::new_v4().to_string()}),
+                ]);
+            }
+            if frame["request"]["subtype"] == "interrupt" {
+                let mut aborted = result_interrupted();
+                aborted["terminal_reason"] = json!("aborted_tools");
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    json!({"type": "user", "message": {"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "toolu_1", "is_error": true,
+                        "content": "[Request interrupted by user for tool use]"}]},
+                        "parent_tool_use_id": null, "uuid": uuid::Uuid::new_v4().to_string()}),
+                    aborted,
+                ]);
+            }
+            None
+        })
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let request = prompt_request(
+        &binding,
+        "turn-1",
+        receipt("first"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    provider
+        .turn_start(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    loop {
+        let envelope = opened.events.recv().await.unwrap().unwrap();
+        if matches!(
+            envelope.event,
+            forge_provider_api::ProviderEvent::Item {
+                event: ItemEvent::Started(ItemStart::CommandExecution(_)),
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    let (events, completed) = until_completed(&mut opened.events).await;
+
+    assert_eq!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Interrupted
+    );
+    let outcomes = events
+        .iter()
+        .filter_map(|event| match event {
+            forge_provider_api::ProviderEvent::Item {
+                event: ItemEvent::Completed(ItemCompletion::CommandExecution(completion)),
+                ..
+            } => Some(completion.outcome.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes,
+        [forge_provider_api::tool::ToolOutcome::Interrupted]
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// A `can_use_tool` request reaches Harness permissions, and a denial answers the CLI with deny.
 #[tokio::test]
 async fn permission_requests_route_through_harness_decisions() {
@@ -1004,6 +1413,175 @@ async fn unanswered_interrupt_ends_the_turn() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// Answer the first `get_context_usage` request, the startup instruction query, and leave every
+/// later one unanswered, as a CLI whose context accounting hangs does.
+fn context_query_hangs_after_startup(prompt: PeerHandler) -> PeerHandler {
+    let mut prompt = prompt;
+    let mut answered = false;
+    Box::new(move |frame| {
+        if frame["request"]["subtype"] == "get_context_usage" {
+            if std::mem::replace(&mut answered, true) {
+                return Some(Vec::new());
+            }
+            return None;
+        }
+        prompt(frame)
+    })
+}
+
+/// Count the `get_context_usage` requests Forge has written.
+fn context_queries(launcher: &PeerLauncher) -> usize {
+    launcher
+        .frames("control_request")
+        .iter()
+        .filter(|frame| frame["request"]["subtype"] == "get_context_usage")
+        .count()
+}
+
+/// A turn whose `result` arrived completes although the context-usage query after it never
+/// returns.
+///
+/// The figure only decorates the status line, so the turn completes and classifies its reply as
+/// the response without it. The outer bound fails the test instead of hanging it.
+#[tokio::test(start_paused = true)]
+async fn completed_turn_does_not_wait_for_an_unanswered_context_query() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher =
+        PeerLauncher::new(|| context_query_hangs_after_startup(answering_peer(&["ready"])));
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    start_prompt(&provider, &binding, "turn-1").await;
+    let (events, completed) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        until_completed(&mut opened.events),
+    )
+    .await
+    .expect("the turn completes without its context usage");
+
+    assert_eq!(classifications(&events), ["Known(Response)"]);
+    assert_eq!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal
+        }
+    );
+    assert_eq!(context_queries(&launcher), 2);
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// An interrupt that arrives after the CLI's `result`, while the adapter still finishes the turn,
+/// ends the interrupt operation promptly.
+///
+/// No `interrupt` request is needed, because the CLI already ended its turn; the interrupt only
+/// abandons the context-usage query. The outer bound is shorter than that query's own deadline.
+#[tokio::test(start_paused = true)]
+async fn interrupt_after_the_result_abandons_the_context_query() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        context_query_hangs_after_startup(Box::new(|frame| {
+            if frame["request"]["subtype"] == "interrupt" {
+                return Some(Vec::new());
+            }
+            answering_peer(&["ready"])(frame)
+        }))
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let scope = start_prompt(&provider, &binding, "turn-1").await;
+    while context_queries(&launcher) < 2 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        provider.turn_interrupt(
+            unbounded_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        ),
+    )
+    .await
+    .expect("the interrupt ends before the context query's deadline")
+    .unwrap();
+    let (_, completed) = until_completed(&mut opened.events).await;
+
+    assert_eq!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal
+        }
+    );
+    assert!(
+        launcher
+            .frames("control_request")
+            .iter()
+            .all(|frame| frame["request"]["subtype"] != "interrupt")
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A steer the CLI never acknowledges cannot hold an interrupted turn open.
+///
+/// The CLI answers the interrupt and ends its turn, but the steer's acknowledgement wait keeps the
+/// steering boundary that ends the turn. The interrupt bounds that wait by the interrupt grace
+/// period, as it bounds a prompt's, and the steer fails because its consumption is unknown.
+#[tokio::test(start_paused = true)]
+async fn unacknowledged_steer_cannot_outlive_its_interrupt() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        let mut prompted = false;
+        Box::new(move |frame| {
+            if frame["request"]["subtype"] == "interrupt" {
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    result_interrupted(),
+                ]);
+            }
+            let uuid = user_uuid(frame)?;
+            if std::mem::replace(&mut prompted, true) {
+                // The wedged CLI never acknowledges the steer.
+                return Some(Vec::new());
+            }
+            let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            frames.extend(text_message("msg-1", &["partial"]));
+            Some(frames)
+        })
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let scope = start_prompt(&provider, &binding, "turn-1").await;
+    until_message(&mut opened.events).await;
+    let steer = tokio::spawn({
+        let provider = provider.clone();
+        let binding = binding.clone();
+        let scope = scope.clone();
+        async move {
+            provider
+                .turn_steer(
+                    unbounded_context(),
+                    &binding,
+                    journaled_steering(scope, "more", "steer"),
+                )
+                .await
+        }
+    });
+    while launcher.frames("user").len() < 2 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let interrupted = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        provider.turn_interrupt(
+            unbounded_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        ),
+    )
+    .await;
+
+    assert!(interrupted.is_ok(), "the interrupt operation ended");
+    assert!(steer.await.unwrap().is_err());
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// Interrupting an input the CLI has queued but not started ends the turn without a `result`.
 ///
 /// A CLI that is still starting, as after a resume or a fork, queues the first input. An interrupt
@@ -1086,6 +1664,87 @@ async fn interrupting_a_queued_input_ends_the_turn_and_keeps_the_binding() {
         &binding,
         "turn-2",
         receipt("second"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    request.input = forge_provider_api::forge::TurnInput::user(
+        forge_provider_api::input::PromptInput::Text("again".into()),
+    );
+    provider
+        .turn_start(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    let (events, completed) = until_completed(&mut opened.events).await;
+    assert_eq!(streamed_text(&events), "answer");
+    assert!(matches!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
+    ));
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Interrupting a prompt that is still held before dispatch reports the turn collected.
+///
+/// The host holds every prompt before dispatch until its baseline checkpoint is captured, and the
+/// adapter installs the turn's collector before that hold. A cancel that arrives during the hold
+/// ends the turn as a pre-dispatch rejection: nothing was written to the CLI, so no native turn
+/// exists and the interrupt has nothing left to stop. Reporting that rejection as an interrupt
+/// failure made the host treat the stop as uncertain and restart a healthy provider. The second
+/// prompt covers the journal the host has already retired, which refuses the adapter's rejection
+/// record.
+#[tokio::test]
+async fn interrupting_a_prompt_held_before_dispatch_reports_it_collected() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| answering_peer(&["answer"]));
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    for (turn, retired) in [("turn-1", false), ("turn-2", true)] {
+        let held_receipt = receipt(turn);
+        held_receipt.state.lock().unwrap().retired = retired;
+        let control = Arc::new(HeldTurnControl::default());
+        let mut request = prompt_request(
+            &binding,
+            turn,
+            held_receipt,
+            forge_provider_api::permissions::PermissionResponse::Allow,
+        );
+        request.turn_control = control.clone();
+        let scope = request.scope.clone();
+        let start = tokio::spawn({
+            let provider = provider.clone();
+            let binding = binding.clone();
+            async move {
+                provider
+                    .turn_start(operation_context(), &binding, request)
+                    .await
+            }
+        });
+        control.entered.notified().await;
+
+        let interrupted = provider
+            .turn_interrupt(
+                operation_context(),
+                &binding,
+                forge_provider_api::CancelRequest { scope },
+            )
+            .await;
+        assert!(
+            interrupted.is_ok(),
+            "{turn}: interrupting an undispatched prompt failed: {interrupted:?}"
+        );
+        assert!(
+            start.await.unwrap().is_err(),
+            "{turn}: the cancelled prompt reported acceptance"
+        );
+        assert!(
+            launcher.frames("user").is_empty(),
+            "{turn}: the cancelled prompt reached the CLI"
+        );
+    }
+
+    let mut request = prompt_request(
+        &binding,
+        "turn-3",
+        receipt("third"),
         forge_provider_api::permissions::PermissionResponse::Allow,
     );
     request.input = forge_provider_api::forge::TurnInput::user(

@@ -135,6 +135,8 @@ pub(super) fn diagnostic_field(key: &str) -> bool {
             | "revision"
             | "phase"
             | "disposition"
+            | "retraction_eligible"
+            | "native_rollback"
             | "terminal_inventory_error"
             | "elapsed_ms"
             | "duration_ms"
@@ -156,6 +158,7 @@ pub(super) fn diagnostic_field(key: &str) -> bool {
             | "encoding_error_count"
             | "obsolete_count"
             | "contention_count"
+            | "storage_cause"
     )
 }
 

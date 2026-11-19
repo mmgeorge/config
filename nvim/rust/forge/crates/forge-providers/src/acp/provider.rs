@@ -822,6 +822,7 @@ impl AcpProvider {
         let state = Arc::new(AcpSessionState::new_binding(
             self.kind,
             self.admission.clone(),
+            request.workspace.clone(),
         ));
         let conversation = AcpConversation::open(
             super::AcpLaunch {
@@ -1271,10 +1272,7 @@ impl AcpProvider {
                 )
             })?;
         if let Some(result) = record.result.lock().await.clone() {
-            return match result {
-                Ok(_) | Err(ProviderError::Cancelled) => Ok(()),
-                Err(error) => Err(error),
-            };
+            return crate::turn_runner::interrupt_outcome(result);
         }
         let task = session
             .active
@@ -1290,10 +1288,7 @@ impl AcpProvider {
             .state
             .revoke_invocation_callbacks(&request.scope)
             .await;
-        match session.settlement(&request.scope).await {
-            Ok(_) | Err(ProviderError::Cancelled) => Ok(()),
-            Err(error) => Err(error),
-        }
+        crate::turn_runner::interrupt_outcome(session.settlement(&request.scope).await)
     }
 
     async fn reconcile_input(
@@ -1550,6 +1545,7 @@ impl AcpProvider {
             Arc::new(AcpSessionState::new_binding(
                 self.kind,
                 self.admission.clone(),
+                workspace.to_owned(),
             )),
             cleanup,
         )

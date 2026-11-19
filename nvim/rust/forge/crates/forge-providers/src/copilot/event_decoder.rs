@@ -66,6 +66,22 @@ struct NativeTool {
     has_changes: bool,
 }
 
+/// Remember which unapplied notification types one binding has already warned about.
+///
+/// Every turn builds its own decoder, so the binding owns this memory and lends it to each one.
+#[derive(Clone, Default)]
+pub(crate) struct ReportedEventTypes(std::sync::Arc<std::sync::Mutex<HashSet<String>>>);
+
+impl ReportedEventTypes {
+    /// Record a notification type and report whether the binding had not recorded it before.
+    fn insert(&self, event_type: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(event_type.to_owned())
+    }
+}
+
 pub struct CopilotEventDecoder {
     scope: InvocationScope,
     workspace: String,
@@ -88,7 +104,7 @@ pub struct CopilotEventDecoder {
     child_agents: HashMap<forge_provider_api::ThreadId, forge_provider_api::agent::AgentId>,
     callbacks: Option<std::sync::Arc<dyn super::provider::NativeCallbackRouter>>,
     turn_owner: Option<forge_provider_api::ProviderEventSink>,
-    unsupported_events: HashSet<String>,
+    reported_event_types: ReportedEventTypes,
     instructions: std::sync::Arc<std::sync::Mutex<crate::instructions::InstructionTracker>>,
 }
 
@@ -115,7 +131,7 @@ impl CopilotEventDecoder {
             children: HashMap::new(),
             child_events: HashMap::new(),
             child_agents: HashMap::new(),
-            unsupported_events: HashSet::new(),
+            reported_event_types: Default::default(),
             instructions: Default::default(),
         }
     }
@@ -126,6 +142,12 @@ impl CopilotEventDecoder {
         instructions: std::sync::Arc<std::sync::Mutex<crate::instructions::InstructionTracker>>,
     ) -> Self {
         self.instructions = instructions;
+        self
+    }
+
+    /// Share the binding's warned notification types so a later turn does not repeat a warning.
+    pub(crate) fn with_reported_event_types(mut self, reported: ReportedEventTypes) -> Self {
+        self.reported_event_types = reported;
         self
     }
 
@@ -318,7 +340,7 @@ impl CopilotEventDecoder {
         event_type: &str,
         sink: &AdapterActivityWriter,
     ) -> Result<(), ProviderError> {
-        if !self.unsupported_events.insert(event_type.to_owned()) {
+        if !self.reported_event_types.insert(event_type) {
             return Ok(());
         }
         sink.send_wait(AdapterActivity::Warning(
@@ -1293,8 +1315,8 @@ impl CopilotEventDecoder {
                     arguments.get("command").and_then(Value::as_str),
                     Some("str_replace" | "create" | "insert" | "undo_edit")
                 );
-        let invocation =
-            crate::copilot::tool_semantics::normalize_invocation(NativeToolDescription {
+        let invocation = crate::copilot::tool_semantics::normalize_invocation(
+            NativeToolDescription {
                 semantics: Default::default(),
                 kind: if file_tool {
                     NativeToolKind::FileChange
@@ -1305,7 +1327,9 @@ impl CopilotEventDecoder {
                     .unwrap_or_else(|| name.clone()),
                 name,
                 arguments,
-            });
+            },
+            &self.workspace,
+        );
         if let Some(existing) = self.tool.get_mut(&key) {
             if existing.invocation.kind != invocation.kind
                 || existing.finished && existing.invocation != invocation
@@ -1874,9 +1898,10 @@ enum UnmappedDisposition {
 /// Classify Copilot SDK 1.0.26 notifications that the main decoder dispatch does not map.
 ///
 /// The prompt driver owns idle, abort, checklist, and turn-boundary evidence; the terminal
-/// observer owns background inventory; the SDK handle and turn evidence own input ancestry; and
-/// the permission callback owns permission requests. Unknown and interaction-bearing types such
-/// as `session.warning`, `model.call_failure`, or `elicitation.requested` remain `Unsupported`.
+/// observer owns background inventory; the SDK handle and turn evidence own input ancestry; the
+/// retraction request owns history truncation; and the permission callback owns permission
+/// requests. Unknown and interaction-bearing types such as `session.warning`,
+/// `model.call_failure`, or `elicitation.requested` remain `Unsupported`.
 fn unmapped_disposition(event_type: &str) -> UnmappedDisposition {
     match event_type {
         "session.todos_changed"
@@ -1890,6 +1915,9 @@ fn unmapped_disposition(event_type: &str) -> UnmappedDisposition {
         // its start and the result the handler already returned.
         | "external_tool.requested"
         | "external_tool.completed"
+        // The retraction request that truncates history owns the removed range; this
+        // notification only echoes the result that request already returned.
+        | "session.snapshot_rewind"
         | "pending_messages.modified" => UnmappedDisposition::OwnedElsewhere,
         "session.start"
         | "session.resume"
@@ -1962,10 +1990,30 @@ fn unmapped_disposition(event_type: &str) -> UnmappedDisposition {
         // The retained prompt owner settles on abort; a running turn's aborted idle follows it.
         | "abort"
         // An interrupted agent reports its terminal outcome through its aborted idle.
-        | "agent.interrupted" => UnmappedDisposition::NoNormalizedMeaning,
+        | "agent.interrupted"
+        // Prompt-cache accounting: the token counts it explains already arrive as usage.
+        | "prompt_cache_break" => UnmappedDisposition::NoNormalizedMeaning,
         // `model.*` is the runtime's model-call telemetry; `assistant.*` and `session.error`
         // carry the same turns, content, usage, and failures that Forge normalizes.
         telemetry if telemetry.starts_with("model.") => UnmappedDisposition::NoNormalizedMeaning,
         _ => UnmappedDisposition::Unsupported,
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::*;
+
+    /// Prompt-cache telemetry raises no warning, while interaction-bearing notices still do.
+    #[test]
+    fn prompt_cache_break_is_telemetry() {
+        assert_eq!(
+            unmapped_disposition("prompt_cache_break"),
+            UnmappedDisposition::NoNormalizedMeaning
+        );
+        assert_eq!(
+            unmapped_disposition("session.warning"),
+            UnmappedDisposition::Unsupported
+        );
     }
 }

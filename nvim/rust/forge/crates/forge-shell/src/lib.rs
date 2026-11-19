@@ -3,5 +3,6 @@
 pub mod command;
 pub mod containment;
 pub mod process;
+pub mod process_tree;
 pub mod resolution;
 pub mod shell;

@@ -300,4 +300,88 @@ T["timeline_status"] = function()
   vim.api.nvim_buf_delete(composer_buffer, { force = true })
 end
 
+
+-- The hand-off flag in the recorded host status tells the transcript that a queued turn
+-- follows the settled exchange; ordinary work and an empty status report no hand-off.
+T["recorded_hand_off_status_reports_the_hand_off"] = function()
+  local layout = require("forge.views.harness.layout")
+  local transcript_buffer, transcript_window, _, composer_window = layout.open("status-handoff")
+  local status = require("forge.views.harness.status_view").new({
+    transcript = { document = "status-handoff", buffer = transcript_buffer },
+    transcript_window = transcript_window, composer_window = composer_window,
+    alive = function() return true end, notice = error, recover = function() end,
+  })
+  MiniTest.finally(function() pcall(status.close, status) end)
+  eq(status:handoff(), false)
+  local snapshot = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/status-handoff.json"), "\n"))
+  local applied
+  status:apply(snapshot, function(ok) applied = ok end)
+  wait_until(function() return applied ~= nil end, "status view did not settle its publication")
+  eq(applied, true)
+  eq(status:handoff(), true)
+  snapshot.revision = snapshot.revision + 1
+  snapshot.block[1].metadata.status.handoff = nil
+  applied = nil
+  status:apply(snapshot, function(ok) applied = ok end)
+  wait_until(function() return applied ~= nil end, "status view did not settle its publication")
+  eq(status:handoff(), false)
+end
+
+
+-- The host reports when the next elapsed label changes, and the view asks for that change
+-- once, at that delay. A one-second poll on the spinner tick drifted against the host's own
+-- one-second gate and skipped a displayed second whenever the drift crossed a boundary.
+T["refresh_follows_the_host_label_deadline"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local current_time = 0
+  local timers = {}
+  stub(vim.uv, "now", function() return current_time end)
+  stub(vim.uv, "new_timer", function()
+    local timer = { stopped = false }
+    function timer:start(timeout, interval, callback) self.timeout, self.interval, self.callback = timeout, interval, callback end
+    function timer:stop() self.stopped = true end
+    function timer:close() self.closed = true end
+    function timer:is_closing() return self.closed == true end
+    timers[#timers + 1] = timer
+    return timer
+  end)
+  local layout = require("forge.views.harness.layout")
+  local transcript_buffer, transcript_window, _, composer_window = layout.open("label-deadline")
+  local refreshes = 0
+  local status = require("forge.views.harness.status_view").new({
+    transcript = { document = "label-deadline", buffer = transcript_buffer },
+    transcript_window = transcript_window, composer_window = composer_window,
+    alive = function() return true end, notice = error, recover = function() end,
+    refresh = function() refreshes = refreshes + 1 end,
+  })
+  MiniTest.finally(function() pcall(status.close, status) end)
+  status.snapshot = { block = { { text = { "Working · 1s" }, metadata = {
+    status = { row = 0, animated = true, hint = "working" }, decoration = {} } } } }
+  status:render()
+  local spinner = timers[#timers]
+  -- The spinner never asks for labels, however long it runs.
+  current_time = 5000
+  spinner.callback()
+  vim.wait(0)
+  eq(refreshes, 0)
+  status:schedule_refresh(250)
+  local deadline = timers[#timers]
+  eq({ deadline.timeout, deadline.interval }, { 250, 0 })
+  -- A later deadline replaces the pending one instead of adding a second request.
+  status:schedule_refresh(600)
+  eq(deadline.stopped, true)
+  local replaced = timers[#timers]
+  eq(replaced.timeout, 600)
+  replaced.callback()
+  wait_until(function() return refreshes == 1 end, "the deadline never requested a refresh")
+  -- No running clock leaves nothing scheduled.
+  status:schedule_refresh(100)
+  local cancelled = timers[#timers]
+  status:schedule_refresh(nil)
+  eq(cancelled.stopped, true)
+  cancelled.callback()
+  vim.wait(0)
+  eq(refreshes, 1)
+end
+
 return T

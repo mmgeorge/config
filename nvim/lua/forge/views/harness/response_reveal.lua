@@ -29,7 +29,10 @@ end
 ---@param document table Committed native transcript replica.
 ---@param views table<integer, table> Attached transcript windows.
 ---@param reset? boolean Adopt initial or switched history without revealing it.
-function Reveal:publish(document, views, reset)
+---@param handoff? boolean The host reports that a queued turn follows the settled exchange. The
+---successor replaces that exchange at the tail within a few owner steps, so revealing it would
+---move the transcript twice; the settlement is adopted as seen instead.
+function Reveal:publish(document, views, reset, handoff)
   local prompt_row, response_row
   local complete_response = true
   local exchange, settled, live
@@ -65,7 +68,8 @@ function Reveal:publish(document, views, reset)
   local follow = live and self.revision ~= document.revision and self:composer_focused()
   self.exchange, self.settled = exchange, settled == true
   self.revision = document.revision
-  if reset or not follow and (not completed or not response_row or not complete_response) then return end
+  if reset or handoff and not follow
+    or not follow and (not completed or not response_row or not complete_response) then return end
   if vim.api.nvim_get_current_buf() == document.buffer then return end
 
   local first_row = not follow and require("forge.buffer").physical_row(document, prompt_row or response_row) or nil

@@ -16,7 +16,86 @@ local field_input = require("forge.views.picker.field_input")
 
 local active = nil
 local install_action_keymaps
+local render_view
 local resize_group = vim.api.nvim_create_augroup("ForgePickerLayout", { clear = true })
+
+-- A picker that takes focus by itself, such as a permission review or a question, can open while
+-- the user is typing in another window, and the next letters or Enter would then pick a decision
+-- the user never saw. Such a picker sets `input_settle_ms`. When it opens within that interval of
+-- a typed key it settles: it discards every typed key except its close and interrupt keys until
+-- the keyboard has been quiet for the interval, each discarded key restarting it. A guarded picker
+-- that closes without a decision shortly after taking a key discards keys for the same interval,
+-- so keys aimed at it do not land in the window beneath.
+Picker.focus_taking_settle_ms = 350
+local settle_namespace = vim.api.nvim_create_namespace("ForgePickerInputSettle")
+---@type number? Loop time of the last typed key, in milliseconds.
+local last_typed_ms = nil
+---@type {instance?: table, until_ms: number, interval_ms: number, pass_keys: table<string, boolean>}?
+local input_settle = nil
+
+local function settle_pass_keys(instance)
+  local pass_keys = { [vim.keycode("<C-c>")] = true }
+  for _, key in ipairs(keymaps.view_keys_for("picker", "close", instance.spec.keymaps)) do
+    pass_keys[vim.keycode(key)] = true
+  end
+  for _, action in ipairs(instance.spec.action_list or {}) do
+    if action.interrupt and action.key then pass_keys[vim.keycode(action.key)] = true end
+  end
+  return pass_keys
+end
+
+local function end_settling(guard)
+  if input_settle ~= guard then return end
+  input_settle = nil
+  local instance = guard.instance
+  if instance and instance.settle_timer then
+    instance.settle_timer:stop()
+    instance.settle_timer:close()
+    instance.settle_timer = nil
+  end
+  if instance then instance.settling = false end
+  -- The keyboard observer runs under textlock, so the footer redraws after it returns.
+  vim.schedule(function()
+    if instance and instance == active and not instance.settling then render_view(instance) end
+  end)
+end
+
+local function schedule_settle_end(guard)
+  local instance = guard.instance
+  if not instance then return end
+  instance.settle_timer = instance.settle_timer or vim.uv.new_timer()
+  instance.settle_timer:stop()
+  instance.settle_timer:start(math.max(1, math.ceil(guard.until_ms - vim.uv.now())), 0, vim.schedule_wrap(function()
+    if input_settle ~= guard then return end
+    if vim.uv.now() >= guard.until_ms then end_settling(guard) else schedule_settle_end(guard) end
+  end))
+end
+
+---@param instance? table Picker that settles, or nil after a guarded picker closed by itself.
+---@param until_ms number Loop time at which the keyboard counts as quiet.
+---@param interval_ms number
+---@param pass_keys table<string, boolean>
+local function begin_settling(instance, until_ms, interval_ms, pass_keys)
+  local guard = { instance = instance, until_ms = until_ms, interval_ms = interval_ms, pass_keys = pass_keys }
+  input_settle = guard
+  if instance then instance.settling = true end
+  schedule_settle_end(guard)
+end
+
+vim.on_key(function(_, typed)
+  if not typed or typed == "" then return end
+  local now = vim.uv.now()
+  last_typed_ms = now
+  local guard = input_settle
+  if guard and now >= guard.until_ms then end_settling(guard) guard = nil end
+  if not guard or guard.pass_keys[typed] then
+    if active then active.last_typed_ms = now end
+    return
+  end
+  guard.until_ms = now + guard.interval_ms
+  schedule_settle_end(guard)
+  return ""
+end, settle_namespace)
 
 local function valid_window(win)
   return win and vim.api.nvim_win_is_valid(win)
@@ -254,27 +333,39 @@ function Picker._navigation_keys(instance)
   return result
 end
 
---- Build configuration hints from the same effective bindings used by the commands.
+--- Build command hints from the same effective bindings used by the commands.
+---
+--- Field commands appear only on pages that map them. `spec.page_hint` names what the page keys
+--- switch between, `page.confirm_label` names what confirming does, and labelled caller actions
+--- follow the built-in commands.
 function Picker._navigation_footer(instance)
   local category = Picker._navigation_keys(instance)
   local parts = {}
-  local category_keys = vim.list_extend(vim.deepcopy(category.page_previous), category.page_next)
-  if #category_keys > 0 then parts[#parts + 1] = table.concat(category_keys, "/") .. " category" end
   local page = picker_state.page(instance.state, instance.spec)
+  local category_keys = vim.list_extend(vim.deepcopy(category.page_previous), category.page_next)
+  if #category_keys > 0 and #instance.spec.page_list > 1 then
+    parts[#parts + 1] = table.concat(category_keys, "/") .. " " .. (instance.spec.page_hint or "category")
+  end
   local multiple_fields = false
   for _, option in ipairs(page.option_list) do
     if #(option.fields or {}) > 1 then multiple_fields = true break end
   end
+  local fields = page.field_navigation == true
   for _, entry in ipairs({
-    { "previous", "row" }, { "next_field", "field" }, { "next_value", "value" },
-    { "toggle_field", "toggle" }, { "select", page.toggle_on_confirm and "toggle/edit" or "edit/open" }, { "close", "close" },
+    { "previous", "row", true }, { "next_field", "field", fields and multiple_fields },
+    { "next_value", "value", fields }, { "toggle_field", "toggle", fields and not page.toggle_on_confirm },
+    { "select", page.confirm_label or (page.toggle_on_confirm and "toggle/edit" or "edit/open"), true },
   }) do
     local key = picker_keys(instance, entry[1])[1]
-    if key and (entry[1] ~= "next_field" or multiple_fields)
-      and (entry[1] ~= "toggle_field" or not page.toggle_on_confirm) then
-      parts[#parts + 1] = key .. " " .. entry[2]
-    end
+    if key and entry[3] then parts[#parts + 1] = key .. " " .. entry[2] end
   end
+  if page.search and not fields then parts[#parts + 1] = "/ search" end
+  for _, action in ipairs(instance.spec.action_list or {}) do
+    local key = action.command and picker_keys(instance, action.command)[1] or action.key
+    if key and action.label then parts[#parts + 1] = key .. " " .. action.label end
+  end
+  local close_key = picker_keys(instance, "close")[1]
+  if close_key then parts[#parts + 1] = close_key .. " close" end
   return table.concat(parts, "  ")
 end
 
@@ -311,7 +402,7 @@ local function show_help(instance)
     { zindex = 100, wrap = true })
 end
 
-local function render_view(instance)
+render_view = function(instance)
   if not (valid_window(instance.win) and vim.api.nvim_buf_is_valid(instance.buf)) then return end
   local page = picker_state.page(instance.state, instance.spec)
   local bounds = layout.host_bounds(instance.spec.host.window_list)
@@ -326,7 +417,9 @@ local function render_view(instance)
   local input_visible = instance.input_visible == true
   local help_only = instance.spec.hint_mode == "help"
   local footer = help_only and (table.concat(picker_keys(instance, "help"), "/") .. " help")
-    or instance.spec.page_navigation and Picker._navigation_footer(instance) or page.footer
+    or (instance.spec.page_navigation or instance.spec.command_footer) and Picker._navigation_footer(instance)
+    or page.footer
+  if instance.settling then footer = "Waiting for typing to stop" .. (footer and ("  " .. footer) or "") end
   if not input_visible then
     local footer_actions = help_only and action_list(instance) or (instance.spec.host.action_list or {})
     for _, action in ipairs(footer_actions) do
@@ -616,6 +709,7 @@ local function field_action(instance, action, direction)
 end
 
 local function confirm(instance, with_feedback)
+  instance.acted = true
   if field_action(instance, "activate") then return end
   local page = picker_state.page(instance.state, instance.spec)
   local option = picker_state.selected_option(instance.state, instance.spec)
@@ -681,6 +775,7 @@ end
 ---@param instance table
 ---@param action table
 local function run_action(instance, action)
+  instance.acted = true
   if action.callback then action.callback(selection_context(instance), Picker) end
 end
 
@@ -725,6 +820,7 @@ end
 ---@field input? boolean Apply this action inside the freeform editor, overriding matching input bindings.
 ---@field label? string Short label used in picker footers.
 ---@field show_in_help_footer? boolean Show this action beside help in the compact Normal-mode footer.
+---@field interrupt? boolean Interrupts the work that opened the picker; its key passes the input-settle guard.
 ---@field callback? fun(context: ForgePickerSelectionContext, picker: table)
 
 ---@param instance table
@@ -891,10 +987,16 @@ end
 
 ---@param spec ForgePickerSpec
 function Picker.open(spec)
+  -- A picker that replaces another, such as the next step of a chain opened from a confirm
+  -- callback, returns to where the chain began. The replaced picker's own restoration has only
+  -- scheduled its Insert mode by now, so a fresh capture would record Normal mode.
+  local replaced_origin = active and active.origin
+  if active then active.replaced = true end
   Picker.close(true)
   spec.host = spec.host or {}
   spec.host.window_list = spec.host.window_list or { spec.host.control_win or vim.api.nvim_get_current_win() }
   local origin = popup_window.capture_origin()
+  if replaced_origin and vim.api.nvim_win_is_valid(replaced_origin.win) then origin = replaced_origin end
   local control_win = spec.host.control_win or origin.win
   assert(vim.api.nvim_win_is_valid(control_win), "picker control window must be valid")
   local state = picker_state.new(spec)
@@ -917,6 +1019,13 @@ function Picker.open(spec)
     spec.placement or (spec.size_ratio and "center" or nil))
   vim.b[instance.buf].miniclue_disable = true
   active = instance
+  instance.opened_ms = vim.uv.now()
+  if spec.input_settle_ms then
+    if input_settle and not input_settle.instance then input_settle = nil end
+    if last_typed_ms and instance.opened_ms - last_typed_ms < spec.input_settle_ms then
+      begin_settling(instance, last_typed_ms + spec.input_settle_ms, spec.input_settle_ms, settle_pass_keys(instance))
+    end
+  end
   update_deadline_timer(instance)
   render_view(instance)
   install_keymaps(instance)
@@ -1015,6 +1124,13 @@ function Picker.close(notify, reason)
   if not instance then return end
   local resume = Picker.capture_state()
   if instance.timer then instance.timer:stop() instance.timer:close() instance.timer = nil end
+  if input_settle and input_settle.instance == instance then end_settling(input_settle) end
+  local interval_ms = instance.spec.input_settle_ms
+  local now = vim.uv.now()
+  local closed_by_itself = reason ~= "user" and not instance.acted and not instance.replaced
+  if interval_ms and closed_by_itself and instance.last_typed_ms and now - instance.last_typed_ms < interval_ms then
+    begin_settling(nil, now + interval_ms, interval_ms, settle_pass_keys(instance))
+  end
   set_picker_cursor_hidden(instance, false)
   active = nil
   vim.api.nvim_clear_autocmds({ group = resize_group })

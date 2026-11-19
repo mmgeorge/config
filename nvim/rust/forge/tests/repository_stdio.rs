@@ -174,6 +174,8 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
     let exchange: forge_harness::exchange::Exchange = serde_json::from_value(json!({
         "id":"large-history", "session_id":session_id, "agent_id":agent_id,
         "ordinal":1, "prompt":prompt, "kind":"chat", "state":"complete",
+        // The transcript renders an exchange's prompt from its typed opening.
+        "opening":{"kind":"user","content":{"kind":"user_text","text":prompt}},
         "created_at_ms":1, "completed_at_ms":2,
         "attributed_matches_checkpoint":false, "node_list":[]
     }))

@@ -193,3 +193,76 @@ fn accepted_input_never_returns_as_failed_and_retry_preserves_identity() -> Resu
     );
     Ok(())
 }
+
+/// Retrying a failed message is an explicit request to send it, so it resumes a paused queue.
+///
+/// A restart pauses the queue and keeps an interrupted prompt as an unsent failed entry. A retry
+/// that cleared only the failure left the entry queued behind the pause, where nothing sent it.
+#[test]
+fn retry_of_a_failed_message_resumes_a_paused_queue() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("message"))?;
+    let claimed = input.claim("message", 1, InputRoute::Turn)?.unwrap();
+    let failed = input.delivery(
+        "message",
+        Some(InputDelivery::Failed),
+        None,
+        Some("Interrupted before provider dispatch".into()),
+    )?;
+    assert!(failed.upsert[0].revision > claimed.revision);
+    input.suspend(true, None)?;
+    let retried = input.apply(InputOperation {
+        id: "retry".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Retry {
+            id: "message".into(),
+            revision: failed.upsert[0].revision,
+        },
+    })?;
+    assert!(retried.error.is_none());
+    assert!(!retried.suspended, "the retry left the queue paused");
+    assert!(!input.snapshot()?.suspended);
+    Ok(())
+}
+
+/// Release one visited message while the rest of the same edit stays reserved.
+#[test]
+fn release_of_one_message_keeps_the_rest_of_its_edit_reserved() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("earlier"))?;
+    input.apply(submit("later"))?;
+    for id in ["earlier", "later"] {
+        input.apply(InputOperation {
+            id: format!("reserve-{id}"),
+            control_revision: 0,
+            after_control: None,
+            action: InputAction::Reserve {
+                id: id.into(),
+                revision: 1,
+                reservation: "editor".into(),
+            },
+        })?;
+    }
+    let released = input.apply(InputOperation {
+        id: "release-earlier".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Release {
+            reservation: "editor".into(),
+            id: Some("earlier".into()),
+        },
+    })?;
+    assert!(released.error.is_none());
+    let snapshot = input.snapshot()?;
+    let reservation = |id: &str| {
+        snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .and_then(|message| message.reservation().map(str::to_owned))
+    };
+    assert_eq!(reservation("earlier"), None);
+    assert_eq!(reservation("later").as_deref(), Some("editor"));
+    Ok(())
+}

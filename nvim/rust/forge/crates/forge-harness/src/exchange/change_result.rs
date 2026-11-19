@@ -63,16 +63,59 @@ impl Exchange {
         {
             return ExchangeChangeResult::NotStarted;
         }
-        match previous {
-            Some(comparison) => ExchangeChangeResult::Captured(comparison),
-            None => ExchangeChangeResult::Unavailable {
+        match (previous, &self.checkpoint_before, &self.checkpoint_after) {
+            (Some(comparison), _, _) => ExchangeChangeResult::Captured(comparison),
+            // A baseline obliges a closing checkpoint, which only a live owner captures: the
+            // session's next owner retries the finalization of an exchange its killed owner left,
+            // and the session preview shows that exchange settled before any owner has. A capture
+            // that fails records `finalization_error`, handled above, so this one is still due.
+            (None, Some(_), None) => ExchangeChangeResult::Pending { previous: None },
+            (None, Some(_), Some(_)) => ExchangeChangeResult::Unavailable {
                 previous: None,
-                reason: if self.checkpoint_before.is_none() || self.checkpoint_after.is_none() {
-                    "checkpoint identities are missing"
-                } else {
-                    "saved checkpoint comparison is missing"
-                },
+                reason: "saved checkpoint comparison is missing",
+            },
+            (None, None, _) => ExchangeChangeResult::Unavailable {
+                previous: None,
+                reason: "checkpoint identities are missing",
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exchange::ExchangeOutcome;
+
+    /// A finished record with a baseline and no closing checkpoint is pending: only the
+    /// session's next owner captures that checkpoint, and a capture that fails records its own
+    /// error. A record that never held checkpoints keeps the general reason.
+    #[test]
+    fn finished_exchange_without_closing_checkpoint_is_pending() {
+        let finished = |baseline: Option<&str>, error: Option<&str>| {
+            let mut exchange = crate::storage::test::running_exchange("interrupted");
+            exchange.checkpoint_before = baseline.map(str::to_owned);
+            exchange.finish(ExchangeOutcome::Interrupted, 40).unwrap();
+            exchange.finalization_error = error.map(str::to_owned);
+            exchange
+        };
+        assert_eq!(
+            finished(Some("baseline"), None).change_result(),
+            ExchangeChangeResult::Pending { previous: None }
+        );
+        assert_eq!(
+            finished(Some("baseline"), Some("capture failed")).change_result(),
+            ExchangeChangeResult::Unavailable {
+                previous: None,
+                reason: "capture failed"
+            }
+        );
+        assert_eq!(
+            finished(None, None).change_result(),
+            ExchangeChangeResult::Unavailable {
+                previous: None,
+                reason: "checkpoint identities are missing"
+            }
+        );
     }
 }

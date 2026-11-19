@@ -42,14 +42,36 @@ function M.respond(state, operation_id, epoch)
   return true
 end
 
+-- Name the boundary a slow cancellation still waits on.
+local function phase_notice(state, progress)
+  local message = ({ acquiring = "Cancellation pending - acquiring ownership",
+    collecting = "Cancellation pending - collecting native work",
+    draining = "Cancellation pending - draining host work",
+    settling = "Cancellation pending - committing settlement",
+    recovering = "Cancellation pending - recovering provider" })[progress.phase]
+  if progress.response_timed_out then message = message .. " (response timed out)" end
+  diagnostic.set(state, "cleanup_notice", message, { owner = progress.operation_id,
+    category = "cleanup", severity = progress.response_timed_out and "warning" or "info",
+    recovery = "wait", clear_when = "matching host settlement" })
+end
+
 ---Render progress published by the host cleanup owner.
 ---@param state table
 ---@param progress ForgeHarnessCleanupProgress
 function M.receive(state, progress)
-  if M.active(state) then return end
+  if M.active(state) then
+    -- The committed operation knows which boundary is open; the owner's report says only that
+    -- the stop is slow, which is what makes that boundary worth a notice.
+    if state.cancellation.operation_id == progress.operation_id then
+      state.cleanup_reported_id = progress.operation_id
+      phase_notice(state, state.cancellation)
+    end
+    return
+  end
   if state.cleanup_epoch == state.runtime_epoch and state.cleanup_operation_id
     and state.cleanup_operation_id ~= progress.operation_id then return end
   state.cleanup_operation_id, state.cleanup_epoch = progress.operation_id, state.runtime_epoch
+  state.cleanup_reported_id = progress.operation_id
   diagnostic.set(state, "cleanup_notice", progress.message, {
     owner = progress.operation_id, category = "cleanup",
     severity = progress.state == "timed_out" and "warning" or "info",
@@ -70,15 +92,11 @@ function M.apply(state, progress)
     return
   end
   state.cleanup_operation_id, state.cleanup_epoch = progress.operation_id, state.runtime_epoch
-  local message = ({ acquiring = "Cancellation pending - acquiring ownership",
-    collecting = "Cancellation pending - collecting native work",
-    draining = "Cancellation pending - draining host work",
-    settling = "Cancellation pending - committing settlement",
-    recovering = "Cancellation pending - recovering provider" })[progress.phase]
-  if progress.response_timed_out then message = message .. " (response timed out)" end
-  diagnostic.set(state, "cleanup_notice", message, { owner = progress.operation_id,
-    category = "cleanup", severity = progress.response_timed_out and "warning" or "info",
-    recovery = "wait", clear_when = "matching host settlement" })
+  -- The status row reads `Stopping` for the whole operation. A notice for every phase replaced
+  -- its text several times within one second, so only a stop already known to be slow gets one.
+  if progress.response_timed_out or state.cleanup_reported_id == progress.operation_id then
+    phase_notice(state, progress)
+  end
 end
 
 ---Retain the matching timeout notice while the host still owns cleanup.
@@ -96,7 +114,7 @@ end
 function M.settled(state, operation_id)
   if operation_id and state.cleanup_operation_id ~= operation_id then return end
   diagnostic.set(state, "cleanup_notice", nil)
-  state.cleanup_operation_id, state.cleanup_epoch = nil, nil
+  state.cleanup_operation_id, state.cleanup_epoch, state.cleanup_reported_id = nil, nil, nil
   if not operation_id then state.cleanup_request_id, state.cleanup_request_epoch = nil, nil end
 end
 

@@ -766,6 +766,9 @@ pub(crate) fn input_outcome(
                 .collect(),
         },
         InputCommand::CancelEdit(edit) => InputChange::EditCancelled { edit: edit.clone() },
+        InputCommand::ReleaseInput(release) => InputChange::EditCancelled {
+            edit: release.edit.clone(),
+        },
         InputCommand::Remove(input) => InputChange::Removed {
             input: input.id.clone(),
         },

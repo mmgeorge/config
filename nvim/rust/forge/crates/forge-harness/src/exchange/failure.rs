@@ -54,6 +54,14 @@ pub(super) struct OwnerStorageUnavailable;
 /// running, leaves storage healthy, so classifying it as storage failure made one rejected
 /// command disable the whole session. Only SQLite, file I/O, and the owner's storage error types
 /// count as storage; everything else is a rejection of this command.
+/// Report whether a failure says the provider may hold an effect the host did not commit.
+fn delivery_uncertain(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::provider::ProviderError>(),
+        Some(crate::provider::ProviderError::DeliveryUncertain)
+    )
+}
+
 pub(super) fn storage_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<rusqlite::Error>()
@@ -77,13 +85,24 @@ pub(super) fn storage_failure(error: &anyhow::Error) -> bool {
 impl OperationFailure {
     /// Classify the outcome of a command that failed while its work was stopped.
     ///
-    /// A lost deadline reports a timeout, storage failures leave the outcome uncommitted, an
+    /// A lost deadline reports a timeout, contention that rolled the outcome back reports a
+    /// retryable busy failure, other storage failures leave the outcome uncommitted, an
     /// explicit rejection keeps its own failure, a domain rule that refused the command reports
     /// a failed prerequisite, and every other cause means the stop could not prove the provider
     /// idle.
     pub(super) fn into_stopped_command(self) -> StoppedCommand {
         use super::command::CommandFailure;
         match self {
+            // Contention rolled the write back, so the journal records a failure the user can
+            // retry instead of fencing the whole queue as if its state were unknown. A busy
+            // write that left delivery uncertain already committed part of its outcome, so it
+            // stays uncommitted below.
+            Self::Domain(error) | Self::Transition(TransitionFailure::Domain(error))
+                if crate::storage::database::storage_busy(&error)
+                    && !delivery_uncertain(&error) =>
+            {
+                StoppedCommand::Failed(CommandFailure::StorageBusy)
+            }
             Self::Domain(error) | Self::Transition(TransitionFailure::Domain(error))
                 if !storage_failure(&error) =>
             {
@@ -108,6 +127,16 @@ impl OperationFailure {
             | Self::Transition(TransitionFailure::Uncertain) => {
                 StoppedCommand::Failed(CommandFailure::StopFailed)
             }
+        }
+    }
+
+    /// Get the SQLite or filesystem cause of a storage failure as a stable code.
+    pub(super) fn storage_cause(&self) -> Option<&'static str> {
+        match self {
+            Self::Domain(error) | Self::Transition(TransitionFailure::Domain(error)) => {
+                crate::storage::database::storage_cause(error)
+            }
+            _ => None,
         }
     }
 
@@ -195,5 +224,51 @@ impl OperationFailure {
             | Self::ExecutionUnavailable => self.to_string(),
         };
         format!("{reason} ({})", self.code())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn busy() -> anyhow::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        )
+        .into()
+    }
+
+    /// Contention that rolled the outcome back is a retryable failure, not unknown state that
+    /// would close the command queue for the session's lifetime.
+    #[test]
+    fn rolled_back_contention_finishes_the_command_as_busy() {
+        assert!(matches!(
+            OperationFailure::Domain(busy()).into_stopped_command(),
+            StoppedCommand::Failed(super::super::command::CommandFailure::StorageBusy)
+        ));
+        assert_eq!(
+            OperationFailure::Domain(busy()).storage_cause(),
+            Some("sqlite_busy")
+        );
+    }
+
+    /// A busy write after the host half committed leaves the outcome uncommitted for recovery.
+    #[test]
+    fn contention_with_uncertain_delivery_stays_uncommitted() {
+        let error = busy().context(crate::provider::ProviderError::DeliveryUncertain);
+        assert!(matches!(
+            OperationFailure::Domain(error).into_stopped_command(),
+            StoppedCommand::Uncommitted
+        ));
+        let corrupt: anyhow::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        )
+        .into();
+        assert!(matches!(
+            OperationFailure::Domain(corrupt).into_stopped_command(),
+            StoppedCommand::Uncommitted
+        ));
     }
 }

@@ -232,8 +232,30 @@ impl HeldDispatch {
         }
     }
 
+    /// Yield until the owner has queued `count` commands in total, as its trace records.
+    ///
+    /// A fixed number of yields assumed how many steps the owner takes before it queues a
+    /// command; waiting for the queued record itself holds however many steps that takes.
+    async fn queued(&self, count: usize) {
+        while self
+            .trace_events()
+            .filter(|event| event == "exchange.command.queued")
+            .count()
+            < count
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Get the event names the session trace has recorded so far, oldest first.
+    ///
+    /// The trace writer appends on its own thread, so the file is read only after a flush; an
+    /// unflushed read misses recent events whenever that thread runs late.
     fn trace_events(&self) -> impl Iterator<Item = String> {
+        self.controller
+            .trace
+            .flush()
+            .expect("the session trace could not be flushed");
         let path = self
             .controller
             .trace
@@ -498,6 +520,103 @@ async fn failed_restart_fails_the_session_and_reports_it() -> Result<()> {
     .await;
     // A failed session must still shut down, and its listener reports the stream no restart replaced.
     let observation = fixture.finish_reporting_observation().await?;
+    scenario?;
+    assert!(
+        observation.is_err(),
+        "the failed observation stream ended cleanly although no restart replaced it"
+    );
+    Ok(())
+}
+
+/// A failed restart answers the commands queued behind it and later input at once.
+///
+/// Commands wait while the provider restarts. A restart that fails never reopens execution, so
+/// waiting longer only held queued commands and new prompts until shutdown answered them with
+/// `command_owner_stopping`. They must instead fail at once with the restart failure as the
+/// cause, and a new prompt's observation recovery must not start another restart.
+#[tokio::test(start_paused = true)]
+async fn failed_restart_answers_queued_and_later_commands_at_once() -> Result<()> {
+    let mut fixture = HeldDispatch::start(HoldPoint::DuringSend).await?;
+    let scenario = async {
+        fixture
+            .controller
+            .initialization_fails
+            .store(true, Ordering::Release);
+        // Queued behind the in-flight send, then behind the restart the failed send requests.
+        let queued_before = fixture
+            .trace_events()
+            .filter(|event| event == "exchange.command.queued")
+            .count();
+        let configured = fixture.spawn_command(model_change()?);
+        // The paused clock runs this bound out at once when the command never queues.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            fixture.queued(queued_before + 1),
+        )
+        .await
+        .context("the command was never queued behind the held send")?;
+        fixture.settle().await;
+        fixture.release(HeldSendEnd::Fail);
+        // The paused clock runs these bounds out at once when an answer never arrives.
+        let bound = std::time::Duration::from_secs(3600);
+        let configured = tokio::time::timeout(bound, configured)
+            .await
+            .context("the command queued behind the failed restart was never answered")??;
+        let unavailable = |result: &Result<_, crate::exchange::command::ExecuteCommandError>| {
+            matches!(
+                result,
+                Err(crate::exchange::command::ExecuteCommandError::Failed(
+                    crate::exchange::command::CommandFailure::OwnerUnavailable(reason)
+                )) if reason.contains("could not be restarted")
+            )
+        };
+        assert!(
+            unavailable(&configured),
+            "the queued command did not fail with the restart failure: {configured:?}"
+        );
+        let later = tokio::time::timeout(bound, fixture.spawn_command(model_change()?))
+            .await
+            .context("a command after the failed restart was never answered")??;
+        assert!(
+            unavailable(&later),
+            "a later command did not fail with the restart failure: {later:?}"
+        );
+        // A new prompt recovers observation before it reaches the owner.
+        let recovered = tokio::time::timeout(
+            bound,
+            fixture.controller.recover_session_events(&fixture.sink),
+        )
+        .await
+        .context("a new prompt's observation recovery was never answered")?;
+        let error = recovered
+            .err()
+            .context("observation recovery succeeded although the session failed")?;
+        assert_eq!(
+            crate::broker::request_failure_code(&error),
+            "session_unavailable",
+            "observation recovery did not report the failed session: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("could not be restarted"),
+            "observation recovery did not carry the restart failure: {error:#}"
+        );
+        assert_eq!(
+            fixture
+                .trace_events()
+                .filter(|event| event == "exchange.restart.failed")
+                .count(),
+            1,
+            "the session attempted another restart after its restart failed"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let observation = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        fixture.finish_reporting_observation(),
+    )
+    .await
+    .context("the failed session never shut down")??;
     scenario?;
     assert!(
         observation.is_err(),

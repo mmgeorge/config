@@ -223,4 +223,32 @@ T["resume_targets_the_requesting_tab"] = function()
   assert(options.source_state == other and options.focus == nil, "a resume for the selected tab lost its focus")
 end
 
+T["resume_reopens_only_an_unavailable_current_session"] = function()
+  local session = require("forge.session")
+  local navigation = require("forge.views.harness.session_navigation")
+  local mock_client = dofile("nvim/lua/forge/tests/support/mock_client.lua")
+  local requests = mock_client.record()
+  local activations = {}
+  navigation.activate = function(result, options) activations[#activations + 1] = { result = result, options = options } end
+  local current = session.new_harness_state()
+  current.transcript_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(0, current.transcript_buf)
+  current.transcript_win, current.timeline_tab = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_tabpage()
+  session.register_harness("current", current)
+  session.select_harness(current)
+
+  navigation.resume("current", { open_mode = "current" })
+  eq(#requests, 0)
+  eq(session.harness, current)
+
+  current.activity = { revision = 3, phase = "unavailable",
+    unavailable_reason = "The provider stopped and could not be restarted (fixture)." }
+  navigation.resume("current", { open_mode = "current" })
+  eq(#requests, 1)
+  eq(requests[1].spec.method, "session.resume")
+  eq(requests[1].spec.params, { session_id = "current" })
+  requests[1].callback({ session = { id = "current" } })
+  assert(activations[1].options.state == current, "the reopened session left its own view")
+end
+
 return T

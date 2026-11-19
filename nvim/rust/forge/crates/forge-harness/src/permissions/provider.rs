@@ -10,8 +10,6 @@ use async_trait::async_trait;
 use forge_provider_api::permissions::{PermissionResponse, ProviderPermissions};
 use std::sync::{Arc, Mutex as StandardMutex};
 
-pub(crate) const REJECT_ALL_GUIDANCE: &str = "Tool approval is set to reject all, and no user is reviewing requests. Commands and tools that saved permission rules do not allow are rejected automatically. Continue with the allowed tools and commands. Do not wait for approval, retry rejected operations, or work around the restrictions.";
-
 #[derive(Clone)]
 struct PermissionState {
     task_authority: Option<crate::tools::TaskAuthority>,
@@ -243,6 +241,8 @@ impl ProviderPermissionContext {
             .and_then(|sink| sink.scope().invocation())
             .map(|scope| self.coordinator.capture_inheritance(scope))
             .transpose()?;
+        self.coordinator
+            .record_approval_mode(&owner, approval_mode)?;
         *state = PermissionState {
             task_authority: None,
             checkpoint: None,
@@ -305,10 +305,10 @@ impl ProviderPermissions for ProviderPermissionContext {
                     .authorize_request(&child.scope, request, PermissionOrigin::Ordinary)
                     .await
             }
-            Err(_) => denied(
-                "Native child permission ownership is unavailable or retired.",
-                None,
-            ),
+            Err(_) => {
+                Denial::unavailable("Native child permission ownership is unavailable or retired.")
+                    .response(None)
+            }
         }
     }
 
@@ -381,16 +381,51 @@ impl ProviderPermissions for ProviderPermissionContext {
 }
 
 impl ProviderPermissionContext {
+    /// Answer one request, recording any refusal Harness makes before the coordinator sees it.
     async fn authorize_request(
         &self,
         scope: &forge_provider_api::InvocationScope,
         request: PermissionRequest,
         origin: PermissionOrigin,
     ) -> PermissionResponse {
-        if !self.matches_scope(scope) {
-            return denied("Provider session observation was retired.", None);
+        let recorded = request.clone();
+        match self.evaluate_request(scope, request, origin).await {
+            RequestDecision::Respond(response) => response,
+            RequestDecision::Refuse {
+                denial,
+                response,
+                event_sink,
+                execution_kind,
+            } => {
+                let reason = denial
+                    .reason
+                    .as_deref()
+                    .unwrap_or("Harness policy rejected this tool call.");
+                // A failed record leaves the provider's own denial on the row; the refusal stands.
+                let _ = PermissionCoordinator::record_policy_denial(
+                    event_sink.as_ref(),
+                    &recorded,
+                    reason,
+                    execution_kind,
+                )
+                .await;
+                response
+            }
         }
-        let (approval_mode, execution_kind, event_sink, _owner, task_authority, tool_free) =
+    }
+
+    async fn evaluate_request(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+        request: PermissionRequest,
+        origin: PermissionOrigin,
+    ) -> RequestDecision {
+        if !self.matches_scope(scope) {
+            return RequestDecision::Respond(
+                Denial::unavailable("Provider session observation was retired.").response(None),
+            );
+        }
+        let (approval_mode, execution_kind, event_sink, owner, task_authority, tool_free) =
             match self.state.lock() {
                 Ok(state) => (
                     state.approval_mode,
@@ -401,13 +436,27 @@ impl ProviderPermissionContext {
                     state.tool_free,
                 ),
                 Err(_) => {
-                    return denied(
-                        "Automatically rejected because Harness permission context is unavailable.",
-                        None,
+                    return RequestDecision::Respond(
+                        Denial::unavailable("Harness permission context is unavailable.")
+                            .response(None),
                     );
                 }
             };
-        let deny = |reason: &str| denied(reason, Some(approval_mode));
+        // A mode change applies to callbacks already bound to this turn, so the coordinator's
+        // current mode for the owner wins over the one captured when the turn started.
+        let current_mode = || {
+            owner
+                .as_ref()
+                .and_then(|owner| self.coordinator.approval_mode(owner).ok().flatten())
+                .unwrap_or(approval_mode)
+        };
+        let approval_mode = current_mode();
+        let refuse = |denial: Denial| RequestDecision::Refuse {
+            response: denial.response(Some(approval_mode)),
+            denial,
+            event_sink: event_sink.clone(),
+            execution_kind,
+        };
         let mutating = origin != PermissionOrigin::SessionStorage
             && (request.target_list.is_empty()
                 || request.target_list.iter().any(|target| {
@@ -431,19 +480,19 @@ impl ProviderPermissionContext {
             && let Some(authority) = &task_authority
             && let Err(error) = authority.admit_mutation()
         {
-            return deny(&error.to_string());
+            return refuse(Denial::policy(error.to_string()));
         }
         if tool_free {
-            return deny(
-                "Automatically rejected because Background generation has no tools. Return only the requested text from the supplied evidence.",
-            );
+            return refuse(Denial::policy(
+                "Background generation has no tools. Return only the requested text from the supplied evidence.",
+            ));
         }
         if let Some(authority) = &task_authority
             && let Err(error) = authority.validate_task_for_new_request()
         {
-            return deny(&format!(
+            return refuse(Denial::unavailable(format!(
                 "Task authority changed before permission approval: {error:#}"
-            ));
+            )));
         }
         if let Some(writer) = request.target_list.iter().find_map(|target| match target {
             crate::permissions::matcher::PermissionTarget::Command { command, shell } => {
@@ -451,9 +500,7 @@ impl ProviderPermissionContext {
             }
             _ => None,
         }) {
-            return deny(&format!(
-                "Automatically rejected because `{writer}` writes files through the shell. Create and edit files with your file-editing tool, such as apply_patch, instead of shell commands."
-            ));
+            return refuse(Denial::shell_writer(writer));
         }
         if request.target_list.iter().any(|target| {
             matches!(
@@ -465,29 +512,25 @@ impl ProviderPermissionContext {
             )
         }) {
             match self.coordinator.writes_disabled(Some(scope)) {
-                Ok(true) => {
-                    return deny(
-                        "Automatically rejected because filesystem writing is off. The user can enable it with /write.",
-                    );
-                }
+                Ok(true) => return refuse(Denial::writes_off()),
                 Ok(false) => {}
                 Err(error) => {
-                    return deny(&format!(
-                        "Automatically rejected because Harness permission evaluation failed: {error:#}"
-                    ));
+                    return refuse(Denial::unavailable(format!(
+                        "Harness permission evaluation failed: {error:#}"
+                    )));
                 }
             }
         }
         let protected = match self.coordinator.store().read() {
             Ok(store) => protected_target(&request, &store),
             Err(_) => {
-                return deny(
-                    "Automatically rejected because Harness permission store is unavailable.",
-                );
+                return refuse(Denial::unavailable(
+                    "Harness permission store is unavailable.",
+                ));
             }
         };
         if protected {
-            return deny("Automatically rejected because the target is protected by Harness.");
+            return refuse(Denial::policy("The target is protected by Harness."));
         }
         // Rename owns path authorization after the server computes the complete edit set.
         // Never open a generic host-tool approval before that fail-closed check.
@@ -509,9 +552,11 @@ impl ProviderPermissionContext {
                             == crate::permissions::document::PermissionDecision::Ask
                             && evaluation.matched_pattern_list.is_empty()) =>
                 {
-                    PermissionResponse::Allow
+                    RequestDecision::Respond(PermissionResponse::Allow)
                 }
-                _ => deny("LSP rename is not allowed by the saved tool policy."),
+                _ => refuse(Denial::policy(
+                    "LSP rename is not allowed by the saved tool policy.",
+                )),
             };
         }
         if origin == PermissionOrigin::SessionStorage {
@@ -524,7 +569,9 @@ impl ProviderPermissionContext {
                     )
                 })
             {
-                return deny("Invalid session storage permission request.");
+                return refuse(Denial::policy(
+                    "Invalid session storage permission request.",
+                ));
             }
             let evaluation = self
                 .coordinator
@@ -543,17 +590,19 @@ impl ProviderPermissionContext {
                         != crate::permissions::document::PermissionDecision::Deny =>
                 {
                     if !self.matches_scope(scope) {
-                        deny("Provider session observation was retired.")
+                        refuse(Denial::unavailable(
+                            "Provider session observation was retired.",
+                        ))
                     } else {
-                        PermissionResponse::Allow
+                        RequestDecision::Respond(PermissionResponse::Allow)
                     }
                 }
-                Ok(_) => deny(
-                    "Automatically rejected by Harness permission policy for this session file.",
-                ),
-                Err(error) => deny(&format!(
-                    "Automatically rejected because Harness permission evaluation failed: {error:#}"
+                Ok(_) => refuse(Denial::policy(
+                    "Harness permission policy rejects this session file.",
                 )),
+                Err(error) => refuse(Denial::unavailable(format!(
+                    "Harness permission evaluation failed: {error:#}"
+                ))),
             };
         }
         let approval = self.coordinator.authorize_scoped(
@@ -564,13 +613,14 @@ impl ProviderPermissionContext {
             Some(self.approval_authority.clone()),
             execution_kind,
         );
+        let deny = |denial: Denial| RequestDecision::Respond(denial.response(Some(approval_mode)));
         tokio::pin!(approval);
         let mut retired = self.retired.subscribe();
         let resolution = tokio::select! {
             resolution = &mut approval => resolution,
             _ = async { let _ = retired.wait_for(|retired| *retired).await; } => {
                 let _ = self.coordinator.cancel_owner(&scope.owner(), event_sink.as_ref()).await;
-                return deny("Provider session observation was retired while approval was pending.");
+                return deny(Denial::unavailable("Provider session observation was retired while approval was pending."));
             }
         };
         match resolution {
@@ -580,65 +630,253 @@ impl ProviderPermissionContext {
                 | ApprovalResolution::AllowBroad,
             ) => {
                 if !self.matches_scope(scope) {
-                    return deny(
+                    return deny(Denial::unavailable(
                         "Provider session observation was retired while approval was pending.",
-                    );
+                    ));
                 }
                 if let Some(authority) = &task_authority
                     && let Err(error) = authority.validate_scope()
                 {
-                    return deny(&format!(
+                    return deny(Denial::unavailable(format!(
                         "Task authority changed while permission approval was pending: {error:#}"
-                    ));
+                    )));
                 }
                 if mutating
                     && let Some(authority) = &task_authority
                     && let Err(error) = authority.admit_mutation()
                 {
-                    return deny(&error.to_string());
+                    return deny(Denial::policy(error.to_string()));
                 }
-                PermissionResponse::Allow
+                RequestDecision::Respond(PermissionResponse::Allow)
             }
-            Ok(ApprovalResolution::TimedOut) => deny(
-                "Automatically rejected because the approval timeout expired. The user may be unavailable.",
-            ),
-            Ok(ApprovalResolution::DenyPolicy) => {
-                deny("Automatically rejected by Harness permission or filesystem access policy.")
+            Ok(ApprovalResolution::TimedOut) => deny(Denial::timeout()),
+            Ok(ApprovalResolution::DenyPolicy) => deny(Denial::policy(
+                "A saved permission rule or Harness access policy rejects this operation.",
+            )),
+            Ok(ApprovalResolution::DenyMode) => {
+                RequestDecision::Respond(Denial::mode().response(Some(current_mode())))
             }
-            Ok(ApprovalResolution::DenyMode) => deny(
-                "Automatically rejected because the current approval mode denies requests that need confirmation.",
-            ),
             Ok(
                 ApprovalResolution::DenyOnce
                 | ApprovalResolution::DenyExact
                 | ApprovalResolution::DenyBroad,
-            ) => deny("Rejected by the user."),
-            Ok(ApprovalResolution::Cancel) => PermissionResponse::Cancelled,
-            Err(error) => deny(&format!(
-                "Automatically rejected because Harness permission evaluation failed: {error:#}"
-            )),
+            ) => deny(Denial::user()),
+            Ok(ApprovalResolution::Cancel) => {
+                RequestDecision::Respond(PermissionResponse::Cancelled)
+            }
+            Err(error) => deny(Denial::unavailable(format!(
+                "Harness permission evaluation failed: {error:#}"
+            ))),
         }
     }
 }
 
-/// Denies execution with feedback that the provider can return to the model.
-fn denied(reason: &str, approval_mode: Option<ApprovalMode>) -> PermissionResponse {
-    let guidance = if approval_mode == Some(ApprovalMode::Deny) {
-        REJECT_ALL_GUIDANCE
-    } else {
-        ""
-    };
-    PermissionResponse::Deny {
-        reason: Some(format!(
-            "Tool call rejected. The requested operation was not executed. Reason: {reason} \
-         Do not retry or bypass this denial. Continue with permitted actions, or explain the blocker to the user. {guidance}"
-        )),
+/// Separate refusals Harness made on its own from answers the coordinator already published.
+enum RequestDecision {
+    /// The coordinator recorded this answer, or no stream exists to record it on.
+    Respond(PermissionResponse),
+    /// Harness refused before the coordinator evaluated the request, so nothing recorded it yet.
+    Refuse {
+        denial: Denial,
+        response: PermissionResponse,
+        event_sink: Option<HarnessEventSink>,
+        execution_kind: crate::provider::ApprovalExecutionKind,
+    },
+}
+
+/// Name who refused a request, so a model never reads Harness's own decision as the user's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DenialSource {
+    /// Saved rules, access scopes, or another Harness policy refused the request unreviewed.
+    HarnessPolicy,
+    /// The user rejected the request in the approval popup.
+    User,
+    /// The approval expired before the user answered.
+    ApprovalTimeout,
+    /// The Deny approval mode refused a request that needed confirmation.
+    ApprovalMode,
+    /// Harness could not evaluate the request and refused it rather than guess.
+    Unavailable,
+}
+
+/// State what the model should do next, which depends on whether a permitted route exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DenialNext {
+    /// Retrying or rerouting the operation is the risk, so forbid both.
+    DoNotRetry,
+    /// File edits have a permitted route; direct the model to it instead of forbidding retries.
+    UseFileEditingTool,
+}
+
+/// Explain one refusal to the model: who decided, why, and what to do next.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Denial {
+    source: DenialSource,
+    reason: Option<String>,
+    next: DenialNext,
+}
+
+impl Denial {
+    fn policy(reason: impl Into<String>) -> Self {
+        Self {
+            source: DenialSource::HarnessPolicy,
+            reason: Some(reason.into()),
+            next: DenialNext::DoNotRetry,
+        }
+    }
+
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            source: DenialSource::Unavailable,
+            reason: Some(reason.into()),
+            next: DenialNext::DoNotRetry,
+        }
+    }
+
+    fn user() -> Self {
+        Self {
+            source: DenialSource::User,
+            reason: None,
+            next: DenialNext::DoNotRetry,
+        }
+    }
+
+    fn timeout() -> Self {
+        Self {
+            source: DenialSource::ApprovalTimeout,
+            reason: None,
+            next: DenialNext::DoNotRetry,
+        }
+    }
+
+    fn mode() -> Self {
+        Self {
+            source: DenialSource::ApprovalMode,
+            reason: None,
+            next: DenialNext::DoNotRetry,
+        }
+    }
+
+    /// Refuse a shell command that writes files, because only a file-editing tool reports the
+    /// concrete path that write scopes and rules can authorize.
+    fn shell_writer(writer: &str) -> Self {
+        Self {
+            source: DenialSource::HarnessPolicy,
+            reason: Some(format!(
+                "`{writer}` writes files through the shell, where Harness cannot check the target path."
+            )),
+            next: DenialNext::UseFileEditingTool,
+        }
+    }
+
+    fn writes_off() -> Self {
+        Self::policy(
+            "Filesystem writing is off for this session. Tell the user the change needs writes; they can enable them with /write.",
+        )
+    }
+
+    /// Render the model-facing text for the approval mode in force.
+    fn message(&self, approval_mode: Option<ApprovalMode>) -> String {
+        let actor = match self.source {
+            DenialSource::HarnessPolicy => {
+                "Harness policy rejected this tool call; the user did not review or reject it. The requested operation did not run."
+            }
+            DenialSource::User => {
+                "The user rejected this tool call. The requested operation did not run."
+            }
+            DenialSource::ApprovalTimeout => {
+                "The approval request expired before the user answered, so Harness rejected it; the user did not reject it. The requested operation did not run and is not approved."
+            }
+            DenialSource::ApprovalMode => {
+                "The current approval mode denies requests that need confirmation; the user did not review this one. The requested operation did not run."
+            }
+            DenialSource::Unavailable => {
+                "Harness could not evaluate this tool call and rejected it. The requested operation did not run."
+            }
+        };
+        let mut parts = vec![actor.to_owned()];
+        if let Some(reason) = &self.reason {
+            parts.push(format!("Reason: {reason}"));
+        }
+        match self.next {
+            DenialNext::DoNotRetry => {
+                parts.push(
+                    "Do not retry or bypass this denial, including through another tool. Continue with permitted actions, or explain the blocker to the user."
+                        .into(),
+                );
+                if approval_mode == Some(ApprovalMode::Deny) {
+                    parts.push(forge_provider_api::forge::REJECT_ALL_GUIDANCE.into());
+                }
+            }
+            DenialNext::UseFileEditingTool => parts.push(
+                "Do not write files from the shell. Make this edit now with your file-editing tool, such as apply_patch."
+                    .into(),
+            ),
+        }
+        parts.join(" ")
+    }
+
+    /// Deny execution with feedback that the provider can return to the model.
+    fn response(&self, approval_mode: Option<ApprovalMode>) -> PermissionResponse {
+        PermissionResponse::Deny {
+            reason: Some(self.message(approval_mode)),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shell write is refused by Harness policy, and the model is sent to its file-editing tool.
+    ///
+    /// The refusal used to read as a user rejection followed by "Do not retry or bypass this
+    /// denial", so a model told to use another tool in the same breath stopped and reported that
+    /// the user had rejected the edit.
+    #[test]
+    fn shell_writer_denial_names_policy_and_directs_the_edit_to_the_file_tool() {
+        let message = Denial::shell_writer("Set-Content").message(Some(ApprovalMode::Ask));
+        assert!(message.contains("Harness policy rejected this tool call"));
+        assert!(message.contains("the user did not review or reject it"));
+        assert!(message.contains("did not run"));
+        assert!(message.contains("Do not write files from the shell."));
+        assert!(message.contains("Make this edit now with your file-editing tool"));
+        assert!(!message.contains("Do not retry or bypass"), "{message}");
+        assert!(!message.contains("rejected by the user"), "{message}");
+        // Deny mode's reject-all guidance forbids working around restrictions, which would
+        // contradict the permitted route.
+        let under_deny = Denial::shell_writer("Set-Content").message(Some(ApprovalMode::Deny));
+        assert!(!under_deny.contains(forge_provider_api::forge::REJECT_ALL_GUIDANCE));
+    }
+
+    /// Writes-off names Harness policy and `/write`, and forbids rerouting the write.
+    #[test]
+    fn writes_off_denial_names_policy_and_the_write_command() {
+        let message = Denial::writes_off().message(Some(ApprovalMode::Ask));
+        assert!(message.contains("Harness policy rejected this tool call"));
+        assert!(message.contains("writing is off"));
+        assert!(message.contains("/write"));
+        assert!(message.contains("Do not retry or bypass this denial"));
+    }
+
+    /// Only the user's own rejection is attributed to the user.
+    #[test]
+    fn only_user_rejections_name_the_user_as_the_actor() {
+        let user = Denial::user().message(None);
+        assert!(user.starts_with("The user rejected this tool call."));
+        for denial in [
+            Denial::policy("rule"),
+            Denial::timeout(),
+            Denial::mode(),
+            Denial::unavailable("store"),
+        ] {
+            let message = denial.message(None);
+            assert!(!message.starts_with("The user rejected"), "{message}");
+        }
+        let deny_mode = Denial::mode().message(Some(ApprovalMode::Deny));
+        assert!(deny_mode.contains("current approval mode denies"));
+        assert!(deny_mode.contains(forge_provider_api::forge::REJECT_ALL_GUIDANCE));
+    }
 
     /// Standing Allow policy cannot reopen writes after terminal intent, while reads remain available.
     #[tokio::test]

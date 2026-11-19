@@ -134,7 +134,17 @@ impl ExchangeDriver {
             serde_json::json!({"reason":error.to_string(),"update_step":step}),
         );
         services.tasks.mark_configuration_uncertain();
-        self.observation_recovery.finish(Err(error.clone()));
+        // Prompts waiting on this recovery, and every later command and prompt, fail with this
+        // cause rather than a generic one.
+        let reason = format!(
+            "The provider stopped and could not be restarted ({error}). Select the session in /sessions and press Enter to reopen it."
+        );
+        self.observation_recovery.finish(Err(
+            crate::exchange::provider_lifecycle::ProviderLifecycleFailure::SessionUnavailable(
+                reason.clone(),
+            ),
+        ));
+        self.failure_reason.get_or_insert_with(|| reason.clone());
         self.execution_fail(services);
         let event = forge_protocol::message::SessionEvent {
             session_id: session_id.clone(),
@@ -142,9 +152,7 @@ impl ExchangeDriver {
             payload: serde_json::json!({
                 "kind":"error",
                 "code":"provider_restart_failed",
-                "text":format!(
-                    "The provider stopped and could not be restarted ({error}). Reopen the session."
-                ),
+                "text":reason,
             }),
         };
         if let Err(publish_error) = services.publications.publish(event, None) {

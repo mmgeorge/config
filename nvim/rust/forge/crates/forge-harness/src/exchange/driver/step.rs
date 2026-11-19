@@ -449,18 +449,9 @@ impl ExchangeDriver {
                     .push((pending.run.command.record.request.id.clone(), queued));
                 return;
             }
-            // Fatal owners cannot execute newly accepted prompts or resume queued delivery.
-            if matches!(self.execution_state, ExecutionState::Failed)
-                && matches!(
-                    queued.record.request.command,
-                    Command::CancelExchange(_)
-                        | Command::Input(
-                            super::super::command::InputCommand::Submit(_)
-                                | super::super::command::InputCommand::Retry(_)
-                                | super::super::command::InputCommand::ResumeDelivery
-                        )
-                )
-            {
+            // A fatal owner never reopens execution, so every command fails at once with the
+            // owner's failure instead of waiting for a recovery that will not come.
+            if matches!(self.execution_state, ExecutionState::Failed) {
                 let failure = if matches!(queued.record.request.command, Command::CancelExchange(_))
                 {
                     CommandFailure::ProviderFailed

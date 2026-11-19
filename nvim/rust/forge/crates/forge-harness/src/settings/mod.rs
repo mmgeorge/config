@@ -10,7 +10,7 @@ pub(crate) use catalog::{ResourceCatalog, SkillResource};
 pub(crate) use import::{ImportKind, ImportedResource, NativeImport};
 pub(crate) use model_selection::ValidatedModelSelection;
 pub(crate) use resources::SessionResources;
-pub(crate) use store::SettingTarget;
+pub(crate) use store::{IntentCommit, SettingTarget};
 pub use store::{
     PortableSettings, SettingScope, SettingsApplication, SettingsSnapshot, SettingsStore,
 };

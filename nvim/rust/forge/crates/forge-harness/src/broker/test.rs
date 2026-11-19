@@ -11,7 +11,8 @@ mod test_support;
 use test_support::{
     PreparationProbe, checkpoint_fixture, completed_message, settle_managed_children,
 };
-pub(super) use test_support::{git_repository, planning_question_broker, repository};
+pub(crate) use test_support::{git_repository, save_host_interrupted_exchange};
+pub(super) use test_support::{planning_question_broker, repository};
 
 /// Keep rejected command diagnostics on their tools without publishing error notifications.
 #[tokio::test]
@@ -836,6 +837,7 @@ pub(super) fn completed_interaction(
         attributed_matches_checkpoint: false,
         provider_checkpoint_id: None,
         approval_resolution: Vec::new(),
+        tool_timeout: Vec::new(),
         host_file_changes: Vec::new(),
         check_setup: None,
         turn: Vec::new(),
@@ -2825,6 +2827,259 @@ async fn forks_a_live_session_without_taking_its_lease() {
         persisted_source.lease_owner.as_deref(),
         Some("source-client")
     );
+}
+
+/// Advance one millisecond per reading. The timeline orders entries by creation time and then
+/// by random identity, so exchanges created at one fixed instant have no stable order.
+struct AdvancingClock(std::sync::atomic::AtomicI64);
+impl Clock for AdvancingClock {
+    fn now_ms(&self) -> i64 {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A preview is read to see where a session stopped, so a long session keeps its final rows.
+#[tokio::test]
+async fn session_preview_keeps_the_final_rows_of_a_long_session() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = HarnessBroker::initialize_with_clock(
+        InitializeRequest {
+            background: None,
+            provider_launch_by_provider: Default::default(),
+            config_dir: None,
+            data_root: data.path().to_string_lossy().into_owned(),
+            permission_file: None,
+            workspace: repository.path().to_string_lossy().into_owned(),
+            client_id: "preview-client".into(),
+            provider: ProviderLaunch {
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+                command: vec!["mock".into()],
+            },
+            model: "mock-model".into(),
+            effort: "low".into(),
+            session_id: None,
+            new_session_name: None,
+            goal_max_turns: 20,
+            lease_conflict_action: None,
+        },
+        Box::new(AdvancingClock(std::sync::atomic::AtomicI64::new(100))),
+    )
+    .unwrap();
+    for (id, label) in [(1, "earlier"), (2, "latest")] {
+        let text = (1..=150)
+            .map(|row| format!("{label} row {row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = broker
+            .dispatch(Request {
+                id,
+                method: "session.prompt.submit".into(),
+                params: json!({ "text": text }),
+            })
+            .await;
+        assert!(prompt.response.error().is_none());
+    }
+    // The preview reads through its own connection. A direct statement on the broker's handle
+    // waits for that handle's write-behind saves, so both exchanges are committed before it.
+    assert_eq!(
+        broker
+            .store
+            .list_exchange(&broker.session.id)
+            .unwrap()
+            .len(),
+        2
+    );
+    let preview = broker
+        .dispatch(Request {
+            id: 3,
+            method: "session.preview".into(),
+            params: json!({ "session_id": broker.session.id }),
+        })
+        .await;
+    assert!(preview.response.error().is_none());
+    let lines = preview.response.result().unwrap()["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 200);
+    // The mock reply repeats its prompt, so the reply's first row places the final row in it.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Mock response: latest row 1")),
+        "the preview omits the final reply: {:?}",
+        &lines[lines.len() - 3..]
+    );
+    assert_eq!(lines.last(), Some(&"latest row 150"));
+    assert!(
+        !lines.iter().any(|line| line.ends_with("earlier row 1")),
+        "the preview spent its rows on the start of the session"
+    );
+}
+
+/// Preview a running exchange as recovery will settle it once nobody owns its session.
+///
+/// A killed editor and host leave the exchange `Running` in storage, and only the next owner's
+/// recovery records it as interrupted at its last observed time. The preview reads storage
+/// without an owner, so it showed `Thinking` with a figure measured to the preview instant. A
+/// session that a live owner still holds shows its stored state.
+#[tokio::test]
+async fn session_preview_shows_an_unowned_running_exchange_as_interrupted() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let initialize = |client: &str| InitializeRequest {
+        background: None,
+        provider_launch_by_provider: Default::default(),
+        config_dir: None,
+        data_root: data.path().to_string_lossy().into_owned(),
+        permission_file: None,
+        workspace: repository.path().to_string_lossy().into_owned(),
+        client_id: client.into(),
+        provider: ProviderLaunch {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            command: vec!["mock".into()],
+        },
+        model: "mock-model".into(),
+        effort: "low".into(),
+        session_id: None,
+        new_session_name: Some(client.into()),
+        goal_max_turns: 20,
+        lease_conflict_action: None,
+    };
+    let mut killed = HarnessBroker::initialize_with_clock(
+        initialize("killed-client"),
+        Box::new(AdvancingClock(std::sync::atomic::AtomicI64::new(100))),
+    )
+    .unwrap();
+    let mut exchange = completed_interaction("killed", &killed.session.id, Vec::new());
+    exchange.phase = crate::exchange::ExchangePhase::Running;
+    exchange.resume(50).unwrap();
+    let address = crate::turn::test_support::address(&exchange, "turn");
+    exchange.start_turn(address, 60).unwrap();
+    exchange.metrics.observed_elapsed_ms = 4_000;
+    // The killed owner captured a baseline; only the next owner captures the closing checkpoint.
+    exchange.checkpoint_before = Some("baseline".into());
+    killed.store.save_exchange(&exchange).unwrap();
+    let killed_session = killed.session.id.clone();
+    let mut reader = HarnessBroker::initialize_with_clock(
+        initialize("reader-client"),
+        Box::new(AdvancingClock(std::sync::atomic::AtomicI64::new(200))),
+    )
+    .unwrap();
+    async fn preview(reader: &mut HarnessBroker, session_id: &str, id: u64) -> String {
+        let preview = reader
+            .dispatch(Request {
+                id,
+                method: "session.preview".into(),
+                params: json!({ "session_id": session_id }),
+            })
+            .await;
+        assert!(preview.response.error().is_none());
+        preview.response.result().unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let owned = preview(&mut reader, &killed_session, 1).await;
+    assert!(owned.contains("Thinking"), "{owned}");
+    assert!(!owned.contains("Interrupted"), "{owned}");
+    // Dropping the owner without shutdown releases its process lock and leaves storage as a
+    // killed host leaves it.
+    drop(killed);
+    let unowned = preview(&mut reader, &killed_session, 2).await;
+    assert!(unowned.contains("Interrupted 4s"), "{unowned}");
+    assert!(!unowned.contains("Thinking"), "{unowned}");
+    // Resuming captures the closing checkpoint, so the preview reports no lost edits.
+    assert!(!unowned.contains("Edits unavailable"), "{unowned}");
+}
+
+/// Keep the exchange heading and the session status on one cancellation fact.
+///
+/// The owner commits the cancelled exchange inside a command step and records the operation's
+/// settled phase only when its next step begins. A publication between the two reads a finished
+/// `Cancelled` exchange beside the operation's earlier `Settling` phase, and the transcript showed
+/// `Cancelled` above a status row that still read `Stopping`.
+#[tokio::test]
+async fn cancellation_heading_and_status_agree_within_one_publication() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "data_root": data.path(),
+        "workspace": repository.path(),
+        "client_id": "cancellation-heading",
+        "provider": {
+            "kind": forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            "command": ["mock"],
+        },
+        "model": "mock-model",
+        "effort": "low",
+        "goal_max_turns": 20,
+    }))?)?;
+    let session_id = broker.session.id.clone();
+    let mut exchange = completed_interaction("cancelled", &session_id, Vec::new());
+    exchange.phase = crate::exchange::ExchangePhase::Running;
+    exchange.resume(50)?;
+    exchange.begin_finalization(crate::exchange::ExchangeOutcome::Cancelled, 60)?;
+    let mut journal =
+        crate::exchange::journal::CommandJournal::open(&broker.data_root, &session_id)?;
+    let mut progress = |revision, phase| -> Result<()> {
+        journal.append_core(
+            &crate::exchange::core_log::CoreRecord::CancellationProgress {
+                progress: crate::exchange::CancellationProgress {
+                    operation_id: crate::exchange::command::CommandId::new("cancel")?,
+                    exchange_id: Some(exchange.id.as_str().into()),
+                    revision,
+                    phase,
+                    response_timed_out: false,
+                    started_at_ms: 55,
+                    updated_at_ms: 60,
+                    blockers: Default::default(),
+                },
+            },
+        )?;
+        Ok(())
+    };
+    progress(1, crate::exchange::CancellationPhase::Settling)?;
+    let published = |broker: &mut HarnessBroker, exchange: &Exchange| -> Result<(String, bool)> {
+        broker.store.save_exchange(exchange)?;
+        let snapshot = broker.observer().publish(broker)?;
+        let mut rows = Vec::new();
+        for entry in &snapshot.timeline {
+            if matches!(entry, crate::timeline::TimelineEntry::Exchange { .. }) {
+                rows.extend(crate::buffer::projection::tests::project_rows(entry)?);
+            }
+        }
+        let stopping = matches!(
+            snapshot.status,
+            crate::session::state_machine::SessionPhase::Stopping { .. }
+        );
+        Ok((rows.join("\n"), stopping))
+    };
+    // Finalization still settles the exchange, so both read as stopping.
+    let (rows, stopping) = published(&mut broker, &exchange)?;
+    assert!(rows.contains("Stopping"), "{rows}");
+    assert!(
+        stopping,
+        "an unsettled cancellation lost its Stopping status"
+    );
+    // Settlement commits the cancelled exchange before the operation records its settled phase.
+    exchange.finish(crate::exchange::ExchangeOutcome::Cancelled, 70)?;
+    let (rows, stopping) = published(&mut broker, &exchange)?;
+    assert!(rows.contains("Cancelled"), "{rows}");
+    assert!(
+        !stopping,
+        "the transcript reads Cancelled while the status still reads Stopping"
+    );
+    Ok(())
 }
 
 fn preference_provider() -> anyhow::Result<crate::provider::test_support::ProviderTestSession> {

@@ -124,7 +124,7 @@ impl ExchangeDriver {
                     initial: None,
                     completion: ForegroundCompletion::Caller(start.completion),
                     updates: Some(start.updates),
-                    execution: Some(start.execution),
+                    execution: start.execution,
                 });
                 self.restore_delivery(&target, run);
             }

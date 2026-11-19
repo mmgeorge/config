@@ -379,6 +379,23 @@ impl HarnessBroker {
         Ok(true)
     }
 
+    /// Re-project the status after a committed queue change while no exchange runs.
+    ///
+    /// Between turns the status shows the next queued turn as already `Working`
+    /// (`hand_off_phase`). An input command, such as an edit reservation or a removal, can
+    /// withdraw that message without any exchange event, and the status would keep predicting
+    /// a turn that never starts. A running exchange owns the status, so nothing changes then.
+    pub(crate) fn owner_refresh_idle_status(&mut self) -> Result<Vec<SessionEvent>> {
+        if self.owner_current_exchange()?.is_some() {
+            return Ok(Vec::new());
+        }
+        let patch = self.reconcile_live_interaction(None, None)?;
+        if patch.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.event("document_changed", patch.notification())?])
+    }
+
     /// Select active exchange work ahead of a newer queued input awaiting delivery.
     fn owner_current_exchange(&self) -> Result<Option<Exchange>> {
         if let Some(exchange) = self

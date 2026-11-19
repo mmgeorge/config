@@ -38,3 +38,37 @@ fn seconds_label(milliseconds: u64) -> String {
         format!("{seconds}.{fraction}s")
     }
 }
+
+/// The earliest presentation instant at which a running elapsed label shows a new value.
+///
+/// Each label renders whole seconds of its own clock, and clocks start at unrelated instants,
+/// so every clock contributes its own next boundary. The presentation refreshes its labels when
+/// that instant passes and tells the editor how long to wait for it, so neither side samples on
+/// a fixed period that can drift across a boundary and skip a displayed second.
+#[derive(Debug, Default)]
+pub(super) struct LabelDue {
+    due_ms: Option<i64>,
+}
+
+impl LabelDue {
+    /// Count a label showing whole seconds of a clock that reads `elapsed_ms` at `now_ms`.
+    pub fn elapsed(&mut self, now_ms: i64, elapsed_ms: u64) {
+        self.at(now_ms.saturating_add(1000 - (elapsed_ms % 1000) as i64));
+    }
+
+    /// Count a countdown showing whole seconds, rounded up, until `deadline_ms`.
+    pub fn countdown(&mut self, now_ms: i64, deadline_ms: i64) {
+        let remaining = deadline_ms.saturating_sub(now_ms);
+        if remaining > 0 {
+            self.at(now_ms.saturating_add((remaining - 1) % 1000 + 1));
+        }
+    }
+
+    pub fn due_ms(&self) -> Option<i64> {
+        self.due_ms
+    }
+
+    fn at(&mut self, due_ms: i64) {
+        self.due_ms = Some(self.due_ms.map_or(due_ms, |current| current.min(due_ms)));
+    }
+}

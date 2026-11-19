@@ -108,10 +108,9 @@ impl std::fmt::Display for ToolTimeout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Tool or shell command '{}' ({}) exceeded its {} second timeout; execution stopped",
+            "`{}` exceeded its {} tool timeout; execution stopped",
             self.title,
-            self.address.item_id,
-            self.duration.as_secs()
+            timeout_label(self.duration)
         )
     }
 }
@@ -122,6 +121,55 @@ impl ToolTimeout {
     /// Reserve the single diagnostic and tool-state publication for this timeout.
     pub(crate) fn claim_report(&self) -> bool {
         !self.reported.swap(true, Ordering::AcqRel)
+    }
+
+    /// Describe the expiry durably on the exchange that owned the invocation.
+    pub(crate) fn record(&self) -> ToolTimeoutRecord {
+        ToolTimeoutRecord {
+            thread_id: self.address.turn.thread_id.clone(),
+            turn_id: self.address.turn.turn_id.clone(),
+            item_id: self.address.item_id.clone(),
+            title: self.title.clone(),
+            timeout_ms: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// Retain which invocation exceeded its deadline after the watchdog that observed it is gone.
+///
+/// Providers report a stopped invocation as interrupted, which says nothing about why it stopped,
+/// so the exchange keeps this record to mark the tool failed and to show the reason in its
+/// transcript.
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub struct ToolTimeoutRecord {
+    pub thread_id: forge_provider_api::ThreadId,
+    pub turn_id: forge_provider_api::TurnId,
+    pub item_id: forge_provider_api::ItemId,
+    pub title: String,
+    pub timeout_ms: u64,
+}
+
+impl ToolTimeoutRecord {
+    /// Name the configured duration the invocation exceeded, such as `10m` or `1m 30s`.
+    pub fn timeout_label(&self) -> String {
+        timeout_label(Duration::from_millis(self.timeout_ms))
+    }
+}
+
+/// Format a configured timeout in the whole units `/config` accepts.
+fn timeout_label(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    let label = [(hours, "h"), (minutes, "m"), (seconds, "s")]
+        .into_iter()
+        .filter(|(amount, _)| *amount > 0)
+        .map(|(amount, unit)| format!("{amount}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        format!("{}ms", duration.as_millis())
+    } else {
+        label
     }
 }
 

@@ -82,6 +82,18 @@ function M.new(state)
     host.revision = host.revision + 1
     require("forge.views.harness.input_state").receive(state, { revision = host.revision, suspended = false, upsert = {}, removed = { id } })
   end
+  ---Retract a message as the host does: retire its identity and keep its text as an unsent
+  ---follow-up under a new identity, which the editor removes once its composer holds the text.
+  ---@param id string
+  function host.retract(id)
+    local unsent = table.remove(host.messages, assert(position(id)))
+    unsent.id, unsent.revision, unsent.delivery, unsent.intent = "retracted:" .. id, 1, "failed", "queue"
+    unsent.error = "Interrupted before the model replied. Retry to send it again."
+    host.messages[#host.messages + 1] = unsent
+    host.revision = host.revision + 1
+    require("forge.views.harness.input_state").receive(state, { revision = host.revision, suspended = true,
+      upsert = { vim.deepcopy(unsent) }, removed = { id }, retracted = id })
+  end
   return host
 end
 

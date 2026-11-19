@@ -93,14 +93,21 @@ function M.heading_lines(tool, width, indent, now_ms)
   } }
 end
 
---- Checks if a tool descriptor represents a failed or cancelled execution state.
+--- Checks if a tool descriptor represents a failed or denied execution state.
 ---@param tool table Tool descriptor table.
----@return boolean failed True if tool execution failed or was denied/cancelled.
+---@return boolean failed True if tool execution failed or was denied.
 function M.failed(tool)
   if tool.failed == true then return true end
   local status = tostring(tool.status or ""):lower()
   return status == "failed" or status == "error" or status == "denied" or status == "rejected"
-    or status == "cancelled" or status == "canceled"
+end
+
+--- Checks if a tool was stopped before it finished, which is neither a success nor a failure.
+---@param tool table Tool descriptor table.
+---@return boolean interrupted True if the tool was cancelled or interrupted.
+function M.interrupted(tool)
+  local status = tostring(tool.status or ""):lower()
+  return status == "cancelled" or status == "canceled" or status == "interrupted"
 end
 
 --- Formats a single-line summary heading string for a tool call.
@@ -202,6 +209,7 @@ function M.foldtext_chunks(tool, indent, visible_text, now_ms)
   local prefix = (indent or "") .. "• "
   local bullet_group = M.failed(tool) and "ForgeHarnessToolFailure" or "ForgeHarnessToolSuccess"
   if tool.status == "denied" or tool.status == "rejected" then bullet_group = "ForgeHarnessToolDenied" end
+  if M.interrupted(tool) then bullet_group = "ForgeHarnessToolInterrupted" end
   local kind = tool.kind or "tool_call"
   local duration = tool_duration(tool, now_ms)
   if kind ~= "command" then

@@ -34,11 +34,15 @@ struct ApprovalExecution<'scope> {
     directory_policy: Option<Arc<DirectoryPolicy>>,
     authority: Option<Arc<ApprovalAuthority>>,
     kind: ApprovalExecutionKind,
+    /// Whether the approval mode decides this request, as it does for every reported tool
+    /// operation that saved rules leave to the user, but not for a proposal review.
+    mode_governed: bool,
 }
 
 struct PendingApproval {
     token: Uuid,
     view: ApprovalRequestView,
+    mode_governed: bool,
     presentation: PermissionApprovalRequest,
     execution_kind: ApprovalExecutionKind,
     response: oneshot::Sender<ApprovalResolution>,
@@ -134,6 +138,11 @@ pub struct PermissionCoordinator {
     feedback_watch: Mutex<HashMap<crate::provider::ThreadOwner, tokio::sync::watch::Sender<bool>>>,
     skill_by_owner: Mutex<HashMap<crate::provider::ThreadOwner, Arc<crate::skill::SkillAccess>>>,
     directory_by_scope: Mutex<HashMap<crate::provider::InvocationScope, Arc<DirectoryPolicy>>>,
+    /// The approval mode each execution owner's callbacks currently apply.
+    ///
+    /// A turn records its owner's mode when its callbacks bind, and a mode change replaces it, so
+    /// requests later in the same turn follow the new mode without restarting the provider.
+    approval_mode_by_owner: Mutex<HashMap<crate::provider::ThreadOwner, ApprovalMode>>,
 }
 
 impl PermissionCoordinator {
@@ -221,7 +230,127 @@ impl PermissionCoordinator {
             feedback_watch: Mutex::new(HashMap::new()),
             skill_by_owner: Mutex::new(HashMap::new()),
             directory_by_scope: Mutex::new(HashMap::new()),
+            approval_mode_by_owner: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record the approval mode an owner's newly bound callbacks apply.
+    pub(crate) fn record_approval_mode(
+        &self,
+        owner: &crate::provider::ThreadOwner,
+        mode: ApprovalMode,
+    ) -> Result<()> {
+        self.approval_mode_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval mode lock poisoned"))?
+            .insert(owner.clone(), mode);
+        Ok(())
+    }
+
+    /// Get the approval mode an owner's callbacks currently apply, if a turn bound them.
+    pub(crate) fn approval_mode(
+        &self,
+        owner: &crate::provider::ThreadOwner,
+    ) -> Result<Option<ApprovalMode>> {
+        Ok(self
+            .approval_mode_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval mode lock poisoned"))?
+            .get(owner)
+            .copied())
+    }
+
+    /// Apply a new approval mode to an owner's running callbacks and its pending requests.
+    ///
+    /// The mode is Harness policy, so changing it needs no provider restart. A pending request
+    /// already passed saved rules and access checks with an Ask result, so Allow approves it and
+    /// Deny rejects it exactly as a new request under that mode would be decided; Ask leaves it
+    /// waiting for the user. Proposal reviews are not mode-governed and keep waiting.
+    pub(crate) fn apply_approval_mode(
+        &self,
+        owner: &crate::provider::ThreadOwner,
+        mode: ApprovalMode,
+    ) -> Result<()> {
+        self.record_approval_mode(owner, mode)?;
+        let resolution = match mode {
+            ApprovalMode::Allow => ApprovalResolution::AllowOnce,
+            ApprovalMode::Deny => ApprovalResolution::DenyMode,
+            ApprovalMode::Ask => return Ok(()),
+        };
+        let decided = {
+            let mut pending_map = self
+                .pending_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+            let id_list: Vec<_> = pending_map
+                .iter()
+                .filter(|(_, pending)| {
+                    pending.mode_governed
+                        && pending.view.execution_owner.as_ref() == Some(owner)
+                        && !pending.authority.as_ref().is_some_and(|authority| {
+                            authority.0.lock().map(|retired| *retired).unwrap_or(true)
+                        })
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            id_list
+                .into_iter()
+                .filter_map(|id| pending_map.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        if decided.is_empty() {
+            return Ok(());
+        }
+        tokio::spawn(async move {
+            for pending in decided {
+                // The waiter answers the provider; the resolution event only records why.
+                let _ = Self::emit_mode_resolution(&pending, resolution).await;
+                let _ = pending.response.send(resolution);
+            }
+        });
+        Ok(())
+    }
+
+    /// Publish a pending request's decision by the approval mode on its own stream.
+    async fn emit_mode_resolution(
+        pending: &PendingApproval,
+        resolution: ApprovalResolution,
+    ) -> Result<()> {
+        let Some(sink) = pending.resolution_sink.as_ref() else {
+            return Ok(());
+        };
+        let choice = ApprovalChoice {
+            id: "approval_mode".into(),
+            label: "Decided by the approval mode".into(),
+            resolution,
+            rule_list: Vec::new(),
+            directory: None,
+        };
+        let targets = pending
+            .presentation
+            .targets
+            .iter()
+            .map(|target| {
+                Ok(ResolvedPermissionTarget {
+                    target_id: target.target_id.clone(),
+                    decision: choice_decision(&choice)?,
+                    source: ApprovalDecisionSource::ApprovalMode,
+                    rules: Vec::new(),
+                    directory_grants: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sink.send_host(HostEvent::PermissionApproval {
+            execution_kind: pending.execution_kind,
+            event: PermissionApprovalEvent::Resolved(PermissionApprovalResolution {
+                request_id: pending.presentation.request_id.clone(),
+                scope: pending.presentation.scope.clone(),
+                targets,
+                resolved_at_ms: now_ms()?,
+            }),
+        })
+        .await?;
+        Ok(())
     }
 
     pub(crate) fn directories(
@@ -359,6 +488,37 @@ impl PermissionCoordinator {
             .remove(owner);
         self.publish_timeout_feedback(owner)?;
         Ok(feedback)
+    }
+
+    /// Drop one owner's feedback for requests whose turns completed normally after expiring.
+    ///
+    /// The provider already received each expiry as a tool rejection inside that turn and
+    /// answered it, so a continuation turn would only repeat the answer. Feedback for a turn that
+    /// failed or was interrupted, or for a request that expired after its turn settled, remains.
+    pub(crate) fn discard_settled_timeout_feedback(
+        &self,
+        owner: &crate::provider::ThreadOwner,
+        turns: &[(forge_provider_api::ThreadId, forge_provider_api::TurnId)],
+    ) -> Result<()> {
+        let discarded = {
+            let mut feedback_by_owner = self
+                .feedback_by_owner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?;
+            let Some(feedback) = feedback_by_owner.get_mut(owner) else {
+                return Ok(());
+            };
+            let discarded = feedback.discard_settled_turns(turns);
+            if feedback.is_empty() {
+                feedback_by_owner.remove(owner);
+            }
+            discarded
+        };
+        // Watchers wake only when feedback they could act on actually disappeared.
+        if discarded {
+            self.publish_timeout_feedback(owner)?;
+        }
+        Ok(())
     }
 
     /// Subscribe to one owner's retained feedback without losing changes during registration.
@@ -503,7 +663,7 @@ impl PermissionCoordinator {
             })
             .transpose()?
             .flatten();
-        let mut evaluation = (async {
+        let (mut evaluation, precheck_notice) = (async {
             let (workspace, evaluation) = {
                 let store = self
                     .store
@@ -525,22 +685,23 @@ impl PermissionCoordinator {
                 };
                 (workspace, evaluation)
             };
+            // Only an approval the user will answer runs the preflight; Allow and Deny modes
+            // decide Ask without it.
+            let mut precheck_notice = Vec::new();
             if evaluation.decision == PermissionDecision::Ask && approval_mode == ApprovalMode::Ask
             {
                 for target in &request.target_list {
                     if let PermissionTarget::Command { command, shell } = target {
                         let shell = shell.unwrap_or_default();
-                        forge_shell::resolution::validate_command_resolution(
+                        let resolution = forge_shell::resolution::validate_command_resolution(
                             command, shell, &workspace,
                         )
-                        .await
-                        .map_err(|failure| {
-                            crate::permissions::matcher::CommandAnalysisError { shell, failure }
-                        })?;
+                        .await;
+                        precheck_notice.extend(command_precheck(shell, resolution)?);
                     }
                 }
             }
-            Ok::<_, anyhow::Error>(evaluation)
+            Ok::<_, anyhow::Error>((evaluation, precheck_notice))
         })
         .await?;
         if evaluation.decision != PermissionDecision::Deny {
@@ -668,6 +829,16 @@ impl PermissionCoordinator {
             .map(|address| address.scope.owner().clone())
             .or_else(|| event_sink.map(|sink| sink.scope().owner().clone()));
         let mut view = approval_view(&request, &evaluation);
+        if !precheck_notice.is_empty() {
+            view.reason = Some(
+                view.reason
+                    .take()
+                    .into_iter()
+                    .chain(precheck_notice)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
         if let Some(policy) = &directory_policy {
             for (item, target) in view
                 .item_list
@@ -760,6 +931,7 @@ impl PermissionCoordinator {
                 directory_policy,
                 authority,
                 kind: execution_kind,
+                mode_governed: true,
             },
         )
         .await
@@ -824,6 +996,7 @@ impl PermissionCoordinator {
                 directory_policy: None,
                 authority: None,
                 kind: ApprovalExecutionKind::Managed,
+                mode_governed: false,
             },
         )
         .await
@@ -843,6 +1016,7 @@ impl PermissionCoordinator {
             directory_policy,
             authority,
             kind: execution_kind,
+            mode_governed,
         } = execution;
         if let Some(sink) = event_sink {
             view.exchange_id = sink
@@ -905,6 +1079,7 @@ impl PermissionCoordinator {
                 PendingApproval {
                     token,
                     view: view.clone(),
+                    mode_governed,
                     presentation: presentation.clone(),
                     execution_kind,
                     response: sender,
@@ -1365,14 +1540,33 @@ impl PermissionCoordinator {
             rule_list: Vec::new(),
             directory: None,
         };
+        // An automatic denial names the policy that made it, so the tool row explains the refusal
+        // the same way for every provider.
+        let reason = match resolution {
+            ApprovalResolution::DenyPolicy => {
+                Some("A saved permission rule or Harness access policy rejects this operation.")
+            }
+            ApprovalResolution::DenyMode => {
+                Some("The approval mode denies requests that need confirmation.")
+            }
+            _ => None,
+        };
         let targets = request
             .target_list
             .iter()
             .enumerate()
             .map(|(index, _)| {
+                let mut decision = choice_decision(&choice)?;
+                if let (
+                    super::host_event::PermissionDecision::Deny { reason: denial, .. },
+                    Some(reason),
+                ) = (&mut decision, reason)
+                {
+                    *denial = SanitizedMessage::new(reason)?;
+                }
                 Ok(ResolvedPermissionTarget {
                     target_id: ApprovalTargetId::new(index.to_string())?,
-                    decision: choice_decision(&choice)?,
+                    decision,
                     source,
                     rules: Vec::new(),
                     directory_grants: Vec::new(),
@@ -1383,6 +1577,54 @@ impl PermissionCoordinator {
             execution_kind,
             event: PermissionApprovalEvent::Resolved(PermissionApprovalResolution {
                 request_id: ApprovalRequestId::new(request.id.clone())?,
+                scope,
+                targets,
+                resolved_at_ms: now_ms()?,
+            }),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Record a refusal Harness made before the coordinator evaluated the request.
+    ///
+    /// Checks such as the shell-writer rule, write-off, and protected targets answer the provider
+    /// directly. Publishing the decision on the request's own stream lets the tool row show the
+    /// host's reason instead of whatever generic denial the provider reports.
+    pub(crate) async fn record_policy_denial(
+        sink: Option<&HarnessEventSink>,
+        request: &PermissionRequest,
+        reason: &str,
+        execution_kind: ApprovalExecutionKind,
+    ) -> Result<()> {
+        let Some(sink) = sink else {
+            return Ok(());
+        };
+        let scope = approval_scope(&request.subject, None, Some(sink), || {
+            Ok(sink.scope().owner().thread_id())
+        })?;
+        let targets = request
+            .target_list
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                Ok(ResolvedPermissionTarget {
+                    target_id: ApprovalTargetId::new(index.to_string())?,
+                    decision: super::host_event::PermissionDecision::Deny {
+                        scope: PermissionRuleScope::Once,
+                        reason: SanitizedMessage::new(reason)?,
+                    },
+                    source: ApprovalDecisionSource::SavedPolicy,
+                    rules: Vec::new(),
+                    directory_grants: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sink.send_host(HostEvent::PermissionApproval {
+            execution_kind,
+            event: PermissionApprovalEvent::Resolved(PermissionApprovalResolution {
+                // Adapter request IDs repeat across callbacks; this record needs its own identity.
+                request_id: ApprovalRequestId::new(Uuid::new_v4().to_string())?,
                 scope,
                 targets,
                 resolved_at_ms: now_ms()?,
@@ -1594,6 +1836,27 @@ fn approval_view(
                 item
             })
             .collect(),
+    }
+}
+
+/// Decide whether a command's resolution preflight blocks its approval.
+///
+/// A command that analysis rejects is denied. A discovery interpreter that could not answer
+/// says nothing about the command, so the approval proceeds with a notice telling the user the
+/// command was not pre-checked; the user's decision remains the authority.
+fn command_precheck(
+    shell: forge_shell::shell::CommandShell,
+    resolution: std::result::Result<(), forge_shell::resolution::ResolutionFailure>,
+) -> std::result::Result<Option<String>, crate::permissions::matcher::CommandAnalysisError> {
+    use forge_shell::resolution::ResolutionFailure;
+    match resolution {
+        Ok(()) => Ok(None),
+        Err(ResolutionFailure::Analysis(failure)) => {
+            Err(crate::permissions::matcher::CommandAnalysisError { shell, failure })
+        }
+        Err(ResolutionFailure::DiscoveryUnavailable(cause)) => Ok(Some(format!(
+            "Harness could not pre-check this command's names ({cause})."
+        ))),
     }
 }
 
@@ -1915,6 +2178,53 @@ mod test {
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }
+    }
+
+    /// A discovery process that cannot answer leaves the command to the user instead of denying
+    /// it, while a command that analysis rejects is still denied.
+    #[test]
+    fn unavailable_discovery_asks_while_rejected_commands_deny() {
+        use forge_shell::resolution::ResolutionFailure;
+        use forge_shell::shell::{CommandAnalysisFailure, CommandShell};
+        let notice = super::command_precheck(
+            CommandShell::PowerShell,
+            Err(ResolutionFailure::DiscoveryUnavailable(
+                "PowerShell discovery launch failed: Access is denied. (os error 5)".into(),
+            )),
+        )
+        .unwrap()
+        .expect("unchecked command carries a notice");
+        assert!(
+            notice.contains("could not pre-check") && notice.contains("os error 5"),
+            "{notice}"
+        );
+        assert_eq!(
+            super::command_precheck(CommandShell::PowerShell, Ok(())).unwrap(),
+            None
+        );
+        for failure in [
+            CommandAnalysisFailure::UnresolvedCommands(vec!["%ad".into()]),
+            CommandAnalysisFailure::Syntax,
+        ] {
+            let error =
+                super::command_precheck(CommandShell::PowerShell, Err(failure.clone().into()))
+                    .unwrap_err();
+            assert_eq!(error.failure, failure);
+        }
+    }
+
+    /// The approval shows the command that runs, including a launcher followed by more commands.
+    #[test]
+    fn command_approval_shows_the_whole_command_after_a_launcher() {
+        let command = r#"nu -c "sleep 45sec"; "exit code: $LASTEXITCODE""#;
+        let item = super::approval_item(
+            &PermissionTarget::Command {
+                command: command.into(),
+                shell: Some(forge_shell::shell::CommandShell::PowerShell),
+            },
+            0,
+        );
+        assert_eq!(item.detail, command);
     }
 
     /// A provider callback that names its tool item addresses that item, so the tool watchdog

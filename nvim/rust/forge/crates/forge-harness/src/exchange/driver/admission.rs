@@ -132,21 +132,30 @@ impl Admission {
         // its delivery unknown, and stopping an unsent turn makes the exchange restart and the
         // input queue both send the prompt again. Cancel prevents an unsent prompt and waits
         // inside the provider runtime for a send in flight, so it is exempt from that wait.
-        let start_command = !facts.command_active
-            && !facts.restart_active
-            && !facts.observation_closed
-            && facts.execution != ExecutionState::Stopping
-            && !facts.delivery_preparing
-            && match (facts.next_command, facts.turn) {
-                (None, _) => false,
-                (Some(_), None) => true,
-                (Some(_), Some(turn)) if turn.dispatch_lost => false,
-                (Some(next), Some(turn)) => match turn.dispatch {
-                    DispatchStage::Settled => true,
-                    DispatchStage::Lost => false,
-                    DispatchStage::Unsent | DispatchStage::InFlight => next == NextCommand::Cancel,
-                },
-            };
+        // A failed owner never reopens execution, and `command_start` rejects every command it
+        // starts, so its commands start at once rather than waiting for a restart or a stream
+        // that will never recover.
+        let failed_rejection = facts.execution == ExecutionState::Failed
+            && !facts.command_active
+            && facts.next_command.is_some();
+        let start_command = failed_rejection
+            || (!facts.command_active
+                && !facts.restart_active
+                && !facts.observation_closed
+                && facts.execution != ExecutionState::Stopping
+                && !facts.delivery_preparing
+                && match (facts.next_command, facts.turn) {
+                    (None, _) => false,
+                    (Some(_), None) => true,
+                    (Some(_), Some(turn)) if turn.dispatch_lost => false,
+                    (Some(next), Some(turn)) => match turn.dispatch {
+                        DispatchStage::Settled => true,
+                        DispatchStage::Lost => false,
+                        DispatchStage::Unsent | DispatchStage::InFlight => {
+                            next == NextCommand::Cancel
+                        }
+                    },
+                });
         // Every rule that waits for background work reads this one definition, so a new kind of
         // job cannot be forgotten by one of them.
         let background_idle = !facts.tasks_running
@@ -423,12 +432,40 @@ mod tests {
         for facts in rows {
             assert!(!Admission::evaluate(&facts).start_command, "{facts:?}");
         }
-        // A failed owner still starts cancel, so it fails immediately instead of waiting.
+        // A failed owner still starts every command, so it fails immediately instead of
+        // waiting for a restart or a stream that will never recover.
         let failed = AdmissionFacts {
             execution: ExecutionState::Failed,
             ..waiting
         };
         assert!(Admission::evaluate(&failed).start_command);
+        for facts in [
+            AdmissionFacts {
+                restart_active: true,
+                ..failed
+            },
+            AdmissionFacts {
+                observation_closed: true,
+                next_command: Some(NextCommand::Other),
+                ..failed
+            },
+            AdmissionFacts {
+                turn: Some(TurnFacts {
+                    dispatch_lost: true,
+                    ..turn(DispatchStage::Settled).unwrap()
+                }),
+                ..failed
+            },
+        ] {
+            assert!(Admission::evaluate(&facts).start_command, "{facts:?}");
+        }
+        assert!(
+            !Admission::evaluate(&AdmissionFacts {
+                command_active: true,
+                ..failed
+            })
+            .start_command
+        );
     }
 
     /// Start turns and their effects only while execution is ready.

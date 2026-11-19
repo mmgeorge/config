@@ -19,6 +19,7 @@ mod reader;
 pub(crate) use ownership::DescendantUnsettled;
 pub(crate) use reader::HistoryReader;
 mod recovery;
+pub(crate) use recovery::{DetachedSettlement, interrupt_detached_exchange};
 mod schema;
 pub mod state;
 mod task;
@@ -137,14 +138,46 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Locate the process lock that one session's runtime owner holds.
+    fn runtime_lock_path(&self, session_id: &str) -> std::path::PathBuf {
+        state::directory(&self.data_root)
+            .join("session-owner")
+            .join(format!(
+                "{}.lock",
+                crate::plan::digest(session_id.as_bytes())
+            ))
+    }
+
+    /// Report whether a live runtime owner, in this process or another, holds a session.
+    ///
+    /// The probe takes the owner lock and releases it at once, so it never keeps an owner
+    /// from starting afterwards. A missing lock file means no owner ever ran under this state
+    /// version.
+    pub(crate) fn session_owner_live(&self, session_id: &str) -> Result<bool> {
+        let probe = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.runtime_lock_path(session_id))
+        {
+            Ok(probe) => probe,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(anyhow::anyhow!("open session runtime lock: {error}")),
+        };
+        match probe.try_lock() {
+            Ok(()) => Ok(false),
+            Err(fs::TryLockError::WouldBlock) => Ok(true),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(anyhow::anyhow!("probe session runtime ownership: {error}"))
+            }
+        }
+    }
+
     /// Acquires an independent lock handle for runtime ownership or session deletion.
     fn acquire_runtime_lock(&self, session_id: &str) -> Result<fs::File> {
-        let directory = state::directory(&self.data_root).join("session-owner");
-        fs::create_dir_all(&directory)?;
-        let path = directory.join(format!(
-            "{}.lock",
-            crate::plan::digest(session_id.as_bytes())
-        ));
+        let path = self.runtime_lock_path(session_id);
+        if let Some(directory) = path.parent() {
+            fs::create_dir_all(directory)?;
+        }
         let owner = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -232,8 +265,10 @@ impl SqliteStore {
         provider: &str,
         preference: &HarnessPreference,
     ) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO preferences.preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3) \
+        // History handles attach settings read-only, so the record commits through its own
+        // settings connection rather than inside a history transaction.
+        preferences::open(&self.data_root)?.execute(
+            "INSERT INTO preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3) \
              ON CONFLICT(workspace, backend) DO UPDATE SET payload=excluded.payload",
             params![workspace, provider, encode(&serde_json::json!({"format_version":PREFERENCE_FORMAT_VERSION,"preference":preference}))?],
         )?;
@@ -1492,6 +1527,7 @@ pub(crate) mod test {
             attributed_matches_checkpoint: false,
             provider_checkpoint_id: None,
             approval_resolution: Vec::new(),
+            tool_timeout: Vec::new(),
             host_file_changes: Vec::new(),
             check_setup: None,
             turn: Vec::new(),
@@ -1653,5 +1689,59 @@ pub(crate) mod test {
             )
             .unwrap();
         assert_eq!(prompt.consumption, InputConsumption::Unconfirmed);
+    }
+
+    /// A primary exchange that captured its baseline stays finalizing through recovery, so the
+    /// next owner captures its closing checkpoint. An exchange without a baseline has nothing
+    /// to compare, and no finalizer settles a child exchange, so both finish at once.
+    #[test]
+    fn recovery_defers_a_baselined_exchange_to_finalization() {
+        use crate::exchange::{ExchangeOutcome, ExchangeState};
+        use crate::turn::{TurnOutcome, TurnState};
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
+        store.save_session(&session("session", "D:/work")).unwrap();
+        store.save_agent_run(&Agent::primary("session", 0)).unwrap();
+        let mut baselined = running_exchange("baselined");
+        baselined.checkpoint_before = Some("baseline".into());
+        let address = crate::turn::test_support::address(&baselined, "turn");
+        baselined.start_turn(address, 30).unwrap();
+        store.save_exchange(&baselined).unwrap();
+        let mut plain = running_exchange("plain");
+        plain.ordinal = 2;
+        store.save_exchange(&plain).unwrap();
+        let reviewer = Agent::pending("session", "reviewer", "review", 10);
+        store.save_agent_run(&reviewer).unwrap();
+        let mut child = running_exchange("child");
+        child.ordinal = 3;
+        child.agent_id = reviewer.id.clone();
+        child.checkpoint_before = Some("baseline".into());
+        store.save_exchange(&child).unwrap();
+
+        store.interrupt_detached_execution("session").unwrap();
+        let load = |store: &SqliteStore| {
+            ["baselined", "plain", "child"].map(|id| store.load_exchange(id).unwrap().unwrap())
+        };
+        let recovered = load(&store);
+        let [deferred, plain, child] = &recovered;
+        assert_eq!(deferred.state(), ExchangeState::Finalizing);
+        assert_eq!(
+            deferred.finalization_outcome(),
+            Some(ExchangeOutcome::Interrupted)
+        );
+        assert_eq!(deferred.completed_at_ms(), None);
+        assert_eq!(deferred.execution_started_at_ms(), None);
+        assert_eq!(deferred.elapsed(90_000), 20);
+        assert_eq!(
+            deferred.turn[0].state(),
+            TurnState::Finished {
+                outcome: TurnOutcome::Interrupted
+            }
+        );
+        assert_eq!(plain.state(), ExchangeState::Interrupted);
+        assert_eq!(child.state(), ExchangeState::Interrupted);
+        let snapshot = serde_json::to_value(&recovered).unwrap();
+        store.interrupt_detached_execution("session").unwrap();
+        assert_eq!(serde_json::to_value(load(&store)).unwrap(), snapshot);
     }
 }

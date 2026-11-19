@@ -161,6 +161,7 @@ impl Command {
                 InputCommand::BeginEdit(_) => "input.begin_edit",
                 InputCommand::CommitEdit(_) => "input.commit_edit",
                 InputCommand::CancelEdit(_) => "input.cancel_edit",
+                InputCommand::ReleaseInput(_) => "input.release_input",
                 InputCommand::Remove(_) => "input.remove",
             },
         }
@@ -201,6 +202,8 @@ pub(crate) enum InputCommand {
     CommitEdit(InputEditCommit),
     /// Release an edit without changing or removing input content.
     CancelEdit(InputEditId),
+    /// Release one input from an edit that keeps its other reserved inputs.
+    ReleaseInput(InputEditRelease),
     /// Remove an input whose revision and unsent status still match.
     Remove(InputRevision),
 }
@@ -384,6 +387,15 @@ pub(crate) struct InputEditRequest {
     /// Input and revision to reserve.
     pub(crate) input: InputRevision,
     /// Edit identity retained for commit or cancellation.
+    pub(crate) edit: InputEditId,
+}
+
+/// Release one input from an edit identity without changing its content.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct InputEditRelease {
+    /// Input whose reservation ends; no other input held by the edit changes.
+    pub(crate) input: InputId,
+    /// Edit identity that must still hold the input for the release to change it.
     pub(crate) edit: InputEditId,
 }
 
@@ -591,9 +603,17 @@ impl CommandRequest {
                         .collect::<Result<_, CommandDecodeError>>()?,
                 })
             }
-            InputAction::Release { reservation } => {
-                InputCommand::CancelEdit(InputEditId::new(reservation)?)
-            }
+            InputAction::Release {
+                reservation,
+                id: None,
+            } => InputCommand::CancelEdit(InputEditId::new(reservation)?),
+            InputAction::Release {
+                reservation,
+                id: Some(id),
+            } => InputCommand::ReleaseInput(InputEditRelease {
+                input: InputId::new(id)?,
+                edit: InputEditId::new(reservation)?,
+            }),
             InputAction::Remove { id, revision } => InputCommand::Remove(InputRevision {
                 id: InputId::new(id)?,
                 revision,
@@ -679,6 +699,11 @@ impl CommandRequest {
             },
             InputCommand::CancelEdit(edit) => InputAction::Release {
                 reservation: edit.as_str().into(),
+                id: None,
+            },
+            InputCommand::ReleaseInput(release) => InputAction::Release {
+                reservation: release.edit.as_str().into(),
+                id: Some(release.input.as_str().into()),
             },
             InputCommand::Remove(input) => InputAction::Remove {
                 id: input.id.as_str().into(),
@@ -766,6 +791,10 @@ pub(crate) enum CommandFailure {
     /// A prerequisite failed without a supported domain recovery category.
     #[error("the command prerequisite could not be completed")]
     PrerequisiteFailed,
+    /// Another writer held a state database past the command's deadline, and the write that
+    /// would have committed its outcome rolled back.
+    #[error("the session's state database stayed busy, so the change was not saved; retry it")]
+    StorageBusy,
     /// The host closed admission before queued work began.
     #[error("the session closed before the command started")]
     OwnerStopping,
@@ -782,7 +811,9 @@ pub(crate) enum CommandFailure {
     #[error("the turn could not be stopped cleanly, so the provider is restarting")]
     StopFailed,
     /// The provider stopped and its restart failed, so the session cannot run commands.
-    #[error("the provider stopped and could not be restarted; reopen the session")]
+    #[error(
+        "the provider stopped and could not be restarted; select the session in /sessions and press Enter to reopen it"
+    )]
     ProviderFailed,
     /// A stop still owns native work after its deadline elapsed.
     #[error("stopping the turn took too long")]
@@ -820,6 +851,7 @@ impl CommandFailure {
             Self::AttachmentUnavailable => "input_attachment_unavailable",
             Self::LegacyInputRejected => "legacy_input_rejected",
             Self::PrerequisiteFailed => "command_prerequisite_failed",
+            Self::StorageBusy => "command_storage_busy",
             Self::OwnerStopping => "command_owner_stopping",
             Self::OwnerUnavailable(_) => "session_unavailable",
             Self::OwnershipUnavailable => "session_ownership_unavailable",

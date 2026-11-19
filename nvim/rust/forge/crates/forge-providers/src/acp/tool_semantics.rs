@@ -11,9 +11,12 @@ pub(super) enum ToolKind {
 }
 
 /// Decode this integration's argument encodings before publishing operation semantics.
+///
+/// Titles reads by their path relative to `workspace`, the binding's workspace.
 pub(super) fn normalize_descriptor(
     mut kind: ToolKind,
     mut descriptor: ToolDescriptor,
+    workspace: &str,
 ) -> (ToolKind, ToolDescriptor) {
     if let Some(encoded) = descriptor.arguments.value().as_str()
         && let Ok(decoded) = serde_json::from_str(encoded)
@@ -57,29 +60,13 @@ pub(super) fn normalize_descriptor(
             shell,
             directory,
         };
-    } else if matches!(
-        name.as_str(),
-        "read" | "read_file" | "readfile" | "view" | "view_file" | "viewfile"
-    ) {
-        let mut paths = string(&[
-            "path",
-            "file_path",
-            "filePath",
-            "absolute_path",
-            "AbsolutePath",
-            "TargetFile",
-        ])
-        .into_iter()
-        .collect::<Vec<_>>();
-        if let Some(locations) = arguments.get("locations").and_then(Value::as_array) {
-            paths.extend(
-                locations
-                    .iter()
-                    .filter_map(|value| value.get("path").and_then(Value::as_str))
-                    .map(str::to_owned),
-            );
+    } else if let Some((title, semantics)) =
+        crate::tool_display::read_tool(&name, arguments, directory, workspace)
+    {
+        if let Some(title) = title {
+            descriptor.title = title;
         }
-        descriptor.semantics = ToolSemantics::Read { paths, directory };
+        descriptor.semantics = semantics;
     }
     (kind, descriptor)
 }
