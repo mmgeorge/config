@@ -416,7 +416,21 @@ pub(super) fn detail(run: &CheckRun, request: &DetailRequest) -> Result<Value> {
         None
     };
     let context = command.context.as_ref();
-    Ok(json!({
+    // Bare empty text reads as output Harness lost, so a command whose requested log is empty
+    // says it printed nothing, beside the exit status in `command`.
+    let silent = request.case.is_none()
+        && request.cursor.offset == 0
+        && text.is_empty()
+        && !more
+        && (command.started_at_ms.is_some() || command.reused_from.is_some());
+    let note = silent.then(|| {
+        super::model::printed_nothing(match request.stream {
+            OutputStream::Stdout => "standard output",
+            OutputStream::Stderr => "standard error",
+            OutputStream::Combined => "standard output or standard error",
+        })
+    });
+    let mut page = json!({
         "run_id":run.id,"state":run.state,
         "command":{
             "command_id":command.id,
@@ -429,7 +443,11 @@ pub(super) fn detail(run: &CheckRun, request: &DetailRequest) -> Result<Value> {
             "reused_from":command.reused_from
         },
         "stream":request.stream,"offset":request.cursor.offset,"text":text,"next_cursor":next
-    }))
+    });
+    if let Some(note) = note {
+        page["note"] = Value::String(note);
+    }
+    Ok(page)
 }
 
 /// Page one contract collection and bind continuation to its immutable run and command.
@@ -762,6 +780,43 @@ mod result_tests {
             panic!("wrong fixture")
         };
         assert_eq!(result.diagnostics[0].message, message);
+        Ok(())
+    }
+
+    /// Output detail of a command that printed nothing says so beside its exit status, instead
+    /// of returning bare empty text, and says nothing more once the command printed something.
+    #[test]
+    fn output_detail_of_a_command_that_printed_nothing_says_so() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut run = run(vec![Value::Null])?;
+        let command = &mut run.commands[0];
+        command.output = directory.path().join("0.output");
+        command.stdout = directory.path().join("0.stdout");
+        command.stderr = directory.path().join("0.stderr");
+        for path in [&command.output, &command.stdout, &command.stderr] {
+            std::fs::write(path, "")?;
+        }
+        for (stream, streams) in [
+            ("combined", "standard output or standard error"),
+            ("stdout", "standard output"),
+            ("stderr", "standard error"),
+        ] {
+            let page = detail(
+                &run,
+                &serde_json::from_value(json!({"run_id":"run","stream":stream}))?,
+            )?;
+            assert_eq!(page["text"], "");
+            assert_eq!(page["command"]["exit_code"], 1);
+            assert_eq!(
+                page["note"],
+                format!("The command printed nothing on {streams}."),
+                "{page:#}"
+            );
+        }
+        std::fs::write(&run.commands[0].output, "src/refund.ts\n")?;
+        let page = detail(&run, &serde_json::from_value(json!({"run_id":"run"}))?)?;
+        assert_eq!(page["text"], "src/refund.ts\n");
+        assert!(page.get("note").is_none(), "{page:#}");
         Ok(())
     }
 

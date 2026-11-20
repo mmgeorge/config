@@ -204,6 +204,33 @@ T["global mappings that edit do nothing in a picker"] = function()
   eq(decision_list, { "only" })
 end
 
+-- Insert mode is global, so returning from a tab where the user was typing put the picker that
+-- held focus in its own tab into Insert mode: its hotkeys then edited the unmodifiable list and
+-- raised E21. The picker takes its keys again once its tab is entered.
+T["a picker keeps its keys after its tab is left from insert mode and entered again"] = function()
+  -- Insert mode only persists across a tab change between typed keys, so a child Neovim receives them.
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.lua([[
+    vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
+    require("forge.infra.config").setup({})
+    _G.decision_list = {}
+    local origin_win = vim.api.nvim_get_current_win()
+    require("forge.views.picker").open({ host = { control_win = origin_win, window_list = { origin_win } },
+      page_list = { { id = "choice", option_list = { { id = "only", key = "y", label = "Only", value = "only" } } } },
+      on_confirm = function(result) table.insert(_G.decision_list, result.option.value) end })
+    _G.picker_win = vim.api.nvim_get_current_win()
+    vim.cmd("tabnew")
+  ]])
+  -- The user types in the other tab and returns while still in Insert mode.
+  child.type_keys("i", "<Cmd>tabprevious<CR>")
+  eq(child.lua_get("vim.api.nvim_get_current_win() == _G.picker_win"), true)
+  child.type_keys("y", "<CR>")
+  eq({ child.api.nvim_get_mode().mode, child.lua_get("_G.decision_list"), child.lua_get("vim.v.errmsg") },
+    { "n", { "only" }, "" })
+end
+
 T["keys after a guarded picker closed by itself do not reach the window beneath"] = function()
   local clock, picker = settle_fixture()
   local origin_win = vim.api.nvim_get_current_win()
@@ -223,6 +250,27 @@ T["keys after a guarded picker closed by itself do not reach the window beneath"
   type_keys("iy<Esc>")
   eq(vim.api.nvim_buf_get_lines(origin_buf, 0, -1, false), { "y" })
   eq(decision_list, {})
+end
+
+-- A list taller than its window scrolls with the selection, so rows past the window's edge looked
+-- absent rather than hidden: the session picker seemed to hold only the sessions that fit. The
+-- border says which rows the window shows and how many the list holds.
+T["a list taller than its window says which rows it shows"] = function()
+  require("forge.infra.config").setup({})
+  local picker = require("forge.views.picker")
+  MiniTest.finally(function() pcall(picker.close, false) end)
+  local origin_win = vim.api.nvim_get_current_win()
+  local option_list = {}
+  for index = 1, 20 do option_list[index] = { id = "row-" .. index, label = "Row " .. index, value = index } end
+  picker.open({ host = { control_win = origin_win, window_list = { origin_win } }, size_ratio = 0.35,
+    placement = "bottom", command_footer = true,
+    page_list = { { id = "rows", title = "Rows", option_list = option_list } } })
+  local function footer() return shown(picker):match("Rows %d+–%d+ of %d+") end
+  local first_footer = assert(footer(), "the border did not count the hidden rows: " .. shown(picker))
+  local first, last = first_footer:match("Rows (%d+)–(%d+) of 20")
+  eq(first, "1")
+  type_keys(string.rep("<Down>", 19))
+  eq(footer(), ("Rows %d–20 of 20"):format(20 - tonumber(last) + 1))
 end
 
 return T

@@ -25,6 +25,9 @@ enum CollectionBoundary {
     /// Hold the prompt before dispatch, as the host's baseline checkpoint does, then fail every
     /// interrupt that collects it, as an adapter does when it cannot prove its turn ended.
     HeldBeforeDispatch,
+    /// Hold native execution after its start, then fail every interrupt of the first binding, as
+    /// an adapter does when its abort is not answered.
+    ActiveFailsInterrupt,
 }
 
 /// Hold one real owner at a selected boundary while native collection remains delayed.
@@ -73,6 +76,7 @@ async fn slow_collection_fixture(
                     | CollectionBoundary::ActiveAfterUserEcho
                     | CollectionBoundary::ActiveInTool
                     | CollectionBoundary::ActiveLosesObservation
+                    | CollectionBoundary::ActiveFailsInterrupt
             ) && executions.fetch_add(1, Ordering::AcqRel) == 0;
             let lose_observation =
                 held_active && boundary == CollectionBoundary::ActiveLosesObservation;
@@ -268,6 +272,28 @@ async fn slow_collection_fixture(
                     return Err(forge_provider_api::ProviderFailure::new(
                         forge_provider_api::ProviderOperation::TurnInterrupt,
                         forge_provider_api::ProviderFailureKind::Protocol,
+                    )
+                    .into());
+                }
+                Ok(())
+            }
+        });
+    }
+    if boundary == CollectionBoundary::ActiveFailsInterrupt {
+        // The restarted provider's binding interrupts normally.
+        let failing_binding: Arc<std::sync::Mutex<Option<forge_provider_api::BindingId>>> =
+            Arc::default();
+        native.with_interrupt_settlement(move |binding| {
+            let failing = failing_binding
+                .lock()
+                .expect("fixture binding lock poisoned")
+                .get_or_insert_with(|| binding.clone())
+                == &binding;
+            async move {
+                if failing {
+                    return Err(forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TurnInterrupt,
+                        forge_provider_api::ProviderFailureKind::Transport,
                     )
                     .into());
                 }
@@ -624,6 +650,105 @@ async fn owner_overdue_reconfiguration_preserves_stopped_clock_and_uncertain_sta
             Some(forge_provider_api::input::PromptInput::Text(text)) if text == "Fresh work after cleanup"));
         Ok::<(), anyhow::Error>(())
     }.await;
+    fixture.finish(scenario).await
+}
+
+/// A configuration change whose stop fails releases the exchange its collection parked.
+///
+/// The change stops the running turn to apply the setting and parks the exchange, labelled
+/// `Stopping`, for the turn that runs again. When the interrupt cannot prove the turn ended, the
+/// command fails and the owner restarts the provider; nothing then runs the parked exchange or
+/// settles it, so its status rested on `Stopping` until the user pressed `Ctrl+C`.
+#[tokio::test(start_paused = true)]
+async fn failed_reconfiguration_stop_releases_the_parked_exchange() -> Result<()> {
+    let mut fixture =
+        slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveFailsInterrupt).await?;
+    let scenario = async {
+        // The paused clock runs each bound below out at once when nothing else can progress.
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while fixture.engine.active_invocation_scope()?.is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("the held turn never started")??;
+        let command = super::super::native_settings::decode_command(&Request {
+            id: 812,
+            method: "session.configure".into(),
+            params: json!({"effort":"high"}),
+        })?;
+        let configured = tokio::time::timeout(
+            Duration::from_secs(120),
+            fixture
+                .controller
+                .exchange_owner
+                .execute_identified(command, fixture.sink.clone()),
+        )
+        .await
+        .context("the configuration change was never answered")?;
+        ensure!(
+            configured.is_err(),
+            "a configuration change whose stop failed reported success"
+        );
+        let session = fixture.controller.observer.session_id().to_owned();
+        let settled = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let changed = fixture.events_changed.notified();
+                let exchange = SqliteStore::read_only(&fixture.controller.data_root)?
+                    .list_exchange(&session)?
+                    .into_iter()
+                    .next()
+                    .context("the stopped exchange disappeared")?;
+                if exchange.collection.is_none() && !exchange.is_parked() {
+                    break Ok::<_, anyhow::Error>(exchange);
+                }
+                changed.await;
+            }
+        })
+        .await;
+        let exchange = match settled {
+            Ok(settled) => settled?,
+            Err(_) => {
+                let exchange = SqliteStore::read_only(&fixture.controller.data_root)?
+                    .list_exchange(&session)?
+                    .into_iter()
+                    .next()
+                    .context("the stopped exchange disappeared")?;
+                anyhow::bail!(
+                    "the failed configuration left its parked exchange {:?} with collection {:?}",
+                    exchange.state(),
+                    exchange.collection
+                );
+            }
+        };
+        ensure!(
+            exchange.state() == crate::exchange::ExchangeState::Failed,
+            "the parked exchange of a failed configuration settled {:?}",
+            exchange.state()
+        );
+        ensure!(
+            exchange.finalization_error.is_some(),
+            "the parked exchange settled failed without stating why"
+        );
+        prompt::apply(
+            &fixture.controller,
+            Request {
+                id: 813,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"after-failed-configuration","text":"Prompt after the restart"}),
+            },
+            &fixture.sink,
+        )
+        .await?;
+        let input = tokio::time::timeout(Duration::from_secs(120), fixture.dispatches.recv())
+            .await
+            .context("the session ran no prompt after the failed configuration")?;
+        ensure!(matches!(input, Some(forge_provider_api::input::PromptInput::Text(text))
+            if text == "Prompt after the restart"));
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     fixture.finish(scenario).await
 }
 
@@ -1310,6 +1435,61 @@ async fn agent_tools_off_while_a_child_runs_keeps_the_exchange_running() -> Resu
             && exchanges[0].turn.len() == 2,
         "the parent did not continue with its child's result: {}",
         exchange_summary(&exchanges[0])
+    );
+    fixture.finish().await
+}
+
+/// A reasoning change while the parent waits for its children stops and restarts the turn.
+///
+/// The parent's own turn had already completed and parked for its children. The restart woke
+/// that parked result while the children still ran, finalization then refused to capture a
+/// checkpoint over the unsettled delegation tree, the exchange failed, and the change was lost.
+/// The change instead cancels and settles the children first, runs the parent again with the
+/// new setting, and commits the setting.
+#[tokio::test]
+async fn reasoning_change_while_the_parent_waits_for_children_restarts_the_turn() -> Result<()> {
+    let mut fixture = MockOwnerFixture::start("wait-configure").await?;
+    fixture.park_parent_for_child().await?;
+    let command = super::super::native_settings::decode_command(&Request {
+        id: 1,
+        method: "session.configure".into(),
+        params: json!({"effort":"high"}),
+    })?;
+    fixture
+        .controller
+        .exchange_owner
+        .execute_identified(command, fixture.sink.clone())
+        .await
+        .context("the reasoning change failed")?;
+    ensure!(
+        fixture.controller.agent_coordinator.active_count() == 0,
+        "the reasoning change left the child running"
+    );
+    fixture.reservation.take();
+    super::owner_transition::settle_exchanges(&fixture.controller, &fixture.session, 1).await?;
+    let effort = fixture
+        .controller
+        .broker
+        .lock()
+        .await
+        .snapshot()?
+        .session
+        .effort;
+    ensure!(
+        effort == "high",
+        "the reasoning change was lost: {effort:?}"
+    );
+    let exchanges = fixture.exchanges()?;
+    ensure!(
+        exchanges[0].state() == crate::exchange::ExchangeState::Complete
+            && exchanges[0].turn.len() == 2,
+        "the parent did not run again with the new setting: {}",
+        exchange_summary(&exchanges[0])
+    );
+    ensure!(
+        exchanges[0].collection.is_none(),
+        "the restarted parent kept the stop label {:?}",
+        exchanges[0].collection
     );
     fixture.finish().await
 }

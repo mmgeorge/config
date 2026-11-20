@@ -97,13 +97,24 @@ pub struct CodexNormalization {
     agents: HashMap<String, forge_provider_api::AgentId>,
     pending_agents: HashMap<(TurnId, String), forge_provider_api::AgentId>,
     delegations: HashMap<String, AgentDelegation>,
-    /// Host reasons for refused approvals, by host turn and native item. Codex's decline reply
-    /// has no reason field, so the declined item reports the reason retained here.
-    denial_reasons: HashMap<(TurnId, String), SanitizedMessage>,
+    /// Host answers that refused approvals, by host turn and native item. Codex reports an
+    /// item as declined whether the host denied or cancelled its approval, and its decline
+    /// reply has no reason field, so the declined item reports the answer retained here.
+    approval_refusals: HashMap<(TurnId, String), ApprovalRefusal>,
     /// Agent messages a delivered steer ended. Codex drops such a draft from its conversation
     /// and may still send a fragment it had queued, which is ignored.
     abandoned_drafts: std::collections::HashSet<(TurnId, String, ItemPart)>,
     pub replay_sensitive: bool,
+}
+
+/// Name how the host answered an approval that it did not allow.
+#[derive(Clone, Debug)]
+pub(super) enum ApprovalRefusal {
+    /// The user, a saved rule, or a Harness policy denied the request for this reason.
+    Denied { reason: SanitizedMessage },
+    /// The stop of the turn ended the approval before anyone decided it, so the abandoned
+    /// item was interrupted, not denied.
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -218,15 +229,15 @@ impl CodexNormalization {
             .map(|item| item.id.clone())
     }
 
-    /// Retain why the host refused a native item's approval until Codex reports the item declined.
-    pub(super) fn denial_record(
+    /// Retain how the host refused a native item's approval until Codex reports the item declined.
+    pub(super) fn approval_refusal_record(
         &mut self,
         turn_id: &TurnId,
         native_item_id: &str,
-        reason: SanitizedMessage,
+        refusal: ApprovalRefusal,
     ) {
-        self.denial_reasons
-            .insert((turn_id.clone(), native_item_id.to_owned()), reason);
+        self.approval_refusals
+            .insert((turn_id.clone(), native_item_id.to_owned()), refusal);
     }
 
     /// Identify a native turn that a host session operation, not an invocation, owns.
@@ -423,36 +434,46 @@ impl CodexNormalization {
     }
 
     /// Route explicitly correlated native errors without inventing a turn from current work.
-    fn native_error(&self, params: &Value) -> std::result::Result<AdapterActivity, ProviderError> {
+    ///
+    /// An error Codex is about to retry by itself does not interrupt the turn, so it yields no
+    /// activity: attributing it would leave a failure on a turn that went on to recover.
+    fn native_error(
+        &self,
+        params: &Value,
+    ) -> std::result::Result<Vec<AdapterActivity>, ProviderError> {
         let thread = error_identity(params, &["/threadId", "/thread_id", "/thread/id"])?
             .ok_or_else(protocol_error)?;
-        let error = ProviderFailure::new(
-            ProviderOperation::TurnStart,
-            super::retry::failure_kind(params.get("error").unwrap_or(params)),
-        )
-        .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain);
-        match error_identity(params, &["/turnId", "/turn_id", "/turn/id"])? {
+        let kind = super::retry::failure_kind(params.get("error").unwrap_or(params));
+        if super::retry::provider_retries(params) {
+            tracing::info!(target: "forge::provider", event_name = "provider.native_retry",
+                provider = "codex", kind = ?kind, "Codex is retrying a failed model request");
+            return Ok(Vec::new());
+        }
+        let error = ProviderFailure::new(ProviderOperation::TurnStart, kind)
+            .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain);
+        let activity = match error_identity(params, &["/turnId", "/turn_id", "/turn/id"])? {
             Some(turn)
                 if !self
                     .operation_turns
                     .contains(&(thread.clone(), turn.clone())) =>
             {
                 let address = self.turns.get(&(thread, turn)).ok_or_else(protocol_error)?;
-                Ok(AdapterActivity::Turn {
+                AdapterActivity::Turn {
                     thread_id: address.thread_id.clone(),
                     turn_id: address.turn_id.clone(),
                     event: TurnMetadataEvent::Error { error },
-                })
+                }
             }
-            Some(_) | None => Ok(AdapterActivity::Thread {
+            Some(_) | None => AdapterActivity::Thread {
                 thread_id: self
                     .threads
                     .get(&thread)
                     .ok_or_else(protocol_error)?
                     .clone(),
                 event: ThreadEvent::Error { error },
-            }),
-        }
+            },
+        };
+        Ok(vec![activity])
     }
 
     /// Normalize late observations only for exact retained native ownership.
@@ -466,7 +487,7 @@ impl CodexNormalization {
             .as_str()
             .is_some_and(|method| method.eq_ignore_ascii_case("error"))
         {
-            return Ok(Some(vec![self.native_error(params)?]));
+            return Ok(Some(self.native_error(params)?));
         }
         if self.operation_turn(params) {
             return self.activities(message, workspace).map(Some);
@@ -692,7 +713,7 @@ impl CodexNormalization {
         if method.eq_ignore_ascii_case("error")
             || params.pointer("/item/type").and_then(Value::as_str) == Some("error")
         {
-            return Ok(vec![self.native_error(params)?]);
+            return Ok(self.native_error(params)?);
         }
         let mut events = Vec::new();
         let native_thread = pointer_string(params, &["/threadId", "/thread_id"]);
@@ -1157,14 +1178,20 @@ impl CodexNormalization {
         } else if is_tool_lifecycle_event(&method.to_ascii_lowercase(), params) {
             let snapshot =
                 normalize_tool_activity(method, params, workspace)?.ok_or_else(protocol_error)?;
-            // Replayed snapshots must derive the same outcome signature, so the reason stays.
-            let denial_reason = self
-                .denial_reasons
+            // Replayed snapshots must derive the same outcome signature, so the answer stays.
+            let declined_outcome = match self
+                .approval_refusals
                 .get(&(address.turn_id.clone(), snapshot.id.clone()))
-                .cloned()
-                .unwrap_or_else(|| {
-                    SanitizedMessage::new("Provider denied this tool call").expect("static text")
-                });
+            {
+                Some(ApprovalRefusal::Denied { reason }) => ToolOutcome::Denied {
+                    reason: reason.clone(),
+                },
+                Some(ApprovalRefusal::Cancelled) => ToolOutcome::Cancelled,
+                None => ToolOutcome::Denied {
+                    reason: SanitizedMessage::new("Provider denied this tool call")
+                        .expect("static text"),
+                },
+            };
             let key = (address.turn_id.clone(), snapshot.id, ItemPart::Tool);
             let mut descriptor = super::tool_semantics::normalize_descriptor(
                 forge_provider_api::tool::ToolDescriptor {
@@ -1290,9 +1317,7 @@ impl CodexNormalization {
                                 .expect("static text"),
                         },
                     },
-                    Some(ToolStatus::Denied) => ToolOutcome::Denied {
-                        reason: denial_reason,
-                    },
+                    Some(ToolStatus::Denied) => declined_outcome,
                     Some(ToolStatus::Running) | None => return Err(protocol_error().into()),
                 };
                 let signature = serde_json::to_string(&(
@@ -1382,9 +1407,7 @@ impl CodexNormalization {
                                 .expect("static text"),
                         },
                     }),
-                    ToolStatus::Denied => Some(ToolOutcome::Denied {
-                        reason: denial_reason,
-                    }),
+                    ToolStatus::Denied => Some(declined_outcome),
                 };
                 if let Some(outcome) = outcome {
                     let signature = serde_json::to_string(&(
@@ -1847,6 +1870,35 @@ mod tests {
             })
             .count();
         assert_eq!(interrupted, 1, "{:#?}", output.event);
+        Ok(())
+    }
+
+    /// Codex reports a sampling request it is about to retry with `willRetry`, and that error
+    /// does not interrupt the turn; only an error Codex will not retry belongs to the turn.
+    #[test]
+    fn only_an_error_codex_will_not_retry_is_attributed_to_the_turn() -> Result<()> {
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        let address = normalization.admit_turn("native", "turn", &scope)?;
+        let stream_error = |will_retry: bool| {
+            json!({"method":"error","params":{"threadId":"native","turnId":"turn",
+                "willRetry":will_retry,"error":{"message":"stream disconnected",
+                    "codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}}}}})
+        };
+        let retried = normalization.activities(&stream_error(true), "")?;
+        assert!(retried.is_empty(), "{retried:#?}");
+        let terminal = normalization.activities(&stream_error(false), "")?;
+        assert!(
+            matches!(terminal.as_slice(), [AdapterActivity::Turn {
+                thread_id,
+                turn_id,
+                event: TurnMetadataEvent::Error { error },
+            }] if thread_id == &address.thread_id
+                && turn_id == &address.turn_id
+                && error.kind() == ProviderFailureKind::Transport),
+            "{terminal:#?}"
+        );
         Ok(())
     }
 

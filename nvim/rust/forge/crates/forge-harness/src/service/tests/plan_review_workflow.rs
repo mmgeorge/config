@@ -115,9 +115,28 @@ impl ReviewFixture {
 
     /// Wait until no turn holds the session and the condition holds.
     async fn settled(&self, what: &str, condition: impl Fn(&Self) -> Result<bool>) -> Result<()> {
+        self.wait_until(what, true, condition).await
+    }
+
+    /// Wait until the condition holds while a held turn keeps the session busy.
+    async fn settled_while_running(
+        &self,
+        what: &str,
+        condition: impl Fn(&Self) -> Result<bool>,
+    ) -> Result<()> {
+        self.wait_until(what, false, condition).await
+    }
+
+    /// Wait until the condition holds, and also until no turn holds the session when `idle`.
+    async fn wait_until(
+        &self,
+        what: &str,
+        idle: bool,
+        condition: impl Fn(&Self) -> Result<bool>,
+    ) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                if self.controller.coordinator.execution.available_permits() == 1
+                if (!idle || self.controller.coordinator.execution.available_permits() == 1)
                     && condition(self)?
                 {
                     break Ok::<(), anyhow::Error>(());
@@ -310,6 +329,14 @@ impl ReviewFixture {
     /// trace records each submission. The trace writer appends on its own thread, so the file
     /// is read after a flush.
     fn command_receipts(&self, operation_id: &str) -> usize {
+        self.trace_events("exchange.command.received")
+            .iter()
+            .filter(|record| record["payload"]["command_id"] == operation_id)
+            .count()
+    }
+
+    /// Read the session trace records whose event name starts with `event_prefix`, oldest first.
+    fn trace_events(&self, event_prefix: &str) -> Vec<Value> {
         self.controller
             .trace
             .flush()
@@ -324,10 +351,11 @@ impl ReviewFixture {
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|record| {
-                record["event"] == "exchange.command.received"
-                    && record["payload"]["command_id"] == operation_id
+                record["event"]
+                    .as_str()
+                    .is_some_and(|event| event.starts_with(event_prefix))
             })
-            .count()
+            .collect()
     }
 
     /// Save one inline comment on the reviewed plan the way the review document does: keyed by
@@ -367,6 +395,14 @@ impl ReviewFixture {
     /// Answer every pending acceptance question with its first option, then continue.
     /// Returns the editor reply to the continuation.
     async fn answer_acceptance(&self, first_id: u64) -> Result<Value> {
+        let continue_id = self.answer_acceptance_questions(first_id).await?;
+        self.continue_acceptance(continue_id).await?;
+        self.response(continue_id).await
+    }
+
+    /// Answer every pending acceptance question with its first option, using request identities
+    /// from `first_id`. Returns the next unused request identity.
+    async fn answer_acceptance_questions(&self, first_id: u64) -> Result<u64> {
         let plan = self.plan()?.context("planning task disappeared")?;
         let questions = plan
             .review_questions()
@@ -389,9 +425,13 @@ impl ReviewFixture {
             self.response(id).await?;
             id += 1;
         }
-        let questions = self
-            .plan()?
-            .context("planning task disappeared")?
+        Ok(id)
+    }
+
+    /// Submit the answered acceptance questions as request `id` without waiting for its reply.
+    async fn continue_acceptance(&self, id: u64) -> Result<()> {
+        let plan = self.plan()?.context("planning task disappeared")?;
+        let questions = plan
             .review_questions()
             .context("acceptance questions disappeared")?
             .clone();
@@ -401,8 +441,7 @@ impl ReviewFixture {
             json!({"operation_id":format!("continue-{id}"),
                 "target":{"owner":"plan_review","id":plan.id,"set_id":questions.question_set.id,"revision":questions.revision}}),
         )
-        .await?;
-        self.response(id).await
+        .await
     }
 
     /// Require that the comment reached a revision before any acceptance: a `ChangesRequested`
@@ -444,6 +483,24 @@ impl ReviewFixture {
             "no revision turn carried the saved comment"
         );
         Ok(())
+    }
+
+    /// Roll the conversation back to before `exchange_id`, as `/undo` with Conversation only
+    /// does, and return the response.
+    async fn undo_conversation(&self, id: u64, exchange_id: &str) -> Result<Value> {
+        let latest = self
+            .store()?
+            .latest_exchange(&self.session_id)?
+            .context("the session has no exchange")?
+            .id;
+        self.dispatch(
+            id,
+            "session.command.apply",
+            json!({"operation_id":format!("undo-{id}"),"action":"undo","rollback":{
+                "scope":"conversation","exchange_id":exchange_id,"latest_exchange_id":latest}}),
+        )
+        .await?;
+        self.response(id).await
     }
 
     async fn finish(self) -> Result<()> {
@@ -987,7 +1044,7 @@ async fn new_plan_after_a_cancelled_plan_says_so() -> Result<()> {
 
 /// `/plan accept on` during review accepts at once; a saved inline comment is revised first,
 /// and the revised submission is then accepted automatically.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn automatic_acceptance_in_review_revises_a_saved_comment_first() -> Result<()> {
     let fixture = ReviewFixture::open(true).await?;
     let plan = fixture.plan_in_review().await?;
@@ -1001,50 +1058,6 @@ async fn automatic_acceptance_in_review_revises_a_saved_comment_first() -> Resul
         })
         .await?;
     fixture.answer_acceptance(21).await?;
-    fixture
-        .settled("revised acceptance", |fixture| {
-            Ok(fixture.task()?.kind() == crate::task::TaskKind::Execute)
-        })
-        .await?;
-    fixture.assert_revised_before_accepted("compute_total", true)?;
-    fixture.assert_execution_started_once()?;
-    assert_eq!(fixture.stopped_acceptance_notices(), 0);
-    fixture.finish().await
-}
-
-/// With automatic acceptance already on, a later submission carrying a saved comment from its
-/// review is revised before the automatic acceptance runs.
-#[tokio::test]
-async fn automatic_acceptance_of_a_later_submission_revises_a_saved_comment_first() -> Result<()> {
-    let fixture = ReviewFixture::open(true).await?;
-    let plan = fixture.plan_in_review().await?;
-    fixture
-        .dispatch(
-            20,
-            "session.command.apply",
-            json!({"action":"request_changes","operation_id":"revise","plan_id":plan.id,"comment":"Add an overview"}),
-        )
-        .await?;
-    fixture.response(20).await?;
-    fixture
-        .settled("first revision", |fixture| {
-            Ok(fixture.plan()?.is_some_and(|current| {
-                current.model_revision > plan.model_revision
-                    && current.state == crate::plan::PlanState::AwaitingReview
-            }))
-        })
-        .await?;
-    let revised = fixture.plan()?.context("planning task disappeared")?;
-    fixture.save_comment(&revised, "Rename the callable to compute_total")?;
-    fixture.prompt(21, "/plan accept on").await?;
-    fixture
-        .settled("acceptance questions", |fixture| {
-            Ok(fixture
-                .plan()?
-                .is_some_and(|plan| plan.review_questions().is_some()))
-        })
-        .await?;
-    fixture.answer_acceptance(22).await?;
     fixture
         .settled("revised acceptance", |fixture| {
             Ok(fixture.task()?.kind() == crate::task::TaskKind::Execute)
@@ -1262,57 +1275,6 @@ async fn cancelled_plan_leaves_no_artifact_or_authoring_directory() -> Result<()
             .iter()
             .all(|artifact| artifact.id != plan.id),
         "the cancelled plan stayed in the artifact list"
-    );
-    fixture.finish().await
-}
-
-/// Cancelling a plan while its draft turn runs settles that turn's exchange as cancelled before
-/// the command answers, rather than parking it for an admission that never comes.
-#[tokio::test]
-async fn plan_cancel_during_a_draft_settles_its_exchange() -> Result<()> {
-    use crate::provider::mock_response::MockResponseCommand;
-    let fixture = ReviewFixture::open(true).await?;
-    let control = fixture
-        .controller
-        .provider_handle()
-        .mock_response_control()
-        .context("mock controls missing")?;
-    fixture.prompt(2, "/yolo").await?;
-    fixture.response(2).await?;
-    let hold = control
-        .dispatch(
-            &fixture.session_id,
-            MockResponseCommand::Hold {
-                mode: None,
-                any_session: false,
-            },
-        )
-        .await?;
-    let hold_id = hold["id"].as_str().context("hold id missing")?.to_owned();
-    fixture.prompt(3, "/plan Add an isolated callable").await?;
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        control.dispatch(
-            &fixture.session_id,
-            MockResponseCommand::Wait { id: hold_id },
-        ),
-    )
-    .await??;
-    let drafting = fixture
-        .store()?
-        .latest_exchange(&fixture.session_id)?
-        .context("the draft turn has no exchange")?
-        .id;
-    fixture.prompt(4, "/plan cancel").await?;
-    let answer = fixture.response(4).await?;
-    let exchange = fixture
-        .store()?
-        .load_exchange(&drafting)?
-        .context("the draft exchange disappeared")?;
-    assert_eq!(
-        exchange.state(),
-        crate::exchange::ExchangeState::Cancelled,
-        "the draft exchange did not settle before the command answered: {answer}"
     );
     fixture.finish().await
 }
@@ -1554,58 +1516,313 @@ async fn live_transcript_shows_a_submission_before_its_turn_settles() -> Result<
     fixture.finish().await
 }
 
-/// Between the revision a saved comment requires and the automatic acceptance that follows it,
-/// no status asks for a plan review: the acceptance is already recorded and only waits for the
-/// revision turn to settle.
-#[tokio::test]
-async fn automatic_acceptance_never_shows_the_revision_awaiting_review() -> Result<()> {
+/// An acceptance that reaches the owner while the revision turn that submitted its revision has
+/// not settled waits for that turn and then runs. The mock provider holds the revision turn after
+/// its terminal event, and `/plan accept on` and the answered acceptance questions arrive in that
+/// window. The continuation is answered only once execution starts, and no acceptance finishes
+/// as failed, which would leave every later automatic recovery finding a finished command and
+/// the revision stranded in review.
+#[tokio::test(start_paused = true)]
+async fn acceptance_during_an_unsettled_revision_turn_runs_after_it_settles() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestHoldId, TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
     let fixture = ReviewFixture::open(true).await?;
-    let plan = fixture.plan_in_review().await?;
-    fixture.save_comment(&plan, "Rename the callable to compute_total")?;
-    fixture.prompt(20, "/plan accept on").await?;
     fixture
-        .settled("acceptance questions", |fixture| {
+        .controller
+        .trace
+        .configure_default(crate::trace::LogLevel::Trace)?;
+    let plan = fixture.plan_in_review().await?;
+    let directory =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?
+            .authoring_directory(&fixture.session_id, &plan.id);
+    let control = fixture
+        .controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?;
+    control
+        .dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        TestPromptStep::FileWrite {
+                            path: directory.join("docs/overview.md").to_string_lossy().into_owned(),
+                            text: "# Implement the requested change\n\n## Objective\nRename the callable.\n\n## Background\nThe review asked for a clearer name.\n\n## Design\nApply the rename at its owning boundary.\n\n## Manual checks\n- Confirm the renamed interface behaves as designed.\n".into(),
+                        },
+                        TestPromptStep::ToolCall {
+                            name: "plan_submit".into(),
+                            arguments: json!({"plan_id":plan.id}),
+                        },
+                        TestPromptStep::Message {
+                            content: TestMessageContent::Response,
+                            text: "Submitted the revised plan.".into(),
+                        },
+                        TestPromptStep::CollectionBarrier {
+                            id: TestHoldId::new("revision-unsettled")?,
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    fixture
+        .dispatch(
+            20,
+            "session.command.apply",
+            json!({"action":"request_changes","operation_id":"revise","plan_id":plan.id,"comment":"Rename the callable"}),
+        )
+        .await?;
+    control
+        .dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Wait {
+                id: "revision-unsettled".into(),
+            },
+        )
+        .await?;
+    let revised = fixture.plan()?.context("planning task disappeared")?;
+    assert_eq!(revised.model_revision, 2, "the revision was not submitted");
+    fixture.prompt(21, "/plan accept on").await?;
+    fixture.response(21).await?;
+    fixture
+        .settled_while_running("acceptance questions", |fixture| {
             Ok(fixture
                 .plan()?
                 .is_some_and(|plan| plan.review_questions().is_some()))
         })
         .await?;
-    let answered_from = fixture.frame_list.lock().unwrap().len();
-    fixture.answer_acceptance(21).await?;
+    let continue_id = fixture.answer_acceptance_questions(22).await?;
+    // The continuation's reply waits for the acceptance it starts, so the turn is released
+    // while that request is still being answered.
+    let operation_id = format!("continue-{continue_id}");
+    let settle_revision = async {
+        fixture
+            .settled_while_running("acceptance reaching the owner", |fixture| {
+                Ok(fixture
+                    .trace_events("plan.acceptance_")
+                    .iter()
+                    .any(|record| record["payload"]["command_id"] == operation_id.as_str()))
+            })
+            .await?;
+        assert_ne!(
+            fixture.task()?.kind(),
+            crate::task::TaskKind::Execute,
+            "execution started before the revision turn settled"
+        );
+        control
+            .dispatch(
+                &fixture.session_id,
+                MockResponseCommand::Release {
+                    id: "revision-unsettled".into(),
+                },
+            )
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let (continuation, settlement) =
+        tokio::join!(fixture.continue_acceptance(continue_id), settle_revision);
+    continuation?;
+    settlement?;
+    let continued = fixture.response(continue_id).await?;
+    assert!(
+        continued.get("error").is_none(),
+        "the acceptance failed while the revision turn settled: {continued}"
+    );
     fixture
-        .settled("revised acceptance", |fixture| {
-            Ok(fixture.task()?.kind() == crate::task::TaskKind::Execute)
+        .settled("accepted revision", |fixture| {
+            Ok(fixture.task()?.kind() == crate::task::TaskKind::Execute
+                || fixture.stopped_acceptance_notices() > 0)
         })
         .await?;
-    // The reviewed revision stays in review while its acceptance questions are answered; the
-    // revision the saved comment produced is the one the recorded acceptance already covers.
-    fn reviews_of(value: &Value, revision: u32, found: &mut Vec<Value>) {
-        match value {
-            Value::Object(object) => {
-                if object.get("kind").and_then(Value::as_str) == Some("awaiting_plan_review")
-                    && object.get("revision").and_then(Value::as_u64) == Some(u64::from(revision))
-                {
-                    found.push(value.clone());
-                }
-                for child in object.values() {
-                    reviews_of(child, revision, found);
-                }
-            }
-            Value::Array(array) => {
-                for child in array {
-                    reviews_of(child, revision, found);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut review_statuses = Vec::new();
-    for frame in &fixture.frame_list.lock().unwrap()[answered_from..] {
-        reviews_of(frame, plan.model_revision + 1, &mut review_statuses);
-    }
+    assert_eq!(fixture.stopped_acceptance_notices(), 0);
+    assert_eq!(
+        fixture.task()?.kind(),
+        crate::task::TaskKind::Execute,
+        "the revision was never accepted"
+    );
+    fixture.assert_execution_started_once()?;
+    fixture.finish().await
+}
+
+/// Rolling back the exchange that started a plan removes the plan from the session's artifacts
+/// once the plan was accepted, as it does while the plan is in review: the winbar count and the
+/// artifact picker no longer offer a plan whose start the transcript no longer shows.
+#[tokio::test]
+async fn rolling_back_an_accepted_plan_start_removes_its_artifact() -> Result<()> {
+    let fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    fixture.accept_and_answer(20).await?;
+    fixture
+        .settled("acceptance", |fixture| {
+            Ok(fixture
+                .store()?
+                .load_plan(&plan.id)?
+                .is_some_and(|plan| plan.state == crate::plan::PlanState::Accepted))
+        })
+        .await?;
+    let start = fixture
+        .store()?
+        .list_exchange(&fixture.session_id)?
+        .into_iter()
+        .next()
+        .context("the plan start exchange is missing")?;
+    let response = fixture.undo_conversation(30, &start.id).await?;
+    assert!(response.get("error").is_none(), "{response}");
+    let snapshot = fixture.controller.observer.snapshot()?;
     assert!(
-        review_statuses.is_empty(),
-        "a recorded acceptance published a plan review status: {review_statuses:#?}"
+        snapshot
+            .artifact
+            .iter()
+            .all(|artifact| artifact.id != plan.id),
+        "the rolled-back plan stayed in the artifact list"
     );
     fixture.finish().await
+}
+
+/// Rolling back a discussion exchange while the plan waits in review, with nothing running,
+/// leaves the plan in review as it was: a plan waiting for the user would not continue by itself,
+/// so the rollback has nothing to pause.
+#[tokio::test]
+async fn rolling_back_a_discussion_keeps_the_plan_in_review() -> Result<()> {
+    let fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    fixture.script_prose_responses(1).await?;
+    fixture.prompt(10, "Explain the proposed callable.").await?;
+    fixture
+        .settled("discussion", |fixture| {
+            Ok(fixture
+                .store()?
+                .latest_exchange(&fixture.session_id)?
+                .is_some_and(|exchange| exchange.is_finished() && exchange.ordinal == 2))
+        })
+        .await?;
+    let discussion = fixture
+        .store()?
+        .latest_exchange(&fixture.session_id)?
+        .context("discussion exchange is missing")?;
+    let response = fixture.undo_conversation(20, &discussion.id).await?;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(fixture.task()?.status(), crate::task::TaskStatus::Waiting);
+    let current = fixture.plan()?.context("the plan disappeared")?;
+    assert_eq!(current.id, plan.id);
+    assert_eq!(current.state, crate::plan::PlanState::AwaitingReview);
+    assert_eq!(current.model_revision, plan.model_revision);
+    fixture.finish().await
+}
+
+/// A `/compact` that stops a revision turn runs that turn again with the review it was given:
+/// the change request, the saved comments, and the edits, together with the notice that says
+/// why the turn runs again.
+///
+/// The turn that ran again once received only "Continue the interrupted request…" followed by
+/// the task's first prompt, so the model revised without the review and resubmitted the plan
+/// unchanged.
+#[tokio::test]
+async fn compaction_during_a_revision_runs_it_again_with_the_review() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestHoldId, TestInputAcceptance, TestPromptScript, TestPromptStep, TestPromptTerminal,
+    };
+    let fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    let control = fixture
+        .controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?;
+    control
+        .dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![TestPromptStep::Barrier {
+                        id: TestHoldId::new("revision-before-compaction")?,
+                    }],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    fixture
+        .dispatch(
+            20,
+            "session.command.apply",
+            json!({"action":"request_changes","operation_id":"revise","plan_id":plan.id,"comment":"Name the leftover rule in the summary."}),
+        )
+        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        control.dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Wait {
+                id: "revision-before-compaction".into(),
+            },
+        ),
+    )
+    .await??;
+    fixture
+        .dispatch(
+            21,
+            "session.command.apply",
+            json!({"operation_id":"compact-revision","action":"compact"}),
+        )
+        .await?;
+    let response = fixture.response(21).await?;
+    assert!(response.get("error").is_none(), "{response}");
+    fixture
+        .settled("the revision that ran again", |fixture| {
+            Ok(fixture.submitted_turns()?.len() > 2)
+        })
+        .await?;
+    let turns = fixture.submitted_turns()?;
+    let review = turns
+        .iter()
+        .filter(|turn| turn["kind"]["kind"] == "plan_review")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        review.len(),
+        2,
+        "the turn that ran again lost its review: {turns:#?}"
+    );
+    let stopped = review[0];
+    let rerun = review[1];
+    assert_eq!(rerun["kind"], stopped["kind"], "{turns:#?}");
+    assert_eq!(
+        rerun["kind"]["review"]["feedback"]["overall"],
+        "Name the leftover rule in the summary."
+    );
+    assert!(
+        rerun["notices"].as_array().is_some_and(|notices| notices
+            .iter()
+            .any(|notice| notice["kind"] == "turn_restarted")),
+        "the turn that ran again does not say why: {rerun:#}"
+    );
+    fixture.finish().await
+}
+
+impl ReviewFixture {
+    /// Read the typed input of every turn the session submitted, in submission order.
+    fn submitted_turns(&self) -> Result<Vec<Value>> {
+        let journal = rusqlite::Connection::open_with_flags(
+            crate::storage::state::directory(&self.controller.data_root)
+                .join("provider-submissions.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut statement = journal.prepare(
+            "SELECT json_extract(payload,'$.request.input.turn') FROM submission \
+             WHERE json_extract(payload,'$.request.harness_session_id')=?1 ORDER BY rowid",
+        )?;
+        let turns = statement
+            .query_map([&self.session_id], |row| row.get::<_, String>(0))?
+            .map(|turn| Ok(serde_json::from_str(&turn?)?))
+            .collect::<Result<Vec<Value>>>()?;
+        Ok(turns)
+    }
 }

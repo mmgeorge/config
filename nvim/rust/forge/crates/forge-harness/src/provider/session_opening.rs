@@ -106,7 +106,17 @@ impl SessionOpening {
             provider.thread_open(operation.clone(), request),
         )
         .await;
-        let settled = self.complete(&operation, result.result.as_ref().err());
+        // Provider-wide shutdown ends every native process that could have applied the open, so
+        // an open whose disposition stays uncertain afterwards has nothing left to collect. The
+        // Codex adapter, for one, repeats an uncertain answer for an open interrupted after its
+        // `thread/start` request was written to every later collector.
+        let settled = self.complete(&operation, result.result.as_ref().err()) || {
+            let collected = collection.collected();
+            if collected {
+                self.release(&operation);
+            }
+            collected
+        };
         let result = self
             .resolve_observation(provider, core, &operation, result, &collection)
             .await;
@@ -378,9 +388,15 @@ impl SessionOpening {
             }
             Some(_) => false,
         };
-        if !settled {
-            return false;
+        if settled {
+            self.release(operation);
         }
+        settled
+    }
+
+    /// Forget a retained attempt whose native work can no longer change, so no later collection
+    /// observes it again.
+    fn release(&self, operation: &OperationContext) {
         let mut state = self
             .state
             .lock()
@@ -399,7 +415,6 @@ impl SessionOpening {
             }
             OpenState::Idle | OpenState::Pending(_) => {}
         }
-        true
     }
 
     /// Revoke the retained attempt without replacing its request or releasing unresolved work.

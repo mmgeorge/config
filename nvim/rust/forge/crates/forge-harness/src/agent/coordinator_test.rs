@@ -346,3 +346,139 @@ fn child_stop_requires_settled_followups() {
     assert!(!coordinator.has_active_task("parent"));
     assert!(coordinator.ready_launch().unwrap().is_none());
 }
+
+/// Send one interrupt request for `work` with the given source and captured target.
+async fn send_interrupt(
+    coordinator: &AgentCoordinator,
+    work: &AgentWork,
+    source: AgentSource,
+    target: AgentTarget,
+) -> tokio::sync::oneshot::Receiver<anyhow::Result<serde_json::Value>> {
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    coordinator
+        .sender()
+        .send(AgentCommand::Request {
+            request: Box::new(AgentRequest {
+                operation_id: format!("interrupt-{source:?}"),
+                source,
+                operation: AgentOperation::Interrupt {
+                    target: work.agent.id.clone(),
+                },
+            }),
+            authority: None,
+            target: Some(target),
+            response,
+            task_admission: None,
+        })
+        .await
+        .unwrap();
+    receiver
+}
+
+/// A user's interrupt stops the child when the editor's request is captured.
+///
+/// The request then waits in the parent's command FIFO, behind any earlier child command, and
+/// in the child command channel, behind every child observation. An informational message ahead
+/// of it once held the FIFO for 33 seconds while the broker worked through a child backlog, so
+/// the child ran on long after the user had interrupted it. Queued tasks stay for the broker,
+/// which persists their cancellation when the request reaches it.
+#[tokio::test]
+async fn user_interrupt_signals_the_child_when_its_command_is_captured() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let work = admit(&coordinator, "operation", "review");
+    let cancellation = coordinator
+        .cancellation(&work.agent.id, &work.task.id)
+        .unwrap();
+    crate::exchange::agent_command::AgentCommand::capture(
+        AgentOperation::Interrupt {
+            target: work.agent.id.clone(),
+        },
+        &coordinator,
+    )
+    .unwrap();
+    assert!(*cancellation.borrow());
+    assert_eq!(
+        coordinator.interruption(&work.agent.id, &work.task.id),
+        Some(AgentSource::User)
+    );
+    assert_eq!(coordinator.active_count(), 1);
+}
+
+/// Capturing a user's interrupt of every child stops each running child at once.
+#[tokio::test]
+async fn user_interrupt_of_every_child_signals_each_when_captured() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let first = admit(&coordinator, "first-operation", "review");
+    let second = admit(&coordinator, "second-operation", "explore");
+    let first_cancellation = coordinator
+        .cancellation(&first.agent.id, &first.task.id)
+        .unwrap();
+    let second_cancellation = coordinator
+        .cancellation(&second.agent.id, &second.task.id)
+        .unwrap();
+    crate::exchange::agent_command::AgentCommand::capture(
+        AgentOperation::InterruptAll,
+        &coordinator,
+    )
+    .unwrap();
+    assert!(*first_cancellation.borrow());
+    assert!(*second_cancellation.borrow());
+}
+
+/// An interrupt that reaches the channel without a captured user command waits for the broker,
+/// which authenticates a model's interrupt before stopping anything.
+#[tokio::test]
+async fn channel_interrupts_wait_for_the_broker() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let work = admit(&coordinator, "operation", "review");
+    let cancellation = coordinator
+        .cancellation(&work.agent.id, &work.task.id)
+        .unwrap();
+    let target = coordinator.capture_target(&work.agent.id).unwrap();
+    let _model = send_interrupt(&coordinator, &work, AgentSource::Model, target).await;
+    assert!(!*cancellation.borrow());
+}
+
+/// A stale captured target stops nothing: the child's later task is not the one the user saw.
+#[test]
+fn stale_user_interrupt_target_signals_nothing() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let work = admit(&coordinator, "operation", "review");
+    let cancellation = coordinator
+        .cancellation(&work.agent.id, &work.task.id)
+        .unwrap();
+    let stale = coordinator.capture_target(&work.agent.id).unwrap();
+    let followup = AgentRequest {
+        operation_id: "followup".into(),
+        source: AgentSource::User,
+        operation: AgentOperation::Followup {
+            target: work.agent.id.clone(),
+            message: "next task".into(),
+        },
+    };
+    coordinator
+        .reserve_followup(&followup, &work.agent.id, "next task", "parent", 2)
+        .unwrap()
+        .commit()
+        .unwrap();
+    coordinator.signal_user_interrupt(&stale);
+    assert!(!*cancellation.borrow());
+}
+
+/// The broker learns whether child commands still wait, so it can publish a backlog's latest
+/// state once instead of rebuilding the agent snapshot for every queued observation.
+#[tokio::test]
+async fn queued_commands_and_deferred_publication_are_reported() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let work = admit(&coordinator, "operation", "review");
+    assert!(!coordinator.has_queued_commands());
+    let target = coordinator.capture_target(&work.agent.id).unwrap();
+    let _model = send_interrupt(&coordinator, &work, AgentSource::Model, target).await;
+    assert!(coordinator.has_queued_commands());
+    assert!(coordinator.try_receive().is_some());
+    assert!(!coordinator.has_queued_commands());
+    assert!(!coordinator.take_deferred_agent_publication());
+    coordinator.defer_agent_publication();
+    assert!(coordinator.take_deferred_agent_publication());
+    assert!(!coordinator.take_deferred_agent_publication());
+}

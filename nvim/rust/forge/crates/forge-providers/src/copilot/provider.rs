@@ -1662,6 +1662,11 @@ impl BindingState {
 
     /// Fence native handoff and stop this already selected execution without consuming settlement.
     async fn interrupt(&self) -> Result<(), ProviderError> {
+        /// Bound how long a stop waits for Copilot to start a turn it accepted.
+        ///
+        /// Copilot usually starts an accepted message within a few hundred milliseconds; a start
+        /// held back longer, as by a slow MCP load, is aborted while still queued.
+        const NATIVE_START_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
         if let Some(shell) = self.callbacks.shell() {
             shell.cancel_waits();
         }
@@ -1678,6 +1683,10 @@ impl BindingState {
         // Stop and writer admission share one state lock; every admitted frame
         // precedes abort, while handoffs attempted after stop are rejected.
         let interrupt = async {
+            // An abort before Copilot starts the accepted input's turn does not prevent that turn,
+            // so the abort waits for the start. A turn that has not started within the grace is
+            // aborted anyway, as Copilot then discards input it still queues.
+            let _ = tokio::time::timeout(NATIVE_START_GRACE, self.turn.wait_native_start()).await;
             let abort = super::operation::wait(session.abort())
                 .await
                 .unwrap_or_else(Err);
@@ -5877,13 +5886,18 @@ mod retained_recovery_tests {
         Success,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum HelperBehavior {
         CompleteTurn,
         StalledTurn,
         /// Create `notes/wave.txt` in the binding's workspace and report a notification type the
         /// adapter does not apply, then complete.
         CreatedFile,
+        /// Accept the sent message without starting its turn; the test publishes the start once
+        /// it sets the flag. An abort before the start leaves the message queued, so the peer
+        /// reports the abort and then runs the turn anyway, as Copilot does; an abort after the
+        /// start ends the running turn as aborted.
+        DeferredStart(Arc<std::sync::atomic::AtomicBool>),
     }
 
     /// An acknowledged abort without terminal evidence must fence the runtime rather than hang
@@ -6043,6 +6057,163 @@ mod retained_recovery_tests {
             .unwrap();
     }
 
+    /// Build one native session notification of the deferred-start fixture.
+    fn deferred_start_event(
+        session: &Value,
+        id: &str,
+        parent: Value,
+        kind: &str,
+        data: Value,
+    ) -> Value {
+        json!({"jsonrpc":"2.0","method":"session.event",
+        "params":{"sessionId":session,"event":{"id":id,"parentId":parent,
+            "type":kind,"timestamp":"2026-11-02T00:00:00Z","data":data}}})
+    }
+
+    /// Build the notifications with which Copilot starts the turn of the accepted message.
+    fn deferred_start_frames(session: &Value) -> [Value; 2] {
+        [
+            deferred_start_event(
+                session,
+                "deferred-user",
+                Value::Null,
+                "user.message",
+                json!({"messageId":"accepted-input","turnId":"0"}),
+            ),
+            deferred_start_event(
+                session,
+                "deferred-start",
+                json!("deferred-user"),
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+        ]
+    }
+
+    /// A stop that arrives after Copilot accepted a message but before it started the message's
+    /// turn waits for the start, then aborts the running turn.
+    ///
+    /// Copilot reports an abort sent in that moment and then runs the message anyway. The adapter
+    /// had settled the message as discarded by the abort, so the turn that followed had no owner:
+    /// the event intake rejected it as unexpected execution, the client generation failed, the
+    /// pending abort failed as a cancelled request, and the host restarted the provider.
+    #[tokio::test(start_paused = true)]
+    async fn stop_before_the_native_start_waits_for_the_start_then_aborts_the_turn() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (provider, opened, _root, peer) = opened_helper_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+            HelperBehavior::DeferredStart(started.clone()),
+        )
+        .await;
+        let binding = opened.binding.id;
+        let mut events = opened.events;
+        let state = provider
+            .binding(&binding, ProviderOperation::TurnStart)
+            .await
+            .unwrap();
+        let session = json!(state.session.read().await.id());
+        let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "deferred-root");
+        let receipt = Arc::new(AcceptedReceipt {
+            id: "deferred-input".try_into().unwrap(),
+            attempt: forge_provider_api::DeliveryAttemptId::new("deferred-attempt").unwrap(),
+            accepted: AtomicU64::new(0),
+        });
+        let request = queued_request(
+            &binding,
+            scope.clone(),
+            state.request.lock().await.configuration.clone(),
+            receipt.clone(),
+        );
+        // The turn start returns only once Copilot reports the native start, so the stop runs
+        // beside it, as the host's stop does.
+        let starting = provider.turn_start(context("deferred-submit"), &binding, request);
+        tokio::pin!(starting);
+        while receipt.accepted.load(Ordering::Acquire) == 0 {
+            assert!(futures_util::poll!(starting.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+        let interrupting = provider.turn_interrupt(
+            context("deferred-interrupt"),
+            &binding,
+            CancelRequest {
+                scope: scope.clone(),
+            },
+        );
+        tokio::pin!(interrupting);
+        let mut start_result = None;
+        let mut interrupt_result = None;
+        let early = tokio::time::sleep(std::time::Duration::from_millis(500));
+        tokio::pin!(early);
+        loop {
+            tokio::select! {
+                result = &mut starting, if start_result.is_none() => start_result = Some(result),
+                result = &mut interrupting, if interrupt_result.is_none() => {
+                    interrupt_result = Some(result);
+                }
+                () = &mut early => break,
+            }
+        }
+        assert!(
+            !peer
+                .requests()
+                .iter()
+                .any(|request| request["method"] == "session.abort"),
+            "the stop aborted Copilot before it started the accepted turn: {interrupt_result:?}"
+        );
+        started.store(true, Ordering::Release);
+        for frame in deferred_start_frames(&session) {
+            peer.notify(&frame).await;
+        }
+        while start_result.is_none() || interrupt_result.is_none() {
+            tokio::select! {
+                result = &mut starting, if start_result.is_none() => start_result = Some(result),
+                result = &mut interrupting, if interrupt_result.is_none() => {
+                    interrupt_result = Some(result);
+                }
+            }
+        }
+        assert!(
+            matches!(start_result, Some(Ok(_))),
+            "the accepted turn did not start: {start_result:?}"
+        );
+        assert!(
+            matches!(interrupt_result, Some(Ok(_))),
+            "the stop after the native start failed: {interrupt_result:?}"
+        );
+        assert!(
+            provider.runtime.failed_generation().await.is_none(),
+            "the stop failed the client generation"
+        );
+        let mut outcome = None;
+        while let Ok(Some(envelope)) = events.try_next() {
+            if let ProviderEvent::Turn {
+                event: forge_provider_api::TurnEvent::Completed(completed),
+                ..
+            } = &envelope.event
+            {
+                outcome = Some(completed.result().outcome());
+            }
+        }
+        assert!(
+            matches!(
+                outcome,
+                Some(forge_provider_api::turn::TurnOutcome::Interrupted)
+            ),
+            "the stopped turn did not settle as interrupted: {outcome:?}"
+        );
+        provider
+            .thread_close(context("deferred-close"), &binding)
+            .await
+            .unwrap();
+        provider
+            .shutdown(context("deferred-shutdown"))
+            .await
+            .unwrap();
+    }
+
     /// Select whether auxiliary queue admission succeeds while preserving the main lifecycle fixture.
     async fn opened_helper_fixture(
         shells: Arc<std::sync::atomic::AtomicBool>,
@@ -6094,6 +6265,9 @@ mod retained_recovery_tests {
                             .insert(request["params"]["sessionId"].as_str().unwrap().to_owned());
                     }
                     json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                }
+                "session.send" if matches!(helper_behavior, HelperBehavior::DeferredStart(_)) => {
+                    json!({"messageId":"accepted-input"})
                 }
                 "session.send" if matches!(helper_behavior, HelperBehavior::CreatedFile) => {
                     send_count += 1;
@@ -6290,6 +6464,49 @@ mod retained_recovery_tests {
                 "session.abort" => {
                     if let Some(aborted) = aborted.take() {
                         let _ = aborted.send(());
+                    }
+                    if let HelperBehavior::DeferredStart(started) = &helper_behavior {
+                        let session = &request["params"]["sessionId"];
+                        let response =
+                            super::super::test_peer::response(request, json!({"success":true}));
+                        if !started.load(Ordering::Acquire) {
+                            let mut frames = vec![
+                                deferred_start_event(
+                                    session,
+                                    "deferred-abort",
+                                    Value::Null,
+                                    "abort",
+                                    json!({"reason":"user initiated"}),
+                                ),
+                                response,
+                            ];
+                            frames.extend(deferred_start_frames(session));
+                            return frames;
+                        }
+                        return vec![
+                            deferred_start_event(
+                                session,
+                                "deferred-abort",
+                                json!("deferred-start"),
+                                "abort",
+                                json!({"reason":"user initiated"}),
+                            ),
+                            deferred_start_event(
+                                session,
+                                "deferred-end",
+                                json!("deferred-abort"),
+                                "assistant.turn_end",
+                                json!({"turnId":"0"}),
+                            ),
+                            deferred_start_event(
+                                session,
+                                "deferred-idle",
+                                json!("deferred-end"),
+                                "assistant.idle",
+                                json!({"aborted":true}),
+                            ),
+                            response,
+                        ];
                     }
                     match abort_acknowledgement {
                         AbortAcknowledgement::Success => json!({"success":true}),

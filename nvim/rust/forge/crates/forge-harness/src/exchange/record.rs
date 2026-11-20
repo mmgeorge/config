@@ -13,6 +13,21 @@ enum InputAppend {
     Dispatched(forge_provider_api::InvocationScope),
 }
 
+/// What one recorded turn message is, as far as the transcript is concerned.
+#[derive(Debug, PartialEq, Eq)]
+enum NativeInput {
+    /// Model output, not input the provider echoed.
+    NotInput,
+    /// The echo of a Forge submission, whose own input node stands for it.
+    Submission(forge_provider_api::SubmissionId),
+    /// Input Harness wrote, which the transcript never shows.
+    HarnessAuthored,
+    /// Input from outside Forge, such as another client of the same thread, which keeps a row.
+    Foreign,
+    /// Native input whose text the provider has not reported yet.
+    Unread,
+}
+
 /// Reports the effect of one native observation on the exchange record.
 #[derive(Debug, Default)]
 pub(crate) struct ProviderObservation {
@@ -926,49 +941,25 @@ impl Exchange {
                 } else {
                     self.turn[index].record_item_message(item_id, event)?;
                 }
-                // Harness authors task-start and continuation input, and its notice row stands in
-                // for that text; the provider's echo of it must not render as a user prompt.
-                let host_input = matches!(
-                    self.opening,
-                    super::ExchangeOpening::TaskStarted { .. }
-                        | super::ExchangeOpening::TaskContinuation { .. }
-                )
-                .then(|| self.prompt.trim().to_owned())
-                .filter(|prompt| !prompt.is_empty());
                 let admitted_items = self.turn[index].items()[item_count..].to_vec();
+                let admitted_now = !admitted_items.is_empty();
                 for item in admitted_items {
                     let item_id = match &item {
                         crate::turn::TurnItem::Message { id }
                         | crate::turn::TurnItem::Tool { id } => id,
                     };
-                    // A native user message that echoes a Forge submission repeats the prompt the
-                    // broker already rendered for that admitted action, so it stays turn evidence
-                    // without a transcript node. Harness-authored child reports carry no submission, so
-                    // their echo is recognized by its shared preamble instead, and task input by the
-                    // exchange prompt it repeats. Other native input, such as text from another
-                    // client, keeps its row.
-                    let echo = match &item {
-                        crate::turn::TurnItem::Message { id } => self.turn[index]
-                            .messages()
-                            .iter()
-                            .find(|message| {
-                                message.id() == id
-                                    && message.kind() == crate::turn::MessageKind::User
-                                    && (message.submission_id().is_some()
-                                        || crate::agent::report::is_child_report_echo(
-                                            message.text(),
-                                        )
-                                        || host_input
-                                            .as_deref()
-                                            .is_some_and(|prompt| message.text().contains(prompt)))
-                            })
-                            .map(|message| message.submission_id().cloned()),
-                        crate::turn::TurnItem::Tool { .. } => None,
+                    let classification = match &item {
+                        crate::turn::TurnItem::Message { id } => {
+                            self.classify_native_input(index, id)
+                        }
+                        crate::turn::TurnItem::Tool { .. } => NativeInput::NotInput,
                     };
-                    if let Some(submission) = echo {
-                        // A provider may consume steering after acknowledgement, for example once
-                        // its current model call ends, so the echo marks where the input applies.
-                        if let Some(submission) = submission {
+                    match classification {
+                        NativeInput::NotInput | NativeInput::Foreign => {}
+                        NativeInput::Submission(submission) => {
+                            // A provider may consume steering after acknowledgement, for example
+                            // once its current model call ends, so the echo marks where the input
+                            // applies.
                             let anchor = ExchangeNode::TurnContent {
                                 id: format!("{turn_id}:content:{item_id}"),
                                 turn_id: turn_id.clone(),
@@ -977,14 +968,21 @@ impl Exchange {
                             if let Some(prompt) = self.consume_input(index, &submission, anchor) {
                                 *consumed_input = Some(prompt);
                             }
+                            continue;
                         }
-                        continue;
+                        NativeInput::HarnessAuthored | NativeInput::Unread => continue,
                     }
                     self.node_list.push(ExchangeNode::TurnContent {
                         id: format!("{turn_id}:content:{item_id}"),
                         turn_id: turn_id.clone(),
                         item,
                     });
+                }
+                if !tool
+                    && !admitted_now
+                    && let Some(prompt) = self.admit_read_native_input(index, item_id)
+                {
+                    *consumed_input = Some(prompt);
                 }
                 if tool {
                     self.record_tool_event(&turn_id, &address, item_id, event, now_ms)?;
@@ -1173,6 +1171,9 @@ impl Exchange {
         );
         let id = format!("{}:turn:{}", self.id, self.turn.len() + 1);
         self.turn.push(crate::turn::Turn::new(id, address, now_ms));
+        // A requested stop belongs to the turn it stopped; recovery must not read it as the
+        // user's intent for a later turn of the same exchange.
+        self.cancellation_requested = false;
         Ok(())
     }
 
@@ -1847,6 +1848,109 @@ impl Exchange {
         Ok(prompt)
     }
 
+    /// Classify one recorded message of a turn as native input or as model output.
+    ///
+    /// A native user message that echoes a Forge submission repeats the prompt the broker already
+    /// rendered for that admitted action, so it stays turn evidence without a transcript node.
+    /// An echo that lost its submission is still the user's steer when it repeats the text of
+    /// steering Harness sent to this exchange, so it reports that submission instead of drawing
+    /// the message a second time. Harness-authored input such as child results, notices, and task
+    /// starts carries no submission: its echo opens with a `<forge>` block, or repeats the prompt
+    /// of an exchange that Harness opened, whose notice row stands in for that text. Other native
+    /// input, such as text from another client, keeps its row. A provider can start the item
+    /// before reporting its text, and such an item stays unread until the text arrives.
+    fn classify_native_input(&self, turn_index: usize, message_id: &str) -> NativeInput {
+        let Some(message) = self.turn[turn_index]
+            .messages()
+            .iter()
+            .find(|message| message.id() == message_id)
+            .filter(|message| message.kind() == crate::turn::MessageKind::User)
+        else {
+            return NativeInput::NotInput;
+        };
+        if let Some(submission) = message.submission_id() {
+            return NativeInput::Submission(submission.clone());
+        }
+        let text = message.text().trim();
+        if text.is_empty() {
+            return NativeInput::Unread;
+        }
+        if let Some(submission) = self.node_list.iter().find_map(|node| match node {
+            ExchangeNode::ExchangeInput { prompt }
+                if matches!(prompt.intent, InputIntent::User { .. })
+                    && prompt.text.trim() == text =>
+            {
+                prompt.submission_id.clone()
+            }
+            _ => None,
+        }) {
+            return NativeInput::Submission(submission);
+        }
+        let task_prompt = matches!(
+            self.opening,
+            super::ExchangeOpening::TaskStarted { .. }
+                | super::ExchangeOpening::TaskContinuation { .. }
+        )
+        .then(|| self.prompt.trim())
+        .filter(|prompt| !prompt.is_empty());
+        if forge_provider_api::forge::opens_with_block(text)
+            || task_prompt.is_some_and(|prompt| text.contains(prompt))
+        {
+            NativeInput::HarnessAuthored
+        } else {
+            NativeInput::Foreign
+        }
+    }
+
+    /// Settle a native user message once its text shows where it came from.
+    ///
+    /// Admission leaves a message whose start carried no text without a node; a later delta or
+    /// completion supplies the text that decides it. Foreign input gains its row, and an echo of
+    /// steering Harness sent consumes that input, which is returned. A message that already has a
+    /// node, or that reads as Harness input, is left as it is.
+    fn admit_read_native_input(
+        &mut self,
+        turn_index: usize,
+        provider_item: &forge_provider_api::ItemId,
+    ) -> Option<ExchangeInput> {
+        let message_id = self.turn[turn_index]
+            .messages()
+            .iter()
+            .find(|message| message.provider_id() == provider_item)
+            .map(|message| message.id().to_owned())?;
+        let turn_id = self.turn[turn_index].id().to_owned();
+        let has_node = self.node_list.iter().any(|node| {
+            matches!(
+                node,
+                ExchangeNode::TurnContent {
+                    turn_id: node_turn,
+                    item: crate::turn::TurnItem::Message { id },
+                    ..
+                } if *node_turn == turn_id && *id == message_id
+            )
+        });
+        if has_node {
+            return None;
+        }
+        let node = ExchangeNode::TurnContent {
+            id: format!("{turn_id}:content:{message_id}"),
+            turn_id,
+            item: crate::turn::TurnItem::Message {
+                id: message_id.clone(),
+            },
+        };
+        match self.classify_native_input(turn_index, &message_id) {
+            NativeInput::Foreign => {
+                self.node_list.push(node);
+                None
+            }
+            NativeInput::Submission(submission) => {
+                self.consume_input(turn_index, &submission, node)
+            }
+            NativeInput::NotInput | NativeInput::HarnessAuthored | NativeInput::Unread => None,
+        }
+    }
+
     /// Find the ordering anchor a consumption report left before its acknowledgement arrived.
     ///
     /// The anchor must belong to a turn of the acknowledging invocation, so evidence from
@@ -2190,6 +2294,38 @@ mod test {
             question: crate::exchange::ExchangeQuestion::None,
             clock: crate::exchange::ExchangeClock::Paused { elapsed_ms: 0 },
         }
+    }
+
+    /// A stop requested during one turn describes only that turn. An exchange that a later turn
+    /// reopens, such as a check result delivered after a cancel, recovers as interrupted when an
+    /// editor exit ends that later turn, because the user cancelled nothing it did.
+    #[test]
+    fn new_turn_clears_the_cancellation_of_the_previous_turn() {
+        use crate::turn::TurnOutcome;
+        let mut exchange = interaction();
+        let first = crate::turn::test_support::address(&exchange, "first");
+        exchange.start_turn(first.clone(), 10).unwrap();
+        exchange.cancellation_requested = true;
+        exchange.start_turn(first.clone(), 10).unwrap();
+        assert!(
+            exchange.cancellation_requested,
+            "repeating the running turn's start forgot its cancellation"
+        );
+        let completed = crate::turn::test_support::completed_event(
+            &first,
+            TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            20,
+        );
+        assert!(exchange.observe_event(&completed, 20).unwrap());
+        exchange
+            .start_turn(crate::turn::test_support::address(&exchange, "second"), 30)
+            .unwrap();
+        assert!(
+            !exchange.cancellation_requested,
+            "the next turn inherited the previous turn's cancellation"
+        );
     }
 
     #[test]
@@ -2818,5 +2954,127 @@ mod test {
             3,
         );
         assert!(!reasoned.is_output_free_continuation());
+    }
+
+    /// Report one native user item the way Codex does: the start carries no text and the
+    /// item's content follows as a delta, then the completion repeats it.
+    fn streamed_native_input(
+        exchange: &mut Exchange,
+        address: &crate::provider::TurnAddress,
+        item_id: &str,
+        text: &str,
+    ) {
+        let events = [
+            ItemEvent::Started(ItemStart::UserMessage(
+                forge_provider_api::UserMessageStart {
+                    text: String::new(),
+                    submission_id: None,
+                },
+            )),
+            ItemEvent::Message {
+                event: forge_provider_api::MessageItemEvent::Delta(text.into()),
+            },
+            ItemEvent::Completed(forge_provider_api::ItemCompletion::UserMessage(
+                forge_provider_api::MessageCompletion {
+                    text: text.into(),
+                    outcome: forge_provider_api::MessageOutcome::Completed,
+                },
+            )),
+        ];
+        for event in events {
+            observe(exchange, &item_event(address, item_id, event), 2);
+        }
+    }
+
+    /// Harness-authored input that a provider echoes without a submission, such as the
+    /// continuation that delivers child results to a running parent, is never a transcript row,
+    /// even when the provider reports its text only after the item starts. Native input that
+    /// Harness did not author keeps its row.
+    #[test]
+    fn harness_authored_input_echoed_after_its_start_draws_no_row() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let address = running_turn(&mut exchange, "first", 1);
+        let continuation = forge_provider_api::forge::TurnInput::child_continuation(vec![
+            forge_provider_api::forge::AgentResult {
+                agent: "/root/code-explorer-1".into(),
+                task_id: "task".into(),
+                status: "completed".into(),
+                response: Some("Read every file.".into()),
+                error: None,
+            },
+        ])
+        .unwrap();
+        streamed_native_input(
+            &mut exchange,
+            &address,
+            "continuation",
+            &forge_provider_api::forge::input_block(&continuation),
+        );
+        assert_eq!(displayed(&exchange), Vec::<String>::new());
+        streamed_native_input(
+            &mut exchange,
+            &address,
+            "other-client",
+            "typed in another client",
+        );
+        let shown = exchange
+            .node_list
+            .iter()
+            .filter(|node| exchange.displays_node(node))
+            .map(|node| match node {
+                ExchangeNode::TurnContent {
+                    item: crate::turn::TurnItem::Message { id },
+                    ..
+                } => exchange.turn[0]
+                    .messages()
+                    .iter()
+                    .find(|message| message.id() == id)
+                    .map(|message| message.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shown, vec![Some("typed in another client".to_owned())]);
+    }
+
+    /// A provider that echoes a steer without its submission still consumes it: the echo repeats
+    /// the text of input Harness sent to that invocation, so the input moves into the transcript
+    /// once and the echo draws no second row, whether its text arrives at once or after its start.
+    #[test]
+    fn steering_echoed_without_its_submission_is_consumed_once() {
+        for streamed in [false, true] {
+            let mut exchange = interaction();
+            exchange.resume(1).unwrap();
+            let address = running_turn(&mut exchange, "first", 1);
+            let prompt = acknowledge(&mut exchange, &address, &submission("steer"), 2);
+            if streamed {
+                streamed_native_input(&mut exchange, &address, "echo", "prefer the short form");
+            } else {
+                observe(
+                    &mut exchange,
+                    &item_event(
+                        &address,
+                        "echo",
+                        ItemEvent::Started(ItemStart::UserMessage(
+                            forge_provider_api::UserMessageStart {
+                                text: "prefer the short form".into(),
+                                submission_id: None,
+                            },
+                        )),
+                    ),
+                    3,
+                );
+            }
+            assert_eq!(
+                consumption(&exchange, &prompt.id),
+                InputConsumption::Consumed,
+                "streamed={streamed}"
+            );
+            assert_eq!(
+                displayed(&exchange),
+                vec![prompt.id.clone()],
+                "streamed={streamed}"
+            );
+        }
     }
 }

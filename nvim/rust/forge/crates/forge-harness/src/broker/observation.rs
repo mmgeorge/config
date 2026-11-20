@@ -29,6 +29,9 @@ pub(crate) struct BrokerObserver {
     pub(crate) input_schedule: tokio::sync::watch::Sender<crate::session::InputSchedule>,
     pub(super) lsp: Arc<crate::tools::lsp::LspService>,
     pub(crate) status_thoughts: AtomicBool,
+    /// A caller's compaction is accepted and has not started its attempt. The session owner
+    /// keeps this current; the idle status reads as a hand-off while it holds.
+    pub(crate) compaction_waiting: AtomicBool,
     pub(crate) check_editing: Arc<AtomicBool>,
     pub(crate) completion_queue: crate::checks::CompletionQueue,
     pub(crate) session_events:
@@ -128,8 +131,11 @@ impl BrokerObserver {
     /// editor does not reveal the finished exchange a moment before the successor replaces it at
     /// the tail. Pending verification checks read `Checking · 0s` instead, and only over an idle
     /// phase: no exchange replaces the finished one, and once the run is recorded its own
-    /// `Checking` phase, timed by the run, follows. An owner that cannot execute is
-    /// excluded, because it would never start the work and the row would never clear.
+    /// `Checking` phase, timed by the run, follows. A `/compact` that waits for session control,
+    /// such as one requested while a task's checks run, is a hand-off too: the work it waits for
+    /// settles to idle before the compaction starts and publishes its own `Compacting` phase. An
+    /// owner that cannot execute is excluded, because it would never start the work and the row
+    /// would never clear.
     pub(crate) fn hand_off_phase(
         &self,
         store: &SqliteStore,
@@ -169,8 +175,21 @@ impl BrokerObserver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .phase
             == crate::exchange::ActivityPhase::Unavailable;
+        if unavailable {
+            return Ok(status);
+        }
+        let hand_off = |activity| SessionPhase::Working {
+            duration_ms: 0,
+            started_at_ms: None,
+            activity,
+            reasoning_summary: None,
+            execution: None,
+        };
+        if self.compaction_waiting.load(Ordering::Acquire) {
+            return Ok(hand_off(WorkflowActivity::HandingOff));
+        }
         let input = self.input.snapshot()?;
-        if unavailable || input.messages.is_empty() && task.is_none() {
+        if input.messages.is_empty() && task.is_none() {
             return Ok(status);
         }
         // Unreadable admission state fails the owner's own offer, which reports it; no turn
@@ -201,13 +220,7 @@ impl BrokerObserver {
             }
             None => return Ok(status),
         };
-        Ok(SessionPhase::Working {
-            duration_ms: 0,
-            started_at_ms: None,
-            activity,
-            reasoning_summary: None,
-            execution: None,
-        })
+        Ok(hand_off(activity))
     }
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
@@ -518,18 +531,20 @@ impl BrokerObserver {
             active_wait.as_ref(),
             interaction.last(),
         );
-        if task
-            .as_ref()
-            .is_some_and(|task| task.status() == crate::task::TaskStatus::Paused)
-        {
-            status = status.paused();
-        }
         if status == crate::session::state_machine::SessionPhase::Idle
             && self.agent_coordinator.active_count() > 0
         {
             status = crate::session::state_machine::SessionPhase::WaitingForAgent {
                 agent_count: self.agent_coordinator.active_count(),
             };
+        }
+        // Children that still run keep the session from reading Paused, as in the live status,
+        // which also applies the pause after it names the running agents.
+        if task
+            .as_ref()
+            .is_some_and(|task| task.status() == crate::task::TaskStatus::Paused)
+        {
+            status = status.paused();
         }
         if let Some(execution) = goal_execution.as_ref() {
             HarnessBroker::execution_status(&mut status, execution);
@@ -546,7 +561,12 @@ impl BrokerObserver {
                 _ => None,
             })
         {
-            status = crate::session::state_machine::SessionPhase::Compacting { started_at_ms };
+            status = crate::session::state_machine::SessionPhase::Compacting {
+                started_at_ms,
+                turn_waiting: interaction
+                    .last()
+                    .is_some_and(|exchange| !exchange.is_finished()),
+            };
         }
         if questions.required_pending()
             && !matches!(
@@ -582,7 +602,10 @@ impl BrokerObserver {
         {
             status = stopping;
         }
-        let status = self.hand_off_phase(store, task, status)?.blocked_by(task);
+        let status = self
+            .hand_off_phase(store, task, status)?
+            .blocked_by(task)
+            .preparing_fork(&source_session.provider_fork_state);
         self.trace.record(
             &source_session.id,
             "status_projected",
@@ -624,6 +647,7 @@ impl BrokerObserver {
         timeline = TimelineProjector::with_observed_agents(
             timeline,
             store.list_observed_agents(&source_session.id)?,
+            interaction.iter().chain(&agent_exchange_list),
         )?;
         let agents = crate::timeline::running_agents(&timeline, status_thoughts);
         timeline.push(TimelineEntry::Status {
@@ -905,6 +929,10 @@ impl BrokerObserver {
             label: &session.provider_label,
             capability: &capability,
             native_history: session.provider_session_id.is_some(),
+            newest_session_compaction_ms:
+                crate::exchange::rollback::RewindProvider::newest_session_compaction(
+                    &store.list_session_event(&session.id)?,
+                ),
         };
         Ok(crate::exchange::rollback::ExchangeRollbackReview::list(
             interaction_list,

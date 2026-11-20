@@ -33,9 +33,10 @@ T["input_reopen_edit"] = function()
   assert(commit and commit.spec.params.action.kind == "commit", "first edit did not commit")
   eq(commit.spec.params.action.edits[1].revision, 2)
 
-  -- The host has not published the commit result yet, so the displayed revision is stale.
+  -- The host has not published the commit result yet, so the displayed revision is stale, while the
+  -- composer shows the text the user saved.
   local text, failure = editor.move(state, "", -1)
-  assert(not failure and text == "original", "reopened edit did not show the queued entry")
+  assert(not failure and text == "first edit", "reopened edit did not show the saved text: " .. tostring(text))
   assert(#requests == 3, "reopened edit reserved before the previous edit was published: "
     .. vim.inspect(requests[4] and requests[4].spec.params.action))
 
@@ -221,6 +222,59 @@ T["navigation_releases_unchanged_entries"] = function()
   local commit = requests[#requests].spec.params.action
   eq(commit.kind, "commit")
   eq(vim.tbl_map(function(edit) return { edit.id, edit.text } end, commit.edits), { { "three", "trois" } })
+end
+
+T["saved_edit_shows_saved_text_until_published"] = function()
+  -- Saving ends the edit before the host answers its commit. The row keeps the saved text from that
+  -- frame, through the reservation's late acknowledgement, until the host publishes the edit.
+  local input = require("forge.views.harness.input_state")
+  local editor = require("forge.views.harness.queue_editor")
+  local requests = mock_client.record()
+  local state = { session = { id = "saved-edit" }, queue = {}, composer_buf = buffer.scratch() }
+  local staged_rows = {}
+  local function stage() staged_rows[#staged_rows + 1] = editor.staging(state, nil)[1].text end
+  input.attach(state, stage)
+  local queued = { id = "queued", revision = 1, text = "three", delivery = "queued", attachments = {} }
+  requests[1].callback({ revision = 1, messages = { queued }, suspended = false })
+  eq(editor.move(state, "", -1), "three")
+  local reserve = requests[2]
+  editor.finish(state, "four")
+  staged_rows = {}
+  stage()
+  -- The reservation lands after the save, so the commit leaves only now.
+  local reserved = vim.deepcopy(queued)
+  reserved.revision, reserved.reservation = 2, reserve.spec.params.action.reservation
+  reserve.callback({ revision = 2, operation_id = reserve.spec.params.id, upsert = { reserved }, removed = {} })
+  local commit = requests[3]
+  eq(commit.spec.params.action.kind, "commit")
+  eq(commit.spec.params.action.edits[1].revision, 2)
+  local published = vim.deepcopy(reserved)
+  published.text, published.revision, published.reservation = "four", 3, nil
+  commit.callback({ revision = 3, operation_id = commit.spec.params.id, upsert = { published }, removed = {} })
+  stage()
+  for index, text in ipairs(staged_rows) do eq({ index, text }, { index, "four" }) end
+  eq(state.input.saved_edit.queued, nil)
+end
+
+T["rejected_saved_edit_shows_host_text"] = function()
+  -- A commit the host rejects leaves the message as the host holds it, so the row shows that text.
+  local input = require("forge.views.harness.input_state")
+  local editor = require("forge.views.harness.queue_editor")
+  local requests = mock_client.record()
+  require("forge.infra.notifications").error = function() end
+  local state = { session = { id = "rejected-save" }, queue = {}, composer_buf = buffer.scratch() }
+  input.attach(state, function() end)
+  local queued = { id = "queued", revision = 1, text = "three", delivery = "queued", attachments = {} }
+  requests[1].callback({ revision = 1, messages = { queued }, suspended = false })
+  editor.move(state, "", -1)
+  local reserved = vim.deepcopy(queued)
+  reserved.revision, reserved.reservation = 2, requests[2].spec.params.action.reservation
+  requests[2].callback({ revision = 2, operation_id = requests[2].spec.params.id, upsert = { reserved }, removed = {} })
+  editor.finish(state, "four")
+  eq(editor.staging(state, nil)[1].text, "four")
+  requests[3].callback(nil, "commit rejected")
+  eq(editor.staging(state, nil)[1].text, "three")
+  eq(state.input.saved_edit.queued, nil)
 end
 
 T["question_staging_preserves_typed_responses"] = function()

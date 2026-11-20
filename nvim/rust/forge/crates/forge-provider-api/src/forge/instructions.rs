@@ -61,6 +61,8 @@ const HISTORY_REPAIRED: &str = "Recovery notice: an interrupted native tool-call
 
 const GOAL_COMPLETION_REFUSED: &str = "Harness refused the goal_complete request from the previous turn, so the goal is still active. Resolve the reason below before calling goal_complete again:";
 
+const TURN_RESTARTED: &str = "Harness stopped this turn before it finished and runs it again with the same input, which follows. Earlier tool results and file changes from the stopped attempt remain in effect.";
+
 const PLAN_ABANDONED: &str = "The user cancelled the earlier plan \"{title}\" in this conversation. This is a new, unrelated plan: do not continue the cancelled plan or reuse its names, decisions, or review comments unless the user's request asks for them.";
 
 const EXECUTE_CONTINUE: &str = "Continue the same Execute task at its saved phase. Reuse confirmed work, and check whether existing evidence still applies.";
@@ -196,6 +198,7 @@ pub(crate) fn for_notice(notice: &Notice) -> String {
         Notice::PermissionTimeout { feedback } => format!("{PERMISSION_TIMEOUT}\n{feedback}"),
         Notice::HistoryRepaired => HISTORY_REPAIRED.into(),
         Notice::PlanAbandoned { title } => PLAN_ABANDONED.replace("{title}", title),
+        Notice::TurnRestarted { reason } => format!("{TURN_RESTARTED} {reason}"),
         Notice::GoalCompletionRefused { reason } => {
             format!(
                 "{GOAL_COMPLETION_REFUSED}

@@ -3095,6 +3095,11 @@ mod tests {
         ] {
             assert!(body.contains(expected), "missing thread entry: {expected}");
         }
+        assert_eq!(
+            body.matches("Add that getter.").count(),
+            1,
+            "the follow-up comment reached the revision twice: {body}"
+        );
         assert!(
             !body.contains("Keep this interface."),
             "unrelated feedback entered the thread"

@@ -64,6 +64,19 @@ impl ActiveCommand {
             Self::Agent(_) | Self::Input(_) | Self::Configuration(_) => false,
         }
     }
+    /// Report whether this command is a compaction whose attempt has yet to start.
+    pub(super) fn compaction_waiting(&self) -> bool {
+        match self {
+            Self::NativeCommand(run) => run.compaction_waiting(),
+            Self::Agent(_)
+            | Self::Rollback(_)
+            | Self::Task(_)
+            | Self::Input(_)
+            | Self::Configuration(_)
+            | Self::Cancel { .. } => false,
+        }
+    }
+
     /// Install the domain stage after the command's active revision commits.
     pub(super) fn start(command: QueuedCommand, services: &OwnerServices) -> Self {
         match &command.record.request.command {

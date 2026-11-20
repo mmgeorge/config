@@ -38,35 +38,51 @@ pub(super) struct TaskCommandRun {
     checkpoint: Option<TaskCommandCheckpoint>,
     control: Option<OwnedSemaphorePermit>,
     transition: Option<ExchangeStop>,
+    /// Questions collection retired, reported once the commit shows whether their task survives.
+    lost_questions: Vec<crate::question::QuestionRecord>,
 }
 
 impl TaskCommandRun {
     /// Acquire compatibility control once for lifecycle commands; collection inherits that capability.
     /// Local policy changes rely on the task mutation fence and do not acquire native lanes.
     pub(super) fn start(command: QueuedCommand, services: &OwnerServices) -> Self {
-        let local = matches!(
-            &command.record.request.command,
-            Command::Task(TaskCommand::SetAutoAccept(_))
-        );
-        let stage = if local {
-            TaskStage::Preflight
-        } else {
-            let control = services.control.clone();
-            TaskStage::Acquiring(tokio::spawn(async move {
-                tokio::time::timeout(std::time::Duration::from_secs(60), control.acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .ok_or(CommandFailure::OwnershipUnavailable)
-            }))
-        };
+        let stage = Self::first_stage(&command, services);
         Self {
             command,
             checkpoint: None,
             control: None,
             transition: None,
+            lost_questions: Vec::new(),
             stage,
         }
+    }
+
+    fn first_stage(command: &QueuedCommand, services: &OwnerServices) -> TaskStage {
+        let local = matches!(
+            &command.record.request.command,
+            Command::Task(TaskCommand::SetAutoAccept(_))
+        );
+        if local {
+            return TaskStage::Preflight;
+        }
+        let control = services.control.clone();
+        TaskStage::Acquiring(tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(60), control.acquire_owned())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .ok_or(CommandFailure::OwnershipUnavailable)
+        }))
+    }
+
+    /// Start an acceptance that a planning invocation could not seal again from its first stage,
+    /// once that invocation has settled. It recorded nothing, so it is prepared exactly as the
+    /// same command arriving after the settle would be, against the task and plan it finds then.
+    pub(super) fn retry_after_planning(&mut self, services: &OwnerServices) {
+        debug_assert!(matches!(self.stage, TaskStage::AwaitingPlanning(_)));
+        self.control = None;
+        self.transition = None;
+        self.stage = Self::first_stage(&self.command, services);
     }
 
     /// Persist the selected revision and resolved authorization before sealing its invocation.
@@ -724,10 +740,16 @@ impl TaskCommandRun {
                     } else {
                         rejected(error)
                     }
-                })?;
+                });
                 // The close below records its question and exchange changes through their own
                 // writer leases, which this thread cannot take while it holds the task commit's.
                 drop(store);
+                // A question collection retired is lost to the task only if the task survived the
+                // commit, refused or not; a control that cleared or replaced it ended it instead.
+                broker
+                    .report_lost_questions(&std::mem::take(&mut self.lost_questions))
+                    .map_err(OperationFailure::Domain)?;
+                let committed = committed?;
                 // Collection parked any running exchange for a later admission to close. A finite
                 // control that removed the task schedules none, so close it while control is held.
                 let closed = match &committed {
@@ -1407,9 +1429,10 @@ impl TaskCommandRun {
         services: &OwnerServices,
     ) -> Result<TaskCommandProgress, OperationFailure> {
         // Revoke delivery before collection releases waiting model tools.
-        broker
-            .cancel_question_delivery()
+        let lost = broker
+            .revoke_question_delivery()
             .map_err(OperationFailure::Domain)?;
+        self.lost_questions.extend(lost);
         let input = if matches!(
             &self.command.record.request.command,
             Command::Task(TaskCommand::Pause(_))

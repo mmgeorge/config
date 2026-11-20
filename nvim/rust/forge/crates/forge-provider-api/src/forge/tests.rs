@@ -47,7 +47,7 @@ fn user_channel_renders_one_block_with_the_task_last() {
             state: "Failed".into(),
             exit_code: Some(101),
             error: Some("assertion failed: x < y".into()),
-            log: "D:/logs/rust-test.log".into(),
+            log: Some("D:/logs/rust-test.log".into()),
         }])
         .unwrap(),
     });
@@ -519,6 +519,25 @@ fn neutralize_disarms_only_forge_markers() {
     );
 }
 
+/// Recognize every rendered block as Harness input, and no text a user typed.
+#[test]
+fn rendered_blocks_open_their_message_and_user_text_does_not() {
+    let continuation = TurnInput::child_continuation(vec![AgentResult {
+        agent: "/root/explore".into(),
+        task_id: "task".into(),
+        status: "completed".into(),
+        response: Some("done".into()),
+        error: None,
+    }])
+    .unwrap();
+    assert!(opens_with_block(&input_block(&continuation)));
+    assert!(opens_with_block(&earlier_input_block(1, &continuation)));
+    assert!(opens_with_block(&system_instructions_block("open")));
+    assert!(!opens_with_block(&neutralize("<forge>typed</forge>")));
+    assert!(!opens_with_block("<forget> me"));
+    assert!(!opens_with_block("see <forge> later"));
+}
+
 /// Render the plan task with its request and contract, and the execute task's children.
 #[test]
 fn tasks_render_their_typed_fields() {
@@ -577,4 +596,30 @@ fn question_batch_renders_all_answers_in_one_user_block() {
         assert!(blocks.user.contains(value));
     }
     assert!(!blocks.lead.contains("Other required questions remain"));
+}
+
+/// A repair failure whose command printed nothing says so beside its exit status, instead of
+/// naming an empty log the model would report as missing output.
+#[test]
+fn check_failure_without_output_says_the_command_printed_nothing() {
+    let input = TurnInput::new(TurnKind::CheckRepair {
+        repair: CheckRepair::new(vec![CheckFailure {
+            check: "prettier".into(),
+            state: "Failed".into(),
+            exit_code: Some(1),
+            error: Some("formatter exited unsuccessfully".into()),
+            log: None,
+        }])
+        .unwrap(),
+    });
+    let lead = render(&context(), &input, ContextChannel::UserMessage).lead;
+    assert!(lead.contains("exit_code=\"1\""), "{lead}");
+    assert!(!lead.contains("log="), "{lead}");
+    assert!(
+        lead.contains(
+            "formatter exited unsuccessfully
+The command printed nothing on standard output or standard error."
+        ),
+        "{lead}"
+    );
 }

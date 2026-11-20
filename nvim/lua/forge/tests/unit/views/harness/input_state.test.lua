@@ -431,6 +431,82 @@ T["steering_never_renders_as_a_queued_follow_up"] = function()
   for _, render in ipairs(fixture.renders) do eq(render.queue, 0) end
 end
 
+-- While the provider is still starting its turn the host keeps a steer unclaimed, so the notice
+-- delay used to draw it under "Queued follow-up inputs". A steer the running turn will take waits
+-- in the "Steering active turn" section instead; an approval, a wait for children, and a paused
+-- queue hold input, so those still list it as a queued follow-up.
+T["unclaimed_steer_waits_under_steering_after_the_notice_delay"] = function()
+  local deferred = dofile("nvim/lua/forge/tests/support/deferred.lua")
+  local fixture = placement_fixture("waiting-steer", "working")
+  local state, input = fixture.state, fixture.input
+  local timers = deferred.install({ input.submission_notice_delay_ms })
+  local staging = require("forge.views.harness.queue_editor").staging
+
+  input.submit(state, "Reply with alpha", {}, "auto")
+  local steer = fixture.commit()
+  eq(timers.fire(input.submission_notice_delay_ms), 1)
+  eq(#state.queue, 0)
+  eq(vim.tbl_map(function(staged) return staged.text end, staging(state, nil, state.pending_steer)),
+    { "[waiting] Reply with alpha" })
+  local identity = state.pending_steer[1]
+  fixture.deliver(steer, "delivering", "steering")
+  eq(state.pending_steer, { identity })
+  eq(vim.tbl_map(function(staged) return staged.text end, staging(state, nil, state.pending_steer)),
+    { "Reply with alpha" })
+  fixture.deliver(steer, "accepted", "steering")
+  eq(state.pending_steer, { identity })
+  for _, render in ipairs(fixture.renders) do eq(render.queue + render.handoff, 0) end
+
+  -- A turn that ended before the steer reached it starts the steer as its own turn, keeping its row.
+  input.submit(state, "Then summarize", {}, "auto")
+  local late = fixture.commit()
+  timers.fire(input.submission_notice_delay_ms)
+  local late_identity = state.pending_steer[#state.pending_steer]
+  eq(late_identity.id, late.id)
+  state.status = { kind = "idle" }
+  fixture.deliver(late, "delivering", "turn")
+  eq(state.pending_handoff, { late_identity })
+
+  for _, holding in ipairs({ { kind = "awaiting_approval" }, { kind = "waiting_for_agent", agent_count = 2 } }) do
+    state.status = holding
+    input.submit(state, "Held prompt", {}, "auto")
+    local held = fixture.commit()
+    timers.fire(input.submission_notice_delay_ms)
+    eq(state.queue[#state.queue].id, held.id)
+    for _, staged in ipairs(state.pending_steer) do assert(staged.id ~= held.id, "a held prompt was drawn as steering") end
+  end
+
+  -- An interrupt that pauses the queue moves a waiting steer into the paused queue.
+  state.status = { kind = "working" }
+  input.submit(state, "Paused prompt", {}, "auto")
+  local paused = fixture.commit()
+  timers.fire(input.submission_notice_delay_ms)
+  eq(state.pending_steer[#state.pending_steer].id, paused.id)
+  input.receive(state, { revision = state.input.revision + 1, suspended = true, upsert = {}, removed = {} })
+  eq(state.queue[#state.queue].id, paused.id)
+  for _, staged in ipairs(state.pending_steer) do assert(staged.id ~= paused.id, "a paused prompt stayed in steering") end
+end
+
+-- A stop holds every unclaimed submission, so a steer still waiting when the user stops the turn
+-- moves into the queue at once and stays there, unsent, after the stop settles.
+T["waiting_steer_moves_to_the_queue_when_the_turn_stops"] = function()
+  local deferred = dofile("nvim/lua/forge/tests/support/deferred.lua")
+  local fixture = placement_fixture("stopped-steer", "working")
+  local state, input = fixture.state, fixture.input
+  local timers = deferred.install({ input.submission_notice_delay_ms })
+  input.submit(state, "Also mention the word anchor once.", {}, "auto")
+  local steer = fixture.commit()
+  timers.fire(input.submission_notice_delay_ms)
+  eq(state.pending_steer[1].id, steer.id)
+  state.status = { kind = "stopping" }
+  input.status_changed(state)
+  eq(vim.tbl_map(function(entry) return entry.id end, state.queue), { steer.id })
+  eq(#state.pending_steer, 0)
+  state.status = { kind = "idle" }
+  input.receive(state, { revision = state.input.revision + 1, suspended = true, upsert = {}, removed = {} })
+  eq(vim.tbl_map(function(entry) return entry.id end, state.queue), { steer.id })
+end
+
 -- The host reports a steer accepted before its exchange holds the acknowledged copy, so dropping
 -- the staged row at acceptance left the "Steering active turn" section without it for a frame.
 T["accepted_steer_stays_staged_until_the_turn_that_took_it_ends"] = function()

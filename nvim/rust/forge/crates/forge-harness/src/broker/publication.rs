@@ -135,10 +135,6 @@ pub enum SessionUpdate {
         operation_id: Option<String>,
         catalog: Box<crate::provider::ProviderCatalogRequest>,
     },
-    ConfigurationProgress {
-        operation_id: String,
-        state: ConfigurationProgressState,
-    },
     /// Publish cleanup observation without claiming execution failure or settlement.
     CleanupProgress {
         operation_id: String,
@@ -152,24 +148,6 @@ pub enum SessionUpdate {
         run_id: String,
         error: String,
     },
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigurationProgressState {
-    Applying,
-    Verifying,
-    Resuming,
-}
-
-impl ConfigurationProgressState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Applying => "applying",
-            Self::Verifying => "verifying",
-            Self::Resuming => "resuming",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -424,14 +402,6 @@ pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json
             None,
             json!({"snapshot":snapshot,"operation_id":operation_id}),
         ),
-        SessionUpdate::ConfigurationProgress {
-            operation_id,
-            state,
-        } => (
-            "configuration_progress",
-            None,
-            json!({"operation_id":operation_id,"state":state}),
-        ),
         SessionUpdate::CleanupProgress {
             operation_id,
             policy,
@@ -487,7 +457,6 @@ pub(crate) fn encode_session_event(
         | SessionUpdate::TurnStarted { .. }
         | SessionUpdate::Timeline { .. }
         | SessionUpdate::PlanProgress { .. }
-        | SessionUpdate::ConfigurationProgress { .. }
         | SessionUpdate::CleanupProgress { .. }
         | SessionUpdate::Diagnostic { .. }
         | SessionUpdate::CheckFailure { .. } => ("provider_event", payload),

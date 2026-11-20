@@ -812,3 +812,64 @@ async fn fork_of_a_session_that_ran_no_turn_opens_fresh_provider_history() -> Re
     scenario?;
     shutdown
 }
+
+/// Read the phase of a session's status entry.
+async fn status_phase(
+    controller: &SessionController,
+) -> Result<crate::session::state_machine::SessionPhase> {
+    controller
+        .broker
+        .lock()
+        .await
+        .snapshot()?
+        .timeline
+        .into_iter()
+        .find_map(|entry| match entry {
+            crate::timeline::TimelineEntry::Status { status, .. } => Some(status),
+            _ => None,
+        })
+        .context("the session has no status entry")
+}
+
+/// A fork whose provider copy is still being prepared says so in its status, so a prompt sent
+/// meanwhile, which waits on that copy, never sits under an empty status; the row leaves when the
+/// attempt ends.
+#[tokio::test]
+async fn a_preparing_fork_names_its_preparation_in_the_status() -> Result<()> {
+    use crate::session::state_machine::SessionPhase;
+    let fixture = RunningSourceFixture::start().await?;
+    let scenario = async {
+        let registry = fixture.service.registry().await?;
+        let (child, _child_id) = interrupted_fork(&registry, &fixture.session_id, true).await?;
+        assert_eq!(status_phase(&child).await?, SessionPhase::Idle);
+
+        let reopened = {
+            let mut broker = child.broker.lock().await;
+            broker
+                .retry_provider_fork()?
+                .context("a failed fork has a next attempt")?;
+            broker.provider_fork_status_events()?
+        };
+        assert_eq!(status_phase(&child).await?, SessionPhase::PreparingFork);
+        assert!(
+            reopened
+                .iter()
+                .any(|event| event.event == "document_changed"),
+            "the editor is not told to redraw the preparing status"
+        );
+
+        let ended = {
+            let mut broker = child.broker.lock().await;
+            broker.complete_provider_fork(Err("native fork failed".into()))?;
+            broker.provider_fork_status_events()?
+        };
+        assert_eq!(status_phase(&child).await?, SessionPhase::Idle);
+        assert!(
+            ended.iter().any(|event| event.event == "document_changed"),
+            "the editor is not told to remove the preparing status"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.finish(scenario).await
+}

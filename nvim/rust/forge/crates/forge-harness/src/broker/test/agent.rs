@@ -1971,10 +1971,13 @@ async fn write_off_child_dispatch_denies_writes_under_a_shared_reservation() -> 
 }
 
 /// Cancelling admitted work that holds no execution slot terminalizes it durably, so the parent
-/// settles and the next prompt starts without receiving the cancelled parent's child report.
+/// settles, and the next prompt tells the model once that the child was cancelled and will not
+/// report, without any result to report.
 ///
 /// Collection once skipped child interruption whenever no execution slot was occupied, so a
 /// launch queued behind a fence stayed admitted and the parent's checkpoint guard rejected it.
+/// The next prompt once received nothing about the cancelled parent's child, so the model still
+/// read its spawn result as admitted work and told the user the child's report was pending.
 #[tokio::test]
 async fn cancel_collects_pending_children_without_execution_slots() -> Result<()> {
     let repository = repository();
@@ -2087,14 +2090,33 @@ async fn cancel_collects_pending_children_without_execution_slots() -> Result<()
         )
         .await?;
     assert_eq!(provider.turn.load(Ordering::Acquire), 1);
-    // The cancelled parent never resumes, so the next prompt's turn never receives its child's
-    // report; that report once made the next turn's model describe the earlier turn's children.
+    // The cancelled parent never resumes, so the next prompt carries the child's cancellation:
+    // a terminal status and why it will not report, with no result for the model to report.
     let next_input = provider.input.lock().unwrap().clone();
+    let notice = next_input
+        .iter()
+        .find(|input| input.contains(&queued.task.id))
+        .with_context(|| {
+            format!("the next prompt never learned of the cancelled child: {next_input:#?}")
+        })?;
     assert!(
-        next_input
-            .iter()
-            .all(|input| !input.contains(&queued.task.id)),
-        "a cancelled parent's child report reached a later turn: {next_input:#?}"
+        notice.contains("status=\"cancelled\"")
+            && notice.contains(crate::agent::AgentTask::STOPPED_REQUEST_CANCELLATION),
+        "the next prompt does not say the child was cancelled and will not report: {notice}"
+    );
+    broker
+        .run_interaction(
+            "EXPLICIT_NEXT_TURN again".into(),
+            PromptMode::Chat,
+            Some(ExchangeAdmission::chat("EXPLICIT_NEXT_TURN again".into())),
+        )
+        .await?;
+    let later_input = provider.input.lock().unwrap().clone();
+    assert!(
+        later_input
+            .last()
+            .is_some_and(|input| !input.contains(&queued.task.id)),
+        "the cancellation reached a later prompt again: {later_input:#?}"
     );
     Ok(())
 }
@@ -2174,11 +2196,21 @@ async fn running_children_move_from_status_to_the_agents_summary() -> Result<()>
     Ok(())
 }
 
-/// Drive one delegating root whose first turn spawns a writing child and a write-off sibling,
-/// then has the user cancel the writing child before it starts; return the root's turn inputs.
+/// Which children the user cancels in `run_parent_with_user_cancelled_child`.
+#[derive(Clone, Copy)]
+enum UserChildCancel {
+    /// `Ctrl-X` on the writing child, while its write-off sibling runs to completion.
+    WritingChild,
+    /// `Ctrl-A` while both children are writers waiting for repository ownership.
+    EveryChild,
+}
+
+/// Drive one delegating root whose first turn spawns two children, then has the user cancel
+/// as `cancel` selects before a writing child starts; return the root's turn inputs.
 async fn run_parent_with_user_cancelled_child(
     broker: &mut HarnessBroker,
     workspace: &std::path::Path,
+    cancel: UserChildCancel,
 ) -> Result<Arc<std::sync::Mutex<Vec<String>>>> {
     let descriptor = crate::provider::ProviderDescriptor {
         kind: forge_providers::registry::nonselectable_id().expect("fixture identity exists"),
@@ -2213,10 +2245,11 @@ async fn run_parent_with_user_cancelled_child(
                 let first = recorded.lock().unwrap().is_empty();
                 recorded.lock().unwrap().push(text);
                 if first {
-                    for (profile, text) in [
-                        ("worker", "CANCELLED_CHILD_TASK"),
-                        ("reader", "SURVIVING_CHILD_TASK"),
-                    ] {
+                    let sibling = match cancel {
+                        UserChildCancel::WritingChild => ("reader", "SURVIVING_CHILD_TASK"),
+                        UserChildCancel::EveryChild => ("worker", "SECOND_CANCELLED_CHILD_TASK"),
+                    };
+                    for (profile, text) in [("worker", "CANCELLED_CHILD_TASK"), sibling] {
                         let result = crate::provider::test_support::call_tool(
                             &request,
                             "agent_spawn",
@@ -2225,21 +2258,27 @@ async fn run_parent_with_user_cancelled_child(
                         .await?;
                         assert!(result.to_string().contains("admitted"), "{result}");
                     }
-                    let target = coordinator
-                        .snapshot(None)
-                        .into_iter()
-                        .find(|(_, task)| {
-                            task.as_ref()
-                                .is_some_and(|task| task.message == "CANCELLED_CHILD_TASK")
-                        })
-                        .map(|(agent, _)| agent.id)
-                        .expect("the first child was admitted");
+                    let operation = match cancel {
+                        UserChildCancel::WritingChild => {
+                            let target = coordinator
+                                .snapshot(None)
+                                .into_iter()
+                                .find(|(_, task)| {
+                                    task.as_ref()
+                                        .is_some_and(|task| task.message == "CANCELLED_CHILD_TASK")
+                                })
+                                .map(|(agent, _)| agent.id)
+                                .expect("the first child was admitted");
+                            crate::agent::AgentOperation::Interrupt { target }
+                        }
+                        UserChildCancel::EveryChild => crate::agent::AgentOperation::InterruptAll,
+                    };
                     coordinator
                         .sender()
                         .request(crate::agent::AgentRequest {
-                            operation_id: "user-interrupt-first-child".into(),
+                            operation_id: "user-interrupt-children".into(),
                             source: crate::agent::AgentSource::User,
-                            operation: crate::agent::AgentOperation::Interrupt { target },
+                            operation,
                         })
                         .await
                         .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?;
@@ -2302,7 +2341,12 @@ async fn user_cancelled_child_leaves_sibling_result_to_continue_the_parent() -> 
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    let input = run_parent_with_user_cancelled_child(&mut broker, repository.path()).await?;
+    let input = run_parent_with_user_cancelled_child(
+        &mut broker,
+        repository.path(),
+        UserChildCancel::WritingChild,
+    )
+    .await?;
     let input = input.lock().unwrap().clone();
     assert_eq!(
         input.len(),
@@ -2324,6 +2368,48 @@ async fn user_cancelled_child_leaves_sibling_result_to_continue_the_parent() -> 
     assert!(
         tasks.iter().all(|task| task.parent_reported),
         "a delivered report stays pending for a later turn"
+    );
+    let exchanges = broker.store.list_exchange(&broker.session.id)?;
+    assert_eq!(exchanges.len(), 1);
+    assert_eq!(exchanges[0].state(), ExchangeState::Complete);
+    Ok(())
+}
+
+/// A user's cancel of every child continues the parent with each cancelled report.
+///
+/// A cancelled child once started no continuation unless a sibling's result accompanied it, so
+/// after `Ctrl-A` no report was reportable and the parked parent settled on its last words,
+/// typically a promise to report once the children finished, with nothing left to wake it.
+#[tokio::test]
+async fn user_cancel_of_every_child_continues_the_parent_with_their_reports() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let input = run_parent_with_user_cancelled_child(
+        &mut broker,
+        repository.path(),
+        UserChildCancel::EveryChild,
+    )
+    .await?;
+    let input = input.lock().unwrap().clone();
+    assert_eq!(
+        input.len(),
+        2,
+        "the parent did not continue after every child was cancelled: {input:#?}"
+    );
+    let continuation = &input[1];
+    assert_eq!(
+        continuation.matches("Cancelled by the user").count(),
+        2,
+        "the continuation does not carry both cancelled reports: {continuation}"
+    );
+    let tasks = broker.store.list_agent_task(&broker.session.id)?;
+    assert_eq!(tasks.len(), 2);
+    assert!(
+        tasks.iter().all(|task| task.parent_reported
+            && task.state == ExchangeState::Cancelled
+            && task.cancelled_by == Some(crate::agent::AgentSource::User)),
+        "a cancelled report stays pending or lost its cancelling source: {tasks:#?}"
     );
     let exchanges = broker.store.list_exchange(&broker.session.id)?;
     assert_eq!(exchanges.len(), 1);
@@ -2432,5 +2518,270 @@ async fn child_settlement_orders_every_refresh_around_its_stop_instant() -> Resu
         unordered.is_empty(),
         "a refresh could draw the running child at {unordered:?}, after it settled at {settled_at}"
     );
+    Ok(())
+}
+
+/// A cancelled child's backlog is recorded without being presented.
+///
+/// The child's observations share one channel with its interrupt and completion, so after a
+/// cancel the broker still applies every event the child produced before the interrupt reached
+/// it. Publishing each one rebuilt and sent the whole agent snapshot, which kept the cancelled
+/// child's tool count climbing and held its settlement back for as long as the backlog took. Once
+/// the cancellation is recorded the events still enter the child's durable transcript, so it
+/// stays truthful, but nothing is published until the child settles.
+#[tokio::test]
+async fn cancelled_child_backlog_is_recorded_without_publication() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let admission = admit_child_fixture(&mut broker, "cancelled")?;
+    let owner = crate::provider::ThreadOwner::new(
+        (broker.session.id.clone()).into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
+    let address = child_address(&owner, &admission.task.id);
+    let mut event = Vec::new();
+    broker
+        .observe_child_fixture(
+            owner.clone(),
+            &admission.task.id,
+            child_event(
+                &address,
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
+            &mut event,
+        )
+        .await?;
+    assert!(!event.is_empty(), "a running child's events are published");
+    broker
+        .interrupt_managed_agent(
+            &admission.agent.id,
+            crate::agent::AgentSource::User,
+            &mut event,
+        )
+        .await?;
+    event.clear();
+    broker
+        .observe_child_fixture(
+            owner.clone(),
+            &admission.task.id,
+            child_message(
+                &address,
+                "backlog",
+                crate::provider::TestMessageContent::Commentary,
+                "Produced before the interrupt arrived",
+            ),
+            &mut event,
+        )
+        .await?;
+    assert!(
+        event.is_empty(),
+        "a cancelled child's backlog was published: {event:?}"
+    );
+    let retained = broker.store.load_exchange(&admission.task.id)?.unwrap();
+    assert_eq!(
+        retained
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .map(|message| message.text().to_owned())
+            .collect::<Vec<_>>(),
+        ["Produced before the interrupt arrived"]
+    );
+    broker
+        .complete_managed_agent(
+            owner,
+            admission.task.id.clone(),
+            Err(anyhow::anyhow!("interrupted")),
+            Vec::new(),
+            None,
+            &mut event,
+        )
+        .await?;
+    assert!(
+        !event.is_empty(),
+        "the cancelled child's settlement is published"
+    );
+    assert_eq!(
+        broker
+            .agent_coordinator
+            .task(&admission.task.id)
+            .context("settled task is retained")?
+            .state,
+        ExchangeState::Cancelled
+    );
+    Ok(())
+}
+
+/// A child backlog publishes the agent snapshot once, when the broker has drained it.
+///
+/// Children can report thirty observations a second while rebuilding and publishing the whole
+/// agent snapshot took about a tenth of a second, so the broker fell further behind with every
+/// event: a child whose native turn had ended still read as running fifteen seconds later, and
+/// an interrupt sent meanwhile seemed to hang in `Cancelling`. Each queued observation is still
+/// applied and saved in order; only the snapshot waits until no child command remains queued,
+/// even when the last queued command publishes nothing of its own.
+#[tokio::test]
+async fn child_backlog_publishes_the_agent_snapshot_once_it_drains() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let admission = admit_child_fixture(&mut broker, "busy")?;
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(admission.agent.id.clone())?,
+    )?;
+    let address = child_address(&owner, &admission.task.id);
+    let scope = crate::provider::InvocationScope {
+        thread_id: forge_provider_api::ThreadId::from(owner.clone()),
+        exchange_id: admission.task.id.as_str().into(),
+        invocation_id: format!("fixture:{}", admission.task.id).into(),
+    };
+    let mut backlog = vec![child_event(
+        &address,
+        crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+            started_at_ms: 0,
+        }),
+    )];
+    backlog.extend(child_message(
+        &address,
+        "backlog",
+        crate::provider::TestMessageContent::Commentary,
+        "Produced while the broker was behind",
+    ));
+    let sender = broker.agent_coordinator.sender();
+    for native in backlog {
+        sender
+            .send(crate::agent::AgentCommand::Event {
+                owner: owner.clone(),
+                task_id: admission.task.id.clone(),
+                event: Box::new(crate::provider::session_execution::OwnerObservation::Event(
+                    crate::provider::test_support::native_event(scope.clone(), native),
+                )),
+            })
+            .await?;
+    }
+    // An inspection publishes nothing itself, so the drain's end must publish what it deferred.
+    let (response, _listing) = tokio::sync::oneshot::channel();
+    sender
+        .send(crate::agent::AgentCommand::Request {
+            request: Box::new(crate::agent::AgentRequest {
+                operation_id: "list".into(),
+                source: crate::agent::AgentSource::User,
+                operation: crate::agent::AgentOperation::List { prefix: None },
+            }),
+            authority: None,
+            target: None,
+            response,
+            task_admission: None,
+        })
+        .await?;
+    let agent_update_count = |published: &[super::super::SessionEvent]| {
+        published
+            .iter()
+            .filter(|event| event.payload["kind"] == "agent_updated")
+            .count()
+    };
+    let mut published = Vec::new();
+    while broker.drain_next_agent_command(None, &mut published).await {
+        assert_eq!(
+            agent_update_count(&published),
+            0,
+            "the agent snapshot was published while child commands were still queued"
+        );
+    }
+    assert!(
+        !published
+            .iter()
+            .any(|event| event.payload["kind"] == "error"),
+        "the backlog failed to apply: {published:?}"
+    );
+    assert_eq!(
+        agent_update_count(&published),
+        1,
+        "the drained backlog published its latest agent snapshot once"
+    );
+    let retained = broker
+        .store
+        .load_exchange(&admission.task.id)?
+        .context("child exchange disappeared")?;
+    assert_eq!(
+        retained
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .map(|message| message.text().to_owned())
+            .collect::<Vec<_>>(),
+        ["Produced while the broker was behind"]
+    );
+    Ok(())
+}
+
+/// A follow-up sent to a child from the editor opens a host-made exchange that history lists,
+/// the `/undo` picker included, so its prompt names the follow-up and the child it went to.
+#[tokio::test]
+async fn a_manual_followup_names_its_admission_exchange() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let first = admit_child_fixture(&mut broker, "followup-name")?;
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(first.agent.id.clone()).unwrap(),
+    )
+    .expect("registered session and agent identities are nonempty");
+    let mut event = Vec::new();
+    broker
+        .observe_child_fixture(
+            owner.clone(),
+            &first.task.id,
+            child_event(
+                &child_address(&owner, &first.task.id),
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 0,
+                }),
+            ),
+            &mut event,
+        )
+        .await?;
+    broker
+        .complete_managed_agent(
+            owner,
+            first.task.id.clone(),
+            Err(anyhow::anyhow!("provider failed")),
+            Vec::new(),
+            None,
+            &mut event,
+        )
+        .await?;
+    // The admission is recorded before the child launches, so its outcome does not matter here.
+    let _ = broker
+        .handle_agent_request(
+            crate::agent::AgentRequest {
+                operation_id: "manual-followup".into(),
+                source: crate::agent::AgentSource::User,
+                operation: crate::agent::AgentOperation::Followup {
+                    target: first.agent.id.clone(),
+                    message: "Check the edge case".into(),
+                },
+            },
+            None,
+            &mut event,
+        )
+        .await;
+    let prompts = broker
+        .store
+        .list_exchange(&broker.session.id)?
+        .into_iter()
+        .map(|exchange| exchange.prompt)
+        .collect::<Vec<_>>();
+    let expected = format!(
+        "Follow-up to child {}: Check the edge case",
+        first.agent.label()
+    );
+    assert!(prompts.contains(&expected), "{prompts:?}");
     Ok(())
 }

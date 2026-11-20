@@ -447,7 +447,7 @@ in `tools/checks/`, with shared execution and result models in `checks/`.
 | `check_run` | Supply `check` and optional `inputs` or `all`. Every admitted run immediately gets only `run_id`, even if execution finishes immediately. |
 | `check_list` | No arguments. Get `runs`, containing compact status for all currently running IDs in this session. Completed history is excluded. |
 | `check_status` | Supply `run_id` and optional `wait_ms` from 0 to 60000, default 0. Get compact status, never logs or saved configuration. |
-| `check_detail` | Supply `run_id`, optional `stream` (`combined`, `stdout`, or `stderr`), and optional `cursor`. Get completed-command metadata and paginated output. |
+| `check_detail` | Supply `run_id`, optional `stream` (`combined`, `stdout`, or `stderr`), and optional `cursor`. Get completed-command metadata and paginated output. When the command printed nothing on the requested stream, a `note` says so beside its exit status. |
 | `check_cancel` | Supply `run_id`. Get `cancellation_requested:true`, not a claim that process cleanup has finished. |
 
 Use `check_definition_list` to choose a saved check and

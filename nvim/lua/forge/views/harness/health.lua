@@ -24,6 +24,9 @@ function M.notice(state)
       waiting = host_notice.waiting, outlives_host = true }
   end
   local notice = state.presentation and diagnostic.get(state.presentation, "failure", "error")
+    -- A failed provider switch left this view on its own session; the notification fades, so
+    -- the reason stays here until the next switch.
+    or diagnostic.get(state, "switch_failure", "error")
     or diagnostic.get(state, "cleanup_notice", "info")
     or diagnostic.get(state, "queue_notice", "info")
     or diagnostic.get(state, "connection_error", "info")

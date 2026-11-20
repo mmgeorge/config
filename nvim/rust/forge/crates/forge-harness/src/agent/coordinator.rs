@@ -268,6 +268,9 @@ impl AgentCommandSender {
             ..
         } = &mut command
         {
+            // A user's interrupt already stopped its child when the editor's command was
+            // captured (`signal_user_interrupt`); a model's interrupt waits for the broker, which
+            // authenticates it first.
             let creates_task = match &request.operation {
                 AgentOperation::Spawn(_) | AgentOperation::Followup { .. } => true,
                 AgentOperation::Message { .. }
@@ -590,6 +593,8 @@ pub struct AgentCoordinator {
     state: Arc<Mutex<AgentStateStore>>,
     receiver: Mutex<mpsc::Receiver<AgentCommand>>,
     foreground_deferred: Mutex<VecDeque<AgentCommand>>,
+    /// Set while the broker holds back the agent snapshot behind still-queued child commands.
+    agent_publication_deferred: AtomicBool,
     sender: AgentCommandSender,
     activity: watch::Sender<u64>,
     profiles: Mutex<Option<Arc<super::AgentProfileStore>>>,
@@ -686,6 +691,7 @@ impl AgentCoordinator {
             state: state.clone(),
             receiver: Mutex::new(receiver),
             foreground_deferred: Mutex::new(VecDeque::new()),
+            agent_publication_deferred: AtomicBool::new(false),
             sender: AgentCommandSender {
                 sender,
                 revision,
@@ -895,6 +901,34 @@ impl AgentCoordinator {
         self.try_receive()
     }
 
+    /// Report whether a child command still waits for the broker, in the channel or handed to
+    /// the active root turn.
+    pub(crate) fn has_queued_commands(&self) -> bool {
+        !self
+            .receiver
+            .lock()
+            .expect("agent request receiver poisoned")
+            .is_empty()
+            || !self
+                .foreground_deferred
+                .lock()
+                .expect("deferred agent commands poisoned")
+                .is_empty()
+    }
+
+    /// Record that the broker applied a child observation without publishing the agent
+    /// snapshot, because a command still queued behind it reaches the broker afterwards.
+    pub(crate) fn defer_agent_publication(&self) {
+        self.agent_publication_deferred
+            .store(true, Ordering::Release);
+    }
+
+    /// Clear a deferred agent snapshot, reporting whether one was pending.
+    pub(crate) fn take_deferred_agent_publication(&self) -> bool {
+        self.agent_publication_deferred
+            .swap(false, Ordering::AcqRel)
+    }
+
     /// Hands a request to the active root turn and wakes its agent wait.
     pub(crate) fn defer_to_foreground(&self, command: AgentCommand) {
         self.foreground_deferred
@@ -986,6 +1020,7 @@ impl AgentCoordinator {
             final_response: None,
             error: None,
             parent_reported: false,
+            cancelled_by: None,
             created_at_ms: now_ms,
             last_activity_at_ms: None,
             completed_at_ms: None,
@@ -1122,6 +1157,7 @@ impl AgentCoordinator {
             final_response: None,
             error: None,
             parent_reported: false,
+            cancelled_by: None,
             created_at_ms: now_ms,
             last_activity_at_ms: None,
             completed_at_ms: None,
@@ -1152,6 +1188,37 @@ impl AgentCoordinator {
             "child task no longer owns execution"
         );
         Ok(execution.cancellation.subscribe())
+    }
+
+    /// Stop the captured child task for a user's interrupt before the request is queued.
+    ///
+    /// The request reaches the broker only after the parent's command FIFO and the child command
+    /// channel, which also carries every child observation, so the child is signalled here and
+    /// the broker still cancels its queued tasks and records the interrupt on arrival. A target
+    /// whose child has since started another task signals nothing.
+    pub(crate) fn signal_user_interrupt(&self, target: &AgentTarget) {
+        let mut state = self.state.lock().expect("agent state poisoned");
+        let latest_task_id = state
+            .task_by_id
+            .values()
+            .filter(|task| task.agent_id == target.agent_id)
+            .max_by_key(|task| task.ordinal)
+            .map(|task| task.id.clone());
+        if latest_task_id == target.task_id
+            && let Some(execution) = state.execution_by_agent.get_mut(&target.agent_id)
+        {
+            execution.interrupted_by.get_or_insert(AgentSource::User);
+            execution.cancellation.send_replace(true);
+        }
+    }
+
+    /// Stop every running child for a user's interrupt of all children before it is queued.
+    pub(crate) fn signal_user_interrupt_all(&self) {
+        let mut state = self.state.lock().expect("agent state poisoned");
+        for execution in state.execution_by_agent.values_mut() {
+            execution.interrupted_by.get_or_insert(AgentSource::User);
+            execution.cancellation.send_replace(true);
+        }
     }
 
     /// Report who interrupted the child's active task, or `None` when no interrupt was requested.

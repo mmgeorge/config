@@ -13,6 +13,8 @@ use crate::exchange::task_command::TaskDeliveryGate;
 pub(super) enum NextCommand {
     /// The next command cancels the exchange.
     Cancel,
+    /// The next command adds a prompt to the input queue.
+    Submission,
     /// The next command is any other kind.
     Other,
 }
@@ -132,6 +134,10 @@ impl Admission {
         // its delivery unknown, and stopping an unsent turn makes the exchange restart and the
         // input queue both send the prompt again. Cancel prevents an unsent prompt and waits
         // inside the provider runtime for a send in flight, so it is exempt from that wait.
+        // A submission only adds a prompt to the input queue, which neither stops nor replaces the
+        // send, so it is exempt too: holding it left the editor's request unanswered until the
+        // provider accepted the turn, and a prompt sent then to steer that turn was drawn as an
+        // unconfirmed submission for as long as the provider took to start it.
         // A failed owner never reopens execution, and `command_start` rejects every command it
         // starts, so its commands start at once rather than waiting for a restart or a stream
         // that will never recover.
@@ -152,7 +158,7 @@ impl Admission {
                         DispatchStage::Settled => true,
                         DispatchStage::Lost => false,
                         DispatchStage::Unsent | DispatchStage::InFlight => {
-                            next == NextCommand::Cancel
+                            matches!(next, NextCommand::Cancel | NextCommand::Submission)
                         }
                     },
                 });
@@ -278,6 +284,9 @@ impl ExchangeDriver {
             command_closes_tools: command.is_some_and(ActiveCommand::closes_tool_admission),
             next_command: self.commands.next_command().map(|next| match next {
                 Command::CancelExchange(_) => NextCommand::Cancel,
+                Command::Input(crate::exchange::command::InputCommand::Submit(_)) => {
+                    NextCommand::Submission
+                }
                 _ => NextCommand::Other,
             }),
             delivery_preparing: self
@@ -365,18 +374,23 @@ mod tests {
         })
     }
 
-    /// Hold every command except cancel while a send is unsettled, and every command once it is lost.
+    /// Hold every command except cancel and a queue submission while a send is unsettled, and
+    /// every command once it is lost.
     #[test]
     fn command_start_follows_the_dispatch_hold() {
         let rows = [
             (DispatchStage::Unsent, NextCommand::Other, false),
             (DispatchStage::Unsent, NextCommand::Cancel, true),
+            (DispatchStage::Unsent, NextCommand::Submission, true),
             (DispatchStage::InFlight, NextCommand::Other, false),
             (DispatchStage::InFlight, NextCommand::Cancel, true),
+            (DispatchStage::InFlight, NextCommand::Submission, true),
             (DispatchStage::Lost, NextCommand::Other, false),
             (DispatchStage::Lost, NextCommand::Cancel, false),
+            (DispatchStage::Lost, NextCommand::Submission, false),
             (DispatchStage::Settled, NextCommand::Other, true),
             (DispatchStage::Settled, NextCommand::Cancel, true),
+            (DispatchStage::Settled, NextCommand::Submission, true),
         ];
         for (dispatch, next, expected) in rows {
             let facts = AdmissionFacts {

@@ -1,13 +1,6 @@
 use super::*;
 use crate::exchange::command::ConfigurationRejection;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum ConfigurationCommand {
-    Permission,
-    Configure,
-    Compact,
-}
-
 /// Select affected execution from the effective candidate, never request labels or provider names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigurationEffect {
@@ -39,7 +32,6 @@ pub(crate) struct PermissionConfiguration {
     expected_task: Option<crate::task::Task>,
     selected_access: Option<crate::session::AccessPolicy>,
     selected_approval: crate::session::ApprovalMode,
-    resume: bool,
     operation_id: Option<String>,
 }
 
@@ -70,11 +62,16 @@ impl PolicyBaseline {
     }
 }
 
+/// Return a committed permission change's presentation and session snapshot to its caller.
+pub(crate) struct CommittedPermission {
+    pub(crate) delivery: PendingProviderDelivery,
+    pub(crate) value: Value,
+}
+
 /// Return owned presentation and any continuation prompt to the service driver.
 pub(crate) struct PermissionConfigurationResult {
     pub(crate) delivery: PendingProviderDelivery,
     pub(crate) resume: Option<String>,
-    pub(crate) value: Value,
 }
 
 /// Capture provider catalog work without retaining the broker across I/O.
@@ -88,6 +85,49 @@ pub(crate) struct ConfigurationCatalogJob {
 pub(crate) struct ConfigurationCatalogResult {
     authority: Box<ConfigurationAuthority>,
     models: Vec<crate::provider::ProviderModel>,
+}
+
+/// Identify the tuning a session inherited, so a late catalog corrects only values that no
+/// configuration has replaced meanwhile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InheritedModelSettings {
+    model: String,
+    effort: String,
+    context_window: Option<String>,
+    service_tier: crate::provider::ServiceTier,
+}
+
+impl InheritedModelSettings {
+    fn of(session: &crate::session::HarnessSession) -> Self {
+        Self {
+            model: session.model.clone(),
+            effort: session.effort.clone(),
+            context_window: session.context_window.clone(),
+            service_tier: session.service_tier,
+        }
+    }
+}
+
+/// Capture the inherited-tuning catalog query without retaining the broker across discovery.
+pub(crate) struct InheritedModelCatalog {
+    provider: Arc<Provider>,
+    request: ProviderCatalogRequest,
+    inherited: InheritedModelSettings,
+}
+
+impl InheritedModelCatalog {
+    /// Read the workspace catalog. An unsupported workspace catalog yields an empty list, which
+    /// leaves the inherited settings for the binding to validate when it opens.
+    pub(crate) async fn run(
+        self,
+    ) -> Result<(InheritedModelSettings, Vec<crate::provider::ProviderModel>)> {
+        let context = self.provider.query_context(&self.request).await?;
+        match self.provider.model_list(context).await {
+            Ok(models) => Ok((self.inherited, models)),
+            Err(crate::provider::ProviderError::Unsupported(_)) => Ok((self.inherited, Vec::new())),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// Own a provider settings reconciliation independently of the broker lock.
@@ -209,7 +249,15 @@ impl ConfigurationCandidate {
             || selected.service_tier != previous.service_tier
             || self.resource_selection.is_some()
         {
-            return ConfigurationEffect::ReplaceRoot;
+            // Replacing the root restarts its turn. While child work is admitted, the parent
+            // either delegates or waits for those children, and its restart can only settle once
+            // the delegation tree has: the change stops the children as a user stop does, and the
+            // restarted turn may delegate again under the new setting.
+            return if self.child_work_admitted {
+                ConfigurationEffect::ReplaceTree
+            } else {
+                ConfigurationEffect::ReplaceRoot
+            };
         }
         // A provider receives the root's tool set when a turn starts, so a toolset toggle restarts
         // the running turn to replace it. While child work is admitted, that restart would finalize
@@ -451,22 +499,30 @@ impl HarnessBroker {
         Ok(selection)
     }
 
-    /// Resolve inherited tuning before a controller can publish state or dispatch input.
-    pub(crate) async fn resolve_inherited_model_settings(&mut self) -> Result<()> {
-        let context = self
-            .provider
-            .query_context(&self.provider_catalog_request()?)
-            .await?;
-        // ACP agents negotiate their model catalog per binding, so workspace discovery before
-        // the first binding can be unsupported, and an agent without model selection advertises
-        // no catalog at all. The binding validates the inherited settings when it opens, so an
-        // unsupported or empty workspace catalog leaves them unchanged.
-        let models = match self.provider.model_list(context).await {
-            Ok(models) if models.is_empty() => return Ok(()),
-            Ok(models) => models,
-            Err(crate::provider::ProviderError::Unsupported(_)) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
+    /// Capture the catalog query that validates inherited tuning, so discovery runs without the
+    /// broker: a provider whose model list answers late must not hold the session's open.
+    pub(crate) fn inherited_model_catalog(&self) -> Result<InheritedModelCatalog> {
+        Ok(InheritedModelCatalog {
+            provider: Arc::clone(&self.provider),
+            request: self.provider_catalog_request()?,
+            inherited: InheritedModelSettings::of(&self.session),
+        })
+    }
+
+    /// Correct inherited tuning that `models` does not offer, unless a configuration has replaced
+    /// the inherited values since the catalog query began. Returns the event that publishes a
+    /// correction, or none when the settings stand.
+    pub(crate) fn apply_inherited_model_settings(
+        &mut self,
+        inherited: &InheritedModelSettings,
+        models: &[crate::provider::ProviderModel],
+    ) -> Result<Option<SessionEvent>> {
+        // ACP agents negotiate their model catalog per binding, and an agent without model
+        // selection advertises no catalog at all. The binding validates the inherited settings
+        // when it opens, so an empty workspace catalog leaves them unchanged.
+        if models.is_empty() || InheritedModelSettings::of(&self.session) != *inherited {
+            return Ok(None);
+        }
         let model = models
             .iter()
             .find(|model| {
@@ -512,7 +568,7 @@ impl HarnessBroker {
             && selected.context_window == self.session.context_window
             && selected.service_tier == self.session.service_tier
         {
-            return Ok(());
+            return Ok(None);
         }
         if selected.context_window != self.session.context_window {
             selected.context_usage = None;
@@ -529,7 +585,11 @@ impl HarnessBroker {
             }),
         );
         self.session = selected;
-        Ok(())
+        Ok(Some(self.event(
+            "session_configured",
+            json!({"session": self.session_view()?,
+                "access_abbreviation": self.session.access.abbreviation()}),
+        )?))
     }
 
     /// Complete a durable configuration before replacing a fenced provider generation.
@@ -1320,24 +1380,18 @@ impl HarnessBroker {
                 changed = true;
             }
         }
-        let provider_setting = if candidate.params.get("settings_revision").is_none() {
-            let mut fields = serde_json::Map::new();
-            if candidate.update_model_preference
+        // A session's model, thinking, context, speed, or executor choice is the default of its
+        // workspace and provider, recorded in the workspace preference below. The global provider
+        // defaults change only through an explicit defaults edit, so a choice made in one
+        // workspace never reaches another workspace's new sessions.
+        let confirms_model_default = candidate.params.get("settings_revision").is_none()
+            && (candidate.update_model_preference
                 || candidate.params.get("service_tier").is_some()
                 || candidate.params.get("plan_executor_enabled").is_some()
                 || candidate.params.get("plan_executor_model").is_some()
-                || candidate.params.get("plan_executor_effort").is_some()
-            {
-                let selection = json!({"model":candidate.configured.model,"effort":candidate.configured.effort,
-                    "context_window":candidate.configured.context_window,"service_tier":candidate.configured.service_tier,
-                    "plan_executor":candidate.configured.plan_executor});
-                fields.extend(
-                    selection
-                        .as_object()
-                        .expect("provider preference encoding is an object")
-                        .clone(),
-                );
-            }
+                || candidate.params.get("plan_executor_effort").is_some());
+        let provider_setting = if candidate.params.get("settings_revision").is_none() {
+            let mut fields = serde_json::Map::new();
             if let Some(selection) = &candidate.question_model {
                 fields.insert("ask_model".into(), serde_json::to_value(selection)?);
             }
@@ -1394,6 +1448,9 @@ impl HarnessBroker {
                 let mut preference = preference_for_session(&session, prior_preference.clone());
                 if !update_model_preference && let Some(previous) = prior_preference {
                     preference.model = previous.model; preference.effort = previous.effort; preference.model_setting = previous.model_setting;
+                }
+                if confirms_model_default {
+                    preference.confirmed_revision = Some(intent_revision);
                 }
                 Some(preference)
             };
@@ -1777,10 +1834,6 @@ impl HarnessBroker {
             expected_task: self.task_controller.current()?,
             selected_access,
             selected_approval: approval,
-            resume: action
-                .get("resume")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
             operation_id: action
                 .get("operation_id")
                 .and_then(Value::as_str)
@@ -1816,7 +1869,7 @@ impl HarnessBroker {
     pub(crate) fn commit_permission_configuration(
         &mut self,
         captured: PermissionConfiguration,
-    ) -> Result<PermissionConfigurationResult> {
+    ) -> Result<CommittedPermission> {
         let controller = self.task_controller.clone();
         controller.with_task_snapshot(|current| {
             anyhow::ensure!(
@@ -1831,7 +1884,6 @@ impl HarnessBroker {
                 "permission authority changed before configuration commit"
             );
             let previous = self.session.clone();
-            let baseline = self.owner_policy_baseline();
             let mut configured = previous.clone();
             configured.approval_mode = captured.selected_approval;
             configured.approval_timeout = self
@@ -1877,33 +1929,8 @@ impl HarnessBroker {
                 catalog: Box::new(self.provider_catalog_request()?),
             };
             let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Update(update))?;
-            let resume = if captured.resume {
-                let previous = self
-                    .store
-                    .latest_exchange(&self.session.id)?
-                    .context("interrupted exchange is missing")?;
-                if previous.is_finished() {
-                    None
-                } else {
-                    let notice = baseline.resume_notice(
-                        self.session.access.abbreviation(),
-                        captured.selected_approval,
-                    );
-                    Some(if previous.elicitation().is_some() {
-                        notice
-                    } else {
-                        format!("{notice}\n\nOriginal request: {}", previous.prompt)
-                    })
-                }
-            } else {
-                None
-            };
             let value = serde_json::to_value(self.snapshot()?)?;
-            Ok(PermissionConfigurationResult {
-                delivery,
-                resume,
-                value,
-            })
+            Ok(CommittedPermission { delivery, value })
         })
     }
 
@@ -1992,168 +2019,14 @@ impl HarnessBroker {
             }
             None => None,
         };
-        let staged = self.stage_selected_foreground_interaction(
-            &text,
-            mode,
-            None,
-            ProviderInput::from_user_text(text.clone()),
-            Some(selected),
-        )?;
+        let input = self.restarted_turn_input(&interaction, text.clone())?;
+        let staged =
+            self.stage_selected_foreground_interaction(&text, mode, None, input, Some(selected))?;
         Ok(SelectedContinuation::Staged {
             interaction: Box::new(staged),
             clarification: None,
             planning,
         })
-    }
-
-    pub(super) async fn apply_configuration(
-        &mut self,
-        action: Value,
-        command: ConfigurationCommand,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let baseline = self.owner_policy_baseline();
-        let mut access = self.session.access.clone();
-        let mut permission_access = None;
-        let mut permission = self.session.approval_mode;
-        if command == ConfigurationCommand::Permission {
-            let change: crate::task::PermissionChange = serde_json::from_value(
-                action
-                    .get("change")
-                    .cloned()
-                    .context("permission change is required")?,
-            )?;
-            if let Some(selection) = action.get("permission_selection") {
-                let selection: crate::task::PermissionSelection =
-                    serde_json::from_value(selection.clone())?;
-                access.sandbox = selection.sandbox;
-                access.read_access = selection.read_access;
-                access.write_access = selection.write_access;
-                permission = selection.approval_mode;
-            } else {
-                change.apply(
-                    &mut access,
-                    &mut permission,
-                    forge_providers::registry::resolve(&forge_providers::registry::select(
-                        &self.session.provider,
-                    )?)?
-                    .capability
-                    .supports_sandbox(),
-                );
-            }
-            if matches!(
-                change,
-                crate::task::PermissionChange::ToggleReadScope
-                    | crate::task::PermissionChange::ToggleWriteEnabled
-                    | crate::task::PermissionChange::ToggleWriteScope
-            ) && let Some(preference) =
-                crate::settings::SettingsStore::read_only(&self.data_root)?
-                    .get(
-                        &self.session.workspace,
-                        &self.session.id,
-                        &self.session.provider,
-                    )?
-                    .desired
-                    .access
-            {
-                access.sandbox = preference.sandbox;
-            }
-            if !matches!(change, crate::task::PermissionChange::SetApproval { .. }) {
-                permission_access = Some(access.validate()?);
-            }
-        }
-        let resume = action
-            .get("resume")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if command == ConfigurationCommand::Configure {
-            self.configuration_progress(ConfigurationProgressState::Applying)
-                .await?;
-        }
-        match command {
-            ConfigurationCommand::Configure => {
-                Box::pin(
-                    self.configure_session(
-                        action
-                            .get("config")
-                            .cloned()
-                            .context("configuration is required")?,
-                    ),
-                )
-                .await?;
-            }
-            ConfigurationCommand::Compact => {
-                Box::pin(self.compact_session(true)).await?;
-            }
-            ConfigurationCommand::Permission => {
-                let mut config = json!({"approval_mode": permission, "session_policy": true});
-                if let Some(access) = permission_access {
-                    config["access"] = serde_json::to_value(access)?;
-                }
-                Box::pin(self.configure_session(config)).await?;
-            }
-        }
-        if command == ConfigurationCommand::Configure
-            && let Some(revision) = action
-                .pointer("/config/settings_revision")
-                .and_then(Value::as_u64)
-            && self.active_operation_id.is_some()
-        {
-            self.configuration_progress(ConfigurationProgressState::Verifying)
-                .await?;
-            let operation = self
-                .active_operation_id
-                .as_deref()
-                .expect("active configuration operation");
-            let settings = crate::settings::SettingsStore::open(&self.data_root)?;
-            let snapshot = settings.get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.provider,
-            )?;
-            anyhow::ensure!(
-                snapshot.revision == revision,
-                "settings changed before application confirmation"
-            );
-            let mut effective = snapshot.desired;
-            effective.access = Some(self.session.access.clone());
-            effective.shell = Some(self.session.shell);
-            effective.plan_compact = Some(self.session.plan_compact);
-            effective.approval_timeout = Some(self.session.approval_timeout);
-            effective.tool_timeout = Some(self.session.tool_timeout);
-            settings.confirm_application(&self.session.id, operation, revision, effective)?;
-        }
-        if command == ConfigurationCommand::Configure {
-            let request = self.provider_catalog_request()?;
-            self.notify_unavailable_mcp(&request, &mut Vec::new())
-                .await?;
-        }
-        self.emit_session_update(
-            SessionUpdate::Configuration {
-                snapshot: Box::new(self.snapshot()?),
-                operation_id: self.active_operation_id.clone(),
-                catalog: Box::new(self.provider_catalog_request()?),
-            },
-            &mut Vec::new(),
-        )
-        .await?;
-        let permission_notice = (command == ConfigurationCommand::Permission)
-            .then(|| baseline.resume_notice(self.session.access.abbreviation(), permission));
-        if resume {
-            self.configuration_progress(ConfigurationProgressState::Resuming)
-                .await?;
-            let previous = self
-                .store
-                .latest_exchange(&self.session.id)?
-                .context("interrupted exchange is missing")?;
-            let notice = permission_notice.as_deref().unwrap_or("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions.");
-            let prompt = if previous.elicitation().is_some() {
-                notice.to_owned()
-            } else {
-                format!("{notice}\n\nOriginal request: {}", previous.prompt)
-            };
-            return Box::pin(self.resume_exchange(json!({"text":prompt}))).await;
-        }
-        Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
     }
 }
 

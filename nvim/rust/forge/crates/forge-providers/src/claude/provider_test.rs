@@ -768,6 +768,198 @@ async fn interrupt_ends_the_turn_as_interrupted() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// The prompts of the modelled CLI chain at each model request, the requesting prompt last.
+type ModelRequestLog = Arc<Mutex<Vec<Vec<String>>>>;
+
+/// Model a CLI that answers every prompt except the one at `unanswered_request`, whose answer
+/// only starts to stream and is never recorded, and that records an interrupt as a user entry.
+///
+/// The real CLI writes `[Request interrupted by user]` as a user entry that queries nothing, and
+/// a `--resume-session-at` launch truncates the chain after the named entry.
+fn unanswered_interrupt_peer(
+    unanswered_request: usize,
+) -> (
+    Arc<PeerLauncher>,
+    Arc<Mutex<Vec<NativeEntry>>>,
+    ModelRequestLog,
+) {
+    let chain: Arc<Mutex<Vec<NativeEntry>>> = Arc::default();
+    let model_requests: ModelRequestLog = Arc::default();
+    let peer_chain = chain.clone();
+    let peer_requests = model_requests.clone();
+    let launcher = PeerLauncher::with_arguments(move |arguments| {
+        if !resume_native_chain(&mut peer_chain.lock().unwrap(), arguments) {
+            return None;
+        }
+        let chain = peer_chain.clone();
+        let requests = peer_requests.clone();
+        let handler: PeerHandler = Box::new(move |frame: &Value| {
+            if frame["request"]["subtype"] == "interrupt" {
+                chain
+                    .lock()
+                    .unwrap()
+                    .push(NativeEntry::Note(uuid::Uuid::new_v4().to_string()));
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    result_interrupted(),
+                ]);
+            }
+            let uuid = user_uuid(frame)?;
+            let entry_uuid = uuid.as_str().unwrap().to_owned();
+            let mut chain = chain.lock().unwrap();
+            if frame["shouldQuery"] == false {
+                chain.push(NativeEntry::Note(entry_uuid));
+                return Some(vec![
+                    lifecycle(&uuid, "queued"),
+                    lifecycle(&uuid, "completed"),
+                ]);
+            }
+            chain.push(NativeEntry::Prompt(entry_uuid));
+            let mut requests = requests.lock().unwrap();
+            requests.push(
+                chain
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        NativeEntry::Prompt(prompt) => Some(prompt.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            let message_id = format!("msg-{}", requests.len());
+            let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            let answer = text_message(&message_id, &["ok"]);
+            if requests.len() == unanswered_request + 1 {
+                // `message_start`, `content_block_start`, and the first delta only.
+                frames.extend(answer.into_iter().take(3));
+                return Some(frames);
+            }
+            let answer_uuid = answer
+                .iter()
+                .find(|frame| frame["type"] == "assistant")
+                .and_then(|frame| frame["uuid"].as_str())
+                .unwrap()
+                .to_owned();
+            chain.push(NativeEntry::Answer(answer_uuid));
+            frames.extend(answer);
+            frames.push(lifecycle(&uuid, "completed"));
+            frames.push(result_success());
+            Some(frames)
+        });
+        Some(handler)
+    });
+    (launcher, chain, model_requests)
+}
+
+/// Run one prompt on `binding`, interrupting it once its answer starts when `interrupt` is set.
+async fn run_turn(
+    provider: &ClaudeProvider,
+    opened: &mut forge_provider_api::OpenedSession,
+    turn: &str,
+    interrupt: bool,
+) -> forge_provider_api::CompletedTurn {
+    let binding = opened.binding.id.clone();
+    let request = prompt_request(
+        &binding,
+        turn,
+        receipt(turn),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    provider
+        .turn_start(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    if interrupt {
+        until_message(&mut opened.events).await;
+        provider
+            .turn_interrupt(
+                operation_context(),
+                &binding,
+                forge_provider_api::CancelRequest { scope },
+            )
+            .await
+            .unwrap();
+    }
+    until_completed(&mut opened.events).await.1
+}
+
+/// The prompt after an interrupt the CLI recorded no answer for reaches the model without the
+/// interrupted request.
+///
+/// The CLI keeps the interrupted prompt and its interrupt marker as user entries, and the API
+/// joins consecutive user entries into one message, so the next prompt once reached the model in
+/// one message with the cancelled request, and the model answered the cancelled request.
+#[tokio::test]
+async fn prompt_after_an_unanswered_interrupt_omits_the_interrupted_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let (launcher, _, model_requests) = unanswered_interrupt_peer(1);
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    run_turn(&provider, &mut opened, "answered", false).await;
+    let interrupted = run_turn(&provider, &mut opened, "interrupted", true).await;
+    assert_eq!(
+        interrupted.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Interrupted
+    );
+    let next = run_turn(&provider, &mut opened, "next", false).await;
+
+    assert!(matches!(
+        next.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
+    ));
+    let requests = model_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    let interrupted_prompt = requests[1].last().unwrap();
+    assert!(
+        !requests[2].contains(interrupted_prompt),
+        "the next prompt reached the model after the interrupted request: {requests:?}"
+    );
+    assert_eq!(
+        requests[2],
+        vec![requests[0][0].clone(), requests[2][1].clone()]
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// An unanswered interrupted request that no known entry precedes is withdrawn by a note.
+///
+/// The binding's first prompt follows history this process never saw, so no resume point can
+/// drop it; a note written without a model request tells the model the request was withdrawn.
+#[tokio::test]
+async fn unanswered_first_interrupt_is_withdrawn_by_a_note() {
+    let directory = tempfile::tempdir().unwrap();
+    let (launcher, chain, _) = unanswered_interrupt_peer(0);
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    run_turn(&provider, &mut opened, "interrupted", true).await;
+    run_turn(&provider, &mut opened, "next", false).await;
+
+    let entries = chain.lock().unwrap().clone();
+    let next_prompt = entries
+        .iter()
+        .rposition(|entry| matches!(entry, NativeEntry::Prompt(_)))
+        .unwrap();
+    let withdrawal = launcher
+        .frames("user")
+        .into_iter()
+        .find(|frame| frame["shouldQuery"] == false)
+        .expect("a note withdrew the interrupted request");
+    assert!(
+        matches!(&entries[next_prompt - 1], NativeEntry::Note(uuid) if frame_uuid(&withdrawal) == uuid),
+        "the withdrawal note directly precedes the next prompt: {entries:?}"
+    );
+    assert!(
+        withdrawal["message"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("withdrew")
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Read a written frame's client-stamped uuid.
+fn frame_uuid(frame: &Value) -> &str {
+    frame["uuid"].as_str().unwrap()
+}
+
 /// Collect the token usage the adapter reported for a turn.
 fn reported_usage(
     events: &[forge_provider_api::ProviderEvent],
@@ -1557,12 +1749,14 @@ enum NativeEntry {
     Answer(String),
     /// A user entry written with `shouldQuery: false`, such as the adapter's rewind note.
     Note(String),
+    /// A steer the running turn absorbed, which the CLI records as a `queued_command` attachment.
+    Queued(String),
 }
 
 impl NativeEntry {
     fn uuid(&self) -> &str {
         match self {
-            Self::Prompt(uuid) | Self::Answer(uuid) | Self::Note(uuid) => uuid,
+            Self::Prompt(uuid) | Self::Answer(uuid) | Self::Note(uuid) | Self::Queued(uuid) => uuid,
         }
     }
 }
@@ -1580,7 +1774,8 @@ fn argument_value<'arguments>(
 /// Apply the CLI's truncating resume to a persisted chain, or refuse it as the CLI does.
 ///
 /// `--resume-drops-turn` declares the prompt of the one turn the truncation discards; the CLI
-/// exits when the discarded range does not start with that prompt or holds another user entry.
+/// exits when the discarded range does not start with that prompt or holds another user entry
+/// or absorbed queued content.
 fn resume_native_chain(chain: &mut Vec<NativeEntry>, arguments: &[String]) -> bool {
     if argument_value(arguments, "--resume").is_none() {
         chain.clear();
@@ -1707,6 +1902,129 @@ async fn rewinds_after_earlier_rewinds_resume_past_their_notes() {
         .filter(|entry| !matches!(entry, NativeEntry::Note(_)))
         .count();
     assert_eq!(kept_turns, 2, "only turn-1 remains in the native chain");
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A rewind that drops a turn which absorbed a steer succeeds, because the CLI records the
+/// absorbed steer as queued content that its `--resume-drops-turn` guard refuses to discard, so
+/// the adapter resumes such a range unguarded.
+#[tokio::test]
+async fn rewinds_drop_a_turn_that_absorbed_a_steer() {
+    let directory = tempfile::tempdir().unwrap();
+    let chain: Arc<Mutex<Vec<NativeEntry>>> = Arc::default();
+    let peer_chain = chain.clone();
+    let launcher = PeerLauncher::with_arguments(move |arguments| {
+        if !resume_native_chain(&mut peer_chain.lock().unwrap(), arguments) {
+            return None;
+        }
+        let chain = peer_chain.clone();
+        let mut held_prompt: Option<Value> = None;
+        let handler: PeerHandler = Box::new(move |frame: &Value| {
+            let uuid = user_uuid(frame)?;
+            let entry_uuid = uuid.as_str().unwrap().to_owned();
+            if frame["shouldQuery"] == false {
+                chain.lock().unwrap().push(NativeEntry::Note(entry_uuid));
+                return Some(vec![
+                    lifecycle(&uuid, "queued"),
+                    lifecycle(&uuid, "completed"),
+                ]);
+            }
+            let answer = text_message("msg-1", &["ok"]);
+            let answer_uuid = answer
+                .iter()
+                .find(|frame| frame["type"] == "assistant")
+                .and_then(|frame| frame["uuid"].as_str())
+                .unwrap()
+                .to_owned();
+            let steered = chain.lock().unwrap().len() == 2;
+            if let Some(original) = held_prompt.take() {
+                chain.lock().unwrap().extend([
+                    NativeEntry::Queued(entry_uuid),
+                    NativeEntry::Answer(answer_uuid),
+                ]);
+                let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+                frames.extend(answer);
+                frames.push(lifecycle(&original, "completed"));
+                frames.push(lifecycle(&uuid, "completed"));
+                frames.push(result_success());
+                return Some(frames);
+            }
+            chain.lock().unwrap().extend([
+                NativeEntry::Prompt(entry_uuid),
+                NativeEntry::Answer(answer_uuid),
+            ]);
+            let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            frames.extend(answer);
+            if steered {
+                held_prompt = Some(uuid);
+                return Some(frames);
+            }
+            frames.push(lifecycle(&uuid, "completed"));
+            frames.push(result_success());
+            Some(frames)
+        });
+        Some(handler)
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    provider
+        .turn_start(
+            operation_context(),
+            &binding,
+            prompt_request(
+                &binding,
+                "turn-1",
+                receipt("turn-1"),
+                forge_provider_api::permissions::PermissionResponse::Allow,
+            ),
+        )
+        .await
+        .unwrap();
+    let (_, kept) = until_completed(&mut opened.events).await;
+    let kept_checkpoint = kept.result().checkpoint_id().cloned().unwrap();
+    let steered = prompt_request(
+        &binding,
+        "steered-turn",
+        receipt("steered-turn"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = steered.scope.clone();
+    provider
+        .turn_start(operation_context(), &binding, steered)
+        .await
+        .unwrap();
+    until_message(&mut opened.events).await;
+    provider
+        .turn_steer(
+            operation_context(),
+            &binding,
+            steering_request(scope, "check results arrived"),
+        )
+        .await
+        .unwrap();
+    until_completed(&mut opened.events).await;
+
+    let rewound = provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest {
+                after: Some(kept_checkpoint),
+            },
+        )
+        .await;
+
+    assert!(
+        rewound.is_ok(),
+        "rewind past the steered turn failed: {rewound:?}"
+    );
+    let remaining = chain
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| !matches!(entry, NativeEntry::Note(_)))
+        .count();
+    assert_eq!(remaining, 2, "only turn-1 remains in the native chain");
     provider.shutdown(operation_context()).await.unwrap();
 }
 
@@ -2665,6 +2983,62 @@ async fn manual_compaction_reports_the_host_operation_identity() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// A `/compact` the CLI declines keeps the CLI's own words as the explanation.
+///
+/// With too little conversation the CLI answers "Not enough messages to compact." through a
+/// failed compaction status, whose `compact_error` it sends only in some sessions, and through
+/// the command's result text. The adapter once kept neither, so the transcript read
+/// `Context compaction failed` and the notice `context compaction failed (Unknown)`.
+#[tokio::test]
+async fn declined_compaction_keeps_the_cli_explanation() {
+    let directory = tempfile::tempdir().unwrap();
+    fn declined(compact_error: Option<&str>) -> Vec<Value> {
+        let mut status = json!({"type": "system", "subtype": "status", "status": null,
+            "compact_result": "failed", "uuid": uuid::Uuid::new_v4().to_string()});
+        if let Some(compact_error) = compact_error {
+            status["compact_error"] = json!(compact_error);
+        }
+        vec![
+            status,
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                "result": "Not enough messages to compact.", "local_command": "compact",
+                "uuid": uuid::Uuid::new_v4().to_string()}),
+        ]
+    }
+    let launcher = scripted_peer(vec![
+        |_| declined(Some("Not enough messages to compact.")),
+        |_| declined(None),
+    ]);
+    let (provider, opened) = open(launcher, directory.path()).await;
+    for _ in 0..2 {
+        let context = operation_context();
+        let request = forge_provider_api::CompactionRequest {
+            scope: forge_provider_api::EventScope::SessionOperation {
+                thread_id: forge_provider_api::testing::root_thread("claude-owner"),
+                operation_id: context.id().clone(),
+            },
+        };
+        let compaction = provider
+            .thread_compact(context, &opened.binding.id, request)
+            .await
+            .unwrap()
+            .compaction;
+        assert_eq!(
+            compaction.state,
+            forge_provider_api::CompactionState::Failed
+        );
+        assert_eq!(
+            compaction
+                .result
+                .provider_explanation
+                .as_ref()
+                .map(forge_provider_api::SanitizedMessage::as_str),
+            Some("Not enough messages to compact.")
+        );
+    }
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// Produces one user frame's replies from every input uuid written so far.
 type ScriptedReply = fn(&[Value]) -> Vec<Value>;
 
@@ -2981,5 +3355,415 @@ async fn stale_steer_start_reports_nothing_to_a_successor() {
     start_prompt(&provider, &binding, "turn-2").await;
     let (second, _) = until_completed(&mut opened.events).await;
     assert_eq!(consumption_trace(&second), ["next"]);
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// How the modelled CLI of `stopped_steer_peer` answers one prompt.
+#[derive(Clone, Copy)]
+enum PromptReply {
+    /// Answer and end the CLI turn.
+    Answered,
+    /// Answer, then hold the CLI turn's result until a steer arrives. The steer stays queued
+    /// across that result and starts a follow-up CLI turn, which no answer ever ends.
+    AnsweredAwaitingSteer,
+    /// Start the prompt and answer nothing, as a model request that a stop ends first.
+    Started,
+}
+
+/// Build the notice the modelled CLI sends once it started an input that it will not answer,
+/// which tells a test that the adapter has read every frame before it.
+fn retry_notice() -> Value {
+    json!({"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 3,
+        "error": "overloaded"})
+}
+
+/// Collect events until the modelled CLI's retry notice arrives.
+async fn until_notice(
+    stream: &mut forge_provider_api::ProviderEventStream,
+) -> Vec<forge_provider_api::ProviderEvent> {
+    let mut events = Vec::new();
+    loop {
+        let envelope = stream.recv().await.unwrap().unwrap();
+        if matches!(
+            envelope.event,
+            forge_provider_api::ProviderEvent::Provider {
+                event: forge_provider_api::ProviderConnectionEvent::Warning(_),
+            }
+        ) {
+            return events;
+        }
+        events.push(envelope.event);
+    }
+}
+
+/// Model a CLI that records every started input as a user entry, answers prompts by `script`,
+/// records an interrupt as a user entry, and refuses a guarded resume as the real CLI does.
+///
+/// The CLI writes a steer it runs after a result as its own prompt entry, and its
+/// `[Request interrupted by user]` marker as a user entry that queries nothing. Each model
+/// request logs the prompts of the chain it reads, the requesting prompt last.
+fn stopped_steer_peer(
+    script: &'static [PromptReply],
+) -> (
+    Arc<PeerLauncher>,
+    Arc<Mutex<Vec<NativeEntry>>>,
+    ModelRequestLog,
+) {
+    let chain: Arc<Mutex<Vec<NativeEntry>>> = Arc::default();
+    let model_requests: ModelRequestLog = Arc::default();
+    // The script position survives the restarts that rewinds and withdrawals cause.
+    let answered_prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer_chain = chain.clone();
+    let peer_requests = model_requests.clone();
+    let launcher = PeerLauncher::with_arguments(move |arguments| {
+        if !resume_native_chain(&mut peer_chain.lock().unwrap(), arguments) {
+            return None;
+        }
+        let chain = peer_chain.clone();
+        let requests = peer_requests.clone();
+        let answered_prompts = answered_prompts.clone();
+        let mut held_prompt: Option<Value> = None;
+        let handler: PeerHandler = Box::new(move |frame: &Value| {
+            if frame["request"]["subtype"] == "interrupt" {
+                chain
+                    .lock()
+                    .unwrap()
+                    .push(NativeEntry::Note(uuid::Uuid::new_v4().to_string()));
+                let mut interrupted = result_interrupted();
+                interrupted["duration_ms"] = json!(1);
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    interrupted,
+                ]);
+            }
+            let uuid = user_uuid(frame)?;
+            let entry_uuid = uuid.as_str().unwrap().to_owned();
+            let mut chain = chain.lock().unwrap();
+            if frame["shouldQuery"] == false {
+                chain.push(NativeEntry::Note(entry_uuid));
+                return Some(vec![
+                    lifecycle(&uuid, "queued"),
+                    lifecycle(&uuid, "completed"),
+                ]);
+            }
+            chain.push(NativeEntry::Prompt(entry_uuid));
+            let mut requests = requests.lock().unwrap();
+            requests.push(
+                chain
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        NativeEntry::Prompt(prompt) => Some(prompt.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            if let Some(held) = held_prompt.take() {
+                return Some(vec![
+                    lifecycle(&uuid, "queued"),
+                    lifecycle(&held, "completed"),
+                    result_success(),
+                    lifecycle(&uuid, "started"),
+                    retry_notice(),
+                ]);
+            }
+            let reply = script[answered_prompts.fetch_add(1, std::sync::atomic::Ordering::SeqCst)];
+            let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            if matches!(reply, PromptReply::Started) {
+                frames.push(retry_notice());
+                return Some(frames);
+            }
+            let answer = text_message(&format!("msg-{}", requests.len()), &["ok"]);
+            let answer_uuid = answer
+                .iter()
+                .find(|frame| frame["type"] == "assistant")
+                .and_then(|frame| frame["uuid"].as_str())
+                .unwrap()
+                .to_owned();
+            chain.push(NativeEntry::Answer(answer_uuid));
+            frames.extend(answer);
+            if matches!(reply, PromptReply::AnsweredAwaitingSteer) {
+                held_prompt = Some(uuid);
+                return Some(frames);
+            }
+            frames.push(lifecycle(&uuid, "completed"));
+            frames.push(result_success());
+            Some(frames)
+        });
+        Some(handler)
+    });
+    (launcher, chain, model_requests)
+}
+
+/// A turn whose steer the CLI ran after the turn's answer, stopped before the follow-up answered.
+struct StoppedFollowUp {
+    provider: ClaudeProvider,
+    opened: forge_provider_api::OpenedSession,
+    model_requests: ModelRequestLog,
+    /// Every event of the steered turn after its answer began.
+    events: Vec<forge_provider_api::ProviderEvent>,
+    completed: forge_provider_api::CompletedTurn,
+}
+
+/// Answer one turn, then steer the next one after its answer and stop it while the follow-up CLI
+/// turn that the steer started has not answered.
+async fn stop_a_follow_up_steer(directory: &std::path::Path) -> StoppedFollowUp {
+    let (launcher, _, model_requests) = stopped_steer_peer(&[
+        PromptReply::Answered,
+        PromptReply::AnsweredAwaitingSteer,
+        PromptReply::Answered,
+    ]);
+    let (provider, mut opened) = open(launcher, directory).await;
+    let binding = opened.binding.id.clone();
+    run_turn(&provider, &mut opened, "turn-1", false).await;
+    let scope = start_prompt(&provider, &binding, "steered").await;
+    until_message(&mut opened.events).await;
+    provider
+        .turn_steer(
+            operation_context(),
+            &binding,
+            journaled_steering(scope.clone(), "mention anchor", "steer"),
+        )
+        .await
+        .unwrap();
+    let mut events = until_notice(&mut opened.events).await;
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    let (rest, completed) = until_completed(&mut opened.events).await;
+    events.extend(rest);
+    assert_eq!(
+        completed.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Interrupted
+    );
+    StoppedFollowUp {
+        provider,
+        opened,
+        model_requests,
+        events,
+        completed,
+    }
+}
+
+/// A steer whose follow-up CLI turn a stop ended before any answer is not reported as read, so
+/// Harness lists it as not confirmed read below the cancelled heading.
+///
+/// The steer was once reported consumed when the CLI started it, and the settled exchange drew it
+/// as a consumed prompt with nothing after it, which read as an exchange without an outcome.
+#[tokio::test]
+async fn a_steer_stopped_before_its_follow_up_answered_is_not_reported_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let stopped = stop_a_follow_up_steer(directory.path()).await;
+
+    let trace = consumption_trace(&stopped.events);
+    assert!(
+        trace.iter().all(|entry| !entry.starts_with("user")),
+        "the unanswered steer was reported read: {trace:?}"
+    );
+    stopped
+        .provider
+        .shutdown(operation_context())
+        .await
+        .unwrap();
+}
+
+/// A steer whose follow-up a stop ended unanswered is removed from the CLI history, so the next
+/// prompt reaches the model alone and a rewind that drops the next turn passes the CLI's guard.
+///
+/// The steer's entry and the interrupt marker once stayed between the steered turn's answer and
+/// the next prompt, and the guarded resume that drops the next turn refused them.
+#[tokio::test]
+async fn a_steer_stopped_before_its_follow_up_answered_is_withdrawn() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut stopped = stop_a_follow_up_steer(directory.path()).await;
+    let binding = stopped.opened.binding.id.clone();
+    let kept = stopped.completed.result().checkpoint_id().cloned().unwrap();
+    run_turn(&stopped.provider, &mut stopped.opened, "next", false).await;
+
+    let requests = stopped.model_requests.lock().unwrap().clone();
+    let steer = requests[2].last().unwrap().clone();
+    let next = requests.last().unwrap();
+    assert!(
+        !next.contains(&steer),
+        "the next prompt reached the model after the stopped steer: {requests:?}"
+    );
+    let rewound = stopped
+        .provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest { after: Some(kept) },
+        )
+        .await;
+    assert!(
+        rewound.is_ok(),
+        "rewind past the next turn failed: {rewound:?}"
+    );
+    stopped
+        .provider
+        .shutdown(operation_context())
+        .await
+        .unwrap();
+}
+
+/// A Forge turn that ran a follow-up CLI turn reports the time of the CLI turns that reported
+/// its tokens, so its speed is computed over the interval that produced them.
+///
+/// The turn once reported only the last CLI turn's duration, a stopped follow-up's few
+/// milliseconds, and the heading divided the whole answer by it.
+#[tokio::test]
+async fn a_stopped_follow_up_turn_times_only_the_answered_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let stopped = stop_a_follow_up_steer(directory.path()).await;
+
+    assert_eq!(stopped.completed.result().reported_duration_ms(), Some(10));
+    stopped
+        .provider
+        .shutdown(operation_context())
+        .await
+        .unwrap();
+}
+
+/// A steer that Harness delivered as its own turn and that a stop ended before any answer is
+/// removed from the CLI history, although the turn reports no execution.
+///
+/// The turn settled as cancelled without a ledger entry, so nothing withdrew its request: the next
+/// prompt reached the model after it, and the guarded resume that drops the next turn refused the
+/// steer's entry and its interrupt marker.
+#[tokio::test]
+async fn a_steer_turn_stopped_before_any_answer_is_withdrawn() {
+    let directory = tempfile::tempdir().unwrap();
+    let (launcher, _, model_requests) = stopped_steer_peer(&[
+        PromptReply::Answered,
+        PromptReply::Started,
+        PromptReply::Answered,
+    ]);
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let kept = run_turn(&provider, &mut opened, "turn-1", false)
+        .await
+        .result()
+        .checkpoint_id()
+        .cloned()
+        .unwrap();
+    let request = prompt_request(
+        &binding,
+        "steer-turn",
+        receipt("steer-turn"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    // `turn_start` returns once the turn starts natively, which this input never does.
+    let start = tokio::spawn({
+        let provider = provider.clone();
+        let binding = binding.clone();
+        async move {
+            provider
+                .turn_start(operation_context(), &binding, request)
+                .await
+        }
+    });
+    until_notice(&mut opened.events).await;
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        start.await.unwrap(),
+        Err(ProviderError::Cancelled)
+    ));
+    run_turn(&provider, &mut opened, "next", false).await;
+
+    let requests = model_requests.lock().unwrap().clone();
+    let steer = requests[1].last().unwrap().clone();
+    assert!(
+        !requests.last().unwrap().contains(&steer),
+        "the next prompt reached the model after the stopped steer: {requests:?}"
+    );
+    let rewound = provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest { after: Some(kept) },
+        )
+        .await;
+    assert!(
+        rewound.is_ok(),
+        "rewind past the next turn failed: {rewound:?}"
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Record every field of every diagnostic event the adapter emits.
+struct CapturedFields(Arc<Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for CapturedFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("{}={value:?}", field.name()));
+    }
+}
+
+impl<SubscriberType: tracing::Subscriber> tracing_subscriber::Layer<SubscriberType>
+    for CapturedFields
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, SubscriberType>,
+    ) {
+        event.record(&mut CapturedFields(self.0.clone()));
+    }
+}
+
+/// A rewind the CLI refuses at startup logs the CLI's own reason, which it prints as an error
+/// `result` before it exits, instead of only the closed output.
+#[tokio::test]
+async fn a_refused_rewind_logs_the_cli_reason() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::with_arguments(|arguments| {
+        argument_value(arguments, "--resume-session-at")
+            .is_none()
+            .then(|| answering_peer(&["ok"]))
+    });
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let kept = run_turn(&provider, &mut opened, "turn-1", false)
+        .await
+        .result()
+        .checkpoint_id()
+        .cloned()
+        .unwrap();
+    run_turn(&provider, &mut opened, "turn-2", false).await;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::Registry::default().with(CapturedFields(captured.clone()));
+
+    let rewound = provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest { after: Some(kept) },
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+    assert!(rewound.is_err());
+    let recorded = captured.lock().unwrap().join("\n");
+    assert!(
+        recorded.contains(super::test_peer::LAUNCH_REFUSAL),
+        "the CLI's reason is missing from the diagnostics: {recorded}"
+    );
     provider.shutdown(operation_context()).await.unwrap();
 }

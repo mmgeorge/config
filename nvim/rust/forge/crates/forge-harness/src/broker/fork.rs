@@ -417,6 +417,19 @@ impl HarnessBroker {
             .map(Some)
     }
 
+    /// Redraw the status after the provider fork state changed outside an exchange.
+    ///
+    /// A retry that reopens a failed fork and the outcome that ends any attempt change only the
+    /// session record, so nothing else refreshes the status document: the row that names the
+    /// preparation would never appear for a retry, nor leave after a failed attempt.
+    pub fn provider_fork_status_events(&mut self) -> Result<Vec<SessionEvent>> {
+        let patch = self.reconcile_timeline()?;
+        if patch.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.event("document_changed", patch.notification())?])
+    }
+
     /// Commit provider preparation into the durable child before queued work enters the provider.
     pub fn complete_provider_fork(
         &mut self,

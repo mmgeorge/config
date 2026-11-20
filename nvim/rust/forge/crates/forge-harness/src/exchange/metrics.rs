@@ -24,9 +24,10 @@ pub struct ExchangeMetrics {
     pub tool_duration_ms: u64,
     /// Active elapsed coordinate at which tool occupancy began.
     pub tool_started_ms: Option<u64>,
-    /// Canonical generated token expenditure after report and model-call deduplication.
+    /// Canonical generated token expenditure after report and model-call deduplication, over the
+    /// turns after the newest turn whose output count is unknown.
     pub reported_output_tokens: Option<u64>,
-    /// Native measured duration, unavailable when contributing turn timing is unknown.
+    /// Native measured duration of the same turns, unavailable when one turn's timing is unknown.
     pub reported_response_ms: Option<u64>,
     /// Whether the clock resumes when the last user wait ends. Resume intent belongs to the live
     /// owner and cannot survive a host restart.
@@ -448,25 +449,38 @@ impl ExchangeMetrics {
             timing: timings,
             cumulative: _,
         } = usage_totals(&self.usage_baseline, &self.reports)?;
-        let mut usages = totals.iter().map(|total| &total.usage);
-        let usage = usages.next().cloned().map(|mut usage| {
-            for incoming in usages {
-                usage.accumulate(incoming);
-            }
-            usage
-        });
-        let mut addresses = totals
+        // A turn whose output count is unknown, such as one a compaction or a configuration change
+        // stopped mid-answer and ran again, leaves the exchange's output unknown. The turns after
+        // the newest such turn produced the answer, so the output and its rate cover only them;
+        // summing across the stopped turn dropped the rerun's figures from the heading.
+        let answer_start = totals
+            .iter()
+            .rposition(|total| total.usage.output.is_none())
+            .map_or(0, |unknown| unknown + 1);
+        let answer_totals = &totals[answer_start..];
+        let output = answer_totals
+            .iter()
+            .map(|total| total.usage.output)
+            .reduce(|sum, output| {
+                sum.zip(output)
+                    .and_then(|(sum, added)| sum.checked_add(added))
+            })
+            .flatten();
+        let mut addresses = answer_totals
             .iter()
             .map(|total| &total.address)
             .collect::<Vec<_>>();
-        for timing in &timings {
-            if !addresses.contains(&&timing.address) {
-                addresses.push(&timing.address);
+        // A turn that reported only timing has no place among the answer's turns.
+        if answer_start == 0 {
+            for timing in &timings {
+                if !addresses.contains(&&timing.address) {
+                    addresses.push(&timing.address);
+                }
             }
-        }
-        for timing in &self.completed_timing {
-            if !addresses.contains(&&timing.address) {
-                addresses.push(&timing.address);
+            for timing in &self.completed_timing {
+                if !addresses.contains(&&timing.address) {
+                    addresses.push(&timing.address);
+                }
             }
         }
         let duration = if addresses.is_empty() {
@@ -488,7 +502,7 @@ impl ExchangeMetrics {
             })
         };
         self.request_count = request_count;
-        self.reported_output_tokens = usage.and_then(|usage| usage.output);
+        self.reported_output_tokens = output;
         self.reported_response_ms = duration;
         Ok(())
     }

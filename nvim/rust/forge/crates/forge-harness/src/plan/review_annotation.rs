@@ -72,13 +72,12 @@ pub(crate) struct ReviewAnnotationStore {
 
 struct AnnotationSet {
     values: Vec<ReviewAnnotation>,
-    root: Vec<String>,
 }
 
 impl AnnotationSet {
     fn new(values: Vec<ReviewAnnotation>) -> Result<Self> {
-        let root = validate(&values)?;
-        Ok(Self { values, root })
+        validate(&values)?;
+        Ok(Self { values })
     }
 }
 
@@ -164,19 +163,32 @@ impl ReviewAnnotationStore {
         Ok(())
     }
 
+    /// Render what `selected` follows up on: its ancestors, oldest first, with their answers.
+    ///
+    /// The selected annotation, its siblings, and its own follow-ups stay out. Every caller
+    /// states the selected body once after this context, and every saved comment reaches the
+    /// revising model once as its own requested change, so a thread entry repeated here would
+    /// reach the model twice.
     pub(crate) fn thread_context(&self, selected: &ReviewAnnotation) -> Result<String> {
-        let selected_root = self
+        let by_id = self
             .annotation
             .iter()
-            .zip(&self.annotation.root)
-            .find(|(item, _)| item.id == selected.id)
-            .map(|(_, root)| root)
+            .map(|item| (item.id.as_str(), item))
+            .collect::<std::collections::HashMap<_, _>>();
+        let selected = by_id
+            .get(selected.id.as_str())
             .context("selected annotation is no longer present")?;
+        let mut ancestors = Vec::new();
+        let mut parent_id = selected.parent_id.as_deref();
+        while let Some(id) = parent_id {
+            let parent = by_id
+                .get(id)
+                .context("annotation parent is no longer present")?;
+            ancestors.push(*parent);
+            parent_id = parent.parent_id.as_deref();
+        }
         let mut context = String::new();
-        for (item, root) in self.annotation.iter().zip(&self.annotation.root) {
-            if root != selected_root {
-                continue;
-            }
+        for item in ancestors.into_iter().rev() {
             let heading = if item.kind == ReviewAnnotationKind::Question {
                 "Plan question"
             } else {
@@ -246,10 +258,9 @@ fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn validate(annotation: &[ReviewAnnotation]) -> Result<Vec<String>> {
-    let mut identities: std::collections::HashMap<&str, (&ReviewAnnotation, String)> =
+fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
+    let mut identities: std::collections::HashMap<&str, &ReviewAnnotation> =
         std::collections::HashMap::new();
-    let mut roots = Vec::with_capacity(annotation.len());
     for annotation in annotation {
         ensure!(
             !annotation.id.is_empty() && !identities.contains_key(annotation.id.as_str()),
@@ -264,8 +275,8 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<Vec<String>> {
             !annotation.source.body.contains('\0'),
             "plan annotation contains NUL"
         );
-        let root = if let Some(parent_id) = &annotation.parent_id {
-            let (parent, root) = identities
+        if let Some(parent_id) = &annotation.parent_id {
+            let parent = identities
                 .get(parent_id.as_str())
                 .context("annotation parent must precede its follow-up")?;
             ensure!(
@@ -273,10 +284,7 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<Vec<String>> {
                     && parent.source.end_line == annotation.source.end_line,
                 "follow-up must retain its parent's source range"
             );
-            root.clone()
-        } else {
-            annotation.id.clone()
-        };
+        }
         if let Some(reply) = &annotation.reply {
             ensure!(
                 annotation.kind == ReviewAnnotationKind::Question
@@ -286,10 +294,9 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<Vec<String>> {
                 "invalid plan question reply"
             );
         }
-        identities.insert(&annotation.id, (annotation, root.clone()));
-        roots.push(root);
+        identities.insert(&annotation.id, annotation);
     }
-    Ok(roots)
+    Ok(())
 }
 
 /// Find the row of `after` that shows what row `line` of `before` showed.
@@ -469,5 +476,60 @@ mod tests {
         std::fs::write(source, b"changed").unwrap();
         assert!(resumed.replace(Vec::new()).is_err());
         assert_eq!(resumed.annotation().len(), 1);
+    }
+
+    /// A follow-up's context names what it answers, never the follow-up itself or a sibling,
+    /// because each caller states the selected body once after the context and every comment
+    /// reaches the revising model once as its own requested change.
+    #[test]
+    fn thread_context_holds_only_the_ancestors_of_the_selected_annotation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("working.json");
+        std::fs::write(&source, b"canonical").unwrap();
+        let mut store = ReviewAnnotationStore::open(source, digest(b"canonical")).unwrap();
+        let annotation = |id: &str, parent_id: Option<&str>, body: &str| ReviewAnnotation {
+            id: id.into(),
+            parent_id: parent_id.map(Into::into),
+            source: PlanAnnotationInput {
+                start_line: 4,
+                end_line: 4,
+                body: body.into(),
+            },
+            anchor: None,
+            kind: ReviewAnnotationKind::Comment,
+            reply: None,
+        };
+        let mut question = annotation("question", None, "Why this rounding rule?");
+        question.kind = ReviewAnnotationKind::Question;
+        question.reply = Some(ReviewQuestionReply {
+            question_body: "Why this rounding rule?".into(),
+            body: "The first shares absorb the remainder.".into(),
+            duration_ms: None,
+        });
+        store
+            .replace(vec![
+                question,
+                annotation("followup", Some("question"), "follow-up note"),
+                annotation("sibling", Some("question"), "sibling note"),
+                annotation("nested", Some("followup"), "nested note"),
+            ])
+            .unwrap();
+        let context_of = |id: &str| {
+            let selected = store
+                .annotation()
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap();
+            store.thread_context(selected).unwrap()
+        };
+        assert_eq!(
+            context_of("followup"),
+            "Plan question:\nWhy this rounding rule?\n\n\
+             Plan answer:\nThe first shares absorb the remainder.\n\n"
+        );
+        let nested = context_of("nested");
+        assert!(nested.contains("Why this rounding rule?") && nested.contains("follow-up note"));
+        assert!(!nested.contains("nested note") && !nested.contains("sibling note"));
+        assert_eq!(context_of("question"), "");
     }
 }

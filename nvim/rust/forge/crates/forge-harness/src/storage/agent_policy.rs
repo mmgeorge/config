@@ -213,6 +213,7 @@ mod tests {
             final_response: None,
             error: Some("observation unavailable".into()),
             parent_reported: false,
+            cancelled_by: None,
             created_at_ms: 1,
             last_activity_at_ms: Some(2),
             completed_at_ms: Some(3),

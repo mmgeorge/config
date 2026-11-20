@@ -28,7 +28,6 @@ pub(crate) struct HostInvocation {
     observed_tools: tokio::sync::Mutex<
         std::collections::HashMap<forge_provider_api::TurnId, Arc<ObservedTools>>,
     >,
-    authority: Option<crate::tools::TaskAuthority>,
     permissions: Arc<crate::permissions::provider::ProviderPermissionContext>,
     directories: Mutex<Option<super::approval::DirectoryExecution>>,
     tools: std::collections::HashSet<String>,
@@ -330,7 +329,6 @@ impl HostInvocation {
             binding,
             scope,
             request: request.invocation_snapshot(),
-            authority: crate::tools::TaskAuthority::capture(&context),
             template: context.clone(),
             observed_authority,
             observed_tools: Default::default(),
@@ -641,7 +639,6 @@ impl HostInvocation {
     ) -> HostCallPublication {
         let owner = self.live_host_effects.clone();
         let scope = self.scope.clone();
-        let authority = self.authority.clone();
         let result = async move {
             let completion = &batch.completion;
             if !completion.plan_edit.is_empty()
@@ -657,14 +654,9 @@ impl HostInvocation {
                         ProviderFailureKind::Rejected,
                     ))
                 })?;
-                let committed = owner.commit(scope, call_id, batch).await?;
-                if let Some(permit) = committed.task_permit
-                    && let Some(authority) = &authority
-                {
-                    // The logical effect already committed. A later user revocation
-                    // prevents future callbacks; it cannot change this retained result.
-                    let _ = authority.advance(permit);
-                }
+                // The owner adopts any task revision the commit produced in the commit
+                // step itself, before this reply can be observed.
+                owner.commit(scope, call_id, batch).await?;
             }
             Ok(message)
         }

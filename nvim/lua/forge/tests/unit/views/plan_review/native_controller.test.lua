@@ -649,8 +649,10 @@ T["close during pending answer retains review then reopens"] = function()
   keymap.feed("q")
   eq(require("forge.session").harness.plan_review, review, { fail_reason = "closing dropped a pending question" })
   local messages = scene.notices:messages()
-  assert(#messages == 1 and messages[1]:find("explicit operation in progress", 1, true),
-    "pending close omitted its explanation: " .. vim.inspect(messages))
+  -- The notice is one complete sentence that names what keeps the review open; a bare phrase
+  -- ending at the notifier's edge read as a message cut off there.
+  eq(messages, { "Plan review stays open until its running answers and edits finish." },
+    { fail_reason = "pending close did not explain what keeps the review open" })
   leave_question(scene, question.id)
   scene.host.answer(1, "The caller owns it.")
   reopen(scene)
@@ -987,6 +989,38 @@ T["reopening a review from the transcript keeps the text column"] = function()
     offsets[round] = text_offset()
   end
   eq(offsets, { opened, opened })
+end
+
+-- A saved comment keeps the review's owner, so `q` hides the review and `op` shows the same owner in
+-- a new tab. That tab copies the Harness window `op` ran in, and showing the review buffer again
+-- restores the columns of the last window that showed it; after a reopen from the transcript, a
+-- reopen from the composer drew the transcript's two-cell sign column in front of the review.
+T["reopening a review with a saved comment keeps the text column"] = function()
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local plan_host = plan_review_host.start({ lines = question_plan_lines })
+  local transcript = vim.api.nvim_get_current_win()
+  vim.wo[transcript].signcolumn, vim.wo[transcript].statuscolumn = "yes:1", "%s"
+  vim.cmd("split")
+  vim.wo.signcolumn, vim.wo.foldcolumn, vim.wo.statuscolumn = "no", "0", ""
+  -- The composer opens below a transcript window that has no columns yet, as `layout.open` builds it.
+  vim.cmd("belowright split")
+  local composer = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(composer, buffer_support.scratch())
+  require("forge.shared.input_gutter").apply(composer)
+  vim.cmd("wincmd p")
+  local scene = { host = plan_host, review = plan_host.open(), comments = require("forge.draft_comments") }
+  local function text_offset() return vim.fn.getwininfo(scene.review.win)[1].textoff end
+  local opened = text_offset()
+  focus_source(scene)
+  add_message(scene, "C", "Keep the column after saving.")
+  save(scene)
+  for _, origin in ipairs({ { "transcript", transcript }, { "composer", composer } }) do
+    vim.api.nvim_set_current_win(scene.review.win)
+    keymap.feed("q")
+    vim.api.nvim_set_current_win(origin[2])
+    scene.review = plan_host.open()
+    eq(text_offset(), opened, { fail_reason = "reopening from the " .. origin[1] .. " moved the text" })
+  end
 end
 
 -- `oY` while the task is paused records the acceptance and starts nothing. The reviewer learns that

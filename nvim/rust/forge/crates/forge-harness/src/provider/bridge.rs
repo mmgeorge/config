@@ -2364,7 +2364,9 @@ impl ProviderBridge {
         // A retirement that fails before native shutdown may only have observed work that native
         // shutdown has yet to join, such as an interrupted open whose retained operation still
         // reports its provisional interruption. Its failure stands only if the owner also fails
-        // to retire after native shutdown, or native shutdown itself fails.
+        // to retire after native shutdown, or native shutdown itself fails. After native
+        // shutdown, an open that stays uncertain settles too: no native process remains that
+        // could hold what it may have created.
         let mut provisional = Vec::new();
         for owner in owners {
             let ambiguous = self

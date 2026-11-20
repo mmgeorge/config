@@ -653,6 +653,38 @@ impl CopilotTurnEvent {
         }
     }
 
+    /// Wait until Copilot starts the turn for an input it accepted, or until no such start can
+    /// still arrive.
+    ///
+    /// Copilot acknowledges a sent message before it begins the turn for it. An abort in that
+    /// moment reaches a session with no turn running: Copilot reports the abort and then runs the
+    /// message anyway, after the foreground observer has settled the input as discarded, so the
+    /// late turn has no owner and fails the client generation. Stopping after the start instead
+    /// interrupts a running turn. The wait ends once a root turn started, the invocation reached
+    /// its terminal boundary, its foreground observer left, or no accepted input awaits a turn.
+    /// A send still in flight may yet be accepted, so it is waited for as well.
+    pub(crate) async fn wait_native_start(&self) {
+        loop {
+            let changed = self.sends_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let Ok(state) = self.state.lock() else {
+                    return;
+                };
+                let awaiting_start = matches!(state.delivery, TurnDelivery::Active(_))
+                    && state.terminal_event.is_none()
+                    && !state.uncertain_send
+                    && state.root_turns.is_empty()
+                    && (state.pending_sends != 0 || !state.accepted_inputs.is_empty());
+                if !awaiting_start {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
+
     /// Match the admitted input to a later root start in the native event chain.
     pub fn foreground_anchor(&self) -> Result<Option<(String, String)>> {
         let state = self
@@ -830,6 +862,11 @@ impl CopilotTurnEvent {
                 .phase = RootTurnPhase::Finished {
                 event_id: event.id.clone(),
             };
+        }
+        drop(state);
+        if root && event.event_type == "assistant.turn_start" {
+            // A stop may be waiting for this start before it aborts.
+            self.sends_changed.notify_waiters();
         }
         Ok(())
     }

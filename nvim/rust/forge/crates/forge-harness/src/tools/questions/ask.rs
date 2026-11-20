@@ -14,11 +14,22 @@ pub(super) fn definition() -> ControlToolDefinition {
                 returns Harness-generated question_ids immediately without ending the turn; keep working while \
                 answers arrive asynchronously as new user messages. Set wait:true only for important decisions \
                 that block progress: the tool stays pending and returns the resolved answers instead of sending \
-                them separately. Never invent IDs or treat recommended choices or assumptions as user answers. \
+                them separately. While drafting or revising a plan, every question waits this way. Never invent IDs or treat recommended choices or assumptions as user answers. \
                 New questions have revision 1. Use the returned question IDs with question_reply, \
                 question_revise, or question_withdraw.",
         input_schema: plan_question_input_schema(),
     }
+}
+
+/// Decide whether a `question_ask` call with `arguments`, made in a turn of `mode`, keeps its
+/// tool pending until the user answers.
+///
+/// A planning turn always waits. An asynchronous question let the planner end its turn while
+/// the question was unanswered, and its answer arrives only as a read-only discussion message,
+/// so the planning loop ran continuation turns that had nothing to plan with until its
+/// no-progress limit stopped planning with the question still waiting.
+pub fn question_ask_waits(arguments: &Value, mode: crate::provider::PromptMode) -> bool {
+    mode == crate::provider::PromptMode::Plan || arguments["wait"].as_bool() == Some(true)
 }
 
 /// Build the waiting and asynchronous question input schema.
@@ -77,7 +88,7 @@ pub(super) async fn execute(
 
         let mut drafts: Vec<crate::question::QuestionDraft> =
             serde_json::from_value(invocation.arguments["questions"].clone())?;
-        let wait = invocation.arguments["wait"].as_bool().unwrap_or(false);
+        let wait = question_ask_waits(&invocation.arguments, runtime.context.mode);
         for draft in &mut drafts {
             draft.requirement = if wait {
                 crate::question::QuestionRequirement::Required

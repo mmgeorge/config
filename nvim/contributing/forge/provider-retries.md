@@ -26,11 +26,12 @@ Provider metadata was checked against the sources below on 2026-10-20.
 
 All other errors fail without a Forge retry, including authentication, authorization, quota, policy, context limits, generic internal errors, HTTP 429, unknown codes, and tool errors. A generic internal error alone does not prove a temporary problem.
 
-Copilot SDK 1.0.26 classifies `errorType: "model_call"` as a native transient error and its agent loop continues, so Forge keeps reading and does not start an overlapping retry. Codex nonterminal error notifications likewise start no retry.
+Copilot SDK 1.0.26 classifies `errorType: "model_call"` as a native transient error and its agent loop continues, so Forge keeps reading and does not start an overlapping retry. Codex nonterminal error notifications likewise start no retry. Codex retries a timed-out or disconnected model request itself, up to five times within the same turn, and announces each retry with an `error` notification whose `willRetry` is true; the protocol states that such an error does not interrupt the turn. The Codex decoder therefore attributes no error to the turn or thread for it and only traces `provider.native_retry`, because a recorded error would draw a `Provider turn error` row under a turn that went on to complete. An `error` notification without `willRetry`, including the one Codex sends after its last retry, still becomes the turn's error.
 
 Sources:
 
 - [Codex error variants](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/shared.rs), file blob `65c7db5aebe8bb5e3d5653a9109d412f099e1edb`.
+- [Codex `ErrorNotification`](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/notification.rs) and its `will_retry` field, checked on 2026-11-20.
 - [Codex turn input](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/turn.rs), file blob `38b00228a6d4c0693c13daa03734bb8f121007dc`.
 - [Copilot session error schema](https://github.com/github/copilot-sdk/blob/main/nodejs/src/generated/session-events.ts), file blob `dc403c7b0f8fbeb7ff6c755e72810ef447727ecd`.
 - The installed `github-copilot-sdk` 1.0.26 `SessionEvent::is_transient_error` implementation.

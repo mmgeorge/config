@@ -70,6 +70,9 @@ M.empty_diff_rows = {}
 ---@field unsubscribe? fun()
 ---@field switching_provider? boolean
 ---@field switch_notice? string Status text while a provider switch or reconnect replaces this view's host.
+---@field pending_switch? table A switch of this view's panes to another session, prepared out of sight.
+---@field pending_rebuild? ForgeHarnessPresentationRebuild The new host's presentation of this view's own
+---  session, rendering out of sight while the previous host's presentation stays on screen.
 ---@field state_sync_pending? table Identity of the one active snapshot read.
 ---@field aborting_plan? boolean
 ---@field session table?
@@ -210,9 +213,13 @@ end
 ---@type table<string, ForgeHarnessPresentationState>
 M.harness_by_id = {}
 
---- Active presentation selected by the current Harness tab.
+--- Active presentation: the selected one, or the one a callback or render temporarily acts on.
 ---@type ForgeHarnessPresentationState
 M.harness = new_harness_state()
+
+-- The presentation the user last selected. `M.harness` also names the presentation a host reply or
+-- a render is scoped to, so code that decides whether to take focus reads this record instead.
+local selected_harness = M.harness
 
 --- Constructs a fresh Harness presentation state container.
 ---@return ForgeHarnessPresentationState state Newly initialized presentation state.
@@ -228,8 +235,13 @@ end
 ---@param state ForgeHarnessPresentationState
 function M.select_harness(state)
   M.harness = state
+  selected_harness = state
   harness_selection = harness_selection + 1
 end
+
+--- The presentation the user last selected, whatever presentation a callback is scoped to now.
+---@return ForgeHarnessPresentationState
+function M.selected_harness() return selected_harness end
 
 --- Get the generation of the last intentional session selection.
 ---@return integer

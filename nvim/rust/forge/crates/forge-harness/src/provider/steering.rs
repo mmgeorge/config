@@ -338,6 +338,23 @@ impl SteerCommand {
         Ok(())
     }
 
+    /// Attribute this input's acceptance to the invocation it is dispatched to.
+    ///
+    /// The parent's input receiver binds its sink to the exchange's first invocation for the
+    /// exchange's whole life, while a child result, a retry, or a check result continues the
+    /// exchange under a successor invocation. The execution owner admits a steer only into the
+    /// invocation that is active, and both it and the foreground refuse an acceptance published
+    /// under any other invocation, so a steer into a successor must publish under that successor.
+    pub(crate) fn deliver_to(&mut self, scope: &super::InvocationScope) -> Result<()> {
+        let Some(sink) = &self.event_sink else {
+            return Ok(());
+        };
+        if sink.invocation_scope()? != scope {
+            self.event_sink = Some(sink.successor_invocation_sink(scope)?);
+        }
+        Ok(())
+    }
+
     pub(crate) fn input(&self) -> SteeringInput {
         if let Some(result) = &self.agent_result {
             return SteeringInput::AgentResult(result.clone());

@@ -118,11 +118,25 @@ pub enum PausedWait {
 impl SessionPhase {
     /// Pause the task this phase belongs to, keeping a plan review that waits for the user.
     ///
-    /// A turn that is still stopping keeps that phase, because its pause has not taken effect
-    /// and showing Paused first would flash before Stopping returns.
+    /// Only a phase in which nothing runs yields. A turn still stopping keeps that phase,
+    /// because its pause has not taken effect and showing Paused first would flash before
+    /// Stopping returns. A turn that runs while the task is paused, such as an ordinary prompt
+    /// in a session whose plan a restart paused, keeps its own phase, so the status row shows
+    /// its elapsed time and interrupt key instead of a pause that describes only the task.
     pub(crate) fn paused(self) -> Self {
         let waiting = match self {
-            stopping @ Self::Stopping { .. } => return stopping,
+            running @ (Self::Stopping { .. }
+            | Self::Compacting { .. }
+            | Self::Finalizing { .. }
+            | Self::Working { .. }
+            | Self::AwaitingApproval { .. }
+            | Self::AwaitingInput {
+                exchange_id: Some(_),
+                ..
+            }
+            | Self::RetryingPlanGeneration { .. }
+            | Self::RetryingProvider { .. }
+            | Self::WaitingForAgent { .. }) => return running,
             Self::AwaitingPlanReview { plan_id, revision } => {
                 Some(PausedWait::PlanReview { plan_id, revision })
             }
@@ -139,6 +153,20 @@ impl SessionPhase {
     pub(crate) fn blocked_by(self, task: Option<&crate::task::Task>) -> Self {
         match (self, task.and_then(crate::task::Task::blocked_cause)) {
             (Self::Idle, Some(reason)) => Self::Blocked { reason },
+            (phase, _) => phase,
+        }
+    }
+
+    /// Name a forked session's provider preparation in place of an idle phase.
+    ///
+    /// A prompt sent to a fork before the provider has copied the source conversation waits on
+    /// that copy, which can take many seconds under load. Without this phase the status split
+    /// stayed empty while the prompt read `[submitting]`.
+    pub(crate) fn preparing_fork(self, fork_state: &crate::session::ProviderForkState) -> Self {
+        match (self, fork_state) {
+            (Self::Idle, crate::session::ProviderForkState::Preparing { .. }) => {
+                Self::PreparingFork
+            }
             (phase, _) => phase,
         }
     }
@@ -161,11 +189,18 @@ pub enum SessionPhase {
     Blocked {
         reason: String,
     },
+    /// The provider is still copying the source conversation into this forked session, and
+    /// provider-bound input waits until it finishes.
+    PreparingFork,
     Stopping {
         collection: crate::exchange::ExchangeCollection,
     },
     Compacting {
         started_at_ms: i64,
+        /// A turn of an unfinished exchange waits for this compaction: the turn it stopped runs
+        /// again, or a running turn continues, once it ends. A compaction between turns, such as
+        /// one while a plan waits in review, holds no turn.
+        turn_waiting: bool,
     },
     Finalizing {
         exchange_id: String,
@@ -345,8 +380,13 @@ impl SessionPhase {
         if let Some(collection) = exchange.and_then(|exchange| exchange.collection) {
             return Self::Stopping { collection };
         }
-        if let Some(started_at_ms) = exchange.and_then(Exchange::compaction_started_at_ms) {
-            return Self::Compacting { started_at_ms };
+        if let Some(exchange) = exchange
+            && let Some(started_at_ms) = exchange.compaction_started_at_ms()
+        {
+            return Self::Compacting {
+                started_at_ms,
+                turn_waiting: !exchange.is_finished(),
+            };
         }
         let active_wait = active_wait.filter(|wait| {
             exchange.is_some_and(|exchange| {
@@ -365,7 +405,10 @@ impl SessionPhase {
                 };
             }
             Some(ExchangeActivity::Compacting { started_at_ms }) => {
-                return Self::Compacting { started_at_ms };
+                return Self::Compacting {
+                    started_at_ms,
+                    turn_waiting: true,
+                };
             }
             Some(ExchangeActivity::WaitingForAgent) => {
                 return Self::WaitingForAgent {
@@ -517,7 +560,7 @@ impl SessionPhase {
             } => duration_ms.saturating_add(
                 started_at_ms.map_or(0, |started| now_ms.saturating_sub(started).max(0) as u64),
             ),
-            Self::Compacting { started_at_ms } => {
+            Self::Compacting { started_at_ms, .. } => {
                 now_ms.saturating_sub(*started_at_ms).max(0) as u64
             }
             _ => 0,
@@ -533,6 +576,7 @@ impl SessionPhase {
                 | Self::RetryingProvider { .. }
                 | Self::Compacting { .. }
                 | Self::WaitingForAgent { .. }
+                | Self::PreparingFork
                 | Self::Finalizing { error: None, .. }
                 | Self::Stopping {
                     collection: crate::exchange::ExchangeCollection::Pending
@@ -590,6 +634,48 @@ mod paused_tests {
         );
         assert_eq!(
             SessionPhase::Idle.paused(),
+            SessionPhase::Paused { waiting: None }
+        );
+    }
+
+    /// A turn that runs while its task is paused, such as an ordinary prompt sent to a session
+    /// whose plan a restart paused, keeps its own phase: the pause describes the task, and the
+    /// status row describes what runs.
+    #[test]
+    fn paused_keeps_a_running_turn() {
+        let working = SessionPhase::Working {
+            duration_ms: 15_000,
+            started_at_ms: Some(1),
+            activity: super::WorkflowActivity::Working,
+            reasoning_summary: None,
+            execution: None,
+        };
+        let answering = SessionPhase::AwaitingInput {
+            owner: super::ElicitationOwner::Interaction,
+            plan_id: None,
+            exchange_id: Some("exchange".into()),
+        };
+        for running in [
+            working,
+            answering,
+            SessionPhase::AwaitingApproval {
+                exchange_id: "exchange".into(),
+            },
+            SessionPhase::WaitingForAgent { agent_count: 1 },
+            SessionPhase::Compacting {
+                started_at_ms: 1,
+                turn_waiting: true,
+            },
+        ] {
+            assert_eq!(running.clone().paused(), running);
+        }
+        assert_eq!(
+            SessionPhase::AwaitingInput {
+                owner: super::ElicitationOwner::Plan,
+                plan_id: Some("plan".into()),
+                exchange_id: None,
+            }
+            .paused(),
             SessionPhase::Paused { waiting: None }
         );
     }

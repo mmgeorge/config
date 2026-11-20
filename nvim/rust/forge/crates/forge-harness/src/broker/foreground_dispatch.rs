@@ -5,12 +5,13 @@ use super::*;
 pub(crate) enum DispatchStage {
     /// The journal still records the input as `Prepared`, so stopping the turn prevents the send.
     Unsent,
-    /// The submission is running and the provider has not confirmed it. Stopping the turn now
-    /// interrupts a send whose delivery is then unknown.
+    /// The submission is running and the provider has not yet reported the turn's native start.
+    /// Stopping the turn now interrupts a send whose delivery is then unknown, or one the provider
+    /// still runs after the stop.
     InFlight,
     /// The send ended without confirmation, so the turn fails and its provider generation with it.
     Lost,
-    /// The provider confirmed the send, or the turn has no send left.
+    /// The provider started the turn its send dispatched, or the turn has no send left.
     Settled,
 }
 
@@ -209,6 +210,24 @@ impl TurnTransaction {
                         }
                         Some(Ok(_) | Err(_)) | None => DispatchStage::InFlight,
                     },
+                    // The confirmation is the adapter's own report that it handed the input to
+                    // the provider, which may still be taking it in: Copilot begins the turn a
+                    // moment after it accepts the input, and an abort in that moment reaches it
+                    // before the turn it then runs anyway. Only the native start the provider
+                    // reports for this invocation, or the end of native work, settles the send.
+                    Ok(Some(_))
+                        if matches!(self, Self::Running { .. })
+                            && !self.invocation_scope().ok().flatten().is_some_and(|scope| {
+                                transaction
+                                    .state
+                                    .interaction
+                                    .turn
+                                    .iter()
+                                    .any(|turn| turn.provider().scope == scope)
+                            }) =>
+                    {
+                        DispatchStage::InFlight
+                    }
                     Ok(Some(_)) => DispatchStage::Settled,
                     Err(_) => DispatchStage::Lost,
                 }
@@ -1688,23 +1707,25 @@ impl HarnessBroker {
             matches!(&admission.purpose, crate::input::InputPurpose::User),
             "unsupported prompt purpose"
         );
-        anyhow::ensure!(
-            !matches!(
-                text.split_whitespace().next(),
-                Some(
-                    "/read"
-                        | "/write"
-                        | "/mode"
-                        | "/ask"
-                        | "/deny"
-                        | "/allow"
-                        | "/yolo"
-                        | "/clear"
-                        | "/plan"
-                )
-            ),
-            "Use /read full, /write, /write full, /ask, /deny, /allow, or /yolo"
-        );
+        if matches!(
+            text.split_whitespace().next(),
+            Some(
+                "/read"
+                    | "/write"
+                    | "/mode"
+                    | "/ask"
+                    | "/deny"
+                    | "/allow"
+                    | "/yolo"
+                    | "/clear"
+                    | "/plan"
+            )
+        ) {
+            return Err(super::PromptRefused(
+                "Use /read full, /write, /write full, /ask, /deny, /allow, or /yolo".into(),
+            )
+            .into());
+        }
         // A message during an Execute task is an execution discussion: the turn carries the
         // execute task section and plan tools whatever the execution's state, so the model
         // never reads "no task" while the editor shows the execution. Tools that change the
@@ -1721,8 +1742,16 @@ impl HarnessBroker {
                 ProviderInput::parse(&text),
             );
         }
+        // A task that is not running takes a typed prompt as conversation: a paused task, one
+        // whose entry was not accepted, and a plan whose generation stopped at its limits. The
+        // stopped plan once refused the prompt as a failed turn, which restarted the provider and
+        // left the prompt failed in a paused queue; the model now reads it, and `/plan retry`
+        // resumes planning with it in the conversation.
         if self.task_controller.current()?.is_some_and(|task| {
-            task.status() == crate::task::TaskStatus::Paused || !task.entry_accepted()
+            task.status() == crate::task::TaskStatus::Paused
+                || !task.entry_accepted()
+                || matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan }
+                    if plan.artifact.state == PlanState::Failed)
         }) {
             return self.stage_foreground_interaction(
                 &text,
@@ -1737,19 +1766,16 @@ impl HarnessBroker {
             .map(|id| self.store.load_plan(id))
             .transpose()?
             .flatten();
-        anyhow::ensure!(
-            !active_plan
-                .as_ref()
-                .is_some_and(|plan| plan.state == PlanState::Failed),
-            "plan generation stopped; run /plan retry or /plan cancel"
-        );
-        anyhow::ensure!(
-            !active_plan
-                .as_ref()
-                .is_some_and(|plan| plan.state == PlanState::AwaitingInput)
-                && self.find_active_interaction_elicitation()?.is_none(),
-            "question clarification requires an explicit source and question revision"
-        );
+        if active_plan
+            .as_ref()
+            .is_some_and(|plan| plan.state == PlanState::AwaitingInput)
+            || self.find_active_interaction_elicitation()?.is_some()
+        {
+            return Err(super::PromptRefused(
+                "question clarification requires an explicit source and question revision".into(),
+            )
+            .into());
+        }
         if let Some(plan) = active_plan
             .as_ref()
             .filter(|plan| plan.state == PlanState::ConfiguringChecks)
@@ -1855,10 +1881,6 @@ impl HarnessBroker {
             if let Some(change) = change {
                 let captured = self.prepare_permission_configuration(&json!({"change": change}))?;
                 let result = self.commit_permission_configuration(captured)?;
-                anyhow::ensure!(
-                    result.resume.is_none(),
-                    "prompt permission unexpectedly requested a restart"
-                );
                 admission.command_result = Some(Ok((result.value, Vec::new())));
                 admission.phase = AdmissionPhase::PermissionPublishing;
                 return Ok(ForegroundAction::Effect(
@@ -1935,10 +1957,6 @@ impl HarnessBroker {
                             },
                         }))?;
                         let result = self.commit_permission_configuration(captured)?;
-                        anyhow::ensure!(
-                            result.resume.is_none(),
-                            "execution approval unexpectedly requested a restart"
-                        );
                         admission.phase = AdmissionPhase::PermissionPublishing;
                         return Ok(ForegroundAction::Effect(
                             ForegroundJob::PermissionPublication(result.delivery),
@@ -1975,7 +1993,17 @@ impl HarnessBroker {
                 self.normalize_foreground_interaction(admission)
             };
             self.submitted_attachments = previous;
-            let mut staged = staged?;
+            let mut staged = match staged {
+                // A refused prompt settles like a rejected command: no turn ran, so none fails
+                // and the provider is not restarted, and the response carries the reason.
+                Err(error) if error.is::<super::PromptRefused>() => {
+                    admission.command_result = Some(Err(error));
+                    let action = self.prepare_foreground_command(admission)?;
+                    admission.phase = AdmissionPhase::Publishing;
+                    return Ok(action);
+                }
+                staged => staged?,
+            };
             if !admission.attachments.is_empty() {
                 staged.input = staged.input.with_attachments(admission.attachments.clone());
             }

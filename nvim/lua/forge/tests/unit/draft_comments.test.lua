@@ -113,6 +113,9 @@ T["saved_comment_collapses_at_once"] = function()
   comments.saved(buffer, comments.capture(buffer))
   -- The save is the visible acknowledgement: the comment collapses as if the cursor had left it.
   assert(compact(), "a saved comment stayed expanded until the cursor moved")
+  -- The editor then reports the cursor the save placed, which must not reopen the comment.
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
+  assert(compact(), "the cursor the save placed reopened the saved comment")
   assert(not vim.bo[buffer].modified, "the saved comment left the buffer modified")
   -- A comment typed into after its save was sent keeps its editor open.
   assert(comments.focus(buffer, 1))

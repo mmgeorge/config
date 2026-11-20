@@ -245,6 +245,13 @@ end
 ---@param composer_buf integer
 function M.detach(transcript_buf, composer_buf)
   pcall(vim.api.nvim_del_augroup_by_name, "ForgeHarnessComposer" .. composer_buf)
+  M.detach_transcript(transcript_buf)
+end
+
+---Remove the autocommand group `attach_scroll_boundary` created for a transcript buffer, as a
+---view does when it replaces its transcript buffer and keeps its composer.
+---@param transcript_buf integer
+function M.detach_transcript(transcript_buf)
   pcall(vim.api.nvim_del_augroup_by_name, "ForgeHarnessScroll" .. transcript_buf)
 end
 

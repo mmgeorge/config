@@ -56,11 +56,16 @@ impl HarnessBroker {
     /// A model-delegated child reports to the turn that delegated it. When that turn was
     /// cancelled, failed, or interrupted, it never resumes, so a later exchange never receives
     /// the result: such a result once reached the next prompt's turn, whose model then reported on
-    /// the earlier turn's children instead of its own.
+    /// the earlier turn's children instead of its own. A child cancelled with that turn is still
+    /// listed, once, so the model learns that it will not report; `agent_result` sends it as a
+    /// cancellation with no result text.
     pub(super) fn deliverable_child_results(&self, exchange_id: &str) -> Result<Vec<AgentTask>> {
         let mut deliverable = Vec::new();
         for task in self.agent_coordinator.unreported_result() {
-            if task.source == AgentSource::Model && task.parent_exchange_id != exchange_id {
+            if task.source == AgentSource::Model
+                && task.parent_exchange_id != exchange_id
+                && task.state != ExchangeState::Cancelled
+            {
                 let parent = self
                     .store
                     .load_exchange_metadata(&task.parent_exchange_id)?;

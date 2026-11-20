@@ -601,6 +601,19 @@ function PickerLayout.viewport(frame, height, previous_top, content_offset, opti
   for _, field in ipairs({ "search_start", "input_start", "footer_line" }) do
     projected[field] = row_map[frame[field]]
   end
+  -- Rows past the window's edges scroll into view with the selection; the frame names the ones it
+  -- shows so the picker can say that the list continues beyond them.
+  local option_count = #frame.option_range
+  local first_visible, last_visible
+  for index = 1, option_count do
+    if projected.option_range[index] then
+      first_visible = first_visible or index
+      last_visible = index
+    end
+  end
+  if first_visible and (first_visible > 1 or last_visible < option_count) then
+    projected.option_overflow = { first = first_visible, last = last_visible, count = option_count }
+  end
   projected.viewport_top = top
   projected.option_offset = option_offset
   projected.option_scroll_max = option_scroll_max

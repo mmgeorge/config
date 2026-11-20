@@ -171,6 +171,11 @@ pub struct HarnessPreference {
     /// Limits each tool invocation and shell command independently.
     #[serde(default)]
     pub tool_timeout: InputTimeout,
+    /// Identifies the settings revision at which a session in this workspace last confirmed a
+    /// model, thinking, or context choice, ordering it against explicit global default edits.
+    /// A record that only mirrors a session's initial settings has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_revision: Option<u64>,
 }
 
 /// Selects the model used after a plan is accepted.

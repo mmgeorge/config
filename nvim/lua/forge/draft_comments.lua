@@ -752,6 +752,34 @@ function M.capture(buf)
   return captured
 end
 
+--- Remove every comment that holds no text, so a save stores nothing for it and deletes a saved
+--- comment that was edited to empty. A comment that another one follows up stays, because
+--- removing it would orphan its thread.
+---@param buf integer
+function M.discard_empty(buf)
+  local state = state_by_buf[buf]
+  if not state or state.readonly then return end
+  sync_focused_body(state)
+  local followed = {}
+  for _, annotation in ipairs(state.annotation_list) do
+    if annotation.parent_id then followed[tostring(annotation.parent_id)] = true end
+  end
+  local discarded
+  for index = #state.annotation_list, 1, -1 do
+    local annotation = state.annotation_list[index]
+    if vim.trim(annotation.body) == "" and not annotation.readonly and not followed[tostring(annotation.id)] then
+      discarded = annotation
+      table.remove(state.annotation_list, index)
+    end
+  end
+  if not discarded then return end
+  local win = displayed_window(state)
+  if win and win == vim.api.nvim_get_current_win() and vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    vim.cmd("stopinsert")
+  end
+  render(state, { source_line = discarded.end_source_line })
+end
+
 ---@param buf integer
 ---@param captured ForgeDraftCommentCapture[]
 function M.saved(buf, captured)
@@ -777,7 +805,10 @@ function M.saved(buf, captured)
     if win and win == vim.api.nvim_get_current_win() and vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
       vim.cmd("stopinsert")
     end
-    render(state, { annotation_id = collapsed.id })
+    -- The cursor returns to the source line the comment annotates, as when it leaves the comment.
+    -- A cursor left inside the collapsed rows would focus the comment again on the editor's next
+    -- CursorMoved and reopen it as the editor, unlike every other saved comment.
+    render(state, { source_line = collapsed.end_source_line })
   end
   vim.bo[buf].modified = not vim.deep_equal(M.capture(buf), state.baseline)
   if state.guard and state.guard.native then state.guard.native.modified = vim.bo[buf].modified end
@@ -809,6 +840,14 @@ function M.focus(buf, id)
   return true
 end
 
+---@param state ForgeDraftCommentState
+local function start_insert_later(state)
+  vim.schedule(function()
+    local displayed = displayed_window(state)
+    if displayed and vim.api.nvim_get_current_win() == displayed then vim.cmd("startinsert") end
+  end)
+end
+
 ---@param buf integer
 ---@param annotation ForgeDraftComment
 ---@param start_insert? boolean
@@ -826,24 +865,42 @@ function M.add(buf, annotation, start_insert)
   state.annotation_list[#state.annotation_list + 1] = annotation
   focus_thread(state, annotation)
   render(state, { annotation_id = annotation.id })
-  if start_insert ~= false then
-    vim.schedule(function()
-      local displayed = displayed_window(state)
-      if displayed and vim.api.nvim_get_current_win() == displayed then vim.cmd("startinsert") end
-    end)
-  end
+  if start_insert ~= false then start_insert_later(state) end
   return annotation
 end
 
+--- Open `annotation`'s own body for editing, leaving the cursor where it is when it already sits
+--- inside that body.
+---@param state ForgeDraftCommentState
+---@param annotation ForgeDraftComment
+---@param win integer
+local function edit_annotation(state, annotation, win)
+  local cursor_row = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local _, range, reply = annotation_at_row(state, cursor_row)
+  local header_row, footer_row
+  if range and not range.compact and not reply then header_row, footer_row = full_range_rows(state, range) end
+  if annotation.focused and header_row and cursor_row > header_row and cursor_row < footer_row then
+    sync_cursor_modifiable(state, win)
+    return
+  end
+  focus_thread(state, annotation)
+  render(state, { annotation_id = annotation.id })
+end
+
+--- Add a comment on the selected rows; a refusal notifies and returns nil without other effects.
+---
+--- On an answer row the comment follows up that answer in its thread. Inside a comment's own
+--- rows the key edits that comment and returns it rather than stacking a second one beside it.
 ---@param buf integer
 ---@param start_insert? boolean
 ---@param properties? {kind?: string, heading?: string}
+---@return ForgeDraftComment?
 function M.add_at_cursor(buf, start_insert, properties)
   local state = state_by_buf[buf]
-  if not state or state.readonly then return end
+  if not state or state.readonly then return nil end
   sync_focused_body(state)
   local win = displayed_window(state)
-  if not win then return end
+  if not win then return nil end
   local mode = vim.fn.mode(1)
   local cursor_row = vim.api.nvim_win_get_cursor(win)[1] - 1
   local first_row = cursor_row
@@ -852,11 +909,24 @@ function M.add_at_cursor(buf, start_insert, properties)
     first_row = vim.fn.getpos("v")[2] - 1
   end
   local source_line, end_source_line = source_range_at_rows(state, first_row, last_row)
-  local parent = first_row == last_row and annotation_at_row(state, cursor_row) or nil
+  local parent, on_answer = nil, false
+  if first_row == last_row then
+    local _
+    parent, _, on_answer = annotation_at_row(state, cursor_row)
+  end
+  if parent and not on_answer then
+    if parent.readonly then
+      notifications.error("This comment cannot be edited", "Forge comments")
+      return nil
+    end
+    edit_annotation(state, parent, win)
+    if start_insert ~= false then start_insert_later(state) end
+    return parent
+  end
   if parent then source_line, end_source_line = parent.source_line, parent.end_source_line end
   if not source_line or not end_source_line then
     notifications.error("Selected rows have no source identity", "Forge comments")
-    return
+    return nil
   end
   local annotation = {
     id = state.next_id,
@@ -870,7 +940,7 @@ function M.add_at_cursor(buf, start_insert, properties)
     heading = properties and properties.heading,
   }
   state.next_id = state.next_id + 1
-  M.add(buf, annotation, start_insert)
+  return M.add(buf, annotation, start_insert)
 end
 
 --- Update thread presentation in one render without replacing local draft bodies.

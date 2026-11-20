@@ -772,7 +772,7 @@ impl HarnessBroker {
                 }
                 let cancelled = failure.original.is::<TurnCancelled>();
                 staged.exchange.set_awaiting_input(false);
-                self.questions.cancel_chat(Some(&staged.exchange.id))?;
+                self.retire_stopped_questions(Some(&staged.exchange.id))?;
                 staged.exchange.finalization_error =
                     (!cancelled).then(|| format!("{:#}", failure.original));
                 staged.exchange.finish(
@@ -1206,7 +1206,7 @@ impl HarnessBroker {
                 )));
             }
             let interaction = &mut transaction.state.interaction;
-            self.questions.cancel_chat(Some(&interaction.id))?;
+            self.retire_stopped_questions(Some(&interaction.id))?;
             interaction.set_awaiting_input(false);
             interaction.finalization_error = match &failure.cleanup {
                 Some(cleanup) => Some(format!(

@@ -1215,4 +1215,49 @@ mod tests {
         assert_eq!(completed.owner.exchange_id(), Some("implement-exchange"));
         Ok(())
     }
+
+    /// An interrupt between an Implement turn and its reserved check run pauses the task with no
+    /// exchange to stop. The status had predicted the run with a clockless `Working`, and with
+    /// no exchange left to republish it, that row kept spinning beside `exec · check · paused`.
+    #[tokio::test]
+    async fn an_interrupt_before_the_check_run_starts_replaces_the_working_status() -> Result<()> {
+        use forge_buffer::identity::{DocumentId, ViewId};
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let document = DocumentId("paused-check".into());
+        let presentation = broker.presentation();
+        presentation.lock().unwrap().open(
+            document.clone(),
+            ViewId("paused-check-view".into()),
+            Default::default(),
+        )?;
+        let status_row = || -> Result<String> {
+            let synced = presentation
+                .lock()
+                .unwrap()
+                .sync(&document, Default::default())?;
+            Ok(synced
+                .status
+                .block
+                .first()
+                .and_then(|block| block.text.wire_rows().first().map(|row| (*row).to_owned()))
+                .unwrap_or_default())
+        };
+        assert!(
+            status_row()?.starts_with("Working"),
+            "the reserved check run is not predicted: {:?}",
+            status_row()?
+        );
+        broker.owner_cancel_local(None)?;
+        assert_eq!(
+            broker.task_controller.current()?.map(|task| task.status()),
+            Some(crate::task::TaskStatus::Paused)
+        );
+        let paused = status_row()?;
+        assert!(
+            paused.is_empty() || paused.starts_with("Paused"),
+            "the paused check phase still reads {paused:?}"
+        );
+        Ok(())
+    }
 }

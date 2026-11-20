@@ -37,7 +37,8 @@ pub use invocation::{ControlToolInvocation, apply_invocation};
 pub(crate) use invocation::{json_pointer_to_path, validate_arguments};
 pub(crate) use origin::AsideToolScope;
 pub use questions::{
-    plan_question_input_schema, question_answer_input_schema, question_withdraw_input_schema,
+    plan_question_input_schema, question_answer_input_schema, question_ask_waits,
+    question_withdraw_input_schema,
 };
 pub(crate) use registry::is_read_only;
 pub use registry::{ControlToolDefinition, ControlToolRegistry};

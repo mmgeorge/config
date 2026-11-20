@@ -88,6 +88,43 @@ impl ExchangeDriver {
         StepGate::Proceed
     }
 
+    /// Keep the observer's record of a waiting compaction current, and re-project an idle status
+    /// whenever it changes.
+    ///
+    /// A `/compact` accepted while other owner work holds session control, such as a task's
+    /// check run, waits for that control, and the work it waits for settles to an idle phase
+    /// before the compaction starts. The idle status reads as a hand-off while such a
+    /// compaction waits (`hand_off_phase`), and the status published before each change would
+    /// otherwise stand until an unrelated event re-projected it.
+    pub(super) async fn compaction_wait_publish(
+        &mut self,
+        env: &DriverEnv,
+        state: &mut DriverState,
+        step: u64,
+    ) {
+        let waiting = state
+            .command
+            .as_ref()
+            .is_some_and(ActiveCommand::compaction_waiting)
+            || self.commands.has_pending_compaction();
+        let observer = &env.services.observer;
+        if observer
+            .compaction_waiting
+            .swap(waiting, std::sync::atomic::Ordering::AcqRel)
+            == waiting
+        {
+            return;
+        }
+        refresh_idle_status(
+            &mut *env.broker.lock().await,
+            &env.services,
+            &env.trace,
+            &env.session_id,
+            step,
+            "compaction_wait",
+        );
+    }
+
     /// Start the next queued turn, then run the active turn's effects under the current gate.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn turns_advance(
@@ -214,6 +251,44 @@ impl ExchangeDriver {
                 }
                 Err(_) => *broker_deferred = true,
             }
+        }
+    }
+
+    /// Settle the exchange a failed command parked once nothing else can still own it.
+    ///
+    /// The command's collection may park the exchange before or after its failure is known, and
+    /// the stop it leaves retained may still be collecting, so the release waits until no turn,
+    /// queued turn, command, or stop remains.
+    pub(super) async fn failed_parking_release(
+        &mut self,
+        env: &DriverEnv,
+        state: &mut DriverState,
+        step: u64,
+    ) {
+        if self.failed_parking_command.is_none()
+            || state.foreground.is_some()
+            || !state.pending.is_empty()
+            || state.command.is_some()
+            || !state.tasks.stops.is_empty()
+        {
+            return;
+        }
+        let command = self
+            .failed_parking_command
+            .take()
+            .expect("failed parking command selected above");
+        let released = env.broker.lock().await.owner_fail_parked_exchange(
+            "The turn was stopped to apply a change that then failed, so it did not run again.",
+        );
+        match released {
+            Ok(events) => publish_control(events, None, env.context(step), &command),
+            Err(error) => env.trace.record(
+                &env.session_id,
+                "exchange.parked_release_failed",
+                serde_json::json!({
+                    "command_id":command.as_str(),"update_step":step,"reason":error.to_string(),
+                }),
+            ),
         }
     }
 
@@ -366,15 +441,23 @@ impl ExchangeDriver {
                     .take()
                     .expect("pending acceptance checked");
                 let ready = (|| -> Result<()> {
+                    let super::PlanningSettlement::Sealed {
+                        exchange: sealed_exchange,
+                        turn: sealed_turn,
+                    } = &pending.planning
+                    else {
+                        pending.run.retry_after_planning(services);
+                        return Ok(());
+                    };
                     let store = crate::storage::HistoryReader::current(&services.root)?;
                     let exchange = store
-                        .load_exchange(&pending.exchange)?
+                        .load_exchange(sealed_exchange)?
                         .context("approved planning exchange disappeared")?;
                     anyhow::ensure!(
                         exchange.state() == crate::exchange::ExchangeState::Complete
                             && crate::task::latest_turn_completed_normally(&exchange)
                             && exchange.turn.last().map(|turn| turn.id().to_owned())
-                                == pending.turn,
+                                == *sealed_turn,
                         "approved planning turn did not complete normally"
                     );
                     pending

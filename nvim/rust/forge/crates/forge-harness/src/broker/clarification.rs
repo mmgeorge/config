@@ -5,6 +5,67 @@ use super::*;
 use crate::exchange::command::InputSubmissionTarget;
 
 impl HarnessBroker {
+    /// Retire the questions of a stopped exchange and say in the transcript which ones a task lost.
+    ///
+    /// A question's waiting tool cannot return an answer once its turn has stopped, by an
+    /// interrupt or a host stop: the provider keeps no pending tool call across either. The task
+    /// pauses, so the row names the question and how to continue, instead of leaving a paused plan
+    /// with no question to answer and no word of what became of it.
+    pub(crate) fn retire_stopped_questions(&mut self, exchange_id: Option<&str>) -> Result<()> {
+        let lost = self.questions.cancel_chat(exchange_id)?;
+        self.report_lost_questions(&lost)
+    }
+
+    /// Retire the questions of the running or latest exchange without reporting them yet.
+    ///
+    /// A task command revokes delivery before it collects the turn, but whether its task
+    /// survives is known only once the command commits; the caller passes the returned
+    /// questions to [`Self::report_lost_questions`] then.
+    pub(crate) fn revoke_question_delivery(
+        &mut self,
+    ) -> Result<Vec<crate::question::QuestionRecord>> {
+        let active = match self
+            .store
+            .exchange_in_state(&self.session.id, ExchangeState::Running)?
+        {
+            Some(active) => Some(active),
+            None => self.store.latest_exchange(&self.session.id)?,
+        };
+        self.questions
+            .cancel_chat(active.as_ref().map(|exchange| exchange.id.as_str()))
+    }
+
+    /// Add a `Question lost` row for each retired question whose task can still resume.
+    ///
+    /// A question whose task is no longer current, because a control such as `/plan cancel`
+    /// cleared or replaced it, ends with that task and gets no row: its advice to resume would
+    /// name a task that no longer exists.
+    pub(crate) fn report_lost_questions(
+        &mut self,
+        lost: &[crate::question::QuestionRecord],
+    ) -> Result<()> {
+        let current_task = self.task_controller.current()?;
+        let resumable = |question: &&crate::question::QuestionRecord| {
+            current_task
+                .as_ref()
+                .is_some_and(|task| question.task_id.as_deref() == Some(task.id.as_str()))
+        };
+        let now_ms = self.clock.now_ms();
+        for question in lost.iter().filter(resumable) {
+            self.store
+                .save_session_event(&crate::timeline::SessionEventRecord {
+                    id: format!("{}:question-lost:{}", self.session.id, question.id.as_str()),
+                    session_id: self.session.id.clone(),
+                    owner: crate::timeline::TimelineOwner::session(&self.session.id),
+                    created_at_ms: now_ms,
+                    detail: crate::timeline::SessionEventKind::TaskAdvancement {
+                        message: lost_question_message(&question.content.header),
+                    },
+                })?;
+        }
+        Ok(())
+    }
+
     /// Revalidate selected question authority before preparing its clarification turn.
     pub(super) fn prepare_selected_clarification(
         &mut self,
@@ -123,4 +184,12 @@ impl HarnessBroker {
         admission.question_discussion = discussion;
         Ok(Some(staged))
     }
+}
+
+/// Name a question whose turn stopped before it was answered, and how the task continues.
+fn lost_question_message(header: &str) -> String {
+    format!(
+        "Question lost: {header}. Its turn stopped before you answered; type the answer as a \
+         prompt, then run /task resume to continue"
+    )
 }

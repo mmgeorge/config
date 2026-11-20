@@ -66,7 +66,7 @@ mod foreground_workspace;
 use foreground_dispatch::ForegroundAdmission;
 pub(crate) use foreground_dispatch::{DispatchStage, TurnTransaction};
 pub mod publication;
-use publication::{ConfigurationProgressState, SessionUpdate, TimelineUpdate};
+use publication::{SessionUpdate, TimelineUpdate};
 mod check_admission;
 mod check_completion;
 mod owned_check_completion;
@@ -212,9 +212,20 @@ fn agent_summaries(
         let tool_label = latest.and_then(|exchange| {
             crate::buffer::projection::tool_count_label(exchange.tool_counter.clone().into(), None)
         });
+        // Each follow-up runs in its own exchange, so a child run more than once also carries the
+        // tally over all of its runs, which the latest run's own tally does not include.
+        let run_tool_label = (owned.len() > 1).then(|| {
+            owned.iter().fold(crate::buffer::projection::ToolTally::default(), |tally, exchange| {
+                crate::buffer::projection::ToolTally {
+                    successful: tally.successful + exchange.tool_counter.completed,
+                    denied: tally.denied + exchange.tool_counter.denied,
+                    total: tally.total + exchange.tool_counter.total,
+                }
+            })
+        }).and_then(|tally| crate::buffer::projection::tool_count_label(tally, None));
         (run.id.clone(), json!({"state":latest.map(|exchange| serde_json::to_value(exchange.state()).expect("exchange state")).unwrap_or_else(|| serde_json::to_value(run.state).expect("agent state")),
             "elapsed_ms":latest.map_or(0, |exchange| exchange.duration_ms()),"running_since_ms":running_since_ms,
-            "tool_label":tool_label,"target":target,
+            "tool_label":tool_label,"run_tool_label":run_tool_label,"target":target,
             "exchange_count":owned.len(),"latest_exchange_id":latest.map(|exchange|exchange.id.as_str())}))
     }).collect()
 }
@@ -1663,12 +1674,15 @@ impl ForegroundJob {
                 flight,
                 engine,
                 scope,
-                input,
+                mut input,
             } => {
-                let result = engine
-                    .steer(scope, input.input())
-                    .await
-                    .map_err(anyhow::Error::from);
+                let result = match input.deliver_to(&scope) {
+                    Ok(()) => engine
+                        .steer(scope, input.input())
+                        .await
+                        .map_err(anyhow::Error::from),
+                    Err(error) => Err(error),
+                };
                 Ok(match input.settle_delivery(result).await {
                     Ok(input) => ForegroundSignal::UserDeliverySettled(input, Some(flight)),
                     Err(error) => ForegroundSignal::EffectFailed(error),
@@ -1842,6 +1856,8 @@ pub(super) enum ParkedClosure {
     Superseded,
     /// The task that owned it was cleared.
     Cleared,
+    /// The command that stopped its turn to run it again failed, so nothing will run it again.
+    StopFailed,
 }
 
 /// What closing a parked exchange left in the session's history.
@@ -2295,6 +2311,23 @@ impl std::fmt::Display for RequestNotAdmitted {
 
 impl std::error::Error for RequestNotAdmitted {}
 
+/// Refuses a typed prompt before any provider work, naming why it cannot run.
+///
+/// Prompt admission refuses some prompts outright, such as a bare `/read` or a typed answer to a
+/// question that needs its own source. The refusal is the prompt's outcome, not a turn failure:
+/// `admit_prepared_foreground` answers it like a rejected command, so the provider is neither
+/// asked to take the prompt nor restarted, and the queue entry keeps this reason.
+#[derive(Debug)]
+pub(crate) struct PromptRefused(pub(crate) String);
+
+impl std::fmt::Display for PromptRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PromptRefused {}
+
 #[derive(Debug)]
 /// Rejects a request naming a durable session that does not exist, which no retry can repair.
 pub struct SessionNotFound {
@@ -2328,6 +2361,8 @@ pub fn request_failure_code(error: &anyhow::Error) -> &'static str {
         "not_admitted"
     } else if error.is::<TurnCancelled>() {
         "turn_cancelled"
+    } else if error.is::<PromptRefused>() {
+        "prompt_refused"
     } else if error.is::<crate::provider::tool_timeout::ToolTimeout>() {
         "tool_timeout"
     } else if error.is::<SessionNotFound>() {
@@ -2715,7 +2750,8 @@ impl HarnessBroker {
             .desired
             .apply(&mut session, provider_descriptor.capability.native_compact)?;
         if created_session && request.background.is_none() {
-            shared.apply_provider_defaults(&mut session)?;
+            let workspace_choice = store.load_preference(&session.workspace, &session.provider)?;
+            shared.apply_provider_defaults(&mut session, workspace_choice.as_ref())?;
         }
         if request.background.is_some() {
             session.access.write_access = crate::session::WriteScope::Off;
@@ -2858,6 +2894,7 @@ impl HarnessBroker {
             input_schedule: tokio::sync::watch::channel(Default::default()).0,
             lsp: runtime.lsp.clone(),
             status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(true)),
+            compaction_waiting: AtomicBool::new(false),
             check_editing: Arc::new(AtomicBool::new(
                 shared.desired.check_editing.unwrap_or(false),
             )),
@@ -3723,9 +3760,10 @@ impl HarnessBroker {
                 self.observer.save_permission_document(params)
             }
             RuntimeMethod::SessionPermissionSet => {
-                let mut action = params;
-                action["action"] = json!("permission");
-                self.transition_task(action).await
+                let captured = self.prepare_permission_configuration(&params)?;
+                let committed = self.commit_permission_configuration(captured)?;
+                let events = committed.delivery.deliver().await?;
+                Ok((committed.value, events))
             }
             RuntimeMethod::SessionPromptHistoryRecord => self
                 .observer
@@ -3928,15 +3966,11 @@ impl HarnessBroker {
         match command.as_str() {
             "undo" => Box::pin(self.transition_undo(action)),
             "pause" | "clear" => Box::pin(self.transition_pause(command == "clear")),
-            "permission" => Box::pin(
-                self.apply_configuration(action, configuration::ConfigurationCommand::Permission),
-            ),
-            "configure" => Box::pin(
-                self.apply_configuration(action, configuration::ConfigurationCommand::Configure),
-            ),
-            "compact" => Box::pin(
-                self.apply_configuration(action, configuration::ConfigurationCommand::Compact),
-            ),
+            "permission" | "configure" | "compact" => {
+                Box::pin(std::future::ready(Err(anyhow::anyhow!(
+                    "configuration changes must be submitted through the session command owner"
+                ))))
+            }
             "resume" | "plan" | "goal" | "execute" | "attach_plan" | "fork" | "replan"
             | "continue" => Box::pin(std::future::ready(
                 self.dispatch_session_command("session.command.apply", action),
@@ -3966,83 +4000,6 @@ impl HarnessBroker {
             "session.command.apply",
             json!({"action":if clear { "clear" } else { "pause" }}),
         )
-    }
-
-    async fn resume_exchange(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let text = required_text(&params, "text")?;
-        let interaction = self
-            .store
-            .latest_exchange(&self.session.id)?
-            .context("no Harness interaction is available to resume")?;
-        anyhow::ensure!(
-            interaction.state() == ExchangeState::Running
-                && interaction.execution_started_at_ms().is_none()
-                && interaction
-                    .turn
-                    .iter()
-                    .all(|turn| turn.state() != crate::turn::TurnState::Running),
-            "the latest Harness exchange is not paused for resumption"
-        );
-        let pending_plan = if self.active_plan_awaits_input()? {
-            Some(self.active_elicitation_plan()?)
-        } else {
-            None
-        };
-        let elicitation = pending_plan
-            .as_ref()
-            .and_then(|plan| plan.elicitation.as_ref())
-            .or(interaction.elicitation());
-        if let Some(elicitation) = elicitation {
-            if !elicitation.clarification_active {
-                return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
-            }
-            let clarification = interaction
-                .node_list
-                .iter()
-                .rev()
-                .find_map(|node| match node {
-                    ExchangeNode::ExchangeInput { prompt }
-                        if prompt.intent == crate::exchange::InputIntent::Clarification
-                            && prompt.question.as_ref().is_some_and(|target| {
-                                target.set_id == elicitation.question_set.id
-                            }) =>
-                    {
-                        Some(prompt)
-                    }
-                    _ => None,
-                });
-            let clarification = clarification
-                .context("interrupted clarification has no recorded question input")?;
-            // Both are the user's words: the recorded clarification and the resumed reply.
-            let follow_up =
-                forge_provider_api::PromptInput::Text(format!("{}\n\n{text}", clarification.text));
-            let prompt = if pending_plan.is_some() {
-                PlanPrompt::clarification(elicitation, follow_up)
-            } else {
-                PlanPrompt::question_follow_up(elicitation, follow_up)
-            };
-            let mode = self.task_prompt_mode()?;
-            let (value, event) = self
-                .run_interaction(ProviderInput::new(prompt), mode, None)
-                .await?;
-            return if let Some(plan) = pending_plan {
-                self.finish_plan_clarification(&plan.id, value, event).await
-            } else {
-                self.finish_question_clarification(value, event).await
-            };
-        }
-        anyhow::ensure!(
-            !interaction.awaiting_input(),
-            "the latest Harness exchange is awaiting a user decision"
-        );
-        let mode = self.task_prompt_mode()?;
-        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
-            self.run_planning_interaction(ProviderInput::from_user_text(text), None)
-                .await
-        } else {
-            self.run_interaction(ProviderInput::from_user_text(text), mode, None)
-                .await
-        }
     }
 
     async fn start_agent(&mut self, mut params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -4295,10 +4252,21 @@ impl HarnessBroker {
         let mut admitted_parent = if let Some(parent) = parent.as_deref() {
             parent.clone()
         } else {
+            // History lists this host-made exchange, the `/undo` picker included, so its prompt
+            // names the child work the user asked for.
+            let admission_prompt = match &work {
+                ChildWork::Spawn(spawn) => format!("Child agent started: {}", spawn.text),
+                ChildWork::Followup { target, message } => format!(
+                    "Follow-up to child {}: {message}",
+                    self.agent_coordinator
+                        .resolve(target)
+                        .map_or_else(|_| (*target).to_owned(), |agent| agent.label().to_owned())
+                ),
+            };
             Exchange::agent_admission(
                 &self.session.id,
                 self.store.next_exchange_ordinal(&self.session.id)?,
-                "Child task admission".into(),
+                admission_prompt,
                 self.clock.now_ms(),
             )
         };
@@ -4407,7 +4375,11 @@ impl HarnessBroker {
     }
 
     /// Stage the agent snapshot and timeline in their original delivery order.
+    ///
+    /// The snapshot reads current state, so it also carries every change a child backlog applied
+    /// while its publication was deferred.
     fn prepare_agent_state(&mut self) -> Result<AppliedProviderEvent> {
+        self.agent_coordinator.take_deferred_agent_publication();
         let snapshot = self.snapshot()?;
         let update = SessionUpdate::Agent {
             snapshot: snapshot.agent,
@@ -4573,6 +4545,7 @@ impl HarnessBroker {
         match cancellation {
             QueuedTaskCancellation::Interrupted { by } => {
                 task.error = Some(by.cancellation_reason().to_owned());
+                task.cancelled_by = Some(by);
             }
             QueuedTaskCancellation::PrerequisiteStopped { stopped_task_id } => {
                 task.error = Some(format!(
@@ -4794,6 +4767,11 @@ impl HarnessBroker {
         event: &mut Vec<SessionEvent>,
     ) -> bool {
         let Some(command) = self.agent_coordinator.try_receive_idle() else {
+            // A drained child backlog publishes the agent snapshot it deferred.
+            if self.agent_coordinator.take_deferred_agent_publication() {
+                let published = self.publish_agent_state(event).await;
+                self.report_agent_command_failure(published, event);
+            }
             if parent.is_none() && !self.agent_coordinator.foreground_claimed() {
                 let launched = self.launch_ready_agents(event).await;
                 self.report_agent_command_failure(launched, event);
@@ -5191,11 +5169,33 @@ impl HarnessBroker {
         )?;
         self.child_exchange_runtime_by_agent
             .insert(owner.agent_id().to_string(), runtime);
+        // A cancelled child's observations still arrive in order ahead of its completion: the
+        // backlog it produced before the interrupt reached it shares the channel. Each is saved
+        // above, so the child's transcript keeps what it did, but publishing each one rebuilt the
+        // agent snapshot, kept the cancelled child's tool count rising, and held its settlement
+        // back for as long as the backlog took to apply. The completion publishes the final state.
+        if self
+            .agent_coordinator
+            .interruption(owner.agent_id().as_str(), task_id)
+            .is_some()
+        {
+            self.agent_coordinator.notify_activity();
+            return Ok(AppliedProviderEvent::None);
+        }
         let mut effects = Vec::new();
         if let Some(update) = SessionUpdate::from_observation(&observation) {
             effects.push(AppliedProviderEvent::Update(update));
         }
-        effects.push(self.prepare_agent_state()?);
+        // Children can report observations several times faster than the whole agent snapshot
+        // can be rebuilt and published, so publishing it for each one let the broker fall behind
+        // without bound: a child whose native turn had ended still read as running many seconds
+        // later. While another child command waits, the snapshot is deferred to that command or
+        // to the drain's end, which publishes only the latest state.
+        if self.agent_coordinator.has_queued_commands() {
+            self.agent_coordinator.defer_agent_publication();
+        } else {
+            effects.push(self.prepare_agent_state()?);
+        }
         self.agent_coordinator.notify_activity();
         Ok(AppliedProviderEvent::Effects(effects))
     }
@@ -5280,6 +5280,7 @@ impl HarnessBroker {
             (Err(_), Some(source)) => Some(source.cancellation_reason().to_owned()),
             (output, _) => output.as_ref().err().map(|error| format!("{error:#}")),
         };
+        task.cancelled_by = interrupted_by.filter(|_| output.is_err());
         // The presentation draws a running child's clock from its last snapshot and the current
         // time whenever it refreshes. Holding it from the settle instant until the settled child
         // replaces the running one orders every refresh before that instant, where its label
@@ -5917,77 +5918,6 @@ impl HarnessBroker {
             exchange.append_input(intent, text, self.clock.now_ms())?;
         }
         self.store.save_exchange(&exchange)
-    }
-
-    async fn finish_plan_clarification(
-        &mut self,
-        plan_id: &str,
-        mut value: Value,
-        mut event: Vec<SessionEvent>,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let current_plan = self
-            .store
-            .load_plan(plan_id)?
-            .context("active plan record is missing after clarification")?;
-        if current_plan.elicitation.is_none()
-            && matches!(
-                current_plan.state,
-                PlanState::Generating | PlanState::Revising
-            )
-        {
-            let withdrawal = self
-                .store
-                .list_plan_lifecycle(&self.session.id)?
-                .into_iter()
-                .rev()
-                .find(|lifecycle| {
-                    lifecycle.plan_id == plan_id
-                        && lifecycle.kind == PlanLifecycleKind::QuestionWithdrawn
-                })
-                .context("withdrawn planning question has no lifecycle record")?;
-            let reason = withdrawal
-                .answer
-                .as_deref()
-                .unwrap_or("no material decision remains");
-            let continuation = self
-                .run_planning_interaction(ProviderInput::new(PlanPrompt::withdrawn(reason)), None)
-                .await;
-            match continuation {
-                Ok((next_value, mut next_event)) => {
-                    value = next_value;
-                    event.append(&mut next_event);
-                }
-                Err(error) => {
-                    return Err(error).context("continue planning after question withdrawal");
-                }
-            }
-        } else if current_plan
-            .elicitation
-            .as_ref()
-            .is_some_and(|elicitation| elicitation.current_question().is_none())
-        {
-            let (next_value, mut next_event) = self.continue_plan_question().await?;
-            value = next_value;
-            event.append(&mut next_event);
-        }
-        Ok((value, event))
-    }
-
-    async fn finish_question_clarification(
-        &mut self,
-        mut value: Value,
-        mut event: Vec<SessionEvent>,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        if self
-            .find_active_interaction_elicitation()?
-            .and_then(|interaction| interaction.elicitation().cloned())
-            .is_some_and(|elicitation| elicitation.current_question().is_none())
-        {
-            let (next_value, mut next_event) = self.continue_question().await?;
-            value = next_value;
-            event.append(&mut next_event);
-        }
-        Ok((value, event))
     }
 
     async fn continue_plan_question(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
@@ -6697,20 +6627,45 @@ impl HarnessBroker {
     }
 
     /// Describe a settled child task as the `final_answer` `<agent_message>` the parent receives.
+    ///
+    /// A child cancelled with a request the user stopped reaches the next prompt only to say it
+    /// will not report: its partial response is withheld, so the model has nothing of it to
+    /// report and no reason to wait for it.
     fn agent_result(
         &self,
         task: &crate::agent::AgentTask,
     ) -> Result<forge_provider_api::forge::AgentResult> {
         let agent = self.agent_coordinator.resolve(&task.agent_id)?;
         let status = serde_json::to_value(task.state)?;
+        let cancelled_with_stopped_request = task.source == crate::agent::AgentSource::Model
+            && task.state == ExchangeState::Cancelled
+            && self
+                .store
+                .load_exchange_metadata(&task.parent_exchange_id)?
+                .is_some_and(|parent| {
+                    matches!(
+                        parent.state(),
+                        ExchangeState::Cancelled
+                            | ExchangeState::Failed
+                            | ExchangeState::Interrupted
+                    )
+                });
+        let (response, error) = if cancelled_with_stopped_request {
+            (
+                None,
+                Some(crate::agent::AgentTask::STOPPED_REQUEST_CANCELLATION.to_owned()),
+            )
+        } else {
+            (task.final_response.clone(), task.error.clone())
+        };
         Ok(forge_provider_api::forge::AgentResult {
             agent: agent.task_path.to_string(),
             task_id: task.id.to_string(),
             status: status
                 .as_str()
                 .map_or_else(|| status.to_string(), str::to_owned),
-            response: task.final_response.clone(),
-            error: task.error.clone(),
+            response,
+            error,
         })
     }
 
@@ -6732,69 +6687,10 @@ impl HarnessBroker {
             .retain(self.agent_coordinator.resolve(&task.agent_id)?, task)
     }
 
-    async fn notify_unavailable_mcp(
-        &mut self,
-        request: &ProviderCatalogRequest,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        let declaration = self.provider.descriptor();
-        let Some(target) = declaration
-            .capability
-            .integration
-            .resource_target
-            .as_deref()
-        else {
-            return Ok(());
-        };
-        let resources = crate::settings::SessionResources::load(
-            &self.data_root,
-            request,
-            &self.session.provider,
-            target,
-        )?;
-        for (id, message) in &resources.launch_notice {
-            if self.mcp_notice.get(id) == Some(message) {
-                continue;
-            }
-            self.trace.record(
-                &self.session.id,
-                "mcp.start_skipped",
-                json!({"resource_id":id,"reason":message}),
-            );
-            self.emit_session_update(
-                SessionUpdate::Diagnostic {
-                    diagnostic: publication::DiagnosticView {
-                        kind: forge_provider_api::ProviderFailureKind::Unknown,
-                        message: forge_provider_api::SanitizedMessage::new(message.clone())
-                            .expect("host diagnostic is nonempty"),
-                        severity: publication::DiagnosticSeverity::Warning,
-                        scope: crate::provider::EventScope::Binding {
-                            thread_id: forge_provider_api::ThreadId::from(
-                                crate::provider::ThreadOwner::root(&self.session.id),
-                            ),
-                        },
-                        native_scope: forge_provider_api::WarningScope::Provider,
-                    },
-                },
-                event,
-            )
-            .await?;
-        }
-        self.mcp_notice = resources.launch_notice;
-        Ok(())
-    }
-
     /// Revoke question delivery before native cancellation can release its waiting tools.
-    pub(crate) fn cancel_question_delivery(&self) -> Result<()> {
-        let active = self
-            .store
-            .exchange_in_state(&self.session.id, ExchangeState::Running)?;
-        let active = match active {
-            Some(active) => Some(active),
-            None => self.store.latest_exchange(&self.session.id)?,
-        };
-        self.questions
-            .cancel_chat(active.as_ref().map(|exchange| exchange.id.as_str()))
+    pub(crate) fn cancel_question_delivery(&mut self) -> Result<()> {
+        let lost = self.revoke_question_delivery()?;
+        self.report_lost_questions(&lost)
     }
 
     /// Retry finalization without submitting provider input or replaying tool execution.
@@ -7109,8 +7005,15 @@ impl HarnessBroker {
                 receipt,
                 presentation,
             } => {
+                // An acceptance belongs to this exchange's input, not to one invocation: a steer
+                // the provider refused is resent as a successor's prompt, and that continuation's
+                // receipt is published under the exchange's first invocation. Any invocation this
+                // owner admitted for the exchange is this foreground's own.
                 anyhow::ensure!(
-                    scope == transaction.state.scope,
+                    scope == transaction.state.scope
+                        || scope.owner() == transaction.state.scope.owner()
+                            && scope.exchange_id == transaction.state.scope.exchange_id
+                            && transaction.engine.admitted_invocation(&scope)?,
                     "acceptance receipt crosses foreground invocation"
                 );
                 self.acknowledge_user_child_reports(&scope, &receipt)?;
@@ -7557,6 +7460,16 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
     ) -> Result<ForegroundAction> {
         let Some(command) = self.agent_coordinator.try_receive_foreground() else {
+            // A drained child backlog publishes the agent snapshot it deferred, then drains again
+            // for the launches and results this step would otherwise have handled.
+            if self.agent_coordinator.take_deferred_agent_publication() {
+                self.agent_coordinator.notify_activity();
+                transaction.agent_revision.mark_changed();
+                let effects = self.prepare_agent_state()?;
+                return Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+                    self.prepare_provider_delivery(effects)?,
+                )));
+            }
             if transaction.pending_agent_launch.is_empty()
                 && let Some(work) = self.agent_coordinator.ready_launch()?
             {
@@ -9706,11 +9619,15 @@ impl HarnessBroker {
         removed_exchange_id: Option<&str>,
     ) -> Result<TimelinePatch> {
         let status = self.live_interaction_status(interaction)?;
+        let questioned = interaction
+            .map(|interaction| self.live_question_rows(interaction))
+            .transpose()?
+            .flatten();
         self.presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
             .update_live(
-                interaction,
+                questioned.as_ref().or(interaction),
                 removed_exchange_id,
                 status,
                 self.observer.status_thoughts.load(Ordering::Relaxed),
@@ -9736,12 +9653,23 @@ impl HarnessBroker {
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?;
         stop(exchange, self.clock.now_ms());
         let status = self.live_interaction_status(Some(exchange))?;
+        let questioned = self.live_question_rows(exchange)?;
         presentation.update_live(
-            Some(exchange),
+            Some(questioned.as_ref().unwrap_or(&*exchange)),
             None,
             status,
             self.observer.status_thoughts.load(Ordering::Relaxed),
         )
+    }
+
+    /// Project the question store's current rows into a copy of the live exchange.
+    ///
+    /// A live update otherwise rebuilds the presented exchange from its record and carries the
+    /// question rows over from the previous frame, so an answer the store accepted while the turn
+    /// that asked runs, such as one returned to a waiting `question_ask`, kept reading `Awaiting
+    /// answer` until the next full snapshot. `None` means no question belongs to the exchange.
+    fn live_question_rows(&self, exchange: &Exchange) -> Result<Option<Exchange>> {
+        crate::question::project_exchange(exchange, &self.questions.snapshot()?)
     }
 
     fn live_interaction_status(
@@ -9774,7 +9702,8 @@ impl HarnessBroker {
         Ok(self
             .observer
             .hand_off_phase(&self.store, runtime.active_task.as_ref(), status)?
-            .blocked_by(runtime.active_task.as_ref()))
+            .blocked_by(runtime.active_task.as_ref())
+            .preparing_fork(&self.session.provider_fork_state))
     }
 
     #[cfg(test)]
@@ -9803,7 +9732,8 @@ impl HarnessBroker {
     /// it holds no work, so a closed copy would only draw its notice above an empty heading. The
     /// exchange a user prompt or task start opened is always kept, since it records that input.
     ///
-    /// A cleared task cancels the work it collected, so its exchange is cancelled. Otherwise the
+    /// A cleared task cancels the work it collected, so its exchange is cancelled. An exchange
+    /// whose stopping command failed ends failed, with the reason its caller recorded. Otherwise the
     /// outcome follows the provider turns the exchange actually started when a new admission
     /// supersedes it. A still-running turn makes it interrupted, and recorded turns complete it.
     /// An exchange without any turn never reached the provider, so it is cancelled rather than
@@ -9826,7 +9756,9 @@ impl HarnessBroker {
             }
             return Ok(ParkedDisposition::Removed);
         }
-        let outcome = if closure == ParkedClosure::Cleared || exchange.turn.is_empty() {
+        let outcome = if closure == ParkedClosure::StopFailed {
+            crate::exchange::ExchangeOutcome::Failed
+        } else if closure == ParkedClosure::Cleared || exchange.turn.is_empty() {
             crate::exchange::ExchangeOutcome::Cancelled
         } else if exchange
             .turn
@@ -10665,20 +10597,6 @@ impl HarnessBroker {
         Ok(())
     }
 
-    async fn configuration_progress(&mut self, state: ConfigurationProgressState) -> Result<()> {
-        let Some(operation_id) = self.active_operation_id.clone() else {
-            return Ok(());
-        };
-        self.emit_session_update(
-            SessionUpdate::ConfigurationProgress {
-                operation_id: operation_id.to_string(),
-                state,
-            },
-            &mut Vec::new(),
-        )
-        .await
-    }
-
     async fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let preparation = self.prepare_configuration(params)?;
         let models = if preparation.needs_catalog(self) {
@@ -11365,6 +11283,9 @@ fn preference_for_session(
     session: &HarnessSession,
     previous: Option<HarnessPreference>,
 ) -> HarnessPreference {
+    let confirmed_revision = previous
+        .as_ref()
+        .and_then(|preference| preference.confirmed_revision);
     let mut model_setting = previous
         .map(|preference| preference.model_setting)
         .unwrap_or_default();
@@ -11394,6 +11315,7 @@ fn preference_for_session(
         plan_compact: session.plan_compact,
         approval_timeout: session.approval_timeout,
         tool_timeout: session.tool_timeout,
+        confirmed_revision,
     }
 }
 

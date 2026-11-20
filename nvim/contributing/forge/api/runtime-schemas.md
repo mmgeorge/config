@@ -348,8 +348,15 @@ pub enum SessionPhase {
     #[default]
     Idle,
     Paused,
+    /// The provider is still copying the source conversation into this forked session, and
+    /// provider-bound input waits until it finishes.
+    PreparingFork,
     Compacting {
         started_at_ms: i64,
+        /// A turn of an unfinished exchange waits for this compaction: the turn it stopped runs
+        /// again, or a running turn continues, once it ends. A compaction between turns, such as
+        /// one while a plan waits in review, holds no turn.
+        turn_waiting: bool,
     },
     Finalizing {
         exchange_id: String,
@@ -757,6 +764,10 @@ pub struct ProviderCapability {
     /// Rewinds only to a recorded turn checkpoint, so a conversation rollback cannot discard the
     /// provider's whole conversation.
     pub conversation_rewind_requires_checkpoint: bool,
+    #[serde(default)]
+    /// Rewinds only to a checkpoint recorded after the conversation's newest compaction, because
+    /// the compaction replaced the native history before it and no earlier entry can be resumed.
+    pub conversation_rewind_stops_at_compaction: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,

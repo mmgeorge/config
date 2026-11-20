@@ -138,9 +138,7 @@ impl HarnessBroker {
                 request.reject(live_host_failure(&error));
                 return Ok(ForegroundAction::Wait);
             }
-            let _ = request
-                .reply
-                .send(Ok(crate::provider::LiveHostCommit { task_permit: None }));
+            let _ = request.reply.send(Ok(crate::provider::LiveHostCommit));
             return Ok(ForegroundAction::Wait);
         }
         let prepared = (|| -> Result<_> {
@@ -275,7 +273,13 @@ impl HarnessBroker {
             .context("live plan task disappeared")?;
         permit.validate_observation(Some(&task))?;
         transaction.dispatched_task_permit = Some(task.permit());
-        live.permit = Some(task.permit());
+        // Adopt the committed revision before this step ends, so a later owner step that seals
+        // this invocation, such as an acceptance of the revision just submitted, validates against
+        // the revision the invocation now owns. A user revocation that rejects the adoption keeps
+        // later callbacks stale; it cannot change the result committed here.
+        if let Some(authority) = &transaction.task_authority {
+            let _ = authority.advance(task.permit());
+        }
         self.store.save_exchange(&transaction.state.interaction)?;
         self.trace_live_host(live, "committed", "plan_submission");
         // The submission's lifecycle record lives beside the exchange, and only a rebuilt
@@ -327,7 +331,13 @@ impl HarnessBroker {
             .context("live planning task disappeared")?;
         permit.validate_observation(Some(&task))?;
         transaction.dispatched_task_permit = Some(task.permit());
-        live.permit = Some(task.permit());
+        // Adopt the committed revision before this step ends, so a later owner step that seals
+        // this invocation, such as an acceptance of the revision just submitted, validates against
+        // the revision the invocation now owns. A user revocation that rejects the adoption keeps
+        // later callbacks stale; it cannot change the result committed here.
+        if let Some(authority) = &transaction.task_authority {
+            let _ = authority.advance(task.permit());
+        }
         self.trace_live_host(live, "committed", "plan_mutation");
         let mut live = transaction
             .live_host
@@ -335,9 +345,7 @@ impl HarnessBroker {
             .expect("committed live mutation retains its reply");
         self.trace_live_host(&live, "replied", "committed");
         if let Some(reply) = live.reply.take() {
-            let _ = reply.send(Ok(crate::provider::LiveHostCommit {
-                task_permit: live.permit.clone(),
-            }));
+            let _ = reply.send(Ok(crate::provider::LiveHostCommit));
         }
         Ok(ForegroundAction::Wait)
     }
@@ -360,9 +368,7 @@ impl HarnessBroker {
             Ok(_) => {
                 self.trace_live_host(&live, "replied", "committed");
                 if let Some(reply) = live.reply.take() {
-                    let _ = reply.send(Ok(crate::provider::LiveHostCommit {
-                        task_permit: live.permit.clone(),
-                    }));
+                    let _ = reply.send(Ok(crate::provider::LiveHostCommit));
                 }
                 Ok(ForegroundAction::Wait)
             }
@@ -378,9 +384,7 @@ impl HarnessBroker {
                 );
                 if let Some(reply) = live.reply.take() {
                     let _ = reply.send(if live.committed {
-                        Ok(crate::provider::LiveHostCommit {
-                            task_permit: live.permit.clone(),
-                        })
+                        Ok(crate::provider::LiveHostCommit)
                     } else {
                         Err(ProviderError::DeliveryUncertain)
                     });
@@ -420,9 +424,7 @@ impl ForegroundTransaction {
                 "batch_revision":live.batch_revision,"stage":"replied",
                 "outcome":if live.committed { "committed_publication_pending" } else { "recovery_required" }}));
             let _ = reply.send(if live.committed {
-                Ok(crate::provider::LiveHostCommit {
-                    task_permit: live.permit.clone(),
-                })
+                Ok(crate::provider::LiveHostCommit)
             } else {
                 Err(ProviderError::DeliveryUncertain)
             });

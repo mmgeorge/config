@@ -733,10 +733,8 @@ async fn yolo_toggles_sandbox_in_direct_and_admitted_transitions() {
                         "sandbox":sandbox,"read_access":"full","write_access":"full","approval_mode":approval
                     });
                 }
-                broker
-                    .apply_configuration(action, configuration::ConfigurationCommand::Permission)
-                    .await
-                    .unwrap();
+                let captured = broker.prepare_permission_configuration(&action).unwrap();
+                broker.commit_permission_configuration(captured).unwrap();
                 let stored = broker
                     .store
                     .load_session(&broker.session.id)

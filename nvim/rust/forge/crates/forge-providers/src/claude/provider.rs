@@ -47,6 +47,18 @@ struct LedgerTurn {
     /// A later turn's prompt follows this note rather than the checkpoint, so a rewind that keeps
     /// this turn resumes at the note, and a rewind that drops this turn discards the note too.
     rewind_note: Option<String>,
+    /// Whether the CLI absorbed steering into this turn. The CLI records each absorbed steer as
+    /// queued content, which `--resume-drops-turn` refuses to discard, so dropping this turn
+    /// resumes unguarded.
+    absorbed_steering: bool,
+    /// The chain entry the turn's prompt was written after, when this process knew it.
+    follows: Option<String>,
+    /// Whether an interrupt ended the turn while a request the CLI recorded had no answer: the
+    /// prompt itself, or a steer that started a follow-up CLI turn after the turn's answer.
+    ///
+    /// The CLI then keeps the request as an unanswered user entry, after `checkpoint` when the
+    /// turn answered earlier input, until `withdraw_unanswered_request` removes or withdraws it.
+    unanswered: bool,
 }
 
 impl LedgerTurn {
@@ -1120,6 +1132,7 @@ impl ClaudeProvider {
                 session.sink.check()?;
                 context.check_admission(ProviderOperation::ThreadFork)?;
                 session.require_idle(ProviderOperation::ThreadFork).await?;
+                withdraw_unanswered_request(&session, ProviderOperation::ThreadFork).await?;
                 let fork_point = session
                     .fork_point
                     .lock()
@@ -1198,6 +1211,7 @@ impl ClaudeProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
+        withdraw_unanswered_request(&session, ProviderOperation::ThreadCompact).await?;
         let sink = session.sink.bind_scope(request.scope.clone())?;
         let command_id = uuid::Uuid::new_v4().to_string();
         let ended = session
@@ -1286,10 +1300,14 @@ impl ClaudeProvider {
             return Ok(());
         }
         // The CLI refuses a guarded resume whose discarded range holds anything but the declared
-        // turn, so only a range of exactly one turn with no rewind note after it is guarded; a
-        // wider range runs unguarded.
+        // turn's own prompt and output, so only a range of exactly one turn with no rewind note
+        // after it and no absorbed steering is guarded; any other range runs unguarded.
         let drops_turn = kept
-            .filter(|kept| kept + 2 == ledger.len() && ledger[kept + 1].rewind_note.is_none())
+            .filter(|kept| {
+                kept + 2 == ledger.len()
+                    && ledger[kept + 1].rewind_note.is_none()
+                    && !ledger[kept + 1].absorbed_steering
+            })
             .map(|kept| ledger[kept + 1].prompt.clone());
         let resume_at = kept
             .and_then(|kept| ledger[kept].resume_point())
@@ -1840,19 +1858,165 @@ impl ClaudeProvider {
 /// Make a rewind durable by appending a note, because the CLI persists a truncation only when
 /// the next entry is appended, and return the note's chain entry uuid.
 async fn persist_rewind(session: &ClaudeBinding) -> Result<String, ProviderError> {
-    let note = UserInput::note(
-        uuid::Uuid::new_v4().to_string(),
+    append_note(
+        session,
         "[Forge: the user rolled the conversation back to this point; later turns were discarded]",
-    );
+        ProviderOperation::ThreadRewind,
+    )
+    .await
+}
+
+/// Append a transcript entry that starts no model request, and return its chain entry uuid.
+async fn append_note(
+    session: &ClaudeBinding,
+    text: &str,
+    operation: ProviderOperation,
+) -> Result<String, ProviderError> {
+    let note = UserInput::note(uuid::Uuid::new_v4().to_string(), text);
     let mut observer = session.state.track_command(&note.uuid, false).await?;
     session.conversation.write(&note).await?;
     wait_command(
         &mut observer,
         |state| state == CommandState::Completed,
-        ProviderOperation::ThreadRewind,
+        operation,
     )
     .await
     .map(|_| note.uuid)
+}
+
+/// Name the chain entry the next input follows, while this process knows it.
+///
+/// `fork_point` is cleared whenever the CLI appended entries the adapter cannot name, such as a
+/// compaction or a turn that reported no checkpoint; otherwise the newest ledger turn's resume
+/// point is the newest entry of the kept history.
+async fn history_tip(session: &ClaudeBinding) -> Option<String> {
+    if session
+        .fork_point
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_none()
+    {
+        return None;
+    }
+    session
+        .ledger
+        .lock()
+        .await
+        .last()
+        .and_then(LedgerTurn::resume_point)
+        .map(ToOwned::to_owned)
+}
+
+/// The note that makes the removal of an unanswered request durable.
+const REMOVED_REQUEST_NOTE: &str =
+    "[Forge: a request the user stopped before it was answered was removed here]";
+
+/// The note that withdraws an unanswered request no resume can remove.
+const WITHDRAWN_REQUEST_NOTE: &str = "[Forge: the user stopped the request above before it was \
+     answered and withdrew it; respond only to the messages that follow]";
+
+/// Remove an interrupted request the CLI never answered before the conversation continues.
+///
+/// The CLI keeps an interrupted prompt, and its `[Request interrupted by user]` marker, as user
+/// entries, and the API joins consecutive user entries into one message. The next prompt then
+/// reached the model in the same message as the unanswered request, and the model carried out
+/// the cancelled request instead of the new one. A restart that resumes at the last entry before
+/// the request drops it, and a note makes the truncation durable: the turn's own checkpoint when
+/// the turn answered earlier input, as when a steer started a follow-up CLI turn after the
+/// answer, or otherwise the entry the prompt followed, when the binding knows it. Otherwise, or
+/// when the CLI refuses that resume, a note withdraws the request.
+///
+/// The removal also keeps the ledger's positions true: a later guarded rewind that drops the next
+/// turn discards exactly that turn's entries, which the CLI refuses when the request and its
+/// marker lie in the discarded range.
+///
+/// The caller holds the binding's operation lock while the CLI is idle.
+async fn withdraw_unanswered_request(
+    session: &ClaudeBinding,
+    operation: ProviderOperation,
+) -> Result<(), ProviderError> {
+    let mut ledger = session.ledger.lock().await;
+    let Some(unanswered) = ledger.last().filter(|turn| turn.unanswered) else {
+        return Ok(());
+    };
+    // The interrupt marker is a user entry, which a guarded resume refuses to discard, so the
+    // resume is unguarded; the range holds only the request and the marker, because the
+    // interrupt cancelled every queued steer.
+    let newest = ledger.len() - 1;
+    let resume = match unanswered.checkpoint.clone() {
+        Some(checkpoint) => Some((newest, checkpoint)),
+        None => newest
+            .checked_sub(1)
+            .zip(unanswered.follows.clone())
+            .filter(|(kept, follows)| ledger[*kept].resume_point() == Some(follows.as_str())),
+    };
+    let session_id = session.conversation.id().to_owned();
+    if let Some((kept, resume_at)) = resume {
+        let resumed = session
+            .conversation
+            .restart(
+                SessionStart::Resume {
+                    session_id: session_id.clone(),
+                    resume_at: Some(resume_at),
+                    drops_turn: None,
+                },
+                &session.cleanup,
+            )
+            .await;
+        let noted = match resumed {
+            Ok(()) => append_note(session, REMOVED_REQUEST_NOTE, operation).await,
+            Err(error) => Err(error),
+        };
+        match noted {
+            Ok(note) => {
+                ledger.truncate(kept + 1);
+                ledger[kept].rewind_note = Some(note);
+                ledger[kept].unanswered = false;
+                ledger[kept].checkpoint.clone_into(
+                    &mut session
+                        .fork_point
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                // A refused or unpersisted resume leaves the transcript unchanged.
+                let restored = session
+                    .conversation
+                    .restart(
+                        SessionStart::Resume {
+                            session_id,
+                            resume_at: None,
+                            drops_turn: None,
+                        },
+                        &session.cleanup,
+                    )
+                    .await;
+                if let Err(restore) = restored {
+                    let cause = with_cleanup(
+                        operation_failure(
+                            operation,
+                            &error,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Invalidated,
+                        ),
+                        vec![restore],
+                    );
+                    session.invalidate(cause.clone()).await;
+                    return Err(cause);
+                }
+            }
+        }
+    }
+    let note = append_note(session, WITHDRAWN_REQUEST_NOTE, operation).await?;
+    // The ledger lock is held throughout, so the unanswered turn is still the newest one.
+    let Some(withdrawn) = ledger.last_mut() else {
+        return Ok(());
+    };
+    withdrawn.rewind_note = Some(note);
+    withdrawn.unanswered = false;
+    Ok(())
 }
 
 #[async_trait]
@@ -2703,6 +2867,11 @@ async fn run_prompt(
         }
         let _operation = session.operation.lock().await;
         session.sink.check()?;
+        if let Err(error) =
+            withdraw_unanswered_request(&session, ProviderOperation::TurnStart).await
+        {
+            return Err(reject_before_dispatch(&request.receipt, error).await);
+        }
         if session.state.replace_host_tools(request.tools.clone())
             && let Err(error) = session.conversation.host_tools_changed().await
         {
@@ -2771,6 +2940,7 @@ async fn run_prompt(
         } else {
             UserInput::composed(prompt_uuid.clone(), content)
         };
+        let follows = history_tip(&session).await;
         let mut observer = session.state.track_command(&prompt_uuid, true).await?;
         let session_id = session.conversation.id().to_owned();
         let receipt = request.receipt.clone();
@@ -2841,6 +3011,12 @@ async fn run_prompt(
             && !session.state.execution_started().await
         {
             session.state.finish(end.outcome).await?;
+            // The turn produced nothing, but a prompt the CLI started is a user entry in its
+            // history, which the next prompt must not follow.
+            if end.unanswered {
+                session.conversation.observe_turn();
+                record_ledger_turn(&session, &end, follows, true).await;
+            }
             return Err(ProviderError::Cancelled);
         }
         session.conversation.observe_turn();
@@ -2854,19 +3030,9 @@ async fn run_prompt(
             session.state.publish_context_usage(usage).await?;
         }
         let _ = session.state.take_completion().await;
-        if let Some(prompt) = end.commands.first() {
-            session.ledger.lock().await.push(LedgerTurn {
-                prompt: prompt.clone(),
-                checkpoint: end.checkpoint.clone(),
-                rewind_note: None,
-            });
-            end.checkpoint.clone_into(
-                &mut session
-                    .fork_point
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-        }
+        let unanswered = end.outcome == forge_provider_api::turn::TurnOutcome::Interrupted
+            && (end.unanswered || end.checkpoint.is_none());
+        record_ledger_turn(&session, &end, follows, unanswered).await;
         let checkpoint = end
             .checkpoint
             .clone()
@@ -2904,6 +3070,35 @@ async fn run_prompt(
             Err(error)
         }
     }
+}
+
+/// Record a finished turn's place in the binding's native history.
+///
+/// `unanswered` marks a turn that left a request the CLI recorded without an answer, which
+/// `withdraw_unanswered_request` removes before the conversation continues.
+async fn record_ledger_turn(
+    session: &ClaudeBinding,
+    end: &super::session::TurnEnd,
+    follows: Option<String>,
+    unanswered: bool,
+) {
+    let Some(prompt) = end.commands.first() else {
+        return;
+    };
+    session.ledger.lock().await.push(LedgerTurn {
+        prompt: prompt.clone(),
+        checkpoint: end.checkpoint.clone(),
+        rewind_note: None,
+        absorbed_steering: end.commands.len() > 1,
+        follows,
+        unanswered,
+    });
+    end.checkpoint.clone_into(
+        &mut session
+            .fork_point
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
 }
 
 /// Reject native controls this adapter cannot apply before allocating profiles or history.

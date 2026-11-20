@@ -51,13 +51,19 @@ end
 ---the key is read, so one scheduled step runs every such paste first; the action then sees the
 ---pasted text and any import it started. A draft changed in any other way during that step, such as
 ---by keys typed after the submit key, is not sent, so later typing never joins the submitted text.
+---
+---Keys that run at once, such as an interrupt, overtake that step. `capture` records, when the key
+---is pressed, the state the action must act on, and the action receives what it returned.
+---@generic Captured
 ---@param buffer_of fun(): integer?
----@param action fun()
+---@param action fun(captured: Captured?)
+---@param capture? fun(): Captured
 ---@return fun()
-function M.after_pending_paste(buffer_of, action)
+function M.after_pending_paste(buffer_of, action, capture)
   return function()
+    local captured = capture and capture()
     local buffer = buffer_of()
-    if not (buffer and vim.api.nvim_buf_is_valid(buffer)) then action() return end
+    if not (buffer and vim.api.nvim_buf_is_valid(buffer)) then action(captured) return end
     local changes = attachment.observe_changes(buffer)
     vim.schedule(function()
       if changes() == "edited" then
@@ -65,7 +71,7 @@ function M.after_pending_paste(buffer_of, action)
           "ForgeHarness")
         return
       end
-      action()
+      action(captured)
     end)
   end
 end

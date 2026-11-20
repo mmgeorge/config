@@ -20,9 +20,17 @@ impl std::fmt::Display for Diagnostic<'_> {
 }
 
 /// Normalize a Codex transport failure at its requested operation boundary.
+///
+/// A connection this side released is the expected end of every binding's reader, so it is
+/// recorded at debug level rather than as a provider failure; its waiters still fail.
 pub(crate) fn codex(error: CodexConnectionError, operation: ProviderOperation) -> ProviderError {
-    tracing::error!(target: "forge::provider", event_name = "provider.failure",
-        provider = "codex", operation = ?operation, error = %Diagnostic(&error));
+    if matches!(error, CodexConnectionError::Released) {
+        tracing::debug!(target: "forge::provider", event_name = "provider.connection_released",
+            provider = "codex", operation = ?operation);
+    } else {
+        tracing::error!(target: "forge::provider", event_name = "provider.failure",
+            provider = "codex", operation = ?operation, error = %Diagnostic(&error));
+    }
     let kind = match error {
         CodexConnectionError::Overflow => {
             return ProviderError::Observation(
@@ -30,9 +38,9 @@ pub(crate) fn codex(error: CodexConnectionError, operation: ProviderOperation) -
             );
         }
         CodexConnectionError::Encoding(_) => ProviderFailureKind::Protocol,
-        CodexConnectionError::Transport { .. } | CodexConnectionError::Closed(_) => {
-            ProviderFailureKind::Transport
-        }
+        CodexConnectionError::Transport { .. }
+        | CodexConnectionError::Closed(_)
+        | CodexConnectionError::Released => ProviderFailureKind::Transport,
     };
     ProviderError::Failure(
         forge_provider_api::ProviderFailure::new(operation, kind).at_phase(

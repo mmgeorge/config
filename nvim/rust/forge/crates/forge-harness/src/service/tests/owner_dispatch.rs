@@ -651,30 +651,30 @@ async fn failed_restart_answers_queued_and_later_commands_at_once() -> Result<()
     Ok(())
 }
 
-/// A direct prompt sent while the first prompt is mid-send queues as a command, and admission
-/// starts it only after the first turn's dispatch settles, so each prompt is sent exactly once.
+/// A direct prompt sent while the first prompt is mid-send is queued at once, without waiting for
+/// the send, and is sent only after the first turn's dispatch settles, so each prompt is sent
+/// exactly once.
+///
+/// Queueing a prompt neither stops nor replaces the send. The owner once held the submission
+/// itself until the provider confirmed the send, so a steer typed while a provider was slow to
+/// start its turn read as an unconfirmed submission for the whole wait.
 #[tokio::test]
-async fn direct_input_during_dispatch_waits_for_the_send() -> Result<()> {
+async fn direct_input_during_dispatch_is_queued_at_once_and_sent_after_the_send() -> Result<()> {
     let mut fixture = HeldDispatch::start(HoldPoint::DuringSend).await?;
     let scenario = async {
-        // The submit request answers only once the owner admits the input, so it runs beside the hold.
-        let controller = fixture.controller.clone();
-        let sink = fixture.sink.clone();
-        let submitted = tokio::spawn(async move {
-            prompt::apply(
-                &controller,
-                Request {
-                    id: 801,
-                    method: "session.prompt.submit".into(),
-                    params: json!({"operation_id":"held-second","text":"Second prompt"}),
-                },
-                &sink,
-            )
-            .await
-        });
+        prompt::apply(
+            &fixture.controller,
+            Request {
+                id: 801,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"held-second","text":"Second prompt"}),
+            },
+            &fixture.sink,
+        )
+        .await?;
         fixture.settle().await;
-        fixture.release(HeldSendEnd::Confirm);
-        submitted.await??;
+        fixture.assert_send_uninterrupted();
+        fixture.end_send(HeldSendEnd::Confirm);
         let mut sent = Vec::new();
         while let Some(text) = fixture.dispatches.recv().await {
             let second_dispatched = text.ends_with("Second prompt");

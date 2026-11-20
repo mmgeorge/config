@@ -141,6 +141,11 @@ impl ExchangeDriver {
                 if result.is_ok() {
                     self.question_inputs.request();
                     services.input.changed.notify_one();
+                    if let Err(error) =
+                        crate::exchange::question_input::present_question_change(services)
+                    {
+                        trace.record(session, "exchange.question.presentation_failed", serde_json::json!({"operation_id":operation,"reason":format!("{error:#}"),"update_step":step}));
+                    }
                 }
                 let code = result
                     .as_ref()

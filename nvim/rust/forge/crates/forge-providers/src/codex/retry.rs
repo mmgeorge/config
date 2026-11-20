@@ -44,6 +44,18 @@ pub fn failure_kind(error: &Value) -> forge_provider_api::ProviderFailureKind {
     }
 }
 
+/// Report whether an `error` notification announces a request Codex retries by itself.
+///
+/// The app-server sets `willRetry` on a transient model-request failure, such as a timed-out
+/// or disconnected response stream, that it retries within the same turn; such an error does
+/// not interrupt the turn. A missing field means Codex will not retry.
+pub fn provider_retries(notification_params: &Value) -> bool {
+    notification_params
+        .get("willRetry")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// Classifies only documented connection and capacity codes, never message text.
 pub fn transient_category(error: &Value) -> Option<RetryCategory> {
     let info = error.get("codexErrorInfo")?;

@@ -51,12 +51,16 @@ impl ConversationRewind {
 
 impl HarnessBroker {
     /// Describe this session's provider for the shared conversation rewind rule.
-    pub(super) fn rewind_provider(&self) -> crate::exchange::rollback::RewindProvider<'_> {
-        crate::exchange::rollback::RewindProvider {
+    pub(super) fn rewind_provider(&self) -> Result<crate::exchange::rollback::RewindProvider<'_>> {
+        Ok(crate::exchange::rollback::RewindProvider {
             label: &self.session.provider_label,
             capability: &self.capability,
             native_history: self.session.provider_session_id.is_some(),
-        }
+            newest_session_compaction_ms:
+                crate::exchange::rollback::RewindProvider::newest_session_compaction(
+                    &self.store.list_session_event(&self.session.id)?,
+                ),
+        })
     }
 
     /// Select the checkpoint that ends the retained native conversation.
@@ -72,7 +76,7 @@ impl HarnessBroker {
         let Some(after) = crate::exchange::rollback::rewind_target(
             exchanges,
             first_removed,
-            &self.rewind_provider(),
+            &self.rewind_provider()?,
         )?
         else {
             return Ok(None);
@@ -171,21 +175,14 @@ impl HarnessBroker {
         self.store
             .require_settled_exchange_tree(&self.session.id, &rewind.exchanges)
             .context("rollback requires settled child work")?;
-        let keeps_task = rewind.expected_task.as_ref().is_some_and(|task| {
-            crate::exchange::rollback::rollback_keeps_task(
-                &exchanges,
-                &rewind.exchanges,
-                task.created_at_ms,
-            )
-        });
         let mut session = self.session.clone();
         self.apply_rewound_conversation(&mut session, rewind.native.as_ref())?;
         self.task_controller.commit_rollback(
             &mut self.store,
             rewind.expected_task.as_ref().map(|task| &task.revision),
             &session,
+            &exchanges,
             &rewind.exchanges,
-            keeps_task,
             self.clock.now_ms(),
         )?;
         session.active_task = self.task_controller.current()?;

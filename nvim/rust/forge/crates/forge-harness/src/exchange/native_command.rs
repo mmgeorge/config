@@ -72,6 +72,11 @@ impl NativeCommandRun {
         }
     }
 
+    /// Report whether this command is a compaction whose attempt has yet to start.
+    pub(super) fn compaction_waiting(&self) -> bool {
+        matches!(&self.work, NativeWork::Compaction(run) if run.awaiting_start())
+    }
+
     /// Get a compaction attempt identity without exposing context contents or native tokens.
     pub(super) fn compaction_id(&self) -> Option<&super::command::ContextCompactionId> {
         match &self.work {
@@ -292,7 +297,8 @@ impl NativeCommandRun {
                         events: Vec::new(),
                         updates,
                     }),
-                    CompactionProgress::Committed { updates } => {
+                    CompactionProgress::Committed { updates }
+                    | CompactionProgress::Unsuccessful { updates } => {
                         self.prepare_completion(broker, updates)
                     }
                 }
@@ -433,10 +439,17 @@ impl NativeCommandRun {
                                         "compaction completion retains its confirmed operation"
                                     )
                                 };
-                                CommandOutcome::Compacted(ContextCompactionOutcome {
-                                    compaction: run.completed_id().clone(),
-                                    disposition: outcome,
-                                })
+                                match run.outcome() {
+                                    Ok(id) => CommandOutcome::Compacted(ContextCompactionOutcome {
+                                        compaction: id.clone(),
+                                        disposition: outcome,
+                                    }),
+                                    Err(unsuccessful) => {
+                                        return Ok(NativeCommandProgress::CompactionUnsuccessful(
+                                            unsuccessful,
+                                        ));
+                                    }
+                                }
                             }
                             Command::ConfigureSession(
                                 ConfigurationChange::Permission(
@@ -630,6 +643,9 @@ pub(super) enum NativeCommandProgress {
     },
     Replacement(NativeCommandReplacement),
     Finished(CommandOutcome),
+    /// The provider answered a compaction without compacting; any stopped turn was handed
+    /// back first, and the command now fails with the provider's reason.
+    CompactionUnsuccessful(super::compaction::UnsuccessfulCompaction),
 }
 
 /// Transfer replacement resources into foreground ownership before confirming command completion.

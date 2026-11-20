@@ -35,7 +35,8 @@ function M.phase(task)
 end
 
 ---@param task ForgeHarnessActiveTask
----@param turn_pending? boolean a provider turn is running, or the host hands off to the next one
+---@param turn_pending? boolean a provider turn is running, the host hands off to the next one, or
+---  a compaction holds a turn that runs after it (`activity.turn_awaited`)
 ---@return string
 function M.label(task, turn_pending)
   local workflow = task.kind == "execute" and "exec" or task.kind

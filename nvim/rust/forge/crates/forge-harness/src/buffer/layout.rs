@@ -13,6 +13,8 @@ pub(super) struct ExchangeLayout<'exchange> {
     pub conclusion: Vec<&'exchange ExchangeNode>,
     pub results: Vec<&'exchange ExchangeNode>,
     pub activity: Vec<&'exchange ExchangeNode>,
+    /// User steering that a settled exchange draws below its folded heading.
+    pub steering: Vec<&'exchange ExchangeNode>,
     pub continuation: Vec<&'exchange ExchangeNode>,
 }
 
@@ -155,12 +157,31 @@ impl<'exchange> ExchangeLayout<'exchange> {
                 true
             }
         });
+        // A settled exchange folds its activity under its heading, and a stop or an abandoned
+        // draft can leave no response to end that activity, so a steer drawn inside the fold
+        // would vanish from the transcript. The user's own message is never folded away: once the
+        // exchange settles, steering that preceded the response is drawn below the heading.
+        let steering = if exchange.is_finished() {
+            let (steering, remaining) = activity.into_iter().partition(|node| {
+                matches!(node, ExchangeNode::ExchangeInput { prompt } if matches!(
+                    &prompt.intent,
+                    crate::exchange::InputIntent::User {
+                        content: crate::input::UserInputContent::UserText { .. }
+                    }
+                ))
+            });
+            activity = remaining;
+            steering
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             questions,
             opening,
             results,
             conclusion,
             activity,
+            steering,
             continuation,
         })
     }
@@ -270,4 +291,166 @@ pub(super) fn materialize(block: &mut BufferBlock) -> Result<()> {
     }
     block.validate()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use forge_provider_api::{AgentMessageRole, ItemEvent, ItemStart, SubmissionId};
+    use serde_json::json;
+
+    use crate::exchange::{Exchange, ExchangeOutcome, InputIntent};
+    use crate::turn::test_support::{address, completed_event, item_event, message};
+
+    fn running_exchange() -> anyhow::Result<Exchange> {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"steered", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Write about ring buffers", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        Ok(exchange)
+    }
+
+    fn acknowledge_steer(
+        exchange: &mut Exchange,
+        address: &crate::provider::TurnAddress,
+        text: &str,
+    ) -> anyhow::Result<SubmissionId> {
+        let submission = SubmissionId::try_from("steer".to_owned())?;
+        exchange.append_acknowledged_input(
+            &address.scope,
+            Some("steer-message".into()),
+            Some(submission.clone()),
+            InputIntent::user_text(text.into()),
+            text.into(),
+            2,
+        )?;
+        Ok(submission)
+    }
+
+    /// Render the rows a reader sees, with every closed section folded to its heading.
+    fn visible_rows(exchange: &Exchange) -> anyhow::Result<Vec<String>> {
+        let projected = crate::buffer::projection::project(
+            crate::buffer::projection::ProjectionSource::Exchange(exchange),
+            &forge_buffer::width::WidthProfile::default(),
+            10,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut crate::buffer::identity::DisplayRegistry::default(),
+        )?;
+        Ok(crate::buffer::sections::preview(projected.entry)?
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// A steer the provider took while its draft was cut off by a stop has no response after it,
+    /// so the settled exchange still shows it below the folded heading, labelled unconfirmed.
+    #[test]
+    fn a_stopped_exchange_shows_its_unconfirmed_steer_below_the_folded_heading()
+    -> anyhow::Result<()> {
+        let mut exchange = running_exchange()?;
+        let turn = address(&exchange, "turn");
+        exchange.start_turn(turn.clone(), 0)?;
+        exchange.observe_event(
+            &message(
+                &turn,
+                "draft",
+                Some(AgentMessageRole::Response),
+                "A ring buffer",
+            ),
+            1,
+        )?;
+        acknowledge_steer(&mut exchange, &turn, "Also mention the word anchor once.")?;
+        exchange.observe_event(
+            &completed_event(&turn, crate::turn::TurnOutcome::Interrupted, 3),
+            3,
+        )?;
+        exchange.finish(ExchangeOutcome::Cancelled, 4)?;
+        let rows = visible_rows(&exchange)?;
+        let steer = rows
+            .iter()
+            .filter(|row| {
+                row.contains("Steering (not confirmed read): Also mention the word anchor once.")
+            })
+            .count();
+        assert_eq!(steer, 1, "{rows:#?}");
+        Ok(())
+    }
+
+    /// A steer consumed before the response stays visible once its exchange settles and the
+    /// heading folds the activity that preceded the response.
+    #[test]
+    fn a_steer_consumed_before_the_response_stays_visible_after_settlement() -> anyhow::Result<()> {
+        let mut exchange = running_exchange()?;
+        let turn = address(&exchange, "turn");
+        exchange.start_turn(turn.clone(), 0)?;
+        let text = "Also end your final answer with the word anchor.";
+        let submission = acknowledge_steer(&mut exchange, &turn, text)?;
+        exchange.observe_event(
+            &item_event(
+                &turn,
+                "echo",
+                ItemEvent::Started(ItemStart::UserMessage(
+                    forge_provider_api::UserMessageStart {
+                        text: text.into(),
+                        submission_id: Some(submission),
+                    },
+                )),
+            ),
+            3,
+        )?;
+        exchange.observe_event(
+            &message(
+                &turn,
+                "plan",
+                Some(AgentMessageRole::Commentary),
+                "Spawning both.",
+            ),
+            4,
+        )?;
+        exchange.observe_event(
+            &crate::turn::test_support::message_completed(&turn, "plan", "Spawning both."),
+            4,
+        )?;
+        exchange.observe_event(
+            &message(
+                &turn,
+                "answer",
+                Some(AgentMessageRole::Response),
+                "Done. anchor",
+            ),
+            5,
+        )?;
+        exchange.observe_event(
+            &crate::turn::test_support::message_completed(&turn, "answer", "Done. anchor"),
+            5,
+        )?;
+        exchange.observe_event(
+            &completed_event(
+                &turn,
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                6,
+            ),
+            6,
+        )?;
+        exchange.finish(ExchangeOutcome::Complete, 7)?;
+        let rows = visible_rows(&exchange)?;
+        let steer = rows.iter().position(|row| row.contains(text));
+        let answer = rows.iter().position(|row| row.contains("Done. anchor"));
+        assert_eq!(
+            rows.iter().filter(|row| row.contains(text)).count(),
+            1,
+            "{rows:#?}"
+        );
+        assert!(steer < answer, "{rows:#?}");
+        Ok(())
+    }
 }

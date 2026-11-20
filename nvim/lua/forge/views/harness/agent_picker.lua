@@ -7,6 +7,7 @@ local picker = require("forge.views.picker")
 
 local active = nil
 local build_spec
+local refresh
 local stop_timer
 
 ---@param instance table
@@ -22,7 +23,7 @@ local function edit_message(instance, action, context)
       id = "agent-message", title = (action == "message" and "Message " or "Follow up with ") .. agent_summary.label(run),
       allow_input = true, input_height = 5, column_headers = { "Action", "Details" },
       option_list = { { id = action, label = action == "message" and "Informational message" or "Follow-up task",
-        input_kind = "other", detail = action == "message" and "Retained in the inbox. An idle child remains idle."
+        input_kind = "other", detail = action == "message" and "Waits in the inbox until the child's next task. An idle child remains idle."
           or "Queued for this child's next turn. Retains only its own conversation history." } },
       footer = "C-s send  q close",
     } },
@@ -48,11 +49,80 @@ stop_timer = function(instance)
   instance.timer = nil
 end
 
+local terminal_after_interrupt = { cancelled = true, interrupted = true }
+
+--- How long an interrupt's outcome stays in its row while the child's state is unchanged,
+--- matching how long a warning notice shows.
+AgentPicker.interrupt_notice_ms = 3000
+
+--- Identify the child state an interrupt outcome describes; a follow-up changes it.
+---@param status string The child's current status.
+---@param summary table? The child's summary, whose run count a follow-up raises.
+---@return string
+local function interrupt_outcome_key(status, summary)
+  return status .. "#" .. tostring(summary and summary.exchange_count or "")
+end
+
+--- Describe a picker interrupt the row has not yet shown settling, or nil once it has.
+---
+--- A child keeps drawing its running state until the host has applied every event it produced
+--- before the interrupt, so the row says that the interrupt was requested instead of looking
+--- ignored. A refusal, or a child that finished on its own first, describes the state the child
+--- had then: the note leaves the row when that state changes, as when a follow-up starts the
+--- child again, or once the notice period has passed.
+---@param interrupt table? The picker's record of the interrupt sent for this child.
+---@param status string The child's current status.
+---@param summary table? The child's summary.
+---@return string? note
+local function interrupt_note(interrupt, status, summary)
+  if not interrupt then return nil end
+  local outcome_key = interrupt_outcome_key(status, summary)
+  if not interrupt.outcome then
+    if interrupt.failure then
+      interrupt.outcome = "Interrupt failed: " .. interrupt.failure
+    elseif agent_summary.is_active(status) then
+      return "Cancelling"
+    elseif terminal_after_interrupt[status] then
+      return nil
+    else
+      interrupt.outcome = "Finished before the interrupt reached it"
+    end
+    interrupt.outcome_key = outcome_key
+    interrupt.outcome_at_ms = vim.uv.now()
+  end
+  if outcome_key ~= interrupt.outcome_key
+    or vim.uv.now() - interrupt.outcome_at_ms >= AgentPicker.interrupt_notice_ms then
+    return nil
+  end
+  return interrupt.outcome
+end
+
+---@param instance table
+---@param run table
+local function interrupt_run(instance, run)
+  local state = instance.state_provider()
+  local status = agent_summary.status(run, (state.agent.summary or {})[run.id])
+  if not agent_summary.is_active(status) then
+    instance.interrupt_by_run_id[run.id] = { failure = agent_summary.label(run) .. " is not running" }
+    refresh(instance)
+    return
+  end
+  local interrupt = {}
+  instance.interrupt_by_run_id[run.id] = interrupt
+  refresh(instance)
+  instance.on_action("interrupt", run.id, nil, function(failure_message)
+    if instance.interrupt_by_run_id[run.id] ~= interrupt then return end
+    interrupt.failure = failure_message
+    refresh(instance)
+  end)
+end
+
+---@param instance table
 ---@param state table
 ---@param selected_run_id string?
 ---@return table[]
 ---@return integer
-local function option_list(state, selected_run_id)
+local function option_list(instance, state, selected_run_id)
   local result = {
     { id = "main", value = { kind = "main" }, label = "Main", detail = "Parent conversation", columns = { "Main", "—", "Parent conversation" } },
   }
@@ -65,15 +135,23 @@ local function option_list(state, selected_run_id)
     { title = "Done", run_list = agent_catalog.run_list(state, false) },
   }) do
     for _, run in ipairs(group.run_list) do
+      local summary = (state.agent.summary or {})[run.id]
+      local detail = agent_summary.status_detail(run, summary, now_ms)
+      -- A follow-up's run counts only its own tools, so the row also keeps every run's tally.
+      if summary and type(summary.run_tool_label) == "string" then
+        detail = detail .. " · " .. summary.run_tool_label .. " across " .. tostring(summary.exchange_count) .. " runs"
+      end
+      local note = interrupt_note(instance.interrupt_by_run_id[run.id], agent_summary.status(run, summary), summary)
+      if note then
+        detail = note .. " · " .. detail
+      else
+        instance.interrupt_by_run_id[run.id] = nil
+      end
       result[#result + 1] = {
         id = "run:" .. run.id,
         value = { kind = "run", run = run },
         label = agent_summary.label(run),
-        detail = agent_summary.status_detail(
-          run,
-          (state.agent.summary or {})[run.id],
-          now_ms
-        ),
+        detail = detail,
         section = group.title,
       }
       local entry = result[#result]
@@ -95,7 +173,7 @@ end
 ---@return table
 build_spec = function(instance)
   local state = instance.state_provider()
-  local entries, initial = option_list(state, state.selected_agent_run_id)
+  local entries, initial = option_list(instance, state, state.selected_agent_run_id)
   return {
     owner = "agent",
     host = instance.host,
@@ -114,7 +192,7 @@ build_spec = function(instance)
       { id = "followup", key = "<C-f>", desc = "Queue follow-up task", callback = function(context) edit_message(instance,"followup",context) end },
       { id = "interrupt", key = "<C-x>", desc = "Interrupt selected child", callback = function(context)
         local run = context.option and context.option.value.run
-        if run then instance.on_action("interrupt",run.id) end
+        if run then interrupt_run(instance, run) end
       end },
       { id = "interrupt-all", key = "<C-a>", desc = "Interrupt all children", callback = function() instance.on_action("interrupt_all") end },
       { id = "tools", key = "<C-t>", desc = "Toggle root model delegation tools", callback = function() instance.on_action("tools") end },
@@ -134,7 +212,7 @@ build_spec = function(instance)
 end
 
 ---@param instance table
-local function refresh(instance)
+refresh = function(instance)
   if active ~= instance or instance.editing or not picker.is_open("agent") then return end
   picker.update(build_spec(instance))
 end
@@ -158,6 +236,7 @@ function AgentPicker.open(options)
     on_select = options.on_select,
     on_action = options.on_action,
     on_close = options.on_close,
+    interrupt_by_run_id = {},
     timer = vim.uv.new_timer(),
   }
   active = instance

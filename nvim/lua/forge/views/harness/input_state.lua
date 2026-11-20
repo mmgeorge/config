@@ -19,18 +19,34 @@ M.submission_notice_delay_ms = 500
 ---  yet to claim, which no list draws until the notice delay passes.
 ---@field follow_up table<string, true> Messages the status split has shown waiting. Membership
 ---  lasts until the message is accepted or removed, so a shown row never hides and returns.
+---@field waiting_steer table<string, true> Automatic submissions still unclaimed after the notice
+---  delay while a provider turn ran, listed under steering as waiting until the host claims them.
 ---@field running_steer table<string, true> Steering the running turn took, kept staged after its
 ---  acceptance until that turn ends.
 ---@field committing table<string, integer> In-flight edit commits per message id.
 ---@field removing table<string, integer> In-flight editor commands that remove a message, which no
 ---  list draws while the host has yet to answer.
 ---@field commit_waiters table<string, fun()[]> Reservations waiting for a message's commit result.
+---@field saved_edit table<string, ForgeSavedQueueEdit> Queue edits the user saved that the host has
+---  yet to publish, drawn in place of the host's text so a saved row never shows its old text.
 ---@field refreshing? boolean
 ---@field required_revision? integer
 ---@field suspended boolean
 ---@field control_revision integer
 ---@field pause_operation_id? string
+---@field submission_fence? ForgeInputControlFence Queue control that submissions made by the action
+---  `under_fence` runs follow, captured when the user pressed the action's key.
 ---@field changed fun()
+
+---@class ForgeInputControlFence
+---@field input table Input projection the fence was captured from.
+---@field control_revision integer Queue control revision the user had seen.
+---@field pause_operation_id? string Newest interrupt the user had requested.
+
+---@class ForgeSavedQueueEdit
+---@field text string Draft the user saved, as the composer showed it.
+---@field revision? integer Message revision the commit edits; the host publishes the edit at a
+---  later revision. Unset while the commit waits for the edit's reservations.
 
 local function index_of(entries, id)
   for index, entry in ipairs(entries) do if entry.id == id then return index end end
@@ -66,6 +82,23 @@ end
 
 local notice_overdue
 
+-- Session phases in which the owner holds every automatic submission rather than steering it: an
+-- open approval request, a parent waiting for its children, and a stop.
+local holding_phase = { awaiting_approval = true, waiting_for_agent = true, stopping = true }
+
+-- Get whether the running turn will take an unclaimed automatic submission as steering.
+--
+-- The host claims a steer only once the provider reports a running turn, so a steer sent while the
+-- provider is still starting its turn stays unclaimed for as long as that start takes. Such a steer
+-- waits for the active turn, not behind it, so it belongs in the steering section. A paused queue,
+-- a failed or reserved message, and a phase in which the owner holds input keep it in the queue.
+local function awaits_steering(state, input, entry)
+  local status = state.status
+  if input.suspended or entry.error ~= nil or entry.reservation ~= nil or entry.intent == "queue" then return false end
+  if host_produced(entry) or type(status) ~= "table" or holding_phase[status.kind] then return false end
+  return require("forge.views.harness.activity").turn_running(state)
+end
+
 -- Get whether an unclaimed message belongs in the queued follow-up list.
 --
 -- Only the host knows where an automatic submission goes: an idle session starts it as a turn, an
@@ -86,6 +119,11 @@ end
 
 -- Place every unsettled message in exactly one list, moving it only forward.
 --
+-- An automatic submission still unclaimed after the notice delay while a turn runs is listed in
+-- `pending_steer` as waiting, because the host steers it into that turn once the provider can take
+-- it. It moves to `queue` only when the owner starts holding input, and keeps its row through a
+-- hand-off when the turn ended first and the host starts it as its own turn.
+--
 -- An unclaimed message that does not wait stays in `pending_submit`, which no view stages, until
 -- the host claims it into steering or a turn. A message shown in `queue` stays shown through its
 -- claim, in `pending_handoff`, until the host accepts it; by then the transcript holds its prompt, so
@@ -100,8 +138,27 @@ local function render(state)
   local queue, steering, handoff, submitting, retained, known = {}, {}, {}, {}, {}, {}
   local function place(entry, destination)
     if destination == queue then input.follow_up[entry.id] = true end
-    if destination then destination[#destination + 1] = display_entry(input, entry) end
+    -- A saved edit is drawn until the host publishes a revision past the one the commit edited.
+    local saved = input.saved_edit[entry.id]
+    if saved and saved.revision and (entry.revision or 0) > saved.revision then
+      input.saved_edit[entry.id], saved = nil, nil
+    end
+    if destination then
+      local displayed = display_entry(input, entry)
+      displayed.saved_text = saved and saved.text
+      destination[#destination + 1] = displayed
+    end
     retained[entry.id] = true
+  end
+  -- A waiting steer leaves the steering section for the queue once the owner holds it; it never
+  -- returns, so a held row does not move back and forth.
+  local function unclaimed_destination(entry)
+    if input.waiting_steer[entry.id] and not awaits_steering(state, input, entry) then
+      input.waiting_steer[entry.id] = nil
+      input.follow_up[entry.id] = true
+    end
+    if input.waiting_steer[entry.id] then return steering end
+    return waits_in_queue(input, entry) and queue or submitting
   end
   if not (input.running_steer and require("forge.views.harness.activity").busy(state)) then input.running_steer = {} end
   for _, entry in ipairs(input.confirmed) do
@@ -115,27 +172,31 @@ local function render(state)
         if entry.route == "steering" then
           destination = steering
           input.running_steer[entry.id] = true
-        else destination = input.follow_up[entry.id] and handoff or submitting end
+        else
+          destination = (input.follow_up[entry.id] or input.waiting_steer[entry.id]) and handoff or submitting
+        end
       else
         if host_produced(entry) and entry.delivery == "queued" and not input.follow_up[entry.id]
           and not input.awaiting_claim[entry.id] then
           input.awaiting_claim[entry.id] = true
           notice_overdue(state, input, entry.id)
         end
-        destination = waits_in_queue(input, entry) and queue or submitting
+        destination = unclaimed_destination(entry)
       end
       place(entry, destination)
+      if destination == steering and entry.delivery == "queued" then input.entry_by_id[entry.id].awaiting_steer = true end
     end
   end
   for _, draft in ipairs(input.drafts) do
-    if not known[draft.id] then place(draft, waits_in_queue(input, draft) and queue or submitting) end
+    if not known[draft.id] then place(draft, unclaimed_destination(draft)) end
   end
   for id, entry in pairs(input.entry_by_id) do
     if not retained[id] and not (state.queue_edit and state.queue_edit.drafts[entry]) then
       input.entry_by_id[id] = nil
     end
   end
-  for _, placement in ipairs({ input.awaiting_claim, input.follow_up, input.running_steer }) do
+  for _, placement in ipairs({ input.awaiting_claim, input.follow_up, input.waiting_steer, input.running_steer,
+    input.saved_edit }) do
     for id in pairs(placement) do if not retained[id] then placement[id] = nil end end
   end
   state.queue, state.pending_steer, state.pending_handoff, state.pending_submit = queue, steering, handoff, submitting
@@ -154,7 +215,9 @@ notice_overdue = function(state, input, id)
     local confirmed = input.confirmed[index_of(input.confirmed, id) or 0]
     local unsettled = index_of(input.drafts, id) ~= nil or (confirmed ~= nil and confirmed.delivery ~= "accepted")
     if not unsettled or not input.awaiting_claim[id] then return end
-    input.follow_up[id], input.awaiting_claim[id] = true, nil
+    input.awaiting_claim[id] = nil
+    local entry = confirmed or input.drafts[index_of(input.drafts, id)]
+    if awaits_steering(state, input, entry) then input.waiting_steer[id] = true else input.follow_up[id] = true end
     render(state)
   end, M.submission_notice_delay_ms)
 end
@@ -254,6 +317,13 @@ function M.activity_changed(state)
   if state.input then render(state) end
 end
 
+---Place a waiting steer again after the session status changes: an approval, a wait for
+---children, or a stop holds it in the queue.
+---@param state table
+function M.status_changed(state)
+  if state.input and next(state.input.waiting_steer) then render(state) end
+end
+
 ---@param state table
 ---@param changed fun()
 function M.attach(state, changed)
@@ -267,8 +337,8 @@ function M.attach(state, changed)
     session_id = state.session.id, runtime_epoch = state.runtime_epoch,
     host_generation = client.host_get_generation(), revision = 0, control_revision = 0,
     confirmed = {}, drafts = {}, entry_by_id = {}, retraction = {}, suspended = false, changed = changed,
-    awaiting_claim = {}, follow_up = {}, running_steer = {},
-    committing = {}, removing = {}, commit_waiters = {},
+    awaiting_claim = {}, follow_up = {}, waiting_steer = {}, running_steer = {},
+    committing = {}, removing = {}, commit_waiters = {}, saved_edit = {},
   }
   M.refresh(state)
 end
@@ -343,9 +413,12 @@ function M.perform(state, action, callback, target, restore)
   if action.kind == "remove" then removing[#removing + 1] = action.id end
   for _, removed_id in ipairs(removing) do input.removing[removed_id] = (input.removing[removed_id] or 0) + 1 end
   if #removing > 0 then render(state) end
+  -- A submission follows the queue control of the moment its key was pressed: the host resumes a
+  -- paused queue only for a submission that follows the pause.
+  local control = action.kind == "submit" and input.submission_fence or input
   client.request({ session_id = input.session_id, method = "session.input.apply", params = {
-    id = id, action = vim.deepcopy(action), control_revision = input.control_revision,
-    after_control = input.pause_operation_id, target = vim.deepcopy(target),
+    id = id, action = vim.deepcopy(action), control_revision = control.control_revision,
+    after_control = control.pause_operation_id, target = vim.deepcopy(target),
   } }, function(result, failure, detail)
     if completed then return end
     completed = true
@@ -425,6 +498,29 @@ function M.after_commit(state, id, continuation)
   waiters[#waiters + 1] = continuation
 end
 
+---Draw `text` as the queued message `id` from the frame the user saves its edit.
+---
+---The edit ends in the editor before the host answers its commit, and the host's copy still holds
+---the old text until then. Call again with the commit's base `revision` once the commit leaves; the
+---row keeps `text` until the host publishes a later revision of the message.
+---@param state table
+---@param id string
+---@param text string
+---@param revision? integer
+function M.hold_saved_edit(state, id, text, revision)
+  state.input.saved_edit[id] = { text = text, revision = revision }
+  render(state)
+end
+
+---Stop drawing a saved edit the host did not take, so the row shows the message the host holds.
+---@param state table
+---@param id string
+function M.release_saved_edit(state, id)
+  if not (state.input and state.input.saved_edit[id]) then return end
+  state.input.saved_edit[id] = nil
+  render(state)
+end
+
 ---Discard an editor-only recovery draft without sending a host input mutation.
 function M.discard_rejected(state, id)
   discard_draft(state.input, id)
@@ -452,6 +548,36 @@ end
 ---Resume delivery of a queue an interrupt paused, keeping its order.
 function M.resume(state)
   M.perform(state, { kind = "resume" })
+end
+
+---Capture the queue control the user sees, for a submission whose key runs its action later.
+---
+---A composer send waits one main-loop turn for a paste still arriving, while an interrupt runs at
+---once, so `Ctrl-S Ctrl-C` reaches the host as the cancel followed by the submission. Stamped at
+---send time, that submission claimed to follow the interrupt, and the host resumed the paused
+---queue with it and ran it once the stop settled.
+---@param state table
+---@return ForgeInputControlFence?
+function M.control_fence(state)
+  local input = state.input
+  if not input then return nil end
+  return { input = input, control_revision = input.control_revision, pause_operation_id = input.pause_operation_id }
+end
+
+---Run `action` so that the submissions it makes follow `fence` rather than the current control.
+---
+---A fence from another input projection, such as one replaced by a session switch, is ignored.
+---@param state table
+---@param fence? ForgeInputControlFence
+---@param action fun()
+function M.under_fence(state, fence, action)
+  local input = state.input
+  if not (fence and input and fence.input == input) then return action() end
+  local previous = input.submission_fence
+  input.submission_fence = fence
+  local ok, failure = pcall(action)
+  input.submission_fence = previous
+  if not ok then error(failure, 0) end
 end
 
 ---Retain the editor draft until the host acknowledges this submission.

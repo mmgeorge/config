@@ -228,7 +228,14 @@ contextual ordering without a filename preference.
 Ctrl-Q queues `/model <model> [effort]` without changing the active turn, even
 when the command contains no follow-up prompt. The model change applies when its
 entry reaches the front of the follow-up queue. Ctrl-S submits a settings-only
-model change immediately through the configuration coordinator.
+model change immediately through the configuration coordinator. A `/model` that names the model, and
+effort if given, the session already uses clears the composer and says that nothing changed.
+`/model` names its model by id, or by the display name the winbar and the model picker show,
+compared without regard to case, so `/model Haiku 5.5` selects `haiku`; a thinking level may
+follow the name. Harness resolves the name against the provider's model catalog before it sends
+anything, so a name that matches no model, or several, is refused with a notice listing the models
+it could have meant, the command stays in the composer, and the winbar never shows the refused
+selection.
 
 New interactive sessions start with full reads, workspace writes, and `ask` approval.
 Reopening a session preserves its filesystem access and tool approval independently.
@@ -239,7 +246,12 @@ Enabled sandbox status precedes the model.
 Opening Harness waits for the session snapshot before showing permission and model
 fields. New sessions reuse the last confirmed default model for that workspace and
 provider while refreshing the catalog in the background. Without a cached model,
-the field shows `resolving model` until the provider responds.
+the field shows `resolving model` until the provider responds. A model, thinking,
+context, or speed change made in a session becomes the default of that session's
+workspace and provider once Harness applies it; it never changes the defaults of
+other workspaces. Editing the global defaults with `:ForgeConfig` outside a session
+is newer than every earlier workspace choice, so the next new session in any
+workspace starts from it until a session there confirms another choice.
 The model field reads `<speed icon> <model> <thinking>`: Fast uses a gray outlined
 lightning glyph (`󱐌`), Ultrafast a filled glyph (`󱐋`) in YOLO's neon red, and Standard no icon.
 Thinking names the level the provider uses. A `default` selection sends no level, so
@@ -250,9 +262,15 @@ Model, thinking, or speed changes waiting for existing work share one trailing `
 after thinking, and the field shows the values they select. This covers a `/model`
 entry queued with Ctrl-Q, from the moment it is queued until its hand-off applies it,
 and a change made with the effort keys or a picker during a turn, which restarts the
-turn on the new settings, until that restart applies it. Idle and paused changes apply
-at once and show no marker. The marker disappears when all selected values are applied,
-and a rejected change leaves the field with the applied values.
+turn on the new settings, until that restart applies it. A change made while the turn's
+prompt is still being sent waits until the provider has started the turn, then restarts it
+the same way. When children run or the
+turn waits for them, the restart first stops the children, which end `Cancelled` as
+after Ctrl-C, and the restarted turn may start children again. An idle or paused change shows
+its value at once and no marker, though the host takes a second or two to check it
+against the provider's model list before it applies. The marker disappears when all
+selected values are applied, and a rejected change leaves the field with the applied
+values.
 Only full reads, full writes, `allow`, and sandbox off add red `YOLO` text:
 `YOLO · rxwxax`. Working, planning, revision, and review labels remain white
 regardless of the selected policy.
@@ -358,7 +376,8 @@ A permission popup opens with no decision selected, so an Enter typed into the
 composer just as the popup takes focus decides nothing; choose a decision with its
 key or the arrow keys first. A permission or question popup never opens by itself while
 the editor is in Insert, Replace, or Command-line mode, in any buffer: the request waits as if
-you had closed it with `q`, a notice such as **Approval waiting · oe** says so, and the popup
+you had closed it with `q`, a notice such as **Approval waiting · oe** says so until the popup opens or the request is
+answered or cancelled, and the popup
 opens when you leave that mode with the session in the current tab, or when you press `oe`.
 Answering or closing a popup that waited this way returns you to the window and mode you were
 in when the request arrived, so you continue typing in the composer where you stopped. Once you
@@ -409,7 +428,7 @@ Child agents appear in three places. Each spawn adds a `◇ Spawned name · prov
 
 A child's transcript names the child in its winbar: the child's own provider, model, and thinking level, then its name, since its profile can choose them independently of the session. A child's edits belong to the exchange that started it, which shows them under its own **Edits**, so a child's transcript shows no Edits row.
 
-The agents picker (`og` or `/agents`) lists running children, then finished ones, each group in the order of the children's numbers (`-2` before `-10`). A child's duration counts the time its task ran, excluding time spent starting and waiting for your approval, so the picker, the status row, the summary row, and the child's heading show the same number, and the picker shows the status row's tool count. `Ctrl-X` interrupts the selected running child.
+The agents picker (`og` or `/agents`) lists running children, then finished ones, each group in the order of the children's numbers (`-2` before `-10`). A child's duration counts the time its task ran, excluding time spent starting and waiting for your approval, so the picker, the status row, the summary row, and the child's heading show the same number, and the picker shows the status row's tool count. A child you ran again with a follow-up also shows the tool count of all its runs, as `… across 2 runs`. `Ctrl-X` interrupts the selected running child at once, even while an earlier command to a child is still waiting: its row reads `Cancelling` until the child has stopped. If the interrupt cannot be carried out, the row says why after `Interrupt failed:`, and a child that finished before the interrupt reached it reads `Finished before the interrupt reached it`. Either note describes the child as it was then, so it leaves the row when the child's state changes, for example when a follow-up starts it again, or after three seconds. `Ctrl-A` interrupts every running child the same way. A parent waiting for its children receives each child you cancelled as a cancelled result and continues, whether you cancelled one child or all of them, so it can report what it has or start new children; only a child the parent's model interrupted itself does not wake it. A message sent with `Ctrl-G` waits in the child's inbox until its next task, because a running child cannot take it into its current turn; while it waits, the child's status row ends with `1 message waiting`. Each exchange's Agents summary lists every child once, with its latest run in that exchange.
 
 `/agents on` and `/agents off` take effect at once: the picker's title shows the new setting, and a model that tries to start a child after `/agents off` is refused. Changing the setting while children run stops nothing; the children finish and report to the parent, and the model's own tool list changes when its next turn starts.
 
@@ -468,8 +487,11 @@ source has child agents running, or the source is itself a fork that has not fin
 its first turn. The fork's tab opens only once Harness has created the child, so a refused
 `/fork` opens no tab: the message appears in the tab where you typed `/fork`, and the command
 stays in the composer in the mode it had. A fork opens in the foreground when you are still
-in that tab, and behind the tab you moved to otherwise. If the provider fork fails, the child keeps its tab, and sending or
-retrying a message in it attempts the fork again.
+in that tab, and behind the tab you moved to otherwise. Until the provider has copied the
+source conversation, the child's status reads **Preparing fork · copying the source
+conversation**, and a message sent meanwhile waits under it as `[submitting]` and runs once the
+copy finishes. If the provider fork fails, the child keeps its tab, and sending or
+retrying a message in it attempts the fork again, showing the same status while it does.
 
 `/btw <question>` opens an aside: a fork in a new tab whose agent is told that you are
 asking about the session you came from. The question is sent to the aside at once, and
@@ -496,9 +518,11 @@ source.
 | `:ForgePermissions` | None | Edit the Harness permissions document |
 
 `/clear` replaces the session in the current Harness tab after creation succeeds.
-`/new` opens a fresh session in a new tab. Both leave the composer in Normal mode, and a
-creation the host refuses closes the new tab and reports the refusal in the tab where
-you typed the command.
+`/new` opens a fresh session in a new tab. Both leave the composer in Normal mode when you
+submit them; a mode you enter while the host creates the session is kept. The new tab's
+composer takes your keys at once, and a submit before the session exists keeps the draft
+and reports that Harness is still initializing. A creation the host refuses closes the new
+tab and reports the refusal in the tab where you typed the command.
 
 `ForgeHarnessLog` requires an open Harness session. Check-worker and tool-export
 cleanup diagnostics follow the same `/log` setting instead of printing to process
@@ -511,7 +535,10 @@ arrow keys, or `Ctrl-O`. Each tab retains its own search query, and **All** incl
 the workspace path for each session.
 Within each scope, **Active** sessions loaded in this Forge host appear first,
 including sessions whose editor views are closed. Saved sessions that are not loaded
-appear under **Inactive**. Searching keeps this section order. The picker opens with the
+appear under **Inactive**. Searching keeps this section order. Each scope lists every
+session it holds; a list taller than the picker scrolls with the highlighted row, and the
+picker's bottom border then reads, for example, `Rows 1–7 of 16`, as every Forge picker
+does when its rows do not fit. The picker opens with the
 current session highlighted. Choosing a session that another tab already shows moves it into the
 current tab and closes its former tab; the session you left stays under **Active**.
 The transcript area previews the highlighted session in a layer drawn over the transcript,
@@ -530,16 +557,28 @@ the mode yours had when you opened the picker, also when the session already had
 `/sessions` or `/provider` **Resume session** switches to it. A session of
 another provider opens through the same provider switch as `/provider`: Forge restarts
 its host on that session's provider, so the switch requires that no Harness tab has
-running, queued, or unsent work. A switch that cannot start reports why and leaves the
+running, queued, or unsent work, and that no other tab is itself switching. A switch that
+cannot start reports why, naming the tab and the work, such as "Cannot switch providers
+yet: tab 2 (Fix tax rate) has a running turn. Finish or cancel it first.", or "has a turn
+waiting for an approval" when that turn stopped at an approval request, and leaves the
 picker open. While the switch runs, the status rows read **Switching Harness to** the
-provider, and the session you chose replaces the current one once it has rendered. Unlike
+provider, and a submit there keeps its draft and says that the switch is still running. The
+session you chose replaces the current one in the same tab once it has rendered and takes the
+focus, unless you moved to another tab meanwhile. The
+switch waits only for the session to open: the provider's model list loads afterwards, so
+a provider that is slow to list its models does not fail or delay it. A switch that fails
+returns the tab to its own session, and the tab's status rows keep saying why, for example
+"Switching to Copilot CLI failed: … Harness still serves Codex CLI.", until the next switch. Unlike
 `/provider`, opening a session this way leaves the saved default
 provider unchanged, so the next editor start still opens the default provider's session.
 Every other Harness tab then says in its status rows which provider the host now serves,
 for example "Harness now serves Codex CLI. Submit or run :ForgeHarness to return to
 Copilot CLI." Submitting from that tab, or running `:ForgeHarness` in it, switches the host
 back to the tab's provider under the same rule, without changing the default; the tab
-stays open and keeps its draft for you to submit. Until then `/sessions` lists that tab's
+stays open and keeps its draft for you to submit. Every such submit or `:ForgeHarness`
+either starts that switch or shows why it cannot start, also after an earlier attempt was
+refused, and `:ForgeHarness` brings back the tab it runs in, even when the switch that
+detached it finished while you were in that tab. Until then `/sessions` lists that tab's
 session under **Inactive** marked `(open, disconnected)`.
 A session of another worktree is history-only; open Harness from that worktree to
 resume it. `Ctrl-J` deletes the selected saved session and closes every tab that shows it.
@@ -549,26 +588,32 @@ After selecting an interaction, choose **Conversation only** to keep current fil
 or **Conversation and files** to restore its checkpoint too. Conversation-only
 rollback works without a file checkpoint. `/undo` also opens the list while a turn runs,
 and the list includes the running turn's interaction and the newest interaction of a
-paused goal. A `/undo` that cannot open its list, because Harness refused it or a rollback is
+paused goal, which it marks `paused`. A `/undo` that cannot open its list, because Harness refused it or a rollback is
 already in progress, leaves `/undo` in the composer. Confirming conversation rollback collects active execution before changing history and
-leaves the task paused; choosing **Conversation and files** collects it before showing the
+leaves a task that was working paused, while a plan waiting in review stays in review; choosing **Conversation and files** collects it before showing the
 files to restore, so the preview describes settled files, and both options say that they
 stop the running turn. Choosing **Cancel** on that preview rolls nothing back, and its
 description says that the turn was already stopped. From confirmation until the rollback finishes, the status reads
 `Rolling back the conversation` (or `… and files`), and a paused queue keeps its `paused`
 heading. A restore that stopped part-way shows `Restore interrupted` and requires recovery
 through `/undo` before other rollbacks; a restore that is still running never shows it.
+When the files were restored but the provider refused the conversation rewind, the notice
+says so and names both ways out: **Continue interrupted restore** retries the conversation,
+and **Restore pre-restore files** puts the files back.
 Rollback rewinds the
 provider's own conversation, so it requires a provider that supports native rewind (Codex,
 Copilot, and Claude). With Antigravity, `/undo` reports that conversation rollback is
 unsupported and changes nothing. Claude can rewind only to the end of an earlier
-interaction, not before the first one. An interaction that cannot be rolled back is marked
+interaction, not before the first one, and not to a point before its context was compacted,
+because the compaction replaced the conversation before it. An interaction that cannot be
+rolled back is marked
 unavailable in the list with its reason, and choosing it reports that reason and changes
 nothing. A failed rollback stays in `:messages` after its notice fades.
 Rolling back an interaction inside a goal leaves the goal paused; rolling back the
 interaction that started it, or an earlier one, removes the goal. The transcript drops every
 row of the rolled-back interactions, including task rows such as `Goal completed` and
-`Goal cleared`. A completed rollback returns the rolled-back prompt to the composer, a
+`Goal cleared`. Rolling back the interaction that started a plan also removes the plan from
+the artifact count and the artifact picker, whatever phase it reached. A completed rollback returns the rolled-back prompt to the composer, a
 `/goal <objective>` or `/plan <request>` command as typed, only when you have not typed there since confirming
 it, and it does not move focus out of another window. Rolling back every interaction of a
 session that took its name from its first prompt leaves the session unnamed again, so the tab
@@ -608,7 +653,14 @@ and the exchange's final duration can read lower than the time since you submitt
 prompt. An exchange cut off because Forge itself stopped reports the active time at its
 last recorded event.
 When interruption begins, the execution timer stops and status changes to **Stopping**,
-which stays unchanged until the stop settles.
+which stays unchanged until the stop settles. Running children stay listed beneath it until
+each is cancelled, and the status area keeps its height until the stop settles, so the
+transcript above it moves once rather than as each child leaves. When the stop leads into more
+work, such as a compaction that runs the stopped turn again, the status area keeps that height
+while the work runs, so the status line stays in the row where **Stopping** was; it fits its
+content again once nothing runs. A turn that runs while its task is paused, such as a prompt
+sent to a session whose plan a restart paused, shows its own **Working** status with its time
+and interrupt key; **Paused** appears only while nothing runs.
 If cleanup outlives its response deadline, **Cleanup timed out - provider state uncertain**
 replaces the spinner. Harness retains ownership until cleanup settles; the timeout does not
 authorize another turn against uncertain provider state. Copilot force-stops its shared native
@@ -627,12 +679,24 @@ Thought headers show successful/total tools and append changed-file counts when
 nonzero. Repeated successful edits to one file count once. Individual tool errors
 and compaction details remain available in the expanded timeline.
 `/compact` asks the provider to compact the conversation's context and adds one
-`Context compacted` row with the token counts the provider reports. Sent during a turn,
-it stops the turn; the status and the exchange heading then read `Compacting` while the
-provider works, and the turn runs again on the compacted context. The row sits inside that
+`Context compacted` row with the context size before and after the compaction, as the
+provider reports them; a provider that reports no counts gets no figures. Both figures measure
+the whole context, so on a short conversation they can rise: a summary longer than the few
+messages it replaces outweighs them. Sent during a turn,
+it stops the turn; the status and the exchange heading then read `Compacting` and count the
+compaction's own time while the provider works, and the heading keeps that word until the turn
+runs again on the compacted context. The row sits inside that
 exchange, above the output of the turn that ran again, and ends with `turn ran again`.
 When the provider declines, for example because nothing is left to compact, the row reads
-`Context not compacted` followed by the provider's own explanation, and the notice repeats it.
+`Context not compacted` followed by the provider's own explanation, such as Copilot's
+"Nothing to compact." or Claude Code's "Not enough messages to compact.", and the notice
+repeats it. A turn that `/compact` stopped runs again whether the provider compacted, declined,
+or failed, so the exchange never rests on `Paused` waiting for a resume that nothing sends.
+It runs again with the input it was given, also after a model, thinking-level, or permission
+change: a plan revision keeps your change request, saved comments, and edits, and a turn that
+was fixing failed checks keeps those checks and their output.
+A tool approval still waiting when a stop such as `/compact` ends the turn is cancelled, not
+denied: the call reads as interrupted, and the turn that runs again may request it afresh.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought beside the
 phase and its controls, after a `│` separator. The thought uses the remaining width,
 with an ellipsis when it does not fit, and disappears when the controls need the whole
@@ -698,12 +762,22 @@ expires, on every provider; it is neither steered nor sent while the request is 
 An explicitly queued follow-up likewise waits while a question is pending. After an
 approval expires, a waiting message steers into the automatic continuation turn when
 the provider accepts steering, or runs after it.
+A message sent while the parent waits for its children (`Waiting for agents`) waits
+under "Queued follow-up inputs", because the parent has no running turn to steer. When
+the children report, it steers into the turn that continues the parent with their
+results, or, if that turn has already ended, runs once after it as a follow-up. Either
+way, on every provider, the parent's report and the message both reach the transcript.
 `Ctrl-C` only interrupts active work. It never submits or steers the composer,
 including while editing a queued message. Interrupting active work pauses the
 queue: drafts and queued follow-ups remain unsent, and the status split shows
 `Queued follow-up inputs · paused · <M-r> resume`, with the configured retry key. Press
 it to resume the queue in its order. Submitting a new prompt also resumes the queue;
-that prompt runs first, ahead of the explicitly queued follow-ups. `Ctrl-C` with
+that prompt runs first, ahead of the explicitly queued follow-ups and of any message the
+interrupt returned to the queue. A message you sent before pressing `Ctrl-C`, even one
+still being sent when the interrupt lands, stays in the paused queue and does not run
+by itself. The heading keeps `paused` in every frame until the queue resumes, also while
+the stop settles, while such a message still reads `[submitting]`, and while a `/compact`
+or a rollback runs. `Ctrl-C` with
 nothing running pauses nothing. With a child timeline selected, it interrupts
 that child without sending the draft. A message or follow-up sent to a selected child
 leaves the composer at once and returns to it only if the child rejects it.
@@ -750,17 +824,24 @@ stays paused until you send or resume. Choosing a working session only focuses i
 A reopen cannot revive a provider process that Harness shares between sessions; when
 that process itself cannot start, switch the provider with `/provider`, which restarts
 Harness.
+A prompt Harness refuses before it reaches the provider, such as a bare `/read` or a
+typed answer while a question needs its own reply, stays in the queue marked failed with
+the reason. No turn runs or fails and the provider is not restarted; edit, retry, or
+remove the entry there.
 An interrupt that Harness cannot confirm restarts the provider the same way and ends
 the interrupted exchange as failed. A prompt interrupted before it was sent stays in
 the queue marked failed, and Harness never resends it on its own; retry or edit it
 there.
 Pending steering appears above queued follow-ups in the status split, under
-"Steering active turn". A steered message stays there after the provider accepts it,
-until the provider reports that the message joined the running turn; it then moves
+"Steering active turn". A steer the provider cannot take yet, because it is still
+starting the turn, is listed there marked `[waiting]` until the provider takes it.
+A steered message stays there after the provider accepts it, until the provider reports that the message joined the running turn; it then moves
 into the transcript at that point, before the output that used it. If the exchange ends
 without that report, for example after an interruption, the message appears in the
 transcript as `Steering (not confirmed read)`. Harness never resends such a message,
-because the provider did accept it. Explicitly
+because the provider did accept it. Once the exchange settles and its heading folds,
+a steered message stays visible directly below that heading. A message still waiting
+for the provider when you stop the turn moves to the paused queue, unsent. Explicitly
 queued messages remain visible while execution is paused or idle. Direct submissions
 enter exchange history. The lower prompt buffer contains only the draft being edited.
 The prompt grows with visual wrapped rows up to its configured maximum height.
@@ -774,7 +855,11 @@ they remain visible in red with the reason instead. `Alt-R` retries the first
 failed message without changing the composer draft, and resumes a paused queue so
 the message is sent. A message Harness marked unsent, such as one interrupted before
 the model replied or before provider dispatch, is retried this way, including after a
-host restart. With no failed message, `Alt-R` resumes a paused queue. For uncertain
+host restart. With no failed message, `Alt-R` resumes a paused queue. A failed
+message pauses the queue, and a prompt you send after it runs as the next exchange
+while the failed message stays, unsent, for `Alt-R`. Follow-ups queued behind a failed
+message wait for it, and the heading then reads
+`Queued follow-up inputs · paused · <M-r> retry`. For uncertain
 delivery, the same shortcut checks provider acceptance before permitting a resend; an
 entry whose delivery is uncertain after a host restart requires manual delivery
 confirmation and is not resent by this shortcut. Explicitly queued messages do not
@@ -783,7 +868,10 @@ The prompt inherits ordinary text-buffer editing and navigation mappings. Harnes
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
 question or approval, `op` for artifacts, `og` for agents, model selection, help,
-and closing Harness. The artifact list omits cancelled plans; their transcript rows still
+and closing Harness. A question popup closed on any of its pages, by its close key or the
+interrupt key, leaves the question pending with its answers, and `oe` reopens it; earlier
+questions that were already answered or withdrawn do not stand in its way. The artifact list
+omits cancelled plans; their transcript rows still
 open them. Cancelling a plan also removes its editable planning directory, so a later plan
 never reads the cancelled draft as current work. These hotkeys also work with Read permissions.
 In Insert mode, `Ctrl-J` inserts a newline at the cursor and preserves the draft.
@@ -816,7 +904,10 @@ the queue, and `M-t` moves forward while editing. Navigation preserves message o
 and saved drafts. Leaving a message unchanged releases it, so only messages you
 changed and the one open in the composer stay held. Earlier messages may execute,
 but the first held message and all later messages wait. `Ctrl-S` saves the edit in its
-reserved position. Submitting an empty edit deletes that message. Finishing restores
+reserved position, and the queue row shows the saved text from that moment while Harness
+confirms the edit. If Harness rejects the edit, the row returns to the text Harness still
+holds, a notice gives the reason, and the next `M-s` reopens your edit. Submitting an
+empty edit deletes that message. Finishing restores
 any unqueued draft that was in the composer before editing began.
 While editing, `Ctrl-Q` instead removes the selected message from the queue and keeps
 its edited text and attachments in the normal prompt. It does not submit automatically,
@@ -921,7 +1012,8 @@ are independent, and neither changes sandbox settings.
 After saving a question, its answer block shows
 `Generating response · <model> · Thinking: <effort>`. Leaving and returning to the
 block preserves the pending status and the eventual answer. Closing PlanReview
-while an answer is running keeps the review open and explains the pending operation.
+while an answer, save, or review edit is running keeps the review open with the notice
+"Plan review stays open until its running answers and edits finish."
 If the buffer is forcibly closed, completed answers remain available after reopening.
 Planning retains the session's current tool-approval mode, configured under
 **Permissions → Tools → Mode**.
@@ -932,7 +1024,12 @@ tool-approval mode unless plan acceptance explicitly selects a different mode.
 Questions have no timeout. By default, the agent receives question IDs immediately
 and can keep working while you answer. For an important decision that blocks
 progress, the agent can request `wait: true`; the question appears as **Required**
-and its tool call waits for the answers. Open questions with
+and its tool call waits for the answers. Every question asked while a plan is drafted
+or revised is Required: planning waits for your answer, and the status reads
+`Waiting for your answer`. Quitting the editor or interrupting the turn ends the question
+with it: the transcript reads `Question lost: <header>`, the plan is paused, and you
+continue by typing the answer as a prompt and running `/task resume`. Cancelling the plan
+with `/plan cancel` ends its questions with it and adds no such row. Open questions with
 `oe` or `/questions`; Tab and Shift-Tab switch questions, including answered drafts.
 Enter records a draft and advances to the next unanswered question. Confirming the
 last pending question submits all answers together; ignoring an optional question
@@ -1034,6 +1131,8 @@ The winbar also shows the selected workflow and phase: `plan · draft`,
 `exec · verify`, or `goal · work`. Pausing preserves that label, such as
 `exec · check · paused`. A planning turn may resubmit its plan before it ends,
 so the label changes to `plan · review` only once the submitting turn settles. A
+`/compact` while a plan waits in review runs no planning turn, so the label stays
+`plan · review` while it compacts. A
 revision whose acceptance is already decided, such as the one a saved comment
 produces under automatic acceptance, goes straight from `plan · draft` to
 `exec · implement`. Resuming Check runs Harness checks locally rather than
@@ -1056,6 +1155,9 @@ A revision that ends without resubmitting, after five turns without progress or 
 total allowance, returns the plan to review at its last submitted revision with a
 `Plan revision stopped` row; the plan never fails, and the comments sent with the request
 stay in the review.
+A first draft that stops this way reads `Planning stopped · no progress limit reached`.
+A prompt you type then reaches the model as conversation, and `/task resume` plans
+again with it in the conversation.
 
 PlanReview shows declaration changes with nearby context lines and enclosing
 declaration boundaries, using the regular diff grouping rules. Nearby method
@@ -1119,6 +1221,10 @@ Declaration navigation never opens a popup.
 While a planning response is running, follow-up instructions can revise and resubmit the plan
 in that same response. A later edit requires a new submission before review. Submission never
 authorizes implementation.
+An inline comment attaches to the plan line under the cursor. The comment key inside an
+existing comment edits that comment; on a question's answer it starts a follow-up in that
+thread. Saving a comment that holds no text saves nothing, and saving a comment emptied of
+its text deletes it.
 Approving a plan and requesting changes both open an optional-comment popup. Press
 `Enter` or `Ctrl-S` in normal or insert mode to submit. Approval accepts an empty
 comment. A change request needs an overall comment, a saved or unsaved inline comment, or

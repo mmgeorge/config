@@ -393,8 +393,7 @@ impl ExchangeDriver {
                             Ok((exchange, turn)) if self.pending_plan_acceptance.is_none() => {
                                 self.pending_plan_acceptance = Some(PendingPlanAcceptance {
                                     run,
-                                    exchange,
-                                    turn,
+                                    planning: PlanningSettlement::Sealed { exchange, turn },
                                 });
                                 publish_task_state(
                                     command_messages.as_ref(),
@@ -405,6 +404,30 @@ impl ExchangeDriver {
                                     step,
                                 );
                                 trace.record(session_id, "plan.acceptance_pending", serde_json::json!({"command_id":id.as_str(),"update_step":step}));
+                            }
+                            Err(error) if crate::exchange::failure::storage_failure(&error) => {
+                                trace.record(session_id, "plan.acceptance_uncommitted", serde_json::json!({"command_id":id.as_str(),"reason":error.to_string(),"update_step":step}));
+                                self.commands.uncommitted(
+                                    run.command,
+                                    CommandJournalError::DomainCommit,
+                                    trace,
+                                    session_id,
+                                    step,
+                                );
+                            }
+                            // The planning invocation has not settled, and its authority cannot
+                            // seal it: the task changed under it, for example by its own
+                            // submission before it adopted the new revision, by `/plan accept on`,
+                            // or by the acceptance questions. The acceptance waits for the
+                            // invocation to settle and is then prepared again, so it is never
+                            // recorded as a finished failure that automatic recovery would only
+                            // find again.
+                            Err(error) if self.pending_plan_acceptance.is_none() => {
+                                trace.record(session_id, "plan.acceptance_deferred", serde_json::json!({"command_id":id.as_str(),"reason":error.to_string(),"update_step":step}));
+                                self.pending_plan_acceptance = Some(PendingPlanAcceptance {
+                                    run,
+                                    planning: PlanningSettlement::Unsealed,
+                                });
                             }
                             result => {
                                 trace.record(session_id, "plan.acceptance_rejected", serde_json::json!({"command_id":id.as_str(),"reason":result.err().map(|error| error.to_string()),"update_step":step}));
@@ -514,12 +537,14 @@ impl ExchangeDriver {
                         }
                     }
                     Err(OperationFailure::Transition(TransitionFailure::Rejected(failure))) => {
+                        self.failed_parking_command = Some(id.clone());
                         let (queued, retained) = run.into_retained();
                         drop(retained);
                         self.commands
                             .finish(queued, Err(failure), trace, session_id, step);
                     }
                     Err(error) => {
+                        self.failed_parking_command = Some(id.clone());
                         trace.record(session_id, "exchange.command.effect_failed", serde_json::json!({"command_id":id.as_str(),"code":error.code(),"storage_cause":error.storage_cause(),"reason":error.diagnostic(),"update_step":step}));
                         let checkpoint = run.checkpoint().cloned();
                         let preparation_overdue =
@@ -642,6 +667,20 @@ impl ExchangeDriver {
                         self.commands
                             .finish(run.command, Ok(outcome), trace, session_id, step);
                     }
+                    Ok(NativeCommandProgress::CompactionUnsuccessful(unsuccessful)) => {
+                        // The stopped turn has already been handed back, so execution stays open.
+                        trace.record(session_id, "exchange.compaction.failed", serde_json::json!({
+                                "command_id":id.as_str(),"update_step":step,"code":unsuccessful.failure.code(),"reason":unsuccessful.cause.to_string(),
+                            }));
+                        let run = *run;
+                        self.commands.finish(
+                            run.command,
+                            Err(CommandFailure::Compaction(unsuccessful.failure)),
+                            trace,
+                            session_id,
+                            step,
+                        );
+                    }
                     Err(error) => {
                         trace.record(session_id, "exchange.configuration.effect_failed", serde_json::json!({
                                 "command_id":id.as_str(),"code":error.code(),"storage_cause":error.storage_cause(),"reason":error.diagnostic(),"update_step":step,
@@ -692,10 +731,12 @@ impl ExchangeDriver {
                             failure,
                         )) = error
                         {
+                            self.failed_parking_command = Some(id.clone());
                             let (queued, _) = run.into_retained();
                             self.commands
                                 .finish(queued, Err(failure), trace, session_id, step);
                         } else {
+                            self.failed_parking_command = Some(id.clone());
                             self.execution_stop_begin(services);
                             let (queued, retained) = run.into_retained();
                             let command_id = queued.record.request.id.clone();

@@ -39,6 +39,10 @@ struct BridgeFixtureProvider {
     /// Report an interrupted open provisionally until native shutdown joins its worker, as an
     /// adapter whose retained operation store publishes its interruption observation first does.
     open_provisional_until_shutdown: std::sync::atomic::AtomicBool,
+    /// Report an interrupted open as possibly applied, before and after native shutdown, as the
+    /// Codex adapter does once its `thread/start` request was written: the retained operation
+    /// completes with that uncertain observation and repeats it to every later collector.
+    open_uncertain_after_dispatch: std::sync::atomic::AtomicBool,
     open_started: tokio::sync::Notify,
     open_failure: Mutex<Option<ProviderError>>,
     open_persistent_failure: Mutex<Option<ProviderError>>,
@@ -98,6 +102,7 @@ impl BridgeFixtureProvider {
             terminal_release: tokio::sync::Notify::new(),
             open_blocked: std::sync::atomic::AtomicBool::new(false),
             open_provisional_until_shutdown: std::sync::atomic::AtomicBool::new(false),
+            open_uncertain_after_dispatch: std::sync::atomic::AtomicBool::new(false),
             open_started: tokio::sync::Notify::new(),
             open_failure: Mutex::new(None),
             open_persistent_failure: Mutex::new(None),
@@ -235,6 +240,22 @@ impl NativeProvider for BridgeFixtureProvider {
         if let Some(error) = self.open_persistent_failure.lock().unwrap().clone() {
             return Err(error);
         }
+        let uncertain = self.open_uncertain_after_dispatch.load(Ordering::Acquire);
+        if uncertain
+            && operation
+                .check_admission(ProviderOperation::ThreadOpen)
+                .is_err()
+        {
+            return Err(ProviderFailure::new(
+                ProviderOperation::ThreadOpen,
+                ProviderFailureKind::Cancelled,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            )
+            .into());
+        }
         let provisional = self.open_provisional_until_shutdown.load(Ordering::Acquire);
         if provisional
             && operation
@@ -292,7 +313,13 @@ impl NativeProvider for BridgeFixtureProvider {
         if self.open_blocked.load(Ordering::Acquire) {
             self.open_started.notify_one();
             let reason = operation.interrupted().await;
-            return Err(if provisional {
+            return Err(if uncertain {
+                reason.failure(
+                    ProviderOperation::ThreadOpen,
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                )
+            } else if provisional {
                 reason.failure(
                     ProviderOperation::ThreadOpen,
                     forge_provider_api::ProviderPhase::Collection,
@@ -991,7 +1018,7 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     );
     effect
         .reply
-        .send(Ok(crate::provider::LiveHostCommit { task_permit: None }))
+        .send(Ok(crate::provider::LiveHostCommit))
         .map_err(|_| anyhow::anyhow!("callback lost its commit waiter"))?;
     let reply = pending.await?;
     assert_eq!(concurrent.await?.message, reply.message);
@@ -1091,6 +1118,43 @@ async fn shutdown_supersedes_a_provisional_open_failure_after_native_collection(
         matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Cancelled)
     );
     assert_eq!(native.shutdown_calls.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+/// Shutdown settles an interrupted open that may have reached the provider once native shutdown
+/// has collected every native resource.
+///
+/// The Codex adapter answers an open interrupted after its `thread/start` request was written
+/// with an uncertain observation, and its retained operation repeats that answer to every later
+/// collector, so the open could never settle: a child agent interrupted at that moment reported
+/// `shutdown: provider ThreadOpen failed: Cancelled`, every retried cleanup failed the same way,
+/// the child stayed `Closing`, and the parent's stop failed and restarted the provider. Native
+/// shutdown ends the process that could have created the thread, so nothing remains to collect.
+#[tokio::test]
+async fn shutdown_settles_an_uncertain_open_after_native_collection() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    native.open_blocked.store(true, Ordering::Release);
+    native
+        .open_uncertain_after_dispatch
+        .store(true, Ordering::Release);
+    let bridge = Arc::new(bridge(root.path(), native.clone()).await?);
+    let request = provider_request(root.path());
+    let opening = bridge.clone();
+    let worker = tokio::spawn(async move { opening.thread_open(request).await });
+    native.open_started.notified().await;
+    if let Err(error) = bridge.shutdown().await {
+        panic!("shutdown reported the collected open as a cleanup failure: {error}");
+    }
+    let error = worker
+        .await?
+        .expect_err("shutdown must interrupt the held open");
+    assert!(
+        matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Cancelled)
+    );
+    if let Err(error) = bridge.shutdown().await {
+        panic!("a retried shutdown reported the collected open again: {error}");
+    }
     Ok(())
 }
 

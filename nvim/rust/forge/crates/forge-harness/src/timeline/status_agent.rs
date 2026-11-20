@@ -37,6 +37,9 @@ pub struct StatusAgent {
     pub tool_total: usize,
     /// Newest readable reasoning summary of the child's running turn, when shown.
     pub reasoning_summary: Option<String>,
+    /// Informational messages the child has not read yet: a running child cannot take one into
+    /// its turn, so each waits in its inbox until the child's next task.
+    pub waiting_message_count: usize,
 }
 
 impl StatusAgent {
@@ -153,5 +156,10 @@ fn snapshot(
         reasoning_summary: status_thoughts
             .then(|| exchange.latest_reasoning_summary().map(str::to_owned))
             .flatten(),
+        waiting_message_count: run
+            .inbox
+            .iter()
+            .filter(|message| message.delivery == crate::agent::MessageDelivery::Queued)
+            .count(),
     }
 }

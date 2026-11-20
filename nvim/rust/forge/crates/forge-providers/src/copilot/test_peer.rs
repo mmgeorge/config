@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 pub(super) struct SdkPeer {
     requests: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
-    _writer: Arc<tokio::sync::Mutex<DuplexStream>>,
+    writer: Arc<tokio::sync::Mutex<DuplexStream>>,
 }
 
 impl SdkPeer {
@@ -21,6 +21,20 @@ impl SdkPeer {
             .lock()
             .expect("fixture request lock is not poisoned")
             .clone()
+    }
+
+    /// Inspect the native requests received so far without collecting the peer.
+    pub(super) fn requests(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .expect("fixture request lock is not poisoned")
+            .clone()
+    }
+
+    /// Publish a native notification that no request of the adapter prompts, as Copilot does
+    /// when it starts a turn it accepted earlier.
+    pub(super) async fn notify(&self, notification: &Value) {
+        write_frame(&mut *self.writer.lock().await, notification).await;
     }
 }
 
@@ -63,7 +77,7 @@ pub(super) fn streams(
         SdkPeer {
             requests,
             task,
-            _writer: writer,
+            writer,
         },
     )
 }

@@ -230,6 +230,7 @@ function StatusView:resize()
     if not visible then
       if self.window and vim.api.nvim_win_is_valid(self.window) then vim.api.nvim_win_close(self.window, true) end
       self.window = nil
+      self.stop_hold = nil
       if self.separator then
         vim.wo[options.transcript_window].fillchars = self.separator.fillchars
         vim.wo[options.transcript_window].winhighlight = self.separator.winhighlight
@@ -255,6 +256,8 @@ function StatusView:resize()
       vim.wo[window].scrollbind = false
       vim.wo[window].cursorbind = false
       vim.wo[window].foldenable = false
+      -- Rows a stop holds below the last status line stay blank rather than showing `~`.
+      vim.api.nvim_win_call(window, function() vim.opt_local.fillchars:append({ eob = " " }) end)
       self.separator = { fillchars = vim.wo[options.transcript_window].fillchars,
         winhighlight = vim.wo[options.transcript_window].winhighlight }
       vim.api.nvim_win_call(options.transcript_window, function()
@@ -266,6 +269,19 @@ function StatusView:resize()
       vim.wo[options.transcript_window].winhighlight = highlights .. (highlights ~= "" and "," or "") .. "WinSeparator:Normal"
     end
     local wanted = vim.api.nvim_win_text_height(self.window, { start_row = 0 }).all
+    -- A stopping exchange's rows leave one by one, a child at a time, and each height change
+    -- re-scrolls the transcript above. The split keeps its height until the settled stop ends the
+    -- status, which closes it in one step. A stop that leads into more work, such as a compaction
+    -- that runs the stopped turn again, keeps the height while that work runs: lowering the split
+    -- moves its first row down, and the status line with it. The hold ends once nothing runs.
+    if self.content.stopping then
+      self.stop_hold = true
+    elseif not self.content.animated then
+      self.stop_hold = nil
+    end
+    if self.stop_hold and previous_window == self.window then
+      wanted = math.max(wanted, vim.api.nvim_win_get_height(self.window))
+    end
     local available = vim.api.nvim_win_get_height(options.transcript_window) + vim.api.nvim_win_get_height(self.window) - 1
     local height = math.max(1, math.min(wanted, available))
     if vim.api.nvim_win_get_height(self.window) ~= height then vim.api.nvim_win_set_height(self.window, height) end

@@ -681,6 +681,33 @@ mod tests {
         Ok(())
     }
 
+    /// A compaction between turns reports that no turn waits for it, so the editor keeps a plan
+    /// that waits in review labelled as in review rather than as a draft a turn may replace.
+    #[tokio::test]
+    async fn compaction_between_turns_holds_no_turn() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.capability.native_compact = true;
+        broker.session.native_compact = true;
+        broker.session.provider_session_id = Some("context-conversation".into());
+        let (_job, _started) =
+            broker.prepare_owned_compaction(CompactionProvenance::Manual, None)?;
+        let status = broker.snapshot()?.status;
+        assert!(
+            matches!(
+                status,
+                crate::session::state_machine::SessionPhase::Compacting {
+                    turn_waiting: false,
+                    ..
+                }
+            ),
+            "{status:?}"
+        );
+        Ok(())
+    }
+
     /// A declined request keeps the provider's own words, and notifications applied while the
     /// request ran fill what its result omits.
     ///

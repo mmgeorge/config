@@ -36,11 +36,15 @@ enum TurnProgress {
 pub(crate) struct TurnEnd {
     pub outcome: turn::TurnOutcome,
     pub completed_at_ms: i64,
+    /// The summed time of the CLI turns that reported the turn's token usage.
     pub duration_ms: Option<u64>,
     /// The last transcript chain entry of the turn, which is its rewind checkpoint.
     pub checkpoint: Option<String>,
     /// Inputs the turn consumed, in delivery order.
     pub commands: Vec<String>,
+    /// Whether the CLI started an input of this turn, recording it as a user entry, that no
+    /// assistant entry answers.
+    pub unanswered: bool,
 }
 
 /// The native end of one `/compact` operation.
@@ -106,6 +110,18 @@ struct TurnDecoder {
     tools: HashMap<String, ToolItem>,
     tool_order: Vec<String>,
     checkpoint: Option<String>,
+    /// Whether the CLI started an input of this turn after the turn's last assistant entry.
+    ///
+    /// The CLI records a started input as a user entry. A steer still queued at a CLI turn's
+    /// `result` starts a follow-up CLI turn after the answer, so a stop can leave a request
+    /// unanswered behind an answered checkpoint.
+    unanswered_input: bool,
+    /// The `duration_ms` of each CLI turn whose `result` reported usage, in arrival order.
+    ///
+    /// A Forge turn's duration covers only these, because a speed figure divides the reported
+    /// output by it: a follow-up CLI turn that a stop ended before any message reports no usage,
+    /// and its few milliseconds once stood in for the whole answer's time.
+    usage_durations: Vec<Option<u64>>,
     model_resolved: bool,
     last_result: Option<ResultFrame>,
     /// Latest usage of each API message in the current CLI turn, in arrival order.
@@ -114,6 +130,19 @@ struct TurnDecoder {
     /// consumed their prompts; these figures stand in for it. Each result clears them, so the
     /// next CLI turn of a steered Forge turn starts empty.
     message_usage: Vec<MessageUsage>,
+}
+
+impl TurnDecoder {
+    /// Sum the durations of the CLI turns that reported usage, unknown when one of them gave no
+    /// duration or none reported usage.
+    fn usage_duration_ms(&self) -> Option<u64> {
+        if self.usage_durations.is_empty() {
+            return None;
+        }
+        self.usage_durations
+            .iter()
+            .try_fold(0_u64, |total, duration| total.checked_add((*duration)?))
+    }
 }
 
 /// One API message's latest usage report and whether its output count is final.
@@ -139,12 +168,14 @@ enum OutputCount {
     Final,
 }
 
-/// A journaled steering input written to the CLI that has not yet joined processing.
+/// A journaled steering input written to the CLI whose consumption is not yet reported.
 ///
 /// The CLI reports `command_lifecycle started` for the input's frame `uuid` when it adds the
 /// input to the next model request, both when the input folds into the running CLI turn after a
-/// tool result and when it starts a follow-up CLI turn. That report is the input's consumption
-/// evidence, which the adapter publishes as a native user item carrying `submission_id`.
+/// tool result and when it starts a follow-up CLI turn. The model's first output after that
+/// report is the input's consumption evidence, which the adapter publishes as a native user item
+/// carrying `submission_id`. A stop that ends the request before any output leaves the steer
+/// unread, and the adapter withdraws its request from the CLI history.
 #[derive(Clone)]
 struct RecordedSteering {
     submission_id: SubmissionId,
@@ -179,6 +210,8 @@ pub(crate) struct ClaudeSessionState {
     commands: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<CommandState>>>,
     /// Journaled steering by frame `uuid`, held until the CLI starts, cancels, or loses it.
     steering: std::sync::Mutex<HashMap<String, RecordedSteering>>,
+    /// Journaled steering the CLI started, in start order, held until the model's next output.
+    started_steering: std::sync::Mutex<Vec<RecordedSteering>>,
     turn_end: std::sync::Mutex<Option<oneshot::Sender<Result<TurnEnd, ProviderError>>>>,
     output: Mutex<completion::ProviderCompletion>,
     catalog: RwLock<SessionCatalog>,
@@ -206,6 +239,7 @@ impl ClaudeSessionState {
             decoder: Mutex::new(TurnDecoder::default()),
             commands: std::sync::Mutex::new(HashMap::new()),
             steering: std::sync::Mutex::new(HashMap::new()),
+            started_steering: std::sync::Mutex::new(Vec::new()),
             turn_end: std::sync::Mutex::new(None),
             output: Mutex::new(completion::ProviderCompletion::default()),
             catalog: RwLock::new(SessionCatalog::default()),
@@ -286,6 +320,7 @@ impl ClaudeSessionState {
     pub(crate) async fn invalidate_binding(&self, cause: ProviderError) {
         self.close_admission();
         self.recorded_steering().clear();
+        self.started_steering().clear();
         self.retain_failure(cause.clone()).await;
         self.revoke_authority().await;
         self.end_turn(Err(cause.clone()));
@@ -452,6 +487,24 @@ impl ClaudeSessionState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn started_steering(&self) -> std::sync::MutexGuard<'_, Vec<RecordedSteering>> {
+        self.started_steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Publish the consumption of every started steer once the model's output follows it.
+    ///
+    /// Callers run this before they emit the output, so each consumption report precedes the
+    /// output that answers it.
+    async fn publish_started_steering(&self) -> Result<(), ProviderError> {
+        let started = std::mem::take(&mut *self.started_steering());
+        for steering in started {
+            self.publish_consumed_steering(steering).await?;
+        }
+        Ok(())
+    }
+
     /// Publish a started steering input's consumption on its original turn.
     ///
     /// The report addresses the active turn only while that turn still belongs to the steering
@@ -565,9 +618,12 @@ impl ClaudeSessionState {
         let Some(active) = self.active.read().await.clone() else {
             return Ok(());
         };
-        // Steering the retiring invocation never started has no turn left to report into.
+        // Steering the retiring invocation never started, or that no output answered, has no
+        // turn left to report into.
         self.recorded_steering()
             .retain(|_, steering| steering.scope != active.address.scope);
+        self.started_steering()
+            .retain(|steering| steering.scope != active.address.scope);
         let completed = matches!(outcome, turn::TurnOutcome::Completed { .. });
         let mut events = Vec::new();
         {
@@ -694,9 +750,9 @@ impl ClaudeSessionState {
                 commands.remove(&lifecycle.command_uuid);
             }
         }
-        // `started` is the boundary where steering joins the next model request. A cancelled
-        // input, or one that completes without starting, never reached the model. The emission
-        // runs before this method takes the active write lock because `emit` reads that turn.
+        // `started` is the boundary where steering joins the next model request, and the model's
+        // next output reports its consumption. A cancelled input, or one that completes without
+        // starting, never reached the model.
         let steering = match lifecycle.state {
             CommandState::Started | CommandState::Cancelled | CommandState::Completed => {
                 self.recorded_steering().remove(&lifecycle.command_uuid)
@@ -706,7 +762,7 @@ impl ClaudeSessionState {
         if lifecycle.state == CommandState::Started
             && let Some(steering) = steering
         {
-            self.publish_consumed_steering(steering).await?;
+            self.started_steering().push(steering);
         }
         if !matches!(
             lifecycle.state,
@@ -714,9 +770,16 @@ impl ClaudeSessionState {
         ) {
             return Ok(());
         }
-        let checkpoint = self.decoder.lock().await.checkpoint.clone();
-        let mut active = self.active.write().await;
-        let Some(active) = active
+        let (checkpoint, unanswered, duration_ms) = {
+            let decoder = self.decoder.lock().await;
+            (
+                decoder.checkpoint.clone(),
+                decoder.unanswered_input,
+                decoder.usage_duration_ms(),
+            )
+        };
+        let mut active_turn = self.active.write().await;
+        let Some(active) = active_turn
             .as_mut()
             .filter(|active| active.commands.contains(&lifecycle.command_uuid))
         else {
@@ -724,6 +787,9 @@ impl ClaudeSessionState {
         };
         if lifecycle.state == CommandState::Started {
             active.native_turn_running = true;
+            drop(active_turn);
+            // The CLI records a started input as a user entry before its model request.
+            self.decoder.lock().await.unanswered_input = true;
             return Ok(());
         }
         if active.native_turn_running || self.awaits_native_start(active) {
@@ -732,9 +798,10 @@ impl ClaudeSessionState {
         self.end_turn(Ok(TurnEnd {
             outcome: turn::TurnOutcome::Interrupted,
             completed_at_ms: timestamp(),
-            duration_ms: None,
+            duration_ms,
             checkpoint,
             commands: active.commands.clone(),
+            unanswered,
         }));
         Ok(())
     }
@@ -1058,6 +1125,9 @@ impl ClaudeSessionState {
                 | StreamEvent::Other { .. } => Vec::new(),
             }
         };
+        if !events.is_empty() {
+            self.publish_started_steering().await?;
+        }
         for event in events {
             self.emit(event).await?;
         }
@@ -1079,6 +1149,7 @@ impl ClaudeSessionState {
             let mut decoder = self.decoder.lock().await;
             if let Some(uuid) = &frame.uuid {
                 decoder.checkpoint = Some(uuid.clone());
+                decoder.unanswered_input = false;
             }
             if decoder.current_api_message.is_none() {
                 decoder.current_api_message = Some(message_id.clone());
@@ -1131,6 +1202,9 @@ impl ClaudeSessionState {
                     | ContentBlock::Other { .. } => {}
                 }
             }
+        }
+        if !events.is_empty() {
+            self.publish_started_steering().await?;
         }
         for event in events {
             self.emit(event).await?;
@@ -1247,6 +1321,10 @@ impl ClaudeSessionState {
                             )
                             .at_phase(ProviderPhase::Observation, FailureDisposition::Unchanged),
                         );
+                        operation.compaction.result.provider_explanation = status
+                            .compact_error
+                            .as_deref()
+                            .and_then(compaction_explanation);
                         true
                     }
                     _ => false,
@@ -1327,6 +1405,18 @@ impl ClaudeSessionState {
                 };
                 operation.compaction.completed_at_ms = Some(timestamp());
             }
+            // The command's output is the CLI's answer to the user, such as "Not enough
+            // messages to compact.", and explains a failure whose status carried no words.
+            if operation.compaction.state == CompactionState::Failed
+                && operation.compaction.result.provider_explanation.is_none()
+            {
+                operation.compaction.result.provider_explanation = result
+                    .result
+                    .as_deref()
+                    .into_iter()
+                    .chain(result.errors.iter().map(String::as_str))
+                    .find_map(compaction_explanation);
+            }
             if let Some(ended) = operation.ended.take() {
                 let _ = ended.send(CompactionEnd {
                     compaction: Some(operation.compaction.clone()),
@@ -1399,6 +1489,11 @@ impl ClaudeSessionState {
             usage => usage,
         };
         if let Some(usage) = usage {
+            self.decoder
+                .lock()
+                .await
+                .usage_durations
+                .push(result.duration_ms);
             let report = TurnUsageReport::accounting(
                 identity::UsageReportId::new(result.uuid.clone())
                     .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?,
@@ -1419,11 +1514,15 @@ impl ClaudeSessionState {
             })
             .await?;
         }
-        let checkpoint = {
+        let (checkpoint, unanswered, duration_ms) = {
             let mut decoder = self.decoder.lock().await;
             decoder.last_result = Some(result.clone());
             decoder.current_api_message = None;
-            decoder.checkpoint.clone()
+            (
+                decoder.checkpoint.clone(),
+                decoder.unanswered_input,
+                decoder.usage_duration_ms(),
+            )
         };
         // Decide under the turn lock so concurrently written steering either joins this decision
         // or is rejected. Steering the CLI has not started yet starts the next CLI turn, which
@@ -1444,9 +1543,10 @@ impl ClaudeSessionState {
         self.end_turn(Ok(TurnEnd {
             outcome,
             completed_at_ms: timestamp(),
-            duration_ms: result.duration_ms,
+            duration_ms,
             checkpoint,
             commands: active.commands.clone(),
+            unanswered,
         }));
         Ok(())
     }
@@ -2116,6 +2216,19 @@ fn todo_checklist(input: &Value, address: &TurnAddress) -> Option<ProviderCheckl
         replace_entries: true,
         entry_list,
     })
+}
+
+/// Keep the CLI's words about a compaction as display text.
+///
+/// The transcript stores a local command's output inside `<local-command-stdout>` tags; only the
+/// text between them is the CLI's answer.
+fn compaction_explanation(text: &str) -> Option<forge_provider_api::SanitizedMessage> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("<local-command-stdout>")
+        .and_then(|inner| inner.strip_suffix("</local-command-stdout>"))
+        .unwrap_or(text);
+    forge_provider_api::SanitizedMessage::new(text.trim()).ok()
 }
 
 /// Map a CLI result to the Forge turn outcome.

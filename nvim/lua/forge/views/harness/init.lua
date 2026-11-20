@@ -35,7 +35,7 @@ local function apply_snapshot(state, result, activation)
     source_state = state,
     interaction_mode = "reconcile",
     open_mode = activation.open_mode,
-    focus = session.harness == state,
+    focus = session.selected_harness() == state,
     insert = activation.insert,
     on_settled = activation.on_settled,
   })
@@ -147,29 +147,80 @@ function M.open()
   vim.api.nvim_set_current_win(state.composer_win)
 end
 
+---Describe the work in `state` that stopping the shared host would interrupt or lose.
+---@param state ForgeHarnessPresentationState
+---@return string? work A phrase such as "a running turn", or nil when the session holds none.
+function M.session_pending_work(state)
+  if state.switching_provider == true then return "a provider switch in progress" end
+  local status_kind = not state.host_error and state.status and state.status.kind
+  if status_kind == "awaiting_approval" then return "a turn waiting for an approval" end
+  if activity.busy(state) then return "a running turn" end
+  if (state.status and state.status.kind == "finalizing") == true then return "a turn that is still finishing" end
+  local queued = #(state.queue or {})
+  if queued == 1 then return "a queued prompt" end
+  if queued > 1 then return queued .. " queued prompts" end
+  if #(state.pending_steer or {}) > 0 then return "a steering prompt that is still being sent" end
+  if #(state.pending_submit or {}) > 0 or #(state.pending_handoff or {}) > 0 then
+    return "a prompt that is still being submitted"
+  end
+end
+
 ---Return whether `state` holds work that stopping the shared host would interrupt or lose.
 ---@param state ForgeHarnessPresentationState
 ---@return boolean
 function M.session_has_pending_work(state)
-  return activity.busy(state) or state.switching_provider == true
-    or (state.status and state.status.kind == "finalizing") == true
-    or #(state.queue or {}) > 0 or #(state.pending_steer or {}) > 0
-    or #(state.pending_submit or {}) > 0 or #(state.pending_handoff or {}) > 0
+  return M.session_pending_work(state) ~= nil
 end
 
----Switching provider stops the one host that serves every Harness tab, so it waits until no
----session in any tab has a turn running, queued or unsent input, or a finalization in progress.
----@return boolean
-function M.provider_switch_available()
+---Name the view that holds blocking work: its tab number and session name, or "this tab".
+---@param state ForgeHarnessPresentationState
+---@param current boolean
+---@return string
+function M.pending_work_place(state, current)
+  if current then return "this tab" end
+  local tab = state.timeline_tab
+  local tab_number = tab and vim.api.nvim_tabpage_is_valid(tab) and vim.api.nvim_tabpage_get_number(tab)
+  local name = state.session and state.session.name
+  name = type(name) == "string" and name ~= "" and name or nil
+  if tab_number then return name and ("tab %d (%s)"):format(tab_number, name) or ("tab %d"):format(tab_number) end
+  return name and ('session "%s"'):format(name) or "another Harness session"
+end
+
+---Explain why the provider cannot switch now, or return nil when it can. Switching provider
+---stops the one host that serves every Harness tab, so it waits until no session in any tab has a
+---turn running, queued or unsent input, a finalization, or a provider switch in progress. A tab
+---whose host already stopped has nothing left to interrupt, unless that tab is itself switching
+---the host back to its provider: stopping the host then would discard that switch's session open.
+---@return string?
+function M.provider_switch_refusal()
   local state = session.harness
-  if state.session == nil or state.state_sync_pending or M.session_has_pending_work(state) then return false end
+  if state.session == nil then
+    return "Cannot switch providers yet: Harness is still opening this tab's session."
+  end
+  if state.state_sync_pending then
+    return "Cannot switch providers yet: Harness is still loading this tab's session."
+  end
+  local function refusal(blocking_state, work)
+    return ("Cannot switch providers yet: %s has %s. Finish or cancel it first."):format(
+      M.pending_work_place(blocking_state, blocking_state == state), work)
+  end
+  local work = M.session_pending_work(state)
+  if work then return refusal(state, work) end
   for _, other_state in pairs(session.harness_by_id) do
-    if other_state ~= state and other_state.session and not other_state.host_error
-      and M.session_has_pending_work(other_state) then
-      return false
+    if other_state ~= state and other_state.session then
+      if other_state.switching_provider == true then
+        return ("Cannot switch providers yet: %s is switching the Harness provider. Wait for it to finish.")
+          :format(M.pending_work_place(other_state, false))
+      end
+      local other_work = not other_state.host_error and M.session_pending_work(other_state)
+      if other_work then return refusal(other_state, other_work) end
     end
   end
-  return true
+end
+
+---@return boolean
+function M.provider_switch_available()
+  return M.provider_switch_refusal() == nil
 end
 
 ---@param provider string?
@@ -268,6 +319,19 @@ end
 ---  Defaults to true, for an explicit provider choice. A caller that only follows a chosen
 ---  session to its provider passes false, so resuming a session never changes the default.
 
+---Say in plain words why a provider switch did not open its session, keeping the raw failure.
+---@param failure string
+---@return string
+function M.switch_failure_cause(failure)
+  if failure:find("unresolved request", 1, true) and failure:find("session.initialize", 1, true) then
+    return ("the Harness host stopped before the session opened (%s)"):format(failure)
+  end
+  if failure:find("ModelList", 1, true) and failure:find("Timeout", 1, true) then
+    return ("the provider did not list its models in time (%s)"):format(failure)
+  end
+  return failure
+end
+
 ---Replace the host with one that serves `provider`, then open `destination` in the current view.
 ---The view says that the switch is running until the destination replaces it, and every other view
 ---keeps a notice naming the provider the host now serves (`mark_detached_views`). A view whose own
@@ -284,8 +348,9 @@ function M.switch_provider(provider, destination)
     notifications.error("Unknown Harness provider: " .. tostring(provider), "Harness provider")
     return false
   end
-  if not M.provider_switch_available() then
-    notifications.warn("Finish or cancel pending work before switching providers", "Harness provider")
+  local refusal = M.provider_switch_refusal()
+  if refusal then
+    notifications.warn(refusal, "Harness provider")
     return false
   end
   if not destination or (destination.kind ~= "new" and destination.kind ~= "resume")
@@ -303,6 +368,7 @@ function M.switch_provider(provider, destination)
   if provider == previous_provider then return false end
   local initialize_options = destination.kind == "new" and { new_session_name = "" }
     or { session_id = destination.session_id }
+  require("forge.views.harness.diagnostic").set(state, "switch_failure", nil)
   state.switching_provider, state.switch_notice = true, "Switching Harness to " .. provider_config.label
   controller.with_state(state, controller.render)
   client.host_stop(nil, function()
@@ -350,20 +416,30 @@ function M.switch_provider(provider, destination)
           end
         end,
         on_error = function(switch_error)
-          notifications.error("Failed to switch Harness provider: " .. switch_error, "Harness provider")
+          local cause = M.switch_failure_cause(switch_error)
+          notifications.error(("Switching to %s failed: %s"):format(provider_config.label, cause), "Harness provider")
           config.options.harness.provider = previous_provider
           if returning then
             -- The view was already detached, and every other view returns on its own submit, so
             -- no host is restarted on its behalf.
             state.switching_provider, state.switch_notice = false, nil
-            M.mark_detached_views(nil, "Switch failed: " .. switch_error)
+            M.mark_detached_views(nil, ("Switching to %s failed: %s"):format(provider_config.label, cause))
             return
           end
           client.host_stop(nil, function()
             client.session_initialize(function(previous_result, previous_error, previous_detail)
               state.switching_provider, state.switch_notice = false, nil
               finish_start(state, previous_result, previous_error, previous_detail)
-              if not previous_error then M.mark_detached_views(state) end
+              if not previous_error then
+                -- The view is back on its own session; it keeps saying why the switch did not
+                -- happen until the next switch, since the notification alone fades.
+                require("forge.views.harness.diagnostic").set(state, "switch_failure",
+                  ("Switching to %s failed: %s. Harness still serves %s."):format(
+                    provider_config.label, cause, M.provider_label(previous_provider)),
+                  { category = "host", severity = "error", recovery = "switch", clear_when = "next provider switch" })
+                M.mark_detached_views(state)
+                controller.with_state(state, controller.render)
+              end
             end, { session_id = previous_session_id })
           end)
         end,
@@ -383,6 +459,10 @@ function M.new_session(name, options)
     and source_state.timeline_tab and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab)
     and valid_window(source_state.transcript_win) and valid_window(source_state.composer_win)
   local pending = not replace_current and session_navigation.begin_new(name, options and options.open_mode) or nil
+  -- `/new` focuses its new tab's composer, whose entry leaves Insert mode. `/clear` keeps the
+  -- focused composer, so it leaves Insert mode here, when submitted; the host's later reply keeps
+  -- whatever mode the user has entered since.
+  if replace_current and vim.api.nvim_get_current_win() == source_state.composer_win then vim.cmd("stopinsert") end
   startup.mark("layout.ready")
   startup.mark("session.new.dispatch")
   client.session_create({ source_session_id = source_session_id, name = name }, function(result, request_error)
@@ -408,7 +488,7 @@ function M.new_session(name, options)
       session_navigation.complete_pending(pending, result)
     elseif source_state.timeline_tab and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab) then
       session_navigation.activate(result, {
-        state = source_state, open_mode = "current", focus = session.harness == source_state,
+        state = source_state, open_mode = "current", focus = session.selected_harness() == source_state,
       })
     end
     startup.mark("snapshot.apply.end")

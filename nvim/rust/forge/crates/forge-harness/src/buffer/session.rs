@@ -735,6 +735,20 @@ impl SessionPresentation {
         Ok(patch)
     }
 
+    /// Get the newest presented exchange that has not finished, as the transcript draws it.
+    pub(crate) fn unfinished_exchange(&self) -> Option<Exchange> {
+        self.timeline
+            .entry_list()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                TimelineEntry::Exchange { exchange, .. } if !exchange.is_finished() => {
+                    Some(exchange.as_ref().clone())
+                }
+                _ => None,
+            })
+    }
+
     pub fn open(
         &mut self,
         document: DocumentId,

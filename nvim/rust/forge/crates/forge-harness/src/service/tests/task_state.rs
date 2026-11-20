@@ -2184,3 +2184,105 @@ async fn a_resumed_goal_turn_keeps_the_task_change_owner() -> Result<()> {
     service.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
+
+/// A prompt that runs while its session's task is paused shows that turn in the status, not the
+/// pause: the status row carries the turn's clock and interrupt key while it runs.
+#[tokio::test]
+async fn a_turn_that_runs_while_its_task_is_paused_reads_as_working() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use crate::session::state_machine::SessionPhase;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let mut writer = SqliteStore::open(&controller.data_root)?;
+    controller.task_controller.change(
+        &mut writer,
+        None,
+        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+            "Keep the paused goal".into(),
+            Default::default(),
+            1,
+        ))),
+        1,
+    )?;
+    let task = controller.task_controller.current()?.unwrap();
+    controller.task_controller.change(
+        &mut writer,
+        Some(&task.revision),
+        crate::task::TaskChange::Pause,
+        1,
+    )?;
+    drop(writer);
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    let held = script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let hold_id = held["id"].as_str().unwrap().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 10,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"while-paused","text":"Answer the lost question."}),
+            },
+            &sink,
+        )
+        .await?;
+    script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Wait {
+                id: hold_id.clone(),
+            },
+        )
+        .await?;
+
+    let snapshot = controller.broker.lock().await.snapshot()?;
+    assert_eq!(
+        controller
+            .task_controller
+            .current()?
+            .map(|task| task.status()),
+        Some(crate::task::TaskStatus::Paused)
+    );
+    let status = snapshot
+        .timeline
+        .iter()
+        .find_map(|entry| match entry {
+            crate::timeline::TimelineEntry::Status { status, .. } => Some(status.clone()),
+            _ => None,
+        })
+        .context("the running turn has no status entry")?;
+    assert!(
+        matches!(status, SessionPhase::Working { .. }),
+        "a running turn of a paused task read {status:?}"
+    );
+    script
+        .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
+        .await?;
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    reader.abort();
+    let _ = reader.await;
+    Ok(())
+}

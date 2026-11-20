@@ -105,7 +105,10 @@ impl Exchange {
             .map(ExchangeEntry::id);
         // A parked, finalizing, or finished exchange runs nothing, so only a running execution
         // clock keeps the newest group open; otherwise its label would report stale running tools.
-        let executing = !self.is_finished() && self.execution_started_at_ms().is_some();
+        // A stop pauses that clock as it begins collecting, yet it settles the exchange moments
+        // later, so its rows change in place instead of folding the group a frame early.
+        let executing = !self.is_finished()
+            && (self.execution_started_at_ms().is_some() || self.collection.is_some());
         let mut content = ExchangeContentView {
             commentary: Vec::new(),
             part: Vec::new(),

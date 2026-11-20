@@ -98,6 +98,7 @@ impl SessionController {
 
     /// Retain startup work while the owner alone commits its initialized native identity.
     pub(super) async fn start_provider(self: &Arc<Self>, sink: &MessageSender) {
+        self.resolve_inherited_model_settings(sink);
         let mut startup = self.provider_startup.lock().await;
         if let Some(task) = startup.as_ref() {
             if !task.is_finished()

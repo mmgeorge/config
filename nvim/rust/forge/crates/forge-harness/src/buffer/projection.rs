@@ -415,7 +415,7 @@ pub(super) fn timing_blocks(
         if exchange.is_finished() || exchange.state() != ExchangeState::Running {
             continue;
         }
-        if exchange.execution_started_at_ms().is_some()
+        if heading_clock_runs(exchange)
             && let Some(previous) = document.block(&BlockId(format!("{}:summary", exchange.id)))
         {
             let mut profile = width.clone();
@@ -631,7 +631,20 @@ pub(super) fn timing_label_due(
                 due.elapsed(now_ms, tool_ms);
             }
         }
+        if let Some(started_at_ms) = exchange.compaction_started_at_ms() {
+            due.elapsed(now_ms, now_ms.saturating_sub(started_at_ms).max(0) as u64);
+        }
     }
+}
+
+/// Report whether the exchange heading's figure advances with the clock.
+///
+/// The heading counts the execution clock while a turn runs and the compaction's own interval
+/// while a compaction runs; a compaction stops the turn it interrupts, so either clock alone
+/// can drive it. The timeline's periodic refresh and `timing_blocks` both read this, so a
+/// heading that counts is redrawn every second without a host event.
+pub(crate) fn heading_clock_runs(exchange: &Exchange) -> bool {
+    exchange.execution_started_at_ms().is_some() || exchange.compaction_started_at_ms().is_some()
 }
 
 pub(super) fn message_block(
@@ -1246,19 +1259,75 @@ impl TimelineRenderer<'_> {
                     .and_then(|entry| DelegatedAgent::resolve(delegation, entry))
             })
             .collect::<Vec<_>>();
+        // A stop cancels every running child while the status area still lists them, and the
+        // status closes only once the exchange settles. Until then the summary leaves out the
+        // children the stop cancelled, so they join it in the frame in which the status closes,
+        // and the transcript above moves once instead of once per step. Only the user's stop
+        // settles the exchange: a restart for a configuration change also collects the turn and
+        // its children, but the exchange runs on, so the children it cancelled are drawn at once.
+        // A child cancelled before the stopped turn started, by a restart or by the user, is
+        // already drawn, so the summary keeps it; withholding it emptied the summary mid-stop.
+        let stop_started_ms = (!exchange.is_finished()
+            && (exchange.cancellation_requested
+                || exchange.finalization_outcome()
+                    == Some(crate::exchange::ExchangeOutcome::Cancelled)))
+        .then(|| {
+            exchange
+                .turn
+                .last()
+                .map_or(i64::MIN, |turn| turn.started_at_ms())
+        });
         let identity = format!("{}:agents", exchange.id);
-        self.agent_group(&identity, &delegations, exchange.is_finished())
+        self.agent_group(
+            &identity,
+            &delegations,
+            exchange.is_finished(),
+            stop_started_ms,
+        )
     }
 
+    /// Summarize the latest run of each delegated child that has finished.
+    ///
+    /// `stop_started_ms` withholds the children that ended cancelled at or after that time,
+    /// which a stop of their parent cancelled, until that parent settles.
     fn agent_group(
         &mut self,
         identity: &str,
         delegations: &[DelegatedAgent<'_>],
         closed: bool,
+        stop_started_ms: Option<i64>,
     ) -> Result<()> {
-        let finished = delegations
+        // A parent can run one child several times in an exchange, through a model follow-up or a
+        // user's, and each run is its own delegation. The summary names each child once, by its
+        // latest run, so it never lists the same child twice with different results.
+        let mut latest_runs: Vec<&DelegatedAgent<'_>> = Vec::new();
+        for delegated in delegations {
+            match latest_runs
+                .iter_mut()
+                .find(|latest| latest.run.id == delegated.run.id)
+            {
+                Some(latest)
+                    if delegated.exchange.created_at_ms >= latest.exchange.created_at_ms =>
+                {
+                    *latest = delegated;
+                }
+                Some(_) => {}
+                None => latest_runs.push(delegated),
+            }
+        }
+        let finished = latest_runs
             .iter()
-            .filter(|delegated| delegated.exchange.is_finished())
+            .copied()
+            .filter(|delegated| {
+                let cancelled_by_stop = stop_started_ms.is_some_and(|stop_started_ms| {
+                    delegated.exchange.state() == ExchangeState::Cancelled
+                        && delegated
+                            .exchange
+                            .completed_at_ms()
+                            .is_none_or(|completed_at_ms| completed_at_ms >= stop_started_ms)
+                });
+                delegated.exchange.is_finished() && !cancelled_by_stop
+            })
             .collect::<Vec<_>>();
         let Some((first, rest)) = finished.split_first() else {
             return Ok(());
@@ -1290,7 +1359,7 @@ impl TimelineRenderer<'_> {
         };
         let mut sections = vec![format!(
             "Agents · {completed}/{} completed · {}s",
-            delegations.len(),
+            latest_runs.len(),
             wall_ms / 1000
         )];
         let tally = finished
@@ -1370,7 +1439,7 @@ impl TimelineRenderer<'_> {
                 .collect::<Vec<_>>();
             if nested.iter().any(|child| child.exchange.is_finished()) {
                 let section = self.begin_section(2);
-                self.agent_group(&format!("{leaf}:agents"), &nested, true)?;
+                self.agent_group(&format!("{leaf}:agents"), &nested, true, None)?;
                 self.finish_section(section, &leaf, false);
             }
             Ok(())
@@ -1615,6 +1684,14 @@ impl TimelineRenderer<'_> {
                 };
             }
         }
+        self.content(
+            interaction,
+            agents,
+            depth,
+            interaction.content(&layout.steering, false)?,
+            Some(&layout.questions),
+            MarkdownRole::Response,
+        )?;
         self.provider_checklist(interaction)?;
         self.host_file_changes(interaction)?;
         self.agent_results(interaction, agents)?;
@@ -2575,23 +2652,30 @@ Action",
         if let Some(explanation) = explanation {
             heading.push_str(&format!(" · {explanation}"));
         }
-        let context_tokens = compaction
-            .result
-            .context_tokens_before
-            .zip(compaction.result.context_tokens_after)
+        // The two figures must be one measure taken around the compaction. The provider's own
+        // counts come first: the context meter Harness captured at the start predates the
+        // context of a turn the compaction stopped, so beside the provider's post-compaction
+        // count it reads as a compaction that grew the context.
+        let result = &compaction.result;
+        let context_tokens = result
+            .pre_compaction_tokens
+            .zip(result.post_compaction_tokens)
             .or_else(|| {
-                compaction
-                    .result
+                result
                     .before_context
                     .as_ref()
                     .and_then(|context| context.current_tokens)
                     .zip(
-                        compaction
-                            .result
+                        result
                             .context_window
                             .as_ref()
                             .and_then(|context| context.current_tokens),
                     )
+            })
+            .or_else(|| {
+                result
+                    .context_tokens_before
+                    .zip(result.context_tokens_after)
             });
         if let Some((before, after)) = context_tokens {
             heading.push_str(&format!(
@@ -3804,7 +3888,7 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     let complete = interaction.is_finished();
     let status = interaction.activity();
     let paused = status == ExchangeActivity::Paused;
-    let duration = interaction.elapsed(now_ms) / 1000;
+    let mut duration = interaction.elapsed(now_ms) / 1000;
     let activity = if let Some(collection) = interaction.collection {
         collection.label()
     } else if interaction.state() == ExchangeState::Cancelled {
@@ -3823,7 +3907,15 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         "Waiting for your answer"
     } else if status == ExchangeActivity::WaitingForAgent {
         "Waiting for agents"
-    } else if matches!(status, ExchangeActivity::Compacting { .. }) {
+    } else if let Some((started_at_ms, completed_at_ms)) = heading_compaction(interaction, status) {
+        // A compaction stops the turn it interrupts, so the exchange has no live execution and
+        // reads as paused; the status row names the compaction and counts it from its start,
+        // and so does the heading, until the stopped turn runs again.
+        duration = completed_at_ms
+            .unwrap_or(now_ms)
+            .saturating_sub(started_at_ms)
+            .max(0) as u64
+            / 1000;
         "Compacting"
     } else {
         if complete {
@@ -3841,13 +3933,51 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     exchange_metrics_summary(interaction, now_ms, summary)
 }
 
+/// Find the compaction that holds the exchange heading, as its start and, once it has ended,
+/// its end.
+///
+/// A running compaction holds it, as it holds the status row. A manual compaction that stopped
+/// the turn and has completed keeps holding it while the exchange waits, paused, for that turn
+/// to run again; the first turn started after the compaction began releases it.
+fn heading_compaction(
+    interaction: &Exchange,
+    status: ExchangeActivity,
+) -> Option<(i64, Option<i64>)> {
+    if let ExchangeActivity::Compacting { started_at_ms } = status {
+        return Some((started_at_ms, None));
+    }
+    if status != ExchangeActivity::Paused {
+        return None;
+    }
+    if let Some(started_at_ms) = interaction.compaction_started_at_ms() {
+        return Some((started_at_ms, None));
+    }
+    interaction.node_list.iter().rev().find_map(|node| {
+        let ExchangeNode::Compaction { compaction, .. } = node else {
+            return None;
+        };
+        let started_at_ms = compaction.started_at_ms?;
+        (compaction.manual
+            && compaction.state == crate::provider::CompactionState::Completed
+            && interaction
+                .turn
+                .iter()
+                .all(|turn| turn.started_at_ms() < started_at_ms))
+        .then_some((started_at_ms, compaction.completed_at_ms))
+    })
+}
+
 fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String) -> String {
     let mut sections = vec![summary];
     if let Some(tools) = exchange_tool_label(interaction, now_ms) {
         sections.push(tools);
     }
     let mut tokens = Vec::new();
-    if let Some(usage) = token_usage_label(&interaction.usage()) {
+    // The input sums every turn, and the output is that of the turns that produced the answer,
+    // the same turns the speed divides by their time.
+    let mut usage = interaction.usage();
+    usage.output = interaction.metrics.reported_output_tokens;
+    if let Some(usage) = token_usage_label(&usage) {
         tokens.push(usage);
     }
     if let Some((output, duration)) = interaction
@@ -3868,8 +3998,13 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
     }
     let mut changes = crate::exchange::ProviderChangeIndex::default();
     changes.record(interaction);
-    if !changes.is_empty() {
-        let files = changes.paths().len();
+    // A planner's design and proposed files live in its authoring tree, not the workspace.
+    let files = changes
+        .paths()
+        .iter()
+        .filter(|path| !crate::plan::is_authoring_path(path))
+        .count();
+    if files > 0 {
         sections.push(format!(
             "{files} file{} changed",
             if files == 1 { "" } else { "s" }
@@ -4048,6 +4183,70 @@ pub(crate) mod tests {
             1
         );
         assert!(projected.action.values().any(|action| matches!(action, super::TranscriptAction::File { path, .. } if path == "/fixture/nested/AGENTS.md")));
+        Ok(())
+    }
+
+    /// A planning exchange's heading counts the workspace files it changed, not its plan drafts.
+    ///
+    /// The planner writes its design and proposed files in the plan's authoring tree under the
+    /// Harness state directory, so a plan draft read `3 files changed` while the workspace had
+    /// no change at all.
+    #[test]
+    fn exchange_heading_counts_workspace_files_only() -> anyhow::Result<()> {
+        use forge_provider_api::{
+            InspectableArguments, ItemCompletion, ItemEvent, ItemStart, ToolCompletion,
+            ToolDescriptor, ToolItemEvent,
+        };
+        let mut exchange = crate::storage::test::running_exchange("plan-draft");
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        let state = crate::storage::state::directory(std::path::Path::new("D:/forge-data"));
+        let authoring = state
+            .join("plan-workspaces")
+            .join(exchange.session_id.as_str())
+            .join("plan");
+        let paths = [
+            authoring.join("docs").join("overview.md"),
+            authoring.join("files").join("src").join("order.ts"),
+            std::path::PathBuf::from("src/order.ts"),
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            crate::turn::test_support::tool(
+                &mut exchange,
+                &address,
+                &format!("change-{index}"),
+                ItemStart::FileChange(ToolDescriptor {
+                    semantics: Default::default(),
+                    name: "edit".into(),
+                    title: "edit".into(),
+                    arguments: InspectableArguments::new(json!({})),
+                }),
+                [
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted,
+                    },
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::Changes(crate::provider::ProviderChangeSet {
+                            file: vec![crate::provider::ProviderFileChange {
+                                path: path.display().to_string(),
+                                move_path: None,
+                                kind: crate::provider::ProviderChangeKind::Update,
+                                diff: "+changed".into(),
+                            }],
+                        }),
+                    },
+                    ItemEvent::Completed(ItemCompletion::FileChange(ToolCompletion {
+                        outcome: forge_provider_api::ToolOutcome::Succeeded,
+                        descriptor: None,
+                        output: None,
+                        changes: Default::default(),
+                    })),
+                ],
+                1,
+            )?;
+        }
+        let heading = super::exchange_metrics_summary(&exchange, 2, "● Thought 0s".into());
+        assert!(heading.contains("│ 1 file changed"), "{heading}");
         Ok(())
     }
 
@@ -5004,6 +5203,64 @@ pub(crate) mod tests {
         }
     }
 
+    /// Show the output and speed of the turn that ran again when the turn it replaced was stopped
+    /// before its output count was known.
+    ///
+    /// A compaction or a configuration change stops a turn and runs it again in the same
+    /// exchange. The stopped turn's unknown output made the exchange total unknown, so the
+    /// heading dropped the rerun's output and speed although the rerun reported both.
+    #[test]
+    fn a_turn_that_ran_again_shows_the_output_of_its_rerun() -> anyhow::Result<()> {
+        use forge_provider_api::{TurnUsageReport, UsageReportId};
+        let mut exchange = crate::storage::test::running_exchange("rerun");
+        let stopped = crate::turn::test_support::address(&exchange, "stopped");
+        let rerun = crate::turn::test_support::address(&exchange, "rerun");
+        for (address, report_id, observed_at_ms, output, duration_ms) in [
+            (&stopped, "stopped-call", 1_000, None, 4_000),
+            (&rerun, "rerun-call", 6_000, Some(40), 2_000),
+        ] {
+            exchange.start_turn(address.clone(), observed_at_ms - 1)?;
+            exchange.observe_event(
+                &crate::provider::test_support::native_event(
+                    crate::provider::EventScope::Invocation {
+                        invocation: address.scope.clone(),
+                    },
+                    forge_provider_api::ProviderEvent::Turn {
+                        thread_id: address.thread_id.clone(),
+                        turn_id: address.turn_id.clone(),
+                        event: forge_provider_api::TurnEvent::Usage(TurnUsageReport::accounting(
+                            UsageReportId::new(report_id)?,
+                            observed_at_ms,
+                            Some(forge_provider_api::usage::TokenUsage {
+                                input: Some(150),
+                                output,
+                                ..Default::default()
+                            }),
+                            Some(duration_ms),
+                        )?),
+                    },
+                ),
+                observed_at_ms,
+            )?;
+            if output.is_none() {
+                exchange.settle_running_turns(
+                    crate::exchange::ExchangeOutcome::Interrupted,
+                    observed_at_ms,
+                )?;
+            }
+        }
+
+        let heading = project_rows(&TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: exchange.clone().into(),
+            agent_by_id: HashMap::new(),
+        })?
+        .join("\n");
+        assert!(heading.contains("300 -> 40 · 20 tps"), "{heading}");
+        Ok(())
+    }
+
     /// Keep a call's throughput when its end arrives as an endpoint no call identity claims.
     ///
     /// Copilot reports a model call's tokens and duration under the call's identity, then ends
@@ -5434,6 +5691,396 @@ pub(crate) mod tests {
         for run_id in ["child-0", "child-1", "child-2"] {
             assert!(opened.contains(&run_id), "{opened:?}");
         }
+        Ok(())
+    }
+
+    /// A child the parent ran twice in one exchange is summarized once, by its latest run. The
+    /// summary once listed it twice with the two runs' different results.
+    #[test]
+    fn agents_summary_names_a_child_run_twice_once() -> anyhow::Result<()> {
+        use crate::exchange::ExchangeOutcome;
+        let mut parent = crate::storage::test::running_exchange("parent");
+        let address = crate::turn::test_support::address(&parent, "turn");
+        parent.start_turn(address, 0)?;
+        let mut child_exchange = Vec::new();
+        for (index, completed_at_ms) in [(0, 2_000), (1, 5_000)] {
+            assert!(parent.append_delegation(
+                "child-0",
+                &format!("call-{index}"),
+                "explore",
+                40
+            )?);
+            let Some(crate::exchange::ExchangeNode::AgentReference { agent: delegation }) =
+                parent.node_list.last()
+            else {
+                unreachable!("delegation appends a reference")
+            };
+            let mut child = crate::storage::test::running_exchange(&delegation.child_exchange_id);
+            child.created_at_ms = 50 + index;
+            child.finish(ExchangeOutcome::Complete, completed_at_ms)?;
+            child_exchange.push(child);
+        }
+        let entry = TimelineEntry::Exchange {
+            id: parent.id.clone(),
+            created_at_ms: parent.created_at_ms,
+            agent_by_id: HashMap::from([(
+                "child-0".to_owned(),
+                TimelineEntry::AgentLifecycle {
+                    id: "child-0".into(),
+                    created_at_ms: 50,
+                    run: Box::new(child_agent("child-0", "explorer")),
+                    exchange: child_exchange,
+                    agent: Vec::new(),
+                },
+            )]),
+            exchange: parent.into(),
+        };
+        let rows = project_at(&entry, &WidthProfile::default(), 6_000)?
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("Agents · 1/1 completed")),
+            "{rows:#?}"
+        );
+        let leaves = rows
+            .iter()
+            .filter(|row| row.starts_with("✓ explorer · Ran "))
+            .collect::<Vec<_>>();
+        assert_eq!(leaves.len(), 1, "{rows:#?}");
+        assert!(leaves[0].starts_with("✓ explorer · Ran 4s"), "{rows:#?}");
+        Ok(())
+    }
+
+    /// A stop cancels every child of the exchange it stops while the status area still lists
+    /// them, and that area closes only when the exchange settles. The Agents summary once gained
+    /// the cancelled children as soon as the last of them settled, a frame before the status
+    /// closed, so the transcript above moved twice. The cancelled children now join the summary
+    /// when the exchange settles, and a child that ended before the stop stays as it was.
+    #[test]
+    fn a_stopping_exchange_summarizes_its_cancelled_children_once_it_settles() -> anyhow::Result<()>
+    {
+        use crate::exchange::ExchangeOutcome;
+        enum Parent {
+            Running,
+            Stopping,
+            Cancelled,
+        }
+        let agent_rows = |outcomes: &[Option<ExchangeOutcome>],
+                          parent: Parent|
+         -> anyhow::Result<Vec<String>> {
+            let mut entry = delegating_exchange(&["explorer-first", "explorer-second"], outcomes)?;
+            let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+                unreachable!("the fixture is an exchange entry")
+            };
+            match parent {
+                Parent::Running => {}
+                Parent::Stopping => {
+                    exchange.collection = Some(crate::exchange::ExchangeCollection::Pending);
+                    exchange.cancellation_requested = true;
+                    exchange.pause(5_500);
+                }
+                Parent::Cancelled => exchange.finish(ExchangeOutcome::Cancelled, 5_500)?,
+            }
+            let projected = project_at(&entry, &WidthProfile::default(), 6_000)?;
+            Ok(projected
+                .entry
+                .block
+                .iter()
+                .filter(|block| block.id.0.starts_with("parent:agents"))
+                .flat_map(|block| block.text.wire_rows())
+                .map(str::to_owned)
+                .collect())
+        };
+        let partly = agent_rows(&[Some(ExchangeOutcome::Cancelled), None], Parent::Stopping)?;
+        assert!(
+            partly.is_empty(),
+            "the summary showed a stop's first cancelled child: {partly:#?}"
+        );
+        let all_cancelled = [
+            Some(ExchangeOutcome::Cancelled),
+            Some(ExchangeOutcome::Cancelled),
+        ];
+        let collected = agent_rows(&all_cancelled, Parent::Stopping)?;
+        assert!(
+            collected.is_empty(),
+            "the summary gained the cancelled children before the stop settled: {collected:#?}"
+        );
+        let settled = agent_rows(&all_cancelled, Parent::Cancelled)?;
+        assert!(
+            settled
+                .first()
+                .is_some_and(|row| row.starts_with("Agents · 0/2 completed")),
+            "{settled:#?}"
+        );
+        assert_eq!(
+            agent_rows(
+                &[
+                    Some(ExchangeOutcome::Complete),
+                    Some(ExchangeOutcome::Cancelled)
+                ],
+                Parent::Stopping
+            )?,
+            agent_rows(&[Some(ExchangeOutcome::Complete), None], Parent::Running)?,
+            "a child that finished before the stop must keep the summary it had"
+        );
+        Ok(())
+    }
+
+    /// A configuration change restarts the delegating turn and cancels its children, and the
+    /// restarted turn may delegate again before the user stops it. The Agents summary withheld
+    /// every cancelled child while any collection ran, so it blanked during the restart, and the
+    /// later stop removed the children the restart had cancelled and shortened the heading's
+    /// span. Each frame now keeps every row the one before it showed, and only the children the
+    /// stop itself cancels wait for the exchange to settle.
+    #[test]
+    fn the_agents_summary_keeps_every_row_it_showed_through_a_restart_and_a_stop()
+    -> anyhow::Result<()> {
+        use crate::exchange::{ExchangeCollection, ExchangeOutcome};
+        fn delegate(parent: &mut Exchange, run_id: &str, at_ms: i64) -> anyhow::Result<Exchange> {
+            assert!(parent.append_delegation(
+                run_id,
+                &format!("call-{run_id}"),
+                "explore",
+                at_ms
+            )?);
+            let Some(crate::exchange::ExchangeNode::AgentReference { agent: delegation }) =
+                parent.node_list.last()
+            else {
+                unreachable!("delegation appends a reference")
+            };
+            let mut child = crate::storage::test::running_exchange(&delegation.child_exchange_id);
+            child.created_at_ms = at_ms;
+            Ok(child)
+        }
+        fn frame(parent: &Exchange, children: &[(&str, &Exchange)], now_ms: i64) -> Vec<String> {
+            let entry = TimelineEntry::Exchange {
+                id: parent.id.clone(),
+                created_at_ms: parent.created_at_ms,
+                exchange: parent.clone().into(),
+                agent_by_id: children
+                    .iter()
+                    .map(|(run_id, child)| {
+                        (
+                            (*run_id).to_owned(),
+                            TimelineEntry::AgentLifecycle {
+                                id: (*run_id).to_owned(),
+                                created_at_ms: child.created_at_ms,
+                                run: Box::new(child_agent(run_id, run_id)),
+                                exchange: vec![(*child).clone()],
+                                agent: Vec::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            project_at(&entry, &WidthProfile::default(), now_ms)
+                .expect("the parent projects")
+                .entry
+                .block
+                .iter()
+                .filter(|block| block.id.0.starts_with("parent:agents"))
+                .flat_map(|block| block.text.wire_rows())
+                .map(str::to_owned)
+                .collect()
+        }
+        let leaf_names = |rows: &[String]| -> Vec<String> {
+            rows.iter()
+                .filter(|row| row.starts_with("✓ ") || row.starts_with("✗ "))
+                .filter_map(|row| row[4..].split(" · ").next().map(str::to_owned))
+                .collect()
+        };
+        let heading_seconds = |rows: &[String]| -> u64 {
+            rows.first()
+                .and_then(|heading| heading.split(" │ ").next())
+                .and_then(|heading| heading.rsplit(" · ").next())
+                .and_then(|span| span.trim_end_matches('s').parse().ok())
+                .unwrap_or_default()
+        };
+
+        let mut parent = crate::storage::test::running_exchange("parent");
+        parent.start_turn(crate::turn::test_support::address(&parent, "first"), 0)?;
+        let mut first = delegate(&mut parent, "explorer-1", 100)?;
+        let mut second = delegate(&mut parent, "explorer-2", 200)?;
+        // The restart cancels the first turn's children before it marks the exchange stopping.
+        first.finish(ExchangeOutcome::Cancelled, 900)?;
+        second.finish(ExchangeOutcome::Cancelled, 950)?;
+        let mut frames = vec![(
+            "the restart cancelled the children",
+            frame(
+                &parent,
+                &[("explorer-1", &first), ("explorer-2", &second)],
+                960,
+            ),
+        )];
+        parent.collection = Some(ExchangeCollection::Pending);
+        parent.pause_for_restart(1_000)?;
+        frames.push((
+            "the restart is collecting",
+            frame(
+                &parent,
+                &[("explorer-1", &first), ("explorer-2", &second)],
+                1_100,
+            ),
+        ));
+        parent.collection = None;
+        parent.start_turn(crate::turn::test_support::address(&parent, "second"), 2_000)?;
+        let mut third = delegate(&mut parent, "explorer-3", 2_100)?;
+        let mut fourth = delegate(&mut parent, "explorer-4", 2_200)?;
+        fourth.finish(ExchangeOutcome::Complete, 4_000)?;
+        frames.push((
+            "the restarted turn runs",
+            frame(
+                &parent,
+                &[
+                    ("explorer-1", &first),
+                    ("explorer-2", &second),
+                    ("explorer-3", &third),
+                    ("explorer-4", &fourth),
+                ],
+                5_000,
+            ),
+        ));
+        parent.collection = Some(ExchangeCollection::Pending);
+        parent.cancellation_requested = true;
+        parent.pause(5_100);
+        frames.push((
+            "the user stopped the turn",
+            frame(
+                &parent,
+                &[
+                    ("explorer-1", &first),
+                    ("explorer-2", &second),
+                    ("explorer-3", &third),
+                    ("explorer-4", &fourth),
+                ],
+                5_200,
+            ),
+        ));
+        third.finish(ExchangeOutcome::Cancelled, 5_300)?;
+        let stopping = frame(
+            &parent,
+            &[
+                ("explorer-1", &first),
+                ("explorer-2", &second),
+                ("explorer-3", &third),
+                ("explorer-4", &fourth),
+            ],
+            5_400,
+        );
+        assert_eq!(
+            leaf_names(&stopping),
+            leaf_names(&frames[frames.len() - 1].1),
+            "the child the stop cancelled joined the summary before the stop settled"
+        );
+        frames.push(("the stop cancelled the last child", stopping));
+        parent.finish(ExchangeOutcome::Cancelled, 5_500)?;
+        let settled = frame(
+            &parent,
+            &[
+                ("explorer-1", &first),
+                ("explorer-2", &second),
+                ("explorer-3", &third),
+                ("explorer-4", &fourth),
+            ],
+            5_600,
+        );
+        assert_eq!(
+            leaf_names(&settled),
+            ["explorer-1", "explorer-2", "explorer-3", "explorer-4"],
+            "{settled:#?}"
+        );
+        frames.push(("the stop settled", settled));
+        for pair in frames.windows(2) {
+            let ((earlier_name, earlier), (later_name, later)) = (&pair[0], &pair[1]);
+            let shown = leaf_names(later);
+            for name in leaf_names(earlier) {
+                assert!(
+                    shown.contains(&name),
+                    "{name} left the summary between \"{earlier_name}\" and \"{later_name}\": \
+                     {earlier:#?} then {later:#?}"
+                );
+            }
+            assert!(
+                heading_seconds(later) >= heading_seconds(earlier),
+                "the summary's span fell between \"{earlier_name}\" and \"{later_name}\": \
+                 {earlier:#?} then {later:#?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A stop pauses the exchange clock, yet the newest thought it interrupts keeps its open fold
+    /// until the exchange settles, so the rows the stop leaves change in place.
+    #[test]
+    fn a_stop_leaves_the_newest_thought_open_until_the_exchange_settles() -> anyhow::Result<()> {
+        use crate::provider::ToolStatus;
+        use forge_provider_api::ItemStart;
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"stopping", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Inspect", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address.clone(), 0)?;
+        exchange.observe_event(
+            &crate::turn::test_support::message(
+                &address,
+                "commentary",
+                Some(forge_provider_api::AgentMessageRole::Commentary),
+                "Reading the files",
+            ),
+            1,
+        )?;
+        let start = ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+            semantics: Default::default(),
+            name: "command".into(),
+            title: "Run".into(),
+            arguments: forge_provider_api::InspectableArguments::new(json!({})),
+        });
+        let updates = crate::turn::test_support::tool_updates(
+            &start,
+            ToolStatus::Succeeded,
+            None,
+            Default::default(),
+        );
+        crate::turn::test_support::tool(&mut exchange, &address, "read", start, updates, 2)?;
+        let thought_display =
+            |exchange: &Exchange| -> anyhow::Result<forge_buffer::node::NodeDisplay> {
+                let projected = super::project(
+                    super::ProjectionSource::Exchange(exchange),
+                    &WidthProfile::default(),
+                    3,
+                    false,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &mut crate::buffer::identity::DisplayRegistry::default(),
+                )?;
+                projected
+                    .entry
+                    .block
+                    .iter()
+                    .filter_map(|block| block.metadata.node.as_ref())
+                    .find(|node| node.kind == forge_buffer::node::NodeKind::Thought)
+                    .map(|node| node.default_display)
+                    .ok_or_else(|| anyhow::anyhow!("the commentary has no thought node"))
+            };
+        assert_eq!(
+            thought_display(&exchange)?,
+            forge_buffer::node::NodeDisplay::Full
+        );
+        exchange.collection = Some(crate::exchange::ExchangeCollection::Pending);
+        exchange.pause(3);
+        assert_eq!(
+            thought_display(&exchange)?,
+            forge_buffer::node::NodeDisplay::Full,
+            "the stop folded the thought it interrupted"
+        );
         Ok(())
     }
 

@@ -383,16 +383,31 @@ impl TimelineProjector {
     ///
     /// A child delegated by a top-level exchange belongs to that exchange's entry, which
     /// draws it inside the turn that ran it. A child whose delegating exchange has no
-    /// top-level entry stays a top-level entry of its own.
-    pub(crate) fn with_observed_agents(
+    /// top-level entry stays a top-level entry of its own. A child delegated by an exchange
+    /// that a rollback retired leaves the timeline with that exchange, together with its own
+    /// native children.
+    pub(crate) fn with_observed_agents<'exchange>(
         mut timeline: Vec<TimelineEntry>,
         observed: Vec<crate::agent::ObservedAgent>,
+        exchanges: impl IntoIterator<Item = &'exchange Exchange>,
     ) -> Result<Vec<TimelineEntry>> {
         timeline.retain(|entry| !matches!(entry, TimelineEntry::ObservedAgent { .. }));
+        let retired: std::collections::HashSet<_> = exchanges
+            .into_iter()
+            .filter(|exchange| {
+                exchange.disposition() != crate::exchange::HistoryDisposition::Current
+            })
+            .map(|exchange| exchange.id.as_str())
+            .collect();
         let parent = crate::agent::ObservedAgent::hierarchy(&observed)?;
         let mut visited = std::collections::HashSet::new();
         for index in 0..observed.len() {
             if parent[index].is_none() {
+                if retired.contains(observed[index].parent_scope().exchange_id.as_str()) {
+                    // Mark the retired subtree visited so the cycle check still covers it.
+                    observed_entry(index, &observed, &parent, &mut visited)?;
+                    continue;
+                }
                 let entry = observed_entry(index, &observed, &parent, &mut visited)?;
                 let delegating = observed[index].parent_scope().exchange_id.as_str();
                 let owner = timeline.iter_mut().find_map(|candidate| match candidate {

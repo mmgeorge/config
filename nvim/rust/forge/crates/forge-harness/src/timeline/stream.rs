@@ -844,7 +844,7 @@ fn ticking(entry: &TimelineEntry) -> bool {
             ..
         } => {
             !exchange.is_finished()
-                && (exchange.execution_started_at_ms().is_some()
+                && (crate::buffer::projection::heading_clock_runs(exchange)
                     || exchange.turn.iter().any(|turn| {
                         exchange
                             .tools_for_turn(turn.id())
@@ -863,7 +863,7 @@ fn ticking(entry: &TimelineEntry) -> bool {
                 crate::agent::AgentState::Starting | crate::agent::AgentState::Closing
             ) || exchange.iter().any(|exchange| {
                 !exchange.is_finished()
-                    && (exchange.execution_started_at_ms().is_some()
+                    && (crate::buffer::projection::heading_clock_runs(exchange)
                         || exchange.turn.iter().any(|turn| {
                             exchange
                                 .tools_for_turn(turn.id())

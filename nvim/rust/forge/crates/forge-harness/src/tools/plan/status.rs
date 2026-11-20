@@ -309,7 +309,7 @@ mod tests {
             "progress":crate::plan::execution::SemanticProgress::default(),"workspace_identity":null,"workspace_digest":{},
             "commands":[{"selected":true,"id":"compiler","command":"typecheck","state":"failed",
                 "started_at_ms":1,"completed_at_ms":2,"exit_code":1,"error":null,
-                "stdout":"unused","stderr":"unused","output":"saved.log","output_bytes":0,"preview":"",
+                "stdout":"unused","stderr":"unused","output":"saved.log","output_bytes":64,"preview":"",
                 "result":{"category":"diagnostics","selection":{"paths":[]},"widened":null,"targets":[],
                     "diagnostics":[{"severity":"error","message":"expected string","path":"src/main.rs","range":{"start":{"line":8,"column":4}},"code":"E0308"},
                         {"severity":"error","message":"linker failed"}],

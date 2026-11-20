@@ -63,6 +63,30 @@ T["unavailable_owner_shows_failure_and_preserves_prompt"] = function()
   eq(opened, true)
 end
 
+-- A submit while the view's host is being replaced cannot run, and it used to keep the draft
+-- without a word, in a live view and in one returning to its own provider alike.
+T["submit_during_a_provider_switch_says_why_and_keeps_the_draft"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local notifications = require("forge.infra.notifications")
+  local notice_list, calls = {}, 0
+  notifications.warn = function(message) notice_list[#notice_list + 1] = message end
+  notifications.error = function(message) notice_list[#notice_list + 1] = message end
+  require("forge.client").request = function() calls = calls + 1 end
+  state.session = { id = "switching", provider = "mock", model = "test" }
+  state.composer_buf = buffer.scratch()
+  state.switching_provider, state.switch_notice = true, "Switching Harness to Codex CLI"
+  buffer.set(state.composer_buf, { "keep this prompt" })
+  for _, submit in ipairs({ controller.submit, controller.queue_submit, controller.steer_submit }) do submit() end
+  state.host_error = "Harness now serves Codex CLI. Submit or run :ForgeHarness to return to Mock."
+  state.diagnostic = { host_error = { text = state.host_error, recovery = "reconnect" } }
+  controller.submit()
+  eq({ calls, buffer.line(state.composer_buf, 1), #notice_list }, { 0, "keep this prompt", 4 })
+  for _, notice in ipairs(notice_list) do
+    assert(notice:find("Switching Harness to Codex CLI", 1, true) and notice:find("draft", 1, true), notice)
+  end
+end
+
 T["harness_child_steering"] = function()
   local client = require("forge.client")
   local state = require("forge.session").harness
@@ -520,6 +544,31 @@ T["plan_review_label_follows_a_running_turn_rather_than_owner_activity"] = funct
   assert(header:find("plan · review", 1, true), header)
 end
 
+-- A compaction while a plan waits in review holds no planning turn, so the winbar keeps
+-- `plan · review` for the whole compaction instead of reading `plan · draft` until it ends. A
+-- compaction that stopped a planning turn still reads as that turn's draft.
+T["plan_review_label_holds_through_a_compaction_between_turns"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local header = ""
+  require("forge.shared.keymaps").apply_view_winbar = function(_, _, _, _, segments)
+    header = table.concat(vim.tbl_map(function(segment) return segment.text end, segments))
+  end
+  state.command_set = controller.command_set()
+  state.transcript_win = vim.api.nvim_get_current_win()
+  state.host_error, state.sync_error, state.connection_error = nil, nil, nil
+  state.session = { id = "plan-compaction", provider = "fixture_alpha", model = "test", resolved_model = "test",
+    active_task = { kind = "plan", phase = "review", status = "waiting" } }
+  state.runtime_epoch = "epoch"
+  state.activity = { revision = 1, phase = "working" }
+  state.status = { kind = "compacting", started_at_ms = 0, turn_waiting = false }
+  controller.refresh_winbar()
+  assert(header:find("plan · review", 1, true), header)
+  state.status = { kind = "compacting", started_at_ms = 0, turn_waiting = true }
+  controller.refresh_winbar()
+  assert(header:find("plan · draft", 1, true), header)
+end
+
 -- An acceptance made while the task is paused is only recorded. When it raised execution
 -- questions, the review's decision reply cannot say so, because the questions come first; the
 -- answer that settles the last of them reports how to carry the acceptance out, once.
@@ -601,8 +650,8 @@ T["effort_selection"] = function()
     eq((header:find("󱐋", 1, true) ~= nil), (tier == "ultrafast"))
     assert(not header:find("unverified", 1, true) and not header:find("unsupported", 1, true), header)
   end
-  -- Settings changes go straight to the host through `session.configure`; the header shows only
-  -- the host-applied settings, so it changes when the session publishes the new values.
+  -- Settings changes go straight to the host through `session.configure`. An idle change shows its
+  -- value at once, without the waiting marker, while the host validates and applies it.
   dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
   state.session.model, state.session.resolved_model, state.session.effort = "test", "test", "medium"
   state.session.service_tier = nil
@@ -632,7 +681,7 @@ T["effort_selection"] = function()
   end
   press_effort("effort_down", "n")
   assert(#transition == 1 and transition[1].params.effort == "low")
-  assert(header:find("test medium", 1, true), "header showed an unapplied effort: " .. header)
+  assert(header:find("test low", 1, true) and not header:find("*", 1, true), "idle effort change: " .. header)
   acknowledge(1)
   controller.refresh_winbar()
   assert(header:find("test low", 1, true) and not header:find("*", 1, true), header)
@@ -756,6 +805,37 @@ T["rejected_command_closes_the_completion_menu"] = function()
   eq(#failures, 1)
   eq(buffer.text(state.composer_buf), "/read")
   eq(hidden, 1)
+end
+
+-- A submit the view refuses before reading the draft, because its session is still starting, its
+-- provider is switching, or its host now serves another provider, left the completion menu drawn
+-- over the transcript until the composer was cleared. Every refusal, submitted or queued, closes it.
+T["refused_submit_closes_the_completion_menu"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  controller.render, controller.refresh_winbar = function() end, function() end
+  require("forge.views.harness").reconnect = function() return true end
+  state.composer_buf = buffer.scratch()
+  vim.api.nvim_win_set_buf(0, state.composer_buf)
+  notify.capture({ min_level = vim.log.levels.WARN, notifications = true })
+  mock_client.record()
+  local hidden = 0
+  package.loaded["blink.cmp"] = { hide = function() hidden = hidden + 1 end }
+  MiniTest.finally(function() package.loaded["blink.cmp"] = nil end)
+  local refusal_list = {
+    { session = nil },
+    { session = { id = "switching", model = "test" }, switching_provider = true },
+    { session = { id = "detached", model = "test" }, host_error = "Harness now serves Codex CLI." },
+  }
+  for _, refusal in ipairs(refusal_list) do
+    for _, action in ipairs({ controller.submit, controller.queue_submit }) do
+      state.session, state.switching_provider, state.host_error = refusal.session, refusal.switching_provider, refusal.host_error
+      buffer.set(state.composer_buf, { "/sessions" })
+      hidden = 0
+      action()
+      eq({ buffer.text(state.composer_buf), hidden }, { "/sessions", 1 })
+    end
+  end
 end
 
 T["mode_restart"] = function()
@@ -893,6 +973,7 @@ T["queued_model"] = function()
   end
   state.session = { id = "queued-model", provider = "mock", model = "old" }
   state.capability = { model_selection = true, effort_selection = true }
+  state.model_provider = "mock"
   state.model_list = {
     { id = "chosen", reasoning = { "xhigh" } },
     { id = "another", reasoning = { "high" } },
@@ -951,6 +1032,82 @@ T["queued_model"] = function()
   controller.submit()
   assert(#state.queue == 2 and configured.model == "immediate", "steering a model change did not configure the active turn")
   eq(#warnings, 1)
+end
+
+-- `/model` naming the model and effort the session already uses sent a configuration that changed
+-- nothing and said nothing, so the command looked ignored.
+T["model_command_that_changes_nothing_clears_the_composer_and_says_so"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local notifications = require("forge.infra.notifications")
+  local notice_list, configured = {}, {}
+  notifications.info = function(message) notice_list[#notice_list + 1] = message end
+  notifications.warn = function(message) error(message) end
+  notifications.error = function(message) error(message) end
+  require("forge.views.harness.prompt_history").record = function() end
+  controller.configure = function(next_config) configured[#configured + 1] = next_config end
+  state.session = { id = "unchanged-model", provider = "mock", model = "gpt-same", effort = "high" }
+  state.capability = { model_selection = true, effort_selection = true }
+  state.model_provider, state.model_list = "mock", { { id = "gpt-same", reasoning = { "low", "high" } } }
+  state.composer_buf = buffer.scratch()
+  for _, command in ipairs({ "/model gpt-same", "/model gpt-same high" }) do
+    buffer.set(state.composer_buf, { command })
+    controller.submit()
+    eq(buffer.line(state.composer_buf, 1), "")
+  end
+  eq({ #configured, #notice_list }, { 0, 2 })
+  for _, notice in ipairs(notice_list) do assert(notice:find("gpt-same", 1, true) and notice:find("already", 1, true), notice) end
+  buffer.set(state.composer_buf, { "/model gpt-same low" })
+  controller.submit()
+  eq(configured, { { model = "gpt-same", effort = "low" } })
+end
+
+-- `/model Haiku 5.5`, the winbar's own model text, was split into the model `Haiku` and the
+-- thinking level `5.5`; the winbar showed that pending pair until the host refused the unknown id.
+T["model_command_resolves_display_names_and_refuses_unknown_names_before_sending"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local notifications = require("forge.infra.notifications")
+  local requests = mock_client.record()
+  local error_list, winbar_selections = {}, {}
+  notifications.error = function(message) error_list[#error_list + 1] = message end
+  notifications.warn = function(message) error(message) end
+  notifications.info = function(message) error(message) end
+  require("forge.views.harness.prompt_history").record = function() end
+  controller.refresh_winbar = function()
+    winbar_selections[#winbar_selections + 1] = vim.deepcopy(state.configuration_requests or {})
+  end
+  controller.render = function() end
+  state.session = { id = "named-model", provider = "mock", model = "opus", effort = "default" }
+  state.capability = { model_selection = true, effort_selection = true }
+  state.model_provider, state.model_list = "mock", {
+    { id = "opus", label = "Opus 5.5", reasoning = { "low", "high" } },
+    { id = "haiku", label = "Haiku 5.5", reasoning = { "low", "high" } },
+    { id = "twin-a", label = "Twin" },
+    { id = "twin-b", label = "Twin" },
+  }
+  state.composer_buf = buffer.scratch()
+  for _, command in ipairs({ "/model Sonnet 5.5", "/model Twin", "/model haiku 5.5 extreme" }) do
+    buffer.set(state.composer_buf, { command })
+    controller.submit()
+    eq(buffer.line(state.composer_buf, 1), command)
+  end
+  eq(#requests, 0)
+  eq(winbar_selections, {})
+  eq(#error_list, 3)
+  assert(error_list[1]:find("haiku (Haiku 5.5)", 1, true) and error_list[1]:find("opus (Opus 5.5)", 1, true), error_list[1])
+  assert(error_list[2]:find("twin-a (Twin)", 1, true) and error_list[2]:find("twin-b (Twin)", 1, true), error_list[2])
+  assert(error_list[3]:find("extreme", 1, true) and error_list[3]:find("low, high", 1, true), error_list[3])
+  buffer.set(state.composer_buf, { "/model haiku 5.5" })
+  controller.submit()
+  eq(buffer.line(state.composer_buf, 1), "")
+  buffer.set(state.composer_buf, { "/model HAIKU 5.5 high" })
+  controller.submit()
+  local configured = {}
+  for _, request in ipairs(requests) do configured[#configured + 1] = { request.spec.method, request.spec.params } end
+  eq(configured, { { "session.configure", { model = "haiku" } },
+    { "session.configure", { model = "haiku", effort = "high" } } })
+  eq(#error_list, 3)
 end
 
 T["input_render_burst"] = function()
@@ -1042,6 +1199,51 @@ T["retry_input_resumes_a_paused_queue"] = function()
   eq({ requests[#requests].spec.params.action.kind, requests[#requests].spec.params.action.id }, { "retry", "failed" })
 end
 
+-- A composer send runs one main-loop turn after its key, while an interrupt runs at once, so the
+-- keys `Ctrl-S Ctrl-C` reach the client as a cancel followed by the submission. The submission
+-- still follows the pause the user saw when pressing its key: had it claimed the interrupt as the
+-- pause it follows, the host would resume the queue with it and run it once the stop settled.
+T["submit_pressed_before_an_interrupt_stays_behind_its_pause"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local input_state = require("forge.views.harness.input_state")
+  local view_command_set = require("forge.shared.view_command_set")
+  require("forge.views.harness.prompt_history").record = function() end
+  controller.render, controller.refresh_winbar = function() end, function() end
+  local requests = mock_client.record()
+  state.session = { id = "interrupt-order", provider = "mock", model = "test" }
+  state.runtime_epoch = "interrupt-order-owner"
+  state.composer_buf = buffer.scratch()
+  state.capability = { native_steer = true }
+  state.presentation = { capture_prompt = function()
+    return { buffer = state.composer_buf, document = "composer", is_current = function() return true end }
+  end }
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, true)
+  input_state.attach(state, function() end)
+  requests[1].callback({ revision = 1, control_revision = 4, suspended = false, messages = {} })
+  local command_set = controller.command_set()
+  local function press(name) view_command_set.action(command_set, name).run({}) end
+  local function submissions()
+    return vim.tbl_filter(function(request) return request.spec.method == "session.input.apply" end, requests)
+  end
+  buffer.set(state.composer_buf, { "typed before the interrupt" })
+  press("steer")
+  press("cancel")
+  local cancellation = requests[#requests]
+  eq(cancellation.spec.method, "session.turn.cancel")
+  wait_until(function() return #submissions() == 1 end, "the deferred submission was never sent")
+  local early = submissions()[1].spec.params
+  eq(early.action.message.text, "typed before the interrupt")
+  eq({ early.control_revision, early.after_control }, { 4, nil })
+  -- A submission pressed after the interrupt follows it, so the host resumes the queue with it.
+  buffer.set(state.composer_buf, { "typed after the interrupt" })
+  press("steer")
+  wait_until(function() return #submissions() == 2 end, "the later submission was never sent")
+  local late = submissions()[2].spec.params
+  eq({ late.action.message.text, late.after_control },
+    { "typed after the interrupt", cancellation.spec.params.operation_id })
+end
+
 T["paused_queue_heading_names_the_resume_key"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")
@@ -1062,6 +1264,53 @@ T["paused_queue_heading_names_the_resume_key"] = function()
   input.receive(state, { revision = 2, suspended = false, upsert = {}, removed = {} })
   controller.refresh_winbar()
   eq(paused[#paused], false)
+end
+
+-- Nothing sends a paused queue's messages until it is resumed, so every frame between the stop and
+-- the resume says so: while the exchange stops, while a message sent as the stop landed still
+-- reads `[submitting]`, in the frame a `/compact` is submitted, while it runs, and as it ends.
+T["paused_queue_heading_stays_in_every_frame_until_resumed"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local activity_fixture = dofile("nvim/lua/forge/tests/support/activity.lua")
+  state.input = { suspended = true }
+  state.queue = { { text = "queued follow-up", delivery = "queued" } }
+  local paused_hint = controller.paused_queue_hint(state)
+  eq(paused_hint, "<M-r> resume")
+  activity_fixture.set_busy(state, true)
+  local frames = {
+    { kind = "stopping" },
+    { kind = "idle" },
+    { kind = "working", activity = "handing_off" },
+    { kind = "compacting" },
+    { kind = "working" },
+  }
+  for _, status in ipairs(frames) do
+    state.status = status
+    eq({ status.kind, controller.paused_queue_hint(state) }, { status.kind, paused_hint })
+  end
+  state.queue = { { text = "sent as the stop landed", local_only = true, draft_state = "pending" } }
+  eq(controller.paused_queue_hint(state), paused_hint)
+  state.input.suspended = false
+  eq(controller.paused_queue_hint(state), nil)
+end
+
+-- A failed message waits for its retry and keeps the follow-ups behind it, so the heading says
+-- the queue is held and names the key that retries the failed message, also once a newer prompt
+-- has resumed delivery.
+T["queue_heading_names_the_retry_key_while_a_failed_message_holds_follow_ups"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local failed = { text = "failed prompt", delivery = "failed", error = "Provider did not confirm" }
+  local follow_up = { text = "queued follow-up", delivery = "queued" }
+  state.input, state.queue = { suspended = true }, { failed, follow_up }
+  eq(controller.paused_queue_hint(state), "<M-r> retry")
+  state.input.suspended = false
+  eq(controller.paused_queue_hint(state), "<M-r> retry")
+  state.queue = { failed }
+  eq(controller.paused_queue_hint(state), nil)
+  state.queue = { follow_up }
+  eq(controller.paused_queue_hint(state), nil)
 end
 
 T["delivered_queue_edit_settles_without_a_keypress"] = function()
@@ -1534,6 +1783,40 @@ T["approval_is_held_in_replace_and_command_line_mode"] = function()
   wait_until(function() return #opened == 1 end, "leaving Command-line mode did not open the held approval")
 end
 
+-- The notice that names a held approval outlived the request by its notifier's timeout: a stop
+-- cancelled the approval and the notice still said one was waiting. Resolving or cancelling the
+-- request withdraws the notice and forgets the held popup in the same event.
+T["a_cancelled_held_approval_withdraws_its_notice"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local set_mode = stub_mode("i")
+  local state, controller, opened = held_approval_scene()
+  local client = require("forge.client")
+  local receive
+  client.session_events_subscribe = function(callback) receive = callback return function() end end
+  quiet_state_read(controller)
+  mock_client.record()
+  require("forge.views.harness.workspace").attach = function() end
+  require("forge.views.harness.prompt_history").attach = function() end
+  local notifications = require("forge.infra.notifications")
+  local shown, withdrawn = {}, {}
+  stub(notifications, "info", function(message, title, id) shown[#shown + 1] = { message = message, id = id } end)
+  stub(notifications, "withdraw", function(id) withdrawn[#withdrawn + 1] = id end)
+  state.transcript_buf = buffer.scratch()
+  controller.attach()
+  state.composer_win = vim.api.nvim_get_current_win()
+  controller.present_approval(false, state)
+  eq(#shown, 1)
+  assert(type(shown[1].id) == "string", "the held notice has no identity to withdraw")
+  receive("provider_event", { kind = "approval_cancelled", data = { request_id = "typed-over" } }, "typing")
+  eq(withdrawn, { shown[1].id })
+  eq(controller.holds_question(state), false)
+  -- Leaving Insert mode finds no held popup to open.
+  set_mode("n")
+  vim.api.nvim_exec_autocmds("InsertLeave", {})
+  vim.wait(20, function() return #opened > 0 end, 5)
+  eq(opened, {})
+end
+
 -- Held popups share one list, so holding a question keeps the approval held before it, and the
 -- approval opens first.
 T["held_popups_open_in_order_after_insert_mode"] = function()
@@ -1898,14 +2181,15 @@ T["restore_preview_names_one_file_in_the_singular"] = function()
   assert(subtitle:find("^1 file will be restored%."), subtitle)
 end
 
--- A paused goal parks its newest exchange, which stays `running` with the output it produced; the
--- list offers it like any other exchange.
+-- A paused goal parks its newest exchange, which stays `running` in history with the output it
+-- produced; the host marks it paused, and the list offers it like any other exchange, named paused.
 T["undo_lists_the_parked_exchange_of_a_paused_goal"] = function()
-  local interaction = { id = "parked", ordinal = 3, state = "running", disposition = "current",
-    prompt = "", checkpoint_before = "checkpoint" }
+  local interaction = { id = "parked", ordinal = 3, state = "running", paused = true, disposition = "current",
+    prompt = "Goal resumed", checkpoint_before = "checkpoint" }
   local scene = undo_scene(interaction, false)
   eq(#scene.specs[1].page_list[1].option_list, 1)
   eq(scene.specs[1].page_list[1].option_list[1].id, "parked")
+  eq(scene.specs[1].page_list[1].option_list[1].detail, "paused · Goal resumed")
 end
 
 -- A restore the host reports as still applying is a rollback in progress, not one to recover.
@@ -2009,6 +2293,24 @@ T["with_state_restores_after_failure"] = function()
     end)
   end, "render failed")
   assert(session.harness == selected, "a failed background render left its state active")
+end
+
+-- A session switch can complete while a render scoped to the switched-in session runs, and it
+-- selects that session for the user. Restoring the state that was active before the scope then
+-- undid the selection, and the next submit acted on the session the user had left.
+T["with_state_keeps_a_selection_made_inside_the_scope"] = function()
+  local session = require("forge.session")
+  local controller = require("forge.views.harness.controller")
+  local previous, chosen = session.harness, session.new_harness_state()
+  session.select_harness(previous)
+  controller.with_state(chosen, function() session.select_harness(chosen) end)
+  eq({ session.harness == chosen, session.selected_harness() == chosen }, { true, true })
+  local background = session.new_harness_state()
+  controller.with_state(background, function()
+    session.select_harness(previous)
+    session.activate_harness(background)
+  end)
+  eq({ session.harness == previous, session.selected_harness() == previous }, { true, true })
 end
 
 T["clarification_settles_on_failed_read"] = function()
@@ -2268,9 +2570,37 @@ T["configuration_during_a_turn_shows_marker_until_applied"] = function()
   state.status = { kind = "idle" }
   controller.configure({ effort = "high" })
   local idle = header()
-  assert(idle:find("test low", 1, true) and not idle:find("*", 1, true), idle)
+  assert(idle:find("test high", 1, true) and not idle:find("*", 1, true), idle)
   requests[3].callback(nil, "rejected")
-  assert(not header():find("*", 1, true), header())
+  local rejected = header()
+  assert(rejected:find("test low", 1, true) and not rejected:find("*", 1, true), rejected)
+end
+
+-- An idle session applies a thinking change in a second or two while the host validates it against
+-- the provider's model list, and its owner reads `working` meanwhile. Each key press while idle drew
+-- the level with `*` for that time, though no turn held it back. The winbar shows the chosen level
+-- at once and keeps the marker for changes that wait behind a turn.
+T["idle_configuration_shows_the_chosen_level_without_marker"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local header = winbar_reader(state, controller)
+  local requests = mock_client.record()
+  controller.render = function() end
+  state.activity = { revision = 1, phase = "idle" }
+  state.status = { kind = "idle" }
+  controller.configure({ effort = "high" })
+  -- The host is applying the first change; no turn runs.
+  state.activity = { revision = 2, phase = "working" }
+  controller.configure({ effort = "xhigh" })
+  eq(#requests, 2)
+  local pending = header()
+  assert(pending:find("test xhigh", 1, true) and not pending:find("*", 1, true), pending)
+  state.session.effort = "high"
+  requests[1].callback({})
+  state.session.effort = "xhigh"
+  requests[2].callback({})
+  local applied = header()
+  assert(applied:find("test xhigh", 1, true) and not applied:find("*", 1, true), applied)
 end
 
 -- A rejected change never applies, so its marker and its requested value leave with the answer.
@@ -2317,6 +2647,61 @@ T["child_view_winbar_names_the_child_provider_and_model"] = function()
   assert(header:find("codex · gpt-6-luna low", 1, true), header)
   assert(header:find("code-explorer-4", 1, true), header)
   assert(not header:find("Haiku 5.5", 1, true), header)
+end
+
+-- The interrupt key closes a question popup on any of its pages, including the review page of a
+-- plan review's execution question. The question stays pending with its answers, so `oe` must
+-- open it again, and the status hint that advertises `oe` must not lie. The session also holds a
+-- model question answered earlier, which the questions history keeps but which awaits nothing.
+T["interrupt_on_a_question_review_page_leaves_the_question_reopenable"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local picker = require("forge.views.picker")
+  local choice_keys = require("forge.infra.config").options.picker.choice_keys
+  quiet_state_read(controller)
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, false)
+  local notices = notify.capture({ min_level = vim.log.levels.WARN, notifications = true })
+  local requests = mock_client.record()
+  state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win =
+    require("forge.views.harness.layout").open("question-interrupt")
+  MiniTest.finally(function() pcall(require("forge.views.harness.workspace").release, state) end)
+  state.session = { id = "question-interrupt", provider = "mock", model = "mock" }
+  state.status = { kind = "awaiting_input" }
+  state.questions = { revision = 3, questions = { { id = "earlier", requirement = "required",
+    resolution = { kind = "answered" }, content = { revision = 1, header = "Negative amounts",
+      question = "Reject negative amounts?", options = {} } } } }
+  local question = { id = "review-execution-mode:plan", header = "Tool approval", question = "Which mode?",
+    allow_freeform = false, options = { { label = "ask" }, { label = "allow" } } }
+  local function pending(answer)
+    return { owner = "plan_review", plan_id = "plan", elicitation = { revision = 1, answer_revision = #answer,
+      current_index = #answer, answer = answer, question_set = { id = "execution", questions = { question } } } }
+  end
+  state.active_elicitation = pending({})
+  vim.api.nvim_set_current_win(state.composer_win)
+  controller.present_plan_question(true)
+  assert(picker.is_open("plan_question"), "the question did not open")
+  local picker_buf = picker._state_for_test().buf
+  keymap.invoke(choice_keys[2], { buffer = picker_buf })
+  keymap.invoke("<CR>", { buffer = picker_buf })
+  local answer = requests[#requests]
+  eq(answer.spec.method, "session.question.answer")
+  answer.callback({ active_elicitation = pending({ { question_id = question.id, source = "user",
+    response = { kind = "selected", option = "allow" } } }) })
+  assert(vim.iter(picker._state_for_test().spec.page_list):any(function(page) return page.id == "review" end),
+    "answering the only question did not show the review page")
+  keymap.invoke("<C-c>", { buffer = picker._state_for_test().buf })
+  assert(not picker.is_open(), "the interrupt key left the question popup open")
+  for _, request in ipairs(requests) do
+    if request.spec.method == "session.turn.cancel" and request.callback then request.callback({}) end
+  end
+  assert(state.active_elicitation and state.active_elicitation.elicitation, "the interrupt discarded the pending question")
+  vim.api.nvim_set_current_win(state.composer_win)
+  controller.reopen_question()
+  assert(picker.is_open("plan_question"), "oe did not reopen the pending question")
+  notices:assert_none()
+  picker.close(true, "user")
+  state.active_elicitation = nil
+  eq(controller.holds_question(state), false)
 end
 
 return T

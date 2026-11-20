@@ -44,6 +44,8 @@ pub(crate) enum MockResponseCommand {
     /// Fire the session's pending timed approvals through their deadline path immediately.
     /// The session service owns the permission coordinator, so it handles this operation.
     ExpireApproval,
+    /// Decline the session's next native compaction in the given words.
+    DeclineCompaction { explanation: String },
 }
 
 /// Preserve the existing Harness RPC surface while routing holds through a normalized provider API.
@@ -96,6 +98,9 @@ impl MockResponseControl {
             MockResponseCommand::FailClose => TestControlCommand::FailClose,
             MockResponseCommand::HoldInterrupt => TestControlCommand::HoldInterrupt,
             MockResponseCommand::HoldRewind => TestControlCommand::HoldRewind,
+            MockResponseCommand::DeclineCompaction { explanation } => {
+                TestControlCommand::DeclineCompaction { explanation }
+            }
             MockResponseCommand::RequireBindingModelCatalog => {
                 TestControlCommand::RequireBindingModelCatalog
             }

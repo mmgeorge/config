@@ -4,8 +4,9 @@
 //! launch builds a fresh `PeerHandler` that receives every frame Forge writes and returns the
 //! frames the CLI would print. Control requests the handler declines receive the generic
 //! success the CLI gives for configuration controls. A launch whose arguments the CLI would
-//! refuse builds no handler, and the peer then closes its output before the initialize answer,
-//! as the CLI does when it exits at startup.
+//! refuse builds no handler, and the peer then prints the CLI's error `result` naming
+//! `LAUNCH_REFUSAL` and closes its output before the initialize answer, as the CLI does when it
+//! exits at startup.
 
 use super::process::{ClaudeLauncher, LaunchSpec};
 use super::transport::ProcessIo;
@@ -91,6 +92,9 @@ impl ClaudeLauncher for PeerLauncher {
         let record = self.record.clone();
         tokio::spawn(async move {
             let Some(mut handler) = handler else {
+                let mut line = serde_json::to_vec(&launch_refusal()).unwrap();
+                line.push(b'\n');
+                let _ = peer_stdout.write_all(&line).await;
                 drop(peer_stdout);
                 drop(peer_stdin);
                 return;
@@ -115,6 +119,17 @@ impl ClaudeLauncher for PeerLauncher {
             process: None,
         })
     }
+}
+
+/// The reason the peer gives for a command line it refuses.
+pub(super) const LAUNCH_REFUSAL: &str =
+    "Error: resuming would discard entries not attributable to the declared turn";
+
+/// Build the error `result` the CLI prints in stream-json mode before it exits at startup.
+fn launch_refusal() -> Value {
+    json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+        "duration_ms": 0, "num_turns": 0, "errors": [LAUNCH_REFUSAL],
+        "uuid": uuid::Uuid::new_v4().to_string()})
 }
 
 /// Answer configuration controls with success and the initialize request with a model catalog.

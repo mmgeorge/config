@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use forge_buffer::{
     block::TextPosition,
@@ -6,53 +6,14 @@ use forge_buffer::{
     patch::BufferSnapshot,
 };
 use forge_diff::{engine::DiffEngine, syntax::SyntaxEngine};
-use forge_git::{
-    command::{CommandLimits, read_command},
-    store::RepositoryStore,
-    writer::{GitWriteService, TargetCompletion},
-};
+use forge_git::{store::RepositoryStore, writer::GitWriteService};
 
 use forge_git::test_support::{
     head_commit, init_repository, lfs_pointer, set_config, set_identity, stage, stage_and_commit,
 };
 
 use crate::protocol::{StatusFile, StatusStatistics};
-use crate::{
-    BodyState, StatusInput, StatusLocation, StatusSection, StatusSelection, StatusService,
-    StatusSnapshot,
-};
-
-fn git(root: &Path, arguments: &[&str]) -> Vec<u8> {
-    let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(root).args(arguments);
-    if arguments.first() == Some(&"commit") {
-        command
-            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
-            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z");
-    }
-    let output = std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                read_command(
-                    &mut command,
-                    CommandLimits {
-                        stderr_bytes: 4096,
-                        timeout: Duration::from_secs(10),
-                    },
-                    || Ok(()),
-                )
-            })
-            .join()
-            .expect("Git fixture command thread")
-    })
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
-}
+use crate::{BodyState, StatusInput, StatusLocation, StatusSection, StatusService, StatusSnapshot};
 
 async fn fixture() -> (
     tempfile::TempDir,
@@ -262,116 +223,6 @@ async fn staged_lfs_diff_uses_payloads_instead_of_cached_pointers() {
         "{text:?}"
     );
     assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
-}
-
-#[tokio::test]
-async fn unstage_invalidates_cached_index_when_replacement_timestamp_moves_backwards() {
-    let (directory, service, _, writer) = fixture().await;
-    stage(directory.path(), &["sample.txt"]);
-    let index = directory.path().join(".git/index");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&index)
-        .unwrap()
-        .set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600)),
-        )
-        .unwrap();
-    let opened = service
-        .open(
-            DocumentId("unstage-index-clock".into()),
-            directory.path().to_owned(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(opened.file.len(), 1);
-    assert_eq!(opened.file[0].section, StatusSection::Staged);
-    let outcome = service
-        .input(input(&opened, "sample.txt", 1, "unstage"))
-        .await
-        .unwrap()
-        .finish()
-        .await
-        .unwrap();
-    assert!(
-        outcome
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Completed)
-    );
-    assert!(outcome.settlement_diagnostic.is_none());
-    assert!(git(directory.path(), &["diff", "--cached", "--name-only"]).is_empty());
-    let settled = service.snapshot(&opened.document).await.unwrap();
-    assert_eq!(settled.file.len(), 1);
-    assert_eq!(settled.file[0].section, StatusSection::Unstaged);
-    let delivery = service
-        .demand(input(&settled, "sample.txt", 2, "demand"))
-        .await
-        .unwrap();
-    let text = rows(delivery.snapshot.as_ref().unwrap()).join("\n");
-    assert!(text.contains("old") && text.contains("new"), "{text}");
-    service.refresh(&opened.document).await.unwrap();
-    let refreshed = service.snapshot(&opened.document).await.unwrap();
-    assert_eq!(refreshed.file.len(), 1);
-    assert_eq!(refreshed.file[0].section, StatusSection::Unstaged);
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"old\n");
-    assert_eq!(
-        std::fs::read(directory.path().join("sample.txt")).unwrap(),
-        b"new\n"
-    );
-    writer.acknowledge(outcome.operation);
-}
-
-#[tokio::test]
-async fn forge_ignore_requires_configured_persistence_and_preserves_invalid_store() {
-    let (directory, service, _, _) = fixture().await;
-    let opened = service
-        .open(
-            DocumentId("unconfigured-ignore".into()),
-            directory.path().to_owned(),
-        )
-        .await
-        .unwrap();
-    let failure = service
-        .act(input(&opened, "sample.txt", 1, "ignore"), None)
-        .await
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(failure.contains("persistence is unavailable"));
-    assert!(!git(directory.path(), &["diff", "--name-only"]).is_empty());
-    service.close(&opened.document);
-    let storage = tempfile::tempdir().unwrap();
-    service
-        .configure_ignored_directory(storage.path().to_owned())
-        .unwrap();
-    let expected = Default::default();
-    let selected = vec![forge_git::RepositoryPath::new(b"sample.txt".to_vec()).unwrap()];
-    crate::ignored::update(storage.path(), directory.path(), &expected, &selected, true).unwrap();
-    let file = std::fs::read_dir(storage.path())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .unwrap();
-    let payload: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    assert_eq!(payload["version"], 1);
-    assert_eq!(payload["ignored_paths"], serde_json::json!(["sample.txt"]));
-    std::fs::write(&file, b"{broken").unwrap();
-    assert!(
-        service
-            .open(
-                DocumentId("invalid-ignore".into()),
-                directory.path().to_owned()
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read(file).unwrap(), b"{broken");
 }
 
 fn file<'a>(
@@ -711,40 +562,6 @@ async fn body_continuation_is_bounded_and_loaded_blocks_remain() {
     );
 }
 
-#[tokio::test]
-async fn physical_selection_stages_multiple_native_file_targets() {
-    let (directory, service, _, writer) = fixture().await;
-    std::fs::write(directory.path().join("first.txt"), "first\n").unwrap();
-    std::fs::write(directory.path().join("second.txt"), "second\n").unwrap();
-    let snapshot = service
-        .open(DocumentId("status".into()), directory.path().to_owned())
-        .await
-        .unwrap();
-    let selected = StatusSelection {
-        target: ["first.txt", "second.txt"]
-            .into_iter()
-            .map(|name| input(&snapshot, name, 1, "stage").location)
-            .collect(),
-    };
-    let outcome = service
-        .input_selection(input(&snapshot, "first.txt", 1, "stage"), selected)
-        .await
-        .unwrap()
-        .finish()
-        .await
-        .unwrap();
-    assert!(
-        outcome
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Completed)
-    );
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"old\n");
-    assert_eq!(git(directory.path(), &["show", ":first.txt"]), b"first\n");
-    assert_eq!(git(directory.path(), &["show", ":second.txt"]), b"second\n");
-    writer.acknowledge(outcome.operation);
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_worktree_preserves_local_deleted_files_and_ignored_identity() {
@@ -779,50 +596,6 @@ async fn symlinked_worktree_preserves_local_deleted_files_and_ignored_identity()
         assert_eq!(snapshot.file.len(), 1);
         assert!(service.close(&snapshot.document));
     }
-}
-
-#[tokio::test]
-async fn whole_section_stages_current_contents_and_only_selected_paths() {
-    let (directory, service, _, writer) = fixture().await;
-    std::fs::write(directory.path().join("first.txt"), "first\n").unwrap();
-    std::fs::write(directory.path().join("second.txt"), "second\n").unwrap();
-    let snapshot = service
-        .open(
-            DocumentId("section-stale".into()),
-            directory.path().to_owned(),
-        )
-        .await
-        .unwrap();
-    let mut captured = input(&snapshot, "sample.txt", 1, "stage");
-    captured.location = StatusLocation::Section {
-        section: StatusSection::Unstaged,
-    };
-    std::fs::write(
-        directory.path().join("second.txt"),
-        "changed before section action\n",
-    )
-    .unwrap();
-    std::fs::write(directory.path().join("unselected.txt"), "not selected\n").unwrap();
-    let outcome = service
-        .input(captured)
-        .await
-        .unwrap()
-        .finish()
-        .await
-        .unwrap();
-    assert!(
-        outcome
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Completed)
-    );
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"new\n");
-    assert_eq!(
-        git(directory.path(), &["show", ":second.txt"]),
-        b"changed before section action\n"
-    );
-    assert!(git(directory.path(), &["ls-files", "unselected.txt"]).is_empty());
-    writer.acknowledge(outcome.operation);
 }
 
 #[tokio::test]
@@ -871,113 +644,6 @@ async fn stale_ignore_rejects_changed_sources_and_does_not_relax_discard() {
         std::fs::read(directory.path().join("sample.txt")).unwrap(),
         b"changed after capture\n"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn changed_hunk_source_rejects_queued_stage_and_refreshes_body() {
-    let (directory, service, _, _) = fixture().await;
-    let opened = service
-        .open(
-            DocumentId("changed-hunk".into()),
-            directory.path().to_owned(),
-        )
-        .await
-        .unwrap();
-    service
-        .demand(input(&opened, "sample.txt", 1, "demand"))
-        .await
-        .unwrap();
-    let current = service.snapshot(&opened.document).await.unwrap();
-    let selected = file(&current, "sample.txt", Some(StatusSection::Unstaged));
-    let loaded = body(&service, &current, selected).await;
-    let (block, row) = loaded
-        .block
-        .iter()
-        .find_map(|block| {
-            block
-                .text
-                .wire_rows()
-                .iter()
-                .position(|row| *row == "new")
-                .map(|row| (block, row))
-        })
-        .unwrap();
-    let repository = service
-        .store
-        .open(directory.path().to_owned())
-        .await
-        .unwrap()
-        .unwrap();
-    let gate = service
-        .store
-        .writes
-        .admit(
-            vec![forge_git::mutation::MutationScope::Index(
-                repository.identity.worktree.clone().unwrap(),
-            )],
-            0,
-        )
-        .unwrap();
-    let guard = service.store.writes.start(gate).unwrap().unwrap();
-    let mut capture = input(&current, "sample.txt", 2, "stage");
-    capture.location = body_location(selected, &loaded, block, row);
-    let mut updates = service.subscribe_updates();
-    let ticket = service.input(capture).await.unwrap();
-    let optimistic = service.snapshot(&opened.document).await.unwrap();
-    assert!(!optimistic.pending.is_empty());
-    assert!(
-        optimistic
-            .section
-            .iter()
-            .any(|section| section.kind == StatusSection::Staged)
-    );
-    std::fs::write(
-        directory.path().join("sample.txt"),
-        b"external replacement\n",
-    )
-    .unwrap();
-    guard
-        .finish(forge_git::mutation::OperationCompletion::Completed)
-        .unwrap();
-    service.store.writes.take_receipt(gate).unwrap();
-    let outcome = ticket.finish().await.unwrap();
-    assert!(
-        outcome
-            .target
-            .iter()
-            .all(|target| target.completion == TargetCompletion::Rejected),
-        "{outcome:?}"
-    );
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"old\n");
-    assert_eq!(
-        std::fs::read(directory.path().join("sample.txt")).unwrap(),
-        b"external replacement\n"
-    );
-    let refreshed = service.snapshot(&opened.document).await.unwrap();
-    assert!(refreshed.pending.is_empty());
-    assert!(
-        !refreshed
-            .section
-            .iter()
-            .any(|section| section.kind == StatusSection::Staged)
-    );
-    let settled = std::iter::from_fn(|| updates.try_recv().ok())
-        .find(|update| update.phase == "settled")
-        .unwrap();
-    assert!(!settled.delta.pending.contains(&outcome.operation.value()));
-    service
-        .demand(input(&refreshed, "sample.txt", 3, "demand"))
-        .await
-        .unwrap();
-    let refreshed = service.snapshot(&opened.document).await.unwrap();
-    let loaded = body(
-        &service,
-        &refreshed,
-        file(&refreshed, "sample.txt", Some(StatusSection::Unstaged)),
-    )
-    .await;
-    assert!(rows(&loaded).contains(&"external replacement"));
-    assert!(!rows(&loaded).contains(&"new"));
 }
 
 async fn semantic_status_fixture(

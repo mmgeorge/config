@@ -360,7 +360,8 @@ impl ControlToolRuntime {
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
             authority.validate_scope()?;
         }
-        if invocation.name == "question_ask" && invocation.arguments["wait"].as_bool() == Some(true)
+        if invocation.name == "question_ask"
+            && super::question_ask_waits(&invocation.arguments, self.context.mode)
         {
             crate::tools::error::ensure!(
                 self.context.questions.is_some(),

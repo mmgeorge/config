@@ -1,6 +1,7 @@
 mod approval_deadline;
 mod bootstrap;
 mod compaction;
+mod configuration_start;
 mod fork;
 mod native_agents;
 mod owner_cancel;
@@ -8,6 +9,7 @@ mod owner_dispatch;
 mod owner_fixture;
 mod owner_storage_failure;
 mod owner_transition;
+mod plan_questions;
 mod plan_review_workflow;
 mod reconnect_overlap;
 mod rollback;

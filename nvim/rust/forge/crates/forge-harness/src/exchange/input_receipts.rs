@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Describe an observed native execution result without transporting native diagnostic text.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum InputExecutionResult {
     /// Execution returned without an error; acceptance still requires receipt evidence.
     Completed,
@@ -23,6 +23,10 @@ pub(crate) enum InputExecutionResult {
     Cancelled,
     /// Execution failed; the receipt determines whether delivery is uncertain or accepted.
     Failed,
+    /// Prompt admission refused the input before any provider work, for this reason. The
+    /// prepared receipt was never sent, so the entry stays failed with the reason and its task
+    /// keeps running.
+    Refused(String),
 }
 
 /// Describe the observed dispatch lane after steering returns.
@@ -385,10 +389,12 @@ impl InputReceipts {
                     SubmissionRetirement::Cancelled => Some(InputDelivery::Failed),
                     SubmissionRetirement::Sending => Some(InputDelivery::Unknown),
                 };
-                if delivery == Some(InputDelivery::Failed) {
+                if delivery == Some(InputDelivery::Failed)
+                    && !matches!(result, InputExecutionResult::Refused(_))
+                {
                     tracked.pause_task(services)?;
                 }
-                let error = match (&delivery, result) {
+                let error = match (&delivery, &result) {
                     (Some(InputDelivery::Queued), _)
                     | (None, InputExecutionResult::Completed | InputExecutionResult::Cancelled) => {
                         None
@@ -396,10 +402,13 @@ impl InputReceipts {
                     (Some(InputDelivery::Unknown), _) => {
                         Some("Delivery unconfirmed. Reconcile before retrying.".into())
                     }
+                    (Some(InputDelivery::Failed), InputExecutionResult::Refused(reason)) => {
+                        Some(reason.clone())
+                    }
                     (Some(InputDelivery::Failed), _) => {
                         Some("Provider did not confirm message acceptance".into())
                     }
-                    (None, InputExecutionResult::Failed) => {
+                    (None, InputExecutionResult::Failed | InputExecutionResult::Refused(_)) => {
                         Some("Input execution failed after message acceptance".into())
                     }
                     (Some(InputDelivery::Delivering | InputDelivery::Accepted), _) => {

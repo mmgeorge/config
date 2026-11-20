@@ -41,7 +41,10 @@ impl ArtifactPath {
                 .nth(3)
                 .context("plan directory has no state root")?;
             return super::authoring::checked_destination(
-                &state.join("plan-workspaces").join(session).join(plan),
+                &state
+                    .join(super::authoring::AUTHORING_ROOT)
+                    .join(session)
+                    .join(plan),
                 path,
             );
         }

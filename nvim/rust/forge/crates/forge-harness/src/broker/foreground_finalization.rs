@@ -224,7 +224,7 @@ impl ForegroundFinalization {
             return self.settle_collected_restart(broker, exchange);
         }
         if outcome == crate::exchange::ExchangeOutcome::Cancelled {
-            broker.questions.cancel_chat(Some(&exchange.id))?;
+            broker.retire_stopped_questions(Some(&exchange.id))?;
             exchange.set_awaiting_input(false);
         } else if outcome == crate::exchange::ExchangeOutcome::Complete
             && broker

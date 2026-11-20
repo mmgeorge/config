@@ -503,6 +503,12 @@ render_view = function(instance)
       picker_keys(instance, "scroll_next"))
     border_footer = table.concat(scroll_keys, "/") .. " scroll  " .. (border_footer or footer or "")
   end
+  -- A page with its own item counter already says where the selection sits in the list.
+  local overflow = frame.option_overflow
+  if overflow and not help_only and not page.show_item_counter then
+    border_footer = ("Rows %d–%d of %d  "):format(overflow.first, overflow.last, overflow.count)
+      .. (border_footer or footer or "")
+  end
   picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance, width), border_footer,
     instance.spec.placement or (instance.spec.size_ratio and "center" or nil))
   render.apply(instance.buf, frame)
@@ -1076,6 +1082,28 @@ function Picker.open(spec)
       if active == instance then vim.schedule(function() if active == instance then render_view(instance) end end) end
     end,
     desc = "Keep the picker anchored to its host surface",
+  })
+  -- The picker floats in its host's tab while the user may work in another. Its hidden cursor must
+  -- not follow the user there, and Insert mode, which is global, must not follow the user back:
+  -- the picker's keys would then edit its unmodifiable list instead of choosing.
+  vim.api.nvim_create_autocmd("TabLeave", {
+    group = resize_group,
+    callback = function()
+      if active == instance and valid_window(instance.win)
+        and vim.api.nvim_win_get_tabpage(instance.win) == vim.api.nvim_get_current_tabpage() then
+        set_picker_cursor_hidden(instance, false)
+      end
+    end,
+    desc = "Show the cursor in the tab the user enters",
+  })
+  vim.api.nvim_create_autocmd("TabEnter", {
+    group = resize_group,
+    callback = function()
+      if active == instance and valid_window(instance.win) and vim.api.nvim_get_current_win() == instance.win then
+        focus_picker(instance)
+      end
+    end,
+    desc = "Give the picker its keys again when its tab is entered",
   })
   focus_picker(instance)
   if picker_state.page(instance.state, instance.spec).search then

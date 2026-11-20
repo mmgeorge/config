@@ -1,0 +1,68 @@
+{
+  "document": "status-stopping:status",
+  "revision": 0,
+  "block": [
+    {
+      "id": "status",
+      "text": [
+        "Stopping",
+        "├─ ⠋ 2s code-explorer-5 · codex · gpt-6-luna +",
+        "└─ ⠋ 2s code-explorer-6 · codex · gpt-6-luna +"
+      ],
+      "metadata": {
+        "status": {
+          "row": 0,
+          "animated": true,
+          "hint": null,
+          "stopping": true
+        },
+        "target": [],
+        "decoration": [
+          {
+            "range": {
+              "start": {
+                "row": 1,
+                "column": 7
+              },
+              "end": {
+                "row": 1,
+                "column": 10
+              }
+            },
+            "capture": "ForgeTimelineStatusSpinner",
+            "priority": 110
+          },
+          {
+            "range": {
+              "start": {
+                "row": 2,
+                "column": 7
+              },
+              "end": {
+                "row": 2,
+                "column": 10
+              }
+            },
+            "capture": "ForgeTimelineStatusSpinner",
+            "priority": 110
+          },
+          {
+            "range": {
+              "start": {
+                "row": 1,
+                "column": 0
+              },
+              "end": {
+                "row": 3,
+                "column": 0
+              }
+            },
+            "capture": "ForgeStatusHint",
+            "priority": 100
+          }
+        ],
+        "editable_region": []
+      }
+    }
+  ]
+}

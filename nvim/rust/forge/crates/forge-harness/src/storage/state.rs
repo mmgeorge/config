@@ -202,6 +202,7 @@ mod tests {
             plan_compact: true,
             approval_timeout: Default::default(),
             tool_timeout: Default::default(),
+            confirmed_revision: None,
         };
         store.save_preference("workspace", "mock", &preference)?;
         let mut settings = crate::settings::SettingsStore::open(root.path())?;

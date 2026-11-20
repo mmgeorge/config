@@ -581,23 +581,23 @@ impl CodexProvider {
         for recovered in &request.recovered_inputs {
             if let Some(PromptInput::Skill { name, .. }) = recovered.input.user_input() {
                 let rpc = session.rpc.lock().await;
-                let path = session
-                    .resources
-                    .lock()
-                    .await
-                    .skill_path(&rpc, &session.workspace, name)
-                    .await?;
+                let resources = session.resources.lock().await;
+                let path = unless_cancelled(
+                    pending,
+                    resources.skill_path(&rpc, &session.workspace, name),
+                )
+                .await?;
                 native_input.push(json!({"type":"skill","name":name,"path":path}));
             }
         }
         if let Some(PromptInput::Skill { name, .. }) = request.input.user_input() {
             let rpc = session.rpc.lock().await;
-            let path = session
-                .resources
-                .lock()
-                .await
-                .skill_path(&rpc, &session.workspace, name)
-                .await?;
+            let resources = session.resources.lock().await;
+            let path = unless_cancelled(
+                pending,
+                resources.skill_path(&rpc, &session.workspace, name),
+            )
+            .await?;
             native_input.push(json!({"type":"skill","name":name,"path":path}));
         }
         let model = request.configuration.model.clone();
@@ -611,8 +611,11 @@ impl CodexProvider {
             "config":{}
         });
         let rpc = session.rpc.lock().await;
-        let effort =
-            apply_model_selection(&rpc, &mut params, &model, ProviderOperation::TurnStart).await?;
+        let effort = unless_cancelled(
+            pending,
+            apply_model_selection(&rpc, &mut params, &model, ProviderOperation::TurnStart),
+        )
+        .await?;
         drop(rpc);
         // Harness tracks which standing sections the conversation already accepted, so the
         // developer message is empty when nothing changed and the input has no instructions.
@@ -642,11 +645,10 @@ impl CodexProvider {
         }
         let thread_id = session.history_id();
         let rpc = session.rpc.lock().await;
-        let injected = session
-            .turn_context
-            .lock()
-            .await
-            .deliver(&rpc, &thread_id, &developer, || {
+        let mut turn_context = session.turn_context.lock().await;
+        let injected = unless_cancelled(
+            pending,
+            turn_context.deliver(&rpc, &thread_id, &developer, || {
                 // An injection persists native history, so the thread can no longer be
                 // replaced as unused even if the turn never starts.
                 session
@@ -654,8 +656,10 @@ impl CodexProvider {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .establish();
-            })
-            .await?;
+            }),
+        )
+        .await?;
+        drop(turn_context);
         drop(rpc);
         if !injected {
             // Without developer injection, the instruction block starts the user input instead.
@@ -4432,9 +4436,18 @@ fn retractable_turn(turn: &Value, request: &forge_provider_api::InputRetractRequ
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
         .collect::<Vec<_>>();
-    inputs.len() == 1
-        && inputs[0].get("clientId").and_then(Value::as_str)
-            == Some(native_input_id(&request.submission_id, &request.attempt_id).as_str())
+    // Codex records the user message only once the turn begins sampling, so an interrupt
+    // before then leaves the turn without one. The rollback authorization already proved that
+    // this submission was the turn's only input, and Harness requests retraction only while
+    // the turn showed no model work, so such a turn holds nothing the revert could lose.
+    match inputs.as_slice() {
+        [] => true,
+        [input] => {
+            input.get("clientId").and_then(Value::as_str)
+                == Some(native_input_id(&request.submission_id, &request.attempt_id).as_str())
+        }
+        _ => false,
+    }
 }
 
 /// Collect terminal publication without cancelling a native turn that is still running.
@@ -5957,20 +5970,29 @@ async fn handle_native_request(
             if session.is_fenced() {
                 return Err(ProviderError::Cancelled);
             }
-            // Codex's decline reply carries no reason, so the declined item would otherwise
-            // report a generic denial to the user.
-            if let PermissionResponse::Deny {
-                reason: Some(reason),
-            } = &decision
+            // Codex reports the item declined after both `decline` and `cancel`, and its decline
+            // reply carries no reason, so the declined item would otherwise report a generic
+            // denial to the user, also for an approval that a stop of the turn cancelled.
+            let refusal = match &decision {
+                PermissionResponse::Deny {
+                    reason: Some(reason),
+                } => forge_provider_api::SanitizedMessage::new(reason.as_str())
+                    .ok()
+                    .map(|reason| super::normalization::ApprovalRefusal::Denied { reason }),
+                PermissionResponse::Cancelled => {
+                    Some(super::normalization::ApprovalRefusal::Cancelled)
+                }
+                PermissionResponse::Allow | PermissionResponse::Deny { reason: None } => None,
+            };
+            if let Some(refusal) = refusal
                 && let Some(native_item_id) = params["itemId"].as_str()
                 && let Some(turn_id) = callback_turn_id(&request, &owner)
-                && let Ok(reason) = forge_provider_api::SanitizedMessage::new(reason.as_str())
             {
-                session
-                    .normalization
-                    .lock()
-                    .await
-                    .denial_record(&turn_id, native_item_id, reason);
+                session.normalization.lock().await.approval_refusal_record(
+                    &turn_id,
+                    native_item_id,
+                    refusal,
+                );
             }
             prepared.validate().map_err(|_| {
                 ProviderError::from(
@@ -6061,6 +6083,27 @@ fn validate_model_selection(selection: &ModelSelection) -> Result<(), ProviderEr
 }
 
 /// Resolve native catalog defaults and encode validated model controls.
+/// Await one turn-start preparation request unless the input's cancellation arrives first.
+///
+/// Before `turn/start`, preparation asks the runtime for its model list, resolves skill paths,
+/// and injects the turn's context items. A loaded runtime can take many seconds to answer, and
+/// `cancel_invocation` waits for the preparing input to finish, so an unraced request held a
+/// cancelled turn's stop until the runtime answered. No `turn/start` has been written while these
+/// run, so abandoning the reply leaves no native turn; the runtime's late answer finds no waiter.
+/// An injection that may still land has already marked the thread's history as established.
+async fn unless_cancelled<Output>(
+    pending: &crate::pending_input::PendingInput,
+    request: impl std::future::Future<Output = Result<Output, ProviderError>>,
+) -> Result<Output, ProviderError> {
+    tokio::select! {
+        biased;
+        () = pending.cancelled() => Err(pending
+            .check_admission(ProviderOperation::TurnStart)
+            .expect_err("preparation cancellation is sticky")),
+        result = request => result,
+    }
+}
+
 async fn apply_model_selection(
     rpc: &NativeRpc,
     parameters: &mut Value,
@@ -6793,6 +6836,84 @@ mod continuation_tests {
         }.await;
     }
 
+    /// A cancel that arrives while turn-start preparation waits on the runtime ends that wait.
+    ///
+    /// Before `turn/start`, preparation asks the runtime for its model list and injects the
+    /// turn's context items. A loaded runtime can take many seconds to answer either, and
+    /// `cancel_invocation` waits for the preparing input to finish, so an unraced request held a
+    /// cancelled child's stop until the runtime answered. The wire here never answers
+    /// `model/list`, so both sides finish only if the cancel interrupts the wait.
+    #[tokio::test]
+    async fn cancellation_during_preparation_ends_the_unanswered_request() {
+        use futures_util::StreamExt;
+        let (provider, session, _events, mut socket) =
+            compaction_fixture(forge_provider_api::SessionHistory::Temporary).await;
+        let mut input = request();
+        input.input = forge_provider_api::forge::TurnInput::new(
+            forge_provider_api::forge::TurnKind::Background {
+                input: PromptInput::Text("Generate a title".into()),
+            },
+        );
+        let (dispatch, _observed) = forge_provider_api::submission::DispatchReporter::channel(
+            session.binding.id.clone(),
+            input.scope.clone(),
+            input.submission_id.clone(),
+            input.attempt_id.clone(),
+        );
+        input.dispatch = dispatch;
+        let scope = input.scope.clone();
+        let binding = session.binding.id.clone();
+        let (requested, held) = tokio::sync::oneshot::channel();
+        let wire = tokio::spawn(async move {
+            let models: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(models["method"], "model/list");
+            requested.send(()).unwrap();
+            // The runtime never answers; only the connection's close ends the wire.
+            if let Some(message) = socket.next().await {
+                let message = message.unwrap();
+                assert!(
+                    message.is_close(),
+                    "a cancelled preparation wrote {message:?}"
+                );
+            }
+        });
+        let submitting_provider = provider.clone();
+        let submitting_binding = binding.clone();
+        let submitting = tokio::spawn(async move {
+            submitting_provider
+                .turn_start(context(), &submitting_binding, input)
+                .await
+        });
+        held.await.unwrap();
+        let bounded = std::time::Duration::from_secs(1);
+        let interrupted = tokio::time::timeout(
+            bounded,
+            provider.turn_interrupt(
+                context(),
+                &binding,
+                forge_provider_api::CancelRequest {
+                    scope: scope.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("the cancel waited for the unanswered preparation request");
+        assert!(
+            matches!(&interrupted, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation),
+            "{interrupted:?}"
+        );
+        let submitted = tokio::time::timeout(bounded, submitting)
+            .await
+            .expect("the cancelled preparation kept waiting for the runtime")
+            .unwrap();
+        assert!(submitted.is_err(), "{submitted:?}");
+        assert!(session.active.lock().await.is_none());
+        session.rpc.lock().await.close().await.unwrap();
+        wire.await.unwrap();
+    }
+
     /// Normal native completion collects automatically; late cancellation cannot touch a newer invocation.
     #[tokio::test]
     async fn completed_invocation_settles_once_and_late_cancel_preserves_successor() {
@@ -7022,6 +7143,48 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         }.await;
     }
 
+    /// A prompt interrupted before Codex recorded it is retracted with its empty native turn.
+    ///
+    /// Codex records the user message only when the turn begins sampling, so an interrupt in
+    /// the first half second leaves an interrupted turn with no items. That turn once failed
+    /// the boundary check, and the output-free exchange stayed in history as `Cancelled 0s`
+    /// instead of returning its prompt to the composer.
+    #[tokio::test]
+    async fn prompt_interrupted_before_codex_recorded_it_is_retracted() {
+        use futures_util::{SinkExt, StreamExt};
+        async {
+            let (provider, session, _events, mut socket) = compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
+            let input = request();
+            let request = forge_provider_api::InputRetractRequest { scope: input.scope.clone(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone(), boundary: forge_provider_api::CheckpointId::new("cancelled-turn").unwrap(), authorization: forge_provider_api::RetractionAuthorization::OutputFreeCancellation };
+            *session.rollback.lock().await = Some(RollbackAuthorization { thread_id: "compaction-thread".into(), scope: input.scope.clone(), turn_id: NativeTurnId::new("cancelled-turn").unwrap(), submission_id: input.submission_id.clone(), attempt_id: input.attempt_id.clone() });
+            let native = collected_result(&input, TurnOutcome::Interrupted);
+            let address = forge_provider_api::TurnAddress { scope: input.scope.clone(), thread_id: input.thread_id.clone(), turn_id: input.turn_id.clone() };
+            let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move { Ok(native) })));
+            let worker = fixture_worker(&session, &input.scope, worker);
+            let completed = worker.join().await.unwrap();
+            session.settlements.lock().await.insert(input.scope.clone(), Ok(CollectedInvocation { address, completed, watermark: session.sink.watermark() }));
+            let wire = tokio::spawn(async move {
+                let answer = |request: &Value, result: Value| tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":result}).to_string().into());
+                let read: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(read["method"], "thread/read");
+                socket.send(answer(&read, json!({"thread":{"turns":[{"id":"answered-turn","status":"completed","items":[]},{"id":"cancelled-turn","status":"interrupted","items":[]}]}}))).await.unwrap();
+                let rollback: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(rollback["method"], "thread/revert");
+                assert_eq!(rollback["params"]["beforeTurnId"], "cancelled-turn");
+                socket.send(answer(&rollback, json!({}))).await.unwrap();
+                let verification: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(verification["method"], "thread/read");
+                socket.send(answer(&verification, json!({"thread":{"turns":[{"id":"answered-turn","status":"completed","items":[]}]}}))).await.unwrap();
+                socket
+            });
+            let outcome = provider.input_retract(context(), &session.binding.id, request.clone()).await.unwrap();
+            assert_eq!(outcome, forge_provider_api::InputRetractOutcome::Retracted { boundary: request.boundary.clone() });
+            assert!(!session.is_fenced());
+            let _socket = wire.await.unwrap();
+            let _ = session.rpc.lock().await.close().await;
+        }.await;
+    }
+
     /// Answer one native request on the rewind fixture's socket and return the request.
     async fn answer_native_request(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
@@ -7208,6 +7371,11 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         turn["items"] = json!([item.clone(), item]);
         assert!(!retractable_turn(&turn, &request));
         turn["items"] = json!([{"type":"userMessage","clientId":native_input_id(&request.submission_id, &forge_provider_api::DeliveryAttemptId::new("different").unwrap())}]);
+        assert!(!retractable_turn(&turn, &request));
+        // An interrupt before Codex recorded the prompt leaves the turn empty.
+        turn["items"] = json!([]);
+        assert!(retractable_turn(&turn, &request));
+        turn["status"] = json!("completed");
         assert!(!retractable_turn(&turn, &request));
     }
 
@@ -7452,6 +7620,112 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
                 })
                 .collect::<Vec<_>>();
             assert_eq!(denial_reasons, [SHELL_WRITE_REASON]);
+            session.rpc.lock().await.close().await.unwrap();
+        }
+        .await;
+    }
+
+    /// Cancel every approval, as Harness does when it stops the turn that waits on one.
+    struct CancelledApproval;
+
+    #[async_trait]
+    impl ProviderPermissions for CancelledApproval {
+        async fn authorize(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            PermissionResponse::Cancelled
+        }
+
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// An approval that Harness cancelled because it stopped the turn is not a denial, although
+    /// Codex reports the command it then abandons as declined.
+    ///
+    /// The command kept a `denied` status, so after a compaction stopped a turn whose command
+    /// waited for approval, the rerun turn read that status through the session tools and
+    /// answered that the command "was denied before it ran", which nobody had done.
+    #[tokio::test]
+    async fn approval_cancelled_by_a_stop_leaves_the_declined_command_cancelled() {
+        use super::super::normalization::CodexOutput;
+        use forge_provider_api::{ItemCompletion, ItemEvent};
+        use futures_util::StreamExt;
+        async {
+            let (_, session, _events, mut socket) =
+                compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None })
+                    .await;
+            let mut request = request();
+            request.permissions = Arc::new(CancelledApproval);
+            let command = |status: &str| {
+                json!({"threadId":"compaction-thread","turnId":"native-turn","item":{
+                    "type":"commandExecution","id":"long-command","cwd":".",
+                    "command":"nu -c \"sleep 45sec\"","status":status}})
+            };
+            {
+                let mut normalization = session.normalization.lock().await;
+                normalization
+                    .admit_turn("compaction-thread", "native-turn", &request.scope)
+                    .unwrap();
+                normalization
+                    .normalize(
+                        &json!({"method":"item/started","params":command("inProgress")}),
+                        &mut CodexOutput::default(),
+                        None,
+                        "",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let approval = json!({"id":22,"method":"item/commandExecution/requestApproval","params":{
+                "threadId":"compaction-thread","turnId":"native-turn","itemId":"long-command",
+                "command":"nu -c \"sleep 45sec\"","cwd":"."}});
+            let native = async {
+                serde_json::from_str::<Value>(
+                    socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap()
+            };
+            let (handled, reply) =
+                tokio::join!(handle_native_request(&session, &request, &approval), native);
+            handled.unwrap();
+            // Codex offers no reply that means "interrupted"; `cancel` is the one that ends the turn.
+            assert_eq!(reply["result"], json!({"decision":"cancel"}), "{reply}");
+            let mut output = CodexOutput::default();
+            session
+                .normalization
+                .lock()
+                .await
+                .normalize(
+                    &json!({"method":"item/completed","params":command("declined")}),
+                    &mut output,
+                    None,
+                    "",
+                )
+                .await
+                .unwrap();
+            let outcome_list = output
+                .event
+                .iter()
+                .filter_map(|activity| match activity {
+                    AdapterActivity::Item {
+                        event:
+                            ItemEvent::Completed(ItemCompletion::CommandExecution(completion)),
+                        ..
+                    } => Some(completion.outcome.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outcome_list,
+                [forge_provider_api::tool::ToolOutcome::Cancelled]
+            );
             session.rpc.lock().await.close().await.unwrap();
         }
         .await;

@@ -164,6 +164,106 @@ async fn native_subagent_content_follows_its_start_and_completes_the_turn() -> R
     scenario
 }
 
+/// A native subagent's row belongs to the exchange that ran it, so a conversation rollback of
+/// that exchange removes the row with it instead of leaving it behind as a row of its own.
+#[tokio::test]
+async fn rolled_back_exchange_takes_its_native_subagent_row_with_it() -> Result<()> {
+    use forge_protocol::message::Request;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.start_provider(&sink).await;
+    controller.attach_input(&sink).await?;
+    let scenario = async {
+        controller
+            .provider_handle()
+            .mock_response_control()
+            .context("mock controls missing")?
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Script {
+                    script: serde_json::from_value(json!({
+                        "steps":[
+                            {"kind":"native_subagent","name":"search","text":"Found the parser."},
+                            {"kind":"message","content":"response","text":"The parser is in src."},
+                        ],
+                        "terminal":"completed",
+                    }))?,
+                },
+            )
+            .await?;
+        submit_input(
+            &service,
+            &controller,
+            &session_id,
+            11,
+            "delegating-input",
+            "Find the parser",
+            &sink,
+        )
+        .await?;
+        tokio::time::timeout(BOUND, settle_exchanges(&controller, &session_id, 1))
+            .await
+            .context("the delegating turn never settled")??;
+        let delegating = crate::storage::HistoryReader::current(&controller.data_root)?
+            .list_exchange(&session_id)?[0]
+            .id
+            .clone();
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 12,
+                    method: "session.command.apply".into(),
+                    params: json!({"operation_id":"undo-delegating","action":"undo","rollback":{
+                        "scope":"conversation","exchange_id":delegating,
+                        "latest_exchange_id":delegating}}),
+                },
+                &sink,
+            )
+            .await?;
+        tokio::time::timeout(BOUND, async {
+            loop {
+                let rolled_back = crate::storage::HistoryReader::current(&controller.data_root)?
+                    .list_exchange(&session_id)?
+                    .iter()
+                    .any(|exchange| {
+                        exchange.id == delegating
+                            && exchange.disposition()
+                                != crate::exchange::HistoryDisposition::Current
+                    });
+                if rolled_back {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("the rollback never retired the delegating exchange")??;
+        let timeline = controller.observer.snapshot()?.timeline;
+        assert!(
+            !timeline
+                .iter()
+                .any(|entry| matches!(entry, TimelineEntry::ObservedAgent { .. })),
+            "the rolled-back native subagent kept a timeline entry: {timeline:#?}"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    service.shutdown(Duration::from_secs(5)).await?;
+    reader.abort();
+    scenario
+}
+
 /// Cancelling the delegating turn ends a running native subagent: its row reads `cancelled`,
 /// and nothing the subagent reports after the cancel request is drawn.
 ///

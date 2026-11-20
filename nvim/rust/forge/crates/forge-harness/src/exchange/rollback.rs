@@ -43,6 +43,41 @@ pub(crate) struct RewindProvider<'session> {
     pub(crate) capability: &'session crate::provider::ProviderCapability,
     /// Whether the provider holds a conversation for this session at all.
     pub(crate) native_history: bool,
+    /// When the newest compaction recorded as a session row, outside every exchange, started.
+    ///
+    /// A compaction that stopped a running exchange is a row of that exchange instead, so the
+    /// exchange list carries it.
+    pub(crate) newest_session_compaction_ms: Option<i64>,
+}
+
+impl RewindProvider<'_> {
+    /// Find when the newest session-row compaction that may have replaced native history started.
+    ///
+    /// A failed compaction left the history in place. An unconfirmed one may have replaced it,
+    /// and offering a rollback the provider then refuses is the failure this rule prevents.
+    pub(crate) fn newest_session_compaction(
+        events: &[crate::timeline::SessionEventRecord],
+    ) -> Option<i64> {
+        events
+            .iter()
+            .filter_map(|event| match &event.detail {
+                crate::timeline::SessionEventKind::Compaction { compaction }
+                    if replaced_history(compaction) =>
+                {
+                    Some(compaction.started_at_ms.unwrap_or(event.created_at_ms))
+                }
+                _ => None,
+            })
+            .max()
+    }
+}
+
+/// Report whether a compaction may have replaced the provider's native history.
+fn replaced_history(compaction: &crate::provider::Compaction) -> bool {
+    matches!(
+        compaction.state,
+        crate::provider::CompactionState::Completed | crate::provider::CompactionState::Unconfirmed
+    )
 }
 
 /// Select where a conversation rollback to `first_removed` truncates native history.
@@ -66,10 +101,26 @@ pub(crate) fn rewind_target(
     if !provider.native_history {
         return Ok(None);
     }
-    let retained = exchanges[..first_removed]
-        .iter()
-        .filter(|exchange| exchange.disposition() == HistoryDisposition::Current);
-    match NativeBoundary::after(retained) {
+    let retained = || {
+        exchanges[..first_removed]
+            .iter()
+            .filter(|exchange| exchange.disposition() == HistoryDisposition::Current)
+    };
+    match NativeBoundary::after(retained()) {
+        NativeBoundary::Checkpoint(_)
+            if provider.capability.conversation_rewind_stops_at_compaction
+                && retained()
+                    .rev()
+                    .find(|exchange| exchange.native_checkpoint().is_some())
+                    .is_some_and(|kept| compacted_after(exchanges, kept, provider)) =>
+        {
+            Err(RollbackFailure::Unsupported {
+                reason: format!(
+                    "Conversation rollback is unsupported here: {} cannot rewind to before its context was compacted",
+                    provider.label
+                ),
+            })
+        }
         NativeBoundary::Checkpoint(checkpoint) => Ok(Some(Some(checkpoint))),
         NativeBoundary::Unrecorded { ordinal } => Err(RollbackFailure::Unsupported {
             reason: format!(
@@ -86,6 +137,49 @@ pub(crate) fn rewind_target(
         }
         NativeBoundary::Empty => Ok(Some(None)),
     }
+}
+
+/// Report whether a compaction may have replaced the native history that ends at `kept`'s
+/// checkpoint.
+///
+/// The checkpoint is the end of `kept`'s newest checkpointed turn, so a compaction that started
+/// after that turn ended replaced it: an idle `/compact`, an automatic compaction at the turn
+/// boundary, or one inside any later exchange. A compaction that stopped `kept` itself and after
+/// which a turn ran again precedes the checkpoint and leaves it resumable. Every exchange counts
+/// whatever its disposition, because a Harness rollback does not undo a compaction.
+fn compacted_after(exchanges: &[Exchange], kept: &Exchange, provider: &RewindProvider<'_>) -> bool {
+    let checkpoint_recorded_at_ms = kept
+        .turn
+        .iter()
+        .rev()
+        .find(|turn| {
+            turn.completed()
+                .is_some_and(|completed| completed.result().checkpoint_id().is_some())
+        })
+        .or(kept.turn.last())
+        .and_then(crate::turn::Turn::completed_at_ms)
+        .or_else(|| kept.completed_at_ms())
+        .unwrap_or(kept.created_at_ms);
+    let root_thread = crate::provider::ThreadOwner::root(&kept.session_id)
+        .thread_id()
+        .to_string();
+    let compacted_in_exchange = exchanges.iter().any(|exchange| {
+        exchange.node_list.iter().any(|node| match node {
+            crate::exchange::ExchangeNode::Compaction { compaction, .. }
+                if compaction.thread_id == root_thread && replaced_history(compaction) =>
+            {
+                match compaction.started_at_ms.or(compaction.completed_at_ms) {
+                    Some(started_at_ms) => started_at_ms >= checkpoint_recorded_at_ms,
+                    None => exchange.ordinal > kept.ordinal,
+                }
+            }
+            _ => false,
+        })
+    });
+    compacted_in_exchange
+        || provider
+            .newest_session_compaction_ms
+            .is_some_and(|started_at_ms| started_at_ms >= checkpoint_recorded_at_ms)
 }
 
 /// Decide whether a task survives the rollback of `removed` exchanges.
@@ -122,6 +216,10 @@ pub(crate) struct ExchangeRollbackReview {
     /// first line. An execution start follows an accepted plan, which no command recreates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) task_command: Option<String>,
+    /// Whether the exchange is parked: its state stays `running` in history while a paused task
+    /// holds it open with no turn running, so the list names it paused instead.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) paused: bool,
 }
 
 impl ExchangeRollbackReview {
@@ -146,6 +244,7 @@ impl ExchangeRollbackReview {
             .zip(unavailable)
             .map(|(exchange, rollback_unavailable)| Self {
                 task_command: task_command(&exchange, plan_list),
+                paused: exchange.is_parked(),
                 exchange,
                 rollback_unavailable,
             })
@@ -336,6 +435,12 @@ pub(crate) enum RollbackFailure {
     /// failed apply leaves only the journal state behind.
     #[error("restoration did not complete ({cause}); inspect retained recovery status")]
     RestoreIncomplete { cause: String },
+    /// The files reached the rollback target but the provider conversation did not, so the
+    /// journal stays incomplete; the message names both ways out of that state.
+    #[error(
+        "the files were restored, but the conversation was not rolled back ({cause}); open /undo and choose Continue interrupted restore to retry the conversation, or Restore pre-restore files to return the files to their state before the rollback"
+    )]
+    ConversationNotRewound { cause: String },
     /// The provider cannot rewind this conversation, so nothing changed.
     #[error("{reason}")]
     Unsupported { reason: String },
@@ -351,7 +456,9 @@ impl RollbackFailure {
             Self::JournalMissing => "restore_journal_missing",
             Self::AuthorityUnavailable => "rollback_authority_unavailable",
             Self::PreparationFailed => "rollback_preparation_failed",
-            Self::RecoveryRequired | Self::RestoreIncomplete { .. } => "restore_recovery_required",
+            Self::RecoveryRequired
+            | Self::RestoreIncomplete { .. }
+            | Self::ConversationNotRewound { .. } => "restore_recovery_required",
             Self::Unsupported { .. } => "rollback_unsupported",
             Self::RewindFailed { .. } => "rollback_rewind_failed",
         }
@@ -399,6 +506,7 @@ mod tests {
             label: "Claude Code",
             capability: &capability,
             native_history: true,
+            newest_session_compaction_ms: None,
         };
         assert!(matches!(
             rewind_target(&exchanges, 1, &provider),
@@ -423,6 +531,139 @@ mod tests {
             rewind_target(&exchanges, 0, &provider),
             Ok(Some(None))
         ));
+    }
+
+    /// A provider whose compaction replaces the native history before it cannot resume at an
+    /// earlier checkpoint, so the exchange list marks every rollback that would keep only
+    /// pre-compaction history unavailable before confirmation, and preparation refuses it.
+    /// A compaction that stopped an exchange which then ran again precedes that exchange's
+    /// checkpoint, so rolling back to just after that exchange stays available.
+    #[test]
+    fn rewind_never_targets_history_a_compaction_replaced() {
+        let completed_at = |id: &str, ordinal: u64, completed_at_ms: i64| {
+            let mut exchange = finished_exchange(id, ordinal);
+            exchange.phase = crate::exchange::ExchangePhase::fixture(
+                crate::exchange::ExchangeState::Complete,
+                Some(completed_at_ms),
+                None,
+            );
+            exchange
+        };
+        let mut compacted = completed_at("third", 3, 30);
+        compacted.observe_compaction(
+            crate::provider::Compaction {
+                id: "mid-turn".into(),
+                thread_id: crate::provider::ThreadOwner::root("session")
+                    .thread_id()
+                    .to_string(),
+                state: crate::provider::CompactionState::Completed,
+                manual: true,
+                started_at_ms: Some(25),
+                completed_at_ms: Some(27),
+                result: Default::default(),
+            },
+            25,
+        );
+        let exchanges = vec![
+            completed_at("first", 1, 10),
+            completed_at("second", 2, 20),
+            compacted,
+            completed_at("fourth", 4, 40),
+        ];
+        let capability = crate::provider::ProviderCapability {
+            native_conversation_rewind: true,
+            conversation_rewind_requires_checkpoint: true,
+            conversation_rewind_stops_at_compaction: true,
+            ..Default::default()
+        };
+        let provider = RewindProvider {
+            label: "Claude Code",
+            capability: &capability,
+            native_history: true,
+            newest_session_compaction_ms: None,
+        };
+        let refusal = rewind_target(&exchanges, 2, &provider).unwrap_err();
+        assert_eq!(refusal.code(), "rollback_unsupported");
+        assert!(refusal.to_string().contains("compacted"), "{refusal}");
+        assert!(matches!(
+            rewind_target(&exchanges, 3, &provider),
+            Ok(Some(Some(checkpoint))) if checkpoint == "checkpoint-third"
+        ));
+        let review = ExchangeRollbackReview::list(exchanges.clone(), &[], &provider);
+        let unavailable = review
+            .iter()
+            .map(|entry| entry.rollback_unavailable.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(unavailable, [true, true, true, false]);
+        assert_eq!(review[2].rollback_unavailable, Some(refusal.to_string()));
+
+        // A compaction recorded as a session row after the last exchange replaced it as well.
+        let idle = RewindProvider {
+            newest_session_compaction_ms: Some(45),
+            ..provider
+        };
+        assert_eq!(
+            rewind_target(&exchanges, 3, &idle).unwrap_err().to_string(),
+            refusal.to_string()
+        );
+
+        // A provider that rewinds across a compaction offers every target after the first.
+        let crosses = crate::provider::ProviderCapability {
+            conversation_rewind_stops_at_compaction: false,
+            ..capability.clone()
+        };
+        let crosses = RewindProvider {
+            capability: &crosses,
+            ..idle
+        };
+        let review = ExchangeRollbackReview::list(exchanges, &[], &crosses);
+        assert_eq!(
+            review
+                .iter()
+                .map(|entry| entry.rollback_unavailable.is_some())
+                .collect::<Vec<_>>(),
+            [true, false, false, false]
+        );
+    }
+
+    /// Only a session-row compaction that may have replaced native history bounds a rewind.
+    #[test]
+    fn newest_session_compaction_ignores_failed_attempts() {
+        let event = |id: &str, state: crate::provider::CompactionState, started_at_ms: i64| {
+            crate::timeline::SessionEventRecord {
+                id: id.into(),
+                session_id: "session".into(),
+                owner: crate::timeline::TimelineOwner::session("session"),
+                created_at_ms: started_at_ms,
+                detail: crate::timeline::SessionEventKind::Compaction {
+                    compaction: Box::new(crate::provider::Compaction {
+                        id: id.into(),
+                        thread_id: crate::provider::ThreadOwner::root("session")
+                            .thread_id()
+                            .to_string(),
+                        state,
+                        manual: true,
+                        started_at_ms: Some(started_at_ms),
+                        completed_at_ms: None,
+                        result: Default::default(),
+                    }),
+                },
+            }
+        };
+        let events = vec![
+            event("completed", crate::provider::CompactionState::Completed, 10),
+            event(
+                "unconfirmed",
+                crate::provider::CompactionState::Unconfirmed,
+                20,
+            ),
+            event("failed", crate::provider::CompactionState::Failed, 30),
+        ];
+        assert_eq!(RewindProvider::newest_session_compaction(&events), Some(20));
+        assert_eq!(
+            RewindProvider::newest_session_compaction(&events[2..]),
+            None
+        );
     }
 
     /// Rolling back a task start names the command that started it, so the composer receives
@@ -477,6 +718,7 @@ Keep the rounding rule.",
             label: "Codex",
             capability: &capability,
             native_history: true,
+            newest_session_compaction_ms: None,
         };
         let review = ExchangeRollbackReview::list(exchanges, &plan_list, &provider);
         assert_eq!(

@@ -512,12 +512,14 @@ T["plan_test_delete"] = function()
     working_path = path, review_digest = "digest:4" }, review = presentation(owner.document) })
   assert(owner.version == 4 and owner.attached(), table.concat(notices:messages(), "\n"))
   assert(comments.capture(review.buf)[1].source.body == "Keep this new feedback", "deletion lost newer typing")
-  -- The queued save then collapses the saved comment, leaving the cursor on its compact row.
+  -- The queued save then collapses the saved comment and returns the cursor to the source line it
+  -- annotates, outside its compact rows, so the next CursorMoved does not reopen it.
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1] - 1
   assert(vim.iter(owner.comment_state.range_list):any(function(range)
-    return tostring(range.annotation.id) == "late" and range.compact
-      and cursor_row >= range.first_row and cursor_row <= range.last_row
-  end), "deletion moved the cursor out of the current comment")
+    return tostring(range.annotation.id) == "late" and range.compact and cursor_row < range.first_row
+  end), "the queued save left the saved comment open or the cursor inside it")
+  MiniTest.expect.equality(comments.source_line_at_cursor(review.buf), 1,
+    { fail_reason = "the queued save moved the cursor away from the comment's source line" })
   assert(not vim.bo[review.buf].modified, "the queued save did not settle")
   assert(opened == 1 and closed == 0, "subsequent deletion reopened the native document")
 end

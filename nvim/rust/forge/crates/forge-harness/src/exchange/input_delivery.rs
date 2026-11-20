@@ -444,6 +444,10 @@ impl InputDeliveryRun {
                         updates,
                         input: None,
                     }),
+                    CompactionProgress::Unsuccessful { .. } => match run.outcome() {
+                        Err(unsuccessful) => Err(unsuccessful.into()),
+                        Ok(_) => unreachable!("an unsuccessful compaction reports its failure"),
+                    },
                     CompactionProgress::Committed { mut updates } => {
                         let completed = broker
                             .owner_finish_configuration(None, self.selected.as_ref(), None)
@@ -831,6 +835,9 @@ impl InputDeliveryRun {
                             None => InputExecutionResult::Completed,
                             Some(error) if error.code == "turn_cancelled" => {
                                 InputExecutionResult::Cancelled
+                            }
+                            Some(error) if error.code == "prompt_refused" => {
+                                InputExecutionResult::Refused(error.message.clone())
                             }
                             Some(_) => InputExecutionResult::Failed,
                         },

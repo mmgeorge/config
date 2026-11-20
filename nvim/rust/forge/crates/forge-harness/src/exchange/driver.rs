@@ -88,6 +88,9 @@ pub(crate) struct ExchangeDriver {
     cancellation_progress: Option<super::CancellationProgress>,
     configuration_attempt: Option<ConfigurationAttempt>,
     deferred_configuration: Option<DeferredConfiguration>,
+    /// A command that may have parked an exchange for its turn to run again failed; the owner
+    /// settles that exchange once no work remains to own it.
+    failed_parking_command: Option<CommandId>,
     pending_plan_acceptance: Option<PendingPlanAcceptance>,
     acceptance_followers: Vec<(CommandId, super::queue::QueuedCommand)>,
     input_receipts: InputReceipts,
@@ -119,12 +122,29 @@ struct DeferredConfiguration {
 /// Keep approval outside the command lane so cancellation and native completion remain serviceable.
 struct PendingPlanAcceptance {
     run: Box<super::task_command::TaskCommandRun>,
-    exchange: String,
-    turn: Option<String>,
+    planning: PlanningSettlement,
+}
+
+/// Say how an acceptance that arrived during a planning invocation resumes once that invocation settles.
+enum PlanningSettlement {
+    /// The acceptance is recorded and the invocation sealed: execution starts only after this
+    /// exact exchange's turn completes normally.
+    Sealed {
+        exchange: String,
+        turn: Option<String>,
+    },
+    /// The invocation could not be sealed, for example because its task authority predates a
+    /// task change it has not adopted. Nothing is recorded; the acceptance is prepared again from
+    /// the settled state, as if it had arrived after the invocation.
+    Unsealed,
 }
 
 impl PendingPlanAcceptance {
+    /// Withdraw the recorded acceptance; an unsealed acceptance recorded nothing.
     fn reject(&self, services: &OwnerServices, reason: &str) -> Result<()> {
+        if matches!(self.planning, PlanningSettlement::Unsealed) {
+            return Ok(());
+        }
         crate::storage::writer::HistoryWriter::lease_for(&services.root)?.reject_terminal_request(
             services.observer.session_id(),
             &format!(
@@ -160,6 +180,7 @@ impl ExchangeDriver {
             cancellation_progress: None,
             configuration_attempt: None,
             deferred_configuration: None,
+            failed_parking_command: None,
             pending_plan_acceptance: None,
             acceptance_followers: Vec::new(),
             input_receipts: InputReceipts::default(),
@@ -465,6 +486,9 @@ impl ExchangeDriver {
                     &event_status,
                 )
                 .await;
+                // A compaction that has just become active is recorded before anything else
+                // in this step can yield, so a status read after its start sees it waiting.
+                self.compaction_wait_publish(&env, &mut state, step).await;
                 self.question_tools_admit(&env, &mut state, step, closed)
                     .await;
                 self.checks_admit(&env, &mut state, step, closed, &mut broker_deferred)
@@ -481,6 +505,7 @@ impl ExchangeDriver {
                 .await;
                 self.turns_advance(&env, &mut state, step, closed, foreground_at_entry)
                     .await;
+                self.failed_parking_release(&env, &mut state, step).await;
                 self.check_results_advance(&env, &mut state, step, closed)
                     .await;
             }
@@ -513,6 +538,8 @@ impl ExchangeDriver {
                     wake,
                 )
                 .await;
+            // Admission, an attempt's start, and a command's end all arrive as wakes.
+            self.compaction_wait_publish(&env, &mut state, step).await;
             if matches!(wake_end, WakeEnd::RestartStep) {
                 continue;
             }

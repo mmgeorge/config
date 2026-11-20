@@ -316,6 +316,24 @@ impl HarnessBroker {
             // and collecting the already settled invocation.
             timeout.claim_report();
         }
+        // A restart that finds the parent waiting for its children wakes the result the parent
+        // parked for them. The parent's request is unfinished, because the reports it waited for
+        // never arrive, so the result settles as the stopped turn the restart runs again, exactly
+        // as a running turn's restart does. Finalizing it as complete captured a checkpoint over
+        // the delegation tree and ended the exchange with nothing left to continue it.
+        let waiting_for_children = self
+            .active_wait_projection
+            .as_ref()
+            .is_some_and(|wait| wait.exchange_id == transaction.state.interaction.id);
+        let outcome = match outcome {
+            ForegroundOutcome::NativeReady(Ok(_))
+                if waiting_for_children
+                    && transaction.collection == Some(ForegroundCollection::Restart) =>
+            {
+                ForegroundOutcome::NativeReady(Err(ProviderError::Cancelled))
+            }
+            outcome => outcome,
+        };
         let (mut output, question_override) = match outcome {
             ForegroundOutcome::NativeReady(Ok(output)) => (output, None),
             ForegroundOutcome::NativeReady(Err(error))
@@ -450,12 +468,12 @@ impl HarnessBroker {
             let pending = self
                 .agent_coordinator
                 .pending_result(&transaction.state.interaction.id);
-            // A child cancelled through Harness reports beside its siblings but never starts a
-            // continuation alone: the cancel was its requester's decision, and its lone report
-            // travels with the next user input instead.
+            // A child the parent's model interrupted reports beside its siblings but never starts
+            // a continuation alone; a child the user cancelled does, even when the user cancelled
+            // every child, so the parent never settles waiting for reports that cannot come.
             let reportable = pending
                 .iter()
-                .any(|task| task.state != ExchangeState::Cancelled);
+                .any(crate::agent::AgentTask::starts_parent_continuation);
             // A stopped child leaves its report unreported until user authorization, so only
             // still-running children keep this exchange waiting.
             let waiting_for_children = if stopped_child {

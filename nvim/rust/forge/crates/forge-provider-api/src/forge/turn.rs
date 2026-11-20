@@ -306,8 +306,9 @@ pub struct CheckFailure {
     pub state: String,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
-    /// Path of the file holding the command's complete output.
-    pub log: String,
+    /// Path of the file holding the command's complete output, or `None` when the command
+    /// printed nothing on standard output or standard error.
+    pub log: Option<String>,
 }
 
 /// A finished child agent's report, rendered as `<agent_message type="final_answer">`.
@@ -379,6 +380,10 @@ pub enum Notice {
     PlanAbandoned { title: String },
     /// Harness refused the goal completion the previous turn requested; the goal is still active.
     GoalCompletionRefused { reason: String },
+    /// Harness stopped this turn before it finished, for example to compact the conversation or
+    /// to apply a configuration change, and runs it again with the same input. `reason` says
+    /// how to continue, such as which permissions changed.
+    TurnRestarted { reason: String },
 }
 
 impl TurnInput {
@@ -804,14 +809,27 @@ impl CheckRepair {
             if let Some(code) = failure.exit_code {
                 attributes.push(("exit_code", code.to_string()));
             }
-            attributes.push(("log", failure.log.clone()));
-            match failure
+            let error = failure
                 .error
                 .as_deref()
-                .filter(|error| !error.trim().is_empty())
-            {
-                Some(error) => writer.element("failure", &attributes, error),
-                None => writer.empty("failure", &attributes),
+                .filter(|error| !error.trim().is_empty());
+            match &failure.log {
+                Some(log) => {
+                    attributes.push(("log", log.clone()));
+                    match error {
+                        Some(error) => writer.element("failure", &attributes, error),
+                        None => writer.empty("failure", &attributes),
+                    }
+                }
+                // Naming an empty log reads as missing evidence, so the failure says the command
+                // printed nothing, beside its exit status.
+                None => {
+                    let silence =
+                        "The command printed nothing on standard output or standard error.";
+                    let text = error
+                        .map_or_else(|| silence.to_owned(), |error| format!("{error}\n{silence}"));
+                    writer.element("failure", &attributes, &text);
+                }
             }
         }
         writer.close();

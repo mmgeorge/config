@@ -50,16 +50,29 @@ local function focus_state(state, insert)
     layout.enter_composer_in_insert(enter)
     if vim.api.nvim_get_mode().mode:sub(1, 1) ~= "i" then vim.cmd("startinsert!") end
   else
+    -- The composer's entry guard leaves Insert mode only when focus moves into it. A composer that
+    -- already has focus keeps its mode: the host's reply can arrive seconds after the user has
+    -- started typing there, and leaving Insert mode then turns the next keys into Normal-mode
+    -- commands. A command that replaces the focused composer's session, as `/clear` does, leaves
+    -- Insert mode when it is submitted instead.
     enter()
-    -- The composer's entry guard leaves Insert mode only when focus moves into it. A session that
-    -- replaces the one in the focused composer, as `/clear` does, moves nothing, so the composer
-    -- is returned to Normal mode here, as it is after every other session change.
-    if target and vim.api.nvim_get_current_win() == target and vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
-      vim.cmd("stopinsert")
-    end
   end
   activate_state(state)
   return true
+end
+
+-- True while a view's buffers move into windows of a tab the user is not in. Placing a buffer in
+-- any window runs its `BufEnter` autocommands, even when focus never reaches that window, and the
+-- activation autocommand would then select a session the user is not looking at.
+local background_placement = false
+
+---Place buffers into another tab's windows without selecting the session they belong to.
+---@param place fun()
+local function place_in_background(place)
+  background_placement = true
+  local placed, failure = pcall(place)
+  background_placement = false
+  if not placed then error(failure, 0) end
 end
 
 ---@param state ForgeHarnessPresentationState
@@ -70,7 +83,7 @@ local function attach_activation(state)
     vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
       group = group,
       buffer = buf,
-      callback = function() activate_state(state) end,
+      callback = function() if not background_placement then activate_state(state) end end,
       desc = "Activate the Harness state owned by this timeline tab",
     })
   end
@@ -103,18 +116,25 @@ local function register(state, session_id)
   layout.rename_session_buffers(state.transcript_buf, state.composer_buf, session_id)
 end
 
+---Close a presentation's window-bound resources while retaining its buffers, reporting a failure.
+---@param owner HarnessPresentation
+---@return boolean
+local function close_presentation(owner)
+  local ok, closed = pcall(owner.close, { preserve_buffer = true })
+  if not ok or not closed then
+    notifications.error("Cannot transfer Harness panes: " .. (ok and "presentation cleanup did not complete" or tostring(closed)), "ForgeHarness")
+    return false
+  end
+  return true
+end
+
 ---Release window-bound presentation resources while retaining the session's buffers.
 ---@param state ForgeHarnessPresentationState
 ---@return boolean
 local function release_presentation(state)
   local owner = state.presentation
   if not owner then return true end
-  local ok, closed = pcall(owner.close, { preserve_buffer = true })
-  if not ok or not closed then
-    notifications.error("Cannot transfer Harness panes: " .. (ok and "presentation cleanup did not complete" or tostring(closed)), "ForgeHarness")
-    return false
-  end
-
+  if not close_presentation(owner) then return false end
   if state.presentation == owner then state.presentation = nil end
   return true
 end
@@ -227,7 +247,9 @@ local function complete_switch(switch)
     abandon_switch(switch)
     return
   end
-  local selected = session.harness == source
+  -- The switch usually completes inside a host reply, which `forge.client` delivers with the
+  -- replying session's view active; only the recorded selection says where the user is.
+  local selected = session.selected_harness() == source
   if not release_presentation(source) then abandon_switch(switch) return end
   local workspace = require("forge.views.harness.workspace")
   workspace.release(source)
@@ -236,7 +258,13 @@ local function complete_switch(switch)
     vim.api.nvim_win_set_buf(composer_win, target.composer_buf)
     layout.place_transcript(window, transcript_win)
   end
-  if switch.insert and selected then layout.enter_composer_in_insert(place) else place() end
+  if not selected then
+    place_in_background(place)
+  elseif switch.insert then
+    layout.enter_composer_in_insert(place)
+  else
+    place()
+  end
   -- The picker that chose the session closes in this same callback, before focus settles.
   if switch.on_settled then switch.on_settled() switch.on_settled = nil end
   source.transcript_win, source.composer_win, source.timeline_tab = nil, nil, nil
@@ -317,6 +345,121 @@ local function switch_in_place(result, source, existing, options)
   target.presentation.when_rendered(function() complete_switch(switch) end)
 end
 
+---@class ForgeHarnessPresentationRebuild
+---@field presentation? HarnessPresentation The presentation the rebuild waits for.
+---@field retired HarnessPresentation The previous host's presentation, still on screen.
+---@field transcript_buf integer The retired presentation's transcript buffer.
+---@field transcript_win integer The visible transcript window, which the rebuilt one replaces.
+---@field window integer The hidden window the rebuilt transcript renders in.
+
+---Whether `state` still draws a presentation that an earlier host generation opened for
+---`session_id`. A view the host stopped serving keeps such a presentation on screen, with its
+---decorations, until its session comes back on a new host.
+---@param state ForgeHarnessPresentationState
+---@param session_id string
+---@return boolean
+local function stale_presentation(state, session_id)
+  local owner = state.presentation
+  return owner ~= nil and not owner.closed and owner.ready == true and owner.session_id == session_id
+    and owner.host_generation ~= client.host_get_generation()
+end
+
+---Give a view whose presentation belongs to an earlier host a fresh transcript buffer in a
+---hidden window over its transcript, where the new host's presentation renders. Closing the old
+---presentation in place cleared every decoration and gutter marker a host round trip before the
+---new one drew, and replacing it on the same buffer would let two replicas share one buffer, so
+---the old one stays on screen untouched until `complete_rebuild` swaps the panes.
+---@param state ForgeHarnessPresentationState
+---@return ForgeHarnessPresentationRebuild
+local function begin_rebuild(state)
+  if state.pending_switch then abandon_switch(state.pending_switch) end
+  local retired = assert(state.presentation)
+  local rebuild = { retired = retired, transcript_buf = state.transcript_buf, transcript_win = state.transcript_win }
+  -- The rebuilt buffer takes the session's buffer name when the activation registers it, so the
+  -- retired one gives that name up first. The rebuilt buffer starts under a key no other buffer
+  -- name contains, because a buffer lookup by name also matches a name that merely contains it.
+  layout.rename_buffer(rebuild.transcript_buf, vim.api.nvim_buf_get_name(rebuild.transcript_buf) .. "?retired")
+  local transcript_buf = layout.create_transcript_buffer("rebuild-pending-" .. tostring(vim.uv.hrtime()))
+  local separator = retired.status_view and retired.status_view.separator
+  rebuild.window = layout.open_hidden_transcript(transcript_buf, rebuild.transcript_win,
+    separator and { fillchars = separator.fillchars, winhighlight = separator.winhighlight } or nil)
+  layout.attach_scroll_boundary(transcript_buf, rebuild.window)
+  -- The retired presentation no longer belongs to the view: renders build the rebuilt one, which
+  -- binds the composer only once the retired status split has closed.
+  state.presentation, state.pending_rebuild = nil, rebuild
+  state.transcript_buf, state.transcript_win = transcript_buf, rebuild.window
+  return rebuild
+end
+
+---Abandon a rebuild whose view closed meanwhile: the session keeps the rebuilt buffers without a view.
+---@param state ForgeHarnessPresentationState
+---@param rebuild ForgeHarnessPresentationRebuild
+local function abandon_rebuild(state, rebuild)
+  if state.pending_rebuild == rebuild then state.pending_rebuild = nil end
+  close_presentation(rebuild.retired)
+  if state.transcript_win == rebuild.window then
+    release_presentation(state)
+    state.transcript_win, state.composer_win, state.timeline_tab = nil, nil, nil
+  end
+  require("forge.views.harness.workspace").release(state)
+  if vim.api.nvim_win_is_valid(rebuild.window) then vim.api.nvim_win_close(rebuild.window, true) end
+  state_by_buffer[rebuild.transcript_buf] = nil
+  layout.detach_transcript(rebuild.transcript_buf)
+  if vim.api.nvim_buf_is_valid(rebuild.transcript_buf) then vim.api.nvim_buf_delete(rebuild.transcript_buf, { force = true }) end
+end
+
+local finish_rebuild
+
+---Put a rebuilt transcript on screen in place of the retired one. Everything happens in this one
+---callback, so the next redraw shows the rebuilt view and no frame shows the panes in between.
+---@param state ForgeHarnessPresentationState
+---@param rebuild ForgeHarnessPresentationRebuild
+local function complete_rebuild(state, rebuild)
+  if state.pending_rebuild ~= rebuild then return end
+  local current = state.presentation
+  if current and current ~= rebuild.presentation and not current.closed then
+    -- A later render replaced the presentation the rebuild waited for; the replacement is awaited.
+    rebuild.presentation = current
+    current.when_rendered(function(rendered) finish_rebuild(state, rebuild, rendered) end)
+    return
+  end
+  local composer_win = state.composer_win
+  if not (composer_win and vim.api.nvim_win_is_valid(composer_win) and vim.api.nvim_win_is_valid(rebuild.window)
+    and vim.api.nvim_win_is_valid(rebuild.transcript_win) and state.transcript_win == rebuild.window) then
+    abandon_rebuild(state, rebuild)
+    return
+  end
+  state.pending_rebuild = nil
+  local workspace = require("forge.views.harness.workspace")
+  workspace.release(state)
+  -- The retired status split closes before the rebuilt one binds the composer it sits above.
+  close_presentation(rebuild.retired)
+  local focused = vim.api.nvim_get_current_win() == rebuild.transcript_win
+  local function place()
+    layout.place_transcript(rebuild.window, rebuild.transcript_win)
+    if focused then vim.api.nvim_set_current_win(rebuild.window) end
+  end
+  if session.selected_harness() == state then place() else place_in_background(place) end
+  state_by_buffer[rebuild.transcript_buf] = nil
+  layout.detach_transcript(rebuild.transcript_buf)
+  if vim.api.nvim_buf_is_valid(rebuild.transcript_buf) then vim.api.nvim_buf_delete(rebuild.transcript_buf, { force = true }) end
+  if state.presentation then state.presentation.bind_composer(composer_win) end
+  workspace.attach(state)
+  controller().with_state(state, controller().refresh_winbar)
+  require("forge.views.harness.tabline").refresh()
+end
+
+---Complete `rebuild` once its presentation has rendered, or once it can no longer render. A
+---presentation that closed may be replaced by the render that closed it, so that case waits for
+---the render to return before looking.
+---@param state ForgeHarnessPresentationState
+---@param rebuild ForgeHarnessPresentationRebuild
+---@param rendered boolean
+finish_rebuild = function(state, rebuild, rendered)
+  if rendered then complete_rebuild(state, rebuild) return end
+  vim.schedule(function() complete_rebuild(state, rebuild) end)
+end
+
 ---@param result table
 ---@param options? ForgeHarnessSessionActivation
 function M.activate(result, options)
@@ -361,7 +504,13 @@ function M.activate(result, options)
         vim.api.nvim_win_set_buf(state.transcript_win, existing.transcript_buf)
         vim.api.nvim_win_set_buf(state.composer_win, existing.composer_buf)
       end
-      if options.insert then layout.enter_composer_in_insert(swap_buffers) else swap_buffers() end
+      if options.focus == false then
+        place_in_background(swap_buffers)
+      elseif options.insert then
+        layout.enter_composer_in_insert(swap_buffers)
+      else
+        swap_buffers()
+      end
       existing.transcript_win, existing.composer_win, existing.timeline_tab =
         state.transcript_win, state.composer_win, state.timeline_tab
       state.transcript_win, state.composer_win, state.timeline_tab = nil, nil, nil
@@ -385,6 +534,12 @@ function M.activate(result, options)
   if not state then
     state = options.open_mode == "current" and source_state or create_view(next_session.id)
   end
+  -- A view returning to its own session on a new host renders the new host's presentation behind
+  -- the one it still shows.
+  local rebuild = valid_view(state) and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win)
+    and not vim.api.nvim_win_get_config(state.transcript_win).hide
+    and state.composer_win and vim.api.nvim_win_is_valid(state.composer_win)
+    and stale_presentation(state, next_session.id) and begin_rebuild(state) or nil
   attach_activation(state)
   register(state, next_session.id)
   state.ready = source_state.ready
@@ -394,6 +549,11 @@ function M.activate(result, options)
   controller().attach_transcript(state.transcript_buf)
   controller().refresh_winbar()
   if options.focus == false then session.activate_harness(selected_state) else focus_state(state, options.insert) end
+  if rebuild then
+    rebuild.presentation = state.presentation
+    if not state.presentation then complete_rebuild(state, rebuild)
+    else state.presentation.when_rendered(function(rendered) finish_rebuild(state, rebuild, rendered) end) end
+  end
 
   if options.open_mode == "current"
     and source_state ~= state
@@ -432,8 +592,8 @@ function M.open_fork(result, source_state)
   if source_session_id and state_by_session_id[source_session_id] ~= source_state then
     register(source_state, source_session_id)
   end
-  local focus = session.harness == source_state
-  local selected_state, previous_window = session.harness, vim.api.nvim_get_current_win()
+  local focus = session.selected_harness() == source_state
+  local selected_state, previous_window = session.selected_harness(), vim.api.nvim_get_current_win()
   if focus and source_state.transcript_win and vim.api.nvim_win_is_valid(source_state.transcript_win) then
     vim.api.nvim_win_call(source_state.transcript_win, function() vim.cmd("normal! m'") end)
   end
@@ -457,6 +617,10 @@ function M.begin_new(name, open_mode)
   pending_sequence = pending_sequence + 1
   local source_state = session.harness
   local state = create_view("new-pending-" .. pending_sequence, open_mode)
+  -- The tab and its focused composer are drawn before the host creates the session, which can take
+  -- seconds. Keys typed there meanwhile belong to that composer, so it takes the session's
+  -- mappings now; a submit before the session exists keeps the draft and says why.
+  require("forge.shared.keymaps").setup_view_keymaps(state.composer_buf, "harness", controller().composer_command_set())
   local pending = { state = state, source_state = source_state, child_name = name }
   M.render_pending(pending)
   return pending
@@ -480,7 +644,7 @@ end
 ---@param result table
 function M.complete_pending(pending, result)
   if not valid_view(pending.state) then return end
-  M.activate(result, { state = pending.state, focus = session.harness == pending.state })
+  M.activate(result, { state = pending.state, focus = session.selected_harness() == pending.state })
 end
 
 ---Remove the view of a request the host refused, which created no session, and report the
@@ -530,7 +694,7 @@ function M.resume(session_id, options)
     if activation.open_mode == "current" and valid_view(source_state) and existing == source_state then
       activation.state = source_state
     end
-    if session.harness ~= source_state then activation.focus = false end
+    if session.selected_harness() ~= source_state then activation.focus = false end
     M.activate(result, activation)
   end)
 end

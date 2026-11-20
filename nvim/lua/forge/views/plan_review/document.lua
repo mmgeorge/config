@@ -313,9 +313,11 @@ function M.attach(options, callback)
     enqueue_operation(operation)
     return true
   end
-  local function save(capture)
+  local function save()
     if not owner.attached() then return end
-    enqueue_operation({ capture = capture or comments.capture(options.buffer) })
+    -- A comment with no text is not feedback: saving drops it, and deletes a saved one emptied.
+    comments.discard_empty(options.buffer)
+    enqueue_operation({ capture = comments.capture(options.buffer) })
   end
   local function attach_projection(opened, source_document, focused_id)
     owner.optimistic_source = nil
@@ -665,8 +667,10 @@ function M.attach(options, callback)
   function owner.action(action, receive, window, settled)
     if not owner.attached() then return false end
     if action == "comment" or action == "question" then
-      comments.add_at_cursor(options.buffer, false, { kind = action == "question" and "question" or nil,
+      -- A refused comment has already said why; opening the comment editor would act on nothing.
+      local added = comments.add_at_cursor(options.buffer, false, { kind = action == "question" and "question" or nil,
         heading = action == "question" and "Plan question" or nil })
+      if not added then return false end
       receive({ local_draft = true }, nil) return true
     end
     if action == "delete" then comments.delete_at_cursor(options.buffer) receive({}, nil) return true end

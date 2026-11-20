@@ -447,8 +447,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         } = heading;
         id.validate()?;
         target.validate()?;
-        let duration = tool_duration(elapsed_ms);
-        let mut row = vec![tool_heading(self.profile, kind, title, &duration, shell)?];
+        let mut row = vec![tool_heading(self.profile, kind, title, elapsed_ms, shell)?];
         let title_rows = row.len();
         if expanded {
             row.extend(tool_source_rows(self.profile, kind, title)?);
@@ -556,16 +555,23 @@ pub(super) fn tool_display_title(kind: &str, title: &str, shell: Option<&str>) -
 }
 
 /// Formats a bounded display title without changing the retained provider call.
+///
+/// A shell command's title is the command itself, so a command that never executed, such as a
+/// denied one, names its tool where the duration column shows `—`; without the name the column
+/// read as an empty gap before the dash.
 fn tool_heading(
     profile: &WidthProfile,
     kind: &str,
     title: &str,
-    duration: &str,
+    elapsed_ms: Option<u64>,
     shell: Option<&str>,
 ) -> Result<String> {
     let normalized = tool_display_title(kind, title, shell);
+    let duration = tool_duration(elapsed_ms);
     let full = if kind == "check" {
         format!("▸ {normalized} · {}", duration.trim())
+    } else if kind == "command" && elapsed_ms.is_none() {
+        format!("• Shell {} {normalized}", duration.trim())
     } else {
         format!("• {duration} {normalized}")
     };
@@ -801,6 +807,37 @@ fn append_decoration(block: &mut BufferBlock, row: usize, start: usize, end: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command that never ran names its tool before the duration column's dash, and a command
+    /// that ran keeps its duration there.
+    #[test]
+    fn a_command_that_never_ran_names_its_tool_before_the_dash() -> Result<()> {
+        let profile = WidthProfile::default();
+        let heading = |elapsed_ms| -> Result<String> {
+            let block = TranscriptRenderer::new(&profile)?.tool_header(
+                BlockId("denied:tool".into()),
+                TargetId("denied:tool".into()),
+                ToolHeading {
+                    shell: None,
+                    kind: "command",
+                    elapsed_ms,
+                    state: crate::turn::ToolState::Denied,
+                    title: "Set-Content -LiteralPath notes/wave.txt -Value 'wave'",
+                    expanded: true,
+                },
+            )?;
+            Ok(block.text.wire_rows()[0].to_owned())
+        };
+        assert_eq!(
+            heading(None)?,
+            "• Shell — Set-Content -LiteralPath notes/wave.txt -Value 'wave'"
+        );
+        assert_eq!(
+            heading(Some(45))?,
+            "•  45ms Set-Content -LiteralPath notes/wave.txt -Value 'wave'"
+        );
+        Ok(())
+    }
 
     /// Keep skill icons in the marker column and preserve folding for wrapped labels.
     #[test]

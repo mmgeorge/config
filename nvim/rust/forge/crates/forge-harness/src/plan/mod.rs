@@ -9,7 +9,7 @@ use crate::session::{ApprovalMode, continuation::ContinuationBudget};
 
 mod artifact_recovery;
 mod authoring;
-pub(crate) use authoring::PlanAuthoringScope;
+pub(crate) use authoring::{PlanAuthoringScope, is_authoring_path};
 mod audit;
 mod comment_lint;
 pub(crate) mod conformance;
@@ -1916,7 +1916,7 @@ impl PlanFileStore {
             })?;
         }
         let directory = crate::storage::state::directory(&self.root)
-            .join("plan-workspaces")
+            .join(authoring::AUTHORING_ROOT)
             .join(session_id);
         if directory.exists() {
             fs::remove_dir_all(&directory).with_context(|| {

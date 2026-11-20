@@ -114,11 +114,36 @@ impl UnstartedSessions {
 struct ProcessFrames {
     state: Arc<ClaudeSessionState>,
     serving: AtomicBool,
+    /// The errors of a `result` the CLI printed before it served the conversation.
+    ///
+    /// A CLI that refuses its command line, such as a guarded resume whose discarded range holds
+    /// entries of another turn, prints its reason in such a `result` and exits; the closed
+    /// output alone does not say why.
+    startup_errors: std::sync::Mutex<Vec<String>>,
+}
+
+impl ProcessFrames {
+    /// Join the reasons the CLI gave before it served the conversation, if it gave any.
+    fn startup_refusal(&self) -> Option<String> {
+        let errors = self
+            .startup_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
 }
 
 #[async_trait]
 impl FrameHandler for ProcessFrames {
     async fn frame(&self, frame: StdoutFrame) {
+        if !self.serving.load(Ordering::Acquire)
+            && let StdoutFrame::Result(result) = &frame
+        {
+            self.startup_errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(result.errors.iter().cloned());
+        }
         FrameHandler::frame(&*self.state, frame).await;
     }
 
@@ -539,6 +564,7 @@ async fn launch(
     let frames = Arc::new(ProcessFrames {
         state: state.clone(),
         serving: AtomicBool::new(false),
+        startup_errors: std::sync::Mutex::new(Vec::new()),
     });
     let transport = Arc::new(ClaudeTransport::start(io, frames.clone(), cleanup));
     let initialized = transport
@@ -551,6 +577,12 @@ async fn launch(
         Ok(initialized) => initialized,
         Err(error) => {
             let _ = transport.shutdown().await;
+            // The reader delivers every frame before it reports the closed output, so a reason
+            // the CLI printed before it exited is already recorded.
+            if let Some(reason) = frames.startup_refusal() {
+                tracing::error!(target: "forge::provider", event_name = "provider.startup.refused",
+                    provider = "claude", reason = %reason);
+            }
             return Err(initialization_failure(error));
         }
     };

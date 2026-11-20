@@ -68,7 +68,12 @@ fn repair_cut(history: &[SessionEvent]) -> Result<Option<String>> {
     ))
 }
 
-/// Read the entire persisted primary history without imposing a content limit.
+/// Read the entire persisted history of every agent without imposing a content limit.
+///
+/// Copilot chains each persisted event to the one appended before it, whichever agent wrote
+/// it, so an abort recorded while a delegated agent runs names that agent's event as its
+/// parent. The primary scope omits those events and breaks the ancestry that proves an abort
+/// closed a call; every other check reads only main-agent events.
 async fn read_history(session: &github_copilot_sdk::session::Session) -> Result<Vec<SessionEvent>> {
     let mut cursor = None;
     let mut history = Vec::new();
@@ -81,7 +86,7 @@ async fn read_history(session: &github_copilot_sdk::session::Session) -> Result<
                 agent_ids: None,
                 direction: None,
                 include_ephemeral: Some(false),
-                agent_scope: Some(EventsAgentScope::Primary),
+                agent_scope: Some(EventsAgentScope::All),
                 cursor: cursor.clone(),
                 max: None,
                 types: Some(serde_json::json!("*")),
@@ -108,6 +113,10 @@ async fn read_history(session: &github_copilot_sdk::session::Session) -> Result<
 }
 
 /// Find an unmatched declaration only when removing its suffix loses no later completed work.
+///
+/// A suffix that holds later answers, results, or requests cannot be cut without losing them,
+/// so the history is refused as a [`ProviderFailureKind::HistoryConflict`]: the thread cannot
+/// be resumed as it is, and the user continues in a new session.
 fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
     let mut declaration = HashMap::new();
     let mut pending = HashMap::new();
@@ -140,9 +149,10 @@ fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
             _ => {}
         }
     }
-    let primary_events = history
+    // Ancestry crosses delegated agents' events: an abort recorded while a delegated agent was
+    // starting or running is parented to that agent's latest event.
+    let ancestry = history
         .iter()
-        .filter(|event| event.agent_id.is_none())
         .map(|event| (event.id.as_str(), event))
         .collect::<HashMap<_, _>>();
     // Copilot never records a completion for a call its abort interrupted, yet the abort closes
@@ -153,7 +163,7 @@ fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
         !history.iter().skip(*index + 1).any(|event| {
             event.agent_id.is_none()
                 && event.parsed_type() == SessionEventType::AssistantTurnEnd
-                && interrupted_turn(&primary_events, event, declaration)
+                && interrupted_turn(&ancestry, event, declaration)
         })
     });
     let Some(boundary) = pending.values().copied().min() else {
@@ -170,7 +180,7 @@ fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
                     .typed_data::<AssistantMessageData>()
                     .ok_or_else(|| failure(ProviderFailureKind::Protocol))?;
                 if !message.content.is_empty() {
-                    return Err(failure(ProviderFailureKind::Rejected));
+                    return Err(failure(ProviderFailureKind::HistoryConflict));
                 }
             }
             SessionEventType::ToolExecutionComplete => {
@@ -181,7 +191,7 @@ fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
                     .get(&completion.tool_call_id)
                     .is_some_and(|index| *index == boundary)
                 {
-                    return Err(failure(ProviderFailureKind::Rejected));
+                    return Err(failure(ProviderFailureKind::HistoryConflict));
                 }
             }
             SessionEventType::AssistantTurnEnd => {
@@ -191,12 +201,12 @@ fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
                         && candidate.parsed_type() == SessionEventType::SessionError
                         && candidate.parent_id.as_deref() == Some(event.id.as_str())
                 });
-                if !failed && !interrupted_turn(&primary_events, event, &history[boundary].id) {
-                    return Err(failure(ProviderFailureKind::Rejected));
+                if !failed && !interrupted_turn(&ancestry, event, &history[boundary].id) {
+                    return Err(failure(ProviderFailureKind::HistoryConflict));
                 }
             }
             SessionEventType::UserMessage => {
-                return Err(failure(ProviderFailureKind::Rejected));
+                return Err(failure(ProviderFailureKind::HistoryConflict));
             }
             _ => {}
         }
@@ -234,6 +244,9 @@ fn unanswered_request(history: &[SessionEvent]) -> Option<String> {
 }
 
 /// Require an abort on this turn's ancestry, even when persisted after its terminal event.
+///
+/// `events` holds every agent's events, because the chain from a main-agent terminal event back
+/// to its declaration passes through any delegated agent's events appended in between.
 fn interrupted_turn(
     events: &HashMap<&str, &SessionEvent>,
     terminal: &SessionEvent,
@@ -249,7 +262,8 @@ fn interrupted_turn(
         if event.id == boundary {
             return aborted;
         }
-        aborted |= event.parsed_type() == SessionEventType::Abort;
+        // Only the main agent's abort ends the turn; a delegated agent's own abort does not.
+        aborted |= event.agent_id.is_none() && event.parsed_type() == SessionEventType::Abort;
         cursor = event
             .parent_id
             .as_deref()
@@ -362,6 +376,112 @@ mod tests {
                 json!({"turnId":"0"}),
             ),
         ]);
+    }
+
+    /// Build a delegated agent's event, which Copilot chains into the same parent sequence as
+    /// the main agent's events.
+    fn delegated(id: &str, parent: &str, kind: &str, data: serde_json::Value) -> SessionEvent {
+        serde_json::from_value(json!({
+            "id":id,"parentId":parent,"agentId":"search-agent","type":kind,
+            "timestamp":"2026-10-30T00:00:00Z","data":data
+        }))
+        .unwrap()
+    }
+
+    /// A delegated call that an abort closed while its agent was starting is settled history.
+    ///
+    /// Copilot parents the abort to the delegated agent's last event, so the abort's ancestry
+    /// reaches the call's declaration only through that agent's events, and the session went
+    /// on to answer a later request after the abort.
+    #[test]
+    fn delegated_call_interrupted_during_agent_startup_needs_no_repair() -> Result<()> {
+        let history = vec![
+            child(
+                "request",
+                "root",
+                "user.message",
+                json!({"content":"Draft the plan"}),
+            ),
+            child(
+                "start",
+                "request",
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "declare",
+                "start",
+                "assistant.message",
+                json!({"messageId":"m1","content":"I have the rule.","toolRequests":[
+                    {"name":"view","toolCallId":"view"},
+                    {"name":"search_code_subagent","toolCallId":"search"}
+                ]}),
+            ),
+            child(
+                "search-start",
+                "declare",
+                "tool.execution_start",
+                json!({"toolCallId":"search","toolName":"search_code_subagent"}),
+            ),
+            delegated(
+                "agent-started",
+                "search-start",
+                "subagent.started",
+                json!({"toolCallId":"search","agentName":"search","agentDisplayName":"Search","agentDescription":"search"}),
+            ),
+            child(
+                "view-done",
+                "agent-started",
+                "tool.execution_complete",
+                json!({"toolCallId":"view","success":true}),
+            ),
+            delegated(
+                "agent-request",
+                "view-done",
+                "user.message",
+                json!({"content":"Find how orders are represented"}),
+            ),
+            delegated(
+                "agent-turn",
+                "agent-request",
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "abort",
+                "agent-turn",
+                "abort",
+                json!({"reason":"user_initiated"}),
+            ),
+            child("end", "abort", "assistant.turn_end", json!({"turnId":"0"})),
+            child(
+                "later",
+                "end",
+                "user.message",
+                json!({"content":"Start the goal"}),
+            ),
+            child(
+                "later-start",
+                "later",
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "later-answer",
+                "later-start",
+                "assistant.message",
+                json!({"messageId":"m2","content":"Working on it"}),
+            ),
+            child(
+                "later-end",
+                "later-answer",
+                "assistant.turn_end",
+                json!({"turnId":"0"}),
+            ),
+        ];
+        assert_eq!(incomplete_suffix(&history)?, None);
+        assert_eq!(repair_cut(&history)?, None);
+        Ok(())
     }
 
     /// A call that an abort closed earlier is settled history, not an incomplete suffix.
@@ -594,7 +714,7 @@ mod tests {
         assert!(
             matches!(incomplete_suffix(&history), Err(ProviderError::Failure(error))
             if error.operation() == ProviderOperation::InputReconcile
-                && error.kind() == ProviderFailureKind::Rejected)
+                && error.kind() == ProviderFailureKind::HistoryConflict)
         );
     }
 }

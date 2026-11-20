@@ -99,7 +99,7 @@ pub fn prepare_new_session(
         &child.provider,
     )?;
     shared.desired.apply(&mut child, native_compact)?;
-    shared.apply_provider_defaults(&mut child)?;
+    shared.apply_provider_defaults(&mut child, preference.as_ref())?;
     store.save_session(&child)?;
     Ok(child)
 }

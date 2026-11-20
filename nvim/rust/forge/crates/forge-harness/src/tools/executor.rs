@@ -110,7 +110,7 @@ impl ControlToolExecutor {
             authority.validate_scope()?;
         }
         if invocation.name == "question_ask"
-            && invocation.arguments["wait"].as_bool() == Some(true)
+            && super::question_ask_waits(&invocation.arguments, self.mode)
             && runtime.context.questions.is_some()
         {
             if let Some(authority) = &self.authority {

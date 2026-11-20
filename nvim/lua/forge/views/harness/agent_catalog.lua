@@ -79,6 +79,34 @@ function AgentCatalog.replace(state, agent)
   return true
 end
 
+local interrupt_failure_text = {
+  stale_target = "the child's task changed before the interrupt applied",
+  rejected = "the child coordinator rejected the interrupt",
+  cleanup_failed = "the child's cleanup remains unresolved",
+  outcome_uncertain = "the interrupt is still unconfirmed",
+  invalid_completion = "the child coordinator returned an invalid result",
+  worker_lost = "the interrupt ended without a result",
+}
+
+--- Name the first child an interrupt response could not interrupt, with the reason.
+---
+--- `session.agent.interrupt` and `session.agent.interrupt_all` succeed as a request and carry one
+--- `{ target, result }` entry per child, whose `result` is `{ Ok = vim.NIL }` or
+--- `{ Err = { failure = <code> } }`.
+---@param response table? Host response to an interrupt request.
+---@return string? message
+function AgentCatalog.interrupt_failure(response)
+  if type(response) ~= "table" or type(response.targets) ~= "table" then return nil end
+  for _, entry in ipairs(response.targets) do
+    local failure = type(entry) == "table" and type(entry.result) == "table" and entry.result.Err
+    if failure then
+      local code = type(failure) == "table" and failure.failure or tostring(failure)
+      return interrupt_failure_text[code] or ("the interrupt failed: " .. tostring(code):gsub("_", " "))
+    end
+  end
+  return nil
+end
+
 ---@param state table
 ---@param selector string
 ---@return table? run

@@ -2,13 +2,13 @@
 
 `session.command.apply` carries both typed task actions and configuration actions. All require an explicit envelope `session_id`. Callers should supply a nonempty `operation_id` so a lost response can be recovered. Typed task actions generate an ID when it is omitted. Reusing an operation ID with a different action fails. The command receipt and later `task_operation` event describe admission and settlement separately. Recover the receipt through `session.command.operation.get` before retrying an uncertain mutation.
 
-Task actions use [SessionAction](native-schemas.md#sessionaction). The additional configuration actions below are decoded by [admit_task_intent](../../../rust/forge/crates/forge-harness/src/service.rs) and executed by [apply_configuration](../../../rust/forge/crates/forge-harness/src/broker/configuration.rs). They do not create a task.
+Task actions use [SessionAction](native-schemas.md#sessionaction). The additional configuration actions below are decoded by [native_permission](../../../rust/forge/crates/forge-harness/src/service/native_permission.rs), [native_settings](../../../rust/forge/crates/forge-harness/src/service/native_settings.rs), and [compaction](../../../rust/forge/crates/forge-harness/src/service/compaction.rs) and executed by the exchange owner, which chooses the affected work, stops it, and runs the stopped turn again with `HarnessBroker::restarted_turn_input`. They do not create a task, and their decoders reject unknown fields, so a caller cannot request or suppress that restart.
 
 | Action | Required fields | Optional fields | Effect |
 | --- | --- | --- | --- |
-| `permission` | `change`: [PermissionChange](native-schemas.md#permissionchange) | `resume`: boolean, default false | Applies the selected access or approval change to the session. Admission captures the resolved permission selection. |
-| `configure` | `config`: configuration object | `resume`: boolean, default false | Validates and applies the requested session and provider settings. |
-| `compact` | None | `resume`: boolean, default false | Requests native context compaction. Unsupported providers fail explicitly. |
+| `permission` | `change`: [PermissionChange](native-schemas.md#permissionchange) | None | Applies the selected access or approval change to the session. Admission captures the resolved permission selection. |
+| `configure` | `config`: configuration object | None | Validates and applies the requested session and provider settings. |
+| `compact` | None | None | Requests native context compaction. Unsupported providers fail explicitly. |
 | `undo` | `rollback.scope`: `conversation`, `rollback.exchange_id`: existing exchange ID, `rollback.latest_exchange_id`: captured latest exchange ID | None | Applies a conversation rollback only while the captured latest exchange remains current. |
 
 The configuration object accepts the fields below. Omitted fields retain their current setting. Typed deserialization rejects null where the type does not allow it. String fields read through `as_str` and boolean fields read through `as_bool` ignore values of the wrong type unless the handler explicitly validates their presence. Callers should always send the documented type.

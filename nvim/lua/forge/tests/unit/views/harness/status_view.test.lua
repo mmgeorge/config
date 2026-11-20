@@ -364,6 +364,102 @@ T["recorded_hand_off_status_reports_the_hand_off"] = function()
 end
 
 
+-- Each frame in which the status split changed height re-scrolled the whole transcript above it,
+-- and a parent stopping with children changed it once per departing child. While the host marks
+-- the status as stopping, the split keeps the height it reached, and it closes in one step when
+-- the settled stop ends the status.
+T["a_stop_keeps_the_status_height_until_it_settles"] = function()
+  local layout = require("forge.views.harness.layout")
+  local transcript_buffer, transcript_window, _, composer_window = layout.open("status-stopping")
+  local status = require("forge.views.harness.status_view").new({
+    transcript = { document = "status-stopping", buffer = transcript_buffer },
+    transcript_window = transcript_window, composer_window = composer_window,
+    alive = function() return true end, notice = error, recover = function() end,
+  })
+  MiniTest.finally(function() pcall(status.close, status) end)
+  local recorded = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/status-stopping.json"), "\n"))
+  local revision = recorded.revision
+  local function publish(rows, stopping)
+    local snapshot = vim.deepcopy(recorded)
+    revision = revision + 1
+    snapshot.revision = revision
+    local block = snapshot.block[1]
+    block.text = rows
+    block.metadata.decoration = {}
+    block.metadata.status.stopping = stopping or nil
+    if #rows == 0 then snapshot.block = {} end
+    local applied
+    status:apply(snapshot, function(ok) applied = ok end)
+    wait_until(function() return applied ~= nil end, "status view did not settle its publication")
+    eq(applied, true)
+  end
+  local function height() return status.window and vim.api.nvim_win_get_height(status.window) end
+  local children = vim.list_slice(recorded.block[1].text, 2)
+  publish(vim.list_extend({ "Waiting for agents · 2 running" }, children), false)
+  eq(height(), 3)
+  local applied
+  revision = revision + 1
+  status:apply(vim.tbl_extend("force", recorded, { revision = revision }), function(ok) applied = ok end)
+  wait_until(function() return applied ~= nil end, "status view did not settle the recorded stop")
+  eq({ applied, height() }, { true, 3 })
+  publish({ "Stopping", children[2] }, true)
+  eq(height(), 3)
+  publish({ "Stopping" }, true)
+  eq(height(), 3)
+  eq(vim.wo[status.window].fillchars:find("eob: ", 1, true) ~= nil, true)
+  publish({}, false)
+  eq(status.window, nil)
+end
+
+
+-- A stop that leads into more work, such as a compaction that runs the stopped turn again, kept
+-- its status line in the split's first row while it stopped and then lowered the split to fit the
+-- next status, so that line jumped down to the split's last row. The held height carries into
+-- the work that follows the stop and ends only when nothing runs any more.
+T["a_stop_keeps_the_status_row_into_the_work_that_follows"] = function()
+  local layout = require("forge.views.harness.layout")
+  local transcript_buffer, transcript_window, _, composer_window = layout.open("status-stop-handover")
+  local status = require("forge.views.harness.status_view").new({
+    transcript = { document = "status-stop-handover", buffer = transcript_buffer },
+    transcript_window = transcript_window, composer_window = composer_window,
+    alive = function() return true end, notice = error, recover = function() end,
+  })
+  MiniTest.finally(function() pcall(status.close, status) end)
+  local recorded = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/status-stopping.json"), "\n"))
+  recorded.document = "status-stop-handover:status"
+  local revision = recorded.revision
+  local function publish(rows, presentation)
+    local snapshot = vim.deepcopy(recorded)
+    revision = revision + 1
+    snapshot.revision = revision
+    local block = snapshot.block[1]
+    block.text = rows
+    block.metadata.decoration = {}
+    block.metadata.status.stopping = presentation.stopping or nil
+    block.metadata.status.animated = presentation.animated
+    local applied
+    status:apply(snapshot, function(ok) applied = ok end)
+    wait_until(function() return applied ~= nil end, "status view did not settle its publication")
+    eq(applied, true)
+  end
+  local function placement()
+    return { vim.fn.win_screenpos(status.window)[1], vim.api.nvim_win_get_height(status.window) }
+  end
+  local children = vim.list_slice(recorded.block[1].text, 2)
+  publish(vim.list_extend({ "Working · 12s" }, children), { animated = true })
+  local working = placement()
+  eq(working[2], 3)
+  publish({ "Stopping" }, { animated = true, stopping = true })
+  eq(placement(), working)
+  publish({ "Compacting · 0s" }, { animated = true })
+  eq(placement(), working)
+  publish({ "Compacting · 1s" }, { animated = true })
+  eq(placement(), working)
+  publish({ "Paused" }, { animated = false })
+  eq(vim.api.nvim_win_get_height(status.window), 1)
+end
+
+
 -- The host reports when the next elapsed label changes, and the view asks for that change
 -- once, at that delay. A one-second poll on the spinner tick drifted against the host's own
 -- one-second gate and skipped a displayed second whenever the drift crossed a boundary.

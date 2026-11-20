@@ -1435,7 +1435,8 @@ function M.host_stop(reason, on_stopped)
         shutdown_timer:close()
       end
       if not still_running() then return end
-      notifications.error("Forge drain deadline exceeded. Unresolved requests retain unknown outcomes until process collection.", "Forge")
+      notifications.error(("The Forge host did not stop within %d seconds, so Forge ended its process. "
+        .. "Requests it had not answered may or may not have taken effect."):format(host_drain_timeout_ms / 1000), "Forge")
       pcall(process.kill, process, 15)
       host_collect_process(client, process, still_running, function(collected)
         if not still_running() then return end

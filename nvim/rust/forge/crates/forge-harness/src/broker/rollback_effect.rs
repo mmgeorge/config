@@ -130,7 +130,7 @@ impl RollbackEffect {
                         reason: "The provider cannot rewind its conversation to this point; nothing changed".into(),
                     }
                 } else if journal.is_some() {
-                    RollbackFailure::RestoreIncomplete { cause }
+                    RollbackFailure::ConversationNotRewound { cause }
                 } else {
                     RollbackFailure::RewindFailed { cause }
                 }
@@ -190,7 +190,9 @@ impl HarnessBroker {
                 crate::exchange::rollback::rewind_target(
                     &history,
                     position,
-                    &self.rewind_provider(),
+                    &self
+                        .rewind_provider()
+                        .map_err(|_| RollbackFailure::PreparationFailed)?,
                 )?;
                 let expected_id = history
                     .iter()

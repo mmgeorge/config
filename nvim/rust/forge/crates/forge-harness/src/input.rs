@@ -916,12 +916,25 @@ impl SessionInputQueue {
                         || after_control.is_some()
                             && after_control == snapshot.control_operation_id.as_deref());
                 update.prepend = snapshot.suspended && resume;
+                // A prompt that resumes a paused queue runs first. Every prompt the queue held,
+                // including a steer a stop returned with its automatic intent, becomes an
+                // ordinary follow-up first, so the new prompt is placed ahead of all of them and
+                // none joins its turn as steering.
+                if update.prepend {
+                    Self::resume_held(snapshot, update);
+                }
                 update.upsert.push(message.clone());
+                // An automatic prompt also enters ahead of a failed one. The failed prompt waits
+                // for its explicit retry and blocks the follow-ups behind it, and a prompt the
+                // user sends after the failure would otherwise wait there with nothing running.
                 let index = if message.intent == InputIntent::Auto {
                     snapshot
                         .messages
                         .iter()
-                        .position(|entry| entry.intent == InputIntent::Queue)
+                        .position(|entry| {
+                            entry.intent == InputIntent::Queue
+                                || entry.delivery() == InputDelivery::Failed
+                        })
                         .unwrap_or(snapshot.messages.len())
                 } else {
                     snapshot.messages.len()
@@ -1284,7 +1297,8 @@ impl SessionInputQueue {
             message.revision += 1;
             update.upsert.push(message.clone());
             // A failed user prompt stays first and blocks every later follow-up until it is
-            // retried, so the queue is paused and says so, as restart recovery leaves it.
+            // retried, so the queue is paused and says so, as restart recovery leaves it. A newer
+            // automatic prompt enters ahead of it and resumes the queue, as after an interrupt.
             if self.channel == InputChannel::User
                 && delivery == InputDelivery::Failed
                 && matches!(message.purpose, InputPurpose::User)

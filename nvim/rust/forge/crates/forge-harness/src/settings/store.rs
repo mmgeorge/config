@@ -208,14 +208,47 @@ pub struct SettingsSnapshot {
     pub desired: PortableSettings,
     /// Contains only this provider's model and tuning choices.
     pub provider: Value,
+    /// Identifies the settings revision at which the global provider defaults were last saved
+    /// explicitly, or none for defaults saved before saves recorded it.
+    #[serde(skip)]
+    pub provider_revision: Option<u64>,
 }
 
+/// Names the provider-layer field that records the revision of its last explicit save.
+const PROVIDER_REVISION_FIELD: &str = "confirmed_revision";
+
 impl SettingsSnapshot {
-    /// Apply provider-local defaults only when creating a conversation.
+    /// Get whether the workspace's last confirmed model choice is newer than the global
+    /// provider defaults, so a new session in that workspace starts from the workspace choice.
+    ///
+    /// A choice confirmed in a session belongs to its workspace and provider. An explicit edit of
+    /// the global defaults afterwards is the newer default for every workspace, so the most recent
+    /// of the two decides. A workspace record that never confirmed a choice, such as the one a
+    /// first session writes, yields to the global defaults.
+    pub fn workspace_choice_is_newer(
+        &self,
+        preference: Option<&crate::session::HarnessPreference>,
+    ) -> bool {
+        match (
+            preference.and_then(|preference| preference.confirmed_revision),
+            self.provider_revision,
+        ) {
+            (Some(workspace), Some(global)) => workspace >= global,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// Apply provider-local defaults only when creating a conversation, unless the workspace has
+    /// confirmed a newer choice of its own (`workspace_choice_is_newer`).
     pub fn apply_provider_defaults(
         &self,
         session: &mut crate::session::HarnessSession,
+        preference: Option<&crate::session::HarnessPreference>,
     ) -> Result<()> {
+        if self.workspace_choice_is_newer(preference) {
+            return Ok(());
+        }
         if let Some(model) = self.provider.get("model").and_then(Value::as_str) {
             ensure!(!model.trim().is_empty(), "saved model cannot be empty");
             // Saved configuration does not confirm the model used by a native turn, and a
@@ -501,14 +534,26 @@ impl SettingsStore {
                 desired.inherit(settings);
             }
         }
-        let provider = provider
+        let mut provider = provider
             .map(|payload| serde_json::from_str(&payload))
             .transpose()?
             .unwrap_or(Value::Null);
+        // The save revision orders the defaults against workspace choices; readers of the
+        // defaults themselves never see it.
+        let provider_revision = provider
+            .as_object_mut()
+            .and_then(|fields| fields.remove(PROVIDER_REVISION_FIELD))
+            .map(|value| {
+                value
+                    .as_u64()
+                    .context("saved provider default revision is not a number")
+            })
+            .transpose()?;
         Ok(SettingsSnapshot {
             revision: u64::try_from(revision)?,
             desired,
             provider,
+            provider_revision,
         })
     }
 
@@ -1135,13 +1180,18 @@ impl SettingsStore {
                 destination.insert(field.clone(), value.clone());
             }
         }
+        let next = revision
+            .checked_add(1)
+            .context("settings revision exhausted")?;
+        // An explicit edit of the main model defaults is newer than every workspace's earlier
+        // choice; the Ask model is not a main model default and leaves that order alone.
+        if field_map.keys().any(|field| field != "ask_model") {
+            destination.insert(PROVIDER_REVISION_FIELD.into(), next.into());
+        }
         transaction.execute(
             "INSERT INTO setting_layer VALUES ('provider',?1,?2)",
             params![provider, serde_json::to_string(&preference)?],
         )?;
-        let next = revision
-            .checked_add(1)
-            .context("settings revision exhausted")?;
         transaction.execute(
             "UPDATE setting_revision SET revision=?1 WHERE id=1",
             [i64::try_from(next)?],

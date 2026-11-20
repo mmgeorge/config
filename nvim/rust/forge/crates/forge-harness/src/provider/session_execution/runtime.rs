@@ -2256,8 +2256,21 @@ impl Driver {
             }
         }
         admitted.insert(scope.clone());
+        drop(admitted);
         let publish = match origin {
-            ReservationOrigin::PreparedForeground => true,
+            ReservationOrigin::PreparedForeground => {
+                // An exchange fence stops the attempts the host would schedule for the work it
+                // collected. A prepared foreground is a new owner admission that follows that
+                // work's settlement, such as a check result continuing an exchange whose turn
+                // completed before an interrupt collected it. Retaining the fence would refuse
+                // this admission's start as a cancellation that no one requested. While work
+                // of the exchange is still live the collection has not finished, so the fence
+                // stays and stops this admission as well.
+                if !self.exchange_has_live_work(&scope.exchange_id) {
+                    self.cancelled_exchanges.remove(&scope.exchange_id);
+                }
+                true
+            }
             ReservationOrigin::Execution => {
                 !self.cancelled_exchanges.contains_key(&scope.exchange_id)
                     && !self.cancelled_admissions.contains(&scope)
@@ -2282,6 +2295,16 @@ impl Driver {
             self.reservations.insert(scope, reservation);
         }
         Ok(())
+    }
+    /// Get whether an attempt, reservation, or unfinished invocation of the exchange remains.
+    fn exchange_has_live_work(&self, exchange: &crate::provider::ExchangeId) -> bool {
+        self.attempts
+            .keys()
+            .chain(self.reservations.keys())
+            .any(|scope| scope.exchange_id == *exchange)
+            || self.invocations.values().any(|invocation| {
+                invocation.scope.exchange_id == *exchange && invocation.terminal.is_none()
+            })
     }
     /// Acknowledge task destruction before cancellation collects resources created during preparation.
     fn submission_finished(&mut self, id: tokio::task::Id) {

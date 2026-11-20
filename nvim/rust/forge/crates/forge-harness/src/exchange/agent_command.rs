@@ -33,6 +33,12 @@ impl AgentCommand {
     }
 
     /// Capture stable child scope at the caller boundary.
+    ///
+    /// A user's interrupt also stops its children here. The command then waits in the parent
+    /// FIFO behind earlier child commands, each of which waits for the broker to work through the
+    /// child observations queued ahead of it, so stopping the child only when the command ran
+    /// let it keep working for as long as that queue took. The command still cancels the
+    /// children's queued tasks and records each interrupt when it executes.
     pub(crate) fn capture(
         operation: AgentOperation,
         children: &AgentCoordinator,
@@ -78,11 +84,15 @@ impl AgentCommand {
                     },
                 )?))
             }
-            AgentOperation::Interrupt { target } => Ok(Self::Interrupt(AgentTargets::One {
-                target: capture(&target)?,
-                selector: target,
-            })),
-            AgentOperation::InterruptAll => Ok(Self::Interrupt(AgentTargets::All)),
+            AgentOperation::Interrupt { target: selector } => {
+                let target = capture(&selector)?;
+                children.signal_user_interrupt(&target);
+                Ok(Self::Interrupt(AgentTargets::One { target, selector }))
+            }
+            AgentOperation::InterruptAll => {
+                children.signal_user_interrupt_all();
+                Ok(Self::Interrupt(AgentTargets::All))
+            }
             AgentOperation::List { .. }
             | AgentOperation::Activity { .. }
             | AgentOperation::ToolOutput { .. } => Err(AgentFailure::InspectionOnly),

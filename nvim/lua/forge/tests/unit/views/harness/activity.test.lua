@@ -19,4 +19,18 @@ T["turn_pending_counts_the_hand_off_to_the_next_turn"] = function()
   eq(activity.turn_pending({ host_error = "gone", status = handing_off.status }), false)
 end
 
+-- A compaction occupies the session as a turn does, but only one that stopped a turn, or runs
+-- inside one, leaves a turn to follow it. A compaction while a plan waits in review leaves the
+-- submission the one to review, so it must not read as a pending planning turn.
+T["turn_awaited_counts_a_compaction_only_when_a_turn_waits_for_it"] = function()
+  local activity = require("forge.views.harness.activity")
+  local between_turns = { status = { kind = "compacting", started_at_ms = 0, turn_waiting = false } }
+  local holding_a_turn = { status = { kind = "compacting", started_at_ms = 0, turn_waiting = true } }
+  local handing_off = { status = { kind = "working", activity = "handing_off" } }
+  eq({ activity.turn_pending(between_turns), activity.turn_awaited(between_turns) }, { true, false })
+  eq({ activity.turn_pending(holding_a_turn), activity.turn_awaited(holding_a_turn) }, { true, true })
+  eq(activity.turn_awaited(handing_off), true)
+  eq(activity.turn_awaited({ host_error = "gone", status = holding_a_turn.status }), false)
+end
+
 return T

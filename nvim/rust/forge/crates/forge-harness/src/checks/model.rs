@@ -75,6 +75,22 @@ pub struct CommandCheck<CommandContext = Option<CheckCommand>> {
     pub adapter_progress: Option<super::adapter::AdapterProgress>,
 }
 
+/// Say that a check command wrote nothing to `streams`, such as `standard error`.
+///
+/// Findings, check details, and repair turns use the same sentence, so the model reads an empty
+/// log as a command that printed nothing rather than as output Harness failed to save.
+pub(crate) fn printed_nothing(streams: &str) -> String {
+    format!("The command printed nothing on {streams}.")
+}
+
+/// Describe a command's exit for findings, such as `exit status 1` or `no exit status`.
+pub(crate) fn exit_status(exit_code: Option<i32>) -> String {
+    exit_code.map_or_else(
+        || "no exit status".to_owned(),
+        |code| format!("exit status {code}"),
+    )
+}
+
 impl<CommandContext> CommandCheck<CommandContext> {
     /// Preserve the command failure and expose located error diagnostics to plan repair.
     pub(crate) fn findings(&self) -> Vec<String> {
@@ -88,13 +104,19 @@ impl<CommandContext> CommandCheck<CommandContext> {
         ) {
             return Vec::new();
         }
+        let exit = exit_status(self.exit_code);
+        // An empty saved output reads to the model as missing evidence, so a command that printed
+        // nothing is described as such instead of pointing at its empty log.
+        let output = if self.output_bytes == 0 {
+            printed_nothing("standard output or standard error")
+        } else {
+            format!("Saved output: {}", self.output.display())
+        };
         let mut summary = format!(
-            "{}: {:?}, exit {:?}. {}\nSaved output: {}",
+            "{}: {:?}, {exit}. {}\n{output}",
             self.command,
             self.state,
-            self.exit_code,
             self.error.as_deref().unwrap_or(""),
-            self.output.display()
         );
         let mut located = Vec::new();
         if let Some(super::adapter::AdapterResult::Diagnostics(result)) = &self.result {
@@ -772,9 +794,9 @@ mod finding_tests {
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[1], "src/π.rs:3:5: wrong type [E0308]");
         for expected in [
-            "cargo check: Failed",
+            "cargo check: Failed, exit status 1",
             "compiler failed",
-            "compiler.log",
+            "The command printed nothing on standard output or standard error.",
             "Error: linker unavailable",
             "Error: src/bad.rs: cannot parse file",
             "2 additional error diagnostics omitted",
@@ -825,6 +847,30 @@ mod finding_tests {
             "{findings}"
         );
         assert!(!findings.contains("src/money.ts"), "{findings}");
+    }
+
+    /// A failed command that printed nothing says so with its exit status and command, instead
+    /// of pointing the model at an empty saved output it would report as missing.
+    #[test]
+    fn findings_of_a_command_that_printed_nothing_say_so() {
+        let mut check = command(CheckState::Failed);
+        check.result = None;
+        assert_eq!(
+            check.findings(),
+            vec![
+                "cargo check: Failed, exit status 1. compiler failed\nThe command printed nothing on standard output or standard error."
+                    .to_owned()
+            ]
+        );
+        check.output_bytes = 12;
+        check.exit_code = None;
+        assert_eq!(
+            check.findings(),
+            vec![
+                "cargo check: Failed, no exit status. compiler failed\nSaved output: compiler.log"
+                    .to_owned()
+            ]
+        );
     }
 
     /// Keep declaration findings before each failed command's summary and located diagnostics.

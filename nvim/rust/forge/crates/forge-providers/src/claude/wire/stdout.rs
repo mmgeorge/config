@@ -504,6 +504,10 @@ pub(crate) struct StatusFrame {
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub compact_result: Option<String>,
+    /// The CLI's explanation of a failed `compact_result`, such as "Not enough messages to
+    /// compact."; the CLI omits it in some sessions.
+    #[serde(default)]
+    pub compact_error: Option<String>,
 }
 
 /// The boundary a completed compaction leaves in the transcript.

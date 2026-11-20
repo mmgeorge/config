@@ -100,23 +100,14 @@ impl HarnessBroker {
         target: Option<&crate::provider::ExchangeId>,
         policy_baseline: Option<&super::configuration::PolicyBaseline>,
     ) -> Result<super::configuration::PermissionConfigurationResult> {
+        // The continuation says only why the turn runs again; `restarted_turn_input` gives it the
+        // input the stopped turn was given. A permission change names the policy transition;
+        // other settings resume generically.
         let resume = match target {
-            Some(target) if self.owner_resume_selected(target)? => {
-                let selected = self
-                    .store
-                    .load_exchange(target.as_str())?
-                    .context("selected configuration exchange disappeared")?;
-                // A permission change names the policy transition; other settings resume generically.
-                let notice = policy_baseline.map_or_else(
-                    || "Continue the interrupted request using the committed session configuration and completed tool results. Do not repeat completed actions.".to_owned(),
-                    |baseline| baseline.resume_notice(self.session.access.abbreviation(), self.session.approval_mode),
-                );
-                Some(if selected.elicitation().is_some() {
-                    notice
-                } else {
-                    format!("{notice}\n\nOriginal request: {}", selected.prompt)
-                })
-            }
+            Some(target) if self.owner_resume_selected(target)? => Some(policy_baseline.map_or_else(
+                || "Continue the interrupted request using the committed session configuration and completed tool results. Do not repeat completed actions.".to_owned(),
+                |baseline| baseline.resume_notice(self.session.access.abbreviation(), self.session.approval_mode),
+            )),
             Some(_) | None => None,
         };
         let thought_patch = self
@@ -139,10 +130,39 @@ impl HarnessBroker {
                     },
                 ),
             ]))?;
-        Ok(super::configuration::PermissionConfigurationResult {
-            delivery,
-            resume,
-            value: serde_json::to_value(self.snapshot()?)?,
+        Ok(super::configuration::PermissionConfigurationResult { delivery, resume })
+    }
+
+    /// Build the input of a turn that Harness stopped, for a compaction or a configuration change,
+    /// and now runs again.
+    ///
+    /// The turn runs again with the input it was given, read back from the submission journal by
+    /// the exchange's current input identity, so a revision keeps its review request, comments,
+    /// and edits, a check turn its check results, and every input its notices and attachments.
+    /// `continuation` becomes a notice that says why the turn runs again and how to continue.
+    /// An exchange whose input the journal does not hold continues from its first prompt.
+    pub(crate) fn restarted_turn_input(
+        &self,
+        exchange: &Exchange,
+        continuation: String,
+    ) -> Result<ProviderInput> {
+        let recorded = match exchange.input_message_id.as_deref() {
+            Some(input_message_id) => self
+                .submission_store
+                .latest_input(&self.session.id, input_message_id)?,
+            None => None,
+        };
+        Ok(match recorded {
+            Some(mut input) => {
+                input.push_notice(forge_provider_api::forge::Notice::TurnRestarted {
+                    reason: continuation,
+                });
+                input
+            }
+            None => ProviderInput::from_user_text(format!(
+                "{continuation}\n\nOriginal request: {}",
+                exchange.prompt
+            )),
         })
     }
 
@@ -219,6 +239,10 @@ impl HarnessBroker {
                 self.clock.now_ms(),
             )?;
             events.push(self.event("session_changed", json!({"snapshot":self.snapshot()?}))?);
+            // With no exchange to settle, nothing else republishes the live status, and the
+            // hand-off it predicted, such as the `Working` that reads until a reserved check run
+            // starts, would outlast the pause. An exchange still open republishes it as it settles.
+            events.extend(self.owner_refresh_idle_status()?);
         }
         let Some(target) = target else {
             return Ok((None, events));
@@ -241,7 +265,7 @@ impl HarnessBroker {
                 .is_some_and(|current| current.id == exchange.id),
             "selected cancellation exchange changed"
         );
-        self.questions.cancel_chat(Some(&exchange.id))?;
+        self.retire_stopped_questions(Some(&exchange.id))?;
         exchange.set_awaiting_input(false);
         match exchange.state() {
             ExchangeState::Queued => {
@@ -350,20 +374,46 @@ impl HarnessBroker {
         if self.task_controller.current()?.is_some() {
             return self.owner_release_parked_collection();
         }
-        let Some(mut exchange) = self
+        let Some(exchange) = self
             .store
             .exchange_in_state(&self.session.id, ExchangeState::Running)?
             .filter(Exchange::is_parked)
         else {
             return Ok(Vec::new());
         };
-        self.questions.cancel_chat(Some(&exchange.id))?;
+        self.owner_close_parked(exchange, super::ParkedClosure::Cleared)
+    }
+
+    /// Settle the exchange that a failed command's collection parked, which nothing will run again.
+    ///
+    /// A configuration change or task control that stops a turn parks its exchange with the stop's
+    /// label for the turn that runs again once the command commits. When the command fails after
+    /// that, no continuation is scheduled, so the exchange ends failed with `reason` instead of
+    /// resting on `Stopping` until the next interrupt. Call this only once no turn, queued turn,
+    /// command, or stop collection remains to own the exchange.
+    pub(crate) fn owner_fail_parked_exchange(&mut self, reason: &str) -> Result<Vec<SessionEvent>> {
+        let Some(mut exchange) = self
+            .store
+            .exchange_in_state(&self.session.id, ExchangeState::Running)?
+            .filter(|exchange| exchange.is_parked() && exchange.collection.is_some())
+        else {
+            return Ok(Vec::new());
+        };
+        exchange.collection = None;
+        exchange.finalization_error = Some(reason.to_owned());
+        self.owner_close_parked(exchange, super::ParkedClosure::StopFailed)
+    }
+
+    /// Close one parked exchange for `closure` and publish what the closure changed.
+    fn owner_close_parked(
+        &mut self,
+        mut exchange: Exchange,
+        closure: super::ParkedClosure,
+    ) -> Result<Vec<SessionEvent>> {
+        self.retire_stopped_questions(Some(&exchange.id))?;
         exchange.set_awaiting_input(false);
-        let disposition = self.close_parked_exchange(
-            &mut exchange,
-            super::ParkedClosure::Cleared,
-            self.clock.now_ms(),
-        )?;
+        let disposition =
+            self.close_parked_exchange(&mut exchange, closure, self.clock.now_ms())?;
         self.save_session()?;
         let mut events = Vec::new();
         if disposition == super::ParkedDisposition::Closed {

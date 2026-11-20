@@ -44,6 +44,7 @@ local function validate_metadata(entry, read_row, region_seen)
     assert(status.hint == nil or status.hint == vim.NIL or status.hint == "working"
       or status.hint == "question" or status.hint == "review" or status.hint == "permission", "invalid status hint")
     assert(status.handoff == nil or type(status.handoff) == "boolean", "invalid status hand-off")
+    assert(status.stopping == nil or type(status.stopping) == "boolean", "invalid status stop")
   end
   if entry.metadata.content_node and entry.metadata.content_node ~= vim.NIL then identity(entry.metadata.content_node) end
   local node = entry.metadata.node

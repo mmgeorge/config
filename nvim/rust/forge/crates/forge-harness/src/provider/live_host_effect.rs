@@ -22,10 +22,11 @@ impl LiveHostEffect {
     }
 }
 
-/// Carry only task authority explicitly advanced by the same live owner commit.
-pub(crate) struct LiveHostCommit {
-    pub(crate) task_permit: Option<crate::task::TaskPermit>,
-}
+/// Acknowledge that the owner committed a callback's logical effects.
+///
+/// The owner adopts any task revision the commit produced into the invocation's task authority
+/// in the commit step itself, so the acknowledgment carries no authority of its own.
+pub(crate) struct LiveHostCommit;
 
 /// Apply bounded backpressure while the owner commits a callback's logical effects.
 #[derive(Clone)]

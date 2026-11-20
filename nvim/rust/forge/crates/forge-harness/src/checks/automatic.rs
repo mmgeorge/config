@@ -124,16 +124,7 @@ impl AutomaticChecks {
         }
         let findings = failures
             .iter()
-            .map(|command| {
-                format!(
-                    "{}: {:?}, exit {:?}. {}\nOutput: {}",
-                    command.command,
-                    command.state,
-                    command.exit_code,
-                    command.error.as_deref().unwrap_or(""),
-                    command.output.display()
-                )
-            })
+            .map(|command| blocked_finding(command))
             .collect::<Vec<_>>()
             .join("\n\n");
         if failures
@@ -156,7 +147,7 @@ impl AutomaticChecks {
                     state: format!("{:?}", command.state),
                     exit_code: command.exit_code,
                     error: command.error.clone().filter(|error| !error.is_empty()),
-                    log: command.output.display().to_string(),
+                    log: (command.output_bytes > 0).then(|| command.output.display().to_string()),
                 })
                 .collect(),
         )
@@ -165,5 +156,49 @@ impl AutomaticChecks {
         self.repair_exchange = None;
         self.save()?;
         Ok(Some(prompt))
+    }
+}
+
+/// Describe one failed command in the message that blocks automatic validation.
+///
+/// The exit reads as in check findings, `exit status 1` or `no exit status`, rather than as a
+/// debug-formatted optional code.
+fn blocked_finding(command: &super::CommandCheck) -> String {
+    format!(
+        "{}: {:?}, {}. {}\nOutput: {}",
+        command.command,
+        command.state,
+        super::model::exit_status(command.exit_code),
+        command.error.as_deref().unwrap_or(""),
+        command.output.display()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn configuration_failure(exit_code: Option<i32>) -> super::super::CommandCheck {
+        serde_json::from_value(json!({
+            "selected":true,"id":"compiler","command":"cargo check",
+            "state":CheckState::ConfigurationError,
+            "started_at_ms":1,"completed_at_ms":2,"exit_code":exit_code,"error":"adapter missing",
+            "stdout":"stdout","stderr":"stderr","output":"compiler.log","output_bytes":0,"preview":""
+        }))
+        .expect("command check decodes")
+    }
+
+    /// A blocked configuration names the exit status as check findings do.
+    #[test]
+    fn blocked_finding_states_the_exit_status_as_findings_do() {
+        assert_eq!(
+            blocked_finding(&configuration_failure(Some(2))),
+            "cargo check: ConfigurationError, exit status 2. adapter missing\nOutput: compiler.log"
+        );
+        assert!(
+            blocked_finding(&configuration_failure(None))
+                .starts_with("cargo check: ConfigurationError, no exit status.")
+        );
     }
 }

@@ -8,6 +8,21 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+/// Name of the state directory that holds every session's plan authoring trees.
+pub(crate) const AUTHORING_ROOT: &str = "plan-workspaces";
+
+/// Get whether `path` lies in a plan authoring tree of this executable's state directory.
+///
+/// A planner writes its design and proposed files there rather than in the workspace, so a
+/// count of the workspace files an exchange changed leaves these paths out.
+pub(crate) fn is_authoring_path(path: &str) -> bool {
+    let marker = format!(
+        "/state/v{}/{AUTHORING_ROOT}/",
+        crate::storage::state::VERSION
+    );
+    path.replace('\\', "/").contains(&marker)
+}
+
 /// Bind ordinary planning tools to one authenticated plan and its version lease.
 #[derive(Clone)]
 pub(crate) struct PlanAuthoringScope {
@@ -247,7 +262,7 @@ impl PlanFileStore {
     /// Get the authoring root, which contains no host-owned metadata or snapshots.
     pub(crate) fn authoring_directory(&self, session_id: &str, plan_id: &str) -> PathBuf {
         crate::storage::state::directory(&self.root)
-            .join("plan-workspaces")
+            .join(AUTHORING_ROOT)
             .join(session_id)
             .join(plan_id)
     }

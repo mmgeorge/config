@@ -346,6 +346,7 @@ fn capability(id: &str) -> ProviderCapability {
             native_turn_rollback: true,
             native_conversation_rewind: true,
             conversation_rewind_requires_checkpoint: false,
+            conversation_rewind_stops_at_compaction: false,
             model_selection: true,
             effort_selection: true,
             fast_mode: true,
@@ -410,6 +411,9 @@ fn capability(id: &str) -> ProviderCapability {
             native_conversation_rewind: true,
             // The CLI resumes only at a transcript entry, so it cannot rewind past every turn.
             conversation_rewind_requires_checkpoint: true,
+            // A compaction boundary starts a new transcript chain, and the CLI resumes only at an
+            // entry of the chain it loads, so no entry before the boundary can be resumed.
+            conversation_rewind_stops_at_compaction: true,
             model_selection: true,
             effort_selection: true,
             permission_control: true,

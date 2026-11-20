@@ -9,6 +9,10 @@ local buffer = require("forge.buffer")
 
 local function notice(message) notifications.error(message, "ForgePlanReview") end
 
+---Explains why a review refused to close: `owner.close` refuses while a save, an answer, or a review
+---edit it sent is still running, and closing then would drop that operation's result.
+local busy_notice = "Plan review stays open until its running answers and edits finish."
+
 ---Reports the host's refusal of a review decision. The reason is the reviewer's only guide to what
 ---to change, so it is wrapped to the notifier's width rather than cut at the window edge, and it
 ---stays on screen longer than a routine notice; the notifier keeps it in its history.
@@ -43,6 +47,21 @@ end
 
 ---@param review table
 ---@param focus_win? integer the window in the return tab to focus instead of the one the review left
+---Show `review_buffer` in a new tab page whose window draws no number, sign, fold, or status
+---column, and return that window. `tabnew` copies the window it runs in, usually a Harness transcript
+---or composer whose columns belong to that view, and showing a buffer again restores the columns of
+---the last window that showed it; either one placed a reopened review two columns to the right of
+---where it first opened.
+---@param review_buffer integer
+---@return integer
+local function open_review_tab(review_buffer)
+  vim.cmd("tabnew")
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, review_buffer)
+  require("forge.views.harness.layout").configure_gutterless_window(window)
+  return window
+end
+
 local function hide_review(review, focus_win)
   if vim.api.nvim_tabpage_is_valid(review.tab) and review.tab ~= review.return_tab and vim.fn.tabpagenr("$") > 1 then
     vim.api.nvim_set_current_tabpage(review.tab)
@@ -59,7 +78,7 @@ end
 ---@param review table
 ---@param focus_win? integer
 local function close_review(review, focus_win)
-  if not review.owner.close() then notice("Plan review has an explicit operation in progress") return false end
+  if not review.owner.close() then notice(busy_notice) return false end
   hide_review(review, focus_win)
   if session.harness.plan_review == review
     and (not vim.api.nvim_buf_is_valid(review.buf) or not vim.bo[review.buf].modified) then
@@ -435,7 +454,7 @@ function M.open(plan, options)
     end
     if not refresh_execution and previous.owner.generation == client.host_get_generation() and not previous.owner.closed and previous.owner.attached() then
       local window = vim.fn.win_findbuf(previous.buf)[1]
-      if window then vim.api.nvim_set_current_win(window) else vim.cmd("tabnew") vim.api.nvim_win_set_buf(0, previous.buf) end
+      if window then vim.api.nvim_set_current_win(window) else open_review_tab(previous.buf) end
       previous.win = vim.api.nvim_get_current_win()
       previous.tab = vim.api.nvim_get_current_tabpage()
       previous.owner.refresh_views()
@@ -455,7 +474,7 @@ function M.open(plan, options)
     local failure
     recovery, failure = previous.owner.recovery()
     if not recovery then notice(failure) return end
-    if not previous.owner.close(true) then notice("Plan review has an explicit operation in progress") return end
+    if not previous.owner.close(true) then notice(busy_notice) return end
     rebase = true
     hide_review(previous)
   elseif previous and not close_review(previous) then return end
@@ -486,9 +505,7 @@ function M.open(plan, options)
   if window then
     if vim.api.nvim_win_get_buf(window) ~= native_buffer then vim.api.nvim_win_set_buf(window, native_buffer) end
   else
-    vim.cmd("tabnew")
-    vim.api.nvim_win_set_buf(0, native_buffer)
-    window = vim.api.nvim_get_current_win()
+    window = open_review_tab(native_buffer)
   end
   vim.bo[native_buffer].bufhidden = "hide"
   vim.bo[native_buffer].swapfile = false

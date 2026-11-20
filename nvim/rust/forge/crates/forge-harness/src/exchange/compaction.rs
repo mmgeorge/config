@@ -27,12 +27,29 @@ impl ContextCompactionRun {
         self.stage = CompactionStage::Prepare;
     }
 
-    /// Get the host attempt identity after confirmed compaction has committed.
-    pub(super) fn completed_id(&self) -> &ContextCompactionId {
-        let CompactionStage::Completed(id) = &self.stage else {
-            unreachable!("only confirmed compaction can complete its caller command")
-        };
-        id
+    /// Report how a committed attempt ended: its host identity once the provider confirmed the
+    /// compaction, or the failure its caller reports when the provider answered without
+    /// compacting.
+    pub(super) fn outcome(&self) -> Result<&ContextCompactionId, UnsuccessfulCompaction> {
+        match &self.stage {
+            CompactionStage::Completed(id) => Ok(id),
+            CompactionStage::Unsuccessful { failure, cause, .. } => Err(UnsuccessfulCompaction {
+                failure: failure.clone(),
+                cause: cause.clone(),
+            }),
+            _ => unreachable!("only a committed attempt can complete its caller command"),
+        }
+    }
+
+    /// Report whether the attempt has yet to start: the command is checking availability,
+    /// collecting the exchange it stops, or preparing its job.
+    pub(super) fn awaiting_start(&self) -> bool {
+        matches!(
+            self.stage,
+            CompactionStage::Inspect
+                | CompactionStage::AwaitingCollection
+                | CompactionStage::Prepare
+        )
     }
 
     /// Get the active host attempt identity for correlated job/event logs.
@@ -41,11 +58,11 @@ impl ContextCompactionRun {
             CompactionStage::Running { id, .. }
             | CompactionStage::Observed { id, .. }
             | CompactionStage::Unobserved(id)
-            | CompactionStage::Completed(id) => Some(id),
+            | CompactionStage::Completed(id)
+            | CompactionStage::Unsuccessful { id, .. } => Some(id),
             CompactionStage::Inspect
             | CompactionStage::AwaitingCollection
             | CompactionStage::Prepare
-            | CompactionStage::Failed(_)
             | CompactionStage::Consumed => None,
         }
     }
@@ -56,7 +73,7 @@ impl ContextCompactionRun {
             CompactionStage::Inspect
             | CompactionStage::Prepare
             | CompactionStage::Completed(_)
-            | CompactionStage::Failed(_) => CompactionEvent::Ready,
+            | CompactionStage::Unsuccessful { .. } => CompactionEvent::Ready,
             CompactionStage::Running { task, deadline, .. } => tokio::select! {
                 result = task => CompactionEvent::Completed(result.map(Box::new)),
                 _ = tokio::time::sleep_until(*deadline) => CompactionEvent::Deadline,
@@ -130,7 +147,15 @@ impl ContextCompactionRun {
                         updates: Vec::new(),
                     })
                 }
-                CompactionStage::Failed(error) => Err(*error),
+                // The provider answered and its terminal record is saved, so the native side
+                // is idle and the turn the compaction stopped can run again as it does after a
+                // confirmed compaction; the caller still learns why nothing was compacted.
+                stage @ CompactionStage::Unsuccessful { .. } => {
+                    self.stage = stage;
+                    Ok(CompactionProgress::Unsuccessful {
+                        updates: Vec::new(),
+                    })
+                }
                 CompactionStage::AwaitingCollection
                 | CompactionStage::Running { .. }
                 | CompactionStage::Observed { .. }
@@ -193,13 +218,14 @@ impl ContextCompactionRun {
                                 .kind(),
                             },
                         };
-                        CompactionStage::Failed(Box::new(OperationFailure::Compaction {
+                        CompactionStage::Unsuccessful {
+                            id,
                             failure,
                             cause: crate::provider::lifecycle_error::classify(
                                 forge_provider_api::ProviderOperation::ThreadCompact,
                                 error,
                             ),
-                        }))
+                        }
                     }
                     None => CompactionStage::Completed(id),
                 };
@@ -225,7 +251,7 @@ impl ContextCompactionRun {
             | CompactionStage::AwaitingCollection
             | CompactionStage::Prepare
             | CompactionStage::Completed(_)
-            | CompactionStage::Failed(_)
+            | CompactionStage::Unsuccessful { .. }
             | CompactionStage::Consumed => {}
         }
     }
@@ -249,11 +275,36 @@ impl CompactionEvent {
     }
 }
 
-/// Distinguish collection admission, committed publications, and confirmed compaction history.
+/// Distinguish collection admission, committed publications, and terminal compaction history.
 pub(super) enum CompactionProgress {
     Collect(ChildCollectionPolicy),
-    Waiting { updates: Vec<SessionUpdate> },
-    Committed { updates: Vec<SessionUpdate> },
+    Waiting {
+        updates: Vec<SessionUpdate>,
+    },
+    /// The provider confirmed the compaction.
+    Committed {
+        updates: Vec<SessionUpdate>,
+    },
+    /// The provider answered without compacting, and that answer is saved; the owner hands any
+    /// stopped turn back exactly as after `Committed`, then reports `outcome`'s failure.
+    Unsuccessful {
+        updates: Vec<SessionUpdate>,
+    },
+}
+
+/// Carry why a committed attempt did not compact: the caller's failure and its classified cause.
+pub(super) struct UnsuccessfulCompaction {
+    pub(super) failure: ContextCompactionFailure,
+    pub(super) cause: crate::provider::ProviderError,
+}
+
+impl From<UnsuccessfulCompaction> for OperationFailure {
+    fn from(unsuccessful: UnsuccessfulCompaction) -> Self {
+        OperationFailure::Compaction {
+            failure: unsuccessful.failure,
+            cause: unsuccessful.cause,
+        }
+    }
 }
 
 enum CompactionStage {
@@ -271,6 +322,11 @@ enum CompactionStage {
     },
     Unobserved(ContextCompactionId),
     Completed(ContextCompactionId),
-    Failed(Box<OperationFailure>),
+    /// The provider's terminal answer is saved and says nothing was compacted.
+    Unsuccessful {
+        id: ContextCompactionId,
+        failure: ContextCompactionFailure,
+        cause: crate::provider::ProviderError,
+    },
     Consumed,
 }

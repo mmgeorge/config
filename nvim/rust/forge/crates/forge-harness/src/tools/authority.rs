@@ -255,7 +255,11 @@ impl TaskAuthority {
         Ok(snapshot)
     }
 
-    /// Adopt only a revision explicitly returned by this invocation's live owner commit.
+    /// Adopt only the revision this invocation's own live owner commit produced.
+    ///
+    /// The session owner calls this in the same step as the commit, so no later owner step,
+    /// such as sealing an acceptance of the committed revision, can observe the new task
+    /// revision while this invocation still holds the one before it.
     pub(crate) fn advance(&self, next: TaskPermit) -> Result<()> {
         let progress = self
             .progress

@@ -72,10 +72,12 @@ local function position(queue, entry)
   end
 end
 
----Expose configuration-only entries as model commands without changing queued payloads.
+---Get the text the queue shows for `entry`: a saved edit the host has yet to publish, or the queued
+---text, with configuration-only entries exposed as model commands without changing queued payloads.
 ---@param entry ForgeQueuedPrompt
 ---@return string
 local function queued_text(entry)
+  if entry.saved_text then return entry.saved_text end
   if entry.text ~= "" or not (entry.config and entry.config.model) then return entry.text end
   local text = "/model " .. entry.config.model
   if entry.config.effort then text = text .. " " .. entry.config.effort end
@@ -266,10 +268,16 @@ function M.finish(state, draft)
     if edit.drafts[entry] ~= nil then entries[#entries + 1] = entry end
   end
   state.queue_edit = nil
+  -- The host answers the commit later, and later still when it waits for a reservation, so each
+  -- saved row shows its saved text from this frame instead of the host's old copy.
+  for _, entry in ipairs(entries) do
+    if not entry.local_only and edit.drafts[entry] ~= "" then input_state.hold_saved_edit(state, entry.id, edit.drafts[entry]) end
+  end
   local function failed(failure)
     if not failure then return end
     state.failed_queue_edit = edit
     edit.failure = failure
+    for _, entry in ipairs(entries) do input_state.release_saved_edit(state, entry.id) end
   end
   local function commit()
     if edit.failure then failed(edit.failure) return end
@@ -289,6 +297,11 @@ function M.finish(state, draft)
           text = edit.commit_text and edit.commit_text[entry] or updated,
           config = edit.commit_config and edit.commit_config[entry],
           attachments = edit.attachments[entry] or entry.attachments or {} }
+      end
+    end
+    for _, sent in ipairs(edits) do
+      if state.input.saved_edit[sent.id] then
+        input_state.hold_saved_edit(state, sent.id, state.input.saved_edit[sent.id].text, sent.revision)
       end
     end
     for _, entry in ipairs(entries) do
@@ -318,6 +331,8 @@ function M.staging(state, draft, entries)
     if edit and entry == edit.entry then text = "[editing] " .. (draft or edit.drafts[entry] or queued_text(entry))
     elseif entry.local_only and entry.draft_state == "pending" then
       text = "[submitting] " .. text
+    elseif entry.awaiting_steer then
+      text = "[waiting] " .. text
     elseif entry.error then
       local keys = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")
       local retry = keys[1] and (" " .. keys[1] .. " retry") or ""

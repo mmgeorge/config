@@ -96,6 +96,10 @@ pub struct ProviderCapability {
     /// Rewinds only to a recorded turn checkpoint, so a conversation rollback cannot discard the
     /// provider's whole conversation.
     pub conversation_rewind_requires_checkpoint: bool,
+    #[serde(default)]
+    /// Rewinds only to a checkpoint recorded after the conversation's newest compaction, because
+    /// the compaction replaced the native history before it and no earlier entry can be resumed.
+    pub conversation_rewind_stops_at_compaction: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,

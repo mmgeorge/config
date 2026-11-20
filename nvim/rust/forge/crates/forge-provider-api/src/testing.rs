@@ -86,6 +86,9 @@ pub enum TestControlCommand {
     /// Hold the selected owner's next native conversation rewind, as a slow native rewind does.
     /// The result names the hold, which `Wait` and `Release` then address like a response hold.
     HoldRewind,
+    /// Answer the selected owner's next native compaction without compacting, in the given
+    /// words, as a native side that finds too little conversation to compact does.
+    DeclineCompaction { explanation: String },
 }
 
 /// Select native fixture content without treating reasoning as an assistant prose role.

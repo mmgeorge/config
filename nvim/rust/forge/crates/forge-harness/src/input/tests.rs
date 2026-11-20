@@ -263,6 +263,43 @@ fn retry_of_a_failed_message_resumes_a_paused_queue() -> Result<()> {
     Ok(())
 }
 
+/// A new prompt that resumes a paused queue runs before every message the queue held.
+///
+/// A steer that a stop returned to the queue keeps its automatic intent, and a resuming prompt was
+/// inserted behind it, so the returned steer ran first although the new prompt is the one the user
+/// asked for. The held message becomes an ordinary follow-up, so it also no longer joins the new
+/// prompt's turn as steering.
+#[test]
+fn resuming_prompt_runs_before_a_steer_the_stop_returned() -> Result<()> {
+    let input = SessionInputQueue::default();
+    let automatic = |id: &str, control: &InputSnapshot| {
+        let mut operation = submit(id);
+        operation.control_revision = control.control_revision;
+        if let InputAction::Submit { message } = &mut operation.action {
+            message.intent = InputIntent::Auto;
+        }
+        operation
+    };
+    input.apply(automatic("returned-steer", &input.snapshot()?))?;
+    input.suspend(true, Some("stop"))?;
+    let resumed = input.apply(automatic("new-prompt", &input.snapshot()?))?;
+    assert!(!resumed.suspended, "the new prompt left the queue paused");
+    let order = input
+        .snapshot()?
+        .messages
+        .iter()
+        .map(|message| (message.id.clone(), message.intent.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        [
+            ("new-prompt".to_owned(), InputIntent::Auto),
+            ("returned-steer".to_owned(), InputIntent::Queue),
+        ]
+    );
+    Ok(())
+}
+
 /// A user prompt that fails delivery pauses the queue, so the queue says it is held.
 ///
 /// A failed entry stays first and blocks every later follow-up until it is retried, but the queue

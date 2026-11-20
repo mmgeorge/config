@@ -1419,23 +1419,51 @@ impl MockProvider {
         }
         let _operation = session.operation.lock().await;
         operation.dispatch(ProviderOperation::ThreadCompact)?;
+        let declined = self
+            .control
+            .declined_compaction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session.owner);
+        let (state, result) = match declined {
+            // A declined request reports a failed attempt in the native side's own words and
+            // leaves the conversation as it was.
+            Some(explanation) => (
+                CompactionState::Failed,
+                CompactionResult {
+                    provider_explanation: Some(SanitizedMessage::new(explanation).map_err(
+                        |_| {
+                            failure(
+                                ProviderOperation::ThreadCompact,
+                                ProviderFailureKind::Protocol,
+                            )
+                        },
+                    )?),
+                    ..Default::default()
+                },
+            ),
+            None => (
+                CompactionState::Completed,
+                CompactionResult {
+                    summary_content: Some(
+                        "Mock compacted context preserves the conversation constraints.".into(),
+                    ),
+                    pre_compaction_tokens: Some(80_000),
+                    post_compaction_tokens: Some(20_000),
+                    context_tokens_after: Some(20_000),
+                    tokens_removed: Some(60_000),
+                    ..Default::default()
+                },
+            ),
+        };
         let result = Compaction {
             id: operation.context.id().as_str().to_owned(),
             thread_id: session.owner.clone().as_str().to_owned(),
-            state: CompactionState::Completed,
+            state,
             manual: true,
             started_at_ms: None,
             completed_at_ms: Some(now_ms()),
-            result: CompactionResult {
-                summary_content: Some(
-                    "Mock compacted context preserves the conversation constraints.".into(),
-                ),
-                pre_compaction_tokens: Some(80_000),
-                post_compaction_tokens: Some(20_000),
-                context_tokens_after: Some(20_000),
-                tokens_removed: Some(60_000),
-                ..Default::default()
-            },
+            result,
         };
         let sink = session.sink.bind_scope(request.scope)?;
         sink.activity_writer()
@@ -2490,6 +2518,8 @@ struct MockControl {
     failing_close: std::sync::Mutex<HashSet<ThreadId>>,
     /// Owners whose turn interrupt never settles.
     held_interrupt: std::sync::Mutex<HashSet<ThreadId>>,
+    /// Owners whose next native compaction is declined, with the words the decline carries.
+    declined_compaction: std::sync::Mutex<HashMap<ThreadId, String>>,
     /// Wake held interrupts when a binding is terminated, as a killed process ends its requests.
     terminated: tokio::sync::Notify,
 }
@@ -2675,6 +2705,13 @@ impl ProviderTestControl for MockControl {
             }
             TestControlCommand::HoldInterrupt => {
                 self.held_interrupt.lock().unwrap().insert(owner.clone());
+                Ok(TestControlResult::Configured)
+            }
+            TestControlCommand::DeclineCompaction { explanation } => {
+                self.declined_compaction
+                    .lock()
+                    .unwrap()
+                    .insert(owner.clone(), explanation);
                 Ok(TestControlResult::Configured)
             }
             TestControlCommand::History => Ok(TestControlResult::History {

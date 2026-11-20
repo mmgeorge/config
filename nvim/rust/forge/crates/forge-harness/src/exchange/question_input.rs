@@ -212,6 +212,34 @@ impl QuestionInputs {
     }
 }
 
+/// Redraw the presented unfinished exchange with the question store's current rows.
+///
+/// A waiting `question_ask` hands a committed answer to the provider without any provider event
+/// that would redraw the exchange, so the owner redraws it after each committed question change
+/// and before acknowledging the change. The redraw keeps the retained session status and takes
+/// no broker lock, because a caller may hold the broker while it waits for the acknowledgement.
+pub(super) fn present_question_change(services: &OwnerServices) -> anyhow::Result<()> {
+    let questions = services.questions.snapshot()?;
+    let mut presentation = services
+        .presentation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?;
+    let Some(presented) = presentation.unfinished_exchange() else {
+        return Ok(());
+    };
+    let Some(projected) = crate::question::project_exchange(&presented, &questions)? else {
+        return Ok(());
+    };
+    presentation.settle_owned_exchange(
+        &projected,
+        services
+            .observer
+            .status_thoughts
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )?;
+    Ok(())
+}
+
 /// Keep normalized scheduling decisions distinct from legacy store implementation errors.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QuestionInputError {

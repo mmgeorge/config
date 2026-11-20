@@ -235,7 +235,19 @@ impl std::fmt::Display for ProviderFailure {
         if self.kind == ProviderFailureKind::Authentication {
             return write!(
                 formatter,
-                "provider {:?} failed: the provider CLI is not signed in. Sign in with that CLI                  (for example, run `claude` and log in for Claude Code), then retry",
+                "provider {:?} failed: the provider CLI is not signed in. Sign in with that CLI (for example, run `claude` and log in for Claude Code), then retry",
+                self.operation
+            );
+        }
+        // Opening a thread whose retained history the adapter cannot resume safely, because a
+        // repair would discard completed work or another owner holds it, fails on every attempt;
+        // only a new session continues the work.
+        if self.kind == ProviderFailureKind::HistoryConflict
+            && self.operation == ProviderOperation::ThreadOpen
+        {
+            return write!(
+                formatter,
+                "provider {:?} failed: the provider's saved conversation for this session cannot be resumed without losing completed work or is held by another session. Continue in a new session with /new",
                 self.operation
             );
         }
@@ -634,6 +646,26 @@ impl From<TurnCancelled> for ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread whose saved history cannot be resumed names the remedy instead of a bare kind.
+    #[test]
+    fn unresumable_history_names_the_remedy() {
+        let message = ProviderFailure::new(
+            ProviderOperation::ThreadOpen,
+            ProviderFailureKind::HistoryConflict,
+        )
+        .to_string();
+        assert!(message.contains("cannot be resumed"), "{message}");
+        assert!(message.contains("/new"), "{message}");
+        assert_eq!(
+            ProviderFailure::new(
+                ProviderOperation::ThreadRewind,
+                ProviderFailureKind::HistoryConflict
+            )
+            .to_string(),
+            "provider ThreadRewind failed: HistoryConflict"
+        );
+    }
 
     /// Preserve the original failure alongside independently failed collection in UI diagnostics.
     #[test]

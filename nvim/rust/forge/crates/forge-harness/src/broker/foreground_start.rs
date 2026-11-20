@@ -97,9 +97,10 @@ impl HarnessBroker {
         // The session's own value, which its edits update; a change to the defaults reaches
         // only sessions created afterwards.
         let tool_timeout = self.session.tool_timeout;
-        let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
-            tool_timeout,
-        )?);
+        let watchdog = Arc::new(
+            crate::provider::tool_timeout::ToolWatchdog::new(tool_timeout)?
+                .for_turn_mode(staged.mode),
+        );
         let session_events = self.observer.session_events();
         let inbox_claim = Some(session_events.claim_for_foreground());
         session_events.watch_tools(&scope, &watchdog)?;

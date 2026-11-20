@@ -239,6 +239,15 @@ impl StatusView<'_> {
         } else {
             primary_text(status, now_ms)
         };
+        // Both phases read `Stopping` until the interrupted exchange settles.
+        let stopping = matches!(
+            status,
+            SessionPhase::Stopping { .. }
+                | SessionPhase::Finalizing {
+                    outcome: Some(crate::exchange::ExchangeOutcome::Cancelled),
+                    ..
+                }
+        );
         let mut block =
             TranscriptRenderer::new(width)?.literal(BlockId(id.to_owned()), &text, 0)?;
         block.metadata.status = Some(StatusPresentation {
@@ -251,6 +260,7 @@ impl StatusView<'_> {
                     ..
                 }
             ),
+            stopping,
             hint: if checking || delegating {
                 Some(StatusHint::Working)
             } else {
@@ -272,8 +282,11 @@ impl StatusView<'_> {
         }
         if !agents.is_empty() {
             // The primary row already names running agents when the root is idle or waiting for
-            // them, so only a root with other work introduces the branch with its own heading.
+            // them, so only a root with other work introduces the branch with its own heading. A
+            // stopping root lists its children as a waiting one does: a heading added by the
+            // interrupt made the status one row taller just before the children left it.
             let heading = !delegating
+                && !stopping
                 && (checks.is_some() || !matches!(status, SessionPhase::WaitingForAgent { .. }));
             append_agents(&mut block, agents, heading, now_ms)?;
         }
@@ -362,6 +375,7 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
         SessionPhase::Blocked { reason } => {
             format!("Blocked · {reason} · /task resume · /task clear")
         }
+        SessionPhase::PreparingFork => "Preparing fork · copying the source conversation".into(),
         SessionPhase::Stopping { collection } => collection.label().into(),
         SessionPhase::Compacting { .. } => {
             let elapsed_seconds = status.elapsed_ms(now_ms) / 1_000;
@@ -723,6 +737,11 @@ fn append_agents(
         ) {
             row.push_str(&format!(" │ {tools}"));
         }
+        match agent.waiting_message_count {
+            0 => {}
+            1 => row.push_str(" │ 1 message waiting"),
+            count => row.push_str(&format!(" │ {count} messages waiting")),
+        }
         let spinner = prefix.len();
         block.metadata.decoration.push(Decoration {
             range: TextRange {
@@ -997,6 +1016,31 @@ mod tests {
         );
         let presentation = block.metadata.status.context("status row metadata")?;
         assert!(!presentation.animated);
+        assert!(presentation.hint.is_none());
+        Ok(())
+    }
+
+    /// A fork whose provider copy is still running says so with a spinner, and offers no
+    /// interrupt key, because no turn runs that the key could stop.
+    #[test]
+    fn preparing_fork_status_names_the_copy() -> Result<()> {
+        use anyhow::Context as _;
+        let block = StatusView {
+            id: "status",
+            status: &SessionPhase::PreparingFork,
+            agents: &[],
+            status_thoughts: false,
+            checks: None,
+        }
+        .render(&WidthProfile::default(), 0)?
+        .block
+        .context("a preparing fork rendered no status")?;
+        assert_eq!(
+            block.text.wire_rows().first().copied(),
+            Some("Preparing fork · copying the source conversation")
+        );
+        let presentation = block.metadata.status.context("status row metadata")?;
+        assert!(presentation.animated);
         assert!(presentation.hint.is_none());
         Ok(())
     }
@@ -1304,6 +1348,7 @@ mod tests {
             tool_denied: 0,
             tool_total: tools.1,
             reasoning_summary: reasoning.map(str::to_owned),
+            waiting_message_count: 0,
         }
     }
 
@@ -1462,6 +1507,36 @@ mod tests {
         Ok(())
     }
 
+    /// A message sent to a running child waits in its inbox until the child's next task, and
+    /// its row says so: the message once appeared nowhere while it waited.
+    #[test]
+    fn running_child_row_counts_its_waiting_messages() -> Result<()> {
+        let mut one = running_agent("explorer", 0, (0, 0), None);
+        one.waiting_message_count = 1;
+        let mut two = running_agent("reviewer", 0, (0, 0), None);
+        two.waiting_message_count = 2;
+        let agents = vec![one, two];
+        let block = StatusView {
+            id: "status",
+            status: &SessionPhase::Idle,
+            agents: &agents,
+            status_thoughts: false,
+            checks: None,
+        }
+        .render(&WidthProfile::default(), 3_000)?
+        .block
+        .unwrap();
+        assert_eq!(
+            block.text.wire_rows(),
+            [
+                "Agents · 2 running",
+                "├─ ⠋ 2s explorer · codex · gpt-6-luna + │ 1 message waiting",
+                "└─ ⠋ 2s reviewer · codex · gpt-6-luna + │ 2 messages waiting",
+            ]
+        );
+        Ok(())
+    }
+
     /// Keep one animated row from the interrupt until settlement.
     ///
     /// Native collection usually ends within a few hundred milliseconds, so a row that renamed
@@ -1493,6 +1568,67 @@ mod tests {
             assert_eq!(block.text.wire_rows(), [text]);
             assert_eq!(block.metadata.status.as_ref().unwrap().animated, animated);
         }
+        Ok(())
+    }
+
+    /// Keep the rows of `Waiting for agents` when the parent stops, and mark the stop.
+    ///
+    /// Each frame in which the status changed height re-scrolled the transcript above it. The
+    /// stopping row once introduced its children under a second `Agents · N running` heading,
+    /// so the interrupt grew the status by one row before each cancelled child shrank it again.
+    /// The stopping row now lists the children directly beneath it, as waiting does, and the
+    /// `stopping` flag tells the editor to keep the status area's height until the stop settles.
+    #[test]
+    fn stopping_parent_keeps_the_waiting_rows_and_marks_the_stop() -> Result<()> {
+        let agents = vec![
+            running_agent("code-explorer-5", 0, (0, 0), None),
+            running_agent("code-explorer-6", 0, (0, 0), None),
+        ];
+        let render = |status: &SessionPhase| -> Result<BufferBlock> {
+            Ok(StatusView {
+                id: "status",
+                status,
+                agents: &agents,
+                status_thoughts: false,
+                checks: None,
+            }
+            .render(&WidthProfile::default(), 3_000)?
+            .block
+            .unwrap())
+        };
+        let waiting = render(&SessionPhase::WaitingForAgent { agent_count: 2 })?;
+        let stopping = render(&SessionPhase::Stopping {
+            collection: crate::exchange::ExchangeCollection::Pending,
+        })?;
+        let finalizing = render(&SessionPhase::Finalizing {
+            exchange_id: "exchange".into(),
+            outcome: Some(crate::exchange::ExchangeOutcome::Cancelled),
+            error: None,
+        })?;
+        let saving = render(&SessionPhase::Finalizing {
+            exchange_id: "exchange".into(),
+            outcome: Some(crate::exchange::ExchangeOutcome::Complete),
+            error: None,
+        })?;
+        let children = [
+            "├─ ⠋ 2s code-explorer-5 · codex · gpt-6-luna +",
+            "└─ ⠋ 2s code-explorer-6 · codex · gpt-6-luna +",
+        ];
+        assert_eq!(waiting.text.wire_rows()[1..], children);
+        assert_eq!(stopping.text.wire_rows()[0], "Stopping");
+        assert_eq!(stopping.text.wire_rows()[1..], children);
+        assert_eq!(finalizing.text.wire_rows()[1..], children);
+        let flag = |block: &BufferBlock| block.metadata.status.as_ref().unwrap().stopping;
+        assert!(!flag(&waiting));
+        assert!(flag(&stopping));
+        assert!(flag(&finalizing));
+        assert!(!flag(&saving));
+        let document =
+            BufferDocument::new(DocumentId("status-stopping:status".into()), vec![stopping])?;
+        forge_recorded_fixtures::assert_matches_recording(
+            "status-stopping.json",
+            &serde_json::to_value(document.snapshot())?,
+        );
         Ok(())
     }
 

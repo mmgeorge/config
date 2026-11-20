@@ -414,25 +414,38 @@ async fn check_result_reaches_mock_provider_while_user_queue_is_paused() -> Resu
     Ok(())
 }
 
-/// Keep active-turn check evidence independent of paused user input and await provider consumption.
+/// A cancellation can collect an exchange whose turn already completed natively, as an interrupt
+/// does when it reaches a turn that is still finalizing. Natural completion wins, so the exchange
+/// stays complete and a check result its turn started continues it. The collection's engine
+/// fence must not then refuse that continuation's prepared submission, which once failed the
+/// result's turn as `provider_cancelled` with no cancellation in flight.
 #[tokio::test]
-async fn check_result_steers_active_mock_with_paused_user_queue() -> Result<()> {
+async fn check_result_continues_an_exchange_collected_after_its_turn_completed() -> Result<()> {
+    use crate::provider::ScopeOwner;
     use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let completed_script = |text: &str| MockResponseCommand::Script {
+        script: TestPromptScript {
+            acceptance: TestInputAcceptance::BeforeResponse,
+            steps: vec![TestPromptStep::Message {
+                content: TestMessageContent::Response,
+                text: text.into(),
+            }],
+            terminal: TestPromptTerminal::Completed,
+        },
+    };
     let root = tempfile::tempdir()?;
     let controller = receipt_test_controller(root.path()).await?;
-    let session = controller.observer.session_id();
+    let session = controller.observer.session_id().to_owned();
     let control = controller
         .provider_handle()
         .mock_response_control()
         .context("mock control")?;
-    let hold = control
-        .dispatch(
-            session,
-            MockResponseCommand::Hold {
-                mode: None,
-                any_session: false,
-            },
-        )
+    control
+        .dispatch(&session, completed_script("Started the check."))
         .await?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
@@ -440,84 +453,125 @@ async fn check_result_steers_active_mock_with_paused_user_queue() -> Result<()> 
         Ok::<_, anyhow::Error>(())
     });
     controller.attach_input(&sink).await?;
-    queued_offer_input(&controller, "user", "Start the task", None)?;
+    queued_offer_input(&controller, "user", "Start the check", None)?;
+    let submissions = &controller.coordinator.submissions;
+    loop {
+        let changed = submissions.changed.notified();
+        if submissions.snapshot()?.messages.is_empty() {
+            break;
+        }
+        changed.await;
+    }
+    let started = crate::storage::HistoryReader::current(&controller.data_root)?
+        .latest_exchange(&session)?
+        .context("started exchange")?;
+    assert_eq!(started.state(), crate::exchange::ExchangeState::Complete);
+    // The interrupt pinned the finalizing turn and collects its exchange, as
+    // `transition::collect_resources` does for the scope it captured.
+    let scope = started
+        .turn
+        .last()
+        .context("started turn")?
+        .provider()
+        .scope
+        .clone();
+    let engine = controller
+        .broker
+        .lock()
+        .await
+        .execution_registry()
+        .existing_owner(&scope.owner())?
+        .context("root execution owner")?;
+    engine.cancel_exchange(scope).await?;
     control
-        .dispatch(
-            session,
-            MockResponseCommand::Wait {
-                id: hold["id"].as_str().unwrap().into(),
-            },
-        )
+        .dispatch(&session, completed_script("Reviewed the check result."))
         .await?;
-    let exchange = crate::storage::HistoryReader::current(&controller.data_root)?
-        .latest_exchange(session)?
-        .context("active exchange")?;
-    controller.coordinator.submissions.suspend(true, None)?;
     let result: forge_provider_api::forge::CheckResult = serde_json::from_value(json!({
-        "run_id":"active-result","exchange_id":exchange.id,"state":"passed","complete":true,"checks":[]
+        "run_id":"interrupted-run","exchange_id":started.id,"state":"failed","complete":true,"checks":[]
     }))?;
     let turn = forge_provider_api::forge::TurnInput::new(
         forge_provider_api::forge::TurnKind::CheckResult { result },
     );
     let message = crate::input::InputMessage::queued(crate::input::InputDraft {
-        id: "active-result".into(),
+        id: "check-result:interrupted-run".into(),
         text: turn.label(),
         purpose: crate::input::InputPurpose::CheckResult {
-            exchange_id: exchange.id,
-            run_id: "active-result".into(),
+            exchange_id: started.id.clone(),
+            run_id: "interrupted-run".into(),
         },
         attachments: Vec::new(),
         config: None,
         intent: crate::input::InputIntent::Auto,
     })
     .with_turn(turn);
-    controller
-        .observer
-        .check_inbox
-        .apply(crate::input::InputOperation {
-            id: "active-result".into(),
-            control_revision: 0,
-            after_control: None,
-            action: crate::input::InputAction::Submit {
-                message: Box::new(message),
-            },
-        })?;
+    let inbox = &controller.observer.check_inbox;
+    inbox.apply(crate::input::InputOperation {
+        id: "check-result:interrupted-run".into(),
+        control_revision: 0,
+        after_control: None,
+        action: crate::input::InputAction::Submit {
+            message: Box::new(message),
+        },
+    })?;
     controller.exchange_owner.input_ready(sink.clone()).await?;
     loop {
-        let changed = controller.observer.check_inbox.changed.notified();
-        if controller
-            .observer
-            .check_inbox
-            .snapshot()?
-            .messages
-            .iter()
-            .any(|message| message.delivery() == crate::input::InputDelivery::Accepted)
-        {
+        let changed = inbox.changed.notified();
+        // The result leaves the inbox once its turn settles; a failed turn leaves it failed.
+        if inbox.snapshot()?.messages.iter().all(|message| {
+            matches!(
+                message.delivery(),
+                crate::input::InputDelivery::Failed | crate::input::InputDelivery::Unknown
+            )
+        }) {
             break;
         }
         changed.await;
     }
-    assert!(controller.coordinator.submissions.snapshot()?.suspended);
+    let remaining = inbox.snapshot()?.messages;
     assert!(
-        controller
-            .coordinator
-            .submissions
-            .snapshot()?
-            .messages
+        remaining.is_empty(),
+        "check result did not settle: {:?}",
+        remaining
             .iter()
-            .all(|message| !matches!(
-                message.purpose,
-                crate::input::InputPurpose::CheckResult { .. }
-            ))
+            .map(|message| (message.delivery(), message.error()))
+            .collect::<Vec<_>>()
     );
-    control
-        .dispatch(
-            session,
-            MockResponseCommand::Release {
-                id: hold["id"].as_str().unwrap().into(),
-            },
-        )
-        .await?;
+    let continued = crate::storage::HistoryReader::current(&controller.data_root)?
+        .load_exchange(&started.id)?
+        .context("continued exchange")?;
+    assert_eq!(
+        continued.state(),
+        crate::exchange::ExchangeState::Complete,
+        "check result continuation failed: {:?}",
+        continued.finalization_error
+    );
+    assert_eq!(continued.turn.len(), 2, "check result never reached a turn");
+    assert!(
+        matches!(
+            continued.turn[1].state(),
+            crate::turn::TurnState::Finished {
+                outcome: crate::turn::TurnOutcome::Completed { .. }
+            }
+        ),
+        "check result turn ended as {:?}",
+        continued.turn[1].state()
+    );
+    let cancelled_report = controller
+        .publications
+        .after(None, std::num::NonZeroU16::new(u16::MAX).unwrap())?
+        .into_iter()
+        .find(|publication| {
+            publication
+                .event()
+                .payload
+                .to_string()
+                .contains("provider execution cancelled")
+        });
+    assert!(
+        cancelled_report.is_none(),
+        "the continuation reported a cancellation: {:?}",
+        cancelled_report.map(|publication| publication.event().clone())
+    );
     controller.finish_exchange_owner().await?;
     drop(sink);
     drop(controller);
@@ -1442,5 +1496,408 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
             .len(),
         1
     );
+    Ok(())
+}
+
+/// Own one mock-provider session with the agent tools enabled, for prompts that arrive while
+/// the parent exchange delegates to children.
+struct DelegatingSession {
+    controller: Arc<SessionController>,
+    session: String,
+    sink: MessageSender,
+    reader: tokio::task::JoinHandle<Result<()>>,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    root: tempfile::TempDir,
+}
+
+impl DelegatingSession {
+    async fn start(client_id: &str) -> Result<Self> {
+        let root = tempfile::tempdir()?;
+        crate::checks::configure_fixture(root.path());
+        let controller =
+            SessionController::new(HarnessBroker::initialize(serde_json::from_value(json!({
+                "workspace":root.path(),"data_root":root.path().join("data"),"client_id":client_id,
+                "provider":{"kind":"mock","command":[]},
+            }))?)?)
+            .await?;
+        let session = controller.observer.session_id().to_owned();
+        controller.agent_coordinator.set_enabled(true);
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<_, anyhow::Error>(())
+        });
+        controller.attach_input(&sink).await?;
+        Ok(Self {
+            controller,
+            session,
+            sink,
+            reader,
+            root,
+        })
+    }
+
+    async fn control(
+        &self,
+        command: crate::provider::mock_response::MockResponseCommand,
+    ) -> Result<Value> {
+        self.controller
+            .provider_handle()
+            .mock_response_control()
+            .context("mock control")?
+            .dispatch(&self.session, command)
+            .await
+    }
+
+    async fn script(&self, script: forge_provider_api::testing::TestPromptScript) -> Result<()> {
+        self.control(crate::provider::mock_response::MockResponseCommand::Script { script })
+            .await?;
+        Ok(())
+    }
+
+    /// Queue one user prompt, as the editor's composer does.
+    fn submit(&self, id: &str, text: &str) -> Result<()> {
+        use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+        self.controller
+            .coordinator
+            .submissions
+            .apply(InputOperation {
+                id: format!("submit-{id}"),
+                control_revision: 0,
+                after_control: None,
+                action: InputAction::Submit {
+                    message: Box::new(InputMessage::queued(crate::input::InputDraft {
+                        id: id.into(),
+                        text: text.into(),
+                        purpose: crate::input::InputPurpose::User,
+                        attachments: Vec::new(),
+                        config: None,
+                        intent: InputIntent::Auto,
+                    })),
+                },
+            })?;
+        Ok(())
+    }
+
+    /// Wait until execution is idle, the queue is empty, and at least `count` exchanges exist,
+    /// all of them settled.
+    async fn settled_exchanges(&self, count: usize) -> Result<Vec<crate::exchange::Exchange>> {
+        loop {
+            if self.controller.coordinator.execution.available_permits() == 1
+                && self
+                    .controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .messages
+                    .is_empty()
+            {
+                let exchanges = crate::storage::HistoryReader::current(&self.controller.data_root)?
+                    .list_exchange(&self.session)?;
+                if exchanges.len() >= count
+                    && exchanges.iter().all(|exchange| exchange.is_finished())
+                {
+                    return Ok(exchanges);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn finish(self) -> Result<()> {
+        self.controller.finish_exchange_owner().await?;
+        drop(self.sink);
+        self.reader.abort();
+        Ok(())
+    }
+}
+
+/// A prompt submitted while the parent continues after its children steers that continuation.
+///
+/// The child's result continues the parent under a successor invocation of the same exchange, and
+/// the steer's acceptance must be applied to that exchange rather than refused as belonging to
+/// another invocation, which failed the exchange and lost the prompt.
+#[tokio::test]
+async fn prompt_during_the_continuation_after_children_steers_it() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let fixture = DelegatingSession::start("continuation-steer").await?;
+    fixture
+        .script(TestPromptScript {
+            acceptance: TestInputAcceptance::BeforeResponse,
+            steps: vec![
+                TestPromptStep::ToolCall {
+                    name: "agent_spawn".into(),
+                    arguments: json!({"profile":"worker","text":"Inspect the sources"}),
+                },
+                TestPromptStep::Message {
+                    content: TestMessageContent::Response,
+                    text: "Waiting for the child".into(),
+                },
+            ],
+            terminal: TestPromptTerminal::Completed,
+        })
+        .await?;
+    // The hold takes the parent's next turn, which is the continuation the child's result starts.
+    let hold = fixture
+        .control(MockResponseCommand::Hold {
+            mode: None,
+            any_session: false,
+        })
+        .await?;
+    let hold_id = hold["id"].as_str().context("hold identity")?.to_owned();
+    fixture.submit("delegate", "Delegate an inspection")?;
+    fixture
+        .control(MockResponseCommand::Wait {
+            id: hold_id.clone(),
+        })
+        .await?;
+    fixture.submit("steer", "Also name the exported types")?;
+    // Release the continuation only once the provider holds the steer, so the turn cannot end
+    // before the steer reaches it and send the prompt as a later follow-up instead.
+    loop {
+        let changed = fixture
+            .controller
+            .coordinator
+            .submissions
+            .changed
+            .notified();
+        if fixture
+            .controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .iter()
+            .all(|message| {
+                message.id != "steer" || message.delivery() == crate::input::InputDelivery::Accepted
+            })
+        {
+            break;
+        }
+        changed.await;
+    }
+    fixture
+        .control(MockResponseCommand::Release { id: hold_id })
+        .await?;
+    let exchanges = fixture.settled_exchanges(1).await?;
+    ensure!(
+        exchanges.len() == 1,
+        "the steer started a separate exchange instead of steering the continuation"
+    );
+    let exchange = &exchanges[0];
+    ensure!(
+        exchange.state() == crate::exchange::ExchangeState::Complete && exchange.turn.len() == 2,
+        "the steered continuation settled {:?} after {} turns: {:?}",
+        exchange.state(),
+        exchange.turn.len(),
+        exchange.finalization_error
+    );
+    ensure!(
+        serde_json::to_string(exchange)?.contains("Also name the exported types"),
+        "the steered prompt is not in its exchange"
+    );
+    fixture.finish().await
+}
+
+/// A prompt submitted while the parent waits for its children is never lost and never fails the
+/// exchange, and the parent's report survives.
+///
+/// The prompt waits while the parent is parked and then reaches the parent with the children's
+/// results as the prompt of a successor invocation. That invocation's acceptance travels under the
+/// exchange's first invocation, which the foreground once refused as crossing invocations.
+#[tokio::test]
+async fn prompt_while_the_parent_waits_for_children_reaches_the_parent() -> Result<()> {
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let fixture = DelegatingSession::start("parked-steer").await?;
+    // A shared reservation holds the writing child in repository admission, so the parent's own
+    // turn ends while its child still runs.
+    let reservation = crate::repository_access::RepositoryReservation::acquire(
+        &fixture.controller.data_root,
+        fixture.root.path(),
+        crate::repository_access::RepositoryAccess::Read,
+    )?;
+    fixture
+        .script(TestPromptScript {
+            acceptance: TestInputAcceptance::BeforeResponse,
+            steps: vec![
+                TestPromptStep::ToolCall {
+                    name: "agent_spawn".into(),
+                    arguments: json!({"profile":"worker","text":"Inspect the sources"}),
+                },
+                TestPromptStep::Message {
+                    content: TestMessageContent::Response,
+                    text: "Waiting for the child".into(),
+                },
+            ],
+            terminal: TestPromptTerminal::Completed,
+        })
+        .await?;
+    fixture
+        .script(TestPromptScript {
+            acceptance: TestInputAcceptance::BeforeResponse,
+            steps: vec![TestPromptStep::Message {
+                content: TestMessageContent::Response,
+                text: "The child inspected the sources".into(),
+            }],
+            terminal: TestPromptTerminal::Completed,
+        })
+        .await?;
+    fixture.submit("delegate", "Delegate an inspection")?;
+    loop {
+        let parked = fixture.controller.agent_coordinator.active_count() == 1
+            && crate::storage::HistoryReader::current(&fixture.controller.data_root)?
+                .list_exchange(&fixture.session)?
+                .first()
+                .and_then(|exchange| exchange.turn.last())
+                .is_some_and(|turn| {
+                    matches!(turn.state(), crate::turn::TurnState::Finished { .. })
+                });
+        if parked {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    fixture.submit("steer", "Also name the exported types")?;
+    drop(reservation);
+    let exchanges = fixture.settled_exchanges(1).await?;
+    ensure!(
+        exchanges
+            .iter()
+            .all(|exchange| exchange.state() == crate::exchange::ExchangeState::Complete),
+        "an exchange did not complete: {:?}",
+        exchanges
+            .iter()
+            .map(|exchange| (exchange.state(), exchange.finalization_error.clone()))
+            .collect::<Vec<_>>()
+    );
+    let transcript = serde_json::to_string(&exchanges)?;
+    ensure!(
+        transcript.contains("Also name the exported types"),
+        "the prompt submitted during the wait was lost"
+    );
+    ensure!(
+        transcript.contains("The child inspected the sources"),
+        "the parent's report after its children is missing"
+    );
+    fixture.finish().await
+}
+
+/// A prompt submitted after an exchange failed runs as the next exchange.
+///
+/// The failed prompt stays in the queue as a failed entry and pauses it. A new prompt resumes the
+/// queue, as it does after an interrupt, so it must not wait behind the failed entry, which only an
+/// explicit retry sends again.
+#[tokio::test]
+async fn prompt_after_a_failed_exchange_runs_and_leaves_the_failure_to_retry() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{TestInputAcceptance, TestPromptScript, TestPromptTerminal};
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let controller = receipt_test_controller(root.path()).await?;
+    let session = controller.observer.session_id().to_owned();
+    let control = controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock control")?;
+    control
+        .dispatch(
+            &session,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![],
+                    terminal: TestPromptTerminal::RejectedBeforeDispatch(
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    ),
+                },
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<_, anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let submit = |request: u64, id: &str, text: &str, control_revision: u64| Request {
+        id: request,
+        method: "session.input.apply".into(),
+        params: json!({"id":format!("submit-{id}"),"control_revision":control_revision,"action":{
+            "kind":"submit","message":{"id":id,"text":text,"intent":"auto"}
+        }}),
+    };
+    controller
+        .input_request(
+            submit(1, "failed-prompt", "Prompt whose exchange fails", 0),
+            RuntimeMethod::SessionInputApply,
+            &sink,
+        )
+        .await
+        .context("first submission")?;
+    let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = controller.coordinator.submissions.snapshot()?;
+            if snapshot.messages.iter().any(|message| {
+                message.id == "failed-prompt"
+                    && message.delivery() == crate::input::InputDelivery::Failed
+            }) {
+                break Ok::<_, anyhow::Error>(snapshot);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the scripted failure never settled as a failed entry")??;
+    assert!(paused.suspended, "the failed prompt left the queue running");
+    controller
+        .input_request(
+            submit(
+                2,
+                "next-prompt",
+                "Prompt after the failure",
+                paused.control_revision,
+            ),
+            RuntimeMethod::SessionInputApply,
+            &sink,
+        )
+        .await
+        .context("second submission")?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let finished = SqliteStore::read_only(&controller.data_root)?
+                .list_exchange(&session)?
+                .iter()
+                .any(|exchange| {
+                    exchange.input_message_id.as_deref() == Some("next-prompt")
+                        && exchange.is_finished()
+                });
+            if finished {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the prompt after the failure waited behind the failed entry")??;
+    let snapshot = controller.coordinator.submissions.snapshot()?;
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .any(|message| message.id == "failed-prompt"
+                && message.delivery() == crate::input::InputDelivery::Failed),
+        "the failed prompt left the queue instead of waiting for its retry: {:?}",
+        snapshot.messages
+    );
+    controller.finish_exchange_owner().await?;
+    drop(sink);
+    reader.abort();
     Ok(())
 }

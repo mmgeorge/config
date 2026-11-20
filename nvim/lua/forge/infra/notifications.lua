@@ -1,7 +1,8 @@
 ---@class ForgeNotificationsModule
 ---@field error fun(message: string, title?: string)
 ---@field warn fun(message: string, title?: string)
----@field info fun(message: string, title?: string)
+---@field info fun(message: string, title?: string, id?: string)
+---@field withdraw fun(id: string)
 ---@field format_failures fun(failures: ForgeGitFailure[]): string
 ---@field git_failures fun(title: string, failures: ForgeGitFailure[])
 ---@field debug fun(message: string, level?: integer, opts?: table)
@@ -63,8 +64,19 @@ end
 
 ---@param message string
 ---@param title? string
-function M.info(message, title)
-  vim.notify(message, vim.log.levels.INFO, { title = title or "Diff Review" })
+---@param id? string Identity that lets the owner replace or withdraw the notice while it shows.
+function M.info(message, title, id)
+  vim.notify(message, vim.log.levels.INFO, { title = title or "Diff Review", id = id })
+end
+
+---Hide the notice shown with `id` before its timeout, once what it announced no longer holds.
+---
+---`vim.notify` has no withdrawal of its own, so this reaches the notifier that shows the notice:
+---Snacks hides it at once, and any other notifier lets it expire at its timeout.
+---@param id string
+function M.withdraw(id)
+  local notifier = package.loaded["snacks.notifier"]
+  if type(notifier) == "table" and type(notifier.hide) == "function" then pcall(notifier.hide, id) end
 end
 
 ---@param failures ForgeGitFailure[]

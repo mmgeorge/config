@@ -455,7 +455,10 @@ impl QuestionController {
     }
 
     /// Revoke cancelled chat continuations while keeping optional questions answerable.
-    pub(crate) fn cancel_chat(&self, active_exchange: Option<&str>) -> Result<()> {
+    ///
+    /// Returns the required questions this retired, whose waiting tool can no longer return an
+    /// answer; the provider keeps no pending tool call once its turn has stopped.
+    pub(crate) fn cancel_chat(&self, active_exchange: Option<&str>) -> Result<Vec<QuestionRecord>> {
         self.update(|state| {
             let mut cancelled = std::collections::BTreeSet::new();
             for (exchange_id, continuation) in &mut state.chat_continuation {
@@ -472,6 +475,7 @@ impl QuestionController {
             }
             state.cancelled_exchanges.extend(cancelled.iter().cloned());
             let mut retired = std::collections::BTreeSet::new();
+            let mut unanswered = Vec::new();
             for question in &mut state.snapshot.questions {
                 if cancelled.contains(&question.exchange_id) {
                     retired.insert(question.id.as_str().to_owned());
@@ -479,13 +483,14 @@ impl QuestionController {
                         question.resolution = QuestionResolution::Retired {
                             reason: "The owning chat request was cancelled".into(),
                         };
+                        unanswered.push(question.clone());
                     }
                 }
             }
             state
                 .outbox
                 .retain(|message| !retired.contains(message.question_id.as_str()));
-            Ok(())
+            Ok(unanswered)
         })
     }
 
@@ -1992,6 +1997,31 @@ pub(crate) fn input_content(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(UserInputContent::QuestionResponse { responses })
+}
+
+/// Project the current question rows into a copy of one exchange, dropping rows it already shows.
+///
+/// `None` means no question belongs to the exchange, so its rows cannot have changed. Live
+/// redraws use this because they otherwise carry rows forward from the previous frame, and an
+/// accepted answer kept reading `Awaiting answer` until the next full snapshot.
+pub(crate) fn project_exchange(
+    exchange: &crate::exchange::Exchange,
+    snapshot: &QuestionSnapshot,
+) -> Result<Option<crate::exchange::Exchange>> {
+    if !snapshot
+        .questions
+        .iter()
+        .any(|question| question.exchange_id == exchange.id)
+    {
+        return Ok(None);
+    }
+    let mut projected = [exchange.clone()];
+    projected[0]
+        .node_list
+        .retain(|node| !node.is_projected_question());
+    project(&mut projected, snapshot)?;
+    let [projected] = projected;
+    Ok(Some(projected))
 }
 
 /// Project retained questions into their originating exchange without changing stored exchanges.

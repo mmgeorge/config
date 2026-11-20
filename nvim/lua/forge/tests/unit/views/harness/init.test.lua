@@ -274,7 +274,104 @@ T["provider_switch_back_is_refused_while_another_tab_has_work"] = function()
   end)
   eq(stopped, false)
   eq(detached.host_error ~= nil, true)
-  eq(notices:messages(), { "Finish or cancel pending work before switching providers" })
+  eq(notices:messages(), { "Cannot switch providers yet: another Harness session has a running turn. Finish or cancel it first." })
+end
+
+T["provider_switch_refusal_names_the_tab_and_its_work"] = function()
+  local activity = dofile("nvim/lua/forge/tests/support/activity.lua")
+  local session = require("forge.session")
+  local harness = require("forge.views.harness")
+  local state = session.harness
+  state.session = { id = "current", provider = "fixture_alpha", name = "" }
+  activity.set_busy(state, false)
+  local other = session.new_harness_state()
+  other.session = { id = "other-tab", provider = "fixture_alpha", name = "Fix tax rate" }
+  vim.cmd("tabnew")
+  other.timeline_tab = vim.api.nvim_get_current_tabpage()
+  session.register_harness("current", state)
+  session.register_harness("other-tab", other)
+  local other_tab = vim.api.nvim_tabpage_get_number(other.timeline_tab)
+  activity.set_busy(other, true)
+  eq(harness.provider_switch_refusal(), ("Cannot switch providers yet: tab %d (Fix tax rate) has a running turn. "
+    .. "Finish or cancel it first."):format(other_tab))
+  -- A turn stopped at an approval request needs the user's answer, not patience.
+  other.status = { kind = "awaiting_approval" }
+  eq(harness.provider_switch_refusal(), ("Cannot switch providers yet: tab %d (Fix tax rate) has a turn waiting "
+    .. "for an approval. Finish or cancel it first."):format(other_tab))
+  other.status = nil
+  activity.set_busy(other, false)
+  other.queue = { { text = "one" }, { text = "two" } }
+  eq(harness.provider_switch_refusal(), ("Cannot switch providers yet: tab %d (Fix tax rate) has 2 queued prompts. "
+    .. "Finish or cancel it first."):format(other_tab))
+  other.queue = {}
+  state.pending_submit = { { text = "sending" } }
+  eq(harness.provider_switch_refusal(), "Cannot switch providers yet: this tab has a prompt that is still being "
+    .. "submitted. Finish or cancel it first.")
+  state.pending_submit = {}
+  eq(harness.provider_switch_refusal(), nil)
+end
+
+T["provider_switch_waits_for_a_detached_tab_that_is_switching_back"] = function()
+  local activity = dofile("nvim/lua/forge/tests/support/activity.lua")
+  local diagnostic = require("forge.views.harness.diagnostic")
+  local session = require("forge.session")
+  local harness = require("forge.views.harness")
+  local state = session.harness
+  state.session = { id = "current", provider = "fixture_alpha" }
+  activity.set_busy(state, false)
+  -- The other tab's host stopped, and that tab is now opening its session on its own provider.
+  local returning = session.new_harness_state()
+  returning.session = { id = "returning", provider = "fixture_beta", name = "Returning" }
+  diagnostic.set(returning, "host_error", "Harness now serves Fixture 1.", { category = "host", recovery = "reconnect" })
+  returning.switching_provider = true
+  session.register_harness("current", state)
+  session.register_harness("returning", returning)
+  -- Stopping the host now would discard that tab's session open.
+  eq(harness.provider_switch_available(), false)
+  eq(harness.provider_switch_refusal(),
+    'Cannot switch providers yet: session "Returning" is switching the Harness provider. Wait for it to finish.')
+  returning.switching_provider = false
+  eq(harness.provider_switch_available(), true)
+end
+
+T["failed_provider_switch_leaves_its_cause_in_the_view"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+  local activity = dofile("nvim/lua/forge/tests/support/activity.lua")
+  dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
+  local session = require("forge.session")
+  local client = require("forge.client")
+  local controller = require("forge.views.harness.controller")
+  local health = require("forge.views.harness.health")
+  local harness = require("forge.views.harness")
+  notify.capture({ notifications = true })
+  stub(controller, "render", function() end)
+  stub(require("forge.views.harness.session_navigation"), "activate", function(result, options)
+    session.harness.session = result.session
+    if options.on_settled then options.on_settled() end
+  end)
+  local pending_stop, pending_start
+  stub(client, "host_stop", function(_, callback) pending_stop = callback end)
+  stub(client, "session_initialize", function(callback) pending_start = callback end)
+  require("forge.infra.config").options.harness.provider = "fixture_alpha"
+  local state = session.harness
+  state.session = { id = "source", provider = "fixture_alpha" }
+  session.register_harness("source", state)
+  activity.set_busy(state, false)
+  eq(harness.switch_provider("fixture_beta", { kind = "new" }), true)
+  pending_stop()
+  pending_start(nil, "Forge host stopped: unresolved request 952 (session.initialize)")
+  pending_stop()
+  pending_start({ session = { id = "source", provider = "fixture_alpha" } })
+  -- The view is back on its own session, and it still says why the switch did not happen.
+  local notice = health.notice(state)
+  eq({ state.session.id, state.switching_provider }, { "source", false })
+  eq(notice and { notice.text, notice.failed }, { "Switching to Fixture 2 failed: the Harness host stopped before "
+    .. "the session opened (Forge host stopped: unresolved request 952 (session.initialize)). Harness still serves "
+    .. "Fixture 1.", true })
+  -- The next switch replaces the explanation with its own progress.
+  eq(harness.switch_provider("fixture_beta", { kind = "new" }), true)
+  eq(health.notice(state).text, "Switching Harness to Fixture 2")
 end
 
 T["replace_session_preserves_requesting_tab_and_handles_failure"] = function()

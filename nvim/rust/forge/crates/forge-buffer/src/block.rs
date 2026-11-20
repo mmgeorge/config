@@ -166,6 +166,11 @@ pub struct StatusPresentation {
     /// settlement as a hand-off rather than the end of the session's work.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handoff: bool,
+    /// The interrupted exchange has not settled yet. Its children and other rows leave one by
+    /// one while it stops, so the editor keeps the status area at least as tall as it already is
+    /// until the stop settles and the status ends, and the transcript above it moves only once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopping: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

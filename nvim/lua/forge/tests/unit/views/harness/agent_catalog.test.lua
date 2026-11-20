@@ -64,4 +64,17 @@ T["an_earlier_child_list_never_replaces_a_later_one"] = function()
   eq(names(catalog.run_list(state, false)), { "code-explorer-13" })
 end
 
+-- An interrupt request succeeds as a whole while one child's interrupt fails; that failure was
+-- dropped, so `Ctrl-X` on such a child appeared to do nothing.
+T["interrupt_failure_names_the_child_outcome"] = function()
+  local catalog = require("forge.views.harness.agent_catalog")
+  eq(catalog.interrupt_failure({ interrupted = true, targets = { { result = { Ok = vim.NIL } } } }), nil)
+  eq(catalog.interrupt_failure({ interrupted = true, targets = {
+    { result = { Ok = vim.NIL } }, { result = { Err = { failure = "stale_target" } } },
+  } }), "the child's task changed before the interrupt applied")
+  eq(catalog.interrupt_failure({ targets = { { result = { Err = { failure = "new_code" } } } } }),
+    "the interrupt failed: new code")
+  eq(catalog.interrupt_failure(nil), nil)
+end
+
 return T

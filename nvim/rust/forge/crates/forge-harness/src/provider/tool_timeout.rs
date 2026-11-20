@@ -13,6 +13,8 @@ use tokio::time::Instant;
 /// Retains each invocation's original deadline, independently of output and replay.
 pub(crate) struct ToolWatchdog {
     duration: Duration,
+    /// Mode of the turns this watchdog observes, which decides whether a question waits.
+    mode: crate::provider::PromptMode,
     state: Mutex<WatchdogState>,
     changed: Notify,
     monitor_started: AtomicBool,
@@ -178,11 +180,19 @@ impl ToolWatchdog {
     pub(crate) fn new(timeout: crate::session::InputTimeout) -> Result<Self> {
         Ok(Self {
             duration: timeout.require_expiry()?.duration(),
+            mode: crate::provider::PromptMode::Chat,
             state: Mutex::new(WatchdogState::default()),
             changed: Notify::new(),
             monitor_started: AtomicBool::new(false),
             timeout_reported: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Observe turns of `mode`, whose waiting questions have no deadline even when the call
+    /// does not ask to wait, as in a planning turn.
+    pub(crate) fn for_turn_mode(mut self, mode: crate::provider::PromptMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Track execution deadlines while leaving explicit waits for user answers unbounded.
@@ -273,7 +283,7 @@ impl ToolWatchdog {
                 }
                 state.tools.entry(address).or_insert_with(|| {
                     if descriptor.name == "question_ask"
-                        && descriptor.arguments.value()["wait"].as_bool() == Some(true)
+                        && crate::tools::question_ask_waits(descriptor.arguments.value(), self.mode)
                     {
                         ToolDeadline::UserInput
                     } else if descriptor.name == "check_discover" {
@@ -913,6 +923,26 @@ mod tests {
             serde_json::json!({}),
         ))?;
         assert_eq!(pending.await?.unwrap().address, command);
+        Ok(())
+    }
+
+    /// A planning turn's question waits for its answer without a deadline, as a planning
+    /// question always does, while the same call in a chat turn returns at once and keeps one.
+    #[tokio::test(start_paused = true)]
+    async fn planning_questions_wait_without_a_deadline() -> Result<()> {
+        let question = address("question_ask");
+        let planning = watchdog()?.for_turn_mode(crate::provider::PromptMode::Plan);
+        planning.observe(&requested(&question, TestTool::Tool, serde_json::json!({})))?;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let pending = std::pin::pin!(planning.expired());
+        assert!(
+            futures_util::poll!(pending).is_pending(),
+            "a waiting planning question expired"
+        );
+        let chat = watchdog()?;
+        chat.observe(&requested(&question, TestTool::Tool, serde_json::json!({})))?;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(chat.expired().await?.unwrap().address, question);
         Ok(())
     }
 }

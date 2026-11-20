@@ -51,6 +51,7 @@ type IdentityHandler = dyn Fn(ThreadOwner) -> BoxFuture<'static, Result<Option<P
 type CleanupHandler =
     dyn Fn(BindingId) -> BoxFuture<'static, Result<(), ProviderError>> + Send + Sync;
 type ShutdownHandler = dyn Fn() -> BoxFuture<'static, Result<(), ProviderError>> + Send + Sync;
+type ModelListHandler = dyn Fn() -> BoxFuture<'static, Result<(), ProviderError>> + Send + Sync;
 type McpHandler =
     dyn Fn(McpQuery) -> BoxFuture<'static, Result<Vec<McpDefinition>, ProviderError>> + Send + Sync;
 
@@ -321,6 +322,7 @@ pub struct EventFixtureProvider {
     handler: Arc<PromptHandler>,
     steering: std::sync::RwLock<Option<Arc<SteeringHandler>>>,
     models: std::sync::RwLock<Option<Vec<ProviderModel>>>,
+    model_list_answer: std::sync::RwLock<Option<Arc<ModelListHandler>>>,
     admission: std::sync::RwLock<Option<Arc<AdmissionHandler>>>,
     reconcile: std::sync::RwLock<Option<Arc<ReconcileHandler>>>,
     pre_dispatch: std::sync::RwLock<Option<Arc<PreDispatchHandler>>>,
@@ -361,6 +363,7 @@ impl EventFixtureProvider {
             }),
             steering: Default::default(),
             models: Default::default(),
+            model_list_answer: Default::default(),
             admission: Default::default(),
             reconcile: Default::default(),
             pre_dispatch: Default::default(),
@@ -441,6 +444,20 @@ impl EventFixtureProvider {
             .models
             .write()
             .expect("fixture model lock is not poisoned") = Some(models);
+        self.clone()
+    }
+
+    /// Answer each model list only once `answer` completes, as a slow provider does.
+    pub fn with_model_list_answer<F, Fut>(self: &Arc<Self>, answer: F) -> Arc<Self>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ProviderError>> + Send + 'static,
+    {
+        *self
+            .model_list_answer
+            .write()
+            .expect("fixture model list hook lock is not poisoned") =
+            Some(Arc::new(move || Box::pin(answer())));
         self.clone()
     }
 
@@ -1408,6 +1425,14 @@ impl EventFixtureProvider {
         context.check_admission(ProviderOperation::ModelList)?;
         if let QueryContext::Binding(binding) = query {
             self.session(&binding, ProviderOperation::ModelList).await?;
+        }
+        let answer = self
+            .model_list_answer
+            .read()
+            .expect("fixture model list hook lock is not poisoned")
+            .clone();
+        if let Some(answer) = answer {
+            answer().await?;
         }
         self.models
             .read()

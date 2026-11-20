@@ -35,11 +35,15 @@ end
 ---@param tab integer
 ---@return boolean
 local function shows_transcript_in(state, tab)
-  local transcript_buffer = state.transcript_buf
-  if not (transcript_buffer and vim.api.nvim_buf_is_valid(transcript_buffer)) then return false end
-  return vim.iter(vim.fn.win_findbuf(transcript_buffer)):any(function(window)
-    return vim.api.nvim_win_get_tabpage(window) == tab and not vim.api.nvim_win_get_config(window).hide
-  end)
+  -- A view rebuilt behind its panes for a new host still shows its retired transcript buffer.
+  local rebuild = state.pending_rebuild
+  for _, transcript_buffer in ipairs({ state.transcript_buf or false, rebuild and rebuild.transcript_buf or false }) do
+    if transcript_buffer and vim.api.nvim_buf_is_valid(transcript_buffer)
+      and vim.iter(vim.fn.win_findbuf(transcript_buffer)):any(function(window)
+        return vim.api.nvim_win_get_tabpage(window) == tab and not vim.api.nvim_win_get_config(window).hide
+      end) then return true end
+  end
+  return false
 end
 
 --- Find the Harness view presented in `tab`, or nil when the tab shows no Harness transcript.

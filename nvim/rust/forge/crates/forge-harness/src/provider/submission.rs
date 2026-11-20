@@ -544,6 +544,37 @@ impl SubmissionStore {
             && included.iter().all(|id| records_seen.contains(id)))
     }
 
+    /// Get the typed input most recently journaled under one input identity of one session.
+    ///
+    /// A turn that Harness stopped and runs again replays this input. A logical input keeps its
+    /// identity across delivery attempts, so the newest record holds its current content, and a
+    /// host-authored continuation, which has no input identity, never replaces it.
+    pub(crate) fn latest_input(
+        &self,
+        session_id: &str,
+        input_message_id: &str,
+    ) -> Result<Option<super::ProviderInput>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM submission WHERE json_extract(payload,'$.input_message_id')=?1 \
+                 AND json_extract(payload,'$.request.harness_session_id')=?2 ORDER BY rowid DESC LIMIT 1",
+                params![input_message_id, session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| {
+                Ok(serde_json::from_str::<SubmissionRecord>(&payload)?
+                    .request
+                    .input)
+            })
+            .transpose()
+    }
+
     /// Reads all unfinished inputs for the same execution owner and provider in admission order.
     pub fn pending(
         &self,

@@ -39,6 +39,7 @@ mod cancellation;
 mod check_completion;
 mod command;
 mod compaction;
+mod inherited_model_settings;
 mod input_delivery;
 #[cfg(test)]
 mod input_durability_test;
@@ -1061,6 +1062,7 @@ impl HarnessService {
                 for controller in &controllers {
                     controller.input_stopping.store(true, Ordering::Release);
                     controller.coordinator.submissions.changed.notify_one();
+                    controller.stop_inherited_model_resolution();
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
                     controller.exchange_owner.close().await;
@@ -1405,6 +1407,8 @@ struct SessionController {
     questions: Arc<crate::question::QuestionController>,
     provider_startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
     provider_startup_error: std::sync::Mutex<Option<String>>,
+    /// Retain the one background check of the inherited model settings against the catalog.
+    inherited_model_resolution: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     goal_max_turns: u32,
     task_controller: Arc<crate::task::SessionTaskController>,
     coordinator: Arc<SessionCoordinator>,
@@ -1514,18 +1518,8 @@ impl SessionController {
     async fn new(mut broker: HarnessBroker) -> Result<Arc<Self>> {
         let observer = broker.observer();
         let session_id = observer.session_id().to_owned();
-        let started = Instant::now();
-        tracing::info!(target: "forge::harness", event_name = "session.startup.started",
-            session_id, phase = "model_validation");
-        let result = tracing::Instrument::instrument(
-            broker.resolve_inherited_model_settings(),
-            tracing::info_span!("session_startup", session_id = session_id.as_str()),
-        )
-        .await;
-        tracing::info!(target: "forge::harness", event_name = "session.startup.phase",
-            session_id, phase = "model_validation", success = result.is_ok(),
-            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
-        result?;
+        // The inherited model settings are checked against the catalog after the open, in
+        // `resolve_inherited_model_settings`, because a slow model list must not hold the open.
         // Recovery leaves an exchange interrupted by host loss finalizing; capture its closing
         // checkpoint before the first snapshot, so no client observes it as still saving.
         let started = Instant::now();
@@ -1562,6 +1556,7 @@ impl SessionController {
             questions: broker.questions.clone(),
             provider_startup: Mutex::new(None),
             provider_startup_error: std::sync::Mutex::new(None),
+            inherited_model_resolution: std::sync::Mutex::new(None),
             stopped_plan_acceptance: std::sync::Mutex::new(None),
             task_controller: broker.task_controller.clone(),
             goal_max_turns: broker.goal_max_turns,
@@ -1666,6 +1661,7 @@ impl SessionController {
         {
             task.abort();
         }
+        self.stop_inherited_model_resolution();
         self.input_stopping.store(true, Ordering::Release);
         self.coordinator.submissions.changed.notify_one();
         self.plan_review.close_all()?;
@@ -2232,11 +2228,12 @@ impl SessionControllerRegistry {
         {
             return Ok(());
         }
-        broker
-            .complete_provider_fork(Err(
-                "provider fork preparation was interrupted before this broker resumed".into(),
-            ))
-            .map(drop)
+        broker.complete_provider_fork(Err(
+            "provider fork preparation was interrupted before this broker resumed".into(),
+        ))?;
+        // The controller's status was drawn while the fork still read as preparing; no editor
+        // has attached to it yet, so redrawing it is enough.
+        broker.provider_fork_status_events().map(drop)
     }
 
     /// Queue provider-bound child work until its native fork reaches durable readiness.
@@ -2301,17 +2298,35 @@ impl SessionControllerRegistry {
                         .write()
                         .await
                         .insert(session_id.to_owned(), Arc::clone(&gate));
-                    let provider_request = controller.broker.lock().await.retry_provider_fork();
+                    // The retry reopens the fork, so the status names the preparation the input
+                    // now waits on before the attempt starts.
+                    let provider_request = {
+                        let mut broker = controller.broker.lock().await;
+                        broker.retry_provider_fork().and_then(|provider_request| {
+                            let status_events = match provider_request {
+                                Some(_) => broker.provider_fork_status_events()?,
+                                None => Vec::new(),
+                            };
+                            Ok(provider_request.map(|request| (request, status_events)))
+                        })
+                    };
                     match provider_request {
-                        Ok(Some(provider_request)) => spawn_provider_fork(
-                            self,
-                            &mut fork_task,
-                            Arc::clone(controller),
-                            Arc::clone(&gate),
-                            provider_request,
-                            None,
-                            message_sink.clone(),
-                        ),
+                        Ok(Some((provider_request, status_events))) => {
+                            for event in status_events {
+                                // A closed editor connection leaves nothing to show the row to;
+                                // the attempt still runs for the input that waits on it.
+                                let _ = message_sink.send_event(event).await;
+                            }
+                            spawn_provider_fork(
+                                self,
+                                &mut fork_task,
+                                Arc::clone(controller),
+                                Arc::clone(&gate),
+                                provider_request,
+                                None,
+                                message_sink.clone(),
+                            )
+                        }
                         Ok(None) => {
                             self.provider_fork_by_id.write().await.remove(session_id);
                             return Ok(());
@@ -2396,15 +2411,31 @@ fn spawn_provider_fork(
             let _ = announcement.await;
         }
         let mut readiness = result.as_ref().map(|_| ()).map_err(ToOwned::to_owned);
-        let completion = child_controller
-            .broker
-            .lock()
-            .await
-            .complete_provider_fork(result);
+        // The status that no longer names the preparation follows the outcome under the same
+        // lock, so no turn's publication falls between them. A status that cannot be redrawn
+        // leaves the committed outcome standing and is recorded instead.
+        let completion = {
+            let mut broker = child_controller.broker.lock().await;
+            broker.complete_provider_fork(result).map(|event| {
+                let mut events = vec![event];
+                match broker.provider_fork_status_events() {
+                    Ok(status_events) => events.extend(status_events),
+                    Err(error) => child_controller.trace.record(
+                        &child_session_id,
+                        "service.fork.status_failed",
+                        json!({ "error": format!("{error:#}") }),
+                    ),
+                }
+                events
+            })
+        };
         match completion {
-            Ok(event) => {
-                if let Err(error) = message_sink.send_event(event).await {
-                    readiness = Err(format!("deliver provider fork outcome: {error:#}"));
+            Ok(events) => {
+                for event in events {
+                    if let Err(error) = message_sink.send_event(event).await {
+                        readiness = Err(format!("deliver provider fork outcome: {error:#}"));
+                        break;
+                    }
                 }
             }
             Err(error) => {

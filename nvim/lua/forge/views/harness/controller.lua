@@ -48,41 +48,46 @@ local function applied_setting(state, field)
   return (state.session and state.session[field]) or config.options.harness[field]
 end
 
----List the model, thinking, and speed changes that wait for existing work, in the order the host
----applies them. A change sent while the owner works waits for that work to stop and restart, and
----changes apply in the order they were sent. A queued `/model` entry applies only at its hand-off,
----after every change already sent. An idle change applies at once and is not listed, and a change
----sent for another session or to a host that has since been replaced no longer applies here.
+---List the model, thinking, and speed changes the host has not applied yet, in the order it
+---applies them, each marked `waiting` when existing work holds it back. Changes apply in the order
+---they were sent. One sent while a turn runs waits for that turn to stop and restart, and so does
+---every change sent after it. A queued `/model` entry applies only at its hand-off, after every
+---change already sent. An idle change applies within the host's own validation and is listed
+---without `waiting`. A change sent for another session or to a host that has since been replaced
+---no longer applies here.
 ---@param state table
----@return table[]
-local function waiting_configuration_list(state)
-  local change_list = {}
+---@return { change: table, waiting: boolean }[]
+local function pending_configuration_list(state)
+  local pending_list = {}
   for _, request in ipairs(state.configuration_requests or {}) do
-    if request.waiting and request.session_id == (state.session and state.session.id)
+    if request.session_id == (state.session and state.session.id)
       and request.generation == client.host_get_generation() then
-      change_list[#change_list + 1] = request.change
+      pending_list[#pending_list + 1] = { change = request.change, waiting = request.waiting == true }
     end
   end
   for _, group in ipairs({ state.pending_handoff, state.pending_submit, state.queue }) do
     for _, entry in ipairs(group or {}) do
-      if type(entry.config) == "table" then change_list[#change_list + 1] = entry.config end
+      if type(entry.config) == "table" then pending_list[#pending_list + 1] = { change = entry.config, waiting = true } end
     end
   end
-  return change_list
+  return pending_list
 end
 
----Get the model, thinking, and speed the session will use once every waiting change applies.
----A model change without a thinking level takes that model's default, as the host applies it.
+---Get the model, thinking, and speed the session will use once every pending change applies, and
+---whether any of them waits for existing work. A model change without a thinking level takes that
+---model's default, as the host applies it.
 ---@param state table
----@return { model: string, effort: string, service_tier: string }
+---@return { model: string, effort: string, service_tier: string, waiting: boolean }
 local function selected_settings(state)
   local selected = {
     model = applied_setting(state, "model"),
     effort = applied_setting(state, "effort"),
     service_tier = applied_setting(state, "service_tier"),
+    waiting = false,
   }
   local catalog = state.session and state.model_provider == state.session.provider and state.model_list or nil
-  for _, change in ipairs(waiting_configuration_list(state)) do
+  for _, pending in ipairs(pending_configuration_list(state)) do
+    local change = pending.change
     if type(change.model) == "string" and change.model ~= selected.model then
       selected.model = change.model
       local model = require("forge.views.harness.model_options").find(catalog, change.model)
@@ -90,6 +95,7 @@ local function selected_settings(state)
     end
     if type(change.effort) == "string" then selected.effort = change.effort end
     if type(change.service_tier) == "string" then selected.service_tier = change.service_tier end
+    selected.waiting = selected.waiting or pending.waiting
   end
   return selected
 end
@@ -101,22 +107,31 @@ local function selected_setting(state, field)
   return selected_settings(state)[field]
 end
 
----Parse model configuration separately from its optional queued prompt.
-local function model_command(text)
-  if not text:match("^/model%s") then return nil end
-  local model, remainder = text:match("^/model%s+(%S+)%s*(.*)$")
-  if not model then return nil end
-  local effort, prompt = remainder:match("^(%S+)%s*(.*)$")
-  if effort then
-    local known, resolved = effort == "default", false
-    for _, candidate in ipairs(session.harness.model_list or {}) do
-      if candidate.id == model or (model == "default" and candidate.is_default) then
-        resolved = true
-        known = known or vim.tbl_contains(candidate.reasoning or {}, effort)
-      end
-    end
-    if resolved and not known then return nil, nil, "Unknown reasoning effort: " .. effort end
+---Get the model catalog loaded for the session's own provider, or nil while none is loaded.
+---@param state table
+---@return table[]?
+local function loaded_model_catalog(state)
+  if state.session and state.model_provider == state.session.provider and type(state.model_list) == "table" then
+    return state.model_list
   end
+end
+
+---Parse model configuration separately from its optional queued prompt. With a catalog, the model
+---is resolved by id or display label (see `model_options.resolve_command`); without one, the first
+---word is taken as the model id, the next as its thinking level, and the host validates both.
+---@param text string
+---@param models? table[] The catalog to resolve against; defaults to the session's loaded catalog.
+---@return { model: string, effort: string? }? next_config
+---@return string? prompt
+---@return string? failure
+local function model_command(text, models)
+  if not text:match("^/model%s") then return nil end
+  local arguments = text:match("^/model%s+(.*)$")
+  if not arguments or not arguments:match("%S") then return nil end
+  models = models or loaded_model_catalog(session.harness)
+  if models then return require("forge.views.harness.model_options").resolve_command(models, arguments, true) end
+  local model, remainder = arguments:match("^(%S+)%s*(.*)$")
+  local effort, prompt = remainder:match("^(%S+)%s*(.*)$")
   return { model = model, effort = effort }, prompt or ""
 end
 
@@ -266,10 +281,11 @@ local function status_text()
   local effort = model_options.thinking(model_options.find(model_catalog, selected.model), selected.effort)
   local tier = selected.service_tier
   local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
-  -- Selected values that differ from the applied ones still wait for existing work.
-  local waiting = selected.model ~= configured_model
+  -- Selected values that differ from the applied ones and wait for existing work carry the marker;
+  -- an idle change shows its value at once, while the host validates and applies it.
+  local waiting = selected.waiting and (selected.model ~= configured_model
     or selected.effort ~= applied_setting(state, "effort")
-    or tier ~= applied_setting(state, "service_tier")
+    or tier ~= applied_setting(state, "service_tier"))
   local model_text = ("%s %s%s"):format(model, effort, waiting and "*" or "")
   local segment_list = {}
   local function append_status(text, group)
@@ -318,7 +334,7 @@ local function status_text()
   elseif activity.unavailable_reason(state) then
     append_status("Session unavailable: " .. activity.unavailable_reason(state), "ForgeHarnessGoal")
   elseif current_task then
-    append_status(task_control.label(current_task, activity.turn_pending(state)), "ForgeHarnessGoal")
+    append_status(task_control.label(current_task, activity.turn_awaited(state)), "ForgeHarnessGoal")
   end
   if state.configuration_error then
     append_status("Settings rejected: " .. state.configuration_error:gsub("%s+", " "), "ForgeHarnessToolFailure")
@@ -366,20 +382,41 @@ function M.refresh_winbar()
   render_status_hint(state)
 end
 
----Get the resume hint for the queued follow-up heading while delivery is paused and idle.
+---Report whether the retry key sends a queued `entry` again.
 ---
----An interrupt pauses the queue, and nothing sends its messages until the user resumes it. The
----heading names the retry key, which resumes a paused queue that holds no failed message.
+---The key retries a message the host marked failed or uncertain and a draft the host rejected. A
+---draft still being sent is not retried, because its submission is in flight.
+---@param entry table
+---@return boolean
+function M.retries(entry)
+  if entry.local_only then return entry.draft_state ~= "pending" end
+  return entry.delivery == "failed" or entry.delivery == "unknown"
+end
+
+---Get the hint for the queued follow-up heading while nothing sends the queue's messages.
+---
+---An interrupt or a failed message pauses the queue, and nothing sends its messages until the user
+---resumes it, so every frame says so, also while the stop, a compaction, or a rollback runs. A
+---failed message also holds the follow-ups behind it after a newer prompt resumed delivery. The
+---heading names the retry key, which retries the first failed message and otherwise resumes.
 ---@param state table
 ---@return string? hint Absent while delivery runs; empty when the retry key is unbound.
 function M.paused_queue_hint(state)
-  -- A rollback keeps the queue paused, so its heading stays while the owner reads busy.
-  if not (state.input and state.input.suspended) or #(state.queue or {}) == 0
-    or (activity.busy(state) and not state.restore_applying) then
-    return nil
+  local queue = state.queue or {}
+  local retry_index, held_by_failure
+  for index, entry in ipairs(queue) do
+    if M.retries(entry) then
+      retry_index = retry_index or index
+    elseif retry_index then
+      held_by_failure = true
+      break
+    end
   end
+  local suspended = state.input and state.input.suspended and #queue > 0
+  if not (suspended or held_by_failure) then return nil end
   local key = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")[1]
-  return key and (key .. " resume") or ""
+  if not key then return "" end
+  return key .. (retry_index and " retry" or " resume")
 end
 
 ---@return integer?
@@ -454,7 +491,8 @@ local function render()
     startup_trace = state.startup_trace,
     capability = function() return state.capability end,
     session_id = state.session.id, transcript_buffer = state.transcript_buf, composer_buffer = state.composer_buf,
-    transcript_window = state.transcript_win, composer_window = state.composer_win,
+    -- A presentation rebuilt behind the view binds the composer once the retired one releases it.
+    transcript_window = state.transcript_win, composer_window = not state.pending_rebuild and state.composer_win or nil,
     is_alive = function() return vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf) end,
     notice = function(message) if owns_presentation() then notifications.error(message, "ForgeHarness") end end,
     on_update = function()
@@ -506,6 +544,7 @@ end
 
 ---@param state table
 local function reconcile_approval_presentation(state)
+  if #(state.approval or {}) == 0 then M.forget_held_popup(state, "approval") end
   if state.dismissed_approval_id and not vim.iter(state.approval or {}):any(function(approval)
     return approval.request_id == state.dismissed_approval_id
   end) then state.dismissed_approval_id = nil end
@@ -536,14 +575,16 @@ end
 
 ---Run `action` with `target` as the active Harness state and restore the previous selection, even
 ---when `action` raises. Callbacks that complete for a background tab use this so that code reading
----the active state acts on the tab that issued the request.
+---the active state acts on the tab that issued the request. An action that selects a session for
+---the user, as a session switch completing in this scope does, leaves that session active.
 ---@param target table
 ---@param action fun()
 function M.with_state(target, action)
-  local active_state = session.harness
+  local active_state, selection = session.harness, session.harness_selection()
   session.activate_harness(target)
   local ok, failure = xpcall(action, debug.traceback)
-  if session.harness == target and active_state ~= target then session.activate_harness(active_state) end
+  if session.harness_selection() ~= selection then session.activate_harness(session.selected_harness())
+  elseif session.harness == target and active_state ~= target then session.activate_harness(active_state) end
   if not ok then error(failure, 0) end
 end
 
@@ -746,7 +787,10 @@ local function on_event(event, payload)
     if payload.host_generation ~= nil and payload.host_generation ~= client.host_get_generation() then return end
     if payload.revision < (state.timeline_revision or 0) then return end
     state.timeline_revision = payload.revision
-    if payload.status then state.status = payload.status end
+    if payload.status then
+      state.status = payload.status
+      require("forge.views.harness.input_state").status_changed(state)
+    end
     if type(payload.checks_running) == "boolean" then
       local checks_finished = state.checks_running and not payload.checks_running
       state.checks_running = payload.checks_running
@@ -919,6 +963,14 @@ local held_popup_list = {}
 local held_popup_order = { approval = 1, plan_question = 2, questions = 3 }
 local held_popup_label = { approval = "Approval", plan_question = "Question", questions = "Question" }
 
+---Identify the notice that announces a held popup, so it leaves when the popup opens or its
+---request ends instead of at the notifier's timeout.
+---@param entry {state: table, kind: string}
+---@return string
+local function held_notice_id(entry)
+  return ("forge-harness-held-%s-%s"):format(entry.kind, tostring(entry.state))
+end
+
 ---@return boolean typing Whether the editor is in a mode that takes typed text.
 function M.typing_mode()
   local mode = vim.api.nvim_get_mode().mode:sub(1, 1)
@@ -940,6 +992,7 @@ function M.release_held_popups()
   held_popup_list = vim.tbl_filter(held_view_in_current_tab, held_popup_list)
   local entry = table.remove(held_popup_list, 1)
   if not entry then return end
+  notifications.withdraw(held_notice_id(entry))
   picker.present_from(entry.origin, entry.present)
   if #held_popup_list > 0 then
     vim.schedule(function() picker.when_idle(M.release_held_popups) end)
@@ -962,12 +1015,26 @@ function M.hold_while_typing(state, kind, present)
   for _, entry in ipairs(held_popup_list) do
     if entry.state == state and entry.kind == kind then entry.present = present return true end
   end
-  held_popup_list[#held_popup_list + 1] = { state = state, kind = kind, present = present,
+  local entry = { state = state, kind = kind, present = present,
     origin = { win = vim.api.nvim_get_current_win(), mode = vim.fn.mode(1) } }
+  held_popup_list[#held_popup_list + 1] = entry
   table.sort(held_popup_list, function(left, right) return held_popup_order[left.kind] < held_popup_order[right.kind] end)
   local key = keymaps.view_keys_for("harness", "reopen_question")[1]
-  notifications.info(held_popup_label[kind] .. " waiting" .. (key and (" · " .. key) or ""), "ForgeHarness")
+  notifications.info(held_popup_label[kind] .. " waiting" .. (key and (" · " .. key) or ""), "ForgeHarness",
+    held_notice_id(entry))
   return true
+end
+
+---Forget the `kind` popup held for `state` and withdraw its notice, because its request was
+---resolved or cancelled while the user typed.
+---@param state table
+---@param kind "approval"|"plan_question"|"questions"
+function M.forget_held_popup(state, kind)
+  held_popup_list = vim.tbl_filter(function(entry)
+    if entry.state ~= state or entry.kind ~= kind then return true end
+    notifications.withdraw(held_notice_id(entry))
+    return false
+  end, held_popup_list)
 end
 
 ---Forget the popups held for `state`, which the user opened another way.
@@ -978,6 +1045,7 @@ local function release_held_for(state)
   held_popup_list = vim.tbl_filter(function(entry)
     if entry.state ~= state then return true end
     origin = origin or entry.origin
+    notifications.withdraw(held_notice_id(entry))
     return false
   end, held_popup_list)
   return origin
@@ -1166,8 +1234,10 @@ end
 ---@param state table
 ---@return boolean
 function M.holds_question(state)
+  -- The questions snapshot also keeps answered and withdrawn questions as history; only a pending
+  -- one awaits the user.
   return #(state.approval or {}) > 0
-    or (state.questions ~= nil and #(state.questions.questions or {}) > 0)
+    or require("forge.views.harness.questions").count(state) > 0
     or (state.active_elicitation ~= nil and state.active_elicitation.elicitation ~= nil)
 end
 
@@ -1184,7 +1254,9 @@ function M.reopen_question(synchronized)
     M.present_approval(true)
     return
   end
-  if state.questions and #(state.questions.questions or {}) > 0 then
+  -- Only a pending question takes this branch: the questions picker opens nothing for history
+  -- alone, so a resolved question must not hide the plan question below.
+  if require("forge.views.harness.questions").count(state) > 0 then
     require("forge.views.harness.questions").open(state, picker_host(state))
     return
   end
@@ -1689,7 +1761,8 @@ end
 ---Open interaction history before choosing a rollback scope.
 ---
 ---The list offers every current exchange, running ones included: confirming a rollback collects
----a running turn first, and a paused goal's newest exchange stays `running` while it is parked.
+---a running turn first. A paused task's newest exchange stays `running` in history while it is
+---parked, and the host marks it `paused`, which the list shows instead.
 ---@param recovery? table restore journal status from `session.exchange.recovery`
 ---@param refused fun() puts the `/undo` command back when no list opens
 local function open_exchange_undo_picker(recovery, refused)
@@ -1719,7 +1792,8 @@ local function open_exchange_undo_picker(recovery, refused)
         -- The host names a rollback it cannot perform, so the option says so before any choice.
         local unavailable = type(interaction.rollback_unavailable) == "string" and interaction.rollback_unavailable
           or nil
-        local detail = tostring(interaction.state) .. " · " .. (prompt ~= "" and prompt or "[empty prompt]")
+        local listed_state = interaction.paused == true and "paused" or tostring(interaction.state)
+        local detail = listed_state .. " · " .. (prompt ~= "" and prompt or "[empty prompt]")
         option_list[#option_list + 1] = {
           id = interaction.id,
           label = "Exchange " .. tostring(interaction.ordinal) .. (unavailable and " · unavailable" or ""),
@@ -1850,7 +1924,8 @@ end
 ---@param action string
 ---@param run_id string?
 ---@param message string?
-function M.agent_action(action, run_id, message)
+---@param on_result? fun(failure_message: string?) Receives why the host could not carry the action out, or nil.
+function M.agent_action(action, run_id, message, on_result)
   local state = harness_state()
   local params = { target = run_id, message = message }
   if action == "tools" then M.configure({ subagent_tools = state.subagent_tools ~= true }) return end
@@ -1869,13 +1944,19 @@ function M.agent_action(action, run_id, message)
       vim.api.nvim_buf_get_lines(buffer, 0, -1, false), attachment.capture(buffer).attachments,
       function() return state.composer_buf == buffer and not state.queue_edit end)
   end
-  client.request({ session_id = state.session.id, method = method, params = params }, function(_, failure)
+  client.request({ session_id = state.session.id, method = method, params = params }, function(result, failure)
     if failure then
       restore_draft()
       notifications.error(failure, "Harness child " .. action)
+      if on_result then on_result(type(failure) == "table" and failure.message or tostring(failure)) end
       return
     end
+    -- An interrupt request succeeds as a whole and reports each child's outcome separately, so
+    -- a child that could not be interrupted is named here rather than passing silently.
+    local target_failure = require("forge.views.harness.agent_catalog").interrupt_failure(result)
+    if target_failure then notifications.warn(target_failure, "Harness child " .. action) end
     synchronize_state(nil, state)
+    if on_result then on_result(target_failure) end
   end)
 end
 
@@ -2050,6 +2131,13 @@ end
 ---@param state ForgeHarnessPresentationState
 ---@return boolean
 local function admit_composer_input(state)
+  if state.switching_provider then
+    -- The host this view will run on is still starting, whether for a provider switch or for a
+    -- view returning to its own provider.
+    notifications.warn((state.switch_notice or "Switching the Harness provider")
+      .. ". The draft stays in the composer; submit it again once the switch finishes.", "ForgeHarness")
+    return false
+  end
   if state.host_error then
     -- A view whose host stopped or now serves another provider comes back on its own submit; the
     -- draft stays in the composer until the user submits it to the returned session.
@@ -2062,7 +2150,6 @@ local function admit_composer_input(state)
     M.report_uninitialized(state, "ForgeHarness")
     return false
   end
-  if state.switching_provider then return false end
   return true
 end
 
@@ -2078,10 +2165,10 @@ end
 
 function M.submit()
   local state = harness_state()
-  if not admit_composer_input(state) then return end
   -- Enter submitted instead of accepting a completion, so the menu closes on every outcome,
-  -- including a rejected command that leaves its text in the composer.
+  -- including a refused or rejected submit that leaves its text in the composer.
   dismiss_composer_completion(state.composer_buf)
+  if not admit_composer_input(state) then return end
   require("forge.text").invalidate(state.composer_buf)
   if not attachments_ready(state.composer_buf) then return end
   state.execution_notice = nil
@@ -2353,19 +2440,38 @@ function M.submit()
     require("forge.views.harness").new_session(vim.trim(new_name))
     return
   end
-  local model, model_effort = text:match("^/model%s+(%S+)%s+(%S+)$")
-  if not model then model = text:match("^/model%s+(%S+)$") end
-  if model then
-    set_composer_text(state.composer_buf, "")
+  local model_arguments = text:match("^/model%s+(%S.*)$")
+  if model_arguments then
     if state.capability.model_selection ~= true then
+      set_composer_text(state.composer_buf, "")
       notifications.warn("The current provider does not support model selection", "ForgeHarness")
       return
     end
-    if model_effort and state.capability.effort_selection ~= true then
-      notifications.warn("The current provider does not support reasoning effort selection", "ForgeHarness")
-      return
-    end
-    M.configure({ model = model, effort = model_effort })
+    local session_id = state.session.id
+    -- The catalog resolves the typed id or display name before anything is sent, so a name the
+    -- provider does not offer is refused here and never enters the winbar's pending settings.
+    require("forge.views.harness.provider_catalog").models(false, function(models, catalog_failure)
+      if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
+      if catalog_failure then
+        report_configuration_error("the model catalog is unavailable: " .. catalog_failure)
+        return
+      end
+      local next_config, _, failure = require("forge.views.harness.model_options").resolve_command(models or {},
+        model_arguments, false)
+      if not next_config then report_configuration_error(assert(failure)) return end
+      if composer_text(state.composer_buf) == text then set_composer_text(state.composer_buf, "") end
+      if next_config.effort and state.capability.effort_selection ~= true then
+        notifications.warn("The current provider does not support reasoning effort selection", "ForgeHarness")
+        return
+      end
+      local selected = selected_settings(state)
+      if next_config.model == selected.model and (next_config.effort == nil or next_config.effort == selected.effort) then
+        notifications.info(("The session already uses %s%s; nothing changed."):format(next_config.model,
+          next_config.effort and (" with " .. next_config.effort .. " effort") or ""), "ForgeHarness")
+        return
+      end
+      M.configure(next_config)
+    end)
     return
   end
   local effort = text:match("^/effort%s+(%S+)$")
@@ -2440,6 +2546,8 @@ end
 ---Queue a follow-up independently of active waits and the selected child timeline.
 function M.queue_submit()
   local state = harness_state()
+  -- As in `submit`, the menu closes on every outcome, including a refusal that keeps the draft.
+  dismiss_composer_completion(state.composer_buf)
   if not admit_composer_input(state) then return end
   if not attachments_ready(state.composer_buf) then return end
   state.execution_notice = nil
@@ -2457,7 +2565,6 @@ function M.queue_submit()
   if failure then report_configuration_error(failure) return end
   prompt_history.record(text)
   local attachments = attachment.capture(state.composer_buf).attachments
-  dismiss_composer_completion(state.composer_buf)
   local restore = require("forge.views.harness.composer_draft").take(state.composer_buf,
     vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), attachments, function() return not state.queue_edit end)
   input_state.submit(state, prompt or text, attachments, "queue", captured_config, nil, restore)
@@ -2719,8 +2826,9 @@ end
 function M.select_provider()
   local state = harness_state()
   local harness = require("forge.views.harness")
-  if not harness.provider_switch_available() then
-    notifications.warn("Finish or cancel pending work before switching providers", "Harness provider")
+  local refusal = harness.provider_switch_refusal()
+  if refusal then
+    notifications.warn(refusal, "Harness provider")
     return
   end
   local source_session_id = state.session.id
@@ -2817,19 +2925,24 @@ configure_now = function(next_config, completed)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
   -- The host answers once the change is applied, after any running turn stopped and restarted on
-  -- it. Until then the winbar shows the change with its waiting marker; an idle change applies at
-  -- once and shows none.
-  local request = { change = vim.deepcopy(next_config), waiting = activity.busy(state),
+  -- it. Until then the winbar shows the change, with the waiting marker when a turn holds it back.
+  -- The host applies changes in order, so a change sent behind a waiting one waits too. An idle
+  -- change shows no marker even while the host's owner reads `working` to validate it.
+  local waiting = activity.turn_pending(state)
+  for _, earlier in ipairs(state.configuration_requests or {}) do
+    if earlier.waiting and earlier.session_id == session_id and earlier.generation == generation then waiting = true end
+  end
+  local request = { change = vim.deepcopy(next_config), waiting = waiting,
     session_id = session_id, generation = generation }
   state.configuration_requests = state.configuration_requests or {}
   table.insert(state.configuration_requests, request)
-  if request.waiting then M.refresh_winbar() end
+  M.refresh_winbar()
   client.request({ session_id = session_id, method = "session.configure", params = vim.deepcopy(next_config) }, function(_, failure)
     for index, candidate in ipairs(state.configuration_requests or {}) do
       if candidate == request then table.remove(state.configuration_requests, index) break end
     end
     if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then
-      if request.waiting and harness_state() == state then M.refresh_winbar() end
+      if harness_state() == state then M.refresh_winbar() end
       if completed then completed(false) end
       return
     end
@@ -2918,10 +3031,14 @@ function M.command_set()
     presentation.selection.start()
   end)
   -- Keys that read the draft wait for any paste that preceded them in the terminal stream.
+  -- The queue control is captured at the key, so a send pressed before an interrupt that overtakes
+  -- its deferred step still follows the pause the user saw rather than that interrupt.
   local function after_paste(action)
     return require("forge.views.harness.composer_draft").after_pending_paste(function()
       return harness_state().composer_buf
-    end, action)
+    end, function(fence)
+      input_state.under_fence(harness_state(), fence, action)
+    end, function() return input_state.control_fence(harness_state()) end)
   end
   command_set.register(set, "edit_queued", after_paste(function() M.edit_queued(-1) end))
   command_set.register(set, "next_queued", after_paste(function() M.edit_queued(1) end))
@@ -2935,7 +3052,7 @@ function M.command_set()
       return
     end
     for _, entry in ipairs(state.queue or {}) do
-      if entry.local_only or entry.delivery == "failed" or entry.delivery == "unknown" then
+      if M.retries(entry) then
         input_state.retry(state, entry)
         return
       end

@@ -320,32 +320,51 @@ impl SessionTaskController {
 
     /// Replace rollback history and settle the task in one durable transaction.
     ///
-    /// A task that began before the retained history ends keeps its identity and is paused, so
-    /// nothing resumes it on the user's behalf. A task whose start the rollback removes is cleared
-    /// without a finish row: its lifecycle leaves the timeline together with the rolled-back
-    /// interactions.
+    /// `history` is the session's exchange history before the rollback, and `roots` the
+    /// exchanges it removes. A task that began before the retained history ends keeps its
+    /// identity; it is paused only when it would otherwise continue by itself, so nothing resumes
+    /// it on the user's behalf, while a task waiting for the user, such as a plan in review,
+    /// stays exactly as it was. A task whose start the rollback removes is cleared without a
+    /// finish row: its lifecycle leaves the timeline together with the rolled-back interactions.
+    /// Every plan whose start the rollback removes leaves the session's artifacts as cancelled,
+    /// whatever phase it reached, including an accepted plan whose execution is the current task.
     pub(crate) fn commit_rollback(
         &self,
         store: &mut SqliteStore,
         expected: Option<&TaskRevision>,
         replacement: &crate::session::HarnessSession,
+        history: &[crate::exchange::Exchange],
         roots: &[String],
-        keeps_task: bool,
         now_ms: i64,
     ) -> Result<()> {
         ensure!(
             replacement.id == self.session_id,
             "rollback belongs to another session"
         );
+        let keeps = |created_at_ms| {
+            crate::exchange::rollback::rollback_keeps_task(history, roots, created_at_ms)
+        };
+        let removed_plan_list = store
+            .list_plan(&self.session_id)?
+            .into_iter()
+            .filter(|plan| {
+                !matches!(
+                    plan.state,
+                    crate::plan::PlanState::Cancelled | crate::plan::PlanState::Rejected
+                ) && !keeps(plan.created_at_ms)
+            })
+            .collect::<Vec<_>>();
         let rollback = store.prepare_rollback(replacement, roots)?;
         store
             .commit_task_effects(&self.session_id, expected, now_ms, |active| {
-                let mut effects = if keeps_task
-                    && active
-                        .as_ref()
-                        .is_some_and(|task| !task.status().terminal())
-                {
-                    Self::apply_change(active, TaskChange::Pause, now_ms)?;
+                let kept_status = active
+                    .as_ref()
+                    .filter(|task| !task.status().terminal() && keeps(task.created_at_ms))
+                    .map(Task::status);
+                let mut effects = if let Some(status) = kept_status {
+                    if status == TaskStatus::Running {
+                        Self::apply_change(active, TaskChange::Pause, now_ms)?;
+                    }
                     crate::storage::TaskEffects::default()
                 } else {
                     let mut effects = clear_effect(&self.session_id, active.as_ref(), None, now_ms);
@@ -353,6 +372,14 @@ impl SessionTaskController {
                     *active = None;
                     effects
                 };
+                for mut plan in removed_plan_list {
+                    if effects.plan.iter().any(|written| written.id == plan.id) {
+                        continue;
+                    }
+                    plan.state = crate::plan::PlanState::Cancelled;
+                    plan.updated_at_ms = now_ms;
+                    effects.plan.push(plan);
+                }
                 effects.rollback = Some(Box::new(rollback));
                 Ok(((), effects))
             })?

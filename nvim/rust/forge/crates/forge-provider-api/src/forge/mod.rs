@@ -164,6 +164,18 @@ pub fn system_instructions_block(text: &str) -> String {
     )
 }
 
+/// Report whether a conversation message's text starts with a Harness-authored block.
+///
+/// Every block this module renders opens a message, and [`neutralize`] escapes the tag in text
+/// the host did not author, so a message that opens with the tag carries Harness input, such as
+/// child results, a notice, or an instruction, rather than words a person typed.
+pub fn opens_with_block(text: &str) -> bool {
+    text.trim_start()
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_prefix(BLOCK_TAG))
+        .is_some_and(|rest| rest.starts_with('>'))
+}
+
 /// Neutralize `<forge>` markers in text the host did not author.
 ///
 /// Only the exact element name is escaped, so tags that merely start with `forge`, such as

@@ -174,6 +174,148 @@ async fn execute(
     Ok(())
 }
 
+/// A provider whose model list answers late does not hold a session's open, which a provider
+/// switch waits on: the controller exists while the catalog query still waits, and the late
+/// catalog then corrects an inherited thinking level the model does not offer.
+#[tokio::test(start_paused = true)]
+async fn session_open_does_not_wait_for_a_slow_model_list() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().unwrap(),
+    )
+    .unwrap();
+    let (answer, answered) = tokio::sync::watch::channel(false);
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |_request, _sink, _start, _cancelled| async move {
+            Err(crate::provider::ProviderError::Cancelled)
+        },
+    )
+    .with_models(vec![serde_json::from_value(json!({
+        "id":"fixture-model", "reasoning":["low","medium","high"], "default_reasoning":"medium",
+        "context_window":[], "vision":false, "is_default":true,
+    }))?])
+    .with_model_list_answer(move || {
+        let mut answered = answered.clone();
+        async move {
+            answered
+                .wait_for(|answered| *answered)
+                .await
+                .map_err(|_| crate::provider::ProviderError::Cancelled)?;
+            Ok(())
+        }
+    });
+    let request = initialize(&root, "mock");
+    let data_root = std::path::PathBuf::from(&request.data_root);
+    crate::storage::layout::prepare(&data_root)?;
+    crate::settings::SettingsStore::open(&data_root)?.save_provider(
+        0,
+        "mock",
+        &json!({"effort":"xhigh"}),
+    )?;
+    let mut broker = crate::broker::HarnessBroker::initialize(request)?;
+    let provider =
+        crate::provider::test_support::ProviderTestSession::from_native_with_permissions(
+            native,
+            broker.permission_coordinator(),
+        )?;
+    broker.set_provider_for_test(provider.provider_handle());
+    let controller = super::super::SessionController::new(broker).await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    let scenario = async {
+        let opened = controller.observer.snapshot()?.session;
+        anyhow::ensure!(
+            opened.effort == "xhigh",
+            "the open resolved the inherited level before the catalog answered: {}",
+            opened.effort
+        );
+        controller.start_provider(&sink).await;
+        answer.send_replace(true);
+        // The paused clock bounds a correction that never comes without waiting in real time.
+        tokio::time::timeout(Duration::from_secs(3600), async {
+            while controller.observer.snapshot()?.session.effort != "medium" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("the late catalog never corrected the inherited thinking level")??;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let teardown = super::approval_deadline::stop_controller(controller, provider, reader).await;
+    scenario?;
+    teardown
+}
+
+/// A thinking level chosen in a session is that workspace's default, never the global one: another
+/// workspace's new sessions keep the global provider default, this workspace's new sessions start
+/// at the session's choice, and a later explicit global edit is the newer default everywhere.
+#[tokio::test]
+async fn session_thinking_choice_stays_with_its_workspace() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (controller, provider, sink, reader) = permissions_fixture(&root).await?;
+    let scenario = async {
+        let session = controller.observer.snapshot()?.session;
+        let settings = || crate::settings::SettingsStore::open(&controller.data_root);
+        let revision = settings()?
+            .get(&session.workspace, "", &session.provider)?
+            .revision;
+        settings()?.save_provider(revision, &session.provider, &json!({"effort":"low"}))?;
+        execute(
+            &controller,
+            &sink,
+            "session.configure",
+            json!({"effort":"high"}),
+        )
+        .await?;
+        let global = settings()?
+            .get("another-workspace", "", &session.provider)?
+            .provider;
+        anyhow::ensure!(
+            global["effort"] == "low",
+            "a session's thinking choice changed the global provider default: {global}"
+        );
+        let new_session = || {
+            crate::broker::prepare_new_session(
+                &controller.data_root,
+                "service-test",
+                &session.provider,
+                false,
+                &session.id,
+                &json!({}),
+                1,
+            )
+        };
+        let same_workspace = new_session()?;
+        anyhow::ensure!(
+            same_workspace.effort == "high",
+            "a new session in the workspace starts at {} instead of its last confirmed level",
+            same_workspace.effort
+        );
+        let revision = settings()?
+            .get(&session.workspace, "", &session.provider)?
+            .revision;
+        settings()?.save_provider(revision, &session.provider, &json!({"effort":"medium"}))?;
+        let after_global_edit = new_session()?;
+        anyhow::ensure!(
+            after_global_edit.effort == "medium",
+            "a later global default edit was ignored: the new session starts at {}",
+            after_global_edit.effort
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let teardown = super::approval_deadline::stop_controller(controller, provider, reader).await;
+    scenario?;
+    teardown
+}
+
 /// The Permissions tab edits the current session, as the slash commands do, so the dialog's
 /// saved access agrees with the session's effective scope after mixing both.
 #[tokio::test]

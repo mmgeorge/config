@@ -16,6 +16,8 @@ local T = MiniTest.new_set({ hooks = isolation.hooks() })
 ---@field failures NotificationCapture
 ---@field generation fun(next?: integer): integer Read or replace the host generation.
 ---@field before_reply? fun() Runs before each host reply, at the points where the editor can redraw.
+---@field scope_replies? boolean Deliver each reply to a session request with that session's view
+---  active, as `forge.client` does, restoring the previous view unless the reply selected one.
 ---@field settled fun(state: table) Wait until the view's presentation is ready.
 ---@field create_session fun(id: string): table Open a session in its own tab with a real presentation.
 
@@ -76,7 +78,13 @@ local function native_host_fixture()
     else error("Unexpected native request: " .. method) end
     vim.schedule(function()
       if fixture.before_reply then fixture.before_reply() end
+      local session = require("forge.session")
+      local owner = fixture.scope_replies and request.session_id and session.harness_by_id[request.session_id]
+      if not owner then callback(result) return end
+      local active_state, selection = session.harness, session.harness_selection()
+      session.activate_harness(owner)
       callback(result)
+      if active_state ~= owner and session.harness_selection() == selection then session.activate_harness(active_state) end
     end)
   end
 
@@ -318,6 +326,70 @@ T["session_switch_never_labels_a_tab_with_a_session_id"] = function()
   fixture.failures:assert_none()
 end
 
+-- A view the host stopped serving keeps its last presentation on screen. When its session comes
+-- back on a new host, from a reconnect in place or from a provider switch that returns to it, the
+-- old presentation closed in place and cleared the transcript's decorations a host round trip
+-- before the new one rendered, so one frame drew the raw rows without their gutter markers.
+T["returning_view_shows_only_complete_views"] = function()
+  local session = require("forge.session")
+  local navigation = require("forge.views.harness.session_navigation")
+  local fixture = native_host_fixture()
+  local state = fixture.create_session("returning")
+  local tab, composer_window = state.timeline_tab, state.composer_win
+  local transcript_name = vim.api.nvim_buf_get_name(state.transcript_buf)
+  for _, reused_view in ipairs({ true, false }) do
+    local retired = state.presentation
+    local retired_buffer = state.transcript_buf
+    fixture.generation(fixture.generation() + 1)
+    local frame_list = {}
+    local function record_frame()
+      local frame = {}
+      for _, window in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+        local displayed = vim.api.nvim_win_get_buf(window)
+        if not vim.api.nvim_win_get_config(window).hide and displayed ~= state.composer_buf
+          and (displayed == retired_buffer or displayed == state.transcript_buf) then
+          local complete = false
+          for _, presentation in ipairs({ retired, state.presentation }) do
+            if presentation and presentation.transcript.buffer == displayed and presentation.ready
+              and not presentation.closed then complete = true end
+          end
+          frame[#frame + 1] = complete
+        end
+      end
+      frame_list[#frame_list + 1] = frame
+    end
+    fixture.before_reply = record_frame
+    session.select_harness(state)
+    vim.api.nvim_set_current_win(composer_window)
+    -- A reconnect activates the view it returns; a provider switch builds behind the view it leaves.
+    navigation.activate({ session = state.session }, { state = reused_view and state or nil, source_state = state,
+      interaction_mode = "reconcile", open_mode = "current", focus = true })
+    record_frame()
+    wait_until(function()
+      return state.presentation ~= retired and state.presentation and state.presentation.ready
+        and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win)
+        and not vim.api.nvim_win_get_config(state.transcript_win).hide
+    end, "the returning view did not show its new presentation")
+    fixture.before_reply = nil
+    record_frame()
+    assert(#frame_list > 2, "the return completed without host replies to observe")
+    for index, frame in ipairs(frame_list) do
+      assert(#frame == 1 and frame[1], ("frame %d showed an incomplete view (reused view %s): %s"):format(
+        index, tostring(reused_view), vim.inspect(frame_list)))
+    end
+    assert(retired.closed, "the returning view kept its old presentation")
+    assert(not vim.api.nvim_buf_is_valid(retired_buffer) or retired_buffer == state.transcript_buf,
+      "the returning view left its old transcript buffer behind")
+    eq(vim.api.nvim_buf_get_name(state.transcript_buf), transcript_name)
+    eq(vim.api.nvim_win_get_buf(state.transcript_win), state.transcript_buf)
+    eq({ state.timeline_tab, state.composer_win, vim.api.nvim_get_current_win() }, { tab, composer_window, composer_window })
+    eq(state.presentation.status_view.options.composer_window, composer_window)
+    eq(buffer.lines(state.composer_buf), { "returning draft", "λ" })
+    eq(session.harness, state)
+  end
+  fixture.failures:assert_none()
+end
+
 T["resume_targets_the_requesting_tab"] = function()
   local session = require("forge.session")
   local navigation = require("forge.views.harness.session_navigation")
@@ -467,14 +539,18 @@ T["new_session_leaves_no_placeholder_buffer"] = function()
   eq(vim.tbl_contains(name_list, "HarnessInput://created"), true)
 end
 
--- `/new` focuses the composer of a new tab, whose entry leaves Insert mode. `/clear` replaces the
--- session in the composer that already has focus, so no entry happened and the composer stayed in
--- Insert mode; both commands now leave the composer in Normal mode.
-T["clear_leaves_the_composer_in_normal_mode"] = function()
+---Start a child editor whose current tab shows a Harness view bound to `source_id`, with `<F2>`
+---in its composer running `/new` or `/clear` and the host's creation reply held in `_G.reply`.
+---The global Insert-mode `<C-s>` saves through `<C-o>`, as a user's save mapping does, so a
+---composer without Harness's own mappings would run it instead of submitting.
+---@param source_id string
+---@param open_mode "current"|"tab"
+local function new_session_child(source_id, open_mode)
   local child = MiniTest.new_child_neovim()
   child.start({ "-u", "NONE" })
   MiniTest.finally(function() pcall(child.stop) end)
   child.lua([[
+    local source_id, open_mode = ...
     vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
     require("forge.infra.config").setup({})
     local session = require("forge.session")
@@ -483,26 +559,63 @@ T["clear_leaves_the_composer_in_normal_mode"] = function()
     for _, name in ipairs({ "activate_snapshot", "attach", "attach_transcript", "refresh_winbar" }) do
       controller[name] = function() end
     end
+    _G.messages = {}
+    vim.notify = function(message) _G.messages[#_G.messages + 1] = message end
+    vim.keymap.set("i", "<C-s>", "<C-o>:let g:saved = 1<CR>")
     -- The host answers after the composer has returned to waiting for keys, as it does in use.
     require("forge.client").session_create = function(_, callback) _G.reply = callback end
     local source = session.harness
     source.transcript_buf, source.transcript_win, source.composer_buf, source.composer_win, source.timeline_tab =
-      layout.open("clear-source", "tab")
-    source.session = { id = "clear-source" }
-    session.register_harness("clear-source", source)
+      layout.open(source_id, "tab")
+    source.session = { id = source_id }
+    session.register_harness(source_id, source)
     session.select_harness(source)
     vim.api.nvim_set_current_win(source.composer_win)
     vim.keymap.set("i", "<F2>", function()
-      require("forge.views.harness").new_session(nil, { open_mode = "current" })
+      require("forge.views.harness").new_session(nil, { open_mode = open_mode })
     end, { buffer = source.composer_buf })
     _G.source = source
-  ]])
+  ]], { source_id, open_mode })
+  return child
+end
+
+-- `/clear` replaces the session in the composer that already has focus, so no focus entry leaves
+-- Insert mode; the command itself does, when it is submitted. The host's reply came seconds later
+-- and left Insert mode again, so a user who had started typing found later keys run as Normal-mode
+-- commands. The reply now keeps whatever mode the composer is in.
+T["clear_leaves_normal_mode_when_submitted_and_keeps_later_insert"] = function()
+  local child = new_session_child("clear-source", "current")
   child.type_keys("i", "<F2>")
-  eq(child.api.nvim_get_mode().mode, "i")
+  eq(child.api.nvim_get_mode().mode, "n")
+  child.type_keys("i", "next")
   child.lua([[_G.reply({ session = { id = "cleared", provider = "mock", model = "mock" } })]])
   eq(child.lua_get([[{ require("forge.session").harness_by_id.cleared == _G.source,
     vim.api.nvim_get_current_win() == _G.source.composer_win }]]), { true, true })
+  eq(child.api.nvim_get_mode().mode, "i")
+  eq(child.lua_get([[vim.api.nvim_buf_get_lines(_G.source.composer_buf, 0, -1, false)]]), { "next" })
+end
+
+-- `/new` draws its tab before the host creates the session, which took seconds under load. The
+-- tab's composer had none of Harness's mappings until then, so `<C-s>` typed there ran the user's
+-- own save mapping (`E382: Cannot write, 'buftype' option is set`), and the host's reply then left
+-- Insert mode under the user's typing. The composer of the new tab now takes the session's keys at
+-- once, a submit before the session exists keeps the draft and says why, and the reply changes
+-- neither the mode nor the focus.
+T["new_session_composer_owns_its_keys_before_the_host_answers"] = function()
+  local child = new_session_child("new-source", "tab")
+  child.type_keys("i", "<F2>")
+  eq(child.lua_get([[{ #vim.api.nvim_list_tabpages(), vim.api.nvim_get_current_win() ~= _G.source.composer_win,
+    vim.bo.filetype }]]), { 3, true, "ForgeHarnessInput" })
   eq(child.api.nvim_get_mode().mode, "n")
+  child.lua([[_G.pending_window = vim.api.nvim_get_current_win()]])
+  child.type_keys("i", "/sessions", "<C-s>")
+  eq(child.lua_get([[{ vim.g.saved == nil, vim.api.nvim_buf_get_lines(0, 0, -1, false), _G.messages }]]),
+    { true, { "/sessions" }, { "Harness is still initializing" } })
+  eq(child.api.nvim_get_mode().mode, "i")
+  child.lua([[_G.reply({ session = { id = "created", provider = "mock", model = "mock" } })]])
+  eq(child.lua_get([[{ require("forge.session").harness_by_id.created ~= nil,
+    vim.api.nvim_get_current_win() == _G.pending_window }]]), { true, true })
+  eq(child.api.nvim_get_mode().mode, "i")
 end
 
 -- Choosing a session from Insert mode returns its composer in Insert mode. The chosen composer's
@@ -537,6 +650,102 @@ T["insert_focus_does_not_trigger_the_composer_entry_guard"] = function()
   vim.api.nvim_feedkeys(vim.keycode("i<F2>"), "xt", false)
   vim.cmd = original_cmd
   eq({ vim.api.nvim_get_current_win(), stop_count }, { chosen.composer_win, 0 })
+end
+
+-- A provider switch replaces the host and builds the destination session behind the current view
+-- before swapping it in. Each displayed view owns two unnamed scratch buffers, its status split and
+-- the status document's replica, which `:ls!` lists as hidden while the split is closed. Repeated
+-- switches must leave no other: every unnamed scratch buffer belongs to the view on screen.
+T["provider_switches_leave_only_owned_scratch_buffers"] = function()
+  local session = require("forge.session")
+  local navigation = require("forge.views.harness.session_navigation")
+  local fixture = native_host_fixture()
+  local first = fixture.create_session("scratch-first")
+  local tab = first.timeline_tab
+  local function scratch_buffer_set()
+    local buffer_set = {}
+    for _, candidate in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_get_name(candidate) == "" and vim.bo[candidate].buftype == "nofile" then
+        buffer_set[candidate] = true
+      end
+    end
+    return buffer_set
+  end
+  local function switch_to(session_id)
+    local current = session.harness
+    fixture.generation(fixture.generation() + 1)
+    navigation.activate({ session = { id = session_id, provider = "mock", model = "mock", approval_mode = "ask" } },
+      { source_state = current, open_mode = "current", interaction_mode = "reconcile", focus = true })
+    wait_until(function()
+      local shown = session.harness_by_id[session_id]
+      return shown and shown.timeline_tab == tab and session.harness == shown
+        and shown.presentation and shown.presentation.ready
+    end, "the switched session was not shown")
+  end
+  for _ = 1, 5 do
+    switch_to("scratch-second")
+    switch_to("scratch-first")
+  end
+  local status_view = assert(first.presentation.status_view)
+  local owned_set = { [status_view.buffer] = true }
+  if status_view.native then owned_set[status_view.native.buffer] = true end
+  eq(scratch_buffer_set(), owned_set)
+  fixture.failures:assert_none()
+end
+
+-- A provider switch started in one tab can finish while the user works in another. Swapping the
+-- prepared session into the first tab's composer window ran that buffer's entry autocommand, which
+-- selected the prepared session, and the restore that followed read the selection after the swap.
+-- Every later submit and `:ForgeHarness` in the user's tab then acted on the other tab's session.
+T["switch_finished_behind_another_tab_keeps_that_tab_selected"] = function()
+  local session = require("forge.session")
+  local navigation = require("forge.views.harness.session_navigation")
+  local fixture = native_host_fixture()
+  local source = fixture.create_session("behind-source")
+  local source_tab = source.timeline_tab
+  local selected = fixture.create_session("behind-selected")
+  session.select_harness(selected)
+  vim.api.nvim_set_current_win(selected.composer_win)
+  local selection_generation = session.harness_selection()
+  navigation.activate({ session = { id = "behind-target", provider = "mock", model = "mock", approval_mode = "ask" } },
+    { source_state = source, open_mode = "current", interaction_mode = "reconcile", focus = false })
+  local target
+  wait_until(function()
+    target = session.harness_by_id["behind-target"]
+    return target and target.timeline_tab == source_tab and target.presentation and target.presentation.ready
+  end, "the prepared session did not replace the source tab's panes")
+  eq({ session.harness == selected, vim.api.nvim_get_current_win() == selected.composer_win,
+    session.harness_selection() }, { true, true, selection_generation })
+  fixture.failures:assert_none()
+end
+
+-- `forge.client` delivers every reply to a session request with that session's view active. The
+-- prepared session's transcript opens in such a reply, and the switch completes inside it when
+-- nothing is left to render, as for a new chat on a loaded machine. The switch then read the
+-- reply's scope as the user's selection, placed the session behind the tab the user was looking
+-- at, and left the session being left selected: the next submit in the new composer went to that
+-- session and switched the host back to its provider in another tab.
+T["switch_completed_inside_a_session_reply_selects_the_target"] = function()
+  local session = require("forge.session")
+  local navigation = require("forge.views.harness.session_navigation")
+  local fixture = native_host_fixture()
+  fixture.scope_replies = true
+  local source = fixture.create_session("scoped-source")
+  local tab = source.timeline_tab
+  session.select_harness(source)
+  vim.api.nvim_set_current_win(source.composer_win)
+  navigation.activate({ session = { id = "scoped-target", provider = "mock", model = "mock", approval_mode = "ask" } },
+    { source_state = source, open_mode = "current", interaction_mode = "reconcile", focus = true })
+  local target
+  wait_until(function()
+    target = session.harness_by_id["scoped-target"]
+    return target and target.timeline_tab == tab and target.presentation and target.presentation.ready
+  end, "the prepared session did not replace the source tab's panes")
+  eq({ session.harness == target, session.selected_harness() == target,
+    vim.api.nvim_get_current_win() == target.composer_win,
+    vim.api.nvim_win_get_buf(target.composer_win) == target.composer_buf },
+    { true, true, true, true })
+  fixture.failures:assert_none()
 end
 
 return T

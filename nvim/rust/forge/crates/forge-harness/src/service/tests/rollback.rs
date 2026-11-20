@@ -601,6 +601,71 @@ async fn a_restore_stopped_part_way_reports_recovery() -> Result<()> {
     scene.finish(scenario).await
 }
 
+/// Fail the next native rewind once the files restore reaches it, while `request` runs.
+async fn fail_rewind_during(
+    scene: &RollbackScene,
+    request: impl std::future::Future<Output = Result<Value>>,
+) -> Result<Value> {
+    let hold = hold_rewind(scene).await?;
+    let (response, cancelled) = tokio::join!(request, async {
+        scene
+            .script
+            .dispatch(
+                &scene.session_id,
+                MockResponseCommand::Wait { id: hold.clone() },
+            )
+            .await?;
+        scene
+            .script
+            .dispatch(&scene.session_id, MockResponseCommand::Cancel { id: hold })
+            .await
+    });
+    cancelled?;
+    response
+}
+
+/// A files rollback whose conversation rewind fails after the files changed says what state the
+/// workspace is in and how to leave it, and continuing the interrupted restore says the same when
+/// the rewind fails again, rather than only that restoration did not complete.
+#[tokio::test]
+async fn a_rewind_failure_after_restoring_files_says_what_changed() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        let preview_id = prepared_files_rollback(&scene).await?;
+        let applied = fail_rewind_during(
+            &scene,
+            scene.request(
+                21,
+                "session.exchange.rollback.apply",
+                json!({"preview_id":preview_id}),
+            ),
+        )
+        .await?;
+        let continued = fail_rewind_during(
+            &scene,
+            scene.request(
+                22,
+                "session.exchange.recovery",
+                json!({"action":"continue"}),
+            ),
+        )
+        .await?;
+        for response in [&applied, &continued] {
+            let message = response["error"].to_string();
+            assert!(
+                message
+                    .contains("the files were restored, but the conversation was not rolled back")
+                    && message.contains("Continue interrupted restore")
+                    && message.contains("Restore pre-restore files"),
+                "{response}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
 /// The first exchange names an unnamed session after its prompt. Rolling back every exchange
 /// returns the session to unnamed, so no title describes a prompt the transcript no longer shows;
 /// a name the user chose survives the same rollback.
@@ -691,8 +756,8 @@ async fn the_running_exchange_can_be_rolled_back() -> Result<()> {
 }
 
 /// Pausing a goal mid-turn parks that turn's exchange: it keeps its output and stays `running` in
-/// history with no execution. The interaction list includes it, and a conversation rollback to it
-/// closes it, rewinds the provider before it, and keeps the goal paused.
+/// history with no execution. The interaction list includes it marked paused, and a conversation
+/// rollback to it closes it, rewinds the provider before it, and keeps the goal paused.
 #[tokio::test]
 async fn a_paused_goal_turn_is_listed_and_rolled_back() -> Result<()> {
     use forge_provider_api::testing::{
@@ -763,6 +828,7 @@ async fn a_paused_goal_turn_is_listed_and_rolled_back() -> Result<()> {
             .with_context(|| format!("exchange list missing: {listed}"))?
             .clone();
         assert_eq!(newest["state"], "running", "{newest}");
+        assert_eq!(newest["paused"], true, "{newest}");
         let newest_id = newest["id"].as_str().context("newest id")?.to_owned();
         succeeded(&scene.conversation_undo(23, &newest_id).await?);
         let rolled_back = scene

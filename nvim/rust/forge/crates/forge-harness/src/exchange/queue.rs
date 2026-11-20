@@ -507,6 +507,16 @@ impl CommandQueue {
         }
     }
 
+    /// Report whether a context compaction waits in the FIFO behind the active command.
+    pub(super) fn has_pending_compaction(&self) -> bool {
+        self.pending.values().any(|command| {
+            matches!(
+                command.record.request.command,
+                super::command::Command::CompactContext(_)
+            )
+        })
+    }
+
     /// Report runnable work without exposing mutable queue contents.
     pub(super) fn has_pending(&self) -> bool {
         matches!(self.availability, QueueAvailability::Open) && !self.order.is_empty()

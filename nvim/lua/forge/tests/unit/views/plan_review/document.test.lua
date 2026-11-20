@@ -445,4 +445,195 @@ T["question_whose_answer_did_not_survive_shows_interrupted"] = function()
   vim.api.nvim_buf_delete(buffer, { force = true })
 end
 
+-- A comment on a row with no source identity is refused, and the refusal changes nothing: the
+-- review used to open the comment editor for the comment it had just refused, which left Insert
+-- mode in the plan buffer and stacked another window on a second try.
+T["refused_comment_leaves_mode_and_windows_unchanged"] = function()
+  local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
+  local client = require("forge.client")
+  local pending = {}
+  client.host_get_generation = function() return 1 end
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    if vim.startswith(request_specification.method, "text.") then return end
+    pending[#pending + 1] = { params = request_specification.params or {}, callback = encode_delivery(callback) }
+  end
+  local notices = dofile("nvim/lua/forge/tests/support/notify.lua").capture({ notifications = true })
+  local buffer = buffer_support.scratch(nil, { name = vim.fn.tempname() .. ".md" })
+  vim.api.nvim_win_set_buf(0, buffer)
+  vim.bo[buffer].bufhidden = "hide"
+  local owner
+  owner = require("forge.views.plan_review.document").attach({ session_id = "session", buffer = buffer,
+    window = vim.api.nvim_get_current_win(), plan = { id = "plan", review_digest = "canonical" },
+    notice = error,
+  }, function(value, failure) assert(not failure, failure) owner = value end)
+  -- Row 2 is a blank separator that maps to no source line.
+  local text = { "Source row 1", "", "Source row 3" }
+  local source = {
+    { id = "source:1", target = "source:1", text = text[1], source_line = 1, block = "plan:source",
+      position = { row = 0, column = 0 }, metadata = {} },
+    { id = "separator", text = text[2], block = "plan:source", position = { row = 1, column = 0 }, metadata = {} },
+    { id = "source:3", target = "source:3", text = text[3], source_line = 3, block = "plan:source",
+      position = { row = 2, column = 0 }, metadata = {} },
+  }
+  pending[1].callback({ saved_source_digest = "saved", annotation = {}, source_row = source,
+    snapshot = { document = owner.document, revision = 0, block = {
+      { id = "plan:source", text = text, metadata = { target = {}, editable_region = {}, decoration = {} } },
+    } } })
+  local blank_row = buffer_support.find_row(buffer, "Source row 3") - 1
+  vim.api.nvim_win_set_cursor(0, { blank_row, 0 })
+  local windows = #vim.api.nvim_list_wins()
+  local received = 0
+  for _ = 1, 2 do
+    local requested = owner.action("comment", function() received = received + 1 end)
+    eq(requested, false, { fail_reason = "a refused comment reported that it was requested" })
+  end
+  vim.wait(20, nil, 5)
+  eq(received, 0, { fail_reason = "a refused comment opened the comment editor" })
+  eq(vim.fn.mode(), "n", { fail_reason = "a refused comment left Normal mode" })
+  eq(#vim.api.nvim_list_wins(), windows, { fail_reason = "a refused comment opened a window" })
+  eq(#require("forge.draft_comments").capture(buffer), 0)
+  eq(notices:messages(), { "Selected rows have no source identity", "Selected rows have no source identity" })
+  owner.close()
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
+
+---Open a plan review whose saves answer at once, with `annotation` already saved. The plan holds
+---the rows of `source_text`, or the single row `Source row 1`.
+---@param annotation table[]
+---@param source_text? string[]
+---@return table owner, integer buffer, table[] saves
+local function open_saving_review(annotation, source_text)
+  source_text = source_text or { "Source row 1" }
+  local source_row = {}
+  for index, text in ipairs(source_text) do
+    source_row[index] = { id = "source:" .. index, target = "source:" .. index, text = text, source_line = index,
+      block = "plan:source", position = { row = index - 1, column = 0 }, metadata = {} }
+  end
+  local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
+  local client = require("forge.client")
+  local pending, saves = {}, {}
+  client.host_get_generation = function() return 1 end
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+    callback = encode_delivery(callback)
+    if request_specification.method == "session.document" and params.operation == "plan_save_annotations" then
+      saves[#saves + 1] = vim.deepcopy(params)
+      callback({ saved = true })
+      return
+    end
+    pending[#pending + 1] = { params = params, callback = callback }
+  end
+  local buffer = buffer_support.scratch(nil, { name = vim.fn.tempname() .. ".md" })
+  vim.api.nvim_win_set_buf(0, buffer)
+  local owner = require("forge.views.plan_review.document").attach({ session_id = "session", buffer = buffer,
+    window = vim.api.nvim_get_current_win(), plan = { id = "plan", review_digest = "canonical" }, notice = error,
+  }, function(_, failure) assert(not failure, failure) end)
+  pending[1].callback({ saved_source_digest = "saved", annotation = annotation, source_row = source_row,
+    snapshot = { document = owner.document, revision = 0, block = {
+      { id = "plan:source", text = source_text, metadata = { target = {}, editable_region = {}, decoration = {} } },
+    } } })
+  MiniTest.finally(function()
+    pcall(owner.close, true)
+    pcall(vim.api.nvim_buf_delete, buffer, { force = true })
+  end)
+  return owner, buffer, saves
+end
+
+-- Saving a comment that holds no text saves nothing, as the queue editor does with an emptied
+-- entry: a new empty comment is dropped, and a saved comment edited to empty is removed. The
+-- review used to save the empty comment, which then reopened with the review as an empty box.
+T["saving_an_empty_comment_saves_nothing"] = function()
+  local comments = require("forge.draft_comments")
+  local owner, buffer, saves = open_saving_review({})
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  assert(owner.action("comment", function() end), "the comment was refused")
+  vim.cmd("write")
+  eq(saves[#saves].annotation, {}, { fail_reason = "an empty new comment was saved" })
+  eq(comments.capture(buffer), {}, { fail_reason = "the empty comment stayed in the review" })
+
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  owner.action("comment", function() end)
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Keep this row." })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
+  vim.cmd("write")
+  eq(#saves[#saves].annotation, 1, { fail_reason = "a comment with text was not saved" })
+  local saved = comments.capture(buffer)[1]
+  assert(comments.focus(buffer, saved.id))
+  row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "   " })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
+  vim.cmd("write")
+  eq(saves[#saves].annotation, {}, { fail_reason = "a comment edited to empty was saved" })
+  eq(comments.capture(buffer), {}, { fail_reason = "a comment edited to empty stayed in the review" })
+  assert(not vim.bo[buffer].modified, "removing the emptied comment left the review modified")
+end
+
+-- `C` with the cursor inside an existing comment edits that comment. It used to start a second
+-- comment on the same line, linked to the first as if it answered a reply; a follow-up belongs
+-- only to a question's answer.
+T["comment_key_inside_a_comment_edits_it"] = function()
+  local comments = require("forge.draft_comments")
+  local owner, buffer = open_saving_review({
+    { id = "1", source = { start_line = 1, end_line = 1, body = "Keep this row." } },
+  })
+  local body_row = buffer_support.find_row(buffer, "Keep this row.")
+  vim.api.nvim_win_set_cursor(0, { body_row, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
+  local received
+  assert(owner.action("comment", function(result) received = result end), "the comment key was refused")
+  local captured = comments.capture(buffer)
+  eq(#captured, 1, { fail_reason = "the comment key stacked a second comment inside the first" })
+  eq(received, { local_draft = true }, { fail_reason = "the comment key did not open the comment for editing" })
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  eq(vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1], "Keep this row.",
+    { fail_reason = "the cursor left the edited comment's body" })
+  assert(vim.bo[buffer].modifiable, "the edited comment's body is not editable")
+end
+
+-- Every question-and-answer block draws in the same collapsed box after a save, including the
+-- block whose follow-up comment was just saved. The save collapsed that block but placed the
+-- cursor on the collapsed block's first row, so the editor's next CursorMoved focused it again
+-- and redrew it as the plain editor while the other block kept its box.
+T["saved_follow_up_draws_its_block_like_the_others"] = function()
+  local owner, buffer = open_saving_review({
+    { id = "1", kind = "question", source = { start_line = 1, end_line = 1, body = "Why prorate?" },
+      reply = { question_body = "Why prorate?", body = "Prorating keeps charged amounts.", duration_ms = 8000 } },
+    { id = "2", kind = "question", source = { start_line = 3, end_line = 3, body = "Why sum duplicates?" },
+      reply = { question_body = "Why sum duplicates?", body = "Summing bounds returned units.", duration_ms = 8000 } },
+  }, { "Source row 1", "Source row 2", "Source row 3" })
+  ---@return string[] block_headings the first row of each question block, in document order
+  local function block_headings()
+    local headings = {}
+    for _, line in ipairs(buffer_support.lines(buffer)) do
+      if line:find("Plan question", 1, true) then headings[#headings + 1] = line end
+    end
+    return headings
+  end
+  local function boxed(heading) return heading:find("╭─ Plan question", 1, true) ~= nil end
+  for index, heading in ipairs(block_headings()) do
+    assert(boxed(heading), ("question block %d opened without its box: %s"):format(index, heading))
+  end
+  for _, answer in ipairs({ "Prorating keeps charged amounts.", "Summing bounds returned units." }) do
+    vim.api.nvim_win_set_cursor(0, { buffer_support.find_row(buffer, answer), 0 })
+    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
+    assert(owner.action("comment", function() end), "the follow-up comment was refused")
+    local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+    vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Follow up on: " .. answer })
+    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
+    vim.cmd("write")
+    -- The editor reports the cursor the save placed; a block it rests on may not reopen.
+    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
+    local headings = block_headings()
+    eq(#headings, 2, { fail_reason = "a question block disappeared after the save" })
+    eq(vim.tbl_map(boxed, headings), { true, true },
+      { fail_reason = "the blocks drew in different styles after saving a follow-up to " .. answer
+        .. ":\n" .. table.concat(headings, "\n") })
+    assert(vim.iter(owner.comment_state.range_list):all(function(range) return range.compact end),
+      "a saved block kept its editor decorations")
+  end
+end
+
 return T

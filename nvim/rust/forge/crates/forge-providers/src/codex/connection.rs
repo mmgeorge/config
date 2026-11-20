@@ -20,6 +20,9 @@ pub enum CodexConnectionError {
     /// The provider closed its connection before returning a result.
     #[error("{0}")]
     Closed(String),
+    /// This side closed or dropped the connection; the provider reported no failure.
+    #[error("Codex connection was closed by Forge")]
+    Released,
     /// A binary frame did not contain UTF-8 JSON text.
     #[error("decode shared Codex app-server binary frame: {0}")]
     Encoding(#[source] Arc<std::string::FromUtf8Error>),
@@ -68,9 +71,12 @@ impl CodexConnection {
         let (publish, received) = mpsc::unbounded_channel();
         let (failure, failures) = watch::channel(None);
         let task = tokio::spawn(async move {
-            if let Err(error) = run_socket(socket, receive_commands, publish).await {
+            // The failure is recorded before the data queue closes, so a reader that sees the
+            // queue end never mistakes a provider loss for a local release.
+            if let Err(error) = run_socket(socket, receive_commands, &publish).await {
                 failure.send_replace(Some(error));
             }
+            drop(publish);
         });
         Ok(Self {
             commands,
@@ -130,11 +136,14 @@ impl CodexConnection {
     }
 
     /// Get the sticky loss reason even when the ordinary data queue has no spare capacity.
+    ///
+    /// The socket owner records a failure for every remote close or failed socket operation,
+    /// so an owner that ended without one stopped because this side closed or dropped it.
     fn stopped(&self) -> CodexConnectionError {
         self.failure
             .borrow()
             .clone()
-            .unwrap_or_else(|| CodexConnectionError::Closed("Codex socket owner closed".into()))
+            .unwrap_or(CodexConnectionError::Released)
     }
 }
 
@@ -151,7 +160,7 @@ impl Drop for CodexConnection {
 async fn run_socket(
     mut socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     mut commands: mpsc::Receiver<Command>,
-    publish: mpsc::UnboundedSender<ReceivedMessage>,
+    publish: &mpsc::UnboundedSender<ReceivedMessage>,
 ) -> Result<(), CodexConnectionError> {
     loop {
         tokio::select! {
@@ -192,5 +201,38 @@ async fn run_socket(
                 if publish.send(message).is_err() { return Ok(()); }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    /// A socket owner that ended because this side closed the connection reports a release,
+    /// not the provider loss that a remote close or a failed read reports.
+    #[tokio::test]
+    async fn a_locally_closed_connection_reports_its_release() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let connection = CodexConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        assert!(matches!(
+            connection.receive().await,
+            Err(CodexConnectionError::Released)
+        ));
+        assert!(matches!(
+            connection.send("{}".to_owned()).await,
+            Err(CodexConnectionError::Released)
+        ));
+        server.await.unwrap();
     }
 }

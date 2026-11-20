@@ -444,6 +444,7 @@ mod tests {
             final_response: None,
             error: None,
             parent_reported: false,
+            cancelled_by: None,
             created_at_ms: 1,
             last_activity_at_ms: None,
             completed_at_ms: None,
