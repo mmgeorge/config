@@ -1,0 +1,1535 @@
+use humantime::format_duration;
+use std::path::PathBuf;
+use std::time::Duration;
+use zellij_tile::graphemes;
+use zellij_tile::prelude::*;
+
+use crate::single_screen::UnifiedSearchResult;
+use crate::ui::{PaneUiInfo, SessionUiInfo, TabUiInfo};
+use crate::{ActiveScreen, NewSessionInfo};
+
+// ---------------------------------------------------------------
+// Render cache for unified results
+// ---------------------------------------------------------------
+
+/// Pre-computed data for a single visible row, independent of selection state.
+#[derive(Clone)]
+pub struct CachedRowData {
+    pub session_name: String,
+    pub indices: Vec<usize>,
+    pub original_index: usize,
+    pub kind: CachedRowKind,
+    // Pre-formatted strings (computed once, reused across renders)
+    pub full_details: String,
+    pub abbr_details: String,
+    // Pre-computed widths
+    pub name_width: usize,
+    pub full_details_width: usize,
+    pub abbr_details_width: usize,
+    // Color range data for details cell
+    pub details_color_ranges: DetailsColorRanges,
+    pub abbr_details_color_ranges: DetailsColorRanges,
+}
+
+#[derive(Clone)]
+pub enum CachedRowKind {
+    Active,
+    Resurrectable,
+}
+
+/// Byte-offset ranges for coloring details cells.
+#[derive(Clone, Default)]
+pub struct DetailsColorRanges {
+    pub ranges: Vec<(usize, std::ops::Range<usize>)>, // (color_index, range)
+}
+
+/// Cached intermediate representation of the unified results table.
+///
+/// Stored on `SingleScreenState` and rebuilt only when `unified_results`
+/// changes (via `update_search_term` / `SessionUpdate`). Selection changes
+/// and timer re-renders reuse the cached data.
+#[derive(Default)]
+pub struct UnifiedResultsRenderCache {
+    /// Filtered rows (current session excluded), with pre-formatted strings.
+    pub rows: Vec<CachedRowData>,
+    /// Max column widths across all cached rows.
+    pub full_name_width: usize,
+    pub full_details_width: usize,
+    pub abbr_details_width: usize,
+}
+
+impl UnifiedResultsRenderCache {
+    /// Rebuild the cache from the current `unified_results`.
+    pub fn rebuild(&mut self, results: &[UnifiedSearchResult]) {
+        self.rows.clear();
+        self.full_name_width = 0;
+        self.full_details_width = 0;
+        self.abbr_details_width = 0;
+
+        for (orig_i, result) in results.iter().enumerate() {
+            let row = match result {
+                UnifiedSearchResult::ActiveSession {
+                    indices,
+                    session_name,
+                    connected_users,
+                    tab_count,
+                    pane_count,
+                    ..
+                } => {
+                    let client_word = if *connected_users == 1 {
+                        "client"
+                    } else {
+                        "clients"
+                    };
+
+                    let tab_str = format!("{}", tab_count);
+                    let pane_str = format!("{}", pane_count);
+                    let conn_str = format!("{}", connected_users);
+
+                    // Full details
+                    let full_details = format!(
+                        "{} tabs, {} panes, {} {}",
+                        tab_str, pane_str, conn_str, client_word
+                    );
+                    let full_details_ranges = {
+                        let tab_end = tab_str.len();
+                        let pane_offset = tab_str.len() + " tabs, ".len();
+                        let pane_end = pane_offset + pane_str.len();
+                        let conn_offset = pane_end + " panes, ".len();
+                        let conn_end = conn_offset + conn_str.len();
+                        DetailsColorRanges {
+                            ranges: vec![
+                                (1, 0..tab_end),
+                                (2, pane_offset..pane_end),
+                                (2, conn_offset..conn_end),
+                            ],
+                        }
+                    };
+
+                    // Abbreviated details
+                    let abbr_details = format!("{}t, {}p, {}c", tab_str, pane_str, conn_str);
+                    let abbr_details_ranges = {
+                        let tab_end = tab_str.len();
+                        let pane_offset = tab_str.len() + "t, ".len();
+                        let pane_end = pane_offset + pane_str.len();
+                        let conn_offset = pane_end + "p, ".len();
+                        let conn_end = conn_offset + conn_str.len();
+                        DetailsColorRanges {
+                            ranges: vec![
+                                (1, 0..tab_end),
+                                (2, pane_offset..pane_end),
+                                (2, conn_offset..conn_end),
+                            ],
+                        }
+                    };
+
+                    let name_width = graphemes::display_width(&session_name);
+                    let full_details_width = graphemes::display_width(&full_details);
+                    let abbr_details_width = graphemes::display_width(&abbr_details);
+
+                    CachedRowData {
+                        session_name: session_name.clone(),
+                        indices: indices.clone(),
+                        original_index: orig_i,
+                        kind: CachedRowKind::Active,
+                        full_details,
+                        abbr_details,
+                        name_width,
+                        full_details_width,
+                        abbr_details_width,
+                        details_color_ranges: full_details_ranges,
+                        abbr_details_color_ranges: abbr_details_ranges,
+                    }
+                },
+                UnifiedSearchResult::ResurrectableSession {
+                    indices,
+                    session_name,
+                    ctime,
+                    ..
+                } => {
+                    let duration = humantime::format_duration(*ctime).to_string();
+                    let mut formatted_duration = String::new();
+                    for part in duration.split_whitespace() {
+                        if !part.ends_with('s') {
+                            if !formatted_duration.is_empty() {
+                                formatted_duration.push(' ');
+                            }
+                            formatted_duration.push_str(part);
+                        }
+                    }
+                    if formatted_duration.is_empty() {
+                        formatted_duration.push_str("<1m");
+                    }
+
+                    let full_details = format!("Created {} ago", formatted_duration);
+                    let full_details_ranges = {
+                        let created_len = "Created ".len();
+                        let duration_end = created_len + formatted_duration.len();
+                        DetailsColorRanges {
+                            ranges: vec![(2, created_len..duration_end)],
+                        }
+                    };
+
+                    let abbr_details = format!("{} ago", formatted_duration);
+                    let abbr_details_ranges = {
+                        let duration_end = formatted_duration.len();
+                        DetailsColorRanges {
+                            ranges: vec![(2, 0..duration_end)],
+                        }
+                    };
+
+                    let name_width = graphemes::display_width(&session_name);
+                    let full_details_width = graphemes::display_width(&full_details);
+                    let abbr_details_width = graphemes::display_width(&abbr_details);
+
+                    CachedRowData {
+                        session_name: session_name.clone(),
+                        indices: indices.clone(),
+                        original_index: orig_i,
+                        kind: CachedRowKind::Resurrectable,
+                        full_details,
+                        abbr_details,
+                        name_width,
+                        full_details_width,
+                        abbr_details_width,
+                        details_color_ranges: full_details_ranges,
+                        abbr_details_color_ranges: abbr_details_ranges,
+                    }
+                },
+            };
+
+            // Update max widths
+            if row.name_width > self.full_name_width {
+                self.full_name_width = row.name_width;
+            }
+            if row.full_details_width > self.full_details_width {
+                self.full_details_width = row.full_details_width;
+            }
+            if row.abbr_details_width > self.abbr_details_width {
+                self.abbr_details_width = row.abbr_details_width;
+            }
+
+            self.rows.push(row);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ListItem {
+    pub name: String,
+    pub session_name: Option<Vec<UiSpan>>,
+    pub tab_name: Option<Vec<UiSpan>>,
+    pub pane_name: Option<Vec<UiSpan>>,
+    colors: Colors,
+}
+
+impl ListItem {
+    pub fn from_session_info(session_ui_info: &SessionUiInfo, colors: Colors) -> Self {
+        let session_ui_line = build_session_ui_line(session_ui_info, colors);
+        ListItem {
+            name: session_ui_info.name.clone(),
+            session_name: Some(session_ui_line),
+            tab_name: None,
+            pane_name: None,
+            colors,
+        }
+    }
+    pub fn from_tab_info(
+        session_ui_info: &SessionUiInfo,
+        tab_ui_info: &TabUiInfo,
+        colors: Colors,
+    ) -> Self {
+        let session_ui_line = build_session_ui_line(session_ui_info, colors);
+        let tab_ui_line = build_tab_ui_line(tab_ui_info, colors);
+        ListItem {
+            name: tab_ui_info.name.clone(),
+            session_name: Some(session_ui_line),
+            tab_name: Some(tab_ui_line),
+            pane_name: None,
+            colors,
+        }
+    }
+    pub fn from_pane_info(
+        session_ui_info: &SessionUiInfo,
+        tab_ui_info: &TabUiInfo,
+        pane_ui_info: &PaneUiInfo,
+        colors: Colors,
+    ) -> Self {
+        let session_ui_line = build_session_ui_line(session_ui_info, colors);
+        let tab_ui_line = build_tab_ui_line(tab_ui_info, colors);
+        let pane_ui_line = build_pane_ui_line(pane_ui_info, colors);
+        ListItem {
+            name: pane_ui_info.name.clone(),
+            session_name: Some(session_ui_line),
+            tab_name: Some(tab_ui_line),
+            pane_name: Some(pane_ui_line),
+            colors,
+        }
+    }
+    pub fn line_count(&self) -> usize {
+        let mut line_count = 0;
+        if self.session_name.is_some() {
+            line_count += 1
+        };
+        if self.tab_name.is_some() {
+            line_count += 1
+        };
+        if self.pane_name.is_some() {
+            line_count += 1
+        };
+        line_count
+    }
+    pub fn render(&self, indices: Option<Vec<usize>>, max_cols: usize) -> Vec<LineToRender> {
+        let mut lines_to_render = vec![];
+        if let Some(session_name) = &self.session_name {
+            let indices = if self.tab_name.is_none() && self.pane_name.is_none() {
+                indices.clone()
+            } else {
+                None
+            };
+            let mut line_to_render = LineToRender::new(self.colors);
+            let mut remaining_cols = max_cols;
+            for span in session_name {
+                span.render(
+                    indices.clone().map(|i| {
+                        (
+                            SpanStyle::ForegroundBold(
+                                self.colors.palette.text_unselected.emphasis_3,
+                            ),
+                            i,
+                        )
+                    }),
+                    &mut line_to_render,
+                    &mut remaining_cols,
+                );
+            }
+            lines_to_render.push(line_to_render);
+        }
+        if let Some(tab_name) = &self.tab_name {
+            let indices = if self.pane_name.is_none() {
+                indices.clone()
+            } else {
+                None
+            };
+            let mut line_to_render = LineToRender::new(self.colors);
+            let mut remaining_cols = max_cols;
+            for span in tab_name {
+                span.render(
+                    indices.clone().map(|i| {
+                        (
+                            SpanStyle::ForegroundBold(
+                                self.colors.palette.text_unselected.emphasis_3,
+                            ),
+                            i,
+                        )
+                    }),
+                    &mut line_to_render,
+                    &mut remaining_cols,
+                );
+            }
+            lines_to_render.push(line_to_render);
+        }
+        if let Some(pane_name) = &self.pane_name {
+            let mut line_to_render = LineToRender::new(self.colors);
+            let mut remaining_cols = max_cols;
+            for span in pane_name {
+                span.render(
+                    indices.clone().map(|i| {
+                        (
+                            SpanStyle::ForegroundBold(
+                                self.colors.palette.text_unselected.emphasis_3,
+                            ),
+                            i,
+                        )
+                    }),
+                    &mut line_to_render,
+                    &mut remaining_cols,
+                );
+            }
+            lines_to_render.push(line_to_render);
+        }
+        lines_to_render
+    }
+}
+
+#[derive(Debug)]
+pub enum UiSpan {
+    UiSpanTelescope(UiSpanTelescope),
+    TruncatableUiSpan(TruncatableUiSpan),
+}
+
+impl UiSpan {
+    pub fn render(
+        &self,
+        indices: Option<(SpanStyle, Vec<usize>)>,
+        line_to_render: &mut LineToRender,
+        remaining_cols: &mut usize,
+    ) {
+        match self {
+            UiSpan::UiSpanTelescope(ui_span_telescope) => {
+                ui_span_telescope.render(line_to_render, remaining_cols)
+            },
+            UiSpan::TruncatableUiSpan(truncatable_ui_span) => {
+                truncatable_ui_span.render(indices, line_to_render, remaining_cols)
+            },
+        }
+    }
+}
+
+#[allow(dead_code)] // in the future this will be moved to be its own component
+#[derive(Debug)]
+pub enum SpanStyle {
+    None,
+    Bold,
+    Foreground(PaletteColor),
+    ForegroundBold(PaletteColor),
+}
+
+impl SpanStyle {
+    pub fn style_string(&self, to_style: &str) -> String {
+        match self {
+            SpanStyle::None => to_style.to_owned(),
+            SpanStyle::Bold => format!("\u{1b}[1m{}\u{1b}[22m", to_style),
+            SpanStyle::Foreground(color) => match color {
+                PaletteColor::EightBit(byte) => {
+                    format!("\u{1b}[38;5;{byte}m{}\u{1b}[39m", to_style)
+                },
+                PaletteColor::Rgb((r, g, b)) => {
+                    format!("\u{1b}[38;2;{};{};{}m{}\u{1b}[39m", r, g, b, to_style)
+                },
+            },
+            SpanStyle::ForegroundBold(color) => match color {
+                PaletteColor::EightBit(byte) => {
+                    format!("\u{1b}[38;5;{byte};1m{}\u{1b}[39;22m", to_style)
+                },
+                PaletteColor::Rgb((r, g, b)) => {
+                    format!("\u{1b}[38;2;{};{};{};1m{}\u{1b}[39;22m", r, g, b, to_style)
+                },
+            },
+        }
+    }
+}
+
+impl Default for SpanStyle {
+    fn default() -> Self {
+        SpanStyle::None
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TruncatableUiSpan {
+    text: String,
+    style: SpanStyle,
+}
+
+impl TruncatableUiSpan {
+    pub fn new(text: String, style: SpanStyle) -> Self {
+        TruncatableUiSpan { text, style }
+    }
+    pub fn render(
+        &self,
+        indices: Option<(SpanStyle, Vec<usize>)>,
+        line_to_render: &mut LineToRender,
+        remaining_cols: &mut usize,
+    ) {
+        let mut rendered = String::new();
+        let truncated = if *remaining_cols >= graphemes::display_width(&self.text) {
+            self.text.clone()
+        } else {
+            graphemes::truncate_end(&self.text, *remaining_cols, "").into_owned()
+        };
+        match indices {
+            Some((index_style, indices)) => {
+                let mut char_index = 0;
+                for (cluster, _) in graphemes::clusters(&truncated) {
+                    let char_count = cluster.chars().count();
+                    let highlighted =
+                        (char_index..char_index + char_count).any(|i| indices.contains(&i));
+                    if highlighted {
+                        rendered.push_str(&index_style.style_string(cluster));
+                    } else {
+                        rendered.push_str(&self.style.style_string(cluster));
+                    }
+                    char_index += char_count;
+                }
+            },
+            None => {
+                rendered.push_str(&self.style.style_string(&truncated));
+            },
+        }
+        *remaining_cols = remaining_cols.saturating_sub(graphemes::display_width(&truncated));
+        line_to_render.append(&rendered);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UiSpanTelescope(Vec<StringAndLength>);
+
+impl UiSpanTelescope {
+    pub fn new(string_and_lengths: Vec<StringAndLength>) -> Self {
+        UiSpanTelescope(string_and_lengths)
+    }
+    pub fn render(&self, line_to_render: &mut LineToRender, remaining_cols: &mut usize) {
+        for string_and_length in &self.0 {
+            if string_and_length.length < *remaining_cols {
+                line_to_render.append(&string_and_length.string);
+                *remaining_cols -= string_and_length.length;
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct StringAndLength {
+    pub string: String,
+    pub length: usize,
+}
+
+impl StringAndLength {
+    pub fn new(string: String, length: usize) -> Self {
+        StringAndLength { string, length }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LineToRender {
+    line: String,
+    is_selected: bool,
+    truncated_result_count: usize,
+    colors: Colors,
+}
+
+impl LineToRender {
+    pub fn new(colors: Colors) -> Self {
+        LineToRender {
+            line: String::default(),
+            is_selected: false,
+            truncated_result_count: 0,
+            colors,
+        }
+    }
+    pub fn append(&mut self, to_append: &str) {
+        self.line.push_str(to_append)
+    }
+    pub fn make_selected_as_search(&mut self, add_arrows: bool) {
+        self.is_selected = true;
+        let arrows = if add_arrows {
+            self.colors.shortcuts(" <↓↑> ")
+        } else {
+            "      ".to_owned()
+        };
+        match self.colors.palette.list_selected.background {
+            PaletteColor::EightBit(byte) => {
+                self.line = format!(
+                    "\u{1b}[48;5;{byte}m\u{1b}[K\u{1b}[48;5;{byte}m{arrows}{}",
+                    self.line
+                );
+            },
+            PaletteColor::Rgb((r, g, b)) => {
+                self.line = format!(
+                    "\u{1b}[48;2;{};{};{}m\u{1b}[K\u{1b}[48;2;{};{};{}m{arrows}{}",
+                    r, g, b, r, g, b, self.line
+                );
+            },
+        }
+    }
+    pub fn make_selected(&mut self, add_arrows: bool) {
+        self.is_selected = true;
+        let arrows = if add_arrows {
+            self.colors.shortcuts("<←↓↑→>")
+        } else {
+            "      ".to_owned()
+        };
+        match self.colors.palette.list_selected.background {
+            PaletteColor::EightBit(byte) => {
+                self.line = format!(
+                    "\u{1b}[48;5;{byte}m\u{1b}[K\u{1b}[48;5;{byte}m{arrows}{}",
+                    self.line
+                );
+            },
+            PaletteColor::Rgb((r, g, b)) => {
+                self.line = format!(
+                    "\u{1b}[48;2;{};{};{}m\u{1b}[K\u{1b}[48;2;{};{};{}m{arrows}{}",
+                    r, g, b, r, g, b, self.line
+                );
+            },
+        }
+    }
+    pub fn render(&self) -> String {
+        let mut line = self.line.clone();
+
+        let more = if self.truncated_result_count > 0 {
+            self.colors
+                .exit_code_error(&format!(" [+{}]", self.truncated_result_count))
+        } else {
+            String::new()
+        };
+
+        line.push_str(&more);
+        if self.is_selected {
+            self.line.clone()
+        } else {
+            format!("\u{1b}[49m      {}", line)
+        }
+    }
+    pub fn add_truncated_results(&mut self, result_count: usize) {
+        self.truncated_result_count += result_count;
+    }
+}
+
+pub fn build_session_ui_line(session_ui_info: &SessionUiInfo, colors: Colors) -> Vec<UiSpan> {
+    let mut ui_spans = vec![];
+    let tab_count_text = session_ui_info.tabs.len();
+    let total_pane_count_text = session_ui_info
+        .tabs
+        .iter()
+        .fold(0, |acc, tab| acc + tab.panes.len());
+    let tab_count = format!("{}", tab_count_text);
+    let tab_count_styled = colors.tab_count(&tab_count);
+    let total_pane_count = format!("{}", total_pane_count_text);
+    let total_pane_count_styled = colors.pane_count(&total_pane_count);
+    let session_name = &session_ui_info.name;
+    let connected_users = format!("{}", session_ui_info.connected_users);
+    let connected_users_styled = colors.connected_users(&connected_users);
+    let session_bullet_span =
+        UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![StringAndLength::new(
+            format!(" > "),
+            3,
+        )]));
+    let session_name_span = UiSpan::TruncatableUiSpan(TruncatableUiSpan::new(
+        session_name.clone(),
+        SpanStyle::ForegroundBold(colors.palette.text_unselected.emphasis_0),
+    ));
+    let tab_and_pane_count = UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![
+        StringAndLength::new(
+            format!(" ({tab_count_styled} tabs, {total_pane_count_styled} panes)"),
+            2 + graphemes::display_width(&tab_count)
+                + 7
+                + graphemes::display_width(&total_pane_count)
+                + 7,
+        ),
+        StringAndLength::new(
+            format!(" ({tab_count_styled}, {total_pane_count_styled})"),
+            2 + graphemes::display_width(&tab_count)
+                + 2
+                + graphemes::display_width(&total_pane_count)
+                + 3,
+        ),
+    ]));
+    let connected_users_count = UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![
+        StringAndLength::new(
+            format!(" [{connected_users_styled} connected users]"),
+            2 + graphemes::display_width(&connected_users) + 17,
+        ),
+        StringAndLength::new(
+            format!(" [{connected_users_styled}]"),
+            2 + graphemes::display_width(&connected_users) + 1,
+        ),
+    ]));
+    ui_spans.push(session_bullet_span);
+    ui_spans.push(session_name_span);
+    ui_spans.push(tab_and_pane_count);
+    ui_spans.push(connected_users_count);
+    if session_ui_info.is_current_session {
+        let current_session_indication = UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![
+            StringAndLength::new(
+                colors.current_session_marker(&format!(" <CURRENT SESSION>")),
+                18,
+            ),
+            StringAndLength::new(colors.current_session_marker(&format!(" <CURRENT>")), 10),
+            StringAndLength::new(colors.current_session_marker(&format!(" <C>")), 4),
+        ]));
+        ui_spans.push(current_session_indication);
+    }
+    ui_spans
+}
+
+pub fn build_tab_ui_line(tab_ui_info: &TabUiInfo, colors: Colors) -> Vec<UiSpan> {
+    let mut ui_spans = vec![];
+    let tab_name = &tab_ui_info.name;
+    let pane_count_text = tab_ui_info.panes.len();
+    let pane_count = format!("{}", pane_count_text);
+    let pane_count_styled = colors.pane_count(&pane_count);
+    let tab_bullet_span =
+        UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![StringAndLength::new(
+            format!("  - "),
+            4,
+        )]));
+    let tab_name_span = UiSpan::TruncatableUiSpan(TruncatableUiSpan::new(
+        tab_name.clone(),
+        SpanStyle::ForegroundBold(colors.palette.text_unselected.emphasis_1),
+    ));
+    let connected_users_count_span = UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![
+        StringAndLength::new(
+            format!(" ({pane_count_styled} panes)"),
+            2 + graphemes::display_width(&pane_count) + 7,
+        ),
+        StringAndLength::new(
+            format!(" ({pane_count_styled})"),
+            2 + graphemes::display_width(&pane_count) + 1,
+        ),
+    ]));
+    ui_spans.push(tab_bullet_span);
+    ui_spans.push(tab_name_span);
+    ui_spans.push(connected_users_count_span);
+    ui_spans
+}
+
+pub fn build_pane_ui_line(pane_ui_info: &PaneUiInfo, colors: Colors) -> Vec<UiSpan> {
+    let mut ui_spans = vec![];
+    let pane_name = pane_ui_info.name.clone();
+    let exit_code = pane_ui_info.exit_code.map(|exit_code_number| {
+        let exit_code = format!("{}", exit_code_number);
+        let exit_code = if exit_code_number == 0 {
+            colors.session_and_folder_entry(&exit_code)
+        } else {
+            colors.exit_code_error(&exit_code)
+        };
+        exit_code
+    });
+    let pane_bullet_span =
+        UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![StringAndLength::new(
+            format!("    > "),
+            6,
+        )]));
+    ui_spans.push(pane_bullet_span);
+    let pane_name_span =
+        UiSpan::TruncatableUiSpan(TruncatableUiSpan::new(pane_name, SpanStyle::Bold));
+    ui_spans.push(pane_name_span);
+    if let Some(exit_code) = exit_code {
+        let pane_name_span = UiSpan::UiSpanTelescope(UiSpanTelescope::new(vec![
+            StringAndLength::new(
+                format!(" (EXIT CODE: {exit_code})"),
+                13 + graphemes::display_width(&exit_code) + 1,
+            ),
+            StringAndLength::new(
+                format!(" ({exit_code})"),
+                2 + graphemes::display_width(&exit_code) + 1,
+            ),
+        ]));
+        ui_spans.push(pane_name_span);
+    }
+    ui_spans
+}
+
+pub fn minimize_lines(
+    total_count: usize,
+    line_count_to_remove: usize,
+    selected_index: Option<usize>,
+) -> (usize, usize, usize, usize) {
+    // returns: (start_index, anchor_index, end_index, lines_left_to_remove)
+    let (count_to_render, line_count_to_remove) = if line_count_to_remove > total_count {
+        (1, line_count_to_remove.saturating_sub(total_count) + 1)
+    } else {
+        (total_count.saturating_sub(line_count_to_remove), 0)
+    };
+    let anchor_index = selected_index.unwrap_or(0); // 5
+    let mut start_index = anchor_index.saturating_sub(count_to_render / 2);
+    let mut end_index = start_index + count_to_render;
+    if end_index > total_count {
+        start_index = start_index.saturating_sub(end_index - total_count);
+        end_index = total_count;
+    }
+    (start_index, anchor_index, end_index, line_count_to_remove)
+}
+
+pub fn render_prompt(search_term: &str, colors: Colors, x: usize, y: usize) {
+    let prompt = colors.session_and_folder_entry(&format!("Search:"));
+    let search_term = colors.bold(&format!("{}_", search_term));
+    println!(
+        "\u{1b}[{};{}H\u{1b}[0m{} {}\n",
+        y + 1,
+        x,
+        prompt,
+        search_term
+    );
+}
+
+pub fn render_single_screen_prompt(
+    search_term: &str,
+    enter_action: Option<&str>,
+    extra_hints: &[(&str, &str)],
+    max_width: usize,
+    colors: Colors,
+    x: usize,
+    y: usize,
+) {
+    let prompt = colors.session_name_prompt("Session:");
+    let search_term_display = colors.bold(&format!("{}_", search_term));
+    let mut used = "Session: ".chars().count() + search_term.chars().count() + 1;
+    let mut enter_hint = match enter_action {
+        Some(action) => {
+            let enter_key = colors.shortcuts("<ENTER>");
+            let room = max_width.saturating_sub(used + " <ENTER> - ".chars().count() + 1);
+            if room < 4 {
+                String::new()
+            } else {
+                let action = if action.chars().count() > room {
+                    let mut short: String = action.chars().take(room - 1).collect();
+                    short.push('…');
+                    short
+                } else {
+                    action.to_owned()
+                };
+                used += format!(" <ENTER> - {}", action).chars().count();
+                format!(" {} - {}", enter_key, action)
+            }
+        },
+        None => String::new(),
+    };
+    for (key, label) in extra_hints {
+        let width = format!(", {} - {}", key, label).chars().count();
+        if used + width >= max_width {
+            break;
+        }
+        used += width;
+        enter_hint.push_str(&format!(", {} - {}", colors.shortcuts(key), label));
+    }
+    println!(
+        "\u{1b}[m\u{1b}[{};{}H\u{1b}[0m{} {}{}\n",
+        y + 2,
+        x + 1,
+        prompt,
+        search_term_display,
+        enter_hint,
+    );
+}
+
+pub fn render_screen_toggle(
+    active_screen: ActiveScreen,
+    x: usize,
+    y: usize,
+    max_cols: usize,
+    background: &PaletteColor,
+) {
+    let key_indication_text = "<TAB>";
+    let (new_session_text, running_sessions_text, exited_sessions_text) = if max_cols > 66 {
+        ("New Session", "Attach to Session", "Resurrect Session")
+    } else {
+        ("New", "Attach", "Resurrect")
+    };
+    let key_indication_len = key_indication_text.chars().count() + 1;
+    let first_ribbon_length = new_session_text.chars().count() + 4;
+    let second_ribbon_length = running_sessions_text.chars().count() + 4;
+    let key_indication_x = x;
+    let first_ribbon_x = key_indication_x + key_indication_len;
+    let second_ribbon_x = first_ribbon_x + first_ribbon_length;
+    let third_ribbon_x = second_ribbon_x + second_ribbon_length;
+    let mut new_session_text = Text::from(new_session_text);
+    let mut running_sessions_text = Text::from(running_sessions_text);
+    let mut exited_sessions_text = Text::from(exited_sessions_text);
+    match active_screen {
+        ActiveScreen::NewSession => {
+            new_session_text = new_session_text.selected();
+        },
+        ActiveScreen::AttachToSession => {
+            running_sessions_text = running_sessions_text.selected();
+        },
+        ActiveScreen::ResurrectSession => {
+            exited_sessions_text = exited_sessions_text.selected();
+        },
+        ActiveScreen::SingleScreen => {
+            // SingleScreen does not use the tab toggle; this arm exists for exhaustiveness
+            return;
+        },
+    }
+    let bg_color = match background {
+        PaletteColor::Rgb((r, g, b)) => format!("\u{1b}[48;2;{};{};{}m\u{1b}[0K", r, g, b),
+        PaletteColor::EightBit(color) => format!("\u{1b}[48;5;{}m\u{1b}[0K", color),
+    };
+    print_text_with_coordinates(
+        Text::from(key_indication_text).color_range(3, ..).opaque(),
+        key_indication_x,
+        y,
+        None,
+        None,
+    );
+    println!("\u{1b}[{};{}H{}", y + 1, first_ribbon_x, bg_color);
+    print_ribbon_with_coordinates(new_session_text, first_ribbon_x, y, None, None);
+    print_ribbon_with_coordinates(running_sessions_text, second_ribbon_x, y, None, None);
+    print_ribbon_with_coordinates(exited_sessions_text, third_ribbon_x, y, None, None);
+}
+
+fn render_new_session_folder_prompt(
+    new_session_info: &NewSessionInfo,
+    colors: Colors,
+    x: usize,
+    y: usize,
+    max_cols: usize,
+) {
+    match new_session_info.new_session_folder.as_ref() {
+        Some(new_session_folder) => {
+            let folder_prompt = "New session folder:";
+            let short_folder_prompt = "Folder:";
+            let new_session_path = new_session_folder.clone();
+            let new_session_folder = new_session_folder.display().to_string();
+            let change_folder_shortcut_text = "<Ctrl f>";
+            let change_folder_shortcut = colors.shortcuts(&change_folder_shortcut_text);
+            let to_change = "to change";
+            let reset_folder_shortcut_text = "<Ctrl c>";
+            let reset_folder_shortcut = colors.shortcuts(reset_folder_shortcut_text);
+            let to_reset = "to reset";
+            if max_cols
+                >= graphemes::display_width(&folder_prompt)
+                    + graphemes::display_width(&new_session_folder)
+                    + graphemes::display_width(&change_folder_shortcut_text)
+                    + graphemes::display_width(&to_change)
+                    + graphemes::display_width(&reset_folder_shortcut_text)
+                    + graphemes::display_width(&to_reset)
+                    + 8
+            {
+                print!(
+                    "\u{1b}[m{}{} {} ({} {}, {} {})",
+                    format!("\u{1b}[{};{}H", y + 1, x + 1),
+                    colors.session_name_prompt(folder_prompt),
+                    colors.session_and_folder_entry(&new_session_folder),
+                    change_folder_shortcut,
+                    to_change,
+                    reset_folder_shortcut,
+                    to_reset,
+                );
+            } else if max_cols
+                >= graphemes::display_width(&short_folder_prompt)
+                    + graphemes::display_width(&new_session_folder)
+                    + graphemes::display_width(&change_folder_shortcut_text)
+                    + graphemes::display_width(&to_change)
+                    + graphemes::display_width(&reset_folder_shortcut_text)
+                    + graphemes::display_width(&to_reset)
+                    + 8
+            {
+                print!(
+                    "\u{1b}[m{}{} {} ({} {}, {} {})",
+                    format!("\u{1b}[{};{}H", y + 1, x + 1),
+                    colors.session_name_prompt(short_folder_prompt),
+                    colors.session_and_folder_entry(&new_session_folder),
+                    change_folder_shortcut,
+                    to_change,
+                    reset_folder_shortcut,
+                    to_reset,
+                );
+            } else if max_cols
+                >= graphemes::display_width(&short_folder_prompt)
+                    + graphemes::display_width(&new_session_folder)
+                    + graphemes::display_width(&change_folder_shortcut_text)
+                    + graphemes::display_width(&reset_folder_shortcut_text)
+                    + 5
+            {
+                print!(
+                    "\u{1b}[m{}{} {} ({}/{})",
+                    format!("\u{1b}[{};{}H", y + 1, x + 1),
+                    colors.session_name_prompt(short_folder_prompt),
+                    colors.session_and_folder_entry(&new_session_folder),
+                    change_folder_shortcut,
+                    reset_folder_shortcut,
+                );
+            } else {
+                let total_len = graphemes::display_width(&short_folder_prompt)
+                    + graphemes::display_width(&change_folder_shortcut_text)
+                    + graphemes::display_width(&reset_folder_shortcut_text)
+                    + 5;
+                let max_path_len = max_cols.saturating_sub(total_len);
+                let truncated_path = truncate_path(
+                    new_session_path,
+                    graphemes::display_width(&new_session_folder).saturating_sub(max_path_len),
+                );
+                print!(
+                    "\u{1b}[m{}{} {} ({}/{})",
+                    format!("\u{1b}[{};{}H", y + 1, x + 1),
+                    colors.session_name_prompt(short_folder_prompt),
+                    colors.session_and_folder_entry(&truncated_path),
+                    change_folder_shortcut,
+                    reset_folder_shortcut,
+                );
+            }
+        },
+        None => {
+            let folder_prompt = "New session folder:";
+            let short_folder_prompt = "Folder:";
+            let change_folder_shortcut_text = "<Ctrl f>";
+            let change_folder_shortcut = colors.shortcuts(change_folder_shortcut_text);
+            let to_set = "to set";
+
+            if max_cols
+                >= graphemes::display_width(&folder_prompt)
+                    + graphemes::display_width(&change_folder_shortcut_text)
+                    + graphemes::display_width(&to_set)
+                    + 4
+            {
+                print!(
+                    "\u{1b}[m{}{} ({} {})",
+                    format!("\u{1b}[{};{}H", y + 1, x + 1),
+                    colors.session_name_prompt(folder_prompt),
+                    change_folder_shortcut,
+                    to_set,
+                );
+            } else if max_cols
+                >= graphemes::display_width(&short_folder_prompt)
+                    + graphemes::display_width(&change_folder_shortcut_text)
+                    + graphemes::display_width(&to_set)
+                    + 4
+            {
+                print!(
+                    "\u{1b}[m{}{} ({} {})",
+                    format!("\u{1b}[{};{}H", y + 1, x + 1),
+                    colors.session_name_prompt(short_folder_prompt),
+                    change_folder_shortcut,
+                    to_set,
+                );
+            } else {
+                print!(
+                    "\u{1b}[m{}{} {}",
+                    format!("\u{1b}[{};{}H", y + 1, x + 1),
+                    colors.session_name_prompt(short_folder_prompt),
+                    change_folder_shortcut,
+                );
+            }
+        },
+    }
+}
+
+pub fn render_new_session_block(
+    new_session_info: &NewSessionInfo,
+    colors: Colors,
+    max_rows_of_new_session_block: usize,
+    max_cols_of_new_session_block: usize,
+    x: usize,
+    y: usize,
+) {
+    let enter = colors.shortcuts("<ENTER>");
+    if new_session_info.entering_new_session_name() {
+        let prompt = "New session name:";
+        let long_instruction = "when done, blank for random";
+        let new_session_name = new_session_info.name();
+        if max_cols_of_new_session_block
+            > graphemes::display_width(&prompt)
+                + graphemes::display_width(&long_instruction)
+                + graphemes::display_width(&new_session_name)
+                + 15
+        {
+            println!(
+                "\u{1b}[m{}{} {}_ ({} {})",
+                format!("\u{1b}[{};{}H", y + 1, x + 1),
+                colors.session_name_prompt(prompt),
+                colors.session_and_folder_entry(&new_session_name),
+                enter,
+                long_instruction,
+            );
+        } else {
+            let space_for_new_session_name = max_cols_of_new_session_block
+                .saturating_sub(graphemes::display_width(&prompt) + 18);
+            let new_session_name =
+                if graphemes::display_width(&new_session_name) > space_for_new_session_name {
+                    let truncated = graphemes::truncate_start(
+                        &new_session_name,
+                        space_for_new_session_name.saturating_sub(1),
+                        "",
+                    );
+                    format!("...{}", truncated)
+                } else {
+                    new_session_name.to_owned()
+                };
+            println!(
+                "\u{1b}[m{}{} {}_ {}",
+                format!("\u{1b}[{};{}H", y + 1, x + 1),
+                colors.session_name_prompt(prompt),
+                colors.session_and_folder_entry(&new_session_name),
+                enter,
+            );
+        }
+    } else if new_session_info.entering_layout_search_term() {
+        let new_session_name = if new_session_info.name().is_empty() {
+            "<RANDOM>"
+        } else {
+            new_session_info.name()
+        };
+        let prompt = "New session name:";
+        let long_instruction = "to correct";
+        let esc = colors.shortcuts("<ESC>");
+        if max_cols_of_new_session_block
+            > graphemes::display_width(&prompt)
+                + graphemes::display_width(&long_instruction)
+                + graphemes::display_width(&new_session_name)
+                + 15
+        {
+            println!(
+                "\u{1b}[m{}{}: {} ({} to correct)",
+                format!("\u{1b}[{};{}H", y + 1, x + 1),
+                colors.session_name_prompt(prompt),
+                colors.session_and_folder_entry(new_session_name),
+                esc,
+            );
+        } else {
+            println!(
+                "\u{1b}[m{}{}: {} {}",
+                format!("\u{1b}[{};{}H", y + 1, x + 1),
+                colors.session_name_prompt("New session name"),
+                colors.session_and_folder_entry(new_session_name),
+                esc,
+            );
+        }
+        render_layout_selection_list(
+            new_session_info,
+            max_rows_of_new_session_block.saturating_sub(8),
+            max_cols_of_new_session_block,
+            x,
+            y + 1,
+        );
+    }
+    render_new_session_folder_prompt(
+        new_session_info,
+        colors,
+        x,
+        (y + max_rows_of_new_session_block).saturating_sub(3),
+        max_cols_of_new_session_block,
+    );
+}
+
+pub fn render_layout_selection_list(
+    new_session_info: &NewSessionInfo,
+    max_rows_of_new_session_block: usize,
+    max_cols_of_new_session_block: usize,
+    x: usize,
+    y: usize,
+) {
+    let layout_search_term = new_session_info.layout_search_term();
+    let search_term_width = graphemes::display_width(&layout_search_term);
+    let search_term_len = layout_search_term.chars().count();
+    let layout_indication_line = if max_cols_of_new_session_block > 73 + search_term_width {
+        Text::from(format!(
+            "New session layout: {}_ (Search and select from list, <ENTER> when done)",
+            layout_search_term
+        ))
+        .color_range(2, ..20 + search_term_len)
+        .color_range(3, 20..20 + search_term_len)
+        .color_range(3, 52 + search_term_len..59 + search_term_len)
+    } else {
+        Text::from(format!(
+            "New session layout: {}_ <ENTER>",
+            layout_search_term
+        ))
+        .color_range(2, ..20 + search_term_len)
+        .color_range(3, 20..20 + search_term_len)
+        .color_range(3, 22 + search_term_len..)
+    };
+    print_text_with_coordinates(layout_indication_line, x, y + 1, None, None);
+    println!();
+    let mut table = Table::new();
+    for (i, (layout_info, indices, is_selected)) in new_session_info
+        .layouts_to_render(max_rows_of_new_session_block)
+        .into_iter()
+        .enumerate()
+    {
+        let layout_name = layout_info.name();
+        let layout_name_len = layout_name.chars().count();
+        let is_builtin = layout_info.is_builtin();
+        if i > max_rows_of_new_session_block.saturating_sub(1) {
+            break;
+        } else {
+            let mut layout_cell = if is_builtin {
+                Text::from(format!("{} (built-in)", layout_name))
+                    .color_range(1, 0..layout_name_len)
+                    .color_range(0, layout_name_len + 1..)
+                    .color_indices(3, indices)
+            } else {
+                Text::from(format!("{}", layout_name))
+                    .color_range(1, ..)
+                    .color_indices(3, indices)
+            };
+            if is_selected {
+                layout_cell = layout_cell.selected();
+            }
+            let arrow_cell = if is_selected {
+                Text::from(format!("<↓↑>")).selected().color_range(3, ..)
+            } else {
+                Text::from(format!("    ")).color_range(3, ..)
+            };
+            table = table.add_styled_row(vec![arrow_cell, layout_cell]);
+        }
+    }
+    let table_y = y + 3;
+    print_table_with_coordinates(table, x, table_y, None, None);
+}
+
+pub fn render_error(error_text: &str, rows: usize, columns: usize, x: usize, y: usize) {
+    print_text_with_coordinates(
+        Text::from(format!("Error: {}", error_text)).color_range(3, ..),
+        x,
+        y + rows,
+        Some(columns),
+        None,
+    );
+}
+
+pub fn render_renaming_session_screen(
+    new_session_name: &str,
+    rows: usize,
+    columns: usize,
+    x: usize,
+    y: usize,
+) {
+    if rows == 0 || columns == 0 {
+        return;
+    }
+    let text = Text::from(format!(
+        "New name for current session: {}_ (<ENTER> when done)",
+        new_session_name
+    ))
+    .color_range(2, ..29)
+    .color_range(
+        3,
+        33 + graphemes::display_width(&new_session_name)
+            ..40 + graphemes::display_width(&new_session_name),
+    );
+    print_text_with_coordinates(text, x, y, None, None);
+    if new_session_name.contains('/') {
+        let error_text = "Error: session name cannot contain '/'";
+        print_text_with_coordinates(
+            Text::from(error_text).color_range(3, ..),
+            x,
+            y + 2,
+            None,
+            None,
+        );
+    }
+}
+
+pub fn render_controls_line(
+    active_screen: ActiveScreen,
+    max_cols: usize,
+    colors: Colors,
+    x: usize,
+    y: usize,
+    show_navigate: bool,
+) -> usize {
+    const HELP_PREFIX_LEN: usize = 6;
+    let x = x + 1;
+
+    let shows_help_prefix = match active_screen {
+        ActiveScreen::NewSession => {
+            if max_cols >= 50 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}H\u{1b}[1mHelp: Fill in the form to start a new session."
+                );
+                true
+            } else {
+                false
+            }
+        },
+        ActiveScreen::AttachToSession => {
+            let rename = colors.shortcuts("<Ctrl r>");
+            let rename_text = colors.bold("Rename");
+            let disconnect = colors.shortcuts("<Alt x>");
+            let disconnect_text = colors.bold("Disconnect others");
+            let kill = colors.shortcuts("<Del>");
+            let kill_text = colors.bold("Kill");
+            let kill_all = colors.shortcuts("<Ctrl d>");
+            let kill_all_text = colors.bold("Kill all");
+
+            if max_cols > 90 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill} - {kill_text}, {kill_all} - {kill_all_text}"
+                );
+                true
+            } else if max_cols >= 28 {
+                print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}/{kill_all}");
+                false
+            } else {
+                false
+            }
+        },
+        ActiveScreen::ResurrectSession => {
+            let arrows = colors.shortcuts("<↓↑>");
+            let navigate = colors.bold("Navigate");
+            let enter = colors.shortcuts("<ENTER>");
+            let select = colors.bold("Resurrect");
+            let del = colors.shortcuts("<DEL>");
+            let del_text = colors.bold("Delete");
+            let del_all = colors.shortcuts("<Ctrl d>");
+            let del_all_text = colors.bold("Delete all");
+
+            if max_cols > 83 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {enter} - {select}, {del} - {del_text}, {del_all} - {del_all_text}"
+                );
+                true
+            } else if max_cols >= 28 {
+                print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{enter}/{del}/{del_all}");
+                false
+            } else {
+                false
+            }
+        },
+        ActiveScreen::SingleScreen if show_navigate && crate::app_panel::is_enabled() => {
+            let arrows = colors.shortcuts("<←↓↑→>");
+            let navigate = colors.bold("Navigate");
+            let rename = colors.shortcuts("<Ctrl r>");
+            let rename_text = colors.bold("Rename");
+            let kill = colors.shortcuts("<Del>");
+            let kill_text = colors.bold("Stop/Delete");
+            let layout = colors.shortcuts("<Ctrl l>");
+            let layout_text = colors.bold("New with layout");
+            if max_cols > 92 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {layout} - {layout_text}, {rename} - {rename_text}, {kill} - {kill_text}"
+                );
+                true
+            } else if max_cols >= 34 {
+                print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{layout}/{rename}/{kill}");
+                false
+            } else {
+                false
+            }
+        },
+        ActiveScreen::SingleScreen if show_navigate => {
+            let arrows = colors.shortcuts("<←↓↑→>");
+            let navigate = colors.bold("Navigate");
+            let rename = colors.shortcuts("<Ctrl r>");
+            let rename_text = colors.bold("Rename");
+            let disconnect = colors.shortcuts("<Alt x>");
+            let disconnect_full_text = colors.bold("Disconnect others");
+            let disconnect_short_text = colors.bold("Disconnect");
+            let kill = colors.shortcuts("<Del>");
+            let kill_text = colors.bold("Kill/Delete");
+            let layout = colors.shortcuts("<Ctrl l>");
+            let layout_full_text = colors.bold("New with layout");
+            let layout_short_text = colors.bold("Layout");
+            if max_cols > 121 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {layout} - {layout_full_text}, {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill} - {kill_text}"
+                );
+                true
+            } else if max_cols > 105 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {layout} - {layout_short_text}, {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}"
+                );
+                true
+            } else if max_cols > 61 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}H{arrows} - {navigate}, {layout} - {layout_short_text}, {rename}/{disconnect}/{kill}"
+                );
+                false
+            } else if max_cols >= 39 {
+                print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{layout}/{rename}/{disconnect}/{kill}");
+                false
+            } else {
+                false
+            }
+        },
+        ActiveScreen::SingleScreen => {
+            let rename = colors.shortcuts("<Ctrl r>");
+            let rename_text = colors.bold("Rename");
+            let disconnect = colors.shortcuts("<Alt x>");
+            let disconnect_full_text = colors.bold("Disconnect others");
+            let disconnect_short_text = colors.bold("Disconnect");
+            let kill = colors.shortcuts("<Del>");
+            let kill_text = colors.bold("Kill/Delete");
+
+            if max_cols > 76 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill} - {kill_text}"
+                );
+                true
+            } else if max_cols > 69 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}"
+                );
+                true
+            } else if max_cols >= 23 {
+                print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}");
+                false
+            } else {
+                false
+            }
+        },
+    };
+
+    if shows_help_prefix {
+        HELP_PREFIX_LEN
+    } else {
+        0
+    }
+}
+
+fn format_elapsed_time(elapsed_millis: u64) -> String {
+    // Convert elapsed milliseconds to Duration
+    let elapsed_duration = Duration::from_millis(elapsed_millis);
+
+    // Use humantime to format the duration, same as in resurrectable_sessions.rs
+    let duration_str = format_duration(elapsed_duration).to_string();
+    let duration_parts = duration_str.split_whitespace();
+    let mut formatted_duration = String::new();
+    for part in duration_parts {
+        if !part.ends_with('s') {
+            if !formatted_duration.is_empty() {
+                formatted_duration.push(' ');
+            }
+            formatted_duration.push_str(part);
+        }
+    }
+    if formatted_duration.is_empty() {
+        format!("just now")
+    } else {
+        format!("{} ago", formatted_duration)
+    }
+}
+
+pub fn saved_text(last_saved_timestamp: Option<u64>) -> String {
+    match last_saved_timestamp {
+        Some(timestamp) => format!("(saved {})", format_elapsed_time(timestamp)),
+        None => "(not saved)".to_string(),
+    }
+}
+
+pub fn render_unsaved_changes_line(
+    max_cols: usize,
+    x: usize,
+    y: usize,
+    last_saved_timestamp: Option<u64>,
+) {
+    // Declare all text components
+    let shortcut_text = "<Ctrl a>";
+    let full_action_text = "Save current session for resurrection";
+    let medium_action_text = "Save session";
+    let short_action_text = "Save";
+    let separator = " - ";
+    let space = " ";
+
+    let time_text = saved_text(last_saved_timestamp);
+
+    // Calculate component widths
+    let shortcut_width = graphemes::display_width(&shortcut_text);
+    let separator_width = graphemes::display_width(&separator);
+    let space_width = graphemes::display_width(&space);
+    let time_width = graphemes::display_width(&time_text);
+
+    // Calculate total widths for each display mode
+    // Format: "{shortcut}{separator}{action}{space}{time}"
+    let full_width = shortcut_width
+        + separator_width
+        + graphemes::display_width(&full_action_text)
+        + space_width
+        + time_width;
+    let medium_width = shortcut_width
+        + separator_width
+        + graphemes::display_width(&medium_action_text)
+        + space_width
+        + time_width;
+    let short_width = shortcut_width
+        + separator_width
+        + graphemes::display_width(&short_action_text)
+        + space_width
+        + time_width;
+    let minimal_width = shortcut_width + space_width + time_width;
+
+    // Select appropriate message based on available width
+    let msg = if max_cols >= full_width {
+        format!(
+            "{}{}{}{}{}",
+            shortcut_text, separator, full_action_text, space, time_text
+        )
+    } else if max_cols >= medium_width {
+        format!(
+            "{}{}{}{}{}",
+            shortcut_text, separator, medium_action_text, space, time_text
+        )
+    } else if max_cols >= short_width {
+        format!(
+            "{}{}{}{}{}",
+            shortcut_text, separator, short_action_text, space, time_text
+        )
+    } else if max_cols >= minimal_width {
+        format!("{}{}{}", shortcut_text, space, time_text)
+    } else {
+        return; // Not enough space to render
+    };
+
+    let text = Text::from(msg)
+        .color_substring(3, shortcut_text)
+        .color_substring(2, &time_text);
+    print_text_with_coordinates(text, x, y, None, None);
+}
+
+// Maps the various prompts and UI elements to the colors to present them with
+//
+// Since this plugin predates the UI components, this is a developer
+// convenience to keep the coloration of dialogs organized by descriptive names
+//
+// It will be obviated once everything is migrated to UI components from zellij-tile
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Colors {
+    pub palette: Styling,
+}
+impl Colors {
+    pub fn new(palette: Styling) -> Self {
+        Colors { palette }
+    }
+    pub fn bold(&self, text: &str) -> String {
+        format!("\u{1b}[1m{}\u{1b}[22m", text)
+    }
+
+    fn color(&self, color: &PaletteColor, text: &str) -> String {
+        match color {
+            PaletteColor::EightBit(byte) => {
+                format!("\u{1b}[38;5;{};1m{}\u{1b}[39;22m", byte, text)
+            },
+            PaletteColor::Rgb((r, g, b)) => {
+                format!("\u{1b}[38;2;{};{};{};1m{}\u{1b}[39;22m", r, g, b, text)
+            },
+        }
+    }
+
+    pub fn session_name_prompt(&self, text: &str) -> String {
+        self.color(&self.palette.exit_code_success.base, text)
+    }
+
+    pub fn connected_users(&self, text: &str) -> String {
+        self.color(&self.palette.text_unselected.emphasis_2, text)
+    }
+
+    pub fn session_and_folder_entry(&self, text: &str) -> String {
+        self.color(&self.palette.text_unselected.emphasis_0, text)
+    }
+
+    pub fn current_session_marker(&self, text: &str) -> String {
+        self.color(&self.palette.text_unselected.emphasis_0, text)
+    }
+
+    pub fn pane_count(&self, text: &str) -> String {
+        self.color(&self.palette.text_unselected.emphasis_2, text)
+    }
+
+    pub fn exit_code_error(&self, text: &str) -> String {
+        self.color(&self.palette.exit_code_error.base, text)
+    }
+
+    pub fn tab_count(&self, text: &str) -> String {
+        self.color(&self.palette.text_unselected.emphasis_1, text)
+    }
+
+    pub fn shortcuts(&self, text: &str) -> String {
+        self.color(&self.palette.text_unselected.emphasis_3, text)
+    }
+}
+
+fn truncate_path(path: PathBuf, mut char_count_to_remove: usize) -> String {
+    let mut truncated = String::new();
+    let component_count = path.iter().count();
+    for (i, component) in path.iter().enumerate() {
+        let mut component_str = component.to_string_lossy().to_string();
+        if char_count_to_remove > 0 {
+            truncated.push(component_str.remove(0));
+            if i != 0 && i + 1 != component_count {
+                truncated.push('/');
+            }
+            char_count_to_remove = char_count_to_remove
+                .saturating_sub(graphemes::display_width(&component_str).saturating_sub(1));
+        } else {
+            truncated.push_str(&component_str);
+            if i != 0 && i + 1 != component_count {
+                truncated.push('/');
+            }
+        }
+    }
+    truncated
+}

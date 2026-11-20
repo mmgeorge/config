@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/sessions"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+zellij-tile = "=0.46.0"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

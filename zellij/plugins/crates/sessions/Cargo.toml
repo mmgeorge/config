@@ -1,0 +1,14 @@
+# Fork of default-plugins/session-manager at zellij-org/zellij@088dc456b3576ec5a377c8bcb970ac5451aa6cfd.
+[package]
+name = "sessions"
+version = "0.1.0"
+authors = ["Aram Drevekenin <aram@poor.dev>"]
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zellij-tile.workspace = true
+fuzzy-matcher = { version = "0.3.7", default-features = false }
+unicode-width = { version = "0.2.2", default-features = false }
+humantime = { version = "2.1.0", default-features = false }
+uuid = { version = "1.4.1", default-features = false, features = ["serde", "v4", "std"] }

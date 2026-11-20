@@ -192,12 +192,13 @@ keybinds clear-defaults=true {
         bind "c" { NewTab; SwitchToMode "normal"; }
         bind "y" { GoToPreviousTab; SwitchToMode "normal"; }
         bind "z" { GoToNextTab; SwitchToMode "normal"; }
-        // Session picker (WezTerm: LEADER + s)
+        // Load the locally built Session Manager from the plugin workspace.
         bind "s" {
             SwitchToMode "normal"
-            LaunchOrFocusPlugin "zellij:session-manager" {
+            LaunchOrFocusPlugin "file:D:/config/zellij/plugins/target/wasm32-wasip1/release/sessions.wasm" {
                 floating true
                 move_to_focused_tab true
+                skip_plugin_cache true
             }
         }
         bind "S" { SwitchToMode "normal"; ToggleSession; }
@@ -226,6 +227,7 @@ terminal {
     cursor_style "block"
     cursor_blink false
     startup_mode "windowed"
+    titlebar_theme "dark"
     initial_columns 80
     initial_rows 24
     paste_keys "Ctrl y" "Ctrl Shift v" "Shift Insert" "Super v"
