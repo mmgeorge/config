@@ -36,6 +36,9 @@ struct BridgeFixtureProvider {
     terminal_started: tokio::sync::Notify,
     terminal_release: tokio::sync::Notify,
     open_blocked: std::sync::atomic::AtomicBool,
+    /// Report an interrupted open provisionally until native shutdown joins its worker, as an
+    /// adapter whose retained operation store publishes its interruption observation first does.
+    open_provisional_until_shutdown: std::sync::atomic::AtomicBool,
     open_started: tokio::sync::Notify,
     open_failure: Mutex<Option<ProviderError>>,
     open_persistent_failure: Mutex<Option<ProviderError>>,
@@ -94,6 +97,7 @@ impl BridgeFixtureProvider {
             terminal_started: tokio::sync::Notify::new(),
             terminal_release: tokio::sync::Notify::new(),
             open_blocked: std::sync::atomic::AtomicBool::new(false),
+            open_provisional_until_shutdown: std::sync::atomic::AtomicBool::new(false),
             open_started: tokio::sync::Notify::new(),
             open_failure: Mutex::new(None),
             open_persistent_failure: Mutex::new(None),
@@ -231,6 +235,34 @@ impl NativeProvider for BridgeFixtureProvider {
         if let Some(error) = self.open_persistent_failure.lock().unwrap().clone() {
             return Err(error);
         }
+        let provisional = self.open_provisional_until_shutdown.load(Ordering::Acquire);
+        if provisional
+            && operation
+                .check_admission(ProviderOperation::ThreadOpen)
+                .is_err()
+        {
+            return Err(if self.shutdown_calls.load(Ordering::Acquire) == 0 {
+                ProviderFailure::new(
+                    ProviderOperation::ThreadOpen,
+                    ProviderFailureKind::Cancelled,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Collection,
+                    forge_provider_api::FailureDisposition::Invalidated,
+                )
+                .into()
+            } else {
+                ProviderFailure::new(
+                    ProviderOperation::ThreadOpen,
+                    ProviderFailureKind::Cancelled,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Admission,
+                    forge_provider_api::FailureDisposition::Unchanged,
+                )
+                .into()
+            });
+        }
         operation.check_admission(ProviderOperation::ThreadOpen)?;
         self.open_instructions
             .lock()
@@ -259,11 +291,20 @@ impl NativeProvider for BridgeFixtureProvider {
         }
         if self.open_blocked.load(Ordering::Acquire) {
             self.open_started.notify_one();
-            return Err(operation.interrupted().await.failure(
-                ProviderOperation::ThreadOpen,
-                forge_provider_api::ProviderPhase::Preparation,
-                forge_provider_api::FailureDisposition::Unchanged,
-            ));
+            let reason = operation.interrupted().await;
+            return Err(if provisional {
+                reason.failure(
+                    ProviderOperation::ThreadOpen,
+                    forge_provider_api::ProviderPhase::Collection,
+                    forge_provider_api::FailureDisposition::Invalidated,
+                )
+            } else {
+                reason.failure(
+                    ProviderOperation::ThreadOpen,
+                    forge_provider_api::ProviderPhase::Preparation,
+                    forge_provider_api::FailureDisposition::Unchanged,
+                )
+            });
         }
         let binding = self
             .open_binding_override
@@ -1018,6 +1059,38 @@ async fn shutdown_revokes_pending_open_before_waiting_for_admission() -> anyhow:
     assert!(
         matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::BindingClosed)
     );
+    Ok(())
+}
+
+/// Shutdown reports no cleanup failure for an interrupted open that native shutdown collects.
+///
+/// An adapter's retained operation store answers an interrupted open with a provisional
+/// observation until its worker joins, and only native shutdown joins it. The retirement pass
+/// before native shutdown therefore cannot settle the open; the pass after it can. A child agent
+/// interrupted while its provider was starting used to report that provisional observation as
+/// `shutdown: provider ThreadOpen failed: Cancelled`, which failed the parent's stop.
+#[tokio::test]
+async fn shutdown_supersedes_a_provisional_open_failure_after_native_collection()
+-> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    native.open_blocked.store(true, Ordering::Release);
+    native
+        .open_provisional_until_shutdown
+        .store(true, Ordering::Release);
+    let bridge = Arc::new(bridge(root.path(), native.clone()).await?);
+    let request = provider_request(root.path());
+    let opening = bridge.clone();
+    let worker = tokio::spawn(async move { opening.thread_open(request).await });
+    native.open_started.notified().await;
+    bridge.shutdown().await?;
+    let error = worker
+        .await?
+        .expect_err("shutdown must interrupt the held open");
+    assert!(
+        matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Cancelled)
+    );
+    assert_eq!(native.shutdown_calls.load(Ordering::Acquire), 1);
     Ok(())
 }
 

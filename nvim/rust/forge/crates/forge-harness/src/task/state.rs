@@ -100,6 +100,29 @@ impl SuspendedTask {
 }
 
 impl SuspensionReason {
+    /// Name why a blocked task stopped continuing, in the words its transcript row and status
+    /// share, or nothing when this suspension is not a block.
+    ///
+    /// `reported` is the model's own explanation of a block it reported, when one is known.
+    pub(crate) fn blocked_cause(&self, reported: Option<&str>) -> Option<String> {
+        Some(match self {
+            Self::TurnBudget { max_turn_count, .. } => {
+                format!("the allowance of {max_turn_count} automatic turns is used up")
+            }
+            Self::NoProgress {
+                consecutive_turn_count,
+            } => format!("{consecutive_turn_count} consecutive turns changed no files"),
+            Self::GoalReportedBlocked | Self::ExecutionBlocked { .. } => reported
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map_or_else(
+                    || "the model reported that it cannot continue".to_owned(),
+                    |message| format!("the model reported: {message}"),
+                ),
+            Self::Paused | Self::PlanningFailed | Self::Stopping => return None,
+        })
+    }
+
     fn status(&self) -> TaskStatus {
         match self {
             Self::Paused => TaskStatus::Paused,
@@ -409,7 +432,10 @@ pub(super) fn validate_passing_gate(record: &crate::plan::PlanExecutionRecord) -
 }
 
 /// Translate artifact outcomes once, at construction of the owning suspension payload.
-fn suspension_reason(workflow: &WorkflowSnapshot, status: TaskStatus) -> SuspensionReason {
+pub(super) fn suspension_reason(
+    workflow: &WorkflowSnapshot,
+    status: TaskStatus,
+) -> SuspensionReason {
     if status == TaskStatus::Paused {
         return SuspensionReason::Paused;
     }

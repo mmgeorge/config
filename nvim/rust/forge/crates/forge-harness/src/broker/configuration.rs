@@ -165,6 +165,8 @@ pub(crate) struct ConfigurationCandidate {
     status_thoughts: Option<bool>,
     question_model: Option<crate::settings::AskModel>,
     delegation_registry_changed: bool,
+    /// Whether child work was running or queued when the candidate was validated.
+    child_work_admitted: bool,
     update_model_preference: bool,
     resource_selection: Option<crate::settings::PortableSettings>,
     reconciled: Arc<std::sync::atomic::AtomicBool>,
@@ -205,9 +207,16 @@ impl ConfigurationCandidate {
             || selected.effort != previous.effort
             || selected.context_window != previous.context_window
             || selected.service_tier != previous.service_tier
-            || self.delegation_registry_changed
             || self.resource_selection.is_some()
         {
+            return ConfigurationEffect::ReplaceRoot;
+        }
+        // A provider receives the root's tool set when a turn starts, so a toolset toggle restarts
+        // the running turn to replace it. While child work is admitted, that restart would finalize
+        // the parent over an unsettled delegation tree and fail it, so the toggle commits locally:
+        // every tool call reads the committed flag, and the next turn start, which comes after the
+        // children settle, receives the new tool set.
+        if self.delegation_registry_changed && !self.child_work_admitted {
             return ConfigurationEffect::ReplaceRoot;
         }
         ConfigurationEffect::Local
@@ -1088,6 +1097,7 @@ impl HarnessBroker {
             status_thoughts,
             question_model,
             delegation_registry_changed,
+            child_work_admitted: self.agent_coordinator.collection_count().has_work(),
             update_model_preference,
             resource_selection,
             reconciled,

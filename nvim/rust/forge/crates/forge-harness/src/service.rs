@@ -1411,6 +1411,9 @@ struct SessionController {
     submission_store: Arc<crate::provider::submission::SubmissionStore>,
     input_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     input_stopping: AtomicBool,
+    /// Name the automatic plan acceptance whose stop was last reported, so input admission
+    /// reports a journaled acceptance it will not resubmit once rather than on every pass.
+    stopped_plan_acceptance: std::sync::Mutex<Option<String>>,
     /// Fail every later provider initialization, so tests reach a restart that cannot finish.
     ///
     /// No provider boundary fails restart initialization, because it opens no native session.
@@ -1559,6 +1562,7 @@ impl SessionController {
             questions: broker.questions.clone(),
             provider_startup: Mutex::new(None),
             provider_startup_error: std::sync::Mutex::new(None),
+            stopped_plan_acceptance: std::sync::Mutex::new(None),
             task_controller: broker.task_controller.clone(),
             goal_max_turns: broker.goal_max_turns,
             coordinator: SessionCoordinator::new(input),

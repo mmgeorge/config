@@ -5,7 +5,7 @@ local popup_window = require("forge.infra.popup_window")
 ---@param lines string[]
 ---@param on_yes fun()
 ---@param on_no? fun()
----@param options? {title?: string, min_width?: integer}
+---@param options? {title?: string, min_width?: integer, origin?: ForgePopupOrigin}
 ---@return integer buffer
 function M.open(lines, on_yes, on_no, options)
   options = options or {}
@@ -15,7 +15,7 @@ function M.open(lines, on_yes, on_no, options)
   local width = options.min_width or 32
   for _, line in ipairs(body) do width = math.max(width, vim.fn.strdisplaywidth(line) + 4) end
   local buffer, window = popup_window.open({ relative = "editor", width = width, height = #body,
-    title = options.title or "Confirm", filetype = "ForgeConfirm" })
+    title = options.title or "Confirm", filetype = "ForgeConfirm", origin = options.origin })
   vim.api.nvim_buf_set_lines(buffer, 0, -1, false, body)
   vim.bo[buffer].modifiable = false
   local finished = false

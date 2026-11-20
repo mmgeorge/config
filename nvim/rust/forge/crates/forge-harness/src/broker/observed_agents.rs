@@ -17,11 +17,93 @@ impl HarnessBroker {
         self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))
     }
 
+    /// End the native children of an exchange the user cancelled, at the cancel request.
+    ///
+    /// A cancel stops the delegating turn and every child running inside it. The provider can
+    /// still deliver child output after the request: Copilot reports a synchronous child's
+    /// cancellation only at shutdown, and a child that finished just before the stop reached
+    /// the provider arrives as a completion the host has not drawn yet. Each live child
+    /// therefore ends interrupted now, and every later native observation of the exchange's
+    /// children is discarded. The next timeline reconciliation publishes the change.
+    ///
+    /// A storage failure here does not fail the cancel: the discard of the next child
+    /// observation and the exchange's settlement record the interruption again.
+    pub(crate) fn cancel_observed_children_of(&mut self, exchange_id: &str) {
+        self.cancelled_native_parents.insert(exchange_id.to_owned());
+        if let Err(error) = self.interrupt_cancelled_children(exchange_id) {
+            self.trace.record(
+                &self.session.id,
+                "agent.native_interrupt_failed",
+                serde_json::json!({
+                    "exchange_id": exchange_id,
+                    "error": format!("{error:#}"),
+                }),
+            );
+        }
+    }
+
+    /// Reopen child observation when an exchange the user cancelled runs a new turn.
+    pub(crate) fn resume_observed_children_of(&mut self, exchange_id: &str) {
+        self.cancelled_native_parents.remove(exchange_id);
+    }
+
+    /// Record the interruption of every live child of a cancelled exchange.
+    fn interrupt_cancelled_children(&mut self, exchange_id: &str) -> Result<()> {
+        let now_ms = self.clock.now_ms();
+        let records = self.store.list_observed_agents(&self.session.id)?;
+        for record in records
+            .iter()
+            .filter(|record| record.parent_scope().exchange_id.as_str() == exchange_id)
+        {
+            self.store.interrupt_observed_agent(
+                record.key().binding_id(),
+                record.key().agent_id(),
+                now_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Discard a native child observation that arrives after its delegating exchange was
+    /// cancelled, ending any child still live, or return `None` when the observation belongs to
+    /// work the user did not stop.
+    fn discard_after_cancel(
+        &mut self,
+        source: &NativeEventSource,
+        scope: &EventScope,
+        kind: impl FnOnce() -> String,
+    ) -> Result<Option<AppliedProviderEvent>> {
+        let Some(exchange_id) = scope
+            .invocation()
+            .map(|invocation| invocation.exchange_id.as_str().to_owned())
+            .filter(|exchange_id| self.cancelled_native_parents.contains(exchange_id))
+        else {
+            return Ok(None);
+        };
+        self.interrupt_cancelled_children(&exchange_id)?;
+        self.trace.record(
+            &self.session.id,
+            "agent.native_discarded",
+            serde_json::json!({
+                "native_sequence": source.sequence.get(),
+                "kind": kind(),
+                "reason": "parent_cancelled",
+            }),
+        );
+        Ok(Some(AppliedProviderEvent::Timeline(
+            self.reconcile_timeline()?,
+        )))
+    }
+
     /// End observation of the native children a failed exchange delegated to.
     ///
     /// A failed turn reports nothing more for its children, so a child still active would keep
-    /// its live clock forever. Freezing it keeps its last native state and evidence.
+    /// its live clock forever. Freezing it keeps its last native state and evidence. A cancelled
+    /// exchange's children already ended interrupted at the cancel.
     pub(crate) fn retire_observed_children_of(&mut self, exchange_id: &str) -> Result<()> {
+        if self.cancelled_native_parents.contains(exchange_id) {
+            self.interrupt_cancelled_children(exchange_id)?;
+        }
         let records = self.store.list_observed_agents(&self.session.id)?;
         for record in records.iter().filter(|record| {
             record.parent_scope().exchange_id.as_str() == exchange_id
@@ -74,6 +156,11 @@ impl HarnessBroker {
         agent_id: &AgentId,
         event: &AgentEvent,
     ) -> Result<AppliedProviderEvent> {
+        if let Some(discarded) =
+            self.discard_after_cancel(source, scope, || encoded_kind(serde_json::to_value(event)))?
+        {
+            return Ok(discarded);
+        }
         match self.place_agent_lifecycle(source, scope, agent_id, event) {
             Ok(applied) => Ok(applied),
             Err(error) => self.reject_observed_child(Some(source), Some(agent_id), error),
@@ -201,6 +288,17 @@ impl HarnessBroker {
         &mut self,
         observation: &HarnessEvent,
     ) -> Result<AppliedProviderEvent> {
+        if let HarnessEvent::Native {
+            source,
+            scope,
+            event,
+        } = observation
+            && !matches!(event.as_ref(), ProviderEvent::Provider { .. })
+            && let Some(discarded) =
+                self.discard_after_cancel(source, scope, || native_kind(event))?
+        {
+            return Ok(discarded);
+        }
         match self.place_observed_child(observation) {
             Ok(applied) => {
                 if let HarnessEvent::Native { source, .. } = observation {
@@ -409,11 +507,20 @@ impl HarnessBroker {
 
 /// Name an observation by its nested event kinds alone, never its content.
 fn observation_kind(observation: &HarnessEvent) -> String {
-    let encoded = match observation {
-        HarnessEvent::Native { event, .. } => serde_json::to_value(event.as_ref()),
-        HarnessEvent::Host { event, .. } => serde_json::to_value(event),
+    match observation {
+        HarnessEvent::Native { event, .. } => native_kind(event),
+        HarnessEvent::Host { event, .. } => encoded_kind(serde_json::to_value(event)),
     }
-    .unwrap_or_default();
+}
+
+/// Name a native event by its nested event kinds alone, never its content.
+fn native_kind(event: &ProviderEvent) -> String {
+    encoded_kind(serde_json::to_value(event))
+}
+
+/// Join the nested `kind` tags of an encoded event.
+fn encoded_kind(encoded: serde_json::Result<serde_json::Value>) -> String {
+    let encoded = encoded.unwrap_or_default();
     let mut kinds = Vec::new();
     let mut level = Some(&encoded);
     while let Some(current) = level {

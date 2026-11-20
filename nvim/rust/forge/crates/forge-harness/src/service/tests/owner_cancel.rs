@@ -1042,3 +1042,423 @@ async fn idle_cancel_leaves_a_held_follow_up_deliverable() -> Result<()> {
     reader.abort();
     Ok(())
 }
+
+////// Own one mock-provider session whose scenario holds work at a chosen boundary.
+struct MockOwnerFixture {
+    controller: Arc<SessionController>,
+    session: String,
+    sink: MessageSender,
+    reader: tokio::task::JoinHandle<Result<()>>,
+    /// Holds a writing child in repository admission until the scenario releases it.
+    reservation: Option<crate::repository_access::RepositoryReservation>,
+    // Declared last: fields drop in order, and Windows cannot delete files still open.
+    root: tempfile::TempDir,
+}
+
+impl MockOwnerFixture {
+    /// Start an owner on the mock provider with the agent tools enabled.
+    async fn start(client_id: &str) -> Result<Self> {
+        let root = tempfile::tempdir()?;
+        crate::checks::configure_fixture(root.path());
+        let controller =
+            SessionController::new(HarnessBroker::initialize(serde_json::from_value(json!({
+                "workspace":root.path(),"data_root":root.path().join("data"),"client_id":client_id,
+                "provider":{"kind":"mock","command":[]},
+            }))?)?)
+            .await?;
+        let session = controller.observer.session_id().to_owned();
+        controller.agent_coordinator.set_enabled(true);
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<_, anyhow::Error>(())
+        });
+        controller.attach_input(&sink).await?;
+        Ok(Self {
+            controller,
+            session,
+            sink,
+            reader,
+            reservation: None,
+            root,
+        })
+    }
+
+    fn control(&self) -> Result<crate::provider::mock_response::MockResponseControl> {
+        self.controller
+            .provider_handle()
+            .mock_response_control()
+            .context("mock control")
+    }
+
+    /// Queue one user prompt, as the editor's composer does.
+    fn submit(&self, text: &str) -> Result<()> {
+        use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+        self.controller
+            .coordinator
+            .submissions
+            .apply(InputOperation {
+                id: "submit-prompt".into(),
+                control_revision: 0,
+                after_control: None,
+                action: InputAction::Submit {
+                    message: Box::new(InputMessage::queued(crate::input::InputDraft {
+                        id: "prompt".into(),
+                        text: text.into(),
+                        purpose: crate::input::InputPurpose::User,
+                        attachments: Vec::new(),
+                        config: None,
+                        intent: InputIntent::Auto,
+                    })),
+                },
+            })?;
+        Ok(())
+    }
+
+    /// Delegate one child, then wait until the parent's own turn has finished and parked for it.
+    async fn park_parent_for_child(&mut self) -> Result<()> {
+        use crate::provider::mock_response::MockResponseCommand;
+        use forge_provider_api::testing::{
+            TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+            TestPromptTerminal,
+        };
+        // A shared reservation holds the writing child in repository admission, so the parent's
+        // own turn ends while its child still runs.
+        self.reservation = Some(crate::repository_access::RepositoryReservation::acquire(
+            &self.controller.data_root,
+            self.root.path(),
+            crate::repository_access::RepositoryAccess::Read,
+        )?);
+        self.control()?
+            .dispatch(
+                &self.session,
+                MockResponseCommand::Script {
+                    script: TestPromptScript {
+                        acceptance: TestInputAcceptance::BeforeResponse,
+                        steps: vec![
+                            TestPromptStep::ToolCall {
+                                name: "agent_spawn".into(),
+                                arguments: json!({"profile":"worker","text":"Inspect the sources"}),
+                            },
+                            TestPromptStep::Message {
+                                content: TestMessageContent::Response,
+                                text: "Waiting for the child".into(),
+                            },
+                        ],
+                        terminal: TestPromptTerminal::Completed,
+                    },
+                },
+            )
+            .await?;
+        self.submit("Delegate an inspection")?;
+        loop {
+            let parked = self.controller.agent_coordinator.active_count() == 1
+                && crate::storage::HistoryReader::current(&self.controller.data_root)?
+                    .list_exchange(&self.session)?
+                    .first()
+                    .and_then(|exchange| exchange.turn.last())
+                    .is_some_and(|turn| {
+                        matches!(turn.state(), crate::turn::TurnState::Finished { .. })
+                    });
+            if parked {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Submit a prompt and wait until the provider holds its running turn.
+    async fn hold_running_turn(&self) -> Result<()> {
+        use crate::provider::mock_response::MockResponseCommand;
+        let control = self.control()?;
+        let hold = control
+            .dispatch(
+                &self.session,
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
+            .await?;
+        self.submit("Inspect the sources")?;
+        control
+            .dispatch(
+                &self.session,
+                MockResponseCommand::Wait {
+                    id: hold["id"].as_str().context("hold identity")?.into(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read the session's exchanges from durable history.
+    fn exchanges(&self) -> Result<Vec<crate::exchange::Exchange>> {
+        SqliteStore::read_only(&self.controller.data_root)?.list_exchange(&self.session)
+    }
+
+    /// Stop the owner as the editor's exit does, then reopen the session's history.
+    async fn exit_and_reopen(mut self) -> Result<Vec<crate::exchange::Exchange>> {
+        self.controller.finish_exchange_owner().await?;
+        self.reservation.take();
+        let data_root = self.controller.data_root.clone();
+        let session = self.session.clone();
+        drop(self.sink);
+        self.reader.abort();
+        drop(self.controller);
+        let mut store = SqliteStore::open(&data_root)?;
+        store.interrupt_detached_execution(&session)?;
+        let exchanges = store.list_exchange(&session)?;
+        drop(store);
+        drop(self.root);
+        Ok(exchanges)
+    }
+
+    /// Release the held child and stop the owner.
+    async fn finish(mut self) -> Result<()> {
+        self.reservation.take();
+        self.controller.finish_exchange_owner().await?;
+        drop(self.sink);
+        self.reader.abort();
+        Ok(())
+    }
+}
+
+/// Describe an exchange's state, finalization error, and turn states for a failed assertion.
+fn exchange_summary(exchange: &crate::exchange::Exchange) -> String {
+    format!(
+        "{:?}: {:?} {:?}",
+        exchange.state(),
+        exchange.finalization_error,
+        exchange
+            .turn
+            .iter()
+            .map(|turn| format!("{:?}", turn.state()))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// A cancel that arrives while the parent waits for its children settles the exchange cancelled.
+///
+/// The parent's own turn had already completed, so the cancel woke its parked result while the
+/// children still ran: finalization then failed on the unsettled delegation tree, or, once the
+/// children had settled, recorded the completed result and the exchange read as complete.
+#[tokio::test]
+async fn cancel_while_the_parent_waits_for_children_settles_cancelled() -> Result<()> {
+    let mut fixture = MockOwnerFixture::start("wait-cancel").await?;
+    fixture.park_parent_for_child().await?;
+    super::super::cancellation::apply(
+        &fixture.controller,
+        &Request {
+            id: 1,
+            method: "session.turn.cancel".into(),
+            params: json!({"operation_id":"wait-cancel"}),
+        },
+        &fixture.sink,
+    )
+    .await?;
+    super::owner_transition::settle_exchanges(&fixture.controller, &fixture.session, 1).await?;
+    let exchanges = fixture.exchanges()?;
+    ensure!(
+        exchanges[0].state() == crate::exchange::ExchangeState::Cancelled,
+        "the interrupted parent settled {}",
+        exchange_summary(&exchanges[0])
+    );
+    // A stop label on a settled exchange outlives the stop: the heading reads `Stopping` forever.
+    ensure!(
+        exchanges[0].collection.is_none(),
+        "the settled parent kept the stop label {:?}",
+        exchanges[0].collection
+    );
+    fixture.finish().await
+}
+
+/// Turning the agent tools off while a child runs applies the setting at once and stops nothing.
+///
+/// The toggle changes the root's tool set, which the provider receives when a turn starts. A
+/// restart of the parked parent finalized it over its running child and failed the exchange on
+/// the descendant guard, so the change waits for the next turn start and the child's result
+/// still continues the parent.
+#[tokio::test]
+async fn agent_tools_off_while_a_child_runs_keeps_the_exchange_running() -> Result<()> {
+    let mut fixture = MockOwnerFixture::start("tools-off").await?;
+    fixture.park_parent_for_child().await?;
+    let command = super::super::native_settings::decode_command(&Request {
+        id: 1,
+        method: "session.configure".into(),
+        params: json!({"subagent_tools":false}),
+    })?;
+    fixture
+        .controller
+        .exchange_owner
+        .execute_identified(command, fixture.sink.clone())
+        .await
+        .context("the agent tools toggle failed")?;
+    ensure!(
+        !fixture.controller.agent_coordinator.enabled(),
+        "the agent tools stayed enabled after the toggle completed"
+    );
+    ensure!(
+        fixture.controller.agent_coordinator.active_count() == 1,
+        "the toggle stopped the running child"
+    );
+    fixture.reservation.take();
+    super::owner_transition::settle_exchanges(&fixture.controller, &fixture.session, 1).await?;
+    let exchanges = fixture.exchanges()?;
+    ensure!(
+        exchanges[0].state() == crate::exchange::ExchangeState::Complete
+            && exchanges[0].turn.len() == 2,
+        "the parent did not continue with its child's result: {}",
+        exchange_summary(&exchanges[0])
+    );
+    fixture.finish().await
+}
+
+/// Exiting the editor during a running turn leaves the reopened exchange cancelled.
+#[tokio::test]
+async fn editor_exit_during_a_running_turn_reopens_cancelled() -> Result<()> {
+    let fixture = MockOwnerFixture::start("exit-running").await?;
+    fixture.hold_running_turn().await?;
+    let exchanges = fixture.exit_and_reopen().await?;
+    ensure!(
+        exchanges[0].state() == crate::exchange::ExchangeState::Cancelled,
+        "the exchange the exit interrupted reopened {}",
+        exchange_summary(&exchanges[0])
+    );
+    Ok(())
+}
+
+/// Exiting the editor while the parent waits for its children leaves the reopened exchange
+/// cancelled, as an explicit cancel does.
+#[tokio::test]
+async fn editor_exit_while_the_parent_waits_for_children_reopens_cancelled() -> Result<()> {
+    let mut fixture = MockOwnerFixture::start("exit-waiting").await?;
+    fixture.park_parent_for_child().await?;
+    let exchanges = fixture.exit_and_reopen().await?;
+    ensure!(
+        exchanges[0].state() == crate::exchange::ExchangeState::Cancelled,
+        "the exchange the exit interrupted reopened {}",
+        exchange_summary(&exchanges[0])
+    );
+    Ok(())
+}
+
+/// An exit whose shutdown stop outlives the host still reopens the exchange cancelled.
+///
+/// The shutdown stop is a cancellation, but recovery saw only a running exchange with a pending
+/// collection, which a reconfiguration's restart leaves as well, and interrupted it.
+#[tokio::test]
+async fn editor_exit_that_outlives_the_host_reopens_cancelled() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let fixture = MockOwnerFixture::start("exit-unfinished").await?;
+    fixture.hold_running_turn().await?;
+    fixture
+        .control()?
+        .dispatch(&fixture.session, MockResponseCommand::HoldInterrupt)
+        .await?;
+    let controller = fixture.controller.clone();
+    let shutdown = tokio::spawn(async move { controller.finish_exchange_owner().await });
+    let collecting = loop {
+        let exchange = fixture.exchanges()?.into_iter().next();
+        if let Some(exchange) = exchange.filter(|exchange| exchange.collection.is_some()) {
+            break exchange;
+        }
+        tokio::task::yield_now().await;
+    };
+    shutdown.abort();
+    let mut recovered = collecting.clone();
+    crate::storage::interrupt_detached_exchange(
+        &mut recovered,
+        &crate::session::HarnessSession::primary_agent_id(&fixture.session),
+        crate::storage::DetachedSettlement::Outcome,
+    )?;
+    ensure!(
+        recovered.state() == crate::exchange::ExchangeState::Cancelled,
+        "the exchange the exit was stopping reopened {}",
+        exchange_summary(&recovered)
+    );
+    Ok(())
+}
+
+/// A request that reaches the owner during a burst of ready turn events is taken between those
+/// events rather than after the burst.
+///
+/// The owner applies a bounded run of ready events in one update step and received nothing from
+/// its inbox until that run ended. On Copilot each child event took about 40 ms to apply, so the
+/// agents picker's interrupt waited 742 ms and reached a child that had already completed.
+#[tokio::test]
+async fn owner_takes_a_request_between_the_events_of_a_burst() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestHoldId, TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    const BURST: usize = 24;
+    let fixture = MockOwnerFixture::start("request-burst").await?;
+    let mut steps = vec![TestPromptStep::Barrier {
+        id: TestHoldId::new("before-burst")?,
+    }];
+    steps.extend((0..BURST).map(|index| TestPromptStep::Message {
+        content: TestMessageContent::Commentary,
+        text: format!("Progress note {index}"),
+    }));
+    fixture
+        .control()?
+        .dispatch(
+            &fixture.session,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps,
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    fixture.submit("Report progress")?;
+    let control = fixture.control()?;
+    control
+        .dispatch(
+            &fixture.session,
+            MockResponseCommand::Wait {
+                id: "before-burst".into(),
+            },
+        )
+        .await?;
+    control
+        .dispatch(
+            &fixture.session,
+            MockResponseCommand::Release {
+                id: "before-burst".into(),
+            },
+        )
+        .await?;
+    let applied = || -> Result<usize> {
+        Ok(fixture
+            .exchanges()?
+            .first()
+            .and_then(|exchange| exchange.turn.last())
+            .map_or(0, |turn| turn.messages().len()))
+    };
+    // Send the request once the owner has started applying the burst.
+    let before = loop {
+        let applied = applied()?;
+        if applied > 0 {
+            break applied;
+        }
+        tokio::task::yield_now().await;
+    };
+    fixture
+        .controller
+        .exchange_owner
+        .command_status(crate::exchange::command::CommandId::new("burst-status")?)
+        .await?;
+    // The request may wait for the one event being applied when it arrived, never for more.
+    let after = applied()?;
+    ensure!(
+        after <= before + 1,
+        "the owner answered after the burst went on: {before} of {BURST} messages applied when \
+         the request arrived, {after} when it was answered"
+    );
+    fixture.finish().await
+}

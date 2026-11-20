@@ -185,8 +185,11 @@ pub(super) fn check_summary(run: &CheckRun) -> String {
         .as_ref()
         .and_then(|planned| planned.resolution_findings().into_iter().next());
     if let Some(summary) = summarize_checks(run.commands.iter()) {
+        // The gate failure leads, so a run whose commands all passed never opens with "N/N passed".
         return match unresolved {
-            Some(cause) if run.state == CheckState::Failed => format!("{summary} · {cause}"),
+            Some(cause) if run.state == CheckState::Failed => {
+                format!("failed · {cause} · {summary}")
+            }
             _ => summary,
         };
     }
@@ -1243,6 +1246,38 @@ mod tests {
             assert!(!summary.contains("not run"), "{summary}");
             assert!(!summary.contains("new_case"), "{summary}");
         }
+        Ok(())
+    }
+
+    /// A gate failure leads the summary of a failed run whose every command passed, so the
+    /// heading never opens with an unqualified "N/N passed".
+    #[test]
+    fn a_gate_failure_leads_a_summary_of_passing_commands() -> Result<()> {
+        let mut run: CheckRun = serde_json::from_value(json!({
+            "id":"plan-run","owner":{"kind":"session","session_id":"session"},"revision":1,
+            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+            "started_at_ms":10,"completed_at_ms":20,"state":"failed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},
+            "commands":[{
+                "id":"typecheck","command":"fixture","state":"passed","selected":true,
+                "started_at_ms":1,"completed_at_ms":2,"exit_code":0,"error":null,
+                "stdout":"unused","stderr":"unused","output":"unused","output_bytes":0,
+                "preview":"","result":null,
+                "context":{"purpose":"verify","definition_id":"typecheck","name":"typecheck",
+                    "area":".","reason":"selected","matched_files":[],"category":"typecheck",
+                    "directory":".","selection":{"kind":"all"},"resolved":null,"depends_on":[]}
+            }]
+        }))?;
+        run.planned_tests = Some(crate::checks::PlannedTestExecution::resolved_fixture(&[
+            "new_case",
+        ]));
+        let summary = check_summary(&run);
+        assert!(
+            summary.starts_with("failed · planned test modified_case"),
+            "{summary}"
+        );
+        assert!(summary.ends_with("1/1 passed · 1 run"), "{summary}");
         Ok(())
     }
 

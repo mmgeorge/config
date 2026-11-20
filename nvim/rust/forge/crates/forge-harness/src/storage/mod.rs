@@ -1548,6 +1548,7 @@ pub(crate) mod test {
         Exchange {
             finalization_error: None,
             collection: None,
+            cancellation_requested: false,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),

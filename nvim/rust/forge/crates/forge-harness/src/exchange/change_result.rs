@@ -20,8 +20,9 @@ impl<'exchange> CheckpointComparison<'exchange> {
 pub(crate) enum ExchangeChangeResult<'exchange> {
     /// The exchange ended before its initial workspace checkpoint was captured.
     NotStarted,
-    /// A provider-native child's edits belong to the checkpoints of the exchange that
-    /// delegated to it, so the child's own exchange records none.
+    /// A child's edits belong to the checkpoints of the exchange that delegated to it, so the
+    /// child's own exchange records none. This holds for provider-native children and for
+    /// managed children, which share the root's workspace and checkpoint settlement.
     Delegated,
     Pending {
         previous: Option<CheckpointComparison<'exchange>>,
@@ -80,6 +81,16 @@ impl Exchange {
                 previous: None,
                 reason: "saved checkpoint comparison is missing",
             },
+            // A managed child shares its root's workspace, and the delegating exchange captures
+            // the checkpoints that cover the child's edits.
+            // A managed child shares its root's workspace, and the delegating exchange captures
+            // the checkpoints that cover the child's edits.
+            (None, None, _)
+                if self.agent_id
+                    != crate::session::HarnessSession::primary_agent_id(&self.session_id) =>
+            {
+                ExchangeChangeResult::Delegated
+            }
             (None, None, _) => ExchangeChangeResult::Unavailable {
                 previous: None,
                 reason: "checkpoint identities are missing",
@@ -121,6 +132,26 @@ mod tests {
             ExchangeChangeResult::Unavailable {
                 previous: None,
                 reason: "checkpoint identities are missing"
+            }
+        );
+    }
+
+    /// A managed child never captures checkpoints of its own: the exchange that delegated to it
+    /// captures the shared workspace, so the child's settled transcript shows no edits row.
+    /// Every child once read "Edits unavailable: checkpoint identities are missing", read-only
+    /// children included. A cleanup failure the child recorded still reads as unavailable.
+    #[test]
+    fn managed_child_exchange_delegates_its_edits_to_its_parent() {
+        let mut child = crate::storage::test::running_exchange("child");
+        child.agent_id = "reviewer".into();
+        child.finish(ExchangeOutcome::Complete, 40).unwrap();
+        assert_eq!(child.change_result(), ExchangeChangeResult::Delegated);
+        child.finalization_error = Some("child cleanup failed".into());
+        assert_eq!(
+            child.change_result(),
+            ExchangeChangeResult::Unavailable {
+                previous: None,
+                reason: "child cleanup failed"
             }
         );
     }

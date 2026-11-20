@@ -10,7 +10,8 @@ pub(super) fn definition() -> ControlToolDefinition {
         name: NAME,
         description: "Read ordered user messages and final answers without commentary, reasoning or tool output. Omit \
                 session_id for the current session. Follow next_cursor with the same arguments. Incomplete \
-                exchanges remain explicit.",
+                exchanges remain explicit. Lists only the current conversation: exchanges a rollback \
+                removed are omitted. A task's opening has role harness, because Harness wrote it.",
         input_schema: strict_object_input_schema(properties, &[]),
     }
 }

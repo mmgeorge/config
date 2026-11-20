@@ -30,6 +30,10 @@ editor commands. `/config` → **Tools** → **Session history** toggles all sev
 history tools. Configuration inspection and the `harness-sessions` skill remain
 available when history is off. Session-specific reads default to the current
 session. Unfiltered listing/search considers all accessible sessions.
+`harness_session_exchange_list` lists only the current conversation: exchanges an
+`/undo` removed are left out, and a direct read or a search result marks such an
+exchange `history: rolled_back`. A task's opening, such as `Goal started: …`, has
+the role `harness` rather than `user`, because Harness wrote it.
 
 `:ForgeHistoryClear` stops its Forge host and attempts to delete every version
 under `stdpath("data")/forge/harness/state/`. It removes unlocked versions completely:
@@ -238,9 +242,17 @@ provider while refreshing the catalog in the background. Without a cached model,
 the field shows `resolving model` until the provider responds.
 The model field reads `<speed icon> <model> <thinking>`: Fast uses a gray outlined
 lightning glyph (`󱐌`), Ultrafast a filled glyph (`󱐋`) in YOLO's neon red, and Standard no icon.
+Thinking names the level the provider uses. A `default` selection sends no level, so
+it reads as the provider's advertised default level, or as `default` when the provider
+names none; the `/model` picker shows the same value for the current model and offers
+`default` as a choice for such models.
 Model, thinking, or speed changes waiting for existing work share one trailing `*`
-after thinking. Idle and paused changes show no marker. The marker disappears when
-all selected values are applied.
+after thinking, and the field shows the values they select. This covers a `/model`
+entry queued with Ctrl-Q, from the moment it is queued until its hand-off applies it,
+and a change made with the effort keys or a picker during a turn, which restarts the
+turn on the new settings, until that restart applies it. Idle and paused changes apply
+at once and show no marker. The marker disappears when all selected values are applied,
+and a rejected change leaves the field with the applied values.
 Only full reads, full writes, `allow`, and sandbox off add red `YOLO` text:
 `YOLO · rxwxax`. Working, planning, revision, and review labels remain white
 regardless of the selected policy.
@@ -393,7 +405,13 @@ Loaded skills appear as `≡ Skill · name`, aligned with commentary rather than
 
 The live check status shows a single selected test by name on a child row beneath its check. Multiple selected tests show a count; full paths and IDs remain available in check details.
 
-Child agents appear in three places. Each spawn adds a `◇ Spawned name · provider · model` row to the thought that started it. While a child runs, the status area shows its row with elapsed time, name, model, tool summary, and newest reasoning summary; a child that reports no reasoning summary leaves that column empty. Once children finish, an **Agents** summary beside **Checks** lists each finished child with its outcome, tool counts, and token usage. Enter on a spawn row or a summary row opens that child's own transcript.
+Child agents appear in three places. Each spawn adds a `◇ Spawned name · provider · model` row to the thought that started it. While a child runs, the status area shows its row with elapsed time, name, model, tool summary, and newest reasoning summary; a child that reports no reasoning summary leaves that column empty. Once children finish, an **Agents** summary beside **Checks** lists each finished child with its outcome, tool counts, and token usage. Enter on a spawn row or a summary row opens that child's own transcript, also while running children keep changing the transcript.
+
+A child's transcript names the child in its winbar: the child's own provider, model, and thinking level, then its name, since its profile can choose them independently of the session. A child's edits belong to the exchange that started it, which shows them under its own **Edits**, so a child's transcript shows no Edits row.
+
+The agents picker (`og` or `/agents`) lists running children, then finished ones, each group in the order of the children's numbers (`-2` before `-10`). A child's duration counts the time its task ran, excluding time spent starting and waiting for your approval, so the picker, the status row, the summary row, and the child's heading show the same number, and the picker shows the status row's tool count. `Ctrl-X` interrupts the selected running child.
+
+`/agents on` and `/agents off` take effect at once: the picker's title shows the new setting, and a model that tries to start a child after `/agents off` is refused. Changing the setting while children run stops nothing; the children finish and report to the parent, and the model's own tool list changes when its next turn starts.
 
 Thoughts with activity start collapsed and preserve the assistant's text in their heading.
 Expanding a thought shows its events first, then its tool summary, then its file changes,
@@ -447,7 +465,10 @@ last finished exchange, and its fork marker reads "Forked before the unfinished
 exchange of" the source. A source still running its first turn has nothing finished to copy, so its
 child starts empty. Two cases are refused with a message and create no session: the
 source has child agents running, or the source is itself a fork that has not finished
-its first turn. If the provider fork fails, the child keeps its tab, and sending or
+its first turn. The fork's tab opens only once Harness has created the child, so a refused
+`/fork` opens no tab: the message appears in the tab where you typed `/fork`, and the command
+stays in the composer in the mode it had. A fork opens in the foreground when you are still
+in that tab, and behind the tab you moved to otherwise. If the provider fork fails, the child keeps its tab, and sending or
 retrying a message in it attempts the fork again.
 
 `/btw <question>` opens an aside: a fork in a new tab whose agent is told that you are
@@ -475,7 +496,9 @@ source.
 | `:ForgePermissions` | None | Edit the Harness permissions document |
 
 `/clear` replaces the session in the current Harness tab after creation succeeds.
-`/new` opens a fresh session in a new tab.
+`/new` opens a fresh session in a new tab. Both leave the composer in Normal mode, and a
+creation the host refuses closes the new tab and reports the refusal in the tab where
+you typed the command.
 
 `ForgeHarnessLog` requires an open Harness session. Check-worker and tool-export
 cleanup diagnostics follow the same `/log` setting instead of printing to process
@@ -492,30 +515,50 @@ appear under **Inactive**. Searching keeps this section order. The picker opens 
 current session highlighted. Choosing a session that another tab already shows moves it into the
 current tab and closes its former tab; the session you left stays under **Active**.
 The transcript area previews the highlighted session in a layer drawn over the transcript,
-below its winbar. The preview ends at the session's latest exchange, on the last row above
+below its winbar. The preview shows the session's saved text without the transcript's
+rendering, and a session without exchanges says so; the rendered transcript replaces the
+preview when you choose the session. The preview ends at the session's latest exchange, on the last row above
 the picker. Highlighting the current session removes the preview and shows its own
 transcript, and closing the picker leaves that transcript exactly as it was, including its
 scroll position and expanded sections. A session that no editor owns, such as
 one whose editor was killed mid-turn, previews its unfinished exchange as **Interrupted**
 at its last recorded active time, as resuming it will show. A session open in another
 editor previews its stored state, with a timer that does not advance.
-In session search, Enter shows the chosen session in the current tab. Its composer takes
+In session search, Enter shows the chosen session in the current tab. The picker stays
+open until that session has rendered, then the session replaces it in one step. Its composer takes
 the mode yours had when you opened the picker, also when the session already had a tab and
 `/sessions` or `/provider` **Resume session** switches to it. A session of
 another provider opens through the same provider switch as `/provider`: Forge restarts
 its host on that session's provider, so the switch requires that no Harness tab has
 running, queued, or unsent work. A switch that cannot start reports why and leaves the
-picker open. Unlike `/provider`, opening a session this way leaves the saved default
+picker open. While the switch runs, the status rows read **Switching Harness to** the
+provider, and the session you chose replaces the current one once it has rendered. Unlike
+`/provider`, opening a session this way leaves the saved default
 provider unchanged, so the next editor start still opens the default provider's session.
+Every other Harness tab then says in its status rows which provider the host now serves,
+for example "Harness now serves Codex CLI. Submit or run :ForgeHarness to return to
+Copilot CLI." Submitting from that tab, or running `:ForgeHarness` in it, switches the host
+back to the tab's provider under the same rule, without changing the default; the tab
+stays open and keeps its draft for you to submit. Until then `/sessions` lists that tab's
+session under **Inactive** marked `(open, disconnected)`.
 A session of another worktree is history-only; open Harness from that worktree to
 resume it. `Ctrl-J` deletes the selected saved session and closes every tab that shows it.
+Its row leaves the list at once and the selection moves to the next row; if Harness
+refuses the deletion, the row returns with the reason.
 After selecting an interaction, choose **Conversation only** to keep current files,
 or **Conversation and files** to restore its checkpoint too. Conversation-only
-rollback works without a file checkpoint. `/undo` also opens the list while a turn runs.
-Confirming conversation rollback collects active execution before changing history and
+rollback works without a file checkpoint. `/undo` also opens the list while a turn runs,
+and the list includes the running turn's interaction and the newest interaction of a
+paused goal. A `/undo` that cannot open its list, because Harness refused it or a rollback is
+already in progress, leaves `/undo` in the composer. Confirming conversation rollback collects active execution before changing history and
 leaves the task paused; choosing **Conversation and files** collects it before showing the
 files to restore, so the preview describes settled files, and both options say that they
-stop the running turn. An unfinished restore requires recovery first. Rollback rewinds the
+stop the running turn. Choosing **Cancel** on that preview rolls nothing back, and its
+description says that the turn was already stopped. From confirmation until the rollback finishes, the status reads
+`Rolling back the conversation` (or `… and files`), and a paused queue keeps its `paused`
+heading. A restore that stopped part-way shows `Restore interrupted` and requires recovery
+through `/undo` before other rollbacks; a restore that is still running never shows it.
+Rollback rewinds the
 provider's own conversation, so it requires a provider that supports native rewind (Codex,
 Copilot, and Claude). With Antigravity, `/undo` reports that conversation rollback is
 unsupported and changes nothing. Claude can rewind only to the end of an earlier
@@ -526,8 +569,11 @@ Rolling back an interaction inside a goal leaves the goal paused; rolling back t
 interaction that started it, or an earlier one, removes the goal. The transcript drops every
 row of the rolled-back interactions, including task rows such as `Goal completed` and
 `Goal cleared`. A completed rollback returns the rolled-back prompt to the composer, a
-`/goal <objective>` command as typed, only when you have not typed there since confirming
-it, and it does not move focus out of another window.
+`/goal <objective>` or `/plan <request>` command as typed, only when you have not typed there since confirming
+it, and it does not move focus out of another window. Rolling back every interaction of a
+session that took its name from its first prompt leaves the session unnamed again, so the tab
+title no longer shows that prompt, and the next prompt you send names it again; a name you
+chose with `/rename` stays.
 
 Live status occupies a non-focusable split immediately above the composer. It stays visible
 while the transcript scrolls through history, and disappears when no work, pending
@@ -580,6 +626,13 @@ list `ot` shows.
 Thought headers show successful/total tools and append changed-file counts when
 nonzero. Repeated successful edits to one file count once. Individual tool errors
 and compaction details remain available in the expanded timeline.
+`/compact` asks the provider to compact the conversation's context and adds one
+`Context compacted` row with the token counts the provider reports. Sent during a turn,
+it stops the turn; the status and the exchange heading then read `Compacting` while the
+provider works, and the turn runs again on the compacted context. The row sits inside that
+exchange, above the output of the turn that ran again, and ends with `turn ran again`.
+When the provider declines, for example because nothing is left to compact, the row reads
+`Context not compacted` followed by the provider's own explanation, and the notice repeats it.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought beside the
 phase and its controls, after a `│` separator. The thought uses the remaining width,
 with an ellipsis when it does not fit, and disappears when the controls need the whole
@@ -621,7 +674,9 @@ An exchange that hands off to a queued message is not revealed, because that
 message's turn takes its place at the end of the transcript a moment later.
 Focused transcripts and folded responses keep their reading position, within the
 same scroll margin.
-Skipped reveals do not run later when focus changes.
+Skipped reveals do not run later when focus changes. An exchange that finishes while
+its tab is hidden is revealed when you show the tab again, by the same rules, unless
+focus is then in its transcript.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
 Claude Code always streams summarized thinking. Antigravity retains provider-defined summary detail
 through its ACP integration.
@@ -909,7 +964,8 @@ Info is the default and records major IPC and provider lifecycle operations plus
 warnings and errors. It also records rate-limited slow UI and queue-edit diagnostics
 locally in `stdpath("cache")/forge/harness-perf.log`. Trace adds verbose diagnostics
 and detailed Harness performance logging. `/log none|error|warn|info|trace` sets a level directly; `/log open` opens
-the current session's JSONL log, and `/log clear` clears it. Saved choices persist
+the current session's JSONL log in Normal mode, with `N records lost` in its header when the host
+failed to write records, and `/log clear` clears it. Saved choices persist
 across restarts and override the Lua `log_level` default.
 Use `/checks edit on/off` to control check-authoring permission.
 Unsupported controls explain their restriction, and Windows sandbox options appear
@@ -977,7 +1033,10 @@ The winbar also shows the selected workflow and phase: `plan · draft`,
 `plan · review`, `exec · implement`, `exec · check`, `exec · resolve`,
 `exec · verify`, or `goal · work`. Pausing preserves that label, such as
 `exec · check · paused`. A planning turn may resubmit its plan before it ends,
-so the label changes to `plan · review` only once the submitting turn settles. Resuming Check runs Harness checks locally rather than
+so the label changes to `plan · review` only once the submitting turn settles. A
+revision whose acceptance is already decided, such as the one a saved comment
+produces under automatic acceptance, goes straight from `plan · draft` to
+`exec · implement`. Resuming Check runs Harness checks locally rather than
 starting a model response. Plan acceptance keeps the same task identity as it
 enters Execute, and planning never enters Verify.
 
@@ -985,6 +1044,11 @@ Automatic continuation stops after five consecutive model turns without
 observable progress or the configured total allowance, which defaults to 20 turns.
 Reads and phase changes do not replenish the allowance. Explicit task resume
 starts a new allowance while retaining the phase, accepted artifact, and findings.
+A goal or execution that stops this way, or because the model reported that it cannot
+continue, shows `· blocked` in the winbar and adds a transcript row that names the
+cause, such as `Execution blocked: 5 consecutive turns changed no files`, followed by
+`/task resume` and `/task clear`. The status split names the same cause while the task
+stays blocked: `Blocked · 5 consecutive turns changed no files · /task resume · /task clear`.
 After a host restart, unfinished tasks require explicit resume before work starts.
 A review decision is an explicit resume: accepting a paused plan with `oY` or requesting
 changes with `oN` resumes the task, so an execution question appears at once.
@@ -1084,7 +1148,8 @@ Use `/plan accept on` or `/plan accept off` at any time during a Plan or Execute
 to change automatic acceptance without interrupting the agent. The winbar appends `pa`
 while it is on. Turning it on while a plan awaits review accepts that revision at once;
 turning it off withdraws an acceptance still waiting for its execution answers, and the plan
-returns to review. Successful full submissions check this task setting; drafts and
+returns to review. Turning it on again is a new acceptance that asks those questions again.
+Successful full submissions check this task setting; drafts and
 failed submissions never authorize implementation. The setting survives submissions,
 pauses, and restarts until changed or the task ends. Requesting changes leaves it
 unchanged, as does accepting inline feedback. Turn it off before resubmission when

@@ -170,3 +170,56 @@ fn unfinished_exchange_reports_its_commentary() -> Result<()> {
     assert!(commentary("exchange")?.is_empty());
     Ok(())
 }
+
+/// The exchange list describes the conversation the session now holds: an exchange a rollback
+/// removed is absent, a direct read marks it, and a task's Harness-authored opening is a notice,
+/// not something the user said.
+#[test]
+fn exchange_list_reads_current_history() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut store = SqliteStore::open(fixture.root.path())?;
+    let mut goal = exchange(&fixture.scope.session, "goal", "Goal started");
+    goal.ordinal = 2;
+    goal.opening = crate::exchange::ExchangeOpening::TaskStarted {
+        start: crate::exchange::TaskStart {
+            kind: crate::task::TaskKind::Goal,
+            title: "Port the parser".into(),
+        },
+    };
+    store.save_exchange(&goal)?;
+    let mut rolled_back: Exchange = serde_json::from_value(json!({
+        "id":"rolled-back","session_id":fixture.scope.session.id,
+        "agent_id":fixture.scope.session.primary_agent_id,"ordinal":3,
+        "prompt":"Remember the code word zebra","state":"complete","disposition":"rolled_back",
+        "created_at_ms":2,"completed_at_ms":3,"attributed_matches_checkpoint":true,"node_list":[]
+    }))?;
+    assert_eq!(
+        rolled_back.disposition(),
+        crate::exchange::HistoryDisposition::RolledBack
+    );
+    rolled_back.ordinal = 3;
+    store.save_exchange(&rolled_back)?;
+
+    let listed = fixture.invoke("harness_session_exchange_list", json!({}))?["items"]
+        .as_array()
+        .context("exchange items missing")?
+        .clone();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|item| item["exchange_id"].clone())
+            .collect::<Vec<_>>(),
+        [json!("exchange"), json!("goal")]
+    );
+    assert_eq!(
+        listed[1]["messages"][0],
+        json!({"role":"harness","text":"Goal started: Port the parser"})
+    );
+    let direct = fixture.invoke(
+        "harness_session_exchange",
+        json!({"exchange_id": "rolled-back"}),
+    )?["items"][0]
+        .clone();
+    assert_eq!(direct["history"], json!("rolled_back"));
+    Ok(())
+}

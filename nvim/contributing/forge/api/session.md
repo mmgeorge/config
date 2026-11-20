@@ -433,7 +433,7 @@ Inspect or resolve retained exchange recovery state.
 
 ### Contract
 
-Accepts `action`, defaulting to `status`. Status returns null when no restore journal exists, otherwise `{ "pending": ..., "applied": ..., "files": ... }`. `continue` requires an incomplete journal and settled exchange tree, resumes filesystem restoration, and returns `{ "restored": true }` after finalization. `undo` creates a reverse restore preview and returns the same preview-summary shape as rollback preparation; it does not apply that preview. Unknown actions, missing journals, changed workspace state, and I/O failures are explicit. This recovers workspace restore, not provider or GitHub mutation delivery.
+Accepts `action`, defaulting to `status`. Status is a read that takes no execution permit, so it answers while a turn runs. It returns null when no restore journal exists, otherwise `{ "pending": ..., "applying": ..., "applied": ..., "files": ... }`: `pending` is true only for a restore that stopped part-way and needs recovery, and `applying` is true while a restore of this session is still running in the host. The snapshot's `restore_recovery` follows `pending`. `continue` requires an incomplete journal and settled exchange tree, resumes filesystem restoration, and returns `{ "restored": true }` after finalization. `undo` creates a reverse restore preview and returns the same preview-summary shape as rollback preparation; it does not apply that preview. Unknown actions, missing journals, changed workspace state, and I/O failures are explicit. This recovers workspace restore, not provider or GitHub mutation delivery.
 
 ## `session.exchange.rollback.apply`
 

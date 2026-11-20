@@ -329,6 +329,463 @@ async fn workspace_rollback_preview_collects_the_running_turn() -> Result<()> {
     scene.finish(scenario).await
 }
 
+/// `/undo` issued while a turn runs sends the editor's requests in the editor's order: restore
+/// recovery status, the interaction list, then the chosen rollback. Each request is served with the
+/// turn still in flight; only the rollback itself stops the turn. The same holds for the "undo last
+/// file restore" path, whose reverse preview comes from a recovery action.
+#[tokio::test]
+async fn undo_requests_are_served_while_a_turn_runs() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        scene.exchange(10, "Keep the first exchange", 1).await?;
+        scene.held_exchange(11, "Running when undo arrives").await?;
+
+        let recovery = scene
+            .request(20, "session.exchange.recovery", json!({}))
+            .await?;
+        succeeded(&recovery);
+        assert_eq!(recovery["result"], Value::Null, "{recovery}");
+        let listed = scene
+            .request(21, "session.exchange.list", json!({}))
+            .await?;
+        succeeded(&listed);
+        let listed = listed["result"]
+            .as_array()
+            .with_context(|| format!("exchange list missing: {listed}"))?
+            .clone();
+        assert_eq!(listed.len(), 2);
+        let first = listed[0]["id"].as_str().context("first id")?.to_owned();
+        let prepared = scene
+            .request(
+                22,
+                "session.exchange.rollback.prepare",
+                json!({"exchange_id":first}),
+            )
+            .await?;
+        succeeded(&prepared);
+        let preview_id = prepared["result"]["preview_id"]
+            .as_str()
+            .with_context(|| format!("preview missing: {prepared}"))?
+            .to_owned();
+        succeeded(
+            &scene
+                .request(
+                    23,
+                    "session.exchange.rollback.apply",
+                    json!({"preview_id":preview_id}),
+                )
+                .await?,
+        );
+
+        scene
+            .held_exchange(30, "Running when the restore is undone")
+            .await?;
+        let recovery = scene
+            .request(31, "session.exchange.recovery", json!({}))
+            .await?;
+        succeeded(&recovery);
+        assert_eq!(recovery["result"]["pending"], json!(false), "{recovery}");
+        succeeded(
+            &scene
+                .request(32, "session.exchange.list", json!({}))
+                .await?,
+        );
+        let reverse = scene
+            .request(33, "session.exchange.recovery", json!({"action":"undo"}))
+            .await?;
+        succeeded(&reverse);
+        let reverse_id = reverse["result"]["preview_id"]
+            .as_str()
+            .with_context(|| format!("reverse preview missing: {reverse}"))?
+            .to_owned();
+        succeeded(
+            &scene
+                .request(
+                    34,
+                    "session.exchange.rollback.apply",
+                    json!({"preview_id":reverse_id}),
+                )
+                .await?,
+        );
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
+/// The conversation-only choice of `/undo` reaches the same requests in the same order during a
+/// running turn, and confirming it stops that turn and rewinds the provider conversation.
+#[tokio::test]
+async fn conversation_undo_requests_are_served_while_a_turn_runs() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        scene
+            .exchange(10, "Keep nothing of this exchange", 1)
+            .await?;
+        scene.held_exchange(11, "Running when undo arrives").await?;
+        let recovery = scene
+            .request(20, "session.exchange.recovery", json!({}))
+            .await?;
+        succeeded(&recovery);
+        let listed = scene
+            .request(21, "session.exchange.list", json!({}))
+            .await?;
+        succeeded(&listed);
+        let first = listed["result"][0]["id"]
+            .as_str()
+            .with_context(|| format!("exchange list missing: {listed}"))?
+            .to_owned();
+        succeeded(&scene.conversation_undo(22, &first).await?);
+        let exchanges = scene.exchanges()?;
+        assert_eq!(
+            exchanges[1].state(),
+            crate::exchange::ExchangeState::Cancelled
+        );
+        assert_eq!(
+            exchanges[0].disposition(),
+            crate::exchange::HistoryDisposition::RolledBack
+        );
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
+/// Arm a hold on the next native rewind and return its identity.
+async fn hold_rewind(scene: &RollbackScene) -> Result<String> {
+    let hold = scene
+        .script
+        .dispatch(&scene.session_id, MockResponseCommand::HoldRewind)
+        .await?;
+    Ok(hold["id"]
+        .as_str()
+        .context("rewind hold id missing")?
+        .to_owned())
+}
+
+/// Prepare a files rollback of the newest of two settled exchanges and return its preview.
+async fn prepared_files_rollback(scene: &RollbackScene) -> Result<String> {
+    scene.exchange(10, "Keep the first exchange", 1).await?;
+    scene
+        .exchange(11, "Roll back the second exchange", 2)
+        .await?;
+    let second = scene.exchanges()?[1].id.clone();
+    let prepared = scene
+        .request(
+            20,
+            "session.exchange.rollback.prepare",
+            json!({"exchange_id":second}),
+        )
+        .await?;
+    succeeded(&prepared);
+    Ok(prepared["result"]["preview_id"]
+        .as_str()
+        .with_context(|| format!("preview missing: {prepared}"))?
+        .to_owned())
+}
+
+/// A files rollback restores files, then waits on the provider's conversation rewind before it
+/// marks its journal complete. Throughout that wait the restore is running, not interrupted:
+/// neither the session snapshot nor the recovery status may offer recovery for it.
+#[tokio::test]
+async fn a_running_restore_is_never_reported_interrupted() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        let preview_id = prepared_files_rollback(&scene).await?;
+        let hold = hold_rewind(&scene).await?;
+        let (applied, observed) = tokio::join!(
+            scene.request(
+                21,
+                "session.exchange.rollback.apply",
+                json!({"preview_id":preview_id}),
+            ),
+            async {
+                scene
+                    .script
+                    .dispatch(
+                        &scene.session_id,
+                        MockResponseCommand::Wait { id: hold.clone() },
+                    )
+                    .await?;
+                let reader = crate::storage::HistoryReader::current(&scene.controller.data_root)?;
+                let journal = crate::checkpoint::RestoreJournal::progress(
+                    &reader.objects,
+                    &scene.session_id,
+                )?
+                .context("the restore wrote no journal before rewinding")?;
+                assert_ne!(journal.state, crate::checkpoint::RestoreState::Complete);
+                assert_eq!(
+                    scene.controller.observer.snapshot()?.restore_recovery,
+                    None,
+                    "the snapshot reported a running restore as interrupted"
+                );
+                let status = scene
+                    .request(22, "session.exchange.recovery", json!({}))
+                    .await?;
+                succeeded(&status);
+                assert_eq!(status["result"]["pending"], json!(false), "{status}");
+                assert_eq!(status["result"]["applying"], json!(true), "{status}");
+                scene
+                    .script
+                    .dispatch(&scene.session_id, MockResponseCommand::Release { id: hold })
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+        );
+        observed?;
+        succeeded(&applied?);
+        assert_eq!(scene.controller.observer.snapshot()?.restore_recovery, None);
+        let status = scene
+            .request(23, "session.exchange.recovery", json!({}))
+            .await?;
+        assert_eq!(
+            (&status["result"]["pending"], &status["result"]["applying"]),
+            (&json!(false), &json!(false)),
+            "{status}"
+        );
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
+/// A restore whose conversation rewind fails after the files changed really stopped part-way, so
+/// the snapshot and the recovery status both offer recovery once the rollback has failed.
+#[tokio::test]
+async fn a_restore_stopped_part_way_reports_recovery() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        let preview_id = prepared_files_rollback(&scene).await?;
+        let hold = hold_rewind(&scene).await?;
+        let (applied, cancelled) = tokio::join!(
+            scene.request(
+                21,
+                "session.exchange.rollback.apply",
+                json!({"preview_id":preview_id}),
+            ),
+            async {
+                scene
+                    .script
+                    .dispatch(
+                        &scene.session_id,
+                        MockResponseCommand::Wait { id: hold.clone() },
+                    )
+                    .await?;
+                scene
+                    .script
+                    .dispatch(&scene.session_id, MockResponseCommand::Cancel { id: hold })
+                    .await
+            }
+        );
+        cancelled?;
+        let applied = applied?;
+        assert!(
+            applied.get("error").is_some_and(|error| !error.is_null()),
+            "{applied}"
+        );
+        assert!(
+            scene
+                .controller
+                .observer
+                .snapshot()?
+                .restore_recovery
+                .is_some()
+        );
+        let status = scene
+            .request(22, "session.exchange.recovery", json!({}))
+            .await?;
+        assert_eq!(status["result"]["pending"], json!(true), "{status}");
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
+/// The first exchange names an unnamed session after its prompt. Rolling back every exchange
+/// returns the session to unnamed, so no title describes a prompt the transcript no longer shows;
+/// a name the user chose survives the same rollback.
+#[tokio::test]
+async fn rolling_back_every_exchange_releases_the_automatic_name() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        let session_name =
+            || -> Result<String> { Ok(scene.controller.observer.snapshot()?.session.name) };
+        scene
+            .exchange(10, "Name the session from this prompt", 1)
+            .await?;
+        assert_eq!(session_name()?, "Name the session from this pro");
+        let first = scene.exchanges()?[0].id.clone();
+        succeeded(&scene.conversation_undo(20, &first).await?);
+        assert_eq!(session_name()?, "");
+
+        scene.exchange(30, "Name the session again", 2).await?;
+        succeeded(
+            &scene
+                .request(
+                    31,
+                    "session.rename",
+                    json!({"session_id":scene.session_id,"name":"Chosen name"}),
+                )
+                .await?,
+        );
+        let second = scene.exchanges()?[1].id.clone();
+        succeeded(&scene.conversation_undo(32, &second).await?);
+        assert_eq!(session_name()?, "Chosen name");
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
+/// A session whose automatic name a rollback released is named again by its next first prompt,
+/// although the rolled-back exchanges stay in history.
+#[tokio::test]
+async fn the_first_prompt_after_a_released_name_names_the_session_again() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        let session_name =
+            || -> Result<String> { Ok(scene.controller.observer.snapshot()?.session.name) };
+        scene.exchange(10, "Name the session first", 1).await?;
+        let first = scene.exchanges()?[0].id.clone();
+        succeeded(&scene.conversation_undo(20, &first).await?);
+        assert_eq!(session_name()?, "");
+
+        scene.exchange(30, "Name the session again", 2).await?;
+        assert_eq!(session_name()?, "Name the session again");
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
+/// The exchange of the running turn is itself a rollback target: confirming it stops the turn and
+/// rolls that exchange back.
+#[tokio::test]
+async fn the_running_exchange_can_be_rolled_back() -> Result<()> {
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        scene.exchange(10, "Keep the first exchange", 1).await?;
+        scene
+            .held_exchange(11, "Roll back the running exchange")
+            .await?;
+        let listed = scene
+            .request(20, "session.exchange.list", json!({}))
+            .await?;
+        let running = listed["result"][1].clone();
+        assert_eq!(running["state"], "running", "{listed}");
+        let running_id = running["id"].as_str().context("running id")?.to_owned();
+        succeeded(&scene.conversation_undo(21, &running_id).await?);
+        let exchanges = scene.exchanges()?;
+        assert_eq!(
+            exchanges[0].disposition(),
+            crate::exchange::HistoryDisposition::Current
+        );
+        assert_eq!(
+            exchanges[1].disposition(),
+            crate::exchange::HistoryDisposition::RolledBack
+        );
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
+/// Pausing a goal mid-turn parks that turn's exchange: it keeps its output and stays `running` in
+/// history with no execution. The interaction list includes it, and a conversation rollback to it
+/// closes it, rewinds the provider before it, and keeps the goal paused.
+#[tokio::test]
+async fn a_paused_goal_turn_is_listed_and_rolled_back() -> Result<()> {
+    use forge_provider_api::testing::{
+        TestHoldId, TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let scene = RollbackScene::start().await?;
+    let scenario = async {
+        scene.install_paused_goal(1)?;
+        scene
+            .exchange(10, "An earlier exchange inside the goal", 1)
+            .await?;
+        scene
+            .script
+            .dispatch(
+                &scene.session_id,
+                MockResponseCommand::Script {
+                    script: TestPromptScript {
+                        acceptance: TestInputAcceptance::BeforeResponse,
+                        steps: vec![
+                            TestPromptStep::Message {
+                                content: TestMessageContent::Response,
+                                text: "Wrote the goal's next file".into(),
+                            },
+                            TestPromptStep::Barrier {
+                                id: TestHoldId::new("goal-turn-running")?,
+                            },
+                        ],
+                        terminal: TestPromptTerminal::Completed,
+                    },
+                },
+            )
+            .await?;
+        succeeded(
+            &scene
+                .request(
+                    20,
+                    "session.command.apply",
+                    json!({"operation_id":"resume-20","action":"resume"}),
+                )
+                .await?,
+        );
+        scene
+            .script
+            .dispatch(
+                &scene.session_id,
+                MockResponseCommand::Wait {
+                    id: "goal-turn-running".into(),
+                },
+            )
+            .await?;
+        succeeded(
+            &scene
+                .request(
+                    21,
+                    "session.command.apply",
+                    json!({"operation_id":"pause-21","action":"pause"}),
+                )
+                .await?,
+        );
+        let listed = scene
+            .request(22, "session.exchange.list", json!({}))
+            .await?;
+        succeeded(&listed);
+        let newest = listed["result"]
+            .as_array()
+            .and_then(|listed| listed.last())
+            .with_context(|| format!("exchange list missing: {listed}"))?
+            .clone();
+        assert_eq!(newest["state"], "running", "{newest}");
+        let newest_id = newest["id"].as_str().context("newest id")?.to_owned();
+        succeeded(&scene.conversation_undo(23, &newest_id).await?);
+        let rolled_back = scene
+            .exchanges()?
+            .into_iter()
+            .find(|exchange| exchange.id == newest_id)
+            .context("the paused turn disappeared")?;
+        assert_eq!(
+            rolled_back.disposition(),
+            crate::exchange::HistoryDisposition::RolledBack
+        );
+        let task = scene
+            .controller
+            .task_controller
+            .current()?
+            .context("rolling back the paused turn removed the goal")?;
+        assert_eq!(task.status(), crate::task::TaskStatus::Paused);
+        Ok(())
+    }
+    .await;
+    scene.finish(scenario).await
+}
+
 /// Rolling back an interaction inside a goal keeps the goal, paused; rolling back past the goal's
 /// start removes it. Neither rollback leaves a task row from the history it removed.
 #[tokio::test]

@@ -3,7 +3,7 @@ mod tests;
 
 use super::logs::LogSnapshot;
 use super::page::InspectionPage;
-use crate::exchange::{Exchange, ExchangeNode, ExchangeState};
+use crate::exchange::{Exchange, ExchangeNode, ExchangeOpening, ExchangeState, HistoryDisposition};
 use crate::permissions::{
     directory::DirectoryPolicy,
     document::PermissionDecision,
@@ -266,8 +266,10 @@ impl HarnessInspectionScope {
                             for message in conversation(&exchange) {
                                 let text=message["text"].as_str().unwrap_or_default();
                                 if let Some(excerpt)=excerpt(text,query) {
-                                    page.push(json!({"session_id":session.id,"exchange_id":exchange.id,
-                                        "workspace":session.workspace,"matched_field":"messages","excerpt":excerpt}))?;
+                                    let mut hit=json!({"session_id":session.id,"exchange_id":exchange.id,
+                                        "workspace":session.workspace,"matched_field":"messages","excerpt":excerpt});
+                                    mark_history(&mut hit,&exchange);
+                                    page.push(hit)?;
                                 }
                             }
                         }
@@ -278,9 +280,11 @@ impl HarnessInspectionScope {
                                     self.check(name)?;
                                     let combined=format!("{tail}{text}");
                                     if let Some(excerpt)=excerpt(&combined,query) {
-                                        page.push(json!({"session_id":session.id,"exchange_id":exchange.id,
+                                        let mut hit=json!({"session_id":session.id,"exchange_id":exchange.id,
                                             "workspace":session.workspace,"turn_id":turn.id(),"tool_call_id":tool.id,
-                                            "matched_field":"tool_outputs","excerpt":excerpt}))?;
+                                            "matched_field":"tool_outputs","excerpt":excerpt});
+                                        mark_history(&mut hit,&exchange);
+                                        page.push(hit)?;
                                     }
                                     tail=combined.chars().rev().take(query.chars().count()).collect::<String>().chars().rev().collect();
                                     Ok(())
@@ -301,8 +305,13 @@ impl HarnessInspectionScope {
             match name {
                 "harness_config" => page.push(self.config(&reader, &session)?)?,
                 "harness_session_status" => page.push(self.status(&reader, &session)?)?,
+                // A rolled-back exchange left the conversation, so the list omits it; a direct
+                // read or a search still finds it, marked with its history disposition.
                 "harness_session_exchange_list" => reader.exchanges(&session, |exchange| {
                     self.check(name)?;
+                    if exchange.disposition() != HistoryDisposition::Current {
+                        return Ok(());
+                    }
                     page.push(exchange_summary(&exchange))
                 })?,
                 "harness_session_exchange" => {
@@ -523,8 +532,20 @@ fn repository_id(workspace: &str) -> Result<Option<String>> {
         .map(|identity| hex::encode(identity.common_directory.to_string_lossy().as_bytes())))
 }
 
+/// List an exchange's messages in order, naming each by who wrote it.
+///
+/// A task start or continuation opens with instructions Harness wrote, which the transcript shows
+/// only as their notice, so the opening is that notice under the `harness` role rather than a
+/// user message.
 fn conversation(exchange: &Exchange) -> Vec<Value> {
-    let mut messages = vec![json!({"role":"user","text":exchange.prompt})];
+    let opening = match &exchange.opening {
+        ExchangeOpening::TaskStarted { start } => json!({"role":"harness","text":start.heading()}),
+        ExchangeOpening::TaskContinuation { reason } => json!({"role":"harness","text":reason}),
+        ExchangeOpening::User { .. } | ExchangeOpening::NativeAgent => {
+            json!({"role":"user","text":exchange.prompt})
+        }
+    };
+    let mut messages = vec![opening];
     let mut seen = HashSet::new();
     for node in &exchange.node_list {
         match node {
@@ -564,6 +585,7 @@ fn conversation(exchange: &Exchange) -> Vec<Value> {
 
 fn exchange_summary(exchange: &Exchange) -> Value {
     let mut value = json!({"session_id":exchange.session_id,"exchange_id":exchange.id,"messages":conversation(exchange)});
+    mark_history(&mut value, exchange);
     if exchange.state() != ExchangeState::Complete {
         value["state"] = json!(exchange.state());
     }
@@ -578,6 +600,15 @@ fn exchange_summary(exchange: &Exchange) -> Value {
         value["final_answer_available"] = json!(false);
     }
     value
+}
+
+/// Mark a result that describes an exchange a rollback removed from the conversation.
+fn mark_history(value: &mut Value, exchange: &Exchange) {
+    match exchange.disposition() {
+        HistoryDisposition::Current => {}
+        HistoryDisposition::RolledBack => value["history"] = json!("rolled_back"),
+        HistoryDisposition::Superseded => value["history"] = json!("superseded"),
+    }
 }
 
 fn excerpt(text: &str, query: &str) -> Option<String> {

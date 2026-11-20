@@ -3,7 +3,9 @@
 //! `PeerLauncher` implements the production `ClaudeLauncher` boundary with duplex streams. Each
 //! launch builds a fresh `PeerHandler` that receives every frame Forge writes and returns the
 //! frames the CLI would print. Control requests the handler declines receive the generic
-//! success the CLI gives for configuration controls.
+//! success the CLI gives for configuration controls. A launch whose arguments the CLI would
+//! refuse builds no handler, and the peer then closes its output before the initialize answer,
+//! as the CLI does when it exits at startup.
 
 use super::process::{ClaudeLauncher, LaunchSpec};
 use super::transport::ProcessIo;
@@ -24,15 +26,25 @@ pub(super) struct PeerRecord {
     pub frames: Vec<Value>,
 }
 
+/// Build the handler of one launch from its CLI arguments, or `None` when the CLI would exit.
+type LaunchHandlerFactory = Box<dyn Fn(&[String]) -> Option<PeerHandler> + Send + Sync>;
+
 /// Launch in-memory peers in place of `claude`.
 pub(super) struct PeerLauncher {
-    handler_factory: Box<dyn Fn() -> PeerHandler + Send + Sync>,
+    handler_factory: LaunchHandlerFactory,
     pub record: Arc<Mutex<PeerRecord>>,
 }
 
 impl PeerLauncher {
     pub(super) fn new(
         handler_factory: impl Fn() -> PeerHandler + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::with_arguments(move |_| Some(handler_factory()))
+    }
+
+    /// Launch peers whose behavior depends on the command line, such as a resume point.
+    pub(super) fn with_arguments(
+        handler_factory: impl Fn(&[String]) -> Option<PeerHandler> + Send + Sync + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
             handler_factory: Box::new(handler_factory),
@@ -71,12 +83,18 @@ impl ClaudeLauncher for PeerLauncher {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<ProcessIo, ProviderError> {
-        self.record.lock().unwrap().launches.push(spec.arguments());
+        let arguments = spec.arguments();
+        let handler = (self.handler_factory)(&arguments);
+        self.record.lock().unwrap().launches.push(arguments);
         let (client_stdin, peer_stdin) = tokio::io::duplex(1 << 20);
         let (mut peer_stdout, client_stdout) = tokio::io::duplex(1 << 20);
-        let mut handler = (self.handler_factory)();
         let record = self.record.clone();
         tokio::spawn(async move {
+            let Some(mut handler) = handler else {
+                drop(peer_stdout);
+                drop(peer_stdin);
+                return;
+            };
             let mut lines = BufReader::new(peer_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let frame: Value = serde_json::from_str(&line).expect("Forge writes JSON lines");

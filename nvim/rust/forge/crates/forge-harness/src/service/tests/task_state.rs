@@ -25,6 +25,103 @@ async fn goal_completion_does_not_override_native_interruption() -> Result<()> {
     goal_request_waits_for_native_completion(false, true).await
 }
 
+/// A goal the model reports blocked publishes a status that names the reason and the commands
+/// that resume or end it, instead of an idle status beside a winbar that reads `blocked`.
+#[tokio::test]
+async fn blocked_goal_status_names_its_reason() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        TestPromptStep::ToolCall {
+                            name: "goal_blocked".into(),
+                            arguments: json!({"reason":"Needs external input"}),
+                        },
+                        TestPromptStep::Message {
+                            content: TestMessageContent::Response,
+                            text: "I cannot continue without the credentials.".into(),
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let published = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let recorded = published.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            let event: serde_json::Value = serde_json::from_slice(frame.bytes())?;
+            if event["event"] == "session_changed" {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(event["payload"]["snapshot"]["status"].clone());
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            goal_command_request("rpc", "goal", 2),
+            &sink,
+        )
+        .await?;
+    let status = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let blocked = controller
+                .task_controller
+                .current()?
+                .is_some_and(|task| task.status() == crate::task::TaskStatus::Blocked);
+            if blocked
+                && controller.coordinator.execution.available_permits() == 1
+                && let Some(status) = published
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .filter(|status| status["kind"] != "working")
+                    .cloned()
+            {
+                break Ok::<_, anyhow::Error>(status);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the goal never settled blocked")??;
+    assert_eq!(status["kind"], "blocked", "{status}");
+    assert_eq!(
+        status["reason"], "the model reported: Needs external input",
+        "{status}"
+    );
+    controller.finish_exchange_owner().await?;
+    reader.abort();
+    let result = reader.await;
+    assert!(result.is_ok() || result.is_err_and(|error| error.is_cancelled()));
+    Ok(())
+}
+
 /// Exercise terminal requests through the same native response barrier.
 async fn goal_request_waits_for_native_completion(blocked: bool, interrupted: bool) -> Result<()> {
     use crate::provider::mock_response::MockResponseCommand;
@@ -339,6 +436,14 @@ async fn plan_acceptance_case(cancel: bool, automatic: bool, scan: bool) -> Resu
     let registry = service.registry().await?;
     let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
+    // The editor draws what the presentation publishes, so completion is read from an open
+    // transcript rather than from a fresh snapshot of durable state.
+    let transcript = forge_buffer::identity::DocumentId("transcript:plan-acceptance".into());
+    let published = controller.presentation.lock().unwrap().open(
+        transcript.clone(),
+        forge_buffer::identity::ViewId("view:plan-acceptance".into()),
+        forge_buffer::width::WidthProfile::default(),
+    )?;
     let files = crate::plan::PlanFileStore::new(&controller.data_root, root.path())?;
     let mut document = crate::plan::test_fixture("acceptance-fixture", "Retain planning ownership");
     let mut design = crate::plan::DeclarationDesign::open(root.path())?;
@@ -757,17 +862,48 @@ async fn plan_acceptance_case(cancel: bool, automatic: bool, scan: bool) -> Resu
         })
         .await
         .context("phase request did not finish through native collection and checking")??;
-        let mut rows = Vec::new();
-        for entry in &controller.observer.snapshot()?.timeline {
-            if matches!(entry, crate::timeline::TimelineEntry::Exchange { .. }) {
-                rows.extend(crate::buffer::projection::tests::project_rows(entry)?);
+        // No further input arrives: the passing check run alone must publish the completion
+        // rows and close the status split. The bound only stops a hung test.
+        let published_rows =
+            |document: &forge_buffer::identity::DocumentId| -> Result<Vec<String>> {
+                Ok(controller
+                    .presentation
+                    .lock()
+                    .unwrap()
+                    .snapshot(document)?
+                    .block
+                    .iter()
+                    .flat_map(|block| block.text.rows().map(str::to_owned).collect::<Vec<_>>())
+                    .collect())
+            };
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = published_rows(&transcript)?;
+                if rows
+                    .iter()
+                    .any(|row| row.contains("◇ Plan complete: Structured plan"))
+                    && published_rows(&published.status.document)?.is_empty()
+                {
+                    break Ok::<_, anyhow::Error>(rows);
+                }
+                tokio::task::yield_now().await;
             }
-        }
+        })
+        .await;
+        let rows = match completed {
+            Ok(rows) => rows?,
+            Err(_) => anyhow::bail!(
+                "the passing check run published no completion; transcript: {:#?}; status: {:#?}",
+                published_rows(&transcript)?,
+                published_rows(&published.status.document)?
+            ),
+        };
         assert!(
             rows.iter()
-                .any(|row| row.contains("◇ Plan complete: Structured plan")),
-            "the completed task rendered no completion row: {rows:#?}"
+                .any(|row| row.contains("Implementation differences")),
+            "the completed task published no implementation report row: {rows:#?}"
         );
+        assert!(controller.task_controller.current()?.is_none());
         assert!(
             store
                 .list_exchange(&session_id)?

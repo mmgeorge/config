@@ -167,7 +167,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
         );
     }
     broker
-        .interrupt_managed_agent(&first.agent.id, &mut event)
+        .interrupt_managed_agent(&first.agent.id, crate::agent::AgentSource::User, &mut event)
         .await?;
     assert_eq!(
         waiters.remove(0).await??,
@@ -284,7 +284,11 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
         )
         .await?;
     broker
-        .interrupt_managed_agent(&admission.agent.id, &mut event)
+        .interrupt_managed_agent(
+            &admission.agent.id,
+            crate::agent::AgentSource::User,
+            &mut event,
+        )
         .await?;
     broker
         .complete_managed_agent(
@@ -1967,7 +1971,7 @@ async fn write_off_child_dispatch_denies_writes_under_a_shared_reservation() -> 
 }
 
 /// Cancelling admitted work that holds no execution slot terminalizes it durably, so the parent
-/// settles and the next prompt starts.
+/// settles and the next prompt starts without receiving the cancelled parent's child report.
 ///
 /// Collection once skipped child interruption whenever no execution slot was occupied, so a
 /// launch queued behind a fence stayed admitted and the parent's checkpoint guard rejected it.
@@ -2083,6 +2087,15 @@ async fn cancel_collects_pending_children_without_execution_slots() -> Result<()
         )
         .await?;
     assert_eq!(provider.turn.load(Ordering::Acquire), 1);
+    // The cancelled parent never resumes, so the next prompt's turn never receives its child's
+    // report; that report once made the next turn's model describe the earlier turn's children.
+    let next_input = provider.input.lock().unwrap().clone();
+    assert!(
+        next_input
+            .iter()
+            .all(|input| !input.contains(&queued.task.id)),
+        "a cancelled parent's child report reached a later turn: {next_input:#?}"
+    );
     Ok(())
 }
 
@@ -2157,6 +2170,267 @@ async fn running_children_move_from_status_to_the_agents_summary() -> Result<()>
         rows.iter()
             .any(|row| row.starts_with(&format!("✗ {label}")) && row.contains(" · Failed ")),
         "{rows:#?}"
+    );
+    Ok(())
+}
+
+/// Drive one delegating root whose first turn spawns a writing child and a write-off sibling,
+/// then has the user cancel the writing child before it starts; return the root's turn inputs.
+async fn run_parent_with_user_cancelled_child(
+    broker: &mut HarnessBroker,
+    workspace: &std::path::Path,
+) -> Result<Arc<std::sync::Mutex<Vec<String>>>> {
+    let descriptor = crate::provider::ProviderDescriptor {
+        kind: forge_providers::registry::nonselectable_id().expect("fixture identity exists"),
+        label: "Normalized delegating root".into(),
+        capability: crate::provider::test_support::fixture_capability(),
+    };
+    let profiles = broker.agent_provider_factory.profiles.clone();
+    let snapshot = profiles.snapshot()?;
+    let mut document = snapshot.document.clone();
+    let mut reader = document.profiles["worker"].clone();
+    reader.write_access = "off".into();
+    document.profiles.insert("reader".into(), reader);
+    profiles.save(&snapshot.revision, document)?;
+    // A shared reservation keeps the writing child waiting for repository ownership until the
+    // user's cancel ends it, while the write-off sibling shares the reservation and runs.
+    let reservation = crate::repository_access::RepositoryReservation::acquire(
+        broker.trace.root(),
+        workspace,
+        crate::repository_access::RepositoryAccess::Read,
+    )?;
+    let input = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let coordinator = broker.agent_coordinator.clone();
+    let recorded = input.clone();
+    let provider = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        move |request, sink, start, _cancelled| {
+            let recorded = recorded.clone();
+            let coordinator = coordinator.clone();
+            async move {
+                start.observed(0).await?;
+                let text = crate::provider::test_support::input_text(&request.input);
+                let first = recorded.lock().unwrap().is_empty();
+                recorded.lock().unwrap().push(text);
+                if first {
+                    for (profile, text) in [
+                        ("worker", "CANCELLED_CHILD_TASK"),
+                        ("reader", "SURVIVING_CHILD_TASK"),
+                    ] {
+                        let result = crate::provider::test_support::call_tool(
+                            &request,
+                            "agent_spawn",
+                            json!({"profile":profile,"text":text}),
+                        )
+                        .await?;
+                        assert!(result.to_string().contains("admitted"), "{result}");
+                    }
+                    let target = coordinator
+                        .snapshot(None)
+                        .into_iter()
+                        .find(|(_, task)| {
+                            task.as_ref()
+                                .is_some_and(|task| task.message == "CANCELLED_CHILD_TASK")
+                        })
+                        .map(|(agent, _)| agent.id)
+                        .expect("the first child was admitted");
+                    coordinator
+                        .sender()
+                        .request(crate::agent::AgentRequest {
+                            operation_id: "user-interrupt-first-child".into(),
+                            source: crate::agent::AgentSource::User,
+                            operation: crate::agent::AgentOperation::Interrupt { target },
+                        })
+                        .await
+                        .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?;
+                }
+                let scope = request.scope.clone();
+                let address = crate::provider::TurnAddress {
+                    thread_id: scope.owner().thread_id(),
+                    turn_id: scope.turn_id().unwrap(),
+                    scope: scope.clone(),
+                };
+                for event in completed_message(
+                    &address,
+                    "root-response",
+                    crate::provider::TestMessageContent::Response,
+                    if first {
+                        "Waiting for both children"
+                    } else {
+                        "SYNTHESIZED"
+                    },
+                ) {
+                    sink.send_wait(crate::provider::test_support::activity(event)?)
+                        .await?;
+                }
+                Ok(forge_provider_api::TurnResult::new(
+                    forge_provider_api::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                    2,
+                    None,
+                    request.input_coverage(),
+                    Vec::new(),
+                    None,
+                )
+                .expect("fixture native coverage is valid"))
+            }
+        },
+    );
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(provider)?;
+    broker.provider = fixture.provider_handle();
+    broker.agent_coordinator.set_enabled(true);
+    broker
+        .run_interaction(
+            "Delegate two inspections".into(),
+            PromptMode::Chat,
+            Some(ExchangeAdmission::chat("Delegate two inspections".into())),
+        )
+        .await?;
+    drop(reservation);
+    Ok(input)
+}
+
+/// A user's cancel of one child leaves its sibling's result to continue the parent by itself.
+///
+/// Every stopped child once suppressed the parent's automatic continuation, so after the user
+/// cancelled one child the parent settled without its sibling's completed result, which then
+/// reached the model only with the next user prompt. The parent also read the cancelled child's
+/// raw provider error and described the user's cancel as a provider failure.
+#[tokio::test]
+async fn user_cancelled_child_leaves_sibling_result_to_continue_the_parent() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let input = run_parent_with_user_cancelled_child(&mut broker, repository.path()).await?;
+    let input = input.lock().unwrap().clone();
+    assert_eq!(
+        input.len(),
+        2,
+        "the parent did not continue by itself: {input:#?}"
+    );
+    let continuation = &input[1];
+    assert!(
+        continuation.contains("SURVIVING_CHILD_TASK"),
+        "the sibling's result is missing: {continuation}"
+    );
+    assert!(
+        continuation.contains("status=\"cancelled\"")
+            && continuation.contains("Cancelled by the user"),
+        "the cancelled child's report does not name the user's cancel: {continuation}"
+    );
+    let tasks = broker.store.list_agent_task(&broker.session.id)?;
+    assert_eq!(tasks.len(), 2);
+    assert!(
+        tasks.iter().all(|task| task.parent_reported),
+        "a delivered report stays pending for a later turn"
+    );
+    let exchanges = broker.store.list_exchange(&broker.session.id)?;
+    assert_eq!(exchanges.len(), 1);
+    assert_eq!(exchanges[0].state(), ExchangeState::Complete);
+    Ok(())
+}
+
+/// Record each clock reading and whether a presentation refresh could have run at that instant.
+struct PresentationProbeClock {
+    now_ms: std::sync::atomic::AtomicI64,
+    presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
+    armed: std::sync::atomic::AtomicBool,
+    /// Each armed reading, with whether the presentation lock was free when it was taken.
+    reading: std::sync::Mutex<Vec<(i64, bool)>>,
+}
+
+impl super::super::Clock for PresentationProbeClock {
+    fn now_ms(&self) -> i64 {
+        let now_ms = self.now_ms.fetch_add(1, Ordering::Relaxed);
+        if self.armed.load(Ordering::Acquire) {
+            let refreshable = self.presentation.try_lock().is_ok();
+            self.reading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((now_ms, refreshable));
+        }
+        now_ms
+    }
+}
+
+/// A child's settlement measures its stop instant and shows the settled child in one
+/// presentation critical section.
+///
+/// The presentation draws a running child's clock from its last snapshot and the current time
+/// whenever it refreshes. A refresh between the broker's settle instant and the reconcile of
+/// the settled child drew the stale running child past that instant, so its heading ticked to
+/// `11s` and then settled at `Cancelled 10s`. No refresh may run from the settle instant until
+/// the settled child replaces the running one.
+#[tokio::test]
+async fn child_settlement_orders_every_refresh_around_its_stop_instant() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let work = admit_child_fixture(&mut broker, "probe-child")?;
+    let owner = crate::provider::ThreadOwner::new(
+        broker.session.id.clone().into(),
+        forge_provider_api::agent::AgentId::new(work.agent.id.clone())?,
+    )?;
+    let address = child_address(&owner, &work.task.id);
+    broker
+        .observe_child_fixture(
+            owner.clone(),
+            &work.task.id,
+            child_event(
+                &address,
+                crate::provider::TurnEvent::Started(forge_provider_api::turn::TurnStarted {
+                    started_at_ms: 100,
+                }),
+            ),
+            &mut Vec::new(),
+        )
+        .await?;
+    let probe = Arc::new(PresentationProbeClock {
+        now_ms: std::sync::atomic::AtomicI64::new(broker.clock.now_ms() + 1_000),
+        presentation: Arc::clone(&broker.presentation),
+        armed: std::sync::atomic::AtomicBool::new(true),
+        reading: std::sync::Mutex::default(),
+    });
+    broker.clock = probe.clone();
+    let (applied, _) = broker.apply_managed_agent_completion(
+        owner,
+        work.task.id.clone(),
+        Err(anyhow::anyhow!("native turn failed")),
+        Vec::new(),
+        None,
+    )?;
+    probe.armed.store(false, Ordering::Release);
+    // The settled child replaces the running one before the lock that ordered the settle
+    // instant is released, so the first presentation change already names the settled child.
+    let super::super::AppliedProviderEvent::Effects(effects) = applied else {
+        anyhow::bail!("the completion published no presentation effects");
+    };
+    assert!(
+        matches!(
+            effects.first(),
+            Some(super::super::AppliedProviderEvent::Timeline(patch)) if !patch.is_empty()
+        ),
+        "the settled child did not replace the running one under the settle instant's lock"
+    );
+    let settled = broker
+        .store
+        .load_exchange(&work.task.id)?
+        .context("child completion disappeared")?;
+    let settled_at = settled
+        .completed_at_ms()
+        .context("the settled child has no completion instant")?;
+    let unordered: Vec<_> = probe
+        .reading
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(now_ms, refreshable)| *now_ms >= settled_at && *refreshable)
+        .map(|(now_ms, _)| *now_ms)
+        .collect();
+    assert!(
+        unordered.is_empty(),
+        "a refresh could draw the running child at {unordered:?}, after it settled at {settled_at}"
     );
     Ok(())
 }

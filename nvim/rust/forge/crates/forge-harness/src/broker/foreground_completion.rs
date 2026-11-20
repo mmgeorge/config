@@ -413,6 +413,23 @@ impl HarnessBroker {
             .provider_session_id
             .clone()
             .or(transaction.request.provider_session_id.clone());
+        // A cancellation marks this turn collecting when it is admitted, before its acquisition
+        // has interrupted the children, so a result the parent had parked for its children wakes
+        // here with them still running. Finalization captures a checkpoint that requires a
+        // settled delegation tree, so the result stays parked until the interrupted children
+        // settle; their completions bump the agent revision that unparks it. Finalizing at once
+        // failed the cancelled turn on the descendant guard instead of cancelling it.
+        if matches!(
+            transaction.collection,
+            Some(ForegroundCollection::Cancel(_))
+        ) && self
+            .agent_coordinator
+            .has_active_task(&transaction.state.interaction.id)
+        {
+            transaction.pending_native_ready = Some(Ok(output));
+            transaction.native_ready_awaits_children = true;
+            return Ok(ForegroundAction::Wait);
+        }
         // A child stop that requires authorization suppresses automatic continuation, but running
         // siblings still own the exchange: finalizing now would capture an unsettled tree.
         if !user_decision && transaction.collection.is_none() {
@@ -427,33 +444,35 @@ impl HarnessBroker {
                 transaction.native_ready_parked = true;
                 return Ok(ForegroundAction::Wait);
             }
-            let unresolved = self
+            let active = self
                 .agent_coordinator
-                .has_unresolved_task(&transaction.state.interaction.id);
+                .has_active_task(&transaction.state.interaction.id);
+            let pending = self
+                .agent_coordinator
+                .pending_result(&transaction.state.interaction.id);
+            // A child cancelled through Harness reports beside its siblings but never starts a
+            // continuation alone: the cancel was its requester's decision, and its lone report
+            // travels with the next user input instead.
+            let reportable = pending
+                .iter()
+                .any(|task| task.state != ExchangeState::Cancelled);
             // A stopped child leaves its report unreported until user authorization, so only
             // still-running children keep this exchange waiting.
             let waiting_for_children = if stopped_child {
-                self.agent_coordinator
-                    .has_active_task(&transaction.state.interaction.id)
+                active
             } else {
-                unresolved
+                active || reportable
             };
             let results = if stopped_child {
                 Vec::new()
             } else if transaction.steering.deferred.is_empty() {
-                self.agent_coordinator
-                    .pending_result(&transaction.state.interaction.id)
+                pending
             } else {
-                self.agent_coordinator.unreported_result()
+                self.deliverable_child_results(&transaction.state.interaction.id)?
             };
             let resume_input = !stopped_child && !transaction.steering.deferred.is_empty();
-            let child_continuation = !stopped_child
-                && transaction.steering.deferred.is_empty()
-                && unresolved
-                && !self
-                    .agent_coordinator
-                    .has_active_task(&transaction.state.interaction.id)
-                && !results.is_empty();
+            let child_continuation =
+                !stopped_child && transaction.steering.deferred.is_empty() && !active && reportable;
             if (resume_input || child_continuation || !waiting_for_children)
                 && self
                     .active_wait_projection

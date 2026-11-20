@@ -1,7 +1,8 @@
 --- Tab labels for Harness views.
 ---
 --- A label is never stored: `render` resolves each tab to the Harness view whose transcript
---- window lies in it and shows that view's transcript buffer, then names that view's session.
+--- window lies in it and shows that view's transcript buffer, or failing that to the view whose
+--- transcript buffer a visible window in it shows, then names that view's session.
 --- Session switches that move a view between tabs, renames published for background views,
 --- and deletions therefore change the label at the next tabline redraw without bookkeeping.
 local session = require("forge.session")
@@ -23,18 +24,37 @@ end
 ---@return boolean
 local function displays_in(state, tab)
   local window = state.transcript_win
+  -- A hidden transcript window prepares a session switch; the tab still shows the session it replaces.
   return window ~= nil and state.transcript_buf ~= nil and vim.api.nvim_win_is_valid(window)
+    and not vim.api.nvim_win_get_config(window).hide
     and vim.api.nvim_win_get_tabpage(window) == tab
     and vim.api.nvim_win_get_buf(window) == state.transcript_buf
 end
 
+---@param state ForgeHarnessPresentationState
+---@param tab integer
+---@return boolean
+local function shows_transcript_in(state, tab)
+  local transcript_buffer = state.transcript_buf
+  if not (transcript_buffer and vim.api.nvim_buf_is_valid(transcript_buffer)) then return false end
+  return vim.iter(vim.fn.win_findbuf(transcript_buffer)):any(function(window)
+    return vim.api.nvim_win_get_tabpage(window) == tab and not vim.api.nvim_win_get_config(window).hide
+  end)
+end
+
 --- Find the Harness view presented in `tab`, or nil when the tab shows no Harness transcript.
+--- A view that a session switch is moving into another tab owns only the hidden window it is
+--- prepared in, while its former tab keeps showing its transcript until the switch closes that
+--- tab; that tab is still named after the view's session rather than its buffer.
 ---@param tab integer
 ---@return ForgeHarnessPresentationState?
 local function displayed_state(tab)
   if displays_in(session.harness, tab) then return session.harness end
   for _, state in pairs(session.harness_by_id) do
     if displays_in(state, tab) then return state end
+  end
+  for _, state in pairs(session.harness_by_id) do
+    if shows_transcript_in(state, tab) then return state end
   end
   return nil
 end

@@ -321,6 +321,18 @@ impl SessionController {
             else {
                 return Ok(AutomaticAcceptanceRecovery::Unchanged);
             };
+            // The command journal answers a repeated operation identity with its recorded
+            // reply and changes nothing, so resubmitting a journaled acceptance cannot make
+            // progress. A finished one is reported once and left for the user; an unfinished
+            // one already belongs to the exchange owner.
+            let id = crate::exchange::command::CommandId::new(command.operation_id.clone())?;
+            if let Some(record) = self.exchange_owner.command_status(id).await? {
+                if record.completion().is_some() {
+                    self.report_stopped_plan_acceptance(&command.operation_id, sink)
+                        .await;
+                }
+                return Ok(AutomaticAcceptanceRecovery::Unchanged);
+            }
             super::task_state::apply_command(
                 self,
                 self.observer.session_id(),
@@ -333,6 +345,37 @@ impl SessionController {
             return Ok(AutomaticAcceptanceRecovery::Applied);
         }
         Ok(AutomaticAcceptanceRecovery::Unchanged)
+    }
+
+    /// Tell the editor, once per operation, that an eligible automatic acceptance was not
+    /// submitted because the command journal already finished it.
+    async fn report_stopped_plan_acceptance(&self, operation_id: &str, sink: &MessageSender) {
+        {
+            let mut reported = self
+                .stopped_plan_acceptance
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reported.as_deref() == Some(operation_id) {
+                return;
+            }
+            *reported = Some(operation_id.to_owned());
+        }
+        self.trace.record(
+            self.observer.session_id(),
+            "plan.automatic_acceptance_stopped",
+            json!({"command_id":operation_id,"reason":"operation_already_finished"}),
+        );
+        let _ = sink
+            .send_event(SessionEvent {
+                session_id: self.observer.session_id().to_owned(),
+                event: "provider_event".into(),
+                payload: json!({
+                    "kind":"error",
+                    "code":"automatic_acceptance_stopped",
+                    "text":"Automatic plan acceptance stopped: this revision's acceptance already finished, so it was not submitted again. Accept the plan from the review, or run /plan accept off and /plan accept on to accept it as a new decision.",
+                }),
+            })
+            .await;
     }
 
     /// Request deferred checks without acquiring execution or lifecycle authority.

@@ -100,6 +100,9 @@ pub struct CodexNormalization {
     /// Host reasons for refused approvals, by host turn and native item. Codex's decline reply
     /// has no reason field, so the declined item reports the reason retained here.
     denial_reasons: HashMap<(TurnId, String), SanitizedMessage>,
+    /// Agent messages a delivered steer ended. Codex drops such a draft from its conversation
+    /// and may still send a fragment it had queued, which is ignored.
+    abandoned_drafts: std::collections::HashSet<(TurnId, String, ItemPart)>,
     pub replay_sensitive: bool,
 }
 
@@ -943,6 +946,13 @@ impl CodexNormalization {
         } else if matches!(method, "item/started" | "item/completed") && item_type == "userMessage"
         {
             let native = pointer_string(params, &["/item/id"]).ok_or_else(protocol_error)?;
+            if !self.items.contains_key(&(
+                address.turn_id.clone(),
+                native.clone(),
+                ItemPart::Message,
+            )) {
+                self.abandon_streaming_drafts(&address, &mut events);
+            }
             let text = params
                 .pointer("/item/content")
                 .and_then(Value::as_array)
@@ -1545,6 +1555,9 @@ impl CodexNormalization {
             NativeTextObservation::Completed(text) => (text, true),
         };
         let key = (address.turn_id.clone(), native, part);
+        if self.abandoned_drafts.contains(&key) {
+            return Ok(());
+        }
         let first = !self.items.contains_key(&key);
         if first && self.terminal.contains_key(&address.turn_id) {
             return Err(protocol_error().into());
@@ -1709,6 +1722,31 @@ fn item_event(address: &TurnAddress, item_id: &ItemId, event: ItemEvent) -> Adap
     }
 }
 
+impl CodexNormalization {
+    /// End the agent messages a turn is still streaming when a user message joins that turn.
+    ///
+    /// A user message that arrives during a turn is a steer. Codex abandons the draft it was
+    /// streaming, never records it, and answers again from the start, so the draft ends
+    /// interrupted when the steer is delivered rather than when the turn ends; the transcript
+    /// hides an interrupted response. The turn's opening message arrives before any answer,
+    /// so it ends nothing.
+    fn abandon_streaming_drafts(
+        &mut self,
+        address: &TurnAddress,
+        events: &mut Vec<AdapterActivity>,
+    ) {
+        for (key, item) in &mut self.items {
+            if key.0 == address.turn_id
+                && item.completed.is_none()
+                && matches!(item.start, ItemStart::AgentMessage(_))
+            {
+                events.push(finish_message(address, item, MessageOutcome::Interrupted));
+                self.abandoned_drafts.insert(key.clone());
+            }
+        }
+    }
+}
+
 /// Freeze partial or final text while retaining the admitted message representation.
 fn finish_message(
     address: &TurnAddress,
@@ -1769,6 +1807,48 @@ fn timestamp() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Codex abandons the answer it is streaming when a steer reaches the turn and never
+    /// records it, so the steer's native user message ends that draft as interrupted at once,
+    /// and a late fragment of the abandoned draft is ignored rather than rejected.
+    #[tokio::test]
+    async fn a_delivered_steer_interrupts_the_streaming_draft() -> Result<()> {
+        let scope =
+            InvocationScope::new(forge_provider_api::testing::root_thread("session"), "one");
+        let mut normalization = CodexNormalization::default();
+        normalization.admit_turn("native", "turn", &scope)?;
+        let mut output = CodexOutput::default();
+        for notification in [
+            json!({"method":"item/started","params":{"threadId":"native","turnId":"turn",
+                "item":{"type":"agentMessage","id":"draft","phase":"final_answer","text":""}}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"native",
+                "turnId":"turn","itemId":"draft","delta":"A Bloom filter answers"}}),
+            json!({"method":"item/started","params":{"threadId":"native","turnId":"turn",
+                "item":{"type":"userMessage","id":"steer",
+                    "content":[{"type":"text","text":"Also mention the word anchor once."}]}}}),
+            json!({"method":"item/agentMessage/delta","params":{"threadId":"native",
+                "turnId":"turn","itemId":"draft","delta":" a narrow question"}}),
+        ] {
+            normalization
+                .normalize(&notification, &mut output, None, "")
+                .await?;
+        }
+        let interrupted = output
+            .event
+            .iter()
+            .filter(|event| {
+                matches!(event, AdapterActivity::Item {
+                    event: ItemEvent::Completed(ItemCompletion::AgentMessage(MessageCompletion {
+                        outcome: MessageOutcome::Interrupted,
+                        text,
+                    })),
+                    ..
+                } if text == "A Bloom filter answers")
+            })
+            .count();
+        assert_eq!(interrupted, 1, "{:#?}", output.event);
+        Ok(())
+    }
 
     /// Only successful reported command reads produce instruction activity at their admitted turn.
     #[tokio::test]

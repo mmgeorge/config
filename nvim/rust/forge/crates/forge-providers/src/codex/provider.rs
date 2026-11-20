@@ -1174,6 +1174,12 @@ impl CodexProvider {
         let Some(first_removed) = turns.get(retained) else {
             return Ok(());
         };
+        // `thread/revert` cuts history where the first removed turn starts, so items injected
+        // before that turn's start, such as its developer context, stay in native history; the
+        // rollback note appended after verification voids them.
+        tracing::info!(target: "forge::provider", event_name = "provider.rewind.requested",
+            provider = "codex", thread_id = %thread_id, before_turn_id = %first_removed,
+            retained_turns = retained, removed_turns = turns.len() - retained);
         super::operations::mark_changed();
         super::operations::check()?;
         *session.rollback.lock().await = None;
@@ -1199,6 +1205,27 @@ impl CodexProvider {
                     )
                     .into(),
             );
+        }
+        // The rewind is complete. A runtime without injection keeps context inside each turn,
+        // where the revert removed it, so only an injecting runtime needs the note; a failed
+        // note leaves the rewind itself intact and is only traced.
+        let note = [super::turn_context::ROLLBACK_NOTE.to_owned()];
+        let delivered = session
+            .turn_context
+            .lock()
+            .await
+            .deliver(&rpc, &session.history_id(), &note, || {})
+            .await;
+        match delivered {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(target: "forge::provider", event_name = "provider.rewind.note_skipped",
+                    provider = "codex", thread_id = %thread_id);
+            }
+            Err(error) => {
+                tracing::warn!(target: "forge::provider", event_name = "provider.rewind.note_failed",
+                    provider = "codex", thread_id = %thread_id, error = %error);
+            }
         }
         Ok(())
     }
@@ -6993,6 +7020,172 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             assert!(matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::OperationConflict));
             let _ = session.rpc.lock().await.close().await;
         }.await;
+    }
+
+    /// Answer one native request on the rewind fixture's socket and return the request.
+    async fn answer_native_request(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        method: &str,
+        reply: Value,
+    ) -> Value {
+        use futures_util::StreamExt;
+        let frame = socket.next().await.unwrap().unwrap();
+        reply_native_request(socket, frame, method, reply).await
+    }
+
+    /// Check that `frame` is a request for `method`, answer it with `reply`, and return it.
+    async fn reply_native_request(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        frame: tokio_tungstenite::tungstenite::Message,
+        method: &str,
+        reply: Value,
+    ) -> Value {
+        use futures_util::SinkExt;
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["method"], method, "{frame}");
+        let mut envelope = reply;
+        envelope["id"] = frame["id"].clone();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                envelope.to_string().into(),
+            ))
+            .await
+            .unwrap();
+        frame
+    }
+
+    /// Thread history whose turns carry exactly these ids.
+    fn thread_history(turn_ids: &[&str]) -> Value {
+        let turns = turn_ids
+            .iter()
+            .map(|id| json!({"id":id,"status":"completed","items":[]}))
+            .collect::<Vec<_>>();
+        json!({"result":{"thread":{"id":"compaction-thread","turns":turns}}})
+    }
+
+    /// `thread/revert` cuts history where the first removed turn starts, so the developer context
+    /// injected before that turn, such as a goal's `<task kind="goal">`, stays in native history.
+    /// A rewind that removed a turn therefore appends a developer note voiding that context once
+    /// the verification read confirms the cut, and the note's failure never fails the rewind.
+    #[tokio::test]
+    async fn rewind_that_removes_turns_voids_the_surviving_context_item() {
+        for injection_reply in [
+            json!({"result":{}}),
+            json!({"error":{"code":-32000,"message":"injection refused"}}),
+        ] {
+            let (provider, session, _events, mut socket) =
+                compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None })
+                    .await;
+            use futures_util::StreamExt;
+            let binding = session.binding.id.clone();
+            let rewind = provider.thread_rewind(
+                context(),
+                &binding,
+                forge_provider_api::ThreadRewindRequest {
+                    after: Some(forge_provider_api::CheckpointId::new("kept-turn").unwrap()),
+                },
+            );
+            tokio::pin!(rewind);
+            let verified = async {
+                answer_native_request(
+                    &mut socket,
+                    "thread/read",
+                    thread_history(&["kept-turn", "goal-turn", "continuation-turn"]),
+                )
+                .await;
+                let revert =
+                    answer_native_request(&mut socket, "thread/revert", json!({"result":{}})).await;
+                assert_eq!(revert["params"]["beforeTurnId"], "goal-turn");
+                answer_native_request(&mut socket, "thread/read", thread_history(&["kept-turn"]))
+                    .await;
+            };
+            tokio::select! {
+                biased;
+                () = verified => {}
+                result = &mut rewind => panic!("rewind finished before its verification read: {result:?}"),
+            }
+            // The note is the next native request; a rewind that finishes first never sent it.
+            let frame = tokio::select! {
+                biased;
+                frame = socket.next() => frame.unwrap().unwrap(),
+                result = &mut rewind => panic!("rewind finished without a rollback note: {result:?}"),
+            };
+            let (injection, rewound) = tokio::join!(
+                reply_native_request(
+                    &mut socket,
+                    frame,
+                    "thread/inject_items",
+                    injection_reply.clone()
+                ),
+                &mut rewind
+            );
+            rewound.unwrap();
+            assert_eq!(injection["params"]["threadId"], "compaction-thread");
+            let items = injection["params"]["items"].as_array().unwrap();
+            assert_eq!(items.len(), 1, "{injection}");
+            assert_eq!(items[0]["role"], "developer");
+            let note = items[0]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(note, super::super::turn_context::ROLLBACK_NOTE);
+            session.rpc.lock().await.close().await.unwrap();
+        }
+    }
+
+    /// A rewind whose checkpoint is already the newest turn changes nothing and adds no note.
+    #[tokio::test]
+    async fn rewind_that_removes_nothing_injects_nothing() {
+        use futures_util::StreamExt;
+        let (provider, session, _events, mut socket) =
+            compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
+        let binding = session.binding.id.clone();
+        let rewind = provider.thread_rewind(
+            context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest {
+                after: Some(forge_provider_api::CheckpointId::new("kept-turn").unwrap()),
+            },
+        );
+        let native =
+            answer_native_request(&mut socket, "thread/read", thread_history(&["kept-turn"]));
+        let (rewound, _) = tokio::join!(rewind, native);
+        rewound.unwrap();
+        session.rpc.lock().await.close().await.unwrap();
+        while let Some(Ok(frame)) = socket.next().await {
+            assert!(
+                !frame.is_text(),
+                "unexpected native request after a no-op rewind: {frame}"
+            );
+        }
+    }
+
+    /// A runtime without `thread/inject_items` carries context inside each turn, where the revert
+    /// removes it, so its rewind sends no note.
+    #[tokio::test]
+    async fn rewind_on_a_runtime_without_injection_sends_no_note() {
+        use futures_util::StreamExt;
+        let (provider, session, _events, mut socket) =
+            compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
+        *session.turn_context.lock().await =
+            super::super::turn_context::TurnContextDelivery::Unsupported;
+        let binding = session.binding.id.clone();
+        let rewind = provider.thread_rewind(
+            context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest { after: None },
+        );
+        let native = async {
+            answer_native_request(&mut socket, "thread/read", thread_history(&["goal-turn"])).await;
+            answer_native_request(&mut socket, "thread/revert", json!({"result":{}})).await;
+            answer_native_request(&mut socket, "thread/read", thread_history(&[])).await;
+        };
+        let (rewound, ()) = tokio::join!(rewind, native);
+        rewound.unwrap();
+        session.rpc.lock().await.close().await.unwrap();
+        while let Some(Ok(frame)) = socket.next().await {
+            assert!(
+                !frame.is_text(),
+                "unexpected native request after the rewind: {frame}"
+            );
+        }
     }
 
     /// Retraction requires exact attempt identity and cannot discard a second input in the same turn.

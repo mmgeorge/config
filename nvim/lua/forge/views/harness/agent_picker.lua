@@ -56,7 +56,10 @@ local function option_list(state, selected_run_id)
   local result = {
     { id = "main", value = { kind = "main" }, label = "Main", detail = "Parent conversation", columns = { "Main", "—", "Parent conversation" } },
   }
-  local now_ms = os.time() * 1000
+  -- The host stamps running clocks in epoch milliseconds; whole seconds would shift every
+  -- duration by up to a second against the status row that counts the same clock.
+  local seconds, microseconds = vim.uv.gettimeofday()
+  local now_ms = seconds * 1000 + math.floor(microseconds / 1000)
   for _, group in ipairs({
     { title = "Running", run_list = agent_catalog.run_list(state, true) },
     { title = "Done", run_list = agent_catalog.run_list(state, false) },

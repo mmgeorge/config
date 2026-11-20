@@ -343,12 +343,15 @@ T["session_picker"] = function()
   local original_tab_count = #vim.api.nvim_list_tabpages()
   keymap.invoke("<CR>", { mode = "i" })
   assert(not picker.is_open("sessions"), "resuming should close the session search")
-  eq(state.session.id, "beta", { fail_reason = "Enter should resume the selected same-repository session" })
+  local resumed = session.harness
+  eq(resumed.session.id, "beta", { fail_reason = "Enter should resume the selected same-repository session" })
   eq(vim.api.nvim_get_current_tabpage(), original_tab)
   eq(#vim.api.nvim_list_tabpages(), original_tab_count,
     { fail_reason = "resuming a session should not create a tab" })
-  eq(vim.api.nvim_win_get_buf(state.transcript_win), original_transcript_buf,
-    { fail_reason = "closing session search should leave the real Harness timeline buffer in place" })
+  eq(vim.api.nvim_win_get_buf(resumed.transcript_win), resumed.transcript_buf,
+    { fail_reason = "the resumed session should replace the transcript pane, not draw over it" })
+  eq(vim.api.nvim_buf_is_valid(original_transcript_buf), true,
+    { fail_reason = "the session left behind keeps its transcript" })
 end
 
 T["enter_on_another_provider_session_switches_provider"] = function()
@@ -382,6 +385,49 @@ T["enter_on_another_provider_session_switches_provider"] = function()
   eq(vim.tbl_filter(function(request) return request.spec.method == "session.resume" end, fixture.requests), {},
     { fail_reason = "the running host serves one provider and cannot resume another provider's session" })
   eq(warnings:messages(), {})
+end
+
+-- The deleted row stayed listed until the host confirmed the deletion and answered a new list
+-- request, while a repeated delete key still targeted it or the row that followed. The row now
+-- leaves the list when the delete is sent, so the selection moves to a row the user can see.
+T["deleting_a_session_removes_its_row_at_once"] = function()
+  local workspace = vim.fn.getcwd()
+  local failures = notify.capture({ min_level = vim.log.levels.WARN, notifications = true })
+  local listed = {
+    { id = "current", provider = "fixture_alpha", workspace = workspace, created_at_ms = 3, active = true },
+    { id = "first", provider = "fixture_alpha", workspace = workspace, created_at_ms = 2 },
+    { id = "second", provider = "fixture_alpha", workspace = workspace, created_at_ms = 1 },
+  }
+  local fixture = open_session_picker(listed[1], listed)
+  local delete_reply_list = {}
+  local picker_session = require("forge.views.harness.session_picker")
+  stub(require("forge.client"), "request", function(spec, callback)
+    fixture.requests[#fixture.requests + 1] = { spec = spec, callback = callback }
+    if spec.method == "session.delete" then delete_reply_list[#delete_reply_list + 1] = callback
+    elseif spec.method == "session.list" then callback(vim.deepcopy(listed)) end
+  end)
+  local function listed_ids()
+    return vim.tbl_map(function(option) return option.id end, fixture.spec().page_list[1].option_list)
+  end
+  local function delete(option) fixture.spec().action_list[2].callback({ option = option }) end
+  local first = fixture.option("first")
+
+  delete(first)
+  eq(listed_ids(), { "current", "second" })
+  -- The key repeats before the host answers; the row it named is gone, so nothing else is deleted.
+  delete(first)
+  eq(#delete_reply_list, 1)
+  table.remove(listed, 2)
+  delete_reply_list[1]({ deleted = "first" })
+  eq(listed_ids(), { "current", "second" })
+
+  -- A refused delete restores the row from the host's list.
+  delete(fixture.option("second"))
+  eq(listed_ids(), { "current" })
+  delete_reply_list[2](nil, "session is in use")
+  eq(listed_ids(), { "current", "second" })
+  eq(failures:messages(), { "session is in use" })
+  eq(picker_session._state_for_test() ~= nil, true)
 end
 
 T["preview_receives_the_rows_above_the_picker"] = function()
@@ -448,6 +494,28 @@ T["footer_and_help_describe_session_commands"] = function()
   for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(instance.buf, "n")) do
     eq((mapping.desc or ""):find("planning", 1, true), nil, { fail_reason = mapping.lhs .. " says " .. tostring(mapping.desc) })
   end
+end
+
+
+-- A tab whose host now serves another provider still shows its session, which the host has not
+-- loaded; the row says so instead of reading as a closed session.
+T["a_session_shown_in_a_tab_the_host_no_longer_serves_is_marked_disconnected"] = function()
+  local workspace = vim.fn.getcwd()
+  local session = require("forge.session")
+  local diagnostic = require("forge.views.harness.diagnostic")
+  local detached = session.new_harness_state()
+  detached.session = { id = "detached", provider = "fixture_alpha", workspace = workspace }
+  detached.transcript_win = vim.api.nvim_get_current_win()
+  diagnostic.set(detached, "host_error", "Harness now serves Fixture 2.", { category = "host", recovery = "reconnect" })
+  session.register_harness("detached", detached)
+  local fixture = open_session_picker(
+    { id = "current", provider = "fixture_beta", workspace = workspace },
+    { { id = "current", provider = "fixture_beta", workspace = workspace, created_at_ms = 2, active = true },
+      { id = "detached", provider = "fixture_alpha", workspace = workspace, created_at_ms = 1, active = false } })
+  wait_until(function() return fixture.spec() ~= nil end, "the session picker did not open")
+  eq({ fixture.option("detached").section, fixture.option("detached").columns[2] },
+    { "Inactive", "[unnamed] (open, disconnected)" })
+  eq(fixture.option("current").columns[2], "[unnamed] (current)")
 end
 
 return T

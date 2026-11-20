@@ -664,9 +664,16 @@ impl ProviderPermissionContext {
             Ok(ApprovalResolution::Cancel) => {
                 RequestDecision::Respond(PermissionResponse::Cancelled)
             }
-            Err(error) => deny(Denial::unavailable(format!(
-                "Harness permission evaluation failed: {error:#}"
-            ))),
+            Err(error) => {
+                match error.downcast_ref::<crate::permissions::matcher::CommandAnalysisError>() {
+                    // Analysis refused the command before any approval opened, so nothing has recorded
+                    // the refusal on the tool row yet.
+                    Some(analysis) => refuse(Denial::command_analysis(analysis)),
+                    None => deny(Denial::unavailable(format!(
+                        "Harness permission evaluation failed: {error:#}"
+                    ))),
+                }
+            }
         }
     }
 }
@@ -711,6 +718,9 @@ enum DenialNext {
     AwaitUserRequest,
     /// Writes are off for the session; only the user can turn them back on.
     EnableWrites,
+    /// Shell analysis could not check the command; commands it can check and file-editing tools
+    /// remain permitted routes to the same work.
+    UseAnalyzableCommand,
 }
 
 /// Explain one refusal to the model: who decided, why, and what to do next.
@@ -785,6 +795,16 @@ impl Denial {
         }
     }
 
+    /// Refuse a command that shell analysis cannot check, because approving it would authorize
+    /// invocations nobody examined; the analysis cause names the construct.
+    fn command_analysis(error: &crate::permissions::matcher::CommandAnalysisError) -> Self {
+        Self {
+            source: DenialSource::HarnessPolicy,
+            reason: Some(error.to_string()),
+            next: DenialNext::UseAnalyzableCommand,
+        }
+    }
+
     fn writes_off() -> Self {
         Self {
             source: DenialSource::HarnessPolicy,
@@ -806,6 +826,9 @@ impl Denial {
             DenialNext::UseFileEditingTool => {
                 format!("{reason} The model was told to make the edit with its file-editing tool.")
             }
+            DenialNext::UseAnalyzableCommand => format!(
+                "{reason} The model was told to use commands Harness can analyze or its file-editing tool."
+            ),
             DenialNext::DoNotRetry | DenialNext::AwaitUserRequest | DenialNext::EnableWrites => {
                 reason.to_owned()
             }
@@ -855,6 +878,10 @@ impl Denial {
             ),
             DenialNext::EnableWrites => parts.push(
                 "Do not retry it or write through another tool. Tell the user the change needs writes, which they can enable with /write."
+                    .into(),
+            ),
+            DenialNext::UseAnalyzableCommand => parts.push(
+                "You may do the same work with commands Harness can analyze, or make file changes with your file-editing tool."
                     .into(),
             ),
         }
@@ -1062,6 +1089,87 @@ mod tests {
         };
         assert!(reason.contains("/write"), "{reason}");
         assert!(!reason.contains("file-editing tool"), "{reason}");
+        Ok(())
+    }
+
+    /// A command that shell analysis cannot check names the unsupported construct and the permitted
+    /// routes, and records that reason on the tool row.
+    ///
+    /// The refusal used to say that Harness could not evaluate the call, ask for the construct to
+    /// be rewritten, and forbid any retry "including through another tool" in the same message, so
+    /// a model told to write a file stopped without writing it.
+    #[tokio::test]
+    async fn unsupported_command_denial_offers_supported_routes() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let coordinator =
+            PermissionCoordinator::load(root.path().join("permissions.json"), root.path())?;
+        let owner = crate::provider::ThreadOwner::root("session");
+        let scope = forge_provider_api::InvocationScope::new(owner.clone(), "unsupported-turn");
+        let context = ProviderPermissionContext::new(coordinator);
+        let (events, mut receiver) = crate::provider::events::channel(scope.clone());
+        context.configure(
+            owner,
+            ApprovalMode::Allow,
+            root.path().display().to_string(),
+            Some(events),
+        )?;
+        let response = context
+            .authorize(
+                &scope,
+                PermissionRequest {
+                    id: "method-invocation".into(),
+                    provider: forge_providers::registry::nonselectable_id().unwrap(),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
+                    reason: None,
+                    target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
+                        command: "New-Item -ItemType Directory -Force -Path notes | Out-Null\n[System.IO.File]::WriteAllText('notes/wave.txt', 'wave')".into(),
+                        shell: Some(forge_shell::shell::CommandShell::PowerShell),
+                    }],
+                },
+            )
+            .await;
+        let PermissionResponse::Deny {
+            reason: Some(reason),
+        } = response
+        else {
+            panic!("the unsupported command was not denied: {response:?}");
+        };
+        assert!(reason.contains("method invocation"), "{reason}");
+        assert!(reason.contains("did not run"), "{reason}");
+        assert!(reason.contains("your file-editing tool"), "{reason}");
+        assert!(!reason.contains("Do not retry"), "{reason}");
+        assert!(
+            !reason.contains("Rewrite the unsupported construct"),
+            "{reason}"
+        );
+        assert!(!reason.contains("could not evaluate"), "{reason}");
+        let mut row_reason = None;
+        while let Ok(observation) = receiver.try_recv() {
+            if let crate::provider::session_execution::OwnerObservation::Event(
+                crate::provider::HarnessEvent::Host {
+                    event:
+                        crate::provider::HostEvent::PermissionApproval {
+                            event: crate::provider::PermissionApprovalEvent::Resolved(resolution),
+                            ..
+                        },
+                    ..
+                },
+            ) = observation
+            {
+                row_reason = resolution
+                    .targets
+                    .first()
+                    .and_then(|target| match &target.decision {
+                        crate::provider::PermissionDecision::Deny { reason, .. } => {
+                            Some(reason.as_str().to_owned())
+                        }
+                        _ => None,
+                    });
+            }
+        }
+        let row_reason = row_reason.expect("the refusal was not recorded for the tool row");
+        assert!(row_reason.contains("method invocation"), "{row_reason}");
+        assert!(row_reason.contains("file-editing tool"), "{row_reason}");
         Ok(())
     }
 

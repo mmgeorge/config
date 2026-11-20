@@ -359,6 +359,9 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
         SessionPhase::Paused {
             waiting: Some(crate::session::state_machine::PausedWait::PlanReview { .. }),
         } => "Paused · plan review waits · /task resume".into(),
+        SessionPhase::Blocked { reason } => {
+            format!("Blocked · {reason} · /task resume · /task clear")
+        }
         SessionPhase::Stopping { collection } => collection.label().into(),
         SessionPhase::Compacting { .. } => {
             let elapsed_seconds = status.elapsed_ms(now_ms) / 1_000;
@@ -370,6 +373,11 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
                 .as_ref()
                 .map_or_else(|| label.into(), |error| format!("{label} failed · {error}"))
         }
+        // The hand-off has no clock of its own; its successor publishes the first one.
+        SessionPhase::Working {
+            activity: WorkflowActivity::HandingOff,
+            ..
+        } => WorkflowActivity::HandingOff.active_label().into(),
         SessionPhase::Working {
             activity,
             execution,
@@ -965,6 +973,34 @@ mod tests {
         Ok(())
     }
 
+    /// A blocked task's status names the cause and both commands that can follow it, and it
+    /// keeps no animation or key hint, as nothing runs until the user acts.
+    #[test]
+    fn blocked_status_names_its_cause_and_commands() -> Result<()> {
+        use anyhow::Context as _;
+        let status = SessionPhase::Blocked {
+            reason: "5 consecutive turns changed no files".into(),
+        };
+        let block = StatusView {
+            id: "status",
+            status: &status,
+            agents: &[],
+            status_thoughts: false,
+            checks: None,
+        }
+        .render(&WidthProfile::default(), 0)?
+        .block
+        .context("a blocked task rendered no status")?;
+        assert_eq!(
+            block.text.wire_rows().first().copied(),
+            Some("Blocked · 5 consecutive turns changed no files · /task resume · /task clear")
+        );
+        let presentation = block.metadata.status.context("status row metadata")?;
+        assert!(!presentation.animated);
+        assert!(presentation.hint.is_none());
+        Ok(())
+    }
+
     /// Omit unknown formatting coverage until the adapter reports a file outcome.
     #[test]
     fn format_details_require_reported_progress() {
@@ -1462,12 +1498,14 @@ mod tests {
 
     /// Mark the predicted hand-off so the editor can tell it from ordinary work.
     ///
-    /// The hand-off reads exactly like the admitted turn's first frame, `Working · 0s`, so the
-    /// status row never changes under the reader. Only the flag tells the editor that the
-    /// exchange that just settled is followed by a queued turn, which keeps the editor from
-    /// revealing the finished exchange a moment before the successor's output replaces it.
+    /// The hand-off reads `Working` with no clock: its successor may be a new exchange whose
+    /// clock starts at zero or an open exchange that continues its own, as a plan revision
+    /// does, and a guessed `0s` jumped to the continued exchange's total a moment later. The
+    /// flag tells the editor that the exchange that just settled is followed by a queued turn,
+    /// which keeps the editor from revealing the finished exchange a moment before the
+    /// successor's output replaces it.
     #[test]
-    fn hand_off_renders_as_working_and_carries_the_hand_off_flag() -> Result<()> {
+    fn hand_off_reads_working_without_a_clock_and_carries_the_hand_off_flag() -> Result<()> {
         let render = |activity| -> Result<BufferBlock> {
             let status = SessionPhase::Working {
                 duration_ms: 0,
@@ -1489,7 +1527,8 @@ mod tests {
         };
         let hand_off = render(WorkflowActivity::HandingOff)?;
         let working = render(WorkflowActivity::Working)?;
-        assert_eq!(hand_off.text.wire_rows(), working.text.wire_rows());
+        assert_eq!(hand_off.text.wire_rows(), ["Working"]);
+        assert_eq!(working.text.wire_rows(), ["Working · 0s"]);
         assert!(hand_off.metadata.status.as_ref().unwrap().handoff);
         assert!(!working.metadata.status.as_ref().unwrap().handoff);
         let document =

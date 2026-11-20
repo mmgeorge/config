@@ -1,7 +1,5 @@
 local AgentSummary = {}
 
-local tool_render = require("forge.render.harness.tool")
-
 local active_status = {
   queued = true,
   starting = true,
@@ -40,57 +38,33 @@ function AgentSummary.label(run)
   return run.task_name or run.nickname or run.definition or "agent"
 end
 
----@class ForgeInteractionSummary : table[]
----@field tool_count? integer
----@field failed_count? integer
+---@class ForgeAgentRunSummary
+---@field state? string Latest task's exchange state.
+---@field elapsed_ms? integer Execution time the latest task's exchange clock has accumulated.
+---@field running_since_ms? integer Instant from which a running exchange's clock keeps counting.
+---@field tool_label? string The status row's tool tally for the latest task.
 
---- Computes total and failed tool invocation counts across interactions.
----@param interaction_list ForgeInteractionSummary? Array of interaction nodes with optional retained counts.
----@return integer tool_count Total count of tool invocations.
----@return integer failed_count Count of failed tool executions.
-function AgentSummary.tool_counts(interaction_list)
-  if interaction_list and interaction_list.tool_count then
-    return interaction_list.tool_count, interaction_list.failed_count or 0
-  end
-  local tool_count, failed_count = 0, 0
-  for _, exchange in ipairs(interaction_list or {}) do
-    for _, turn in ipairs(exchange.turn or {}) do
-      local store = turn.tool or {}
-      for _, id in ipairs(store.order or {}) do
-        local tool = (store.item or {})[id]
-        if tool then
-          tool_count = tool_count + 1
-          if tool_render.failed(tool) then failed_count = failed_count + 1 end
-        end
-      end
-    end
-  end
-  return tool_count, failed_count
-end
-
---- Formats a status summary string with elapsed duration and tool invocation counts.
+--- Formats the agents picker's status for one child: state, duration, and tool tally.
+---
+--- The duration and tally come from the host's summary of the child's latest task exchange, the
+--- clock and counter its status row, transcript row, and heading read, so all of them show one
+--- number. The editor only keeps a running clock counting between summaries.
 ---@param run table Agent run descriptor table.
----@param interaction_list ForgeInteractionSummary? Array of interaction nodes with optional retained counts.
+---@param summary ForgeAgentRunSummary? Host summary of the child's latest task.
 ---@param now_ms integer Current epoch timestamp in milliseconds.
----@param capitalize? boolean True to capitalize status label prefix.
----@param include_zero_tools? boolean True to include tool count when zero.
 ---@return string detail Formatted status description string.
-function AgentSummary.status_detail(run, interaction_list, now_ms, capitalize, include_zero_tools)
-  local status = execution_status(run, interaction_list)
-  local active = AgentSummary.is_active(status)
-  local end_ms = active and now_ms or (run.updated_at_ms or now_ms)
-  local duration_seconds = math.floor(math.max(0, end_ms - (run.created_at_ms or end_ms)) / 1000)
-  local status_label = capitalize == false and status or (status:sub(1, 1):upper() .. status:sub(2))
-  local tool_count, failed_count = AgentSummary.tool_counts(interaction_list)
+function AgentSummary.status_detail(run, summary, now_ms)
+  local status = execution_status(run, summary)
+  local elapsed_ms = summary and type(summary.elapsed_ms) == "number" and summary.elapsed_ms or 0
+  local running_since_ms = summary and summary.running_since_ms
+  if type(running_since_ms) == "number" then elapsed_ms = elapsed_ms + math.max(0, now_ms - running_since_ms) end
   local detail = ("%s %s %ds"):format(
-    status_label,
-    active and "for" or "in",
-    duration_seconds
+    status:sub(1, 1):upper() .. status:sub(2),
+    AgentSummary.is_active(status) and "for" or "in",
+    math.floor(elapsed_ms / 1000)
   )
-  if tool_count > 0 or include_zero_tools ~= false then
-    detail = detail .. (", %d %s called"):format(tool_count, tool_count == 1 and "tool" or "tools")
-    if failed_count > 0 then detail = detail .. (" (%d failed)"):format(failed_count) end
-  end
+  local tool_label = summary and summary.tool_label
+  if type(tool_label) == "string" and tool_label ~= "" then detail = detail .. " · " .. tool_label end
   return detail
 end
 

@@ -277,7 +277,10 @@ pub fn codex_response(message: &Value, response: &PermissionResponse) -> Value {
 }
 
 /// Recovers provider arguments before applying the selected shell's quoting rules.
-fn provider_command(
+///
+/// Command approvals and command tool rows both read a command through this function, so the row
+/// names the same script, in the same shell, that permission analysis checked.
+pub(super) fn provider_command(
     params: &Value,
     uses_argv_serialization: bool,
 ) -> Result<(String, Option<CommandShell>)> {

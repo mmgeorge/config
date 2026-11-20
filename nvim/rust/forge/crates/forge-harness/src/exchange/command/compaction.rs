@@ -16,8 +16,9 @@ pub(crate) struct ContextCompactionOutcome {
     pub(crate) disposition: super::InvocationDisposition,
 }
 
-/// Preserve normalized compaction failure categories without native diagnostic strings.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, thiserror::Error)]
+/// Preserve normalized compaction failure categories; only a provider's own sanitized
+/// explanation of a declined request carries text.
+#[derive(Clone, Debug, Deserialize, Serialize, thiserror::Error)]
 #[serde(tag = "compaction_failure", rename_all = "snake_case")]
 pub(crate) enum ContextCompactionFailure {
     /// The normalized capability does not support an explicit compaction operation.
@@ -32,6 +33,12 @@ pub(crate) enum ContextCompactionFailure {
     /// The result cannot mutate a different conversation or task revision.
     #[error("compaction authority changed before the result could apply")]
     AuthorityChanged,
+    /// The provider answered the request without compacting and said why, such as
+    /// "Nothing to compact."; its words are the user's explanation.
+    #[error("context was not compacted: {explanation}")]
+    Declined {
+        explanation: forge_provider_api::SanitizedMessage,
+    },
     /// The attempt remains retained while cleanup establishes quiescence.
     #[error("context compaction exceeded its deadline; its work remains owned for collection")]
     TimedOut,
@@ -44,12 +51,13 @@ pub(crate) enum ContextCompactionFailure {
 
 impl ContextCompactionFailure {
     /// Get the stable host failure code without parsing provider messages.
-    pub(crate) fn code(self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Unsupported => "compaction_unsupported",
             Self::NoConversation => "compaction_no_conversation",
             Self::Unconfirmed => "compaction_unconfirmed",
             Self::AuthorityChanged => "compaction_authority_changed",
+            Self::Declined { .. } => "compaction_declined",
             Self::TimedOut => "compaction_timeout",
             Self::Provider { .. } => "compaction_provider_failed",
         }

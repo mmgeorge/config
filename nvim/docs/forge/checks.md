@@ -143,7 +143,9 @@ case does not satisfy the plan even if its check passes. Removed tests require
 exact discovery to confirm their absence. Missing or ambiguous tests enter
 Resolve; they fail the Check but stop no other check, so type checking,
 formatting, lint, and the planned tests that were found still run, and the
-Check heading names only the tests that are missing. With Planned selected, a test check owning no required cases is excluded
+Check heading names only the tests that are missing. The heading opens with
+`failed` and that cause, as in `Checks · failed · planned test … · 4/4 passed`, so a
+Check whose commands all passed never reads as a plain pass. With Planned selected, a test check owning no required cases is excluded
 after resolution. Whole suite still runs an enabled check with no planned cases,
 and every required planned case must pass even when the whole suite runs.
 Each Check retry resolves the tests again and records a new attempt. Results from
@@ -476,8 +478,10 @@ restart. With automatic checks disabled, the requirement stays pending until
 an explicit verification run or plan Checking satisfies it; it never starts
 a background check by itself.
 While the requirement is pending, a goal's completion request is refused: the
-goal stays active, and its next turn tells the model to run the originating
-checks first. A goal turn that ends while its own check run is still collecting
+goal stays active, and its next turn names each pending check and the exact
+`check_run` request that verifies it, which selects the whole check, for example
+`{"ids":["format"],"selections":{"format":{"kind":"all"}}}`. A run that names only
+the check ID selects the changed paths and does not satisfy the requirement. A goal turn that ends while its own check run is still collecting
 also cannot complete the goal; the check result starts the next turn.
 Configured or task disabling leaves that requirement unresolved. Re-enable the
 check and run it again with whole-check coverage. Changes to automatic selection,
@@ -570,6 +574,10 @@ Submitting a prompt while checks run interrupts those checks and starts the prom
 after their processes stop. Explicitly queueing a prompt leaves checks running and
 waits for completion. A directly submitted prompt takes precedence over queued
 prompts, and edits made to the composer during cancellation remain unsent.
+Only what you send interrupts checks: a prompt, an answer, or a task you start or
+resume. A continuation Harness schedules after a task's turn, such as the next goal
+turn, waits for running checks instead, so a model that ends its turn while its own
+`check_run` is still running receives that run's result rather than an interrupted one.
 `Ctrl-C` stops running checks and pauses work without submitting the composer or
 queued messages. `Ctrl-S`
 submits the composer even while that pause is pending, after cleanup finishes.

@@ -23,6 +23,13 @@ local function option(entry, scope)
   if name == "" then name = "[unnamed]" end
   local current_session = session.harness.session or {}
   local label = current_session.id == entry.id and (name .. " (current)") or name
+  -- A tab whose host stopped or now serves another provider still shows its session, which the
+  -- host has not loaded; the row says why that open session is listed as Inactive.
+  local shown_state = not entry.active and session.harness_by_id[entry.id]
+  if shown_state and shown_state.host_error and shown_state.transcript_win
+    and vim.api.nvim_win_is_valid(shown_state.transcript_win) then
+    label = label .. " (open, disconnected)"
+  end
   local mode = entry.approval_mode or "ask"
   local columns = { datetime.relative_ms(entry.created_at_ms), label, entry.provider or "", mode }
   if scope == "all" then columns[#columns + 1] = entry.workspace or "" end
@@ -98,9 +105,15 @@ local function resume_session(instance, entry)
     if started then dismiss(instance) end
     return
   end
-  dismiss(instance)
-  if instance.on_select then instance.on_select(entry)
-  else session_navigation.resume(entry.id, { open_mode = "current", insert = instance.composer_insert }) end
+  if instance.on_select then
+    dismiss(instance)
+    instance.on_select(entry)
+    return
+  end
+  -- The picker and its preview of the chosen session stay on screen until that session replaces
+  -- the panes beneath them, so the tab never shows the session being left in between.
+  session_navigation.resume(entry.id, { open_mode = "current", insert = instance.composer_insert,
+    on_settled = function() if active == instance then dismiss(instance) end end })
 end
 
 local build_spec
@@ -118,9 +131,21 @@ local function delete_session(instance, entry)
     notifications.warn("The active session cannot be deleted.", "ForgeSessions")
     return
   end
+  if instance.deleting[entry.id] then return end
+  -- The row leaves the list in the same update that moves the selection to the row after it, so
+  -- a repeated delete key can only act on a row the picker has already shown selected.
+  instance.deleting[entry.id] = true
+  for scope, entry_list in pairs(instance.entry_list_by_scope) do
+    instance.entry_list_by_scope[scope] = vim.tbl_filter(function(listed) return listed.id ~= entry.id end, entry_list)
+  end
+  if picker.is_open("sessions") then picker.update(build_spec(instance)) end
   client.request({ session_id = instance.owner_session_id, method = "session.delete", params = { session_id = entry.id } }, function(_, request_error)
+    instance.deleting[entry.id] = nil
     if request_error then
-      if active == instance then notifications.error(request_error, "ForgeSessions") end
+      if active ~= instance then return end
+      notifications.error(request_error, "ForgeSessions")
+      -- The session still exists, so the host's list restores its row.
+      load_session_list(instance)
       return
     end
     -- Views of the deleted session close even when the picker closed before the host replied.
@@ -243,6 +268,7 @@ load_session_list = function(instance)
       return
     end
     instance.entry_list_by_scope[instance.scope] = vim.tbl_filter(function(entry)
+      if instance.deleting[entry.id] then return false end
       return not instance.provider or (entry.provider == instance.provider and same_workspace(entry.workspace, instance.workspace))
     end, result or {})
     if picker.is_open("sessions") then
@@ -267,6 +293,8 @@ function SessionPicker.open(host, options)
     owner_session_id = session.harness.session and session.harness.session.id,
     scope = "repo",
     entry_list_by_scope = {},
+    -- Sessions whose deletion the host has not answered yet; their rows are already removed.
+    deleting = {},
     list_generation = 0,
     preview_generation = 0,
     provider = options.provider,

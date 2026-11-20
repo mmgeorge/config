@@ -123,7 +123,11 @@ function HarnessSnapshot.apply(state, result)
   end
   state.active_wait = vim.deepcopy(result.active_wait)
   state.approval = vim.deepcopy(result.approval or {})
-  state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, exchange = {} })
+  -- Child list revisions count within one session's host run, so another session's list or a
+  -- list from an earlier run never outranks this one.
+  if session_changed or runtime_changed then state.agent = nil end
+  require("forge.views.harness.agent_catalog").replace(state,
+    result.agent or { definition = {}, run = {}, exchange = {} })
   if state.selected_agent_run_id then
     local selected_exists = vim.iter(state.agent.run or {}):any(function(run)
       return run.id == state.selected_agent_run_id

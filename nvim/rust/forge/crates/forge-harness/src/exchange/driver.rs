@@ -429,7 +429,8 @@ impl ExchangeDriver {
             }
             self.step_begin(&env, &mut state, step, closed);
             let foreground_at_entry = state.foreground.is_some();
-            self.events_receive(&env, &mut state, step, continuing_event_phase, &mut closed)
+            let received = self
+                .events_receive(&env, &mut state, step, continuing_event_phase, &mut closed)
                 .await;
             self.publications_flush(&env, &mut state, step).await;
             self.history_failure_apply(&env, step);
@@ -437,10 +438,19 @@ impl ExchangeDriver {
                 .await;
             self.deliveries_advance(&env, &mut state, step, closed)
                 .await;
-            let (ready_wake, event_status) =
-                self.ready_wake_poll(&env, &mut state, closed, event_budget);
+            // Intent received at this step's entry runs its effect phase before further ready
+            // events, and a run of ready events ends as soon as the inbox holds more intent. A
+            // request therefore waits for the event being applied, not for the bounded run: a
+            // burst of child events once held the agents picker's interrupt for 742 ms, until
+            // the child it named had completed.
+            let (ready_wake, event_status) = self.ready_wake_poll(
+                &env,
+                &mut state,
+                closed,
+                if received { 0 } else { event_budget },
+            );
             let mut broker_deferred = false;
-            continuing_event_phase = ready_wake.is_some();
+            continuing_event_phase = ready_wake.is_some() && self.receiver.is_empty();
             if continuing_event_phase {
                 event_budget = event_budget.saturating_sub(1);
             }
@@ -1170,8 +1180,9 @@ fn publish_input_events(
 ///
 /// A direct prompt preempts checks whether the owner is idle or a running turn is waiting on a
 /// `check_run` result; input readiness retries delivery once the cancelled run is collected.
-/// Explicitly queued input and stale task input never interrupt checks. Returns whether a run
-/// was active and cancellation was requested.
+/// Explicitly queued input, Harness-generated continuations, and stale task input never
+/// interrupt checks (see `InputMessage::preempts_checks`). Returns whether a run was active and
+/// cancellation was requested.
 fn interrupt_checks_for_direct_input(
     message: &crate::input::InputMessage,
     services: &OwnerServices,
@@ -1179,11 +1190,7 @@ fn interrupt_checks_for_direct_input(
     session: &str,
     step: u64,
 ) -> bool {
-    if message.intent != crate::input::InputIntent::Auto
-        || matches!(
-            message.purpose,
-            crate::input::InputPurpose::CheckResult { .. }
-        )
+    if !message.preempts_checks()
         || !crate::input::input_purpose_is_current(
             &services.tasks,
             &services.questions,

@@ -278,7 +278,11 @@ impl HarnessBroker {
         live.permit = Some(task.permit());
         self.store.save_exchange(&transaction.state.interaction)?;
         self.trace_live_host(live, "committed", "plan_submission");
-        let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::None)?;
+        // The submission's lifecycle record lives beside the exchange, and only a rebuilt
+        // timeline attaches it; a live exchange update would draw the proposal without its
+        // `Plan submitted` row until the turn settles.
+        let patch = self.reconcile_timeline()?;
+        let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
         delivery.events = events;
         Ok(ForegroundAction::Effect(
             ForegroundJob::PlanTerminalPublication {

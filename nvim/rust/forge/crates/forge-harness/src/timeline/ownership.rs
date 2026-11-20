@@ -110,11 +110,9 @@ impl TimelineEvent {
     }
 }
 
+/// Report a node the exchange record stores, which is what event anchors count.
 pub(crate) fn source_node(node: &ExchangeNode) -> bool {
-    !matches!(
-        node,
-        ExchangeNode::PlanEvent { .. } | ExchangeNode::TimelineEvent { .. }
-    )
+    !node.is_derived()
 }
 
 struct AnchoredEvent {

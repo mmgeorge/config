@@ -407,6 +407,37 @@ impl TimelineStream {
         })
     }
 
+    /// Replace an exchange this timeline already holds, such as a settled child inside its
+    /// parent's entry, and refresh the running-agent rows under the current session status.
+    ///
+    /// An exchange the timeline does not hold changes nothing, because the next full reconcile
+    /// places it; inserting it here would draw a child as a top-level entry.
+    pub(crate) fn settle_owned_exchange(
+        &mut self,
+        exchange: &crate::exchange::Exchange,
+        status_thoughts: bool,
+    ) -> Result<TimelinePatch> {
+        let status_id = format!("{}:status", self.session_id);
+        let status =
+            self.entry_index
+                .get(&status_id)
+                .and_then(|index| match &self.entry_list[*index] {
+                    TimelineEntry::Status { status, .. } => Some(status.clone()),
+                    _ => None,
+                });
+        match status {
+            Some(status) if self.exchange_owner.contains_key(&exchange.id) => {
+                self.update_live(Some(exchange), None, status, status_thoughts)
+            }
+            _ => Ok(TimelinePatch {
+                session_id: self.session_id.clone(),
+                base_revision: self.revision,
+                revision: self.revision,
+                operation: Vec::new(),
+            }),
+        }
+    }
+
     /// Updates only the active interaction and transient status without copying settled history.
     pub fn update_live(
         &mut self,
@@ -635,8 +666,25 @@ impl TimelineStream {
                 agents: Vec::new(),
                 checks: None,
             });
-            if let TimelineEntry::Status { checks, .. } = &mut entry {
+            if let TimelineEntry::Status { checks, status, .. } = &mut entry {
                 if let Some(activity) = activity {
+                    // A `Checking` phase reports this run, so the run is its clock. Run progress
+                    // reaches only this entry, so without this the heading stayed at `0s` while
+                    // the rows beneath it counted up. A run that was still starting becomes
+                    // `Checking` here, in the same publication that brings its rows.
+                    if let crate::session::state_machine::SessionPhase::Working {
+                        activity:
+                            phase_activity @ (crate::session::state_machine::WorkflowActivity::Checking
+                            | crate::session::state_machine::WorkflowActivity::ChecksStarting),
+                        duration_ms,
+                        started_at_ms,
+                        ..
+                    } = status
+                    {
+                        *phase_activity = crate::session::state_machine::WorkflowActivity::Checking;
+                        *duration_ms = activity.duration_ms;
+                        *started_at_ms = activity.started_at_ms;
+                    }
                     *checks = Some(activity);
                 } else if checks
                     .as_ref()

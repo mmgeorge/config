@@ -3,10 +3,11 @@ use crate::storage::objects::ObjectStore;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::{LazyLock, Mutex},
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -206,6 +207,64 @@ pub(crate) struct RestoreJournal {
     pub state: RestoreState,
 }
 
+/// Count the claims on each journal whose restore is still running in this process.
+///
+/// A restore writes its journal before the first file changes and marks it complete only after
+/// the conversation rewind commits, so an incomplete journal alone cannot tell a running restore
+/// from one that stopped part-way. A session's owner lives in one process, so a claim held in this
+/// process is the evidence that its restore is still running.
+static RUNNING_RESTORE_CLAIMS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(Default::default);
+
+/// Mark one session's restore journal as owned by a restore that is still running.
+///
+/// The restore holds the claim from before its first file write until its outcome commits or
+/// fails; dropping it leaves an incomplete journal to read as interrupted.
+pub(crate) struct RunningRestoreClaim {
+    journal: PathBuf,
+}
+
+impl RunningRestoreClaim {
+    pub(crate) fn hold(objects: &ObjectStore, session: &str) -> Self {
+        let journal = journal_path(objects, session);
+        *RUNNING_RESTORE_CLAIMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(journal.clone())
+            .or_default() += 1;
+        Self { journal }
+    }
+
+    fn is_held(objects: &ObjectStore, session: &str) -> bool {
+        RUNNING_RESTORE_CLAIMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&journal_path(objects, session))
+    }
+}
+
+impl Drop for RunningRestoreClaim {
+    fn drop(&mut self) {
+        let mut claims = RUNNING_RESTORE_CLAIMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = claims.get_mut(&self.journal) {
+            *count -= 1;
+            if *count == 0 {
+                claims.remove(&self.journal);
+            }
+        }
+    }
+}
+
+/// Locate one session's restore journal under the recovery root.
+fn journal_path(objects: &ObjectStore, session: &str) -> PathBuf {
+    objects
+        .recovery_root()
+        .join(crate::plan::digest(session.as_bytes()))
+        .join("journal.json")
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RestoreProgress {
     pub preview_id: String,
@@ -229,11 +288,12 @@ impl RestoreJournal {
     }
 
     pub(crate) fn save(&self, objects: &ObjectStore) -> Result<()> {
-        let directory = objects
-            .recovery_root()
-            .join(crate::plan::digest(self.preview.session_id.as_bytes()));
-        fs::create_dir_all(&directory)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        let journal = journal_path(objects, &self.preview.session_id);
+        let directory = journal
+            .parent()
+            .context("restore journal has no directory")?;
+        fs::create_dir_all(directory)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
         serde_json::to_writer(
             &mut temporary,
             &RestoreProgress {
@@ -246,9 +306,7 @@ impl RestoreJournal {
         )?;
         temporary.flush()?;
         temporary.as_file().sync_all()?;
-        temporary
-            .persist(directory.join("journal.json"))
-            .map_err(|error| error.error)?;
+        temporary.persist(&journal).map_err(|error| error.error)?;
         Ok(())
     }
 
@@ -256,11 +314,7 @@ impl RestoreJournal {
         objects: &ObjectStore,
         session: &str,
     ) -> Result<Option<RestoreProgress>> {
-        let path = objects
-            .recovery_root()
-            .join(crate::plan::digest(session.as_bytes()))
-            .join("journal.json");
-        match fs::File::open(path) {
+        match fs::File::open(journal_path(objects, session)) {
             Ok(file) => {
                 let progress: RestoreProgress = serde_json::from_reader(file)?;
                 ensure!(
@@ -272,6 +326,38 @@ impl RestoreJournal {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Read the progress of a restore that stopped part-way, or none when the retained journal is
+    /// complete or belongs to a restore still running in this process.
+    pub(crate) fn interrupted(
+        objects: &ObjectStore,
+        session: &str,
+    ) -> Result<Option<RestoreProgress>> {
+        Ok(Self::progress(objects, session)?.filter(|progress| {
+            progress.state != RestoreState::Complete
+                && !RunningRestoreClaim::is_held(objects, session)
+        }))
+    }
+
+    /// Describe the retained journal as `{pending, applying, applied, files}`, or null when no
+    /// restore ran. `pending` means the restore stopped part-way and needs recovery; `applying`
+    /// means a restore is still running.
+    ///
+    /// This reads only the journal file, so it needs no execution permit or broker ownership.
+    pub(crate) fn status(objects: &ObjectStore, session: &str) -> Result<serde_json::Value> {
+        let running = RunningRestoreClaim::is_held(objects, session);
+        Ok(Self::progress(objects, session)?
+            .map(|progress| {
+                let incomplete = progress.state != RestoreState::Complete;
+                serde_json::json!({
+                    "pending": incomplete && !running,
+                    "applying": incomplete && running,
+                    "applied": progress.applied,
+                    "files": progress.files,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null))
     }
 
     pub(crate) fn load(objects: &ObjectStore, session: &str) -> Result<Option<Self>> {

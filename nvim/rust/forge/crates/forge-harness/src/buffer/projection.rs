@@ -172,6 +172,8 @@ impl Drop for RenderMarginScope {
 struct RenderBlock {
     content: BufferBlock,
     layout: ContentLayout,
+    /// Rows of the heading a closed event fold must leave visible; the rest is its body.
+    heading_rows: usize,
 }
 
 impl RenderBlock {
@@ -181,7 +183,11 @@ impl RenderBlock {
             marker: None,
             source_indent: 0,
         });
-        Self { content, layout }
+        Self {
+            content,
+            layout,
+            heading_rows: 1,
+        }
     }
 
     fn into_block(mut self) -> BufferBlock {
@@ -782,11 +788,13 @@ fn project_at_with_separator(
     let mut blocks: Vec<_> = projection
         .block
         .into_iter()
-        .map(RenderBlock::into_block)
+        .map(|block| {
+            let heading_rows = block.heading_rows;
+            let mut block = block.into_block();
+            TranscriptRenderer::prepare_event(&mut block, heading_rows);
+            block
+        })
         .collect();
-    for block in &mut blocks {
-        TranscriptRenderer::prepare_event(block);
-    }
     super::nodes::link(&mut blocks);
     for block in &mut blocks {
         TranscriptRenderer::resolve_marker(block)?;
@@ -1100,7 +1108,7 @@ impl TimelineRenderer<'_> {
                         reason.replace(['\n', '\r'], " ")
                     ),
                 };
-                self.literal(&event.id, &format!("◇ {label}"), None)?;
+                self.event_row(&event.id, &label, "", None)?;
             }
             PlanEventContent::Resolution {
                 resolution,
@@ -1534,59 +1542,78 @@ impl TimelineRenderer<'_> {
                 &interaction.prompt,
             )?;
         }
-        let summary = exchange_activity_summary(interaction, self.now_ms);
-        let mut heading = TranscriptRenderer::new(&self.content_width())?.literal(
-            BlockId(format!("{}:summary", interaction.id)),
-            &summary,
-            2,
-        )?;
-        heading.metadata.decoration.push(Decoration {
-            range: TextRange {
-                start: TextPosition { row: 0, column: 0 },
-                end: TextPosition {
-                    row: heading.text.row_count(),
-                    column: 0,
-                },
-            },
-            capture: if interaction.approval_mode.is_some() {
-                "ForgeHarnessRead".into()
-            } else if interaction.is_finished() {
-                "ForgeHarnessThought".into()
-            } else {
-                "ForgeHarnessThinking".into()
-            },
-            priority: 100,
-        });
-        let capture = heading.metadata.decoration[0].capture.clone();
-        TranscriptRenderer::heading_marker(&mut heading, &capture);
-        self.push(heading)?;
-        let section = self.begin_section(2);
         // The first turn's check runs are drawn once, as the exchange's results beneath the
         // Thought, so the commentary that owns them inside the Thought does not draw them too.
         // Later turns' commentary draws its own runs where they happened.
         let mut activity = interaction.content(&layout.activity, true)?;
         let activity_checks = activity.take_checks();
-        self.content(
-            interaction,
-            agents,
-            depth,
-            activity,
-            Some(&layout.questions),
-            MarkdownRole::Response,
-        )?;
-        let exchange_start = section.start;
-        self.finish_section(
-            section,
-            &format!("{}:exchange", interaction.id),
-            interaction.is_finished(),
-        );
-        if let Some(node) = &mut self.block[exchange_start].metadata.node {
-            node.kind = NodeKind::Exchange;
-            node.lifecycle = if interaction.is_finished() {
-                NodeLifecycle::Settled
-            } else {
-                NodeLifecycle::Live
-            };
+        // A task notice whose exchange settled with nothing beneath it stands alone: a heading
+        // there would summarize no work, as a goal paused before its first answer shows.
+        if !(agents.is_empty() && interaction.is_settled_output_free_task_notice()) {
+            let summary = exchange_activity_summary(interaction, self.now_ms);
+            let mut heading = TranscriptRenderer::new(&self.content_width())?.literal(
+                BlockId(format!("{}:summary", interaction.id)),
+                &summary,
+                2,
+            )?;
+            heading.metadata.decoration.push(Decoration {
+                range: TextRange {
+                    start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition {
+                        row: heading.text.row_count(),
+                        column: 0,
+                    },
+                },
+                capture: if interaction.approval_mode.is_some() {
+                    "ForgeHarnessRead".into()
+                } else if interaction.is_finished() {
+                    "ForgeHarnessThought".into()
+                } else {
+                    "ForgeHarnessThinking".into()
+                },
+                priority: 100,
+            });
+            let capture = heading.metadata.decoration[0].capture.clone();
+            TranscriptRenderer::heading_marker(&mut heading, &capture);
+            self.push(heading)?;
+            let section = self.begin_section(2);
+            self.content(
+                interaction,
+                agents,
+                depth,
+                activity,
+                Some(&layout.questions),
+                MarkdownRole::Response,
+            )?;
+            // A native child the provider ran inside this turn stays inside its Thought, where it
+            // ran, before the answer that followed it, whether the turn is running or settled.
+            let mut observed = agents
+                .values()
+                .filter_map(|entry| match entry {
+                    TimelineEntry::ObservedAgent {
+                        id, created_at_ms, ..
+                    } => Some(((*created_at_ms, id.as_str()), *entry)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            observed.sort_by_key(|(order, _)| *order);
+            for (_, entry) in observed {
+                self.entry(entry, depth + 1)?;
+            }
+            let exchange_start = section.start;
+            self.finish_section(
+                section,
+                &format!("{}:exchange", interaction.id),
+                interaction.is_finished(),
+            );
+            if let Some(node) = &mut self.block[exchange_start].metadata.node {
+                node.kind = NodeKind::Exchange;
+                node.lifecycle = if interaction.is_finished() {
+                    NodeLifecycle::Settled
+                } else {
+                    NodeLifecycle::Live
+                };
+            }
         }
         self.provider_checklist(interaction)?;
         self.host_file_changes(interaction)?;
@@ -2252,7 +2279,11 @@ Action",
                         }),
                     )?;
                 }
-                ExchangeNode::Compaction { id, compaction } => self.compaction(id, compaction)?,
+                ExchangeNode::Compaction { id, compaction } => self.compaction(
+                    id,
+                    compaction,
+                    compaction_restarted(interaction, compaction),
+                )?,
                 ExchangeNode::TurnContent {
                     turn_id,
                     item: crate::turn::TurnItem::Message { id },
@@ -2524,15 +2555,26 @@ Action",
         Ok(())
     }
 
-    fn compaction(&mut self, id: &str, compaction: &crate::provider::Compaction) -> Result<()> {
+    /// Draw one compaction row; `restarted` adds that the turn it stopped ran again afterwards.
+    fn compaction(
+        &mut self,
+        id: &str,
+        compaction: &crate::provider::Compaction,
+        restarted: bool,
+    ) -> Result<()> {
         use crate::provider::CompactionState;
+        let explanation = compaction.result.provider_explanation.as_ref();
         let label = match compaction.state {
             CompactionState::Running => return Ok(()),
             CompactionState::Completed => "Context compacted",
+            CompactionState::Failed if explanation.is_some() => "Context not compacted",
             CompactionState::Failed => "Context compaction failed",
             CompactionState::Unconfirmed => "Context compaction completion unconfirmed",
         };
         let mut heading = format!("◇ {label}");
+        if let Some(explanation) = explanation {
+            heading.push_str(&format!(" · {explanation}"));
+        }
         let context_tokens = compaction
             .result
             .context_tokens_before
@@ -2565,6 +2607,9 @@ Action",
                 " · {}s",
                 completed.saturating_sub(started).max(0) / 1_000
             ));
+        }
+        if restarted {
+            heading.push_str(" · turn ran again");
         }
         self.literal(id, &heading, None)?;
         let mut details = Vec::new();
@@ -3152,7 +3197,7 @@ Action",
             return self.task_notice(&format!("{}:start", event.id), &start.heading(), prompt);
         }
         if let SessionEventKind::Compaction { compaction } = &event.detail {
-            return self.compaction(&event.id, compaction);
+            return self.compaction(&event.id, compaction, false);
         }
         let action = match &event.detail {
             SessionEventKind::Forked {
@@ -3162,11 +3207,38 @@ Action",
             }),
             _ => None,
         };
-        self.literal(
-            &event.id,
-            &format!("◇ {}", session_event_text(&event.detail)),
-            action,
-        )
+        let text = session_event_text(&event.detail);
+        let (heading, body) = text.split_once('\n').unwrap_or((&text, ""));
+        self.event_row(&event.id, heading, body, action)
+    }
+
+    /// Render an event row whose heading stays whole, so only its body starts folded.
+    ///
+    /// Task rows name their task by title, and a closed fold over the heading's own wrapped rows
+    /// would cut that title mid-phrase. The heading wraps in full instead, as `Plan submitted`
+    /// does, and the fold covers only the lines after it.
+    fn event_row(
+        &mut self,
+        identity: &str,
+        heading: &str,
+        body: &str,
+        action: Option<TranscriptAction>,
+    ) -> Result<()> {
+        let heading = format!("◇ {heading}");
+        let heading_rows = TranscriptRenderer::new(&self.content_width())?
+            .literal(BlockId(identity.into()), &heading, 2)?
+            .text
+            .row_count();
+        let text = if body.is_empty() {
+            heading
+        } else {
+            format!("{heading}\n{body}")
+        };
+        self.literal(identity, &text, action)?;
+        if let Some(block) = self.block.last_mut() {
+            block.heading_rows = heading_rows;
+        }
+        Ok(())
     }
 
     /// Render a task start or continuation as one notice whose Harness-authored input stays folded.
@@ -3175,12 +3247,7 @@ Action",
     /// literal starts as a closed fold, so the complete instruction remains inspectable without
     /// filling the transcript.
     fn task_notice(&mut self, identity: &str, heading: &str, input: &str) -> Result<()> {
-        let mut text = format!("◇ {heading}");
-        if !input.is_empty() {
-            text.push('\n');
-            text.push_str(input);
-        }
-        self.literal(identity, &text, None)?;
+        self.event_row(identity, heading, input, None)?;
         self.prompt.push(BlockId(identity.to_owned()));
         Ok(())
     }
@@ -3703,6 +3770,21 @@ fn history_prefix(disposition: crate::exchange::HistoryDisposition) -> &'static 
     }
 }
 
+/// Report whether a manual compaction stopped this exchange's turn, which then ran again.
+///
+/// `/compact` during a turn records the attempt inside the exchange it stopped; every turn that
+/// started after the compaction began is the replay on the compacted context.
+fn compaction_restarted(exchange: &Exchange, compaction: &crate::provider::Compaction) -> bool {
+    compaction.manual
+        && compaction.state == crate::provider::CompactionState::Completed
+        && compaction.started_at_ms.is_some_and(|started_at_ms| {
+            exchange
+                .turn
+                .iter()
+                .any(|turn| turn.started_at_ms() >= started_at_ms)
+        })
+}
+
 fn token_display(tokens: u64) -> String {
     match tokens {
         tokens if tokens >= 1000 => format!("{:.1}k", tokens as f64 / 1000.0),
@@ -3818,10 +3900,10 @@ pub(super) fn exchange_tool_label(interaction: &Exchange, now_ms: i64) -> Option
 
 /// Count a set of tool calls the way every tool summary reports them.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ToolTally {
-    pub(super) successful: usize,
-    pub(super) denied: usize,
-    pub(super) total: usize,
+pub(crate) struct ToolTally {
+    pub(crate) successful: usize,
+    pub(crate) denied: usize,
+    pub(crate) total: usize,
 }
 
 impl From<crate::exchange::ToolCounter> for ToolTally {
@@ -3838,7 +3920,7 @@ impl From<crate::exchange::ToolCounter> for ToolTally {
 ///
 /// Durations use the same formatter as the Tools group label, so a heading and its group never
 /// disagree on units or spacing.
-pub(super) fn tool_count_label(tally: ToolTally, tool_ms: Option<u64>) -> Option<String> {
+pub(crate) fn tool_count_label(tally: ToolTally, tool_ms: Option<u64>) -> Option<String> {
     (tally.total > 0).then(|| tool_tally_label(tally, tool_ms, " tools"))
 }
 
@@ -5367,6 +5449,156 @@ pub(crate) mod tests {
                 .iter()
                 .all(|block| block.id.0 != "parent:agents")
         );
+        Ok(())
+    }
+
+    /// Every task row keeps its whole title visible, as `Plan submitted` does: a closed fold may
+    /// hide the row's body, never the rest of a wrapped title.
+    #[test]
+    fn task_rows_keep_their_whole_title_visible() -> anyhow::Result<()> {
+        let title = "Add one Vitest case to tests/tax.test.ts that checks taxCompute with a zero                      amount, then call check_run with apply set to true for the format check";
+        let event = |id: &str, mut detail: serde_json::Value| -> anyhow::Result<TimelineEntry> {
+            detail["id"] = id.into();
+            detail["session_id"] = "session".into();
+            detail["owner"] =
+                serde_json::to_value(crate::timeline::TimelineOwner::session("session"))?;
+            detail["created_at_ms"] = 1.into();
+            Ok(TimelineEntry::SessionEvent {
+                id: id.into(),
+                created_at_ms: 1,
+                event: serde_json::from_value(detail)?,
+            })
+        };
+        let started = event(
+            "started",
+            json!({"kind":"task_started","start":{"kind":"plan","title":title},
+                "prompt":"Harness instruction that stays folded"}),
+        )?;
+        let cleared = event(
+            "cleared",
+            json!({"kind":"task_finished","outcome":{"id":"task","kind":"plan","title":title,
+                "state":"cancelled","summary":"Task cleared"}}),
+        )?;
+        for entry in [started, cleared] {
+            let projected = project_at(&entry, &WidthProfile::default(), 6_000)?;
+            let block = &projected.entry.block[0];
+            let fold_start = block
+                .metadata
+                .fold
+                .first()
+                .map_or(block.text.row_count(), |fold| fold.start.row);
+            let visible = block.text.wire_rows()[..fold_start].join(" ");
+            assert!(
+                visible.contains("for the format check"),
+                "the title was folded: {visible:?}"
+            );
+            assert!(!visible.contains("Task cleared") && !visible.contains("Harness instruction"));
+        }
+        Ok(())
+    }
+
+    /// A task start paused before its provider showed anything, and closed when the task resumed
+    /// in a new exchange, keeps its start notice but draws no empty heading beneath it. The same
+    /// exchange still draws its heading while it is paused.
+    #[test]
+    fn closed_output_free_task_start_draws_no_empty_heading() -> anyhow::Result<()> {
+        let mut exchange = crate::storage::test::running_exchange("goal-start");
+        exchange.opening = crate::exchange::ExchangeOpening::TaskStarted {
+            start: crate::exchange::TaskStart {
+                kind: crate::task::TaskKind::Goal,
+                title: "Create notes/d.txt".into(),
+            },
+        };
+        let address = crate::turn::test_support::address(&exchange, "turn");
+        exchange.start_turn(address, 0)?;
+        exchange.pause_for_restart(1)?;
+        let rows = |exchange: &Exchange| -> anyhow::Result<Vec<String>> {
+            let mut display = crate::buffer::identity::DisplayRegistry::default();
+            let projected = super::project(
+                super::ProjectionSource::Exchange(exchange),
+                &WidthProfile::default(),
+                2,
+                false,
+                &HashMap::new(),
+                &HashMap::new(),
+                &mut display,
+            )?;
+            Ok(projected
+                .entry
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .map(str::to_owned)
+                .collect())
+        };
+        let paused = rows(&exchange)?;
+        assert!(
+            paused.iter().any(|row| row.contains("Paused 0s")),
+            "{paused:#?}"
+        );
+        exchange.finish(crate::exchange::ExchangeOutcome::Complete, 2)?;
+        let closed = rows(&exchange)?;
+        assert!(
+            closed
+                .iter()
+                .any(|row| row.contains("Goal started: Create notes/d.txt")),
+            "{closed:#?}"
+        );
+        assert!(
+            closed.iter().all(|row| !row.contains("Thought")),
+            "{closed:#?}"
+        );
+        Ok(())
+    }
+
+    /// Plan execution rows name their plan by title too, so `Plan complete` and `Plan failed`
+    /// wrap the whole title instead of folding its wrapped rows away.
+    #[test]
+    fn plan_execution_rows_keep_their_whole_title_visible() -> anyhow::Result<()> {
+        let title = "Add a function moneyAllocate(amount, shares) to src/money.ts that splits an                 amount across equal shares and gives the remainder to the first share";
+        let mut exchange = crate::storage::test::running_exchange("plan-execution-title");
+        for (id, event) in [
+            ("complete", json!({"kind":"completed","title":title})),
+            (
+                "failed",
+                json!({"kind":"failed","title":title,"reason":"checks failed"}),
+            ),
+        ] {
+            exchange.node_list.push(serde_json::from_value(json!({
+                "kind":"plan_event","event":{
+                    "id":id,"node_count":exchange.node_list.len(),
+                    "content":{"kind":"execution","event":event}
+                }
+            }))?);
+        }
+        let mut display = crate::buffer::identity::DisplayRegistry::default();
+        let projected = super::project(
+            super::ProjectionSource::Exchange(&exchange),
+            &WidthProfile::default(),
+            1,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut display,
+        )?;
+        for id in ["complete", "failed"] {
+            let block = projected
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == id)
+                .expect("plan execution row");
+            let fold_start = block
+                .metadata
+                .fold
+                .first()
+                .map_or(block.text.row_count(), |fold| fold.start.row);
+            let visible = block.text.wire_rows()[..fold_start].join(" ");
+            assert!(
+                visible.contains("to the first share"),
+                "the title was folded: {visible:?}"
+            );
+        }
         Ok(())
     }
 }

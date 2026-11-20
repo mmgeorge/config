@@ -823,9 +823,16 @@ impl CopilotEventDecoder {
                 self.interrupt_synchronous_children(observed_at_ms, sink)
                     .await?;
             }
-            "session.compaction_start" | "session.compaction_complete" => {
-                self.compaction(event, &thread, output, sink).await?;
+            "session.compaction_start" | "session.compaction_complete"
+                if event.agent_id.is_some() =>
+            {
+                self.child_compaction(event, &thread, sink).await?;
             }
+            // The session's `CompactionMonitor` owns root-thread compaction: it is the reader
+            // that correlates a manual request with its notifications. Decoding the same
+            // notifications here, in a turn or a retained idle decoder, published each root
+            // compaction a second time under its native identity.
+            "session.compaction_start" | "session.compaction_complete" => {}
             other => match unmapped_disposition(other) {
                 UnmappedDisposition::OwnedElsewhere | UnmappedDisposition::NoNormalizedMeaning => {}
                 UnmappedDisposition::Unsupported => self.unsupported(other, sink).await?,
@@ -1739,37 +1746,30 @@ impl CopilotEventDecoder {
         Ok(())
     }
 
-    async fn compaction(
+    /// Publish a native subagent's compaction on that child's observed turn.
+    async fn child_compaction(
         &mut self,
         event: &SessionEvent,
         thread: &str,
-        _output: &mut impl TurnProgress,
         sink: &AdapterActivityWriter,
     ) -> Result<(), ProviderError> {
-        let scope = if event.agent_id.is_some() {
-            self.children
-                .get(thread)
-                .ok_or_else(|| Self::protocol("compaction refers to an unknown child"))?
-        } else {
-            &self.scope
-        };
+        let scope = self
+            .children
+            .get(thread)
+            .ok_or_else(|| Self::protocol("compaction refers to an unknown child"))?;
         let thread_id = scope.thread_id.clone();
         let update = super::decode::decode_compaction(
             event,
             thread_id.as_str(),
             self.compaction.get(thread),
         )?;
-        let writer = if scope != &self.scope {
-            sink.register_observed_turn(TurnAddress {
-                scope: scope.clone(),
-                thread_id: thread_id.clone(),
-                turn_id: scope
-                    .turn_id()
-                    .map_err(|_| Self::protocol("invalid child compaction owner"))?,
-            })?
-        } else {
-            sink.clone()
-        };
+        let writer = sink.register_observed_turn(TurnAddress {
+            scope: scope.clone(),
+            thread_id: thread_id.clone(),
+            turn_id: scope
+                .turn_id()
+                .map_err(|_| Self::protocol("invalid child compaction owner"))?,
+        })?;
         writer
             .send_wait(AdapterActivity::Thread {
                 thread_id,
@@ -2589,6 +2589,48 @@ mod native_agent_replay_tests {
                 "finished Interrupted"
             ]
         );
+        Ok(())
+    }
+
+    /// The session's compaction monitor is the only publisher of root-thread compaction.
+    ///
+    /// An idle `/compact` reached both the monitor and the decoder that a finished turn leaves
+    /// retained. The monitor published the attempt under its host identity and the decoder
+    /// published it again under the native event identity, so the transcript drew two
+    /// `Context compacted` rows for one compaction.
+    #[tokio::test]
+    async fn root_compaction_notifications_are_left_to_the_compaction_monitor() -> anyhow::Result<()>
+    {
+        let published = replay([
+            native(
+                "compaction-start",
+                "idle",
+                "session.compaction_start",
+                None,
+                json!({"conversationTokens":649,"systemTokens":9196,"toolDefinitionsTokens":42201}),
+            ),
+            native(
+                "compaction-complete",
+                "compaction-start",
+                "session.compaction_complete",
+                None,
+                json!({"success":true,"preCompactionTokens":52049,"postCompactionTokens":52024}),
+            ),
+        ])
+        .await?;
+        let compactions = published
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    forge_provider_api::ProviderEvent::Thread {
+                        event: ThreadEvent::CompactionUpdated(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(compactions, 0, "{published:?}");
         Ok(())
     }
 }

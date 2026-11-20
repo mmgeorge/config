@@ -5,7 +5,9 @@
 //!
 //! The CLI writes a conversation to disk when its first turn runs, so a session id that has only
 //! ever launched names nothing to resume. `UnstartedSessions` records those ids, and
-//! `launch_conversation` starts such a conversation again when its resume finds nothing.
+//! `launch_conversation` starts such a conversation again when its resume finds nothing. It also
+//! records the fork targets that have run no turn, whose copied history ends in the note that
+//! materialized them, and `launch_conversation` resumes such a target before that note.
 
 use super::process::{ClaudeLauncher, LaunchSpec, McpConfig, SessionStart};
 use super::session::ClaudeSessionState;
@@ -22,7 +24,7 @@ use forge_provider_api::{
     ProviderOperation, ProviderPhase,
 };
 use serde_json::{Map, Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
@@ -43,9 +45,17 @@ const CONTEXT_USAGE_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// `--session-id` when its resume fails. An id leaves when a turn the CLI started ends, because
 /// starting that conversation again would replace history Harness still shows. An id whose
 /// session never ran a turn stays for the provider's lifetime.
+///
+/// A fork target is written by a note the adapter appends without a model call, so its newest
+/// entry is that note. Resuming it plainly would hand the model the note followed by the
+/// "No response requested." reply the CLI adds after a trailing user entry. A target held here
+/// therefore resumes at the entry its fork copied up to, which discards the note when the first
+/// prompt is appended. The record lives in the provider, so a target first opened after an editor
+/// restart resumes plainly.
 #[derive(Clone, Default)]
 pub(crate) struct UnstartedSessions {
     session_ids: Arc<std::sync::Mutex<HashSet<String>>>,
+    fork_points: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl UnstartedSessions {
@@ -65,9 +75,30 @@ impl UnstartedSessions {
             .contains(session_id)
     }
 
-    /// Forget a session id whose conversation the CLI has written.
+    /// Record a fork target whose copied history ends at `fork_point`, before its note.
+    pub(crate) fn fork(&self, session_id: &str, fork_point: &str) {
+        self.fork_points
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_owned(), fork_point.to_owned());
+    }
+
+    /// Name the entry a fork target that has run no turn resumes at.
+    fn fork_point(&self, session_id: &str) -> Option<String> {
+        self.fork_points
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Forget a session id whose conversation the CLI has run a turn under.
     fn started(&self, session_id: &str) {
         self.session_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.fork_points
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
@@ -410,15 +441,16 @@ impl ClaudeConversation {
     pub(crate) async fn fork(
         &self,
         target_id: &str,
-        resume_at: Option<String>,
+        fork_point: Option<String>,
         options: ConversationOptions,
         cleanup: &crate::resource_cleanup::ResourceCleanup,
     ) -> Result<(), ProviderError> {
         fork_session(
             &*self.launcher,
+            &self.unstarted,
             &self.session_id,
             target_id,
-            resume_at,
+            fork_point,
             options,
             cleanup,
         )
@@ -453,6 +485,18 @@ async fn launch_conversation(
     unstarted: &UnstartedSessions,
     cleanup: &crate::resource_cleanup::ResourceCleanup,
 ) -> Result<LiveProcess, ProviderError> {
+    let start = match start {
+        SessionStart::Resume {
+            session_id,
+            resume_at: None,
+            drops_turn: None,
+        } => SessionStart::Resume {
+            resume_at: unstarted.fork_point(&session_id),
+            session_id,
+            drops_turn: None,
+        },
+        start => start,
+    };
     let restart = match &start {
         SessionStart::Resume {
             session_id,
@@ -542,11 +586,15 @@ async fn launch(
 }
 
 /// Launch, materialize, and close a fork of `source_id` under `target_id`.
+///
+/// `fork_point` names the last entry the fork copies; without it the CLI chooses the source's
+/// leaf. A named point is also where the target's first launch resumes, before the note.
 pub(crate) async fn fork_session(
     launcher: &dyn ClaudeLauncher,
+    unstarted: &UnstartedSessions,
     source_id: &str,
     target_id: &str,
-    resume_at: Option<String>,
+    fork_point: Option<String>,
     options: ConversationOptions,
     cleanup: &crate::resource_cleanup::ResourceCleanup,
 ) -> Result<(), ProviderError> {
@@ -556,7 +604,7 @@ pub(crate) async fn fork_session(
     let start = SessionStart::Fork {
         source_id: source_id.to_owned(),
         target_id: target_id.to_owned(),
-        resume_at,
+        resume_at: fork_point.clone(),
     };
     let live = launch(launcher, &state, &options, start, cleanup).await?;
     // A fork is written only when an entry is appended; a note appends one without a model call.
@@ -584,7 +632,11 @@ pub(crate) async fn fork_session(
     }
     .await;
     let collected = live.transport.shutdown().await;
-    result.and(collected)
+    result.and(collected)?;
+    if let Some(fork_point) = &fork_point {
+        unstarted.fork(target_id, fork_point);
+    }
+    Ok(())
 }
 
 /// Wait until the CLI reports that a command reached a delivery state.

@@ -348,8 +348,11 @@ impl<'profile> TranscriptRenderer<'profile> {
     }
 
     /// Gives wrapped events a closed fold while retaining their complete source and actions.
-    pub(super) fn prepare_event(block: &mut BufferBlock) {
-        if block.text.row_count() <= 1
+    ///
+    /// The fold starts after `heading_rows`, which stay visible: one row for an event whose whole
+    /// text may fold behind its first line, or every wrapped row of a heading that must stay whole.
+    pub(super) fn prepare_event(block: &mut BufferBlock, heading_rows: usize) {
+        if block.text.row_count() <= heading_rows.max(1)
             || block.metadata.node.is_some()
             || !block.metadata.fold.is_empty()
             || block
@@ -364,7 +367,10 @@ impl<'profile> TranscriptRenderer<'profile> {
         let identity = FoldId(block.id.0.clone());
         block.metadata.fold.push(FoldRange {
             id: identity.clone(),
-            start: TextPosition { row: 1, column: 0 },
+            start: TextPosition {
+                row: heading_rows.max(1),
+                column: 0,
+            },
             end: BlockAnchor {
                 block: block.id.clone(),
                 position: TextPosition {
@@ -815,7 +821,7 @@ mod tests {
             assert_eq!(layout.marker.as_ref().unwrap().text, "≡");
             assert_eq!(block.metadata.conceal[0].range.end.column, "≡ ".len());
 
-            TranscriptRenderer::prepare_event(&mut block);
+            TranscriptRenderer::prepare_event(&mut block, 1);
             TranscriptRenderer::resolve_marker(&mut block)?;
             let wrapped = columns == 16;
             assert_eq!(!block.metadata.fold.is_empty(), wrapped);

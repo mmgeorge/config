@@ -152,7 +152,7 @@ T["plan_optimistic_edit"] = function()
     replica = { physical_row = function(row) return row end,
       sequence = { position = function(_, block) return 0, block == "first" and 0 or 1 end } },
   } }
-  local selection = { symbol = "original", name = "Original", expected_version = 1,
+  local selection = { symbol = "original", name = "Original", expected_version = 1, existing_names = { "Original" },
     preview = { { block = "first", column = 0, length = 8 }, { block = "second", column = 4, length = 8 } } }
   local input, answer, finish, committed
   popup.incremental_input = function(options, callback) input, answer = options, callback end
@@ -372,7 +372,7 @@ T["plan_test_delete"] = function()
     local params = request_specification.params or {}
     callback = encode_delivery(callback)
     if params.operation == "plan_action" then
-      callback({ rename = { symbol = "tests", name = heading, expected_version = version,
+      callback({ rename = { symbol = "tests", name = heading, existing_names = { heading }, expected_version = version,
         preview = { { block = heading, column = 0, length = #heading } } } }) return
     end
     if params.operation == "plan_save_annotations" then

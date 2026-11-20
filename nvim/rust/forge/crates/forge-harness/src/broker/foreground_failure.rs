@@ -338,6 +338,9 @@ impl HarnessBroker {
         } else {
             error
         };
+        if error.is::<TurnCancelled>() {
+            self.cancel_observed_children_of(&transaction.state.interaction.id);
+        }
         if error.is::<TurnCancelled>() && transaction.collection.is_none() {
             transaction.collection = Some(ForegroundCollection::Cancel(
                 crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed,

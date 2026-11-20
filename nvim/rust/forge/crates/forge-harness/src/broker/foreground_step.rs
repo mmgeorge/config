@@ -390,6 +390,12 @@ impl HarnessBroker {
             }
             ForegroundSignal::CollectionStarted(disposition) => {
                 admission.begin_owner_collection(disposition)?;
+                if matches!(disposition, ForegroundCollection::Cancel(_)) {
+                    self.cancel_observed_children_of(&transaction.state.interaction.id);
+                    // Saved with the pending collection below, so recovery after a host that ends
+                    // mid-stop, as on an editor exit, settles the exchange cancelled.
+                    transaction.state.interaction.cancellation_requested = true;
+                }
                 transaction.collection = Some(disposition);
                 if let Some(finalization) = transaction.finalization.as_mut() {
                     finalization.set_collection(disposition);
@@ -431,8 +437,10 @@ impl HarnessBroker {
                 // turn has not committed yet, and an unlabelled exchange whose turn was
                 // interrupted reads as paused until it does. Resuming or closing the exchange,
                 // or the command's own release of a parked exchange, clears it.
-                transaction.state.interaction.collection =
-                    Some(crate::exchange::ExchangeCollection::Settling);
+                if !transaction.state.interaction.is_finished() {
+                    transaction.state.interaction.collection =
+                        Some(crate::exchange::ExchangeCollection::Settling);
+                }
                 Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::CollectionFailed => {
@@ -786,6 +794,12 @@ impl HarnessBroker {
         collection: crate::exchange::ExchangeCollection,
     ) -> Result<ForegroundAction> {
         let exchange = &mut transaction.state.interaction;
+        // A cancel announces its collection only after interrupting the children, and their
+        // completions can let finalization settle the exchange first. A label written then would
+        // outlive the stop, because only settlement clears it.
+        if exchange.is_finished() {
+            return Ok(ForegroundAction::Wait);
+        }
         exchange.collection = Some(collection);
         exchange.pause(self.clock.now_ms());
         self.store.save_exchange(exchange)?;

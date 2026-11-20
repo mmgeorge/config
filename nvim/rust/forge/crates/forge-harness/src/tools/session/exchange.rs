@@ -12,7 +12,8 @@ pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
         description: "Inspect one exchange conversation and compact tool/decision/check activity. Omit session_id for \
-                current. An exchange still in progress also returns its commentary so far. Does not hydrate \
+                current. An exchange still in progress also returns its commentary so far. An exchange \
+                a rollback removed carries history rolled_back or superseded. Does not hydrate \
                 tool output. Use returned tool_call_id and turn_id for exact tool \
                 details.",
         input_schema: strict_object_input_schema(properties, &["exchange_id"]),

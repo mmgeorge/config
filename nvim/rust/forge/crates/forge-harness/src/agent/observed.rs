@@ -152,6 +152,38 @@ impl ObservedAgent {
         }
         true
     }
+    /// End a live child whose delegating exchange the user cancelled.
+    ///
+    /// The provider may report such a child's end late, only at shutdown, or as a completion
+    /// it reached before the stop arrived, so the host records the interruption at the cancel:
+    /// each open child turn ends interrupted at `now_ms` and the lifecycle reads finished.
+    /// A child that already finished, lost observation, or never reported activity keeps its
+    /// state.
+    pub(crate) fn interrupt_for_cancelled_parent(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<bool, ObservedAgentError> {
+        if self.availability == ObservedAgentAvailability::Unavailable
+            || !matches!(self.state, ObservedAgentState::Active(_))
+        {
+            return Ok(false);
+        }
+        let mut next = self.clone();
+        for exchange in next
+            .exchanges
+            .iter_mut()
+            .filter(|exchange| !exchange.is_finished())
+        {
+            exchange
+                .finish(ExchangeOutcome::Interrupted, now_ms)
+                .map_err(ObservedAgentError::Exchange)?;
+        }
+        next.state = ObservedAgentState::Finished(AgentOutcome::Interrupted);
+        next.updated_at_ms = now_ms;
+        next.validate()?;
+        *self = next;
+        Ok(true)
+    }
     /// Get independently owned child exchanges in admission order.
     pub fn exchanges(&self) -> &[Exchange] {
         &self.exchanges

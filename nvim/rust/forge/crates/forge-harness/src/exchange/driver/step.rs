@@ -911,10 +911,12 @@ impl ExchangeDriver {
         }
     }
 
-    /// Receive a bounded batch of owner events, and record when the owner inbox closes.
+    /// Receive a bounded batch of owner events, record when the owner inbox closes, and report
+    /// whether anything was received.
     ///
     /// A step that continues its event phase, or holds a wake for the next pass, receives
-    /// nothing, so ready events finish before new commands queue behind them.
+    /// nothing, so the wake already selected applies before new commands queue behind it. The
+    /// event phase itself ends once the inbox holds intent, so that wait is one event long.
     pub(super) async fn events_receive(
         &mut self,
         env: &DriverEnv,
@@ -922,7 +924,7 @@ impl ExchangeDriver {
         step: u64,
         continuing_event_phase: bool,
         closed: &mut bool,
-    ) {
+    ) -> bool {
         let DriverEnv { broker, .. } = env;
         let DriverState {
             pending,
@@ -937,9 +939,11 @@ impl ExchangeDriver {
         } else {
             OWNER_INTAKE_BUDGET.min(OWNER_QUEUE_CAPACITY - pending.len())
         };
+        let mut received = false;
         for _ in 0..intake {
             match self.receiver.try_recv() {
                 Ok(event) => {
+                    received = true;
                     self.receive(
                         event,
                         pending,
@@ -960,6 +964,7 @@ impl ExchangeDriver {
                 }
             }
         }
+        received
     }
 
     /// Publish the owner's activity, start shutdown once the inbox closes, and retire question waits.

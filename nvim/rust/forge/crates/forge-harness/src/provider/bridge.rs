@@ -2361,6 +2361,11 @@ impl ProviderBridge {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        // A retirement that fails before native shutdown may only have observed work that native
+        // shutdown has yet to join, such as an interrupted open whose retained operation still
+        // reports its provisional interruption. Its failure stands only if the owner also fails
+        // to retire after native shutdown, or native shutdown itself fails.
+        let mut provisional = Vec::new();
         for owner in owners {
             let ambiguous = self
                 .sessions
@@ -2381,7 +2386,7 @@ impl ProviderBridge {
                     .and_then(|host| host.initialized.get())
                     .is_some_and(|bound| self.binding_collection.ambiguous(&bound.binding.id));
                 if !ambiguous {
-                    errors.push(error);
+                    provisional.push((owner, error));
                 }
             }
         }
@@ -2405,13 +2410,26 @@ impl ProviderBridge {
                     .keys()
                     .cloned()
                     .collect::<Vec<_>>();
+                let mut retired = std::collections::HashSet::new();
                 for owner in remaining {
-                    if let Err(error) = self.retire_owner(&owner).await {
-                        errors.push(error);
+                    match self.retire_owner(&owner).await {
+                        Ok(_) => {
+                            retired.insert(owner);
+                        }
+                        Err(error) => errors.push(error),
                     }
                 }
+                errors.extend(
+                    provisional
+                        .into_iter()
+                        .filter(|(owner, _)| !retired.contains(owner))
+                        .map(|(_, error)| error),
+                );
             }
-            Err(error) => errors.push(error),
+            Err(error) => {
+                errors.extend(provisional.into_iter().map(|(_, error)| error));
+                errors.push(error);
+            }
         }
         combined(errors)
     }

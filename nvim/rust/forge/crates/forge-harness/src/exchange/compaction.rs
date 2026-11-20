@@ -69,11 +69,15 @@ impl ContextCompactionRun {
     }
 
     /// Commit native facts and select the next compaction stage in the exchange owner.
+    ///
+    /// `interrupted` is the exchange this command's collection stopped, which records the
+    /// attempt and runs again after it.
     pub(super) fn update(
         &mut self,
         event: CompactionEvent,
         broker: &mut HarnessBroker,
         can_commit: bool,
+        interrupted: Option<&crate::provider::ExchangeId>,
     ) -> Result<CompactionProgress, OperationFailure> {
         if matches!(event, CompactionEvent::Deadline) {
             return Err(OperationFailure::Compaction {
@@ -107,7 +111,7 @@ impl ContextCompactionRun {
                 }
                 CompactionStage::Prepare => {
                     let (job, started) = broker
-                        .prepare_owned_compaction(CompactionProvenance::Manual)
+                        .prepare_owned_compaction(CompactionProvenance::Manual, interrupted)
                         .map_err(OperationFailure::Domain)?;
                     let id = ContextCompactionId::new(job.id())
                         .expect("host compaction UUIDs are nonempty");
@@ -172,6 +176,11 @@ impl ContextCompactionRun {
                             ) => ContextCompactionFailure::AuthorityChanged,
                             Some(CompactionEvidenceError::Unconfirmed) => {
                                 ContextCompactionFailure::Unconfirmed
+                            }
+                            Some(CompactionEvidenceError::Declined { explanation }) => {
+                                ContextCompactionFailure::Declined {
+                                    explanation: explanation.clone(),
+                                }
                             }
                             Some(CompactionEvidenceError::Failed { kind }) => {
                                 ContextCompactionFailure::Provider { kind: *kind }

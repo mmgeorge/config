@@ -33,6 +33,43 @@ fn user_queue_rejects_check_results_without_changing_pause() -> Result<()> {
     Ok(())
 }
 
+/// Only input the user sends directly preempts a running check. A continuation Harness reserves
+/// when a task's turn ends must wait for the run instead: a model may end its turn while its own
+/// `check_run` is still running, and preempting would interrupt the very run it waits for.
+#[test]
+fn only_direct_user_input_preempts_running_checks() -> Result<()> {
+    let message = |purpose: serde_json::Value, intent: InputIntent| -> Result<InputMessage> {
+        Ok(InputMessage::queued(crate::input::InputDraft {
+            id: "input".into(),
+            text: "text".into(),
+            purpose: serde_json::from_value(purpose)?,
+            attachments: Vec::new(),
+            config: None,
+            intent,
+        }))
+    };
+    let task_input = serde_json::json!({
+        "revision":"task-revision","id":"task-input",
+        "completed_turn_id":{"exchange_ordinal":1,"turn_ordinal":0},
+        "reason":"The active task requires another turn"
+    });
+    let mut task_continuation = task_input.clone();
+    task_continuation["kind"] = "task_continuation".into();
+    assert!(message(serde_json::json!({"kind":"user"}), InputIntent::Auto)?.preempts_checks());
+    assert!(!message(serde_json::json!({"kind":"user"}), InputIntent::Queue)?.preempts_checks());
+    for purpose in [
+        task_continuation,
+        serde_json::json!({"kind":"question_continuation","exchange_id":"exchange"}),
+        serde_json::json!({"kind":"check_result","exchange_id":"exchange","run_id":"run"}),
+    ] {
+        assert!(
+            !message(purpose.clone(), InputIntent::Auto)?.preempts_checks(),
+            "{purpose}"
+        );
+    }
+    Ok(())
+}
+
 fn submit(id: &str) -> InputOperation {
     InputOperation {
         id: format!("submit-{id}"),

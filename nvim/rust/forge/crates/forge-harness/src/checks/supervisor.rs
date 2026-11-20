@@ -269,16 +269,36 @@ impl CheckSupervisor {
         &self,
         snapshot: &crate::checkpoint::CheckpointRecord,
     ) -> Result<bool> {
+        Ok(self.pending_verification(snapshot)?.is_empty())
+    }
+
+    /// Get each check whose whole-check verification the source capture still needs, once.
+    ///
+    /// A definition comes from the mutation that created the obligation, so its name and ID
+    /// remain available when the current configuration changed or removed it.
+    pub(crate) fn pending_verification(
+        &self,
+        snapshot: &crate::checkpoint::CheckpointRecord,
+    ) -> Result<Vec<super::CheckDefinition>> {
         if !self.has_verification_requirements()? {
-            return Ok(true);
+            return Ok(Vec::new());
         }
         let config = ConfigSnapshot::load(&self.workspace)?;
-        Ok(self
+        let pending = self
             .verification
             .lock()
             .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-            .pending_for_config(snapshot, &config)?
-            .is_empty())
+            .pending_for_config(snapshot, &config)?;
+        let mut definitions: Vec<super::CheckDefinition> = Vec::new();
+        for requirement in pending {
+            if !definitions
+                .iter()
+                .any(|definition| definition.id == requirement.check)
+            {
+                definitions.push(requirement.definition);
+            }
+        }
+        Ok(definitions)
     }
 
     /// Recheck mutation obligations against fresh source after a completion check run.

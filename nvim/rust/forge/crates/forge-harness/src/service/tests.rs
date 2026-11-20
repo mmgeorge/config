@@ -1,5 +1,6 @@
 mod approval_deadline;
 mod bootstrap;
+mod compaction;
 mod fork;
 mod native_agents;
 mod owner_cancel;

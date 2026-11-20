@@ -1548,6 +1548,292 @@ async fn prompts_run_after_a_rewind_restart() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// One persisted transcript chain entry of the modelled CLI conversation.
+#[derive(Clone, Debug, PartialEq)]
+enum NativeEntry {
+    /// The user entry that starts a turn.
+    Prompt(String),
+    /// An assistant entry, which a turn reports as its checkpoint.
+    Answer(String),
+    /// A user entry written with `shouldQuery: false`, such as the adapter's rewind note.
+    Note(String),
+}
+
+impl NativeEntry {
+    fn uuid(&self) -> &str {
+        match self {
+            Self::Prompt(uuid) | Self::Answer(uuid) | Self::Note(uuid) => uuid,
+        }
+    }
+}
+
+/// Read the value of one `--name=value` argument.
+fn argument_value<'arguments>(
+    arguments: &'arguments [String],
+    name: &str,
+) -> Option<&'arguments str> {
+    arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// Apply the CLI's truncating resume to a persisted chain, or refuse it as the CLI does.
+///
+/// `--resume-drops-turn` declares the prompt of the one turn the truncation discards; the CLI
+/// exits when the discarded range does not start with that prompt or holds another user entry.
+fn resume_native_chain(chain: &mut Vec<NativeEntry>, arguments: &[String]) -> bool {
+    if argument_value(arguments, "--resume").is_none() {
+        chain.clear();
+        return true;
+    }
+    let Some(resume_at) = argument_value(arguments, "--resume-session-at") else {
+        return true;
+    };
+    let Some(kept) = chain.iter().position(|entry| entry.uuid() == resume_at) else {
+        return false;
+    };
+    let discarded = &chain[kept + 1..];
+    if let Some(dropped_prompt) = argument_value(arguments, "--resume-drops-turn") {
+        let starts_with_prompt =
+            discarded.is_empty() || discarded[0] == NativeEntry::Prompt(dropped_prompt.to_owned());
+        let attributable = discarded
+            .iter()
+            .skip(1)
+            .all(|entry| matches!(entry, NativeEntry::Answer(_)));
+        if !starts_with_prompt || !attributable {
+            return false;
+        }
+    }
+    chain.truncate(kept + 1);
+    true
+}
+
+/// A rewind succeeds however many rewinds came before it in the session, because each rewind
+/// appends a note to the native chain that a later guarded resume must not count as content of
+/// the dropped turn: neither the note before a dropped turn's prompt nor the note after it.
+#[tokio::test]
+async fn rewinds_after_earlier_rewinds_resume_past_their_notes() {
+    let directory = tempfile::tempdir().unwrap();
+    let chain: Arc<Mutex<Vec<NativeEntry>>> = Arc::default();
+    let peer_chain = chain.clone();
+    let launcher = PeerLauncher::with_arguments(move |arguments| {
+        if !resume_native_chain(&mut peer_chain.lock().unwrap(), arguments) {
+            return None;
+        }
+        let chain = peer_chain.clone();
+        let handler: PeerHandler = Box::new(move |frame: &Value| {
+            let uuid = user_uuid(frame)?;
+            let entry_uuid = uuid.as_str().unwrap().to_owned();
+            if frame["shouldQuery"] == false {
+                chain.lock().unwrap().push(NativeEntry::Note(entry_uuid));
+                return Some(vec![
+                    lifecycle(&uuid, "queued"),
+                    lifecycle(&uuid, "completed"),
+                ]);
+            }
+            let answer = text_message("msg-1", &["ok"]);
+            let answer_uuid = answer
+                .iter()
+                .find(|frame| frame["type"] == "assistant")
+                .and_then(|frame| frame["uuid"].as_str())
+                .unwrap()
+                .to_owned();
+            chain.lock().unwrap().extend([
+                NativeEntry::Prompt(entry_uuid),
+                NativeEntry::Answer(answer_uuid),
+            ]);
+            let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            frames.extend(answer);
+            frames.push(lifecycle(&uuid, "completed"));
+            frames.push(result_success());
+            Some(frames)
+        });
+        Some(handler)
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let mut checkpoint_of_turn =
+        std::collections::HashMap::<&str, forge_provider_api::CheckpointId>::new();
+    let mut rewind_count = 0;
+    for step in [
+        "turn-1",
+        "turn-2",
+        "rewind:turn-1",
+        "turn-3",
+        "rewind:turn-1",
+        "turn-4",
+        "turn-5",
+        "rewind:turn-4",
+        "rewind:turn-1",
+    ] {
+        if let Some(target) = step.strip_prefix("rewind:") {
+            rewind_count += 1;
+            let rewound = provider
+                .thread_rewind(
+                    operation_context(),
+                    &binding,
+                    forge_provider_api::ThreadRewindRequest {
+                        after: Some(checkpoint_of_turn[target].clone()),
+                    },
+                )
+                .await;
+            assert!(
+                rewound.is_ok(),
+                "rewind {rewind_count} to {target} failed: {rewound:?}"
+            );
+            continue;
+        }
+        provider
+            .turn_start(
+                operation_context(),
+                &binding,
+                prompt_request(
+                    &binding,
+                    step,
+                    receipt(step),
+                    forge_provider_api::permissions::PermissionResponse::Allow,
+                ),
+            )
+            .await
+            .unwrap();
+        let (_, completed) = until_completed(&mut opened.events).await;
+        checkpoint_of_turn.insert(step, completed.result().checkpoint_id().cloned().unwrap());
+    }
+
+    let kept_turns = chain
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| !matches!(entry, NativeEntry::Note(_)))
+        .count();
+    assert_eq!(kept_turns, 2, "only turn-1 remains in the native chain");
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Answer prompts with one reply each and acknowledge notes, which run no model turn.
+fn noting_peer() -> PeerHandler {
+    Box::new(|frame| {
+        let uuid = user_uuid(frame)?;
+        if frame["shouldQuery"] == false {
+            return Some(vec![
+                lifecycle(&uuid, "queued"),
+                lifecycle(&uuid, "completed"),
+            ]);
+        }
+        let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+        frames.extend(text_message("msg-1", &["ok"]));
+        frames.push(lifecycle(&uuid, "completed"));
+        frames.push(result_success());
+        Some(frames)
+    })
+}
+
+/// Fork a live binding into a separately owned target conversation.
+async fn fork_binding(
+    provider: &ClaudeProvider,
+    binding: &forge_provider_api::BindingId,
+    workspace: &std::path::Path,
+) -> forge_provider_api::ProviderSessionId {
+    let source = session_request(workspace);
+    provider
+        .thread_fork(
+            operation_context(),
+            forge_provider_api::session::SessionForkRequest {
+                source: forge_provider_api::ForkSource::Binding(binding.clone()),
+                target: forge_provider_api::ForkTarget {
+                    thread_id: forge_provider_api::testing::root_thread("claude-fork-owner"),
+                    workspace: source.workspace,
+                    configuration: source.configuration,
+                    system_instructions: source.system_instructions,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .provider_session_id
+}
+
+/// A fork made after a rewind copies the history the rewind kept, and the fork's first turn
+/// follows that history directly.
+///
+/// The rewind leaves the discarded turn in the CLI transcript beside the kept history, and an
+/// unpositioned `--fork-session` copied the discarded branch, so the fork names the kept turn's
+/// checkpoint. The note that materializes the fork is the target's newest entry; resuming the
+/// target at the same checkpoint discards it when the first prompt is appended, so the model never
+/// reads the note or the "No response requested." reply the CLI adds after a trailing user entry.
+#[tokio::test]
+async fn forks_after_a_rewind_copy_the_kept_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(noting_peer);
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let mut checkpoints = Vec::new();
+    for turn in ["turn-1", "turn-2"] {
+        provider
+            .turn_start(
+                operation_context(),
+                &binding,
+                prompt_request(
+                    &binding,
+                    turn,
+                    receipt(turn),
+                    forge_provider_api::permissions::PermissionResponse::Allow,
+                ),
+            )
+            .await
+            .unwrap();
+        let (_, completed) = until_completed(&mut opened.events).await;
+        checkpoints.push(completed.result().checkpoint_id().cloned().unwrap());
+    }
+    provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest {
+                after: Some(checkpoints[0].clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let target = fork_binding(&provider, &binding, directory.path()).await;
+    let mut target_request = session_request(directory.path());
+    target_request.thread_id = forge_provider_api::testing::root_thread("claude-fork-owner");
+    target_request.history = forge_provider_api::SessionHistory::Durable {
+        resume: Some(target.clone()),
+    };
+    provider
+        .thread_open(operation_context(), target_request)
+        .await
+        .unwrap();
+
+    let launches = launcher.record.lock().unwrap().launches.clone();
+    let fork = launches
+        .iter()
+        .find(|arguments| {
+            arguments
+                .iter()
+                .any(|argument| argument == "--fork-session")
+        })
+        .expect("the fork launched a process");
+    assert_eq!(
+        argument_value(fork, "--resume-session-at"),
+        Some(checkpoints[0].as_str()),
+        "the fork copies the kept history, not the discarded turn"
+    );
+    let target_open = launches.last().unwrap();
+    assert_eq!(
+        argument_value(target_open, "--resume"),
+        Some(target.as_str())
+    );
+    assert_eq!(
+        argument_value(target_open, "--resume-session-at"),
+        Some(checkpoints[0].as_str()),
+        "the target resumes before the note that materialized it"
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// MCP credentials reach the CLI through the session's private profile, never its command line.
 #[tokio::test]
 async fn mcp_credentials_stay_off_the_command_line() {
@@ -2315,6 +2601,66 @@ async fn a_conversation_that_ran_a_turn_is_never_started_again() {
             format!("--session-id={}", session_id.as_str()),
             format!("--resume={}", session_id.as_str()),
         ]
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A manual compaction's notifications and result carry the host operation identity.
+///
+/// The adapter once named the attempt after the `/compact` input's own uuid, so the host
+/// settled its own record from the result and kept the notifications as a second compaction:
+/// the transcript drew `Context compacted` twice for one `/compact`.
+#[tokio::test]
+async fn manual_compaction_reports_the_host_operation_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = scripted_peer(vec![|_| {
+        let system = |fields: Value| {
+            let mut frame = json!({"type": "system", "uuid": uuid::Uuid::new_v4().to_string()});
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            frame
+        };
+        vec![
+            system(json!({"subtype": "status", "status": "compacting"})),
+            system(json!({"subtype": "compact_boundary", "compact_metadata":
+                {"trigger": "manual", "pre_tokens": 62121, "post_tokens": 13787}})),
+            system(json!({"subtype": "status", "status": null, "compact_result": "success"})),
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                "local_command": "compact", "uuid": uuid::Uuid::new_v4().to_string()}),
+        ]
+    }]);
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let context = operation_context();
+    let operation_id = context.id().clone();
+    let request = forge_provider_api::CompactionRequest {
+        scope: forge_provider_api::EventScope::SessionOperation {
+            thread_id: forge_provider_api::testing::root_thread("claude-owner"),
+            operation_id: operation_id.clone(),
+        },
+    };
+    let compacted = provider
+        .thread_compact(context, &opened.binding.id, request)
+        .await
+        .unwrap()
+        .compaction;
+    assert_eq!(compacted.id, operation_id.as_str());
+    assert_eq!(compacted.result.context_tokens_after, Some(13787));
+    let mut observed = Vec::new();
+    while let Some(envelope) = opened.events.try_next().unwrap() {
+        if let forge_provider_api::ProviderEvent::Thread {
+            event: forge_provider_api::ThreadEvent::CompactionUpdated(compaction),
+            ..
+        } = envelope.event
+        {
+            observed.push(compaction.id.clone());
+        }
+    }
+    assert!(!observed.is_empty());
+    assert!(
+        observed.iter().all(|id| id == operation_id.as_str()),
+        "{observed:?}"
     );
     provider.shutdown(operation_context()).await.unwrap();
 }

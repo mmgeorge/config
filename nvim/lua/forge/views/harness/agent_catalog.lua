@@ -2,13 +2,41 @@ local AgentCatalog = {}
 
 local agent_summary = require("forge.render.harness.agent_summary")
 
+--- Split a label into text and number segments, so `explorer-10` compares as `explorer-` then 10.
+---@param label string
+---@return (string|integer)[]
+local function label_segments(label)
+  local segment_list = {}
+  for text, digits in label:gmatch("(%D*)(%d*)") do
+    if text ~= "" then segment_list[#segment_list + 1] = text end
+    if digits ~= "" then segment_list[#segment_list + 1] = tonumber(digits) end
+  end
+  return segment_list
+end
+
+--- Order labels by their number segments as numbers, so `-2` precedes `-10`.
+---@param left_label string
+---@param right_label string
+---@return boolean?
+local function label_before(left_label, right_label)
+  local left_segments, right_segments = label_segments(left_label), label_segments(right_label)
+  for index = 1, math.min(#left_segments, #right_segments) do
+    local left, right = left_segments[index], right_segments[index]
+    if left ~= right then
+      if type(left) ~= type(right) then return type(left) == "number" end
+      return left < right
+    end
+  end
+  if #left_segments ~= #right_segments then return #left_segments < #right_segments end
+  return nil
+end
+
 ---@param left table
 ---@param right table
 ---@return boolean
 local function run_before(left, right)
-  local left_label = agent_summary.label(left):lower()
-  local right_label = agent_summary.label(right):lower()
-  if left_label ~= right_label then return left_label < right_label end
+  local before = label_before(agent_summary.label(left):lower(), agent_summary.label(right):lower())
+  if before ~= nil then return before end
   if (left.created_at_ms or 0) ~= (right.created_at_ms or 0) then
     return (left.created_at_ms or 0) < (right.created_at_ms or 0)
   end
@@ -30,6 +58,25 @@ function AgentCatalog.run_list(state, active)
   end
   table.sort(result, run_before)
   return result
+end
+
+--- Replace the view's child list unless the incoming list was read before the current one.
+---
+--- The host delivers child lists in `agent_updated` events and inside whole session snapshots,
+--- and a list read earlier can arrive after a later one. Applying it showed a settled child as
+--- running again, so an interrupt chosen from that list addressed a child that had already
+--- finished. Revisions restart with each host run, so they compare only within one runtime epoch.
+---@param state table
+---@param agent table
+---@return boolean replaced
+function AgentCatalog.replace(state, agent)
+  local current = state.agent
+  if current and type(current.revision) == "number" and type(agent.revision) == "number"
+    and current.runtime_epoch == agent.runtime_epoch and agent.revision < current.revision then
+    return false
+  end
+  state.agent = vim.deepcopy(agent)
+  return true
 end
 
 ---@param state table

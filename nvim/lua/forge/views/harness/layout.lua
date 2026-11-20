@@ -52,8 +52,9 @@ function M.enter_composer_in_insert(action)
 end
 
 ---Leave Insert mode whenever focus enters `buf`, unless a caller enters the composer in Insert
----mode on purpose. The composer starts each visit in Normal mode; the transcript never takes typed
----edits, which a mouse click from an Insert-mode composer would otherwise send to its rows.
+---mode on purpose or a closing popup returns the user to the place they were typing. The composer
+---starts each visit in Normal mode; the transcript never takes typed edits, which a mouse click
+---from an Insert-mode composer would otherwise send to its rows.
 ---@param buf integer
 ---@param description string
 local function keep_normal_on_entry(buf, description)
@@ -61,7 +62,11 @@ local function keep_normal_on_entry(buf, description)
   vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
     group = composer_mode_group,
     buffer = buf,
-    callback = function() if insert_entry_depth == 0 then vim.cmd("stopinsert") end end,
+    callback = function()
+      if insert_entry_depth == 0 and not require("forge.infra.popup_window").returning_to_insert then
+        vim.cmd("stopinsert")
+      end
+    end,
     desc = description,
   })
 end
@@ -102,8 +107,26 @@ end
 ---@param composer_buffer integer
 ---@param session_id string
 function M.rename_session_buffers(transcript_buffer, composer_buffer, session_id)
-  vim.api.nvim_buf_set_name(transcript_buffer, transcript_name(session_id))
-  vim.api.nvim_buf_set_name(composer_buffer, config.options.harness.composer_name .. "://" .. session_id)
+  M.rename_buffer(transcript_buffer, transcript_name(session_id))
+  M.rename_buffer(composer_buffer, config.options.harness.composer_name .. "://" .. session_id)
+end
+
+---Rename `buffer` without leaving its former name behind. Neovim keeps a renamed buffer's former
+---name on a new unloaded, unlisted buffer, the alternate file, so a view opened under a
+---placeholder name and then bound to its session left one such buffer per pane in `:ls!`.
+---@param buffer integer
+---@param name string
+function M.rename_buffer(buffer, name)
+  local previous_name = vim.api.nvim_buf_get_name(buffer)
+  if previous_name == name then return end
+  vim.api.nvim_buf_set_name(buffer, name)
+  if previous_name == "" then return end
+  for _, candidate in ipairs(vim.api.nvim_list_bufs()) do
+    if candidate ~= buffer and vim.api.nvim_buf_get_name(candidate) == previous_name
+      and not vim.api.nvim_buf_is_loaded(candidate) and not vim.bo[candidate].buflisted then
+      vim.api.nvim_buf_delete(candidate, { force = true })
+    end
+  end
 end
 
 ---@param win integer
@@ -127,8 +150,12 @@ end
 ---@return integer, integer, integer, integer, integer
 function M.open(timeline_key, open_mode)
   local options = config.options.harness
+  local placeholder_buffer
   if open_mode ~= "current" then
     vim.cmd("tabnew")
+    -- `tabnew` shows a fresh empty buffer, which the transcript replaces below; deleting it keeps
+    -- each opened tab from leaving an unnamed buffer behind.
+    placeholder_buffer = vim.api.nvim_get_current_buf()
   elseif vim.wo[vim.api.nvim_get_current_win()].winfixbuf then
     -- Keep buffer-locked views intact while opening Harness in the same tab.
     vim.cmd("aboveleft split")
@@ -138,19 +165,17 @@ function M.open(timeline_key, open_mode)
   local transcript_win = vim.api.nvim_get_current_win()
   local transcript_buf = M.create_transcript_buffer(timeline_key)
   vim.api.nvim_win_set_buf(transcript_win, transcript_buf)
+  if placeholder_buffer and placeholder_buffer ~= transcript_buf and vim.api.nvim_buf_is_valid(placeholder_buffer)
+    and vim.api.nvim_buf_get_name(placeholder_buffer) == "" and not vim.bo[placeholder_buffer].modified
+    and #vim.fn.win_findbuf(placeholder_buffer) == 0 then
+    vim.api.nvim_buf_delete(placeholder_buffer, { force = true })
+  end
   M.configure_transcript_window(transcript_win)
 
   vim.cmd("belowright " .. tostring(options.composer_min_height) .. "split")
   local composer_win = vim.api.nvim_get_current_win()
-  local composer_name = timeline_key and (options.composer_name .. "://" .. timeline_key)
-    or options.composer_name
-  local composer_buf = named_buffer(composer_name)
+  local composer_buf = M.create_composer_buffer(timeline_key)
   vim.api.nvim_win_set_buf(composer_win, composer_buf)
-  vim.bo[composer_buf].buftype = "nofile"
-  vim.bo[composer_buf].bufhidden = "hide"
-  vim.bo[composer_buf].swapfile = false
-  vim.bo[composer_buf].filetype = "ForgeHarnessInput"
-  vim.bo[composer_buf].modifiable = true
   vim.wo[composer_win].wrap = true
   vim.wo[composer_win].linebreak = true
   vim.wo[composer_win].showbreak = ""
@@ -159,8 +184,68 @@ function M.open(timeline_key, open_mode)
   vim.api.nvim_set_option_value("smoothscroll", true, { scope = "local", win = composer_win })
   vim.wo[composer_win].winfixheight = true
   input_gutter.apply(composer_win)
-  keep_normal_on_entry(composer_buf, "Keep Harness input in Normal mode when focused")
   return transcript_buf, transcript_win, composer_buf, composer_win, tabpage
+end
+
+---@param timeline_key? string
+---@return integer
+function M.create_composer_buffer(timeline_key)
+  local options = config.options.harness
+  local buf = named_buffer(timeline_key and (options.composer_name .. "://" .. timeline_key) or options.composer_name)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "ForgeHarnessInput"
+  vim.bo[buf].modifiable = true
+  keep_normal_on_entry(buf, "Keep Harness input in Normal mode when focused")
+  return buf
+end
+
+---Open a hidden window over `replaced_window` that shows `transcript_buf` with the transcript's
+---window options and the same width, so a session can be opened, rendered, and positioned there
+---while `replaced_window` still shows the session being left. `place_transcript` then puts it on
+---screen in one step.
+---@param transcript_buf integer
+---@param replaced_window integer
+---@param window_options? table<string, any> Local options that differ from the replaced window's,
+---  such as its separator before a status split changed it.
+---@return integer
+function M.open_hidden_transcript(transcript_buf, replaced_window, window_options)
+  -- A new window copies the current window's local options, so it is opened from the window it
+  -- replaces rather than from the composer that usually has focus.
+  local window = vim.api.nvim_win_call(replaced_window, function()
+    return vim.api.nvim_open_win(transcript_buf, false, {
+      relative = "win", win = replaced_window, row = 0, col = 0, hide = true,
+      width = vim.api.nvim_win_get_width(replaced_window), height = vim.api.nvim_win_get_height(replaced_window),
+    })
+  end)
+  vim.api.nvim_set_option_value("winfixbuf", false, { scope = "local", win = window })
+  for name, value in pairs(window_options or {}) do
+    vim.api.nvim_set_option_value(name, value, { scope = "local", win = window })
+  end
+  M.configure_transcript_window(window)
+  return window
+end
+
+---Put a window from `open_hidden_transcript` in place of the window it covered, keeping its
+---buffer, view, and window identity, and close the covered window.
+---@param window integer
+---@param replaced_window integer
+function M.place_transcript(window, replaced_window)
+  local view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+  vim.api.nvim_win_set_config(window, { split = "above", win = replaced_window })
+  vim.api.nvim_win_close(replaced_window, true)
+  vim.api.nvim_win_call(window, function() vim.fn.winrestview(view) end)
+end
+
+---Remove the autocommand groups `attach_auto_height` and `attach_scroll_boundary` created for a
+---view's buffers. The composer group also holds a global resize autocommand, which deleting the
+---buffer alone would leave behind.
+---@param transcript_buf integer
+---@param composer_buf integer
+function M.detach(transcript_buf, composer_buf)
+  pcall(vim.api.nvim_del_augroup_by_name, "ForgeHarnessComposer" .. composer_buf)
+  pcall(vim.api.nvim_del_augroup_by_name, "ForgeHarnessScroll" .. transcript_buf)
 end
 
 ---@param composer_buf integer

@@ -1092,8 +1092,15 @@ impl EditablePlanReview<'_> {
                 }
             }
         }
+        // The editor refuses a name in this list as soon as it is entered, before it asks for
+        // confirmation; the rename itself refuses the same names through the same function.
+        let existing_names = super::references::names_in_scope(
+            &definition_path,
+            &design.parsed()?.proposed[&definition_path],
+            &symbol,
+        )?;
         Ok(
-            serde_json::json!({"rename":{"symbol":identity,"name":symbol.name,"expected_version":document.source.document.version,"preview":preview}}),
+            serde_json::json!({"rename":{"symbol":identity,"name":symbol.name,"existing_names":existing_names,"expected_version":document.source.document.version,"preview":preview}}),
         )
     }
 }
@@ -2495,21 +2502,16 @@ mod tests {
         );
     }
 
-    /// The rename preview lists every inline-code mention the rename rewrites, in narrative rows,
-    /// test descriptions, flow text, and Mermaid labels, beside the declaration itself.
-    #[test]
-    fn rename_preview_lists_narrative_mentions() {
-        let temporary = tempfile::tempdir().unwrap();
-        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
-        crate::checks::configure_fixture(&file.workspace);
-        let canonical = crate::plan::references::tests::scoring_plan();
-        file.write_working_document("session", "plan", &canonical)
-            .unwrap();
-        let (_, _, checksum) = file
-            .submit_document_revision("session", "plan", 1, 1)
-            .unwrap();
+    /// Open the review of the submitted plan and request the rename preview at the declaration
+    /// row containing `declaration`, `offset` characters into it.
+    fn rename_preview(
+        file: &PlanFileStore,
+        checksum: &str,
+        declaration: &str,
+        offset: usize,
+    ) -> (BufferSnapshot, serde_json::Value) {
         let source = file
-            .capture_review_source("session", "plan", None, &checksum)
+            .capture_review_source("session", "plan", None, checksum)
             .unwrap();
         let id = DocumentId("rename".into());
         let document = ReadOnlyPlanReview::new(
@@ -2536,8 +2538,8 @@ mod tests {
                     .iter()
                     .enumerate()
                     .find_map(|(row, text)| {
-                        text.find("fn score(")
-                            .map(|column| (block.clone(), row, column + 3))
+                        text.find(declaration)
+                            .map(|column| (block.clone(), row, column + offset))
                     })
             })
             .unwrap_or_else(|| panic!("no declaration row in {rendered:#?}"));
@@ -2566,6 +2568,23 @@ mod tests {
                 target: target.map(|target| target.id),
             })
             .unwrap();
+        (snapshot, result)
+    }
+
+    /// The rename preview lists every inline-code mention the rename rewrites, in narrative rows,
+    /// test descriptions, flow text, and Mermaid labels, beside the declaration itself.
+    #[test]
+    fn rename_preview_lists_narrative_mentions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
+        crate::checks::configure_fixture(&file.workspace);
+        let canonical = crate::plan::references::tests::scoring_plan();
+        file.write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = file
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let (snapshot, result) = rename_preview(&file, &checksum, "fn score(", 3);
         let rows = snapshot
             .block
             .iter()
@@ -2601,6 +2620,52 @@ mod tests {
         .to_vec();
         expected.sort();
         assert_eq!(previewed, expected);
+    }
+
+    /// The rename preview names every declaration already in the renamed symbol's scope, those the
+    /// modified workspace file already declares as well as those the plan adds, so the editor can
+    /// refuse a colliding name before it asks for confirmation; a rename to such a name sent anyway
+    /// is refused and leaves the plan unchanged.
+    #[test]
+    fn rename_preview_lists_the_names_in_scope_and_apply_refuses_them() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
+        crate::checks::configure_fixture(&file.workspace);
+        let canonical = crate::plan::references::tests::existing_module_allocation_plan();
+        let existing = &canonical.design.as_ref().unwrap().baseline["src/money.ts"].text;
+        std::fs::create_dir_all(file.workspace.join("src")).unwrap();
+        std::fs::write(file.workspace.join("src/money.ts"), existing).unwrap();
+        file.write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = file
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let (_, result) = rename_preview(&file, &checksum, "function moneyAllocate(", 9);
+        let existing_names = result["rename"]["existing_names"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the preview names no existing names: {result}"))
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (result["rename"]["name"].as_str(), existing_names),
+            (
+                Some("moneyAllocate"),
+                vec!["moneyAllocate", "moneyShare", "moneySplit"]
+            )
+        );
+        let identity = result["rename"]["symbol"].as_str().unwrap();
+        let working = file.read_working_document("session", "plan").unwrap();
+        let refusal = file
+            .rename_symbol_from_document("session", &working, identity, "moneyShare", None)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            refusal.as_deref(),
+            Some("`moneyShare` already exists in this scope")
+        );
+        let unchanged = file.read_working_document("session", "plan").unwrap();
+        assert_eq!(unchanged, working);
     }
 
     /// A rename rewrites rows of a section that holds a saved multi-row comment; the comment keeps

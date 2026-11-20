@@ -653,6 +653,23 @@ impl ExchangeStop {
                     || self.invocation.is_some()
                     || check.is_some();
                 if native {
+                    // A collection of the whole tree, such as a task control (`/plan cancel`,
+                    // a pause, a plan decision) or a tree-wide configuration change, stops the
+                    // delegating turn and the provider's native subagents with it, as a
+                    // cancellation does. The foreground reducer ends those subagents for a
+                    // cancellation; this collection reaches it as a restart, so it ends them
+                    // here, before any of their queued output is drawn. A root-only
+                    // reconfiguration keeps them, and a new turn of the exchange observes its
+                    // subagents again.
+                    if matches!(
+                        self.intent,
+                        StopIntent::Reconfigure {
+                            children: ChildCollectionPolicy::Collect
+                        }
+                    ) && let Some(target) = &view.selection
+                    {
+                        broker.cancel_observed_children_of(target.id().as_str());
+                    }
                     self.foreground_signals.push_back(
                         crate::broker::ForegroundSignal::CollectionStarted(match self.intent {
                             StopIntent::Cancel(_) => {
@@ -1822,7 +1839,7 @@ mod tests {
             "queued work keeps collection open"
         );
         let cancelled = coordinator
-            .interrupt(&queued.agent.id)
+            .interrupt(&queued.agent.id, crate::agent::AgentSource::User)
             .expect("interrupt drains the queued launch");
         assert_eq!(cancelled.len(), 1);
         let mut task = cancelled.into_iter().next().unwrap();

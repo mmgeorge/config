@@ -1,7 +1,32 @@
 use super::*;
 
 /// Explain a completion refused because an adapter fix still awaits its whole-check verification.
-pub(crate) const GOAL_VERIFICATION_PENDING: &str = "required whole-check verification remains pending; run the originating checks before completing the goal";
+///
+/// The text names each check and the exact `check_run` request that satisfies it. Only a passing
+/// read-only run over the whole check counts: a run narrowed to the changed paths, which is what a
+/// request naming only the check ID selects, leaves the obligation pending.
+pub(crate) fn goal_verification_pending(pending: &[crate::checks::CheckDefinition]) -> String {
+    let checks = pending
+        .iter()
+        .map(|definition| format!("{} (`{}`)", definition.name, definition.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ids = pending
+        .iter()
+        .map(|definition| definition.id.as_str())
+        .collect::<Vec<_>>();
+    let selections = ids
+        .iter()
+        .map(|id| (id.to_string(), json!({"kind":"all"})))
+        .collect::<serde_json::Map<_, _>>();
+    let request = json!({"ids":ids,"selections":selections});
+    format!(
+        "required whole-check verification remains pending for {checks}, because a fix changed \
+         source after their last whole-check pass; run check_run {request} without apply, wait for \
+         its result, and complete the goal only after those checks pass. A run limited to changed \
+         paths does not verify the fix."
+    )
+}
 
 /// Explain a completion refused because another owner held the workspace when the turn ended.
 pub(crate) const GOAL_WORKSPACE_BUSY: &str = "another operation, such as a check run this turn started, held the workspace when the turn ended, so Harness could not verify the source; review the check results, then request completion again";
@@ -358,6 +383,17 @@ mod tests {
         );
         assert!(
             instruction.contains("required whole-check verification remains pending"),
+            "{instruction}"
+        );
+        // The refusal names the check and the exact whole-check request that satisfies it, since
+        // a run narrowed to the changed paths does not.
+        assert!(
+            instruction.contains("Formatting (`format`)"),
+            "{instruction}"
+        );
+        assert!(
+            instruction
+                .contains(r#"check_run {"ids":["format"],"selections":{"format":{"kind":"all"}}}"#),
             "{instruction}"
         );
         let exchanges = broker.store.list_exchange(&broker.session.id)?;

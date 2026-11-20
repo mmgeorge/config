@@ -25,6 +25,8 @@ pub(crate) fn automatic_session_name(session_title: &str) -> String {
 }
 
 #[cfg(test)]
+mod agent_summary_test;
+#[cfg(test)]
 mod cancellation_test;
 #[cfg(test)]
 mod change_results_test;
@@ -187,20 +189,32 @@ pub struct InitializeRequest {
     pub lease_conflict_action: Option<String>,
 }
 
+/// Summarize each child for the agents picker from its latest task's exchange.
+///
+/// The duration and tool tally come from the same exchange clock and tool counter that the
+/// child's status row, transcript row, and heading read, so every view shows one number:
+/// `elapsed_ms` is the accumulated execution time and `running_since_ms`, present only while
+/// the exchange runs, is the instant from which the editor keeps counting. `tool_label` is the
+/// status row's own tally text.
 fn agent_summaries(
     runs: &[Agent],
     exchanges: &[Exchange],
 ) -> std::collections::HashMap<String, Value> {
     runs.iter().map(|run| {
         let owned: Vec<_> = exchanges.iter().filter(|exchange| exchange.agent_id == run.id).collect();
-        let tool_count: usize = owned.iter().map(|exchange| exchange.tool_counter.total).sum();
-        let failed_count: usize = owned.iter().map(|exchange| exchange.tool_counter.failed).sum();
         let latest = owned.iter().rev().find(|exchange| exchange.state() == ExchangeState::Running)
             .or_else(|| owned.last());
         let target = latest.and_then(|exchange| exchange.turn.iter().rev().find(|turn| matches!(turn.state(),crate::turn::TurnState::Running)))
             .map(|turn| serde_json::to_value(turn.provider()).expect("provider address"));
+        let running_since_ms = latest
+            .filter(|exchange| exchange.state() == ExchangeState::Running)
+            .and_then(|exchange| exchange.execution_started_at_ms());
+        let tool_label = latest.and_then(|exchange| {
+            crate::buffer::projection::tool_count_label(exchange.tool_counter.clone().into(), None)
+        });
         (run.id.clone(), json!({"state":latest.map(|exchange| serde_json::to_value(exchange.state()).expect("exchange state")).unwrap_or_else(|| serde_json::to_value(run.state).expect("agent state")),
-            "tool_count":tool_count,"failed_count":failed_count,"target":target,
+            "elapsed_ms":latest.map_or(0, |exchange| exchange.duration_ms()),"running_since_ms":running_since_ms,
+            "tool_label":tool_label,"target":target,
             "exchange_count":owned.len(),"latest_exchange_id":latest.map(|exchange|exchange.id.as_str())}))
     }).collect()
 }
@@ -286,6 +300,14 @@ pub struct BrokerSnapshot {
 /// Retains reusable child identities and their durable timelines inside one root.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentSnapshot {
+    /// Snapshot revision of the read that produced this list.
+    ///
+    /// The editor receives agent lists both in `agent_updated` events and in whole session
+    /// snapshots, and a list read earlier can arrive after a later one. The editor keeps the list
+    /// with the highest revision, so a stale list cannot show a settled child as running again.
+    /// Revisions restart with each host run, which `runtime_epoch` names.
+    pub revision: u64,
+    pub runtime_epoch: String,
     pub run: Vec<Agent>,
     pub summary: std::collections::HashMap<String, Value>,
     #[serde(skip)]
@@ -619,6 +641,9 @@ pub(crate) struct ForegroundTransaction {
     /// Holds a deferred root result while unsettled children own the exchange. Only child
     /// activity, user input, or collection re-exposes it; immediate re-exposure spun the owner.
     pub(crate) native_ready_parked: bool,
+    /// Holds a deferred root result while a cancellation collects this exchange's children.
+    /// Only child activity re-exposes it, because the collection itself is already under way.
+    pub(crate) native_ready_awaits_children: bool,
     pub(crate) retraction_boundary: Option<(
         crate::provider::InvocationScope,
         forge_provider_api::CheckpointId,
@@ -965,6 +990,8 @@ pub(crate) struct OwnedAgentRequest {
 struct AgentInterruptItem {
     agent: Agent,
     owner: crate::provider::ThreadOwner,
+    /// Who requested the interrupt, which the cancelled tasks' reports name.
+    interrupted_by: crate::agent::AgentSource,
     cancelled: Vec<crate::agent::AgentTask>,
     cleanup: Option<crate::agent::AgentTask>,
     provider: Option<Arc<Provider>>,
@@ -1714,6 +1741,7 @@ impl ForegroundTransaction {
                 && self.steering.pending_deliveries.is_empty()
                 && self.pending_native_ready.is_some()
                 && !(self.native_ready_parked && self.collection.is_none())
+                && !self.native_ready_awaits_children
             {
                 // A bounded staging window is not the entire accepted observation prefix.
                 // Recheck both upstream owners before exposing a deferred native result.
@@ -1769,6 +1797,7 @@ impl ForegroundTransaction {
                 changed = self.agent_revision.changed(), if !self.agent_command_active => {
                     changed.context("agent coordinator closed during root execution")?;
                     self.native_ready_parked = false;
+                    self.native_ready_awaits_children = false;
                     return Ok(ForegroundSignal::AgentChanged);
                 }
                 delivery = self.result_delivery.join_next(), if !self.result_delivery.is_empty() => {
@@ -2412,6 +2441,12 @@ pub struct HarnessBroker {
     settlement_events: Vec<SessionEvent>,
     agent_registry: AgentRegistry,
     native_providers_by_binding: HashMap<forge_provider_api::BindingId, Arc<Provider>>,
+    /// Exchanges the user cancelled, whose native children present nothing more.
+    ///
+    /// A cancel ends every child the exchange delegated to. Observations the host places after
+    /// it, including output a child produced before the stop reached its provider but the host
+    /// had not yet drawn, belong to stopped work and are discarded.
+    cancelled_native_parents: std::collections::HashSet<String>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     pub(crate) agent_provider_factory: crate::agent::AgentProviderFactory,
     child_provider_by_agent: HashMap<String, Arc<Provider>>,
@@ -2906,6 +2941,7 @@ impl HarnessBroker {
             settlement_events: Vec::new(),
             agent_registry,
             native_providers_by_binding: HashMap::new(),
+            cancelled_native_parents: Default::default(),
             agent_coordinator,
             agent_provider_factory,
             child_provider_by_agent: HashMap::new(),
@@ -3565,7 +3601,6 @@ impl HarnessBroker {
                 Box::pin(self.prepare_rollback(params))
             }
             RuntimeMethod::SessionExchangeRollbackApply => Box::pin(self.apply_rollback(params)),
-            RuntimeMethod::SessionExchangeRecovery => Box::pin(self.restore_recovery(params)),
             RuntimeMethod::SessionResume => Box::pin(self.resume_session(params)),
             RuntimeMethod::SessionConfigure => Box::pin(self.configure_session(params)),
             RuntimeMethod::SessionCompact => Box::pin(self.compact_session(true)),
@@ -4239,7 +4274,8 @@ impl HarnessBroker {
                 return Ok(serde_json::to_value(message)?);
             }
             AgentOperation::Interrupt { target } => {
-                self.interrupt_managed_agent(target, event).await?;
+                self.interrupt_managed_agent(target, request.source, event)
+                    .await?;
                 return Ok(json!({"status":"interrupting","target":target}));
             }
             AgentOperation::InterruptAll => {
@@ -4249,7 +4285,8 @@ impl HarnessBroker {
                     .into_iter()
                     .map(|(agent, _)| agent.id)
                     .collect::<Vec<_>>();
-                self.interrupt_managed_agents(&targets, event).await?;
+                self.interrupt_managed_agents(&targets, request.source, event)
+                    .await?;
                 return Ok(json!({"status":"interrupting"}));
             }
             AgentOperation::Spawn(spawn) => ChildWork::Spawn(spawn),
@@ -4429,9 +4466,10 @@ impl HarnessBroker {
     async fn interrupt_managed_agent(
         &mut self,
         target: &str,
+        source: crate::agent::AgentSource,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        self.interrupt_managed_agents(&[target.to_owned()], event)
+        self.interrupt_managed_agents(&[target.to_owned()], source, event)
             .await
     }
 
@@ -4443,12 +4481,16 @@ impl HarnessBroker {
     async fn interrupt_managed_agents(
         &mut self,
         targets: &[String],
+        source: crate::agent::AgentSource,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let mut failures = Vec::new();
         let mut flagged = Vec::new();
         for target in targets {
-            match self.flag_managed_agent_interrupt(target, event).await {
+            match self
+                .flag_managed_agent_interrupt(target, source, event)
+                .await
+            {
                 Ok(agent) => flagged.push(agent),
                 Err(error) => failures.push(error.context(format!("interrupt child {target}"))),
             }
@@ -4468,6 +4510,7 @@ impl HarnessBroker {
     async fn flag_managed_agent_interrupt(
         &mut self,
         target: &str,
+        source: crate::agent::AgentSource,
         event: &mut Vec<SessionEvent>,
     ) -> Result<Agent> {
         let agent = self.agent_coordinator.resolve(target)?;
@@ -4476,10 +4519,14 @@ impl HarnessBroker {
             crate::provider::AgentId::new(agent.id.clone())?,
         )
         .expect("registered session and agent identities are nonempty");
-        let cancelled = self.agent_coordinator.interrupt(target)?;
+        let cancelled = self.agent_coordinator.interrupt(target, source)?;
         self.cancel_agent_approvals(&owner, event).await?;
         for task in cancelled {
-            self.persist_queued_cancellation(&agent, task, QueuedTaskCancellation::Interrupted)?;
+            self.persist_queued_cancellation(
+                &agent,
+                task,
+                QueuedTaskCancellation::Interrupted { by: source },
+            )?;
         }
         Ok(agent)
     }
@@ -4523,13 +4570,18 @@ impl HarnessBroker {
     ) -> Result<(crate::agent::AgentTask, Option<Exchange>)> {
         task.state = ExchangeState::Cancelled;
         task.completed_at_ms = Some(self.clock.now_ms());
-        if let QueuedTaskCancellation::PrerequisiteStopped { stopped_task_id } = cancellation {
-            task.error = Some(format!(
-                "Cancelled before dispatch: prerequisite task {stopped_task_id} stopped and requires explicit user continuation"
-            ));
-            // The stopped task's own report carries the stop; reporting each cancelled
-            // follow-up again would require acknowledging a task the policy does not name.
-            task.parent_reported = true;
+        match cancellation {
+            QueuedTaskCancellation::Interrupted { by } => {
+                task.error = Some(by.cancellation_reason().to_owned());
+            }
+            QueuedTaskCancellation::PrerequisiteStopped { stopped_task_id } => {
+                task.error = Some(format!(
+                    "Cancelled before dispatch: prerequisite task {stopped_task_id} stopped and requires explicit user continuation"
+                ));
+                // The stopped task's own report carries the stop; reporting each cancelled
+                // follow-up again would require acknowledging a task the policy does not name.
+                task.parent_reported = true;
+            }
         }
         let exchange = match self.store.load_exchange(&task.id)? {
             Some(mut exchange) => {
@@ -5209,17 +5261,38 @@ impl HarnessBroker {
             return Ok((AppliedProviderEvent::Effects(Vec::new()), None));
         }
         let mut agent = self.agent_coordinator.resolve(owner.agent_id().as_str())?;
-        let interrupted = self
+        let interrupted_by = self
             .agent_coordinator
-            .cancellation(owner.agent_id().as_str(), &task_id)
-            .is_ok_and(|cancel| *cancel.borrow());
+            .interruption(owner.agent_id().as_str(), &task_id);
+        let interrupted = interrupted_by.is_some()
+            || self
+                .agent_coordinator
+                .cancellation(owner.agent_id().as_str(), &task_id)
+                .is_ok_and(|cancel| *cancel.borrow());
         let provider_cancelled = output
             .as_ref()
             .is_err_and(|error| error.is::<TurnCancelled>());
         // The task keeps the child's own outcome; a cleanup failure is a separate obligation
         // recorded on the exchange, so a later cleanup retry cannot erase the original cause.
-        task.error = output.as_ref().err().map(|error| format!("{error:#}"));
-        task.completed_at_ms = Some(self.clock.now_ms());
+        // A host interrupt states who cancelled, because the provider's own cancellation error
+        // reads to the parent model as a provider failure.
+        task.error = match (&output, interrupted_by) {
+            (Err(_), Some(source)) => Some(source.cancellation_reason().to_owned()),
+            (output, _) => output.as_ref().err().map(|error| format!("{error:#}")),
+        };
+        // The presentation draws a running child's clock from its last snapshot and the current
+        // time whenever it refreshes. Holding it from the settle instant until the settled child
+        // replaces the running one orders every refresh before that instant, where its label
+        // cannot exceed the kept duration, or after the replacement, which no longer ticks. A
+        // refresh in between drew the running child past its settled duration, so its heading
+        // read less once it settled. The full reconcile below reads a snapshot, which takes this
+        // lock itself, so the settled child is placed directly before the lock is released.
+        let presentation = Arc::clone(&self.presentation);
+        let mut presentation = presentation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?;
+        let settled_at_ms = self.clock.now_ms();
+        task.completed_at_ms = Some(settled_at_ms);
         if let Ok(output) = &output {
             agent.provider_thread_id = output
                 .provider_session_id
@@ -5294,7 +5367,7 @@ impl HarnessBroker {
         {
             task.state = ExchangeState::Interrupted;
         }
-        exchange.finish(task.state.try_into()?, self.clock.now_ms())?;
+        exchange.finish(task.state.try_into()?, settled_at_ms)?;
         exchange.finalization_error = cleanup_error.clone();
         if exchange.turn.is_empty() {
             for message in agent.inbox.iter_mut().filter(|message| {
@@ -5332,7 +5405,7 @@ impl HarnessBroker {
         } else {
             AgentState::Ready
         };
-        agent.updated_at_ms = self.clock.now_ms();
+        agent.updated_at_ms = settled_at_ms;
         let requires_authorization = matches!(
             task.state,
             ExchangeState::Interrupted | ExchangeState::Cancelled | ExchangeState::Failed
@@ -5392,8 +5465,19 @@ impl HarnessBroker {
             self.child_execution_by_agent
                 .remove(owner.agent_id().as_str());
         }
+        let settled_patch = presentation.settle_owned_exchange(
+            &exchange,
+            self.observer.status_thoughts.load(Ordering::Relaxed),
+        )?;
+        drop(presentation);
         self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":*owner.agent_id(),"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
-        Ok((self.prepare_agent_state()?, next))
+        Ok((
+            AppliedProviderEvent::Effects(vec![
+                AppliedProviderEvent::Timeline(settled_patch),
+                self.prepare_agent_state()?,
+            ]),
+            next,
+        ))
     }
 
     async fn list_provider_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
@@ -6630,10 +6714,15 @@ impl HarnessBroker {
         })
     }
 
+    /// Mark a delivered child report received, so no later turn receives it again.
+    ///
+    /// A stopped child's report stays unreported here: only an accepted user input that carried
+    /// it may acknowledge it, together with the stop's authorization. A cancelled child's report
+    /// is acknowledged on delivery, while its agent keeps requiring explicit user continuation.
     fn acknowledge_agent_result(&mut self, mut task: crate::agent::AgentTask) -> Result<()> {
         if matches!(
             task.state,
-            ExchangeState::Interrupted | ExchangeState::Cancelled | ExchangeState::Failed
+            ExchangeState::Interrupted | ExchangeState::Failed
         ) {
             return Ok(());
         }
@@ -7323,7 +7412,7 @@ impl HarnessBroker {
         {
             return Ok(ForegroundAction::Wait);
         }
-        for task in self.agent_coordinator.unreported_result() {
+        for task in self.deliverable_child_results(&transaction.state.interaction.id)? {
             if transaction
                 .attached_results
                 .iter()
@@ -7373,7 +7462,8 @@ impl HarnessBroker {
                     crate::provider::AgentId::new(agent.id.clone())?,
                 )
                 .expect("registered session and agent identities are nonempty");
-                let cancelled = self.agent_coordinator.interrupt(&target)?;
+                let interrupted_by = request.request.source;
+                let cancelled = self.agent_coordinator.interrupt(&target, interrupted_by)?;
                 let cleanup = self.agent_coordinator.cleanup_task(&agent.id);
                 let provider = if cleanup.is_some() {
                     Some(
@@ -7388,6 +7478,7 @@ impl HarnessBroker {
                 Ok(AgentInterruptItem {
                     agent,
                     owner,
+                    interrupted_by,
                     cancelled,
                     cleanup,
                     provider,
@@ -8073,6 +8164,7 @@ impl HarnessBroker {
         let AgentInterruptItem {
             agent,
             owner,
+            interrupted_by,
             cancelled,
             cleanup,
             provider,
@@ -8127,7 +8219,11 @@ impl HarnessBroker {
                 serde_json::to_value(&current)? == serde_json::to_value(&task)?,
                 "interrupted queued task changed during cleanup"
             );
-            self.persist_queued_cancellation(&agent, task, QueuedTaskCancellation::Interrupted)?;
+            self.persist_queued_cancellation(
+                &agent,
+                task,
+                QueuedTaskCancellation::Interrupted { by: interrupted_by },
+            )?;
         }
         if let Some(task) = cleanup.filter(|_| cleanup_succeeded) {
             let current = self
@@ -9675,8 +9771,10 @@ impl HarnessBroker {
                 _ => {}
             }
         }
-        self.observer
-            .hand_off_phase(&self.store, runtime.active_task.as_ref(), status)
+        Ok(self
+            .observer
+            .hand_off_phase(&self.store, runtime.active_task.as_ref(), status)?
+            .blocked_by(runtime.active_task.as_ref()))
     }
 
     #[cfg(test)]
@@ -9766,7 +9864,17 @@ impl HarnessBroker {
             interaction.resume(now_ms)?;
             return Ok((interaction, false, Vec::new(), Vec::new()));
         }
-        if current.latest.is_none() && self.session.name.trim().is_empty() {
+        // Rolled-back exchanges keep their records, so the first prompt of the current history is
+        // the one no current exchange precedes, as `release_automatic_session_name` counts it.
+        if self.session.name.trim().is_empty()
+            && !self
+                .store
+                .list_exchange(&self.session.id)?
+                .iter()
+                .any(|exchange| {
+                    exchange.disposition() == crate::exchange::HistoryDisposition::Current
+                })
+        {
             let title = automatic_session_name(session_title);
             if !title.is_empty() {
                 self.session.name = self
@@ -9806,6 +9914,7 @@ impl HarnessBroker {
             Exchange {
                 finalization_error: None,
                 collection: None,
+                cancellation_requested: false,
                 check_owner: None,
                 output_store: None,
                 archived_output: Default::default(),
@@ -9924,16 +10033,18 @@ impl HarnessBroker {
                 .context("goal completion requires reserved workspace evidence")?;
             // A refused completion is an ordinary turn outcome: the goal stays active and its next
             // turn tells the model why, instead of failing the foreground that asked.
-            let refusal =
-                match workspace {
-                    foreground_goal_effect::GoalWorkspace::Reserved(reserved) => (!self
+            let refusal = match workspace {
+                foreground_goal_effect::GoalWorkspace::Reserved(reserved) => {
+                    let pending = self
                         .check_runner
-                        .verification_satisfied(reserved.checkpoint())?)
-                    .then_some(foreground_goal_effect::GOAL_VERIFICATION_PENDING),
-                    foreground_goal_effect::GoalWorkspace::Unprotected { .. } => {
-                        Some(foreground_goal_effect::GOAL_WORKSPACE_BUSY)
-                    }
-                };
+                        .pending_verification(reserved.checkpoint())?;
+                    (!pending.is_empty())
+                        .then(|| foreground_goal_effect::goal_verification_pending(&pending))
+                }
+                foreground_goal_effect::GoalWorkspace::Unprotected { .. } => {
+                    Some(foreground_goal_effect::GOAL_WORKSPACE_BUSY.to_owned())
+                }
+            };
             if let Some(reason) = refusal {
                 evidence.structured_complete = false;
                 self.trace.record(
@@ -9942,7 +10053,7 @@ impl HarnessBroker {
                     json!({"reason":reason}),
                 );
                 refused_control = control.map(|control| crate::goal::GoalControl {
-                    refusal: Some(reason.into()),
+                    refusal: Some(reason),
                     ..control.clone()
                 });
             }
@@ -10466,86 +10577,6 @@ impl HarnessBroker {
         Ok(events)
     }
 
-    async fn restore_recovery(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let action = params
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("status");
-        if action == "status" {
-            let progress =
-                crate::checkpoint::RestoreJournal::progress(&self.store.objects, &self.session.id)?;
-            return Ok((progress.map(|progress| json!({"pending": progress.state != crate::checkpoint::RestoreState::Complete,
-                "applied": progress.applied, "files": progress.files})).unwrap_or(Value::Null), Vec::new()));
-        }
-        enum RecoveryAction {
-            Continue,
-            Undo,
-        }
-        let action = match action {
-            "continue" => RecoveryAction::Continue,
-            "undo" => RecoveryAction::Undo,
-            _ => anyhow::bail!("unknown restore recovery action"),
-        };
-        let objects = self.store.objects.clone();
-        let session_id = self.session.id.clone();
-        let journal = tokio::task::spawn_blocking(move || {
-            crate::checkpoint::RestoreJournal::load(&objects, &session_id)
-        })
-        .await
-        .context("restore journal read failed")??
-        .context("restore journal is missing")?;
-        match action {
-            RecoveryAction::Continue => {
-                anyhow::ensure!(
-                    journal.state != crate::checkpoint::RestoreState::Complete,
-                    "restore is already complete"
-                );
-                let exchange = self.store.list_exchange(&self.session.id)?;
-                anyhow::ensure!(
-                    exchange.iter().all(|exchange| exchange.is_finished()),
-                    "cancel or finish active work before restore recovery"
-                );
-                if let Some(position) = journal.preview.exchange_ids.first().and_then(|first| {
-                    exchange.iter().position(|candidate| {
-                        &candidate.id == first
-                            && candidate.disposition()
-                                == crate::exchange::HistoryDisposition::Current
-                    })
-                }) {
-                    self.native_rewind(&exchange, position)?;
-                }
-                self.store
-                    .require_settled_exchange_tree(
-                        &self.session.id,
-                        &exchange
-                            .iter()
-                            .map(|exchange| exchange.id.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                    .context("rollback requires settled child work")?;
-                let journal = GitCheckpoint::new(&journal.preview.workspace)
-                    .apply_preview(
-                        Arc::clone(&self.repositories),
-                        self.store.objects.clone(),
-                        journal.preview,
-                        true,
-                    )
-                    .await?;
-                return self.finish_restore(journal).await;
-            }
-            RecoveryAction::Undo => {
-                let objects = self.store.objects.clone();
-                let preview = tokio::task::spawn_blocking(move || {
-                    let preview = journal.reverse(&objects)?;
-                    preview.save(&objects)?;
-                    Ok::<_, anyhow::Error>(preview)
-                })
-                .await
-                .context("recovery preparation worker failed")??;
-                Ok((preview.summary(0), Vec::new()))
-            }
-        }
-    }
     async fn new_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         self.new_session_now(params)
     }
@@ -11000,7 +11031,7 @@ impl HarnessBroker {
                     .context("automatic compaction requires its authorizing turn")?,
             }
         };
-        let (job, started) = self.prepare_owned_compaction(provenance)?;
+        let (job, started) = self.prepare_owned_compaction(provenance, None)?;
         let mut events = started.deliver_and_flush().await?;
         let observer = self.observer.session_events();
         let work = job.run();
@@ -11095,17 +11126,24 @@ impl HarnessBroker {
         })
     }
 
-    /// Return a session named only by its retracted first prompt to the unnamed state.
+    /// Return a session named only by its removed first prompt to the unnamed state.
     ///
-    /// The first exchange names an unnamed session when it starts. Retracting that exchange
-    /// restores its prompt to the composer, so the name would otherwise describe a prompt the
-    /// transcript no longer contains. A name that differs from the derived one was chosen by the
-    /// user or a later exchange and stays.
-    pub(crate) fn release_automatic_session_name(&mut self, retracted_prompt: &str) -> Result<()> {
-        let derived_name = automatic_session_name(retracted_prompt);
+    /// The first exchange names an unnamed session when it starts. Retracting that exchange, or
+    /// rolling back every exchange, returns its prompt to the composer, so the name would
+    /// otherwise describe a prompt the transcript no longer contains. A name that differs from the
+    /// derived one was chosen by the user or a later exchange and stays, as does any name while a
+    /// current exchange remains.
+    pub(crate) fn release_automatic_session_name(&mut self, removed_prompt: &str) -> Result<()> {
+        let derived_name = automatic_session_name(removed_prompt);
         if self.session.name.is_empty()
             || self.session.name != derived_name
-            || !self.store.list_exchange(&self.session.id)?.is_empty()
+            || self
+                .store
+                .list_exchange(&self.session.id)?
+                .iter()
+                .any(|exchange| {
+                    exchange.disposition() == crate::exchange::HistoryDisposition::Current
+                })
         {
             return Ok(());
         }
@@ -11229,9 +11267,9 @@ fn attribute_provider_tool(
 
 /// Distinguish why an admitted child task ends before it ever dispatched.
 enum QueuedTaskCancellation {
-    /// An explicit interrupt or a collecting transition cancelled it; the parent receives its
-    /// report like any other stopped task.
-    Interrupted,
+    /// An explicit interrupt or a collecting transition cancelled it on behalf of `by`; the
+    /// parent receives its report like any other cancelled task.
+    Interrupted { by: crate::agent::AgentSource },
     /// Its child stopped on an earlier task that requires explicit user continuation.
     PrerequisiteStopped { stopped_task_id: String },
 }

@@ -122,11 +122,13 @@ impl BrokerObserver {
     /// is claimed and admitted, and before a task's reserved continuation becomes queued input or
     /// its verification checks start. Publishing that idle phase closed the status row and
     /// reopened it at every hand-off. The substitute carries no running clock, so it reads
-    /// `Working · 0s`, which is also what the admitted exchange first publishes. Its `HandingOff`
+    /// `Working` without one: the successor may continue an open exchange whose clock already
+    /// stands well past zero, and publishes that clock itself once admitted. Its `HandingOff`
     /// activity tells the editor that the settled exchange is followed by another turn, so the
     /// editor does not reveal the finished exchange a moment before the successor replaces it at
-    /// the tail. Pending verification checks read `Checking · 0s` instead: no exchange replaces
-    /// the finished one, and the check run's own status follows. An owner that cannot execute is
+    /// the tail. Pending verification checks read `Checking · 0s` instead, and only over an idle
+    /// phase: no exchange replaces the finished one, and once the run is recorded its own
+    /// `Checking` phase, timed by the run, follows. An owner that cannot execute is
     /// excluded, because it would never start the work and the row would never clear.
     pub(crate) fn hand_off_phase(
         &self,
@@ -135,6 +137,29 @@ impl BrokerObserver {
         status: crate::session::state_machine::SessionPhase,
     ) -> Result<crate::session::state_machine::SessionPhase> {
         use crate::session::state_machine::{SessionPhase, WorkflowActivity};
+        // A revision whose acceptance is already decided reaches review only for the instant
+        // before execution starts: either the acceptance command waits for the revision's turn
+        // to settle, or the reviewer's recorded decision runs as soon as the owner can issue
+        // it. That instant is the hand-off to execution, not a review the user must act on.
+        if matches!(status, SessionPhase::AwaitingPlanReview { .. })
+            && let Some(task) = task
+            && (crate::task::command::SessionCommand::recorded_acceptance(task).is_some()
+                || store
+                    .pending_terminal_requests(&self.session_id)?
+                    .iter()
+                    .any(|(id, owner)| {
+                        id.starts_with("plan_acceptance:")
+                            && owner.as_deref() == Some(task.id.as_str())
+                    }))
+        {
+            return Ok(SessionPhase::Working {
+                duration_ms: 0,
+                started_at_ms: None,
+                activity: WorkflowActivity::HandingOff,
+                reasoning_summary: None,
+                execution: None,
+            });
+        }
         if status != SessionPhase::Idle {
             return Ok(status);
         }
@@ -162,7 +187,14 @@ impl BrokerObserver {
             |turn| store.continuation_source_complete(&self.session_id, turn),
         )?;
         let activity = match task_successor {
-            Some(crate::exchange::TaskSuccessor::Checks) => WorkflowActivity::Checking,
+            // Once the run is recorded the execution already reads `Checking` with the run's
+            // clock; only the idle gap before it needs the clockless substitute.
+            Some(crate::exchange::TaskSuccessor::Checks) if status != SessionPhase::Idle => {
+                return Ok(status);
+            }
+            // No run record exists yet, so the rows it will show are unknown; the timeline
+            // turns this into `Checking` when the run's first record attaches its rows.
+            Some(crate::exchange::TaskSuccessor::Checks) => WorkflowActivity::ChecksStarting,
             Some(crate::exchange::TaskSuccessor::Turn) => WorkflowActivity::HandingOff,
             None if crate::exchange::successor_turn_pending(input, &self.questions, gates)? => {
                 WorkflowActivity::HandingOff
@@ -550,7 +582,7 @@ impl BrokerObserver {
         {
             status = stopping;
         }
-        let status = self.hand_off_phase(store, task, status)?;
+        let status = self.hand_off_phase(store, task, status)?.blocked_by(task);
         self.trace.record(
             &source_session.id,
             "status_projected",
@@ -640,11 +672,11 @@ impl BrokerObserver {
             exchange: interaction,
             capability: metadata.capability.clone(),
             no_checkpoint: metadata.no_checkpoint,
-            restore_recovery: crate::checkpoint::RestoreJournal::progress(
+            // A restore still running owns its incomplete journal; only a stopped one needs recovery.
+            restore_recovery: crate::checkpoint::RestoreJournal::interrupted(
                 &store.objects,
                 &source_session.id,
             )?
-            .filter(|progress| progress.state != crate::checkpoint::RestoreState::Complete)
             .map(|progress| json!({"applied":progress.applied,"files":progress.files})),
             active_plan,
             active_elicitation,
@@ -664,6 +696,8 @@ impl BrokerObserver {
             active_wait,
             prompt_history: store.list_prompt_history()?,
             agent: AgentSnapshot {
+                revision,
+                runtime_epoch: self.runtime_epoch.clone(),
                 summary: agent_summaries(&agent_run_list, &agent_exchange_list),
                 run: agent_run_list,
                 exchange: agent_exchange_list,
@@ -690,6 +724,17 @@ impl BrokerObserver {
                 let id = required_text(&params, "preview_id")?;
                 crate::checkpoint::RestorePreview::load(&store.objects, &self.session_id, &id)?
                     .summary(params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize)
+            }
+            // Only the status read is a query; `continue` and `undo` run as owner commands.
+            RuntimeMethod::SessionExchangeRecovery => {
+                match params.get("action").and_then(Value::as_str) {
+                    None | Some("status") => crate::checkpoint::RestoreJournal::status(
+                        &crate::storage::HistoryReader::current(&self.data_root)?.objects,
+                        &self.session_id,
+                    )?,
+                    Some("continue" | "undo") => return Ok(None),
+                    Some(_) => anyhow::bail!("unknown restore recovery action"),
+                }
             }
             RuntimeMethod::SessionPlanDeclarationGet => self.read_plan_declaration(params)?.0,
             RuntimeMethod::SessionPlanList => self.list_replanning_choices()?.0,
@@ -828,6 +873,8 @@ impl BrokerObserver {
             exchange: interaction,
             timeline,
             agent: AgentSnapshot {
+                revision: 0,
+                runtime_epoch: self.runtime_epoch.clone(),
                 summary: agent_summaries(&agent_run_list, &agent_exchange_list),
                 run: agent_run_list,
                 exchange: agent_exchange_list,
@@ -861,6 +908,7 @@ impl BrokerObserver {
         };
         Ok(crate::exchange::rollback::ExchangeRollbackReview::list(
             interaction_list,
+            &store.list_plan(&session.id)?,
             &provider,
         ))
     }

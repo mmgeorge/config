@@ -42,6 +42,29 @@ function M.capture_origin()
   return origin
 end
 
+---True while a popup returns focus to an origin where Insert mode continues. A view that leaves
+---Insert mode whenever focus enters it, such as the Harness transcript and composer, keeps it then:
+---the keys the user typed after the popup's submit key are already queued as text for the origin,
+---and a `:stopinsert` on the way there would turn them into Normal-mode commands.
+---@type boolean?
+M.returning_to_insert = nil
+
+---@param origin ForgePopupOrigin?
+---@return boolean
+local function continues_insert(origin)
+  return origin ~= nil and origin.mode:sub(1, 1) == "i" and vim.api.nvim_get_mode().mode:sub(1, 1) == "i"
+    and vim.api.nvim_win_is_valid(origin.win)
+end
+
+---@param action fun()
+local function while_returning_to_insert(action)
+  local previous = M.returning_to_insert
+  M.returning_to_insert = true
+  local ok, failure = pcall(action)
+  M.returning_to_insert = previous
+  if not ok then error(failure, 0) end
+end
+
 ---Return to the window and mode a popup interrupted.
 ---
 ---A popup often closes from one of its own Insert-mode mappings, such as the submit key of its
@@ -51,10 +74,8 @@ end
 ---@param origin ForgePopupOrigin?
 function M.restore_origin(origin)
   if not origin then return end
-  local continue_insert = origin.mode:sub(1, 1) == "i" and vim.api.nvim_get_mode().mode:sub(1, 1) == "i"
-    and vim.api.nvim_win_is_valid(origin.win)
-  if continue_insert then
-    vim.api.nvim_set_current_win(origin.win)
+  if continues_insert(origin) then
+    while_returning_to_insert(function() vim.api.nvim_set_current_win(origin.win) end)
     return
   end
   vim.cmd("stopinsert")
@@ -156,6 +177,8 @@ function M.open(options)
   return buf, popup_win
 end
 
+---Close a popup and, unless `restore` is false, return to its origin. Closing the popup first
+---enters whichever window Neovim picks, so a return to Insert mode covers that entry as well.
 ---@param win integer?
 ---@param restore? boolean
 function M.close(win, restore)
@@ -165,8 +188,12 @@ function M.close(win, restore)
   local previous = M.restoring_origin
   M.restoring_origin = true
   local ok, failure = pcall(function()
-    if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
-    if restore ~= false then M.restore_origin(origin) end
+    local function close_and_restore()
+      if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+      if restore ~= false then M.restore_origin(origin) end
+    end
+    if restore ~= false and continues_insert(origin) then while_returning_to_insert(close_and_restore)
+    else close_and_restore() end
   end)
   M.restoring_origin = previous
   if not ok then error(failure) end

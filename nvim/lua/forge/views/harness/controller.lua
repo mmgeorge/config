@@ -48,11 +48,57 @@ local function applied_setting(state, field)
   return (state.session and state.session[field]) or config.options.harness[field]
 end
 
+---List the model, thinking, and speed changes that wait for existing work, in the order the host
+---applies them. A change sent while the owner works waits for that work to stop and restart, and
+---changes apply in the order they were sent. A queued `/model` entry applies only at its hand-off,
+---after every change already sent. An idle change applies at once and is not listed, and a change
+---sent for another session or to a host that has since been replaced no longer applies here.
+---@param state table
+---@return table[]
+local function waiting_configuration_list(state)
+  local change_list = {}
+  for _, request in ipairs(state.configuration_requests or {}) do
+    if request.waiting and request.session_id == (state.session and state.session.id)
+      and request.generation == client.host_get_generation() then
+      change_list[#change_list + 1] = request.change
+    end
+  end
+  for _, group in ipairs({ state.pending_handoff, state.pending_submit, state.queue }) do
+    for _, entry in ipairs(group or {}) do
+      if type(entry.config) == "table" then change_list[#change_list + 1] = entry.config end
+    end
+  end
+  return change_list
+end
+
+---Get the model, thinking, and speed the session will use once every waiting change applies.
+---A model change without a thinking level takes that model's default, as the host applies it.
+---@param state table
+---@return { model: string, effort: string, service_tier: string }
+local function selected_settings(state)
+  local selected = {
+    model = applied_setting(state, "model"),
+    effort = applied_setting(state, "effort"),
+    service_tier = applied_setting(state, "service_tier"),
+  }
+  local catalog = state.session and state.model_provider == state.session.provider and state.model_list or nil
+  for _, change in ipairs(waiting_configuration_list(state)) do
+    if type(change.model) == "string" and change.model ~= selected.model then
+      selected.model = change.model
+      local model = require("forge.views.harness.model_options").find(catalog, change.model)
+      selected.effort = model and model.default_reasoning or "default"
+    end
+    if type(change.effort) == "string" then selected.effort = change.effort end
+    if type(change.service_tier) == "string" then selected.service_tier = change.service_tier end
+  end
+  return selected
+end
+
 ---@param state table
 ---@param field "model"|"effort"|"service_tier"
 ---@return string
 local function selected_setting(state, field)
-  return applied_setting(state, field)
+  return selected_settings(state)[field]
 end
 
 ---Parse model configuration separately from its optional queued prompt.
@@ -214,14 +260,17 @@ local function status_text()
   local saved_label = displayed_model == active_session.model and type(active_session.model_label) == "string"
     and active_session.model_label or nil
   local model = model_options.label(model_catalog, displayed_model, saved_label)
-  local effort = selected_setting(state, "effort")
-  local selected_model = selected_setting(state, "model")
-  if selected_model ~= configured_model then
-    model = model_options.label(model_catalog, selected_model) .. " (requested)"
-  end
-  local tier = selected_setting(state, "service_tier")
+  local selected = selected_settings(state)
+  if selected.model ~= configured_model then model = model_options.label(model_catalog, selected.model) end
+  -- The thinking field names the level the provider uses, the name the model picker gives it.
+  local effort = model_options.thinking(model_options.find(model_catalog, selected.model), selected.effort)
+  local tier = selected.service_tier
   local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
-  local model_text = ("%s %s"):format(model, effort)
+  -- Selected values that differ from the applied ones still wait for existing work.
+  local waiting = selected.model ~= configured_model
+    or selected.effort ~= applied_setting(state, "effort")
+    or tier ~= applied_setting(state, "service_tier")
+  local model_text = ("%s %s%s"):format(model, effort, waiting and "*" or "")
   local segment_list = {}
   local function append_status(text, group)
     if not text or text == "" then return end
@@ -233,14 +282,35 @@ local function status_text()
   if (active_session.access or {}).sandbox ~= false then
     append_status("sandbox", "ForgeStatusLabel")
   end
-  if speed_icon then
+  local selected_run = selected_agent_run(state)
+  local child_selection = selected_run and selected_run.selection
+  if type(child_selection) == "table" and type(child_selection.provider) == "string" then
+    -- A child's view names the child's own provider, model, and thinking level, which its
+    -- profile may choose independently of the root session's.
+    local child_catalog = state.model_provider == child_selection.provider and state.model_list or nil
+    local child_tier = child_selection.service_tier
+    local child_speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[child_tier]
+    if child_speed_icon then
+      append_status(child_speed_icon, child_tier == "ultrafast" and "ForgeHarnessUltrafast" or "ForgeStatusLabel")
+    end
+    local child_model = child_selection.model or "default"
+    local child_model_text = ("%s · %s %s"):format(child_selection.provider,
+      model_options.label(child_catalog, child_model),
+      model_options.thinking(model_options.find(child_catalog, child_model), child_selection.reasoning_effort))
+    if child_speed_icon then
+      segment_list[#segment_list + 1] = { text = " " .. child_model_text, group = "ForgeStatusLabel" }
+    else
+      append_status(child_model_text, "ForgeStatusLabel")
+    end
+  elseif speed_icon then
     append_status(speed_icon, tier == "ultrafast" and "ForgeHarnessUltrafast" or "ForgeStatusLabel")
     segment_list[#segment_list + 1] = { text = " " .. model_text, group = "ForgeStatusLabel" }
   else
     append_status(model_text, "ForgeStatusLabel")
   end
-  local selected_run = selected_agent_run(state)
-  if selected_run then append_status(selected_run.nickname or selected_run.definition, "ForgeStatusLabel") end
+  if selected_run then
+    append_status(require("forge.render.harness.agent_summary").label(selected_run), "ForgeStatusLabel")
+  end
   if state.connection_error then
     append_status(state.connection_error, "ForgeHarnessGoal")
   elseif state.sync_error then
@@ -248,7 +318,7 @@ local function status_text()
   elseif activity.unavailable_reason(state) then
     append_status("Session unavailable: " .. activity.unavailable_reason(state), "ForgeHarnessGoal")
   elseif current_task then
-    append_status(task_control.label(current_task, activity.turn_running(state)), "ForgeHarnessGoal")
+    append_status(task_control.label(current_task, activity.turn_pending(state)), "ForgeHarnessGoal")
   end
   if state.configuration_error then
     append_status("Settings rejected: " .. state.configuration_error:gsub("%s+", " "), "ForgeHarnessToolFailure")
@@ -303,7 +373,9 @@ end
 ---@param state table
 ---@return string? hint Absent while delivery runs; empty when the retry key is unbound.
 function M.paused_queue_hint(state)
-  if not (state.input and state.input.suspended) or #(state.queue or {}) == 0 or activity.busy(state) then
+  -- A rollback keeps the queue paused, so its heading stays while the owner reads busy.
+  if not (state.input and state.input.suspended) or #(state.queue or {}) == 0
+    or (activity.busy(state) and not state.restore_applying) then
     return nil
   end
   local key = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")[1]
@@ -635,7 +707,15 @@ local function on_event(event, payload)
   end
   if event == "input_changed" then input_state.receive(state, payload) return end
   if event == "activity_changed" then
-    if activity.receive(state, payload.activity, payload.runtime_epoch) then schedule_render() end
+    local was_busy = activity.busy(state)
+    if activity.receive(state, payload.activity, payload.runtime_epoch) then
+      schedule_render()
+      -- A question raised while the session read busy, such as the execution settings an
+      -- automatic plan acceptance asks for while its command applies, could not open then.
+      if was_busy and not activity.busy(state) and question_presentation.should_present(state) then
+        vim.schedule(function() M.with_state(state, function() M.present_plan_question(false) end) end)
+      end
+    end
     return
   end
   if event == "host_stopped" then
@@ -718,8 +798,9 @@ local function on_event(event, payload)
       render_status_hint(state)
       if #state.approval > 0 then vim.schedule(function() M.present_approval(false, state) end) end
     elseif payload.kind == "agent_updated" then
-      state.agent = vim.deepcopy(payload.data or payload)
-      require("forge.views.harness.agent_picker").refresh()
+      if require("forge.views.harness.agent_catalog").replace(state, payload.data or payload) then
+        require("forge.views.harness.agent_picker").refresh()
+      end
     elseif payload.kind == "runtime_resolved" then
       local runtime = payload.data or {}
       if not state.session or runtime.session_id ~= state.session.id then return end
@@ -814,9 +895,10 @@ local function on_event(event, payload)
       schedule_render()
     end
   elseif event == "agent_updated" then
-    state.agent = vim.deepcopy(payload)
-    require("forge.views.harness.agent_picker").refresh()
-    schedule_render()
+    if require("forge.views.harness.agent_catalog").replace(state, payload) then
+      require("forge.views.harness.agent_picker").refresh()
+      schedule_render()
+    end
   elseif event == "state_invalidated" then
     synchronize_state()
   else
@@ -1181,8 +1263,8 @@ end
 local function submit_aside_prompt(aside_state, aside_session_id, prompt)
   local input = aside_state.input
   if not (aside_session_id and input and input.session_id == aside_session_id) then
-    -- The fork answered after its tab closed, so no view exists to queue the question in.
-    notifications.warn("The aside opened after its tab closed, so its question was not sent. "
+    -- The aside's view did not bind to its session, so no view exists to queue the question in.
+    notifications.warn("The aside's tab could not be opened, so its question was not sent. "
       .. "Resume the aside from /sessions and ask again: " .. prompt, "Harness aside")
     return
   end
@@ -1191,18 +1273,36 @@ end
 
 ---@class ForgeHarnessForkOptions
 ---@field aside_prompt string? Opens the fork as an aside of the current session and sends this question to it.
+---@field restore_draft? fun(): boolean Returns the submitted `/fork` or `/btw` command to the
+---  composer when the fork is refused, from `composer_draft.take`.
 
+---Clear a submitted fork command from the composer and return its restoration for a refusal.
+---@param state ForgeHarnessPresentationState
+---@return fun(): boolean
+local function take_fork_command(state)
+  local composer = state.composer_buf
+  return require("forge.views.harness.composer_draft").take(composer,
+    vim.api.nvim_buf_get_lines(composer, 0, -1, false), attachment.capture(composer).attachments,
+    function() return harness_state() == state and state.composer_buf == composer end)
+end
+
+---Ask the host to fork the current session, and open the fork's tab once the host has created it.
+---A refusal opens nothing, so no frame shows a tab for a session that never existed; the command
+---returns to the composer, whose focus and mode never changed.
 ---@param name? string
 ---@param options? ForgeHarnessForkOptions
 function M.fork_session(name, options)
   local aside_prompt = options and options.aside_prompt
+  local restore_draft = options and options.restore_draft or function() return false end
   local state = harness_state()
   local active_session = state.session
   if not (active_session and active_session.id) then
+    restore_draft()
     notifications.error("No active Harness session to fork", "ForgeHarness")
     return
   end
   if state.capability.native_fork ~= true then
+    restore_draft()
     notifications.warn("The current provider does not support session fork", "ForgeHarness")
     return
   end
@@ -1210,11 +1310,6 @@ function M.fork_session(name, options)
   if name and name ~= "" then params.name = name end
   if aside_prompt then params.aside = true end
   local fork_started = perf.now()
-  local pending = session_navigation.begin_fork(active_session, name)
-  perf.event("harness", "harness.fork.ui_opened", {
-    ms = perf.elapsed_ms(fork_started),
-    source_session_id = active_session.id,
-  })
   client.request({ session_id = active_session.id, method = "session.fork", params = params }, function(result, request_error)
     if request_error then
       perf.event("harness", "harness.fork.failed", {
@@ -1222,7 +1317,8 @@ function M.fork_session(name, options)
         source_session_id = active_session.id,
         error = tostring(request_error),
       })
-      session_navigation.fail_fork(pending, request_error)
+      restore_draft()
+      notifications.error(request_error, "Harness fork")
       return
     end
     local performance = result and result.fork_performance or {}
@@ -1239,9 +1335,9 @@ function M.fork_session(name, options)
         source_session_id = active_session.id,
       })
     end
-    session_navigation.complete_fork(pending, result)
+    local fork_state = session_navigation.open_fork(result, state)
     if aside_prompt then
-      submit_aside_prompt(pending.state, result.session and result.session.id, aside_prompt)
+      submit_aside_prompt(fork_state or {}, result.session and result.session.id, aside_prompt)
     end
   end)
 end
@@ -1378,6 +1474,7 @@ end
 ---@field state "complete"|"failed"|"cancelled"|"interrupted"
 ---@field checkpoint_before string
 ---@field rollback_unavailable? string Why the host cannot roll back to this interaction.
+---@field task_command? string The `/goal` or `/plan` command a rollback of this task start returns.
 
 ---Put `text` in the composer and focus it for an immediate follow-up.
 ---
@@ -1430,19 +1527,28 @@ local function report_undo_failure(message, title)
   pcall(vim.api.nvim_echo, { { (title or "Harness undo") .. ": " .. tostring(message), "ErrorMsg" } }, true, {})
 end
 
+---Confirm a files restore from its preview.
+---
+---Preparing the preview collects a running turn, because the preview compares the workspace with
+---the closing checkpoint that only a settled exchange writes, so `stopped_turn` marks a preview
+---prepared over a running turn and its Cancel says the turn already stopped.
 ---@param preview table
----@param interaction table?
-local function confirm_restore_preview(preview, interaction)
+---@param interaction? ForgeRollbackInteraction
+---@param stopped_turn? boolean
+local function confirm_restore_preview(preview, interaction, stopped_turn)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
   local function current()
     return harness_state() == state and state.session and state.session.id == session_id
       and client.host_get_generation() == generation
   end
-  local description = { tostring(preview.files) .. " files will be restored.", "Git’s index will not change." }
+  local file_count = tonumber(preview.files) or 0
+  local description = { ("%d %s will be restored."):format(file_count, file_count == 1 and "file" or "files"),
+    "Git’s index will not change." }
   for _, warning in ipairs(preview.warnings or {}) do description[#description + 1] = warning end
   local choices = {
-    { label = "Cancel", value = "cancel" },
+    { label = "Cancel", value = "cancel", detail = stopped_turn
+      and "Keep files and history; the running turn was already stopped to compute this preview" or nil },
     { label = (preview.warning_count or 0) > 0 and "Restore anyway" or "Restore", value = "restore" },
   }
   if preview.next_offset then
@@ -1454,18 +1560,21 @@ local function confirm_restore_preview(preview, interaction)
       client.request({ session_id = session_id, method = "session.exchange.rollback.preview", params = { preview_id = preview.preview_id, offset = preview.next_offset } }, function(page, err)
         if not current() then return end
         if err then report_undo_failure(err) return end
-        confirm_restore_preview(page, interaction)
+        confirm_restore_preview(page, interaction, stopped_turn)
       end)
       return
     end
     if state.restore_applying then return end
-    local operation = {}
+    -- A preview without an interaction undoes the last file restore and changes no conversation.
+    local operation = { scope = interaction and "workspace" or "files" }
     state.restore_applying = operation
+    render_status_hint(state)
     local composer_free = state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
       and require("forge.views.harness.composer_draft").observe(state.composer_buf) or function() return false end
     client.request({ session_id = session_id, method = "session.exchange.rollback.apply", params = { preview_id = preview.preview_id } }, function(_, err)
       if state.restore_applying ~= operation then return end
       state.restore_applying = nil
+      render_status_hint(state)
       if not (state.session and state.session.id == session_id and client.host_get_generation() == generation) then return end
       synchronize_state(nil, state)
       if harness_state() ~= state then
@@ -1480,7 +1589,7 @@ local function confirm_restore_preview(preview, interaction)
           client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(refreshed, failure)
             if not current() then return end
             if failure then report_undo_failure(failure) return end
-            confirm_restore_preview(refreshed, interaction)
+            confirm_restore_preview(refreshed, interaction, stopped_turn)
           end)
         end
         return
@@ -1492,18 +1601,17 @@ end
 
 ---Name the composer text that recreates a rolled-back exchange, or nil when the user wrote none.
 ---
----A goal start returns as the `/goal <objective>` command that started it, since the objective
----is the goal's title. Other task starts and continuations carry Harness-authored instructions,
----which the user never typed and the next task transition regenerates.
+---A goal or plan start returns as the command that started it, `/goal <objective>` or
+---`/plan <request>`, which the host names as `task_command` because only it holds a plan's
+---request. Other task starts and continuations carry Harness-authored instructions, which the
+---user never typed and the next task transition regenerates.
 ---@param interaction ForgeRollbackInteraction
 ---@return string?
 function M.rolled_back_prompt(interaction)
-  local opening = interaction.opening
-  if type(opening) == "table" and opening.kind == "task_started" and type(opening.start) == "table"
-    and opening.start.kind == "goal" and (opening.start.title or "") ~= "" then
-    return "/goal " .. opening.start.title
+  if type(interaction.task_command) == "string" and interaction.task_command ~= "" then
+    return interaction.task_command
   end
-  if require("forge.render.harness.exchange_opening").notice(opening) then return nil end
+  if require("forge.render.harness.exchange_opening").notice(interaction.opening) then return nil end
   return interaction.prompt or ""
 end
 
@@ -1530,14 +1638,17 @@ local function confirm_rollback(interaction, latest_exchange_id)
   local session_id, generation = state.session.id, client.host_get_generation()
   if state.restore_applying then return end
   -- Both scopes collect active execution before they change anything, and leave the task paused.
-  local stops = activity.busy(state) and "Stops the running turn. " or ""
+  -- Conversation only collects on confirmation; a files rollback collects to compute its preview.
+  local busy = activity.busy(state)
   local choices = {
     { label = "Cancel", value = "cancel" },
-    { label = "Conversation only", detail = stops .. "Keep all current files", value = "conversation" },
+    { label = "Conversation only", detail = (busy and "Stops the running turn. " or "") .. "Keep all current files",
+      value = "conversation" },
   }
   if interaction.checkpoint_before and not state.no_checkpoint then
     choices[#choices + 1] = { label = "Conversation and files",
-      detail = stops .. "Restore this interaction's checkpoint", value = "workspace" }
+      detail = (busy and "Stops the running turn to preview the files. " or "") .. "Restore this interaction's checkpoint",
+      value = "workspace" }
   end
   open_choice_picker(state, "Rollback interaction", "Choose what to roll back", choices, function(choice)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
@@ -1548,13 +1659,14 @@ local function confirm_rollback(interaction, latest_exchange_id)
         if harness_state() ~= state or not state.session or state.session.id ~= session_id
           or client.host_get_generation() ~= generation then return end
         if err then report_undo_failure(err) return end
-        confirm_restore_preview(preview, interaction)
+        confirm_restore_preview(preview, interaction, busy)
       end)
       return
     end
     if choice ~= "conversation" then return end
-    local operation = {}
+    local operation = { scope = "conversation" }
     state.restore_applying = operation
+    render_status_hint(state)
     local composer_free = state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
       and require("forge.views.harness.composer_draft").observe(state.composer_buf) or function() return false end
     M.task_transition({ action = "undo", rollback = {
@@ -1562,6 +1674,7 @@ local function confirm_rollback(interaction, latest_exchange_id)
     } }, nil, function(applied, failure)
       if state.restore_applying ~= operation then return end
       state.restore_applying = nil
+      render_status_hint(state)
       -- The task command already showed the failure as a notice; message history keeps it.
       if not applied and failure then
         pcall(vim.api.nvim_echo, { { "Harness undo: " .. tostring(failure), "ErrorMsg" } }, true, {})
@@ -1573,32 +1686,34 @@ local function confirm_rollback(interaction, latest_exchange_id)
   end)
 end
 
----Open finished interaction history before choosing a rollback scope.
+---Open interaction history before choosing a rollback scope.
 ---
----The list opens during a running turn too: confirming a rollback collects that turn first.
-local function open_exchange_undo_picker(recovery)
+---The list offers every current exchange, running ones included: confirming a rollback collects
+---a running turn first, and a paused goal's newest exchange stays `running` while it is parked.
+---@param recovery? table restore journal status from `session.exchange.recovery`
+---@param refused fun() puts the `/undo` command back when no list opens
+local function open_exchange_undo_picker(recovery, refused)
   local state = harness_state()
   -- Every rollback rewinds the provider conversation natively; Harness never replays history.
   if not (state.capability and state.capability.native_conversation_rewind == true) then
     notifications.warn("Conversation rollback is unsupported: the current provider cannot rewind its conversation", "Harness undo")
+    refused()
     return
   end
   local session_id, generation = state.session and state.session.id, client.host_get_generation()
-  if not session_id then return end
+  if not session_id then refused() return end
   client.request({ session_id = session_id, method = "session.exchange.list", params = {} }, function(interaction_list, request_error)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_get_generation() ~= generation then return end
     if request_error then
       report_undo_failure(request_error)
+      refused()
       return
     end
-    local rollback_state = { complete = true, failed = true, cancelled = true, interrupted = true }
     local option_list = {}
     for index = #(interaction_list or {}), 1, -1 do
       local interaction = interaction_list[index]
-      if rollback_state[interaction.state]
-        and interaction.disposition == "current"
-      then
+      if interaction.disposition == "current" and interaction.state ~= "queued" then
         local host_notice = require("forge.render.harness.exchange_opening").notice(interaction.opening)
         local prompt = host_notice or vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
         -- The host names a rollback it cannot perform, so the option says so before any choice.
@@ -1642,20 +1757,31 @@ local function open_exchange_undo_picker(recovery)
 end
 
 ---Open interaction history directly unless an unfinished file restore needs recovery.
-function M.open_undo_picker()
+---
+---`refused`, from `composer_draft.take` when `/undo` was submitted, returns the command to the
+---composer when no picker opens, so a refusal never consumes what the user typed.
+---@param refused? fun()
+function M.open_undo_picker(refused)
+  refused = refused or function() end
   local state = harness_state()
   if state.restore_applying then
     notifications.warn("A rollback is already in progress", "Harness undo")
+    refused()
     return
   end
-  if not state.session then return end
+  if not state.session then refused() return end
   local session_id, generation = state.session.id, client.host_get_generation()
   client.request({ session_id = session_id, method = "session.exchange.recovery", params = {} }, function(recovery, err)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_get_generation() ~= generation then return end
-    if err then report_undo_failure(err, "Harness recovery") return end
-    if not recovery or recovery == vim.NIL then open_exchange_undo_picker() return end
-    if not recovery.pending then open_exchange_undo_picker(recovery) return end
+    if err then report_undo_failure(err, "Harness recovery") refused() return end
+    if not recovery or recovery == vim.NIL then open_exchange_undo_picker(nil, refused) return end
+    if recovery.applying then
+      notifications.warn("A rollback is already in progress", "Harness undo")
+      refused()
+      return
+    end
+    if not recovery.pending then open_exchange_undo_picker(recovery, refused) return end
     local choices = { { label = "Cancel", value = "cancel" } }
     choices[#choices + 1] = { label = "Continue interrupted restore", value = "continue" }
     choices[#choices + 1] = { label = "Restore pre-restore files", value = "undo" }
@@ -1924,7 +2050,14 @@ end
 ---@param state ForgeHarnessPresentationState
 ---@return boolean
 local function admit_composer_input(state)
-  if state.host_error then notifications.error(state.execution_notice, "ForgeHarness") return false end
+  if state.host_error then
+    -- A view whose host stopped or now serves another provider comes back on its own submit; the
+    -- draft stays in the composer until the user submits it to the returned session.
+    if not require("forge.views.harness").reconnect(state) then
+      notifications.error(state.execution_notice or state.host_error, "ForgeHarness")
+    end
+    return false
+  end
   if not state.session or type(state.session.id) ~= "string" or state.session.id == "" then
     M.report_uninitialized(state, "ForgeHarness")
     return false
@@ -2115,8 +2248,7 @@ function M.submit()
     return
   end
   if text == "/fork" then
-    set_composer_text(state.composer_buf, "")
-    M.fork_session()
+    M.fork_session(nil, { restore_draft = take_fork_command(state) })
     return
   end
   if text == "/new" or text == "/clear" then
@@ -2161,8 +2293,11 @@ function M.submit()
     return
   end
   if text == "/undo" then
-    set_composer_text(state.composer_buf, "")
-    M.open_undo_picker()
+    local composer = state.composer_buf
+    local refused = require("forge.views.harness.composer_draft").take(composer,
+      vim.api.nvim_buf_get_lines(composer, 0, -1, false), {},
+      function() return harness_state() == state and state.composer_buf == composer end)
+    M.open_undo_picker(function() refused() end)
     return
   end
   local spawn_profile, spawn_task = text:match("^/agents%s+spawn%s+(%S+)%s+(.+)$")
@@ -2204,14 +2339,12 @@ function M.submit()
   end
   local fork_name = text:match("^/fork%s+(.+)$")
   if fork_name then
-    set_composer_text(state.composer_buf, "")
-    M.fork_session(vim.trim(fork_name))
+    M.fork_session(vim.trim(fork_name), { restore_draft = take_fork_command(state) })
     return
   end
   local aside_prompt = text:match("^/btw%s+(.+)$")
   if aside_prompt then
-    set_composer_text(state.composer_buf, "")
-    M.fork_session(nil, { aside_prompt = vim.trim(aside_prompt) })
+    M.fork_session(nil, { aside_prompt = vim.trim(aside_prompt), restore_draft = take_fork_command(state) })
     return
   end
   local new_name = text:match("^/new%s+(.+)$")
@@ -2379,10 +2512,12 @@ function M.change_effort(direction)
     local model_id = selected_setting(state, "model")
     for _, model in ipairs(model_list or {}) do
       if model.id == model_id or (model_id == "default" and model.is_default) then
-        local choice = model.reasoning or {}
+        local model_options = require("forge.views.harness.model_options")
+        local choice = model_options.reasoning_choices(model)
         if #choice == 0 then return end
+        local resolved = model_options.thinking(model, current)
         local index = 1
-        for candidate_index, candidate in ipairs(choice) do if candidate == current then index = candidate_index end end
+        for candidate_index, candidate in ipairs(choice) do if candidate == resolved then index = candidate_index end end
         index = math.max(1, math.min(#choice, index + direction))
         M.configure({ effort = choice[index] })
         return
@@ -2681,8 +2816,20 @@ end
 configure_now = function(next_config, completed)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
+  -- The host answers once the change is applied, after any running turn stopped and restarted on
+  -- it. Until then the winbar shows the change with its waiting marker; an idle change applies at
+  -- once and shows none.
+  local request = { change = vim.deepcopy(next_config), waiting = activity.busy(state),
+    session_id = session_id, generation = generation }
+  state.configuration_requests = state.configuration_requests or {}
+  table.insert(state.configuration_requests, request)
+  if request.waiting then M.refresh_winbar() end
   client.request({ session_id = session_id, method = "session.configure", params = vim.deepcopy(next_config) }, function(_, failure)
+    for index, candidate in ipairs(state.configuration_requests or {}) do
+      if candidate == request then table.remove(state.configuration_requests, index) break end
+    end
     if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then
+      if request.waiting and harness_state() == state then M.refresh_winbar() end
       if completed then completed(false) end
       return
     end
@@ -2747,13 +2894,17 @@ function M.activate_snapshot(result, options)
   -- block, so every attach reconciles instead of waiting for an event that cannot arrive.
   synchronize_state()
   M.resolve_runtime_model()
-  if not options or options.present_questions ~= false then
-    if state.active_elicitation and state.active_elicitation.elicitation then
-      state.presented_question_key = nil
-      vim.schedule(M.present_plan_question)
-    end
-    if #state.approval > 0 then vim.schedule(function() M.present_approval(false, state) end) end
+  if not options or options.present_questions ~= false then M.present_held_prompts() end
+end
+
+---Open the question or approval the selected session's snapshot holds, once its view is on screen.
+function M.present_held_prompts()
+  local state = harness_state()
+  if state.active_elicitation and state.active_elicitation.elicitation then
+    state.presented_question_key = nil
+    vim.schedule(M.present_plan_question)
   end
+  if #(state.approval or {}) > 0 then vim.schedule(function() M.present_approval(false, state) end) end
 end
 
 ---@return ForgeViewCommandSet

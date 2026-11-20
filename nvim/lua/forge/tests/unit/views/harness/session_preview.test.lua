@@ -49,6 +49,19 @@ T["render_shows_the_tail_above_the_picker"] = function()
   eq(topline(), 60 - window_height + 1)
 end
 
+-- A session without exchanges previewed as a blank float, which read as the transcript area
+-- emptying. The preview names what it shows instead.
+T["an_empty_session_previews_as_a_message"] = function()
+  local preview = require("forge.views.harness.session_preview")
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, buffer.scratch({ "session transcript" }))
+  local state = preview.open(window)
+  for _, lines in ipairs({ {}, { "", "  " } }) do
+    preview.render({ lines = lines }, 8)
+    eq(buffer.lines(state.buffer), { "", "  This session has no exchanges yet." })
+  end
+end
+
 -- A float relative to a window is placed from the window's first text row, below its winbar, in
 -- a running editor. Offsetting it by the winbar left the transcript's first row uncovered above
 -- the preview, which read as a duplicated row.

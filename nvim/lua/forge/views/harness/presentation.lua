@@ -39,6 +39,24 @@ function M.open(options, callback)
     timeline_key = "main", timeline_view = {}, epoch = 0,
     staging = { queue = {}, steering = {} }, applied_staging = { queue = {}, steering = {} } }
   local response_reveal = require("forge.views.harness.response_reveal").new(options.composer_window)
+  ---Callers of `owner.when_rendered` waiting for the first rendered transcript, and whether the
+  ---transcript opened (`true`) or can no longer open (`false`) once that is known.
+  local rendered_waiter_list, rendered_outcome = {}, nil
+  ---@param rendered boolean
+  local function settle_rendered(rendered)
+    if rendered_outcome == nil or not rendered then rendered_outcome = rendered end
+    local waiter_list = rendered_waiter_list
+    rendered_waiter_list = {}
+    for _, waiter in ipairs(waiter_list) do
+      if rendered then
+        require("forge.render.harness.markdown").after_render(options.transcript_buffer, function()
+          waiter(not owner.closed and owner.failure == nil)
+        end)
+      else
+        waiter(false)
+      end
+    end
+  end
   local function alive()
     return not owner.closed and owner.host_generation == client.host_get_generation()
       and client.host_is_accepting() and options.is_alive()
@@ -61,6 +79,7 @@ function M.open(options, callback)
     if previous ~= owner.failure then notice(owner.failure) end
     if options.on_update then pcall(options.on_update) end
     owner.settle_selection(owner.failure)
+    settle_rendered(false)
     if not owner.ready and not owner.open_failed then
       owner.open_failed = true
       pcall(callback, nil, owner.failure)
@@ -307,6 +326,7 @@ function M.open(options, callback)
     if owner.view then input.close(owner.view) end
     if owner.transcript and not owner.transcript.generated_owned then replica.close(owner.transcript) end
     request({ operation = "close", document = identity }, function() end)
+    settle_rendered(false)
     callback(nil, message)
   end
   owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true, source_projected = true,
@@ -321,11 +341,36 @@ function M.open(options, callback)
       owner.save_timeline = nil
     end,
     recover = function() recovery(owner.transcript) end })
-  owner.status_view = require("forge.views.harness.status_view").new({
+  local status_options = {
     transcript = owner.transcript, transcript_window = options.transcript_window,
     composer_window = options.composer_window, alive = alive, notice = notice, recover = recovery,
     refresh = function() if owner.ready and not owner.closed then owner.sync() end end,
-  })
+  }
+  owner.status_view = require("forge.views.harness.status_view").new(status_options)
+
+  ---Call `waiter(true)` once the transcript has opened and the Markdown around its windows has
+  ---rendered, or `waiter(false)` when the presentation fails or closes first. A session switch
+  ---prepares the target out of sight and shows it only then, so it is drawn once.
+  ---@param waiter fun(rendered: boolean)
+  function owner.when_rendered(waiter)
+    if owner.closed or owner.failure or rendered_outcome == false then waiter(false) return end
+    rendered_waiter_list[#rendered_waiter_list + 1] = waiter
+    if owner.ready then settle_rendered(true) end
+  end
+
+  ---Give a presentation opened without a composer, as one prepared out of sight, the composer
+  ---window it now sits above: live progress follows from it, and the status split opens above it.
+  ---@param composer_window integer
+  function owner.bind_composer(composer_window)
+    if owner.closed or options.composer_window == composer_window then return end
+    assert(options.composer_window == nil, "presentation composer is already bound")
+    options.composer_window, status_options.composer_window = composer_window, composer_window
+    response_reveal.composer_window = composer_window
+    local status_view = owner.status_view
+    status_view.release_geometry = require("forge.views.harness.layout").observe_composer(composer_window,
+      function() status_view:resize() end)
+    status_view:resize()
+  end
   owner.selection = require("forge.document_commands").attach_selection(owner.transcript, { normalize = false })
   owner.transcript.fold_loading = {}
   owner.view = input.open(owner.transcript, options.transcript_window, transcript_options)
@@ -376,6 +421,7 @@ function M.open(options, callback)
     if startup then startup.mark("document.open.received", { error = failure, rust = opened and opened.startup_timing }) end
     if not alive() then
       request({ operation = "close", document = identity }, function() end)
+      settle_rendered(false)
       return
     end
     if failure then reject_open(failure) return end
@@ -412,6 +458,7 @@ function M.open(options, callback)
     vim.bo[options.composer_buffer].modifiable = not options.read_only
     callback(owner)
     if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
+    settle_rendered(true)
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
     if startup then startup.mark("document.ready") startup.watch(options.transcript_buffer) end
     dispatch_next()
@@ -565,10 +612,16 @@ function M.open(options, callback)
   end
 
   --- End the hidden pace once the transcript is on screen, so its tab page shows current text.
+  --- An exchange that finished while the tab page was hidden is revealed now: a pending
+  --- synchronization publishes the reveal itself, and otherwise the committed text needs only it.
   function owner.hasten_displayed_refresh()
-    if not owner.refresh_timer or not owner.displayed() then return end
-    cancel_refresh_timer()
-    owner.sync()
+    if not owner.displayed() then return end
+    if owner.refresh_timer then
+      cancel_refresh_timer()
+      owner.sync()
+    elseif owner.ready and not owner.syncing and not owner.applying and owner.transcript.status == "Applied" then
+      response_reveal:publish(owner.transcript, owner.views, false, owner.status_view:handoff())
+    end
   end
 
   function owner.sync()
@@ -613,9 +666,13 @@ function M.open(options, callback)
       end
       owner.sync_failure = nil
       owner.applying = true
-      local function complete(status_applied)
+      -- The elapsed labels follow the clock: the next label refresh is armed from this result and
+      -- its status applies at once, so a large transcript update, such as the reflow each resize
+      -- causes, neither holds a stale label on screen nor postpones the next one.
+      owner.status_view:schedule_refresh(result.activity_due_in_ms)
+      local status_applied, transcript_settled
+      local function complete()
         owner.applying, owner.syncing = false, false
-        owner.status_view:schedule_refresh(result.activity_due_in_ms)
         if result.diff_view and result.diff_view ~= vim.NIL then owner.diff_view = result.diff_view end
         publish_openings()
         local switched_timeline = owner.restore_timeline ~= nil
@@ -641,8 +698,13 @@ function M.open(options, callback)
         dispatch_next()
       end
       local function complete_status()
-        owner.status_view:apply(result.status, guard(complete))
+        transcript_settled = true
+        if status_applied ~= nil then complete() end
       end
+      owner.status_view:apply(result.status, guard(function(applied)
+        status_applied = applied
+        if transcript_settled then complete() end
+      end))
       local snapshot = type(result.snapshot) == "table" and result.snapshot or nil
       local update = snapshot or { patch = result.patch or {} }
       if not snapshot and #update.patch == 0 then
@@ -710,6 +772,15 @@ function M.open(options, callback)
     elseif more and owner.section_failure[section] then return end
     owner.section_intent = owner.section_intent or {}
     local intent = owner.section_intent[view.id] or {}
+    -- A request for the transition already in flight would supersede it, and a superseded answer
+    -- never synchronizes the replica. Reissuing it before each answer arrived once kept the
+    -- transcript behind the host until an unrelated session read synchronized it.
+    local inflight = owner.section_inflight and owner.section_inflight[view.id]
+    local active = inflight and inflight[section]
+    if active and not more and not retry and not active.more and intent[section] == expanded
+      and active.generation == node.generation then
+      return
+    end
     owner.section_intent[view.id] = intent
     if not more then intent[section] = expanded end
     owner.section_sequence = (owner.section_sequence or 0) + 1
@@ -1071,6 +1142,7 @@ function M.open(options, callback)
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
     owner.closed = true
     owner.settle_selection("Harness presentation closed")
+    settle_rendered(false)
     owner.selection.close()
     owner.epoch = owner.epoch + 1
     owner.applying = false

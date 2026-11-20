@@ -928,40 +928,54 @@ impl CopilotSession {
         }
     }
 
-    pub async fn compact(&self, id: String) -> Result<Compaction, ProviderError> {
-        let result: Result<Compaction> = async {
-            super::operation::dispatch_for(forge_provider_api::ProviderOperation::ThreadCompact)?;
-            let result = self
-                .inner
-                .rpc()
-                .history()
-                .compact()
-                .await
-                .context("compact Copilot history")?;
-            let data = serde_json::to_value(&result)?;
-            Ok(Compaction {
-                id,
-                thread_id: self.id(),
-                state: if result.success {
+    /// Compact native history and report the outcome under the Harness thread that owns it.
+    ///
+    /// `thread_id` is the owner's Harness thread, not the native session identity, because the
+    /// host settles the attempt only for the conversation it addressed. A JSON-RPC error answer
+    /// is the CLI declining or failing the request, such as "Nothing to compact.", so it returns
+    /// as a failed compaction carrying the CLI's own words rather than as a transport failure.
+    pub async fn compact(
+        &self,
+        id: String,
+        thread_id: &forge_provider_api::ThreadId,
+    ) -> Result<Compaction, ProviderError> {
+        const OPERATION: forge_provider_api::ProviderOperation =
+            forge_provider_api::ProviderOperation::ThreadCompact;
+        super::operation::dispatch_for(OPERATION)?;
+        let compaction = |state, result| Compaction {
+            id: id.clone(),
+            thread_id: thread_id.as_str().into(),
+            state,
+            manual: true,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result,
+        };
+        match self.inner.rpc().history().compact().await {
+            Ok(native) => Ok(compaction(
+                if native.success {
                     CompactionState::Completed
                 } else {
                     CompactionState::Failed
                 },
-                manual: true,
-                started_at_ms: None,
-                completed_at_ms: None,
-                result: serde_json::from_value(data)?,
-            })
+                native_compaction_result(native),
+            )),
+            Err(error) if error.rpc_code().is_some() => {
+                log_native_failure(OPERATION, &error);
+                Ok(compaction(
+                    CompactionState::Failed,
+                    forge_provider_api::compaction::CompactionResult {
+                        error: Some(forge_provider_api::ProviderFailure::new(
+                            OPERATION,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        )),
+                        provider_explanation: error.message().and_then(declined_compaction_reason),
+                        ..Default::default()
+                    },
+                ))
+            }
+            Err(error) => Err(transport_failure(OPERATION, &error)),
         }
-        .await;
-        result.map_err(|error| {
-            error.downcast::<ProviderError>().unwrap_or_else(|error| {
-                transport_failure(
-                    forge_provider_api::ProviderOperation::ThreadCompact,
-                    error.as_ref(),
-                )
-            })
-        })
     }
     pub async fn steer(
         &self,
@@ -1162,6 +1176,47 @@ pub(super) fn resolve_unclaimed_submissions(
 }
 
 /// Retain the native cause before replacing it with the provider's sanitized transport category.
+/// Map the typed manual-compaction answer onto normalized evidence; a failed answer carries
+/// no explanation of its own, so it reports an unknown failure category.
+fn native_compaction_result(
+    native: HistoryCompactResult,
+) -> forge_provider_api::compaction::CompactionResult {
+    let count = |value: i64| u64::try_from(value).ok();
+    forge_provider_api::compaction::CompactionResult {
+        summary_content: native.summary_content,
+        tokens_removed: count(native.tokens_removed),
+        messages_removed: count(native.messages_removed),
+        context_window: native.context_window.map(|context| {
+            forge_provider_api::compaction::CompactionContext {
+                current_tokens: count(context.current_tokens),
+                token_limit: count(context.token_limit),
+                messages_length: count(context.messages_length),
+                conversation_tokens: context.conversation_tokens.and_then(count),
+                system_tokens: context.system_tokens.and_then(count),
+                tool_definitions_tokens: context.tool_definitions_tokens.and_then(count),
+            }
+        }),
+        error: (!native.success).then(|| {
+            forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::ThreadCompact,
+                forge_provider_api::ProviderFailureKind::Unknown,
+            )
+        }),
+        ..Default::default()
+    }
+}
+
+/// Keep the CLI's explanation of a declined compaction without its JSON-RPC request wrapper.
+///
+/// The CLI reports a handler error as "Request <method> failed with message: <reason>"; only
+/// the reason is the CLI's answer to the user.
+fn declined_compaction_reason(message: &str) -> Option<forge_provider_api::SanitizedMessage> {
+    let reason = message
+        .split_once(" failed with message: ")
+        .map_or(message, |(_, reason)| reason);
+    forge_provider_api::SanitizedMessage::new(reason.trim()).ok()
+}
+
 fn transport_failure(
     operation: forge_provider_api::ProviderOperation,
     error: &(dyn std::error::Error + 'static),

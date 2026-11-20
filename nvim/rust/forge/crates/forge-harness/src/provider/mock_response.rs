@@ -39,6 +39,8 @@ pub(crate) enum MockResponseCommand {
     FailClose,
     /// Never settle a later interrupt of the session's turn.
     HoldInterrupt,
+    /// Hold the session's next native conversation rewind until `Release` names the hold.
+    HoldRewind,
     /// Fire the session's pending timed approvals through their deadline path immediately.
     /// The session service owns the permission coordinator, so it handles this operation.
     ExpireApproval,
@@ -93,6 +95,7 @@ impl MockResponseControl {
             MockResponseCommand::History => TestControlCommand::History,
             MockResponseCommand::FailClose => TestControlCommand::FailClose,
             MockResponseCommand::HoldInterrupt => TestControlCommand::HoldInterrupt,
+            MockResponseCommand::HoldRewind => TestControlCommand::HoldRewind,
             MockResponseCommand::RequireBindingModelCatalog => {
                 TestControlCommand::RequireBindingModelCatalog
             }

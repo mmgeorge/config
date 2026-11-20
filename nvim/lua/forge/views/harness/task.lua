@@ -35,14 +35,15 @@ function M.phase(task)
 end
 
 ---@param task ForgeHarnessActiveTask
----@param turn_running? boolean a provider turn is still running for the session
+---@param turn_pending? boolean a provider turn is running, or the host hands off to the next one
 ---@return string
-function M.label(task, turn_running)
+function M.label(task, turn_pending)
   local workflow = task.kind == "execute" and "exec" or task.kind
   local phase = M.phase(task)
   -- A planning turn may resubmit its plan before it ends, so a submission becomes the one to
-  -- review only once the turn that made it settles.
-  if task.kind == "plan" and phase == "review" and turn_running then phase = "draft" end
+  -- review only once the turn that made it settles and no successor, such as the execution an
+  -- automatic acceptance starts, is about to replace it.
+  if task.kind == "plan" and phase == "review" and turn_pending then phase = "draft" end
   local label = workflow .. " · " .. phase
   local status = M.status(task)
   if status ~= "running" and status ~= "waiting" then label = label .. " · " .. status end

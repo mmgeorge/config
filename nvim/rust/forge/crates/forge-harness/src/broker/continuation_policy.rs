@@ -51,7 +51,39 @@ impl HarnessBroker {
         Ok(())
     }
 
+    /// List the unreported child results the root may still receive while running `exchange_id`.
+    ///
+    /// A model-delegated child reports to the turn that delegated it. When that turn was
+    /// cancelled, failed, or interrupted, it never resumes, so a later exchange never receives
+    /// the result: such a result once reached the next prompt's turn, whose model then reported on
+    /// the earlier turn's children instead of its own.
+    pub(super) fn deliverable_child_results(&self, exchange_id: &str) -> Result<Vec<AgentTask>> {
+        let mut deliverable = Vec::new();
+        for task in self.agent_coordinator.unreported_result() {
+            if task.source == AgentSource::Model && task.parent_exchange_id != exchange_id {
+                let parent = self
+                    .store
+                    .load_exchange_metadata(&task.parent_exchange_id)?;
+                if parent.is_some_and(|parent| {
+                    matches!(
+                        parent.state(),
+                        ExchangeState::Cancelled
+                            | ExchangeState::Failed
+                            | ExchangeState::Interrupted
+                    )
+                }) {
+                    continue;
+                }
+            }
+            deliverable.push(task);
+        }
+        Ok(deliverable)
+    }
+
     /// Require new user authorization after a stopped own cycle or unresolved stopped descendant.
+    ///
+    /// A child cancelled through Harness is not such a stop: the cancel was its requester's
+    /// decision about that child alone, so its siblings' results still continue the parent.
     pub(super) fn requires_explicit_continuation(&self, exchange: &Exchange) -> Result<bool> {
         let tasks = self.store.list_agent_task(&self.session.id)?;
         let observed = self.store.list_observed_agents(&self.session.id)?;
@@ -92,7 +124,7 @@ fn continuation_blocked(
     }) {
         if matches!(
             task.state,
-            ExchangeState::Interrupted | ExchangeState::Cancelled | ExchangeState::Failed
+            ExchangeState::Interrupted | ExchangeState::Failed
         ) {
             ancestors.remove(&exchange.id);
             return Ok(true);

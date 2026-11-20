@@ -132,3 +132,46 @@ fn implementation_cannot_jump_to_manual_verification_or_completion() -> Result<(
     assert_eq!(execution.continuation.turn_count, 0);
     Ok(())
 }
+
+/// A goal that stops for want of progress says so in the transcript, with the commands that
+/// continue or end it, because the winbar only reads `blocked`.
+#[test]
+fn a_stalled_goal_records_why_it_is_blocked() -> Result<()> {
+    let (_root, mut store, controller) = SessionTaskController::test_goal();
+    let task = controller.current()?.unwrap();
+    let mut decision = crate::goal::ContinuationDecision::Continue;
+    let mut ordinal = 0;
+    while decision != crate::goal::ContinuationDecision::Stalled {
+        ordinal += 1;
+        assert!(ordinal <= 20, "the goal never stalled");
+        decision = controller
+            .observe_goal(
+                &mut store,
+                &task.permit(),
+                TaskTurnId {
+                    exchange_ordinal: ordinal,
+                    turn_ordinal: 1,
+                },
+                crate::goal::TurnEvidence::default(),
+                ordinal as i64,
+            )?
+            .1;
+    }
+    let rows: Vec<_> = store
+        .list_session_event("session")?
+        .into_iter()
+        .filter_map(|event| match event.detail {
+            crate::timeline::SessionEventKind::TaskAdvancement { message } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            "Goal blocked: 5 consecutive turns changed no files. Run /task resume to continue \
+             with a new allowance, or /task clear to end it."
+                .to_owned()
+        ]
+    );
+    Ok(())
+}

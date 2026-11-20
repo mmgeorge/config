@@ -845,9 +845,14 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         if let Some(manual) = &manual {
             manual.lock().await.register(id.clone());
         }
-        let result = session.compact(id.clone()).await;
-        if let Some(manual) = &manual {
-            manual.lock().await.finish(&id);
+        let result = session.compact(id.clone(), key).await;
+        // The CLI emits its start and completion notifications before it answers, but the
+        // monitor can read them after the answer arrives, so only an unanswered request gives
+        // its identity up.
+        if result.is_err()
+            && let Some(manual) = &manual
+        {
+            manual.lock().await.release_unanswered(&id);
         }
         result
     }

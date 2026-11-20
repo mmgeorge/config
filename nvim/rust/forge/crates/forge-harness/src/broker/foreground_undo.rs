@@ -191,6 +191,10 @@ impl HarnessBroker {
         session.active_task = self.task_controller.current()?;
         self.session = session;
         self.context_usage_fresh = false;
+        // The session's first exchange named it; with no exchange left current, neither is that name.
+        if let Some(first) = exchanges.first() {
+            self.release_automatic_session_name(&first.prompt)?;
+        }
         self.rolled_back_events(&rewind.exchanges[0])
     }
 

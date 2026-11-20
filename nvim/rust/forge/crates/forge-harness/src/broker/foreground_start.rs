@@ -40,7 +40,7 @@ impl HarnessBroker {
         if let Some(context) = request.control_context.as_mut() {
             context.live_host_effects = Some(live_host_sender);
         }
-        let attached_results = self.agent_coordinator.unreported_result();
+        let attached_results = self.deliverable_child_results(&staged.exchange.id)?;
         if !attached_results.is_empty() {
             // Child results travel as `final_answer` `<agent_message>` elements beside the input,
             // never inside the user's text.
@@ -183,6 +183,7 @@ impl HarnessBroker {
             .parent_input
             .activate(Some(provider_event_sink.clone()))?;
         let state = self.begin_owned_foreground(staged.exchange.clone(), scope)?;
+        self.resume_observed_children_of(&state.interaction.id);
         let settlement = Arc::new(crate::provider::session_execution::SettlementCell::default());
         self.pending_host_settlement = Some(settlement.clone());
         // Prior-turn usage remains useful for display but cannot authorize maintenance
@@ -260,6 +261,7 @@ impl HarnessBroker {
             question_override: None,
             pending_native_ready: None,
             native_ready_parked: false,
+            native_ready_awaits_children: false,
             retraction_boundary: None,
             scan_enabled: execution.is_some(),
             execution_open: true,

@@ -5,6 +5,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Correlates manual RPC identities with native session lifecycle notifications.
+///
+/// Manual compaction runs only on an idle binding, one request at a time, and the CLI reports
+/// every request it answers, a declined one included, as a `session.compaction_start` followed
+/// by a `session.compaction_complete`. The next native start therefore belongs to the oldest
+/// registered request that no start has claimed yet.
 #[derive(Default)]
 pub struct ManualCompactionMap {
     pending: Vec<String>,
@@ -17,8 +22,9 @@ impl ManualCompactionMap {
         self.pending.push(id);
     }
 
-    /// Release an unassigned RPC without losing identities used by delayed completions.
-    pub fn finish(&mut self, id: &str) {
+    /// Release a request the CLI never answered, which therefore has no notifications to claim
+    /// it; identities already assigned keep correlating delayed completions.
+    pub fn release_unanswered(&mut self, id: &str) {
         self.pending.retain(|pending| pending != id);
     }
 

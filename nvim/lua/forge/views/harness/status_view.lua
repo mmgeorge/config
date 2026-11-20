@@ -216,7 +216,10 @@ function StatusView:resize()
     return
   end
   local composer = options.composer_window
-  local visible = not self.suspended and options.alive() and self.content and #self.content.lines > 0
+  -- A notice about the view's own host, such as a provider switch that replaced it, stays on screen
+  -- after that host is gone, because it is how the view says what happened and how to come back.
+  local host_notice = self.context and self.context.status_notice and self.context.status_notice.outlives_host
+  local visible = not self.suspended and (options.alive() or host_notice) and self.content and #self.content.lines > 0
     and composer and vim.api.nvim_win_is_valid(composer)
     and vim.api.nvim_win_get_tabpage(options.transcript_window) == vim.api.nvim_get_current_tabpage()
     and vim.api.nvim_win_get_buf(options.transcript_window) == options.transcript.buffer

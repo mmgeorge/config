@@ -12,6 +12,16 @@ pub enum AgentSource {
     User,
 }
 
+impl AgentSource {
+    /// Describe a child cancel this source requested, as the parent's report of the child states it.
+    pub fn cancellation_reason(self) -> &'static str {
+        match self {
+            Self::Model => "Interrupted by its parent agent before it finished.",
+            Self::User | Self::Root => "Cancelled by the user before it finished.",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Records whether an informational message still needs a provider input boundary.

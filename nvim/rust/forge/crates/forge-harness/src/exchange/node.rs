@@ -74,7 +74,40 @@ pub enum ExchangeNode {
     },
 }
 
+/// Prefixes the identity of a question row a question snapshot projects into an exchange.
+///
+/// Stored question rows take their exchange's identity as prefix, so the two never collide.
+const PROJECTED_QUESTION_PREFIX: &str = "question:";
+
 impl ExchangeNode {
+    /// Build the question row a question snapshot places into a copy of its exchange.
+    ///
+    /// The row is presentation only: the exchange record never stores it, so plan event anchors,
+    /// which count stored nodes, do not count it either.
+    pub(crate) fn projected_question(
+        question_id: &str,
+        question: crate::plan::PlanQuestionSet,
+        answer: Option<String>,
+    ) -> Self {
+        Self::QuestionPresented {
+            id: format!("{PROJECTED_QUESTION_PREFIX}{question_id}"),
+            question,
+            answer,
+        }
+    }
+
+    /// Report a question row a question snapshot projected rather than the exchange stored.
+    pub(crate) fn is_projected_question(&self) -> bool {
+        matches!(self, Self::QuestionPresented { id, .. } if id.starts_with(PROJECTED_QUESTION_PREFIX))
+    }
+
+    /// Report a node the exchange record does not store: planning and timeline events attached
+    /// from their own records, and projected question rows.
+    pub(crate) fn is_derived(&self) -> bool {
+        matches!(self, Self::PlanEvent { .. } | Self::TimelineEvent { .. })
+            || self.is_projected_question()
+    }
+
     pub fn id(&self) -> &str {
         match self {
             Self::TimelineEvent { event } => event.id(),

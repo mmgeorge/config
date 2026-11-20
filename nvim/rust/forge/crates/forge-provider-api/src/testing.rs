@@ -83,6 +83,9 @@ pub enum TestControlCommand {
     /// Never settle a later interrupt of the selected owner's turn, as a native side that
     /// stopped answering does; only forced termination then ends the turn.
     HoldInterrupt,
+    /// Hold the selected owner's next native conversation rewind, as a slow native rewind does.
+    /// The result names the hold, which `Wait` and `Release` then address like a response hold.
+    HoldRewind,
 }
 
 /// Select native fixture content without treating reasoning as an assistant prose role.
@@ -143,7 +146,17 @@ pub enum TestPromptStep {
     /// Run one native subagent the provider delegates to on its own, as Copilot runs a built-in
     /// subagent: the agent's start, one response message in the agent's own turn, then its
     /// completed finish.
-    NativeSubagent { name: String, text: String },
+    NativeSubagent {
+        name: String,
+        text: String,
+        /// Hold the running agent until the delegating turn is cancelled, then report its
+        /// response and completed finish before the turn ends interrupted. Copilot can deliver
+        /// a subagent's output after the user stopped its parent in this order, because the
+        /// subagent finished before the stop reached Copilot while the host still had its
+        /// output queued.
+        #[serde(default)]
+        finishes_after_cancel: bool,
+    },
 }
 
 /// Control announcement and execution independently for a scripted native tool.

@@ -126,6 +126,10 @@ pub struct CompactionResult {
     pub system_tokens: Option<u64>,
     /// Tool definition tokens after automatic compaction.
     pub tool_definitions_tokens: Option<u64>,
+    /// The provider's own sanitized words when it declined or failed the request, such as
+    /// "Nothing to compact.", shown instead of a normalized transport category.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_explanation: Option<crate::SanitizedMessage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -217,7 +221,7 @@ impl Compaction {
 
 impl CompactionResult {
     /// Preserve confirmed evidence while filling fields supplied by later notifications.
-    fn retain_missing(&mut self, update: Self) {
+    pub fn retain_missing(&mut self, update: Self) {
         fn merge_missing(existing: &mut serde_json::Value, update: serde_json::Value) {
             match (existing, update) {
                 (serde_json::Value::Object(existing), serde_json::Value::Object(update)) => {

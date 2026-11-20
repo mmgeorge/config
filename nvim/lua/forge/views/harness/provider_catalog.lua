@@ -13,6 +13,10 @@ local skill_cache = {}
 local mcp_cache = {}
 ---@type table<string, ForgeProviderCatalogEntry>
 local model_cache = {}
+---The latest model catalog each provider returned, which labels a view's model while that view's
+---own catalog loads. A model's label belongs to its provider, so another session's catalog names it.
+---@type table<string, table[]>
+local latest_model_list_by_provider = {}
 
 ---@return string
 local function cache_key()
@@ -79,7 +83,8 @@ function M.models(force, callback)
     local selected = state.session or {}
     for _, model in ipairs(models) do
       if model.id == selected.model or (selected.model == "default" and model.is_default) then
-        if selected.effort and selected.effort ~= "default" then model.selected_reasoning = selected.effort end
+        -- The session's own thinking selection, `default` included, outranks a saved preference.
+        if selected.effort then model.selected_reasoning = selected.effort end
         if selected.context_window ~= nil then model.selected_context_window = selected.context_window end
       end
       if context_size and context_size > 0
@@ -96,15 +101,24 @@ function M.models(force, callback)
     end
     callback(models, nil)
   end
-  if not force and provider == state.model_provider and type(state.model_list) == "table" then
+  if not force and provider == state.model_provider and type(state.model_list) == "table"
+    and not state.model_list_provisional then
     deliver(state.model_list, nil)
     return
+  end
+  local latest = provider and latest_model_list_by_provider[provider]
+  if latest and state.model_provider ~= provider then
+    -- A provider switch leaves the winbar naming the previous provider's catalog; it names the
+    -- model from this provider's latest catalog at once instead of by its raw id.
+    state.model_provider, state.model_list, state.model_list_provisional = provider, vim.deepcopy(latest), true
+    require("forge.views.harness.controller").refresh_winbar()
   end
   local key = cache_key()
   request_catalog(model_cache, "session.provider.model.list", force, function(value, failure)
     if key ~= cache_key() then return end
     if not failure then
-      state.model_provider, state.model_list = provider, vim.deepcopy(value or {})
+      if provider then latest_model_list_by_provider[provider] = vim.deepcopy(value or {}) end
+      state.model_provider, state.model_list, state.model_list_provisional = provider, vim.deepcopy(value or {}), nil
       -- The winbar names the session's model by its catalog label, so it must redraw once the
       -- catalog arrives instead of keeping the raw selection id such as `opus`.
       require("forge.views.harness.controller").refresh_winbar()
@@ -145,6 +159,7 @@ function M.clear()
   skill_cache = {}
   mcp_cache = {}
   model_cache = {}
+  latest_model_list_by_provider = {}
 end
 
 return M

@@ -1,6 +1,6 @@
 //! Run retained rollback work without holding the exchange broker lock.
 use super::*;
-use crate::checkpoint::{CheckpointRecord, RestoreJournal, RestorePreview};
+use crate::checkpoint::{CheckpointRecord, RestoreJournal, RestorePreview, RunningRestoreClaim};
 use crate::exchange::rollback::{
     PreparedRollbackToken, RollbackCommand, RollbackFailure, RollbackOutcome,
 };
@@ -11,6 +11,8 @@ pub(crate) struct RollbackEffect {
     repositories: Arc<forge_git::store::RepositoryStore>,
     work: RollbackWork,
     rewind: Option<foreground_undo::ConversationRewind>,
+    /// Keeps a file restore's incomplete journal from reading as interrupted until it commits.
+    restore_claim: Option<RunningRestoreClaim>,
 }
 struct RollbackPreparation {
     workspace: std::path::PathBuf,
@@ -35,6 +37,7 @@ pub(crate) struct RollbackEffectResult {
     rewind: Option<foreground_undo::ConversationRewind>,
     authority: Option<crate::exchange::rollback::RestoreRevision>,
     failure: Option<RollbackFailure>,
+    restore_claim: Option<RunningRestoreClaim>,
 }
 impl RollbackEffect {
     /// Restore files, then rewind the provider conversation, without broker ownership.
@@ -109,6 +112,7 @@ impl RollbackEffect {
                     rewind: self.rewind,
                     authority,
                     failure: Some(failure),
+                    restore_claim: self.restore_claim,
                 });
             }
         };
@@ -139,6 +143,7 @@ impl RollbackEffect {
             rewind: self.rewind,
             authority,
             failure,
+            restore_claim: self.restore_claim,
         })
     }
 }
@@ -266,15 +271,22 @@ impl HarnessBroker {
                 RollbackWork::Reverse(journal)
             }
         };
+        // Claimed before the worker writes the journal, so no observer sees it unclaimed.
+        let restore_claim = matches!(work, RollbackWork::Restore { .. })
+            .then(|| RunningRestoreClaim::hold(&self.store.objects, &self.session.id));
         Ok(RollbackEffect {
             objects: self.store.objects.clone(),
             repositories: self.repositories.clone(),
             work,
             rewind,
+            restore_claim,
         })
     }
 
     /// Commit settled rollback effects before the owner releases completion waiters.
+    ///
+    /// The result's restore claim drops only after the journal is marked complete or, on failure,
+    /// left incomplete for recovery.
     pub(crate) fn commit_rollback_effect(
         &mut self,
         mut result: RollbackEffectResult,
@@ -310,6 +322,8 @@ impl HarnessBroker {
                 .save(&self.store.objects)
                 .map_err(|_| RollbackFailure::RecoveryRequired)?;
         }
+        // The journal is complete, so observers may now read it without the running claim.
+        drop(result.restore_claim);
         Ok((RollbackOutcome::Restored, events))
     }
 

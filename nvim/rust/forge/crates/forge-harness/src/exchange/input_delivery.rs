@@ -434,7 +434,7 @@ impl InputDeliveryRun {
                 let PreparationWork::Compaction(run) = &mut self.work else {
                     unreachable!("compaction fact belongs to queued compaction")
                 };
-                match run.update(event, broker, can_commit)? {
+                match run.update(event, broker, can_commit, self.selected.as_ref())? {
                     CompactionProgress::Collect(children) => {
                         self.collect(children, services);
                         Ok(InputDeliveryProgress::waiting())

@@ -277,12 +277,14 @@ end
 ---@field path? string
 ---@field rejected_record_count? integer
 
----Describe host-reported diagnostic loss beside the log's recording state.
+---Describe host-reported diagnostic loss beside the log's recording state. The host counts only
+---records its writer failed to keep (a full queue or a failed encoding); verbose records that
+---yield to another producer are a designed omission and never appear here.
 ---@param status ForgeHarnessLogStatus
 ---@return string
 local function log_title(status)
-  local rejected = status.rejected_record_count or 0
-  local loss = rejected > 0 and (" • %d record%s rejected"):format(rejected, rejected == 1 and "" or "s") or ""
+  local lost = status.rejected_record_count or 0
+  local loss = lost > 0 and (" • %d record%s lost"):format(lost, lost == 1 and "" or "s") or ""
   return "Harness log • " .. status.level .. loss .. " • R refresh • q close"
 end
 
@@ -313,12 +315,16 @@ local function open_log(status, session_id)
     local windows = vim.fn.win_findbuf(existing)
     if #windows > 0 then
       vim.api.nvim_set_current_win(windows[1])
+      -- `/log open` arrives from the composer in Insert mode, which a window switch keeps.
+      vim.cmd("stopinsert")
       vim.wo.winbar = title
       refresh_log(status.path, existing)
       return
     end
   end
   vim.cmd.tabnew()
+  -- `/log open` arrives from the composer in Insert mode, which opening a tab keeps.
+  vim.cmd("stopinsert")
   local buffer = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_win_set_buf(0, buffer)
   log_buffer_by_path[status.path] = buffer

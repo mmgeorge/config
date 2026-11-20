@@ -256,6 +256,19 @@ impl ReviewFixture {
         Ok(())
     }
 
+    /// Count the editor notices that automatic acceptance stopped without submitting again.
+    fn stopped_acceptance_notices(&self) -> usize {
+        self.frame_list
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| {
+                frame["event"] == "provider_event"
+                    && frame["payload"]["code"] == "automatic_acceptance_stopped"
+            })
+            .count()
+    }
+
     /// Accept the plan in review and answer its execution questions.
     async fn accept_and_answer(&self, first_id: u64) -> Result<()> {
         let plan = self.plan()?.context("planning task disappeared")?;
@@ -291,6 +304,30 @@ impl ReviewFixture {
 
     fn store(&self) -> Result<SqliteStore> {
         SqliteStore::open(&self.controller.data_root)
+    }
+
+    /// Count the times the exchange owner received the command `operation_id`, as the session
+    /// trace records each submission. The trace writer appends on its own thread, so the file
+    /// is read after a flush.
+    fn command_receipts(&self, operation_id: &str) -> usize {
+        self.controller
+            .trace
+            .flush()
+            .expect("the session trace could not be flushed");
+        let path = self
+            .controller
+            .trace
+            .session_status(self.controller.observer.session_id())
+            .path;
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| {
+                record["event"] == "exchange.command.received"
+                    && record["payload"]["command_id"] == operation_id
+            })
+            .count()
     }
 
     /// Save one inline comment on the reviewed plan the way the review document does: keyed by
@@ -599,6 +636,113 @@ async fn automatic_acceptance_off_withdraws_its_pending_question() -> Result<()>
     fixture.finish().await
 }
 
+/// Enabling automatic acceptance again after `/plan accept off` withdrew its questions is a new
+/// acceptance: it asks the execution questions again, and answering them starts execution.
+#[tokio::test]
+async fn automatic_acceptance_enabled_again_asks_again() -> Result<()> {
+    let fixture = ReviewFixture::open(true).await?;
+    fixture.plan_in_review().await?;
+    let questions_pending = |fixture: &ReviewFixture| {
+        Ok(fixture.plan()?.is_some_and(|plan| {
+            plan.review_questions()
+                .is_some_and(|questions| questions.has_pending_decisions())
+        }))
+    };
+    fixture.prompt(10, "/plan accept on").await?;
+    fixture
+        .settled("automatic acceptance", questions_pending)
+        .await?;
+    fixture.prompt(11, "/plan accept off").await?;
+    fixture
+        .settled("withdrawn acceptance", |fixture| {
+            Ok(fixture
+                .plan()?
+                .is_some_and(|plan| plan.review_questions().is_none()))
+        })
+        .await?;
+    fixture.prompt(12, "/plan accept on").await?;
+    fixture
+        .settled("second automatic acceptance", questions_pending)
+        .await?;
+    fixture.answer_acceptance(20).await?;
+    fixture
+        .settled("execution", |fixture| {
+            Ok(fixture.task()?.kind() == crate::task::TaskKind::Execute)
+        })
+        .await?;
+    fixture.assert_execution_started_once()?;
+    assert_eq!(fixture.stopped_acceptance_notices(), 0);
+    fixture.finish().await
+}
+
+/// An automatic acceptance whose operation the command journal already finished is not
+/// submitted again and again: the journal can only replay the recorded reply, so recovery
+/// submits it a bounded number of times and reports that it stopped.
+///
+/// A manual acceptance sent under the operation identity that automatic acceptance computes
+/// reaches the state directly: its questions are withdrawn by `/plan accept off`, and the
+/// following `/plan accept on` finds the plan eligible again under that finished identity.
+#[tokio::test]
+async fn journaled_automatic_acceptance_is_not_resubmitted_in_a_loop() -> Result<()> {
+    let fixture = ReviewFixture::open(true).await?;
+    fixture
+        .controller
+        .trace
+        .configure_default(crate::trace::LogLevel::Trace)?;
+    fixture.plan_in_review().await?;
+    // The command `/plan accept on` will make eligible, computed from the task it will leave.
+    let mut enabled = fixture.task()?.draft();
+    enabled.auto_accept_plan = true;
+    enabled.plan_acceptance_enablement += 1;
+    let acceptance = crate::task::command::SessionCommand::approved_revision(
+        &crate::task::Task::try_from(enabled)?,
+    )?
+    .context("an enabled acceptance would not be eligible")?;
+    let mut request = acceptance.to_request(20)?;
+    request.params["operation_id"] = json!(acceptance.operation_id);
+    fixture
+        .dispatch(20, &request.method, request.params.clone())
+        .await?;
+    fixture.response(20).await?;
+    fixture
+        .settled("manual acceptance questions", |fixture| {
+            Ok(fixture
+                .plan()?
+                .is_some_and(|plan| plan.review_questions().is_some()))
+        })
+        .await?;
+    fixture.prompt(11, "/plan accept off").await?;
+    fixture
+        .settled("withdrawn acceptance", |fixture| {
+            Ok(fixture
+                .plan()?
+                .is_some_and(|plan| plan.review_questions().is_none()))
+        })
+        .await?;
+    fixture.prompt(12, "/plan accept on").await?;
+    fixture.response(12).await?;
+    let reported = |fixture: &ReviewFixture| fixture.stopped_acceptance_notices() > 0;
+    // Settle on either outcome, so a loop fails the count below instead of the wait.
+    fixture
+        .settled("reported stop", |fixture| {
+            Ok(reported(fixture) || fixture.command_receipts(&acceptance.operation_id) > 2)
+        })
+        .await?;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    let submitted = fixture.command_receipts(&acceptance.operation_id);
+    assert!(
+        submitted <= 2,
+        "the journaled acceptance was submitted {submitted} times"
+    );
+    assert!(
+        reported(&fixture),
+        "the stopped acceptance was not reported"
+    );
+    fixture.finish().await
+}
+
 /// An explicit pause holds through `oY`: the acceptance and its questions are recorded, nothing
 /// starts, and `/task resume` presents the questions the acceptance raised.
 #[tokio::test]
@@ -864,6 +1008,7 @@ async fn automatic_acceptance_in_review_revises_a_saved_comment_first() -> Resul
         .await?;
     fixture.assert_revised_before_accepted("compute_total", true)?;
     fixture.assert_execution_started_once()?;
+    assert_eq!(fixture.stopped_acceptance_notices(), 0);
     fixture.finish().await
 }
 
@@ -907,6 +1052,7 @@ async fn automatic_acceptance_of_a_later_submission_revises_a_saved_comment_firs
         .await?;
     fixture.assert_revised_before_accepted("compute_total", true)?;
     fixture.assert_execution_started_once()?;
+    assert_eq!(fixture.stopped_acceptance_notices(), 0);
     fixture.finish().await
 }
 
@@ -1296,6 +1442,170 @@ async fn edits_a_discussion_delivered_retire_with_the_revision_it_led_to() -> Re
     assert!(
         !requested.contains("set_check") && !requested.contains("zero parts"),
         "the revision request replayed review from an earlier revision: {requested}"
+    );
+    fixture.finish().await
+}
+
+/// The live transcript draws `Plan submitted` as soon as the submission is committed, while the
+/// turn that submitted it still runs, so it shows the same rows a restored transcript shows.
+#[tokio::test]
+async fn live_transcript_shows_a_submission_before_its_turn_settles() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestHoldId, TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let fixture = ReviewFixture::open(true).await?;
+    let transcript = forge_buffer::identity::DocumentId("transcript:live-submission".into());
+    fixture.controller.presentation.lock().unwrap().open(
+        transcript.clone(),
+        forge_buffer::identity::ViewId("view:live-submission".into()),
+        forge_buffer::width::WidthProfile::default(),
+    )?;
+    let plan = fixture.plan_in_review().await?;
+    let directory =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?
+            .authoring_directory(&fixture.session_id, &plan.id);
+    let control = fixture
+        .controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?;
+    control
+        .dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        TestPromptStep::FileWrite {
+                            path: directory.join("docs/overview.md").to_string_lossy().into_owned(),
+                            text: "# Implement the requested change\n\n## Objective\nRename the callable.\n\n## Background\nThe review asked for a clearer name.\n\n## Design\nApply the rename at its owning boundary.\n\n## Manual checks\n- Confirm the renamed interface behaves as designed.\n".into(),
+                        },
+                        TestPromptStep::ToolCall {
+                            name: "plan_submit".into(),
+                            arguments: json!({"plan_id":plan.id}),
+                        },
+                        TestPromptStep::Barrier {
+                            id: TestHoldId::new("revision-submitted")?,
+                        },
+                        TestPromptStep::Message {
+                            content: TestMessageContent::Response,
+                            text: "Submitted the revised plan.".into(),
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    fixture
+        .dispatch(
+            20,
+            "session.command.apply",
+            json!({"action":"request_changes","operation_id":"revise","plan_id":plan.id,"comment":"Rename the callable"}),
+        )
+        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        control.dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Wait {
+                id: "revision-submitted".into(),
+            },
+        ),
+    )
+    .await??;
+    let submitted = fixture.plan()?.context("planning task disappeared")?;
+    assert_eq!(
+        submitted.model_revision, 2,
+        "the revision was not submitted"
+    );
+    let rows = fixture
+        .controller
+        .presentation
+        .lock()
+        .unwrap()
+        .snapshot(&transcript)?
+        .block
+        .iter()
+        .flat_map(|block| block.text.rows().map(str::to_owned).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    control
+        .dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Release {
+                id: "revision-submitted".into(),
+            },
+        )
+        .await?;
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Plan submitted") && row.contains("revision 2")),
+        "the live transcript omitted the submission: {rows:#?}"
+    );
+    fixture
+        .settled("revision", |fixture| {
+            Ok(fixture
+                .plan()?
+                .is_some_and(|plan| plan.state == crate::plan::PlanState::AwaitingReview))
+        })
+        .await?;
+    fixture.finish().await
+}
+
+/// Between the revision a saved comment requires and the automatic acceptance that follows it,
+/// no status asks for a plan review: the acceptance is already recorded and only waits for the
+/// revision turn to settle.
+#[tokio::test]
+async fn automatic_acceptance_never_shows_the_revision_awaiting_review() -> Result<()> {
+    let fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    fixture.save_comment(&plan, "Rename the callable to compute_total")?;
+    fixture.prompt(20, "/plan accept on").await?;
+    fixture
+        .settled("acceptance questions", |fixture| {
+            Ok(fixture
+                .plan()?
+                .is_some_and(|plan| plan.review_questions().is_some()))
+        })
+        .await?;
+    let answered_from = fixture.frame_list.lock().unwrap().len();
+    fixture.answer_acceptance(21).await?;
+    fixture
+        .settled("revised acceptance", |fixture| {
+            Ok(fixture.task()?.kind() == crate::task::TaskKind::Execute)
+        })
+        .await?;
+    // The reviewed revision stays in review while its acceptance questions are answered; the
+    // revision the saved comment produced is the one the recorded acceptance already covers.
+    fn reviews_of(value: &Value, revision: u32, found: &mut Vec<Value>) {
+        match value {
+            Value::Object(object) => {
+                if object.get("kind").and_then(Value::as_str) == Some("awaiting_plan_review")
+                    && object.get("revision").and_then(Value::as_u64) == Some(u64::from(revision))
+                {
+                    found.push(value.clone());
+                }
+                for child in object.values() {
+                    reviews_of(child, revision, found);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    reviews_of(child, revision, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut review_statuses = Vec::new();
+    for frame in &fixture.frame_list.lock().unwrap()[answered_from..] {
+        reviews_of(frame, plan.model_revision + 1, &mut review_statuses);
+    }
+    assert!(
+        review_statuses.is_empty(),
+        "a recorded acceptance published a plan review status: {review_statuses:#?}"
     );
     fixture.finish().await
 }

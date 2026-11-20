@@ -5,6 +5,8 @@ local layout = require("forge.views.harness.layout")
 ---@field settled boolean Whether that exchange had completed.
 ---@field revision? integer Last observed transcript revision.
 ---@field composer_window? integer Window whose focus enables live progress following.
+---@field deferred? string Completed exchange whose reveal waits for a window of the current tab
+---  page, because it finished while every transcript window was in a hidden tab page.
 local Reveal = {}
 Reveal.__index = Reveal
 
@@ -64,10 +66,12 @@ function Reveal:publish(document, views, reset, handoff)
       end
     end
   end
-  local completed = exchange and settled and (self.exchange ~= exchange or not self.settled)
+  local completed = exchange and settled and (self.exchange ~= exchange or not self.settled
+    or self.deferred == exchange)
   local follow = live and self.revision ~= document.revision and self:composer_focused()
   self.exchange, self.settled = exchange, settled == true
   self.revision = document.revision
+  self.deferred = nil
   if reset or handoff and not follow
     or not follow and (not completed or not response_row or not complete_response) then return end
   if vim.api.nvim_get_current_buf() == document.buffer then return end
@@ -75,10 +79,12 @@ function Reveal:publish(document, views, reset, handoff)
   local first_row = not follow and require("forge.buffer").physical_row(document, prompt_row or response_row) or nil
   local last_row = vim.api.nvim_buf_line_count(document.buffer) - 1
   local tabpage = vim.api.nvim_get_current_tabpage()
+  local shown = false
   for window in pairs(views) do
     if vim.api.nvim_win_is_valid(window)
       and vim.api.nvim_win_get_buf(window) == document.buffer
       and vim.api.nvim_win_get_tabpage(window) == tabpage then
+      shown = true
       if follow then
         layout.position_tail(document.buffer, window)
       else
@@ -102,6 +108,8 @@ function Reveal:publish(document, views, reset, handoff)
       end
     end
   end
+  -- Nobody saw the exchange finish, so its reveal runs when its tab page is shown again.
+  if not shown and not follow then self.deferred = exchange end
 end
 
 return Reveal

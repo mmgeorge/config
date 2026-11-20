@@ -380,6 +380,10 @@ pub struct TimelineProjection<'a> {
 
 impl TimelineProjector {
     /// Attach native observed children by their original generation and trusted ancestry.
+    ///
+    /// A child delegated by a top-level exchange belongs to that exchange's entry, which
+    /// draws it inside the turn that ran it. A child whose delegating exchange has no
+    /// top-level entry stays a top-level entry of its own.
     pub(crate) fn with_observed_agents(
         mut timeline: Vec<TimelineEntry>,
         observed: Vec<crate::agent::ObservedAgent>,
@@ -389,7 +393,22 @@ impl TimelineProjector {
         let mut visited = std::collections::HashSet::new();
         for index in 0..observed.len() {
             if parent[index].is_none() {
-                timeline.push(observed_entry(index, &observed, &parent, &mut visited)?);
+                let entry = observed_entry(index, &observed, &parent, &mut visited)?;
+                let delegating = observed[index].parent_scope().exchange_id.as_str();
+                let owner = timeline.iter_mut().find_map(|candidate| match candidate {
+                    TimelineEntry::Exchange {
+                        exchange,
+                        agent_by_id,
+                        ..
+                    } if exchange.id == delegating => Some(agent_by_id),
+                    _ => None,
+                });
+                match owner {
+                    Some(agent_by_id) => {
+                        agent_by_id.insert(entry.id(), entry);
+                    }
+                    None => timeline.push(entry),
+                }
             }
         }
         anyhow::ensure!(

@@ -1684,7 +1684,15 @@ impl HarnessBroker {
             .turn
             .last()
             .is_some_and(|turn| turn.requires_explicit_continuation());
+        // A user's cancel ends the exchange even when its own turn had already completed, as
+        // when the parent was waiting for its children: the exchange stopped before its work
+        // finished, and reading it as complete hid the cancel.
+        let cancelled = matches!(
+            finalization.collection,
+            Some(ForegroundCollection::Cancel(_))
+        );
         let outcome = match &finalization.outcome {
+            Ok(_) if cancelled => crate::exchange::ExchangeOutcome::Cancelled,
             Ok(_) if own_turn_stopped => crate::exchange::ExchangeOutcome::Interrupted,
             Ok(_) => crate::exchange::ExchangeOutcome::Complete,
             Err(ProviderError::Cancelled) => crate::exchange::ExchangeOutcome::Cancelled,
@@ -2624,10 +2632,12 @@ mod cancellation_tests {
         finalization.check_result = Some((Value::Null, Vec::new()));
         broker.capability.native_compact = true;
         broker.session.provider_session_id = Some("fixture-history".into());
-        let (job, _) =
-            broker.prepare_owned_compaction(compaction::CompactionProvenance::Automatic {
+        let (job, _) = broker.prepare_owned_compaction(
+            compaction::CompactionProvenance::Automatic {
                 turn_id: "fixture-turn".into(),
-            })?;
+            },
+            None,
+        )?;
         finalization.auto_compaction_job = Some(job);
         transaction.finalization = Some(finalization);
         let mut dispatch = TurnTransaction::Finalizing {

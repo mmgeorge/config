@@ -7,6 +7,7 @@ export const required = [
   { name: 'fzf', winget: 'junegunn.fzf', brew: 'fzf' }
   { name: 'rg', winget: 'BurntSushi.ripgrep.MSVC', brew: 'ripgrep' }
   { name: 'uv', winget: 'astral-sh.uv', brew: 'uv' }
+  { name: 'go', winget: 'GoLang.Go', brew: 'go' }
   { name: 'pnpm', winget: 'pnpm.pnpm', brew: 'pnpm' }
   { name: 'delta', winget: 'dandavison.delta', brew: 'git-delta' }
   { name: 'jj', winget: 'jj-vcs.jj', brew: 'jj' }

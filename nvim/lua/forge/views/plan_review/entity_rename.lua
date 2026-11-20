@@ -40,6 +40,7 @@ end
 ---@field symbol string
 ---@field name string
 ---@field expected_version integer
+---@field existing_names string[] names already declared or imported in the symbol's scope
 ---@field preview ForgePlanRenamePreview[]
 
 --- Retain the semantic preview until the commit callback calls its idempotent finish function.
@@ -48,6 +49,7 @@ end
 ---@param captured table
 ---@param commit fun(name: string, finish: fun())
 function M.proposed(review, selection, captured, commit)
+  local origin = popup_window.capture_origin()
   local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
   local conceallevel, concealcursor = vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor
   vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor = 2, "nvic"
@@ -95,6 +97,10 @@ function M.proposed(review, selection, captured, commit)
       finish()
       notifications.error("Entity name must be a nonempty single line", "ForgePlanReview") return
     end
+    if vim.tbl_contains(selection.existing_names, value) then
+      finish()
+      notifications.error(("`%s` already exists in this scope"):format(value), "ForgePlanReview") return
+    end
     if not review.owner.is_current(captured) then
       finish()
       notifications.error("Plan changed while the rename popup was open", "ForgePlanReview") return
@@ -105,6 +111,8 @@ function M.proposed(review, selection, captured, commit)
     -- The preview stays on screen while the reviewer confirms, so a name typed and entered in
     -- one motion is still shown in every span it rewrites before anything changes.
     local count = #selection.preview
+    -- The name input closes from its Insert-mode submit key, and Insert mode ends only once that
+    -- key returns, so the confirmation returns to the review in the mode the rename began in.
     require("forge.infra.confirm").open({
       ("Rename %s to %s in %d place%s?"):format(selection.name, value, count, count == 1 and "" or "s"),
       "Each highlighted span in the review changes.",
@@ -115,7 +123,7 @@ function M.proposed(review, selection, captured, commit)
       end
       local submitted, failure = pcall(commit, value, finish)
       if not submitted then finish() notifications.error(tostring(failure), "ForgePlanReview") end
-    end, finish, { title = "Rename symbol" })
+    end, finish, { title = "Rename symbol", origin = origin })
   end)
 end
 

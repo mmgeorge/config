@@ -130,6 +130,11 @@ pub struct Exchange {
     /// Cleanup state retained until collection or exchange settlement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) collection: Option<ExchangeCollection>,
+    /// Whether a cancellation, including the one the host's shutdown sends, began collecting
+    /// this exchange. Recovery reads it when the host ended before that collection settled, so
+    /// an exchange the user stopped reopens cancelled rather than interrupted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) cancellation_requested: bool,
     /// Persistent agent identity that owns this exchange.
     pub agent_id: String,
     pub id: String,
@@ -213,6 +218,8 @@ struct ExchangeRecord {
     /// Cleanup state retained until collection or exchange settlement.
     #[serde(default)]
     pub(crate) collection: Option<ExchangeCollection>,
+    #[serde(default)]
+    pub(crate) cancellation_requested: bool,
     /// Persistent agent identity that owns this exchange.
     pub agent_id: String,
     pub id: String,
@@ -484,6 +491,7 @@ impl Exchange {
             phase: crate::exchange::ExchangePhase::Queued,
             finalization_error: None,
             collection: None,
+            cancellation_requested: false,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),
@@ -541,6 +549,7 @@ impl Exchange {
             phase: crate::exchange::ExchangePhase::Running,
             finalization_error: None,
             collection: None,
+            cancellation_requested: false,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),
@@ -1328,17 +1337,64 @@ impl Exchange {
     /// Report a Harness-authored continuation in which the model produced nothing visible.
     ///
     /// A continuation stopped before its provider answered has only its opening notice and an
-    /// empty heading, so closing it would record a row with no content. Every visible item, from
-    /// model text and reasoning to questions, steering input, and timeline events, is a node; tool
-    /// calls and check runs live on commentary entries; host edits change files. A prompt echo
-    /// records neither, so an echoed continuation still counts as output-free. Exchanges that a
-    /// user prompt or a task start opened carry content of their own and never qualify.
+    /// empty heading, so closing it would record a row with no content. Exchanges that a user
+    /// prompt or a task start opened carry input of their own and never qualify.
     pub(crate) fn is_output_free_continuation(&self) -> bool {
         matches!(
             self.opening,
             super::ExchangeOpening::TaskContinuation { .. }
-        ) && self.node_list.is_empty()
-            && self.host_file_changes.is_empty()
+        ) && self.is_output_free()
+    }
+
+    /// Report a Harness-authored task exchange that settled without showing anything beneath
+    /// its notice.
+    ///
+    /// A task start or continuation paused before its provider answered, then closed when the
+    /// task resumed in a new exchange, has nothing for its heading to summarize. Turn errors are
+    /// output too, and failed or interrupted outcomes say something the notice does not.
+    pub(crate) fn is_settled_output_free_task_notice(&self) -> bool {
+        matches!(
+            self.opening,
+            super::ExchangeOpening::TaskStarted { .. }
+                | super::ExchangeOpening::TaskContinuation { .. }
+        ) && matches!(
+            self.state(),
+            ExchangeState::Complete | ExchangeState::Cancelled
+        ) && self.turn.iter().all(|turn| turn.errors().is_empty())
+            && self.is_output_free()
+    }
+
+    /// Report an exchange in which the model produced nothing visible.
+    ///
+    /// Every visible item, from model text and reasoning to questions, steering input, and
+    /// timeline events, is a node; tool calls and check runs live on commentary entries; host
+    /// edits change files. Two message nodes show nothing: the provider's echo of a Harness
+    /// instruction, which the opening notice already stands for, and reasoning without text,
+    /// which only times hidden thinking.
+    fn is_output_free(&self) -> bool {
+        let invisible = |turn_id: &str, message_id: &str| {
+            self.turn
+                .iter()
+                .filter(|turn| turn.id() == turn_id)
+                .flat_map(|turn| turn.messages())
+                .find(|message| message.id() == message_id)
+                .is_some_and(|message| match message.kind() {
+                    crate::turn::MessageKind::User => true,
+                    crate::turn::MessageKind::Reasoning
+                    | crate::turn::MessageKind::ReasoningSummary => message.text.trim().is_empty(),
+                    crate::turn::MessageKind::Assistant | crate::turn::MessageKind::Unknown => {
+                        false
+                    }
+                })
+        };
+        self.node_list.iter().all(|node| match node {
+            super::ExchangeNode::TurnContent {
+                turn_id,
+                item: crate::turn::TurnItem::Message { id },
+                ..
+            } => invisible(turn_id, id),
+            _ => false,
+        }) && self.host_file_changes.is_empty()
             && self.checklist.is_none()
             && self.entry.iter().all(|entry| match entry {
                 super::ExchangeEntry::Commentary { commentary } => {
@@ -2097,6 +2153,7 @@ mod test {
         Exchange {
             finalization_error: None,
             collection: None,
+            cancellation_requested: false,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),
@@ -2720,5 +2777,46 @@ mod test {
             .unwrap();
         let late = acknowledge(&mut open, &address, &submission("late"), 3);
         assert!(late.is_awaiting_consumption());
+    }
+
+    /// A continuation paused after the provider echoed its instruction, and perhaps reasoned
+    /// without a visible summary, still produced nothing to show. Visible reasoning counts.
+    #[test]
+    fn echo_and_empty_reasoning_leave_a_continuation_output_free() {
+        let continuation = |name: &str| {
+            let mut exchange = interaction();
+            exchange.opening = crate::exchange::ExchangeOpening::TaskContinuation {
+                reason: "The active task requires another turn".into(),
+            };
+            exchange.resume(1).unwrap();
+            let address = running_turn(&mut exchange, name, 1);
+            observe(&mut exchange, &echo(&address, "echo", &submission(name)), 2);
+            (exchange, address)
+        };
+        let (mut echoed, address) = continuation("echoed");
+        assert!(echoed.is_output_free_continuation());
+        observe(
+            &mut echoed,
+            &crate::turn::test_support::reasoning(
+                &address,
+                "hidden",
+                forge_provider_api::ReasoningKind::Summary,
+                "",
+            ),
+            3,
+        );
+        assert!(echoed.is_output_free_continuation());
+        let (mut reasoned, address) = continuation("reasoned");
+        observe(
+            &mut reasoned,
+            &crate::turn::test_support::reasoning(
+                &address,
+                "summary",
+                forge_provider_api::ReasoningKind::Summary,
+                "**Continuing forward**",
+            ),
+            3,
+        );
+        assert!(!reasoned.is_output_free_continuation());
     }
 }

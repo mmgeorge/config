@@ -137,6 +137,9 @@ pub enum PermissionSubject {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Rejects command execution when Harness cannot determine every shell invocation.
+///
+/// Its text states the cause and never forbids another attempt: the refusal that carries it to
+/// the model adds the permitted routes, such as simpler commands or a file-editing tool.
 pub struct CommandAnalysisError {
     /// Shell selected at the provider or nested-launcher boundary.
     pub shell: CommandShell,
@@ -159,7 +162,7 @@ impl std::fmt::Display for CommandAnalysisError {
             ),
             forge_shell::shell::CommandAnalysisFailure::Unsupported(construct) => write!(
                 formatter,
-                "shell_command_unsupported: Harness does not support {construct} in {:?} command analysis. Rewrite the unsupported construct while keeping pipelines intact. No command was executed.",
+                "shell_command_unsupported: Harness cannot analyze {construct} in {:?} commands, so it runs no command that contains it. No command was executed.",
                 self.shell
             ),
             forge_shell::shell::CommandAnalysisFailure::UnresolvedCommands(names) => write!(

@@ -25,6 +25,18 @@ function M.turn_running(state)
   return not (status.kind == "working" and status.activity == "handing_off")
 end
 
+---Report whether a provider turn is running or the host has handed off to the one that follows.
+---
+---A hand-off reads `working` with the `handing_off` activity: a queued turn, or an accepted
+---plan's execution, starts next. The submission it follows is not yet the one to review.
+---@param state table
+---@return boolean
+function M.turn_pending(state)
+  local status = state.status
+  return M.turn_running(state) or (not state.host_error and type(status) == "table"
+    and status.kind == "working" and status.activity == "handing_off")
+end
+
 ---Get the owner's fatal execution failure for status and prompt admission.
 ---@param state table
 ---@return string?

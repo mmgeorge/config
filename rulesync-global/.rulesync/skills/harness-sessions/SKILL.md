@@ -30,7 +30,7 @@ Approval mode (`ask`, `allow`, or `deny`), filesystem read/write scope, sandboxi
 ## Recall previous work
 
 1. Use `harness_session_search` with a literal `query`. Without filters it searches all accessible sessions. Add `session_id`, `repository_id`, or `workspace` to narrow results. Combined filters use AND.
-2. Read `harness_session_exchange_list` for question/final-answer context, or `harness_session_exchange` with the matching `exchange_id` for activity details.
+2. Read `harness_session_exchange_list` for question/final-answer context, or `harness_session_exchange` with the matching `exchange_id` for activity details. The list holds only the current conversation: exchanges `/undo` removed are omitted, and a direct read or search result from one carries `history: "rolled_back"`. A message with role `harness` is a task notice Harness wrote, not something the user said, so do not count it as a user message.
 3. Use `harness_session_tool` only when exact output or normalized file changes matter. Pass `turn_id` from the activity index when tool IDs are ambiguous.
 
 `harness_session_list` discovers session metadata and repository IDs. Repository identity follows the canonical Git common directory, including linked worktrees, not shared remote URLs. Conversation search excludes progress and reasoning. Explicit `search_in: ["tool_outputs"]` searches recorded output instead. Structured tool input is not retained in exchange storage. Requesting `tool_inputs` or a tool's `input` reports that limitation, not an empty successful result.

@@ -129,6 +129,28 @@ impl SqliteStore {
         Ok(Some(record))
     }
 
+    /// End one live child whose delegating exchange the user cancelled, and report whether its
+    /// stored state changed.
+    pub(crate) fn interrupt_observed_agent(
+        &mut self,
+        binding: &BindingId,
+        agent: &AgentId,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut record) = load(&transaction, binding, agent)? else {
+            return Ok(false);
+        };
+        let changed = record.interrupt_for_cancelled_parent(now_ms)?;
+        if changed {
+            write(&transaction, &record)?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
     /// Load observed children in first-association order for one retained host session.
     pub(crate) fn list_observed_agents(&self, session_id: &str) -> Result<Vec<ObservedAgent>> {
         select(

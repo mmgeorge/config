@@ -176,7 +176,7 @@ impl OwnedTaskCheckRun {
             TaskCheckEvent::Published(result) => {
                 let (mut events, acknowledgment) = (*result)?;
                 broker.acknowledge_owned_task_check(acknowledgment)?;
-                events.push(Self::session_changed(broker)?);
+                events.extend(Self::settled_events(broker)?);
                 return Ok(TaskCheckProgress::Finished {
                     events,
                     failure: None,
@@ -192,7 +192,7 @@ impl OwnedTaskCheckRun {
                     broker.acknowledge_owned_task_check(acknowledgment)?;
                 }
                 if handled {
-                    events.push(Self::session_changed(broker)?);
+                    events.extend(Self::settled_events(broker)?);
                 }
                 return Ok(TaskCheckProgress::Finished {
                     events,
@@ -252,7 +252,7 @@ impl OwnedTaskCheckRun {
             }
             TaskCheckEvent::Published(result) => {
                 let (mut events, _) = (*result)?;
-                events.push(Self::session_changed(broker)?);
+                events.extend(Self::settled_events(broker)?);
                 return Ok(TaskCheckProgress::Finished {
                     events,
                     failure: None,
@@ -261,7 +261,7 @@ impl OwnedTaskCheckRun {
             TaskCheckEvent::FailurePublished(payload) => {
                 let (error, result) = *payload;
                 let (handled, mut events, _) = result?;
-                events.push(Self::session_changed(broker)?);
+                events.extend(Self::settled_events(broker)?);
                 return Ok(TaskCheckProgress::Finished {
                     events,
                     failure: (!handled).then_some(CheckOwnerFailure::Worker(error)),
@@ -283,7 +283,7 @@ impl OwnedTaskCheckRun {
             return Ok(TaskCheckProgress::Pending);
         }
         Ok(TaskCheckProgress::Finished {
-            events: vec![Self::session_changed(broker)?],
+            events: Self::settled_events(broker)?,
             failure: None,
         })
     }
@@ -361,12 +361,23 @@ impl OwnedTaskCheckRun {
         Ok(TaskCheckProgress::Pending)
     }
 
-    /// Publish the committed task/session snapshot through the owner's retained event stream.
-    fn session_changed(broker: &HarnessBroker) -> Result<SessionEvent> {
-        Ok(SessionEvent {
+    /// Publish the committed task and session state that the settled verification left.
+    ///
+    /// The editor draws the transcript and the status split from the session presentation, not
+    /// from the snapshot. Only a dispatched request, a foreground turn, or check progress used to
+    /// reconcile that presentation, so a passing final run committed the completed execution,
+    /// its report, and its completion rows, yet published none of them, and the pending-checks
+    /// status stayed until the next prompt reconciled it.
+    fn settled_events(broker: &mut HarnessBroker) -> Result<Vec<SessionEvent>> {
+        let mut events = vec![SessionEvent {
             session_id: broker.session.id.clone(),
             event: "session_changed".into(),
             payload: json!({"snapshot":broker.snapshot()?}),
-        })
+        }];
+        let patch = broker.reconcile_timeline()?;
+        if !patch.is_empty() {
+            events.push(broker.event("document_changed", patch.notification())?);
+        }
+        Ok(events)
     }
 }

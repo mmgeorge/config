@@ -14,6 +14,10 @@ pub enum WorkflowActivity {
     /// A finished turn's queued successor is about to start. Status shows the work continuing,
     /// and the editor reads the hand-off to leave the finished exchange where it is.
     HandingOff,
+    /// A finished Implement turn's check run is reserved but has no record yet. Status keeps
+    /// reading like the finished turn until the run's rows exist, then becomes `Checking` with
+    /// those rows in one publication, so entering Check changes the status height once.
+    ChecksStarting,
     Planning,
     Revising,
     Implementing,
@@ -27,7 +31,7 @@ impl WorkflowActivity {
     /// Label an active exchange and its live status with the same activity.
     pub fn active_label(self) -> &'static str {
         match self {
-            Self::Working | Self::HandingOff | Self::Goal => "Working",
+            Self::Working | Self::HandingOff | Self::ChecksStarting | Self::Goal => "Working",
             Self::Planning => "Planning",
             Self::Revising => "Revising plan",
             Self::Implementing => "Implementing",
@@ -40,7 +44,7 @@ impl WorkflowActivity {
     /// Label an exchange whose activity finished.
     pub fn completed_label(self) -> &'static str {
         match self {
-            Self::Working | Self::HandingOff | Self::Goal => "Thought",
+            Self::Working | Self::HandingOff | Self::ChecksStarting | Self::Goal => "Thought",
             Self::Planning | Self::Revising => "Planned",
             Self::Implementing => "Implemented",
             Self::Checking => "Checked",
@@ -56,7 +60,7 @@ impl WorkflowActivity {
             Self::Planning => "Planning",
             Self::Revising => "Plan revision",
             Self::Implementing => "Plan implementation",
-            Self::Checking => "Checks",
+            Self::Checking | Self::ChecksStarting => "Checks",
             Self::Verifying => "Plan verification",
             Self::Resolving => "Plan resolution",
             Self::Goal => "Goal",
@@ -127,6 +131,17 @@ impl SessionPhase {
         };
         Self::Paused { waiting }
     }
+
+    /// Name a blocked task's cause in place of an idle phase.
+    ///
+    /// Only an idle phase yields: a turn still stopping or finalizing, or queued input handing
+    /// off to its turn, describes what happens next better than the block it replaces.
+    pub(crate) fn blocked_by(self, task: Option<&crate::task::Task>) -> Self {
+        match (self, task.and_then(crate::task::Task::blocked_cause)) {
+            (Self::Idle, Some(reason)) => Self::Blocked { reason },
+            (phase, _) => phase,
+        }
+    }
 }
 
 /// Represents the authoritative workflow phase exposed to one session timeline.
@@ -140,6 +155,11 @@ pub enum SessionPhase {
     Paused {
         #[serde(skip_serializing_if = "Option::is_none")]
         waiting: Option<PausedWait>,
+    },
+    /// A Goal or Execute task stopped continuing on its own; `reason` says why, so the status
+    /// can name it beside the commands that resume or end the task.
+    Blocked {
+        reason: String,
     },
     Stopping {
         collection: crate::exchange::ExchangeCollection,

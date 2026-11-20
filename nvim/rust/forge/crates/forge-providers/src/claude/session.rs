@@ -767,11 +767,14 @@ impl ClaudeSessionState {
     // ----- Compaction ----------------------------------------------------------------------
 
     /// Begin a `/compact` operation published under its own operation scope.
+    ///
+    /// `compaction_id` is the host operation identity, so the notifications and the returned
+    /// result settle the one timeline record the host created for this attempt.
     pub(crate) async fn begin_compaction(
         &self,
         sink: ProviderEventSink,
         thread_id: &ThreadId,
-        command: &str,
+        compaction_id: &str,
     ) -> Result<oneshot::Receiver<CompactionEnd>, ProviderError> {
         if self.active.read().await.is_some() {
             return Err(provider_failure(ProviderFailureKind::ExecutionActive));
@@ -784,31 +787,13 @@ impl ClaudeSessionState {
         *operation = Some(ActiveOperation {
             sink,
             compaction: Compaction {
-                id: command.to_owned(),
+                id: compaction_id.to_owned(),
                 thread_id: thread_id.as_str().into(),
                 state: CompactionState::Running,
                 manual: true,
                 started_at_ms: Some(timestamp()),
                 completed_at_ms: None,
-                result: compaction::CompactionResult {
-                    context_tokens_before: None,
-                    context_tokens_after: None,
-                    model: None,
-                    before_context: None,
-                    custom_instructions: None,
-                    summary_content: None,
-                    error: None,
-                    pre_compaction_tokens: None,
-                    post_compaction_tokens: None,
-                    tokens_removed: None,
-                    pre_compaction_messages_length: None,
-                    messages_removed: None,
-                    compaction_tokens_used: None,
-                    context_window: None,
-                    conversation_tokens: None,
-                    system_tokens: None,
-                    tool_definitions_tokens: None,
-                },
+                result: compaction::CompactionResult::default(),
             },
             ended: Some(ended),
         });

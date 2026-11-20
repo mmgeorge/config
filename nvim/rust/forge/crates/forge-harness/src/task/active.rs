@@ -46,6 +46,13 @@ pub struct TaskSnapshot {
     pub(crate) observation_revision: TaskRevision,
     /// Accept complete plan submissions until the user disables this task policy.
     pub auto_accept_plan: bool,
+    /// Count the times automatic acceptance was turned on for this task.
+    ///
+    /// An automatic acceptance's operation identity includes this count, so an acceptance
+    /// that `/plan accept off` withdrew runs again as a new operation once acceptance is
+    /// enabled again, instead of the command journal replaying the withdrawn one's reply.
+    #[serde(default)]
+    pub plan_acceptance_enablement: u32,
     /// Preserve execution choices independently of automatic acceptance.
     pub plan_execution: Option<PlanExecutionChoice>,
     pub created_at_ms: i64,
@@ -134,6 +141,22 @@ impl Task {
     /// Get the lifecycle condition from the canonical state.
     pub fn status(&self) -> super::TaskStatus {
         self.lifecycle.status()
+    }
+
+    /// Explain why a blocked Goal or Execute task stopped continuing, for its status row.
+    ///
+    /// A goal keeps the model's report of its block; an execution's transcript row alone
+    /// quotes that report, so its status names the block without the model's words.
+    pub(crate) fn blocked_cause(&self) -> Option<String> {
+        let super::state::TaskLifecycle::Suspended(suspended) = &self.lifecycle else {
+            return None;
+        };
+        let reported = match &self.lifecycle.snapshot().workflow {
+            WorkflowSnapshot::Goal { goal } => goal.reported_status.as_deref(),
+            WorkflowSnapshot::Execute { .. } => None,
+            WorkflowSnapshot::Plan { .. } => return None,
+        };
+        suspended.reason().blocked_cause(reported)
     }
 
     /// Derive the next operation from the committed workflow and lifecycle.
@@ -533,6 +556,7 @@ impl TaskSnapshot {
             revision: TaskRevision::fresh(),
             observation_revision: TaskRevision::fresh(),
             auto_accept_plan: false,
+            plan_acceptance_enablement: 0,
             plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -557,6 +581,7 @@ impl TaskSnapshot {
             revision: TaskRevision::fresh(),
             observation_revision: TaskRevision::fresh(),
             auto_accept_plan: false,
+            plan_acceptance_enablement: 0,
             plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -583,6 +608,7 @@ impl TaskSnapshot {
             revision: TaskRevision::fresh(),
             observation_revision: TaskRevision::fresh(),
             auto_accept_plan: false,
+            plan_acceptance_enablement: 0,
             plan_execution: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,

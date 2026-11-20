@@ -171,6 +171,71 @@ T["harness_file_paging"] = function()
   wait_until(settled, "explicit retry was blocked")
 end
 
+-- An editor may ask for the same section transition again before the first answer arrives.
+-- When each repeat superseded the request in flight, no answer was ever current, nothing
+-- synchronized the replica, and the section stayed collapsed although the host had opened it.
+T["repeated_section_request_keeps_the_answer_in_flight"] = function()
+  local client = require("forge.client")
+  local expanded, revision = false, 0
+  local held, notices = {}, {}
+  local owner
+  local transcript = buffer.scratch()
+  local composer = buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local function snapshot(document)
+    local blocks = {
+      { id = "exchange", text = { "Exchange heading" }, metadata = {
+        node = { id = "exchange", kind = "exchange", lifecycle = "settled", generation = 1,
+          content_revision = revision, loaded_rows = 0, loaded_bytes = 0, order = 0, more = false,
+          display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
+        section = { { id = "exchange", revision = revision, open = expanded, more = false } },
+      } },
+    }
+    if expanded then blocks[#blocks + 1] = { id = "body", text = { "Exchange body" }, metadata = {} } end
+    for _, block in ipairs(blocks) do
+      block.metadata.target, block.metadata.decoration, block.metadata.editable_region = {}, {}, {}
+    end
+    return { document = document, revision = revision, block = blocks }
+  end
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    if params.operation == "background_terminals" then callback({ supported = false })
+    elseif params.operation == "open" then
+      vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)
+    elseif params.operation == "node" then held[#held + 1] = { params = params, callback = callback }
+    elseif params.operation == "sync" then callback({ snapshot = snapshot(params.document) })
+    else callback({}) end
+  end
+  -- Answer the oldest held node request the way the host does: apply it, then reply.
+  local function answer()
+    local request = table.remove(held, 1)
+    expanded = request.params.expanded
+    revision = revision + 1
+    request.callback({})
+  end
+  MiniTest.finally(function() if owner then pcall(owner.close) end end)
+  owner = require("forge.views.harness.presentation").open({
+    session_id = "superseded-section", transcript_buffer = transcript, composer_buffer = composer,
+    transcript_window = window, is_alive = function() return true end,
+    notice = function(message) notices[#notices + 1] = message end,
+  }, function() end)
+  wait_until(function() return owner.ready end, "presentation did not become ready",
+    { context = function() return table.concat(notices, "\n") end })
+  owner.set_section("exchange", true, false)
+  wait_until(function() return #held == 1 end, "the first expansion was not sent")
+  for _ = 1, 3 do owner.set_section("exchange", true, false) end
+  eq(#held, 1)
+  answer()
+  wait_until(function() return owner.transcript.block.body ~= nil end,
+    "the replica never read the expansion the host applied",
+    { context = function() return owner.transcript.block.exchange.metadata.node.display end })
+  eq(owner.transcript.block.exchange.metadata.node.display, "full")
+  assert(#notices == 0, table.concat(notices, "\n"))
+end
+
 T["presentation"] = function()
   local client = require("forge.client")
   local markdown = require("forge.render.harness.markdown")
@@ -1717,6 +1782,59 @@ T["update_scheduling"] = function()
   assert(owner.transcript.status == "Applied" and owner.transcript.revision == 3,
     "snapshot recovery did not restore the committed document")
   owner.close()
+end
+
+-- The elapsed label follows the clock, not the transcript: a synchronization arms the next
+-- label refresh when its result arrives and shows its status while a large transcript update,
+-- such as the reflow every resize causes, is still being applied.
+T["status_label_does_not_wait_for_the_transcript_update"] = function()
+  local client = require("forge.client")
+  local requests = {}
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    local params = request_specification.params or {}
+    callback = dofile("nvim/lua/forge/tests/support/presentation_status.lua")(params, callback)
+    requests[#requests + 1] = { params = params, callback = callback }
+  end
+  local transcript, composer = buffer.scratch(), buffer.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, transcript)
+  local owner = require("forge.views.harness.presentation").open({ session_id = "label-clock",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function() end, refresh = function() end,
+  }, function(value, failure) assert(value and not failure, failure) end)
+  MiniTest.finally(function() pcall(owner.close) end)
+  requests[#requests].callback({ transcript = { document = owner.document, revision = 0,
+    block = { { id = "body", text = { "initial" },
+      metadata = { target = {}, decoration = {}, editable_region = {} } } } } })
+  wait_until(function() return owner.ready end, "the presentation did not open")
+  local count = #requests
+  owner.sync()
+  wait_until(function() return #requests > count and requests[#requests].params.operation == "sync" end,
+    "the refresh did not dispatch")
+  local block = {}
+  for index = 1, 2048 do
+    block[index] = { id = "body:" .. index, text = { "reflowed " .. index },
+      metadata = { target = {}, decoration = {}, editable_region = {} } }
+  end
+  local transcript_revision_at_label
+  local render = owner.status_view.render
+  owner.status_view.render = function(view, ...)
+    if view.snapshot and view.snapshot.revision == 1 and not transcript_revision_at_label then
+      transcript_revision_at_label = owner.transcript.revision
+    end
+    return render(view, ...)
+  end
+  requests[#requests].callback({
+    snapshot = { document = owner.document, revision = 50, block = block },
+    status = { document = owner.document .. ":status", revision = 1, block = { { id = "status",
+      text = { "Working · 3s" }, metadata = { target = {}, decoration = {}, editable_region = {} } } } },
+    activity_due_in_ms = 1000,
+  })
+  assert(owner.transcript.update_pending, "the transcript update did not yield")
+  assert(owner.status_view.label_timer ~= nil, "the label refresh waited for the transcript update")
+  wait_until(function() return owner.transcript.revision == 50 end, "the transcript update stalled", { timeout_ms = 3000 })
+  eq(transcript_revision_at_label, 0)
 end
 
 T["markdown_pass_skips_unchanged_messages"] = function()

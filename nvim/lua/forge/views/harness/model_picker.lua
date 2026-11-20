@@ -2,6 +2,7 @@ local ModelPicker = {}
 
 local picker = require("forge.views.picker")
 local picker_field = require("forge.views.picker.field")
+local model_options = require("forge.views.harness.model_options")
 local model_order = require("forge.views.harness.model_order")
 local model_pins = require("forge.views.harness.model_pins")
 local notifications = require("forge.infra.notifications")
@@ -33,16 +34,18 @@ end
 
 local function selectable_field_list(model)
   local field_list = {}
-  if #(model.reasoning or {}) > 1 then field_list[#field_list + 1] = "reasoning" end
+  if #model_options.reasoning_choices(model) > 1 then field_list[#field_list + 1] = "reasoning" end
   if #(model.context_window or {}) > 1 then field_list[#field_list + 1] = "context_window" end
   return field_list
 end
 
+-- The row shows the level the provider will use, the same name the winbar gives it: a `default`
+-- selection reads as the provider's named default level, or as `default` when it has none.
 local function initialize_model(model)
   model.picker_reasoning = selected_value(
-    model.reasoning or {},
+    model_options.reasoning_choices(model),
     model.selected_reasoning,
-    model.default_reasoning
+    model_options.thinking(model, "default")
   )
   model.picker_context_window = selected_value(
     context_id_list(model),
@@ -63,7 +66,7 @@ local function field_value(model, field)
 end
 
 local function field_option_list(model, field)
-  if field == "reasoning" then return model.reasoning or {} end
+  if field == "reasoning" then return model_options.reasoning_choices(model) end
   return context_id_list(model)
 end
 
@@ -95,9 +98,10 @@ local function column_layout(model_list)
     vision = { width = 0, selectable = false },
   }
   for _, model in ipairs(model_list) do
-    layout.reasoning.selectable = layout.reasoning.selectable or #(model.reasoning or {}) > 1
+    local reasoning_choices = model_options.reasoning_choices(model)
+    layout.reasoning.selectable = layout.reasoning.selectable or #reasoning_choices > 1
     layout.context_window.selectable = layout.context_window.selectable or #(model.context_window or {}) > 1
-    for _, reasoning in ipairs(model.reasoning or {}) do
+    for _, reasoning in ipairs(reasoning_choices) do
       layout.reasoning.width = math.max(layout.reasoning.width, vim.fn.strdisplaywidth(reasoning))
     end
     for _, context in ipairs(model.context_window or {}) do

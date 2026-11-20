@@ -554,14 +554,14 @@ T["settings"] = function()
   settings.log("settings-session", "open")
   assert(#vim.api.nvim_list_tabpages() == before + 1, "log open duplicated the tab")
   eq(vim.api.nvim_get_current_buf(), log_buffer)
-  assert(not vim.wo.winbar:find("rejected", 1, true), "zero rejections appeared as diagnostic loss")
+  assert(not vim.wo.winbar:find("lost", 1, true), "zero losses appeared as diagnostic loss")
   rejected_record_count = 7
   local refresh = keymap.get("R")
   refresh.callback()
-  assert(vim.wo.winbar:find("7 records rejected", 1, true), "log refresh hid host-reported saturation")
+  assert(vim.wo.winbar:find("7 records lost", 1, true), "log refresh hid host-reported saturation")
   rejected_record_count = 0
   settings.adopt({ level = log_level, path = path, rejected_record_count = rejected_record_count })
-  assert(not vim.wo.winbar:find("rejected", 1, true), "adopting reset host status retained diagnostic loss")
+  assert(not vim.wo.winbar:find("lost", 1, true), "adopting reset host status retained diagnostic loss")
   local logical = vim.json.encode({ timestamp_ms = 1700000000123, event = "chunked",
     payload = { text = "λ retained across rotations" } })
   local split = assert(logical:find("λ", 1, true))
@@ -626,6 +626,31 @@ T["log_level_picker_retains_failed_saves_and_ignores_stale_responses"] = functio
   eq(picker._state_for_test(), replacement)
   assert(picker.is_open("harness-log-level"), "stale save closed the replacement picker")
   picker.close()
+end
+
+-- `/log open` is typed in the composer, so the viewer opens while Insert mode is active. The
+-- read-only log must start in Normal mode; Insert mode used to carry over into it.
+T["log_open_from_insert_mode_starts_in_normal_mode"] = function()
+  local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+  local path = temp.directory("settings-log-mode") .. "/trace.jsonl"
+  vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","payload":{}}' }, path)
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.lua([[
+    vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
+    local path = ...
+    require("forge.client").request = function(_, callback)
+      callback({ level = "info", path = path, rejected_record_count = 0 })
+    end
+    _G.composer_buffer = vim.api.nvim_get_current_buf()
+  ]], { path })
+  child.type_keys("i")
+  eq(child.api.nvim_get_mode().mode, "i")
+  child.lua([[require("forge.views.harness.settings").log("session", "open")]])
+  assert(child.api.nvim_get_current_buf() ~= child.lua_get("_G.composer_buffer"), "the log viewer did not open")
+  wait_until(function() return child.api.nvim_get_mode().mode == "n" end,
+    "the log viewer stayed in Insert mode")
 end
 
 return T

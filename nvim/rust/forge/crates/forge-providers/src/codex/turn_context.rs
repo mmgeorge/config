@@ -19,6 +19,16 @@ use serde_json::json;
 /// Native request that appends raw Responses API items to model-visible thread history.
 const INJECT_METHOD: &str = "thread/inject_items";
 
+/// Developer note appended after a rewind that removed turns.
+///
+/// `thread/revert` cuts history where the first removed turn starts, and it accepts no other
+/// boundary, so the developer context injected just before that turn stays in model-visible
+/// history. For a goal that context holds the rolled-back objective. Harness cannot remove the
+/// item, so this note voids it; the next turn's own context states the current task. The note
+/// follows the open-time convention for bracketed `[Forge:` history notes and opens with the same
+/// statement as the Claude adapter's rewind note.
+pub(super) const ROLLBACK_NOTE: &str = "[Forge: the user rolled the conversation back to this point; later turns were discarded. A <forge> developer message above this note that follows the last completed turn belongs to the rolled-back interaction: its <task> and <instructions> are void. Do not continue them, quote them as the user's instruction, or count them as messages.]";
+
 /// Remember whether the native runtime accepts developer-message injection.
 #[derive(Debug, Default)]
 pub(super) enum TurnContextDelivery {

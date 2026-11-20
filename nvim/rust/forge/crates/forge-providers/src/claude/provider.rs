@@ -41,6 +41,23 @@ struct LedgerTurn {
     prompt: String,
     /// The turn's last transcript chain entry.
     checkpoint: Option<String>,
+    /// The rewind note the adapter appended after the checkpoint, the newest chain entry while
+    /// this turn is the last one kept.
+    ///
+    /// A later turn's prompt follows this note rather than the checkpoint, so a rewind that keeps
+    /// this turn resumes at the note, and a rewind that drops this turn discards the note too.
+    rewind_note: Option<String>,
+}
+
+impl LedgerTurn {
+    /// Name the chain entry a rewind that keeps this turn resumes at.
+    ///
+    /// Harness names the kept turn by its checkpoint, but the entries between the checkpoint and
+    /// the next turn's prompt belong to neither turn. Resuming at the note keeps it, so the
+    /// discarded range starts with the dropped turn's prompt as `--resume-drops-turn` requires.
+    fn resume_point(&self) -> Option<&str> {
+        self.rewind_note.as_deref().or(self.checkpoint.as_deref())
+    }
 }
 
 struct ClaudeBinding {
@@ -78,6 +95,14 @@ struct ClaudeBinding {
         )>,
     >,
     ledger: Mutex<Vec<LedgerTurn>>,
+    /// The last entry of the history this binding keeps, while this process knows it.
+    ///
+    /// It is the newest turn's checkpoint, or the checkpoint a rewind kept. A rewind leaves the
+    /// discarded turns in the CLI transcript beside the kept history, and a `--fork-session`
+    /// without a position copied the discarded branch, so a fork copies up to this entry. A turn
+    /// that reports no checkpoint and a compaction append entries the adapter cannot name, so they
+    /// clear it, and a fork then takes the CLI's own choice.
+    fork_point: std::sync::Mutex<Option<String>>,
 }
 
 impl ClaudeBinding {
@@ -912,6 +937,7 @@ impl ClaudeProvider {
             history_released: AtomicBool::new(false),
             rejected_inputs: Mutex::new(Vec::new()),
             ledger: Mutex::new(Vec::new()),
+            fork_point: std::sync::Mutex::new(None),
         });
         self.bindings
             .lock()
@@ -1094,9 +1120,14 @@ impl ClaudeProvider {
                 session.sink.check()?;
                 context.check_admission(ProviderOperation::ThreadFork)?;
                 session.require_idle(ProviderOperation::ThreadFork).await?;
+                let fork_point = session
+                    .fork_point
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 session
                     .conversation
-                    .fork(&target_id, None, options, &cleanup)
+                    .fork(&target_id, fork_point, options, &cleanup)
                     .await
             }
             forge_provider_api::ForkSource::Checkpoint {
@@ -1105,6 +1136,7 @@ impl ClaudeProvider {
             } => {
                 super::conversation::fork_session(
                     &*self.launcher,
+                    &self.unstarted_sessions,
                     provider_session_id.as_str(),
                     &target_id,
                     Some(checkpoint.as_str().to_owned()),
@@ -1170,7 +1202,7 @@ impl ClaudeProvider {
         let command_id = uuid::Uuid::new_v4().to_string();
         let ended = session
             .state
-            .begin_compaction(sink, &session.owner, &command_id)
+            .begin_compaction(sink, &session.owner, context.id().as_str())
             .await?;
         let written = session
             .conversation
@@ -1184,6 +1216,12 @@ impl ClaudeProvider {
             }
         };
         session.state.finish_compaction().await;
+        // The compaction appended entries after the last known one, which a fork must copy.
+        session
+            .fork_point
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let compaction = ended
             .and_then(|ended| ended.compaction)
             .filter(|compaction| {
@@ -1247,17 +1285,26 @@ impl ClaudeProvider {
         {
             return Ok(());
         }
-        // The CLI validates exactly one dropped turn; a wider range runs unguarded.
+        // The CLI refuses a guarded resume whose discarded range holds anything but the declared
+        // turn, so only a range of exactly one turn with no rewind note after it is guarded; a
+        // wider range runs unguarded.
         let drops_turn = kept
-            .filter(|kept| kept + 2 == ledger.len())
+            .filter(|kept| kept + 2 == ledger.len() && ledger[kept + 1].rewind_note.is_none())
             .map(|kept| ledger[kept + 1].prompt.clone());
+        let resume_at = kept
+            .and_then(|kept| ledger[kept].resume_point())
+            .unwrap_or(after.as_str())
+            .to_owned();
         let session_id = session.conversation.id().to_owned();
+        tracing::info!(target: "forge::provider", event_name = "provider.rewind.requested",
+            provider = "claude", session_id = %session_id, resume_at = %resume_at,
+            drops_turn = ?drops_turn, ledger_turns = ledger.len(), kept_turn = ?kept);
         let rewound = session
             .conversation
             .restart(
                 SessionStart::Resume {
                     session_id: session_id.clone(),
-                    resume_at: Some(after.as_str().to_owned()),
+                    resume_at: Some(resume_at),
                     drops_turn,
                 },
                 &session.cleanup,
@@ -1267,46 +1314,56 @@ impl ClaudeProvider {
             Ok(()) => persist_rewind(&session).await,
             Err(error) => Err(error),
         };
-        if let Err(error) = persisted {
-            // A refused or unpersisted rewind leaves the transcript unchanged; resume it plainly.
-            let restored = session
-                .conversation
-                .restart(
-                    SessionStart::Resume {
-                        session_id,
-                        resume_at: None,
-                        drops_turn: None,
-                    },
-                    &session.cleanup,
-                )
-                .await;
-            return Err(match restored {
-                Ok(()) => ProviderError::Failure(
-                    ProviderFailure::new(
-                        ProviderOperation::ThreadRewind,
-                        ProviderFailureKind::Rejected,
+        let rewind_note = match persisted {
+            Ok(rewind_note) => rewind_note,
+            Err(error) => {
+                // A refused or unpersisted rewind leaves the transcript unchanged; resume it plainly.
+                let restored = session
+                    .conversation
+                    .restart(
+                        SessionStart::Resume {
+                            session_id,
+                            resume_at: None,
+                            drops_turn: None,
+                        },
+                        &session.cleanup,
                     )
-                    .at_phase(ProviderPhase::Observation, FailureDisposition::Unchanged),
-                ),
-                Err(restore) => {
-                    let cause = with_cleanup(
-                        operation_failure(
+                    .await;
+                return Err(match restored {
+                    Ok(()) => ProviderError::Failure(
+                        ProviderFailure::new(
                             ProviderOperation::ThreadRewind,
-                            &error,
-                            ProviderPhase::Observation,
-                            FailureDisposition::Invalidated,
-                        ),
-                        vec![restore],
-                    );
-                    session.invalidate(cause.clone()).await;
-                    cause
-                }
-            });
-        }
+                            ProviderFailureKind::Rejected,
+                        )
+                        .at_phase(ProviderPhase::Observation, FailureDisposition::Unchanged),
+                    ),
+                    Err(restore) => {
+                        let cause = with_cleanup(
+                            operation_failure(
+                                ProviderOperation::ThreadRewind,
+                                &error,
+                                ProviderPhase::Observation,
+                                FailureDisposition::Invalidated,
+                            ),
+                            vec![restore],
+                        );
+                        session.invalidate(cause.clone()).await;
+                        cause
+                    }
+                });
+            }
+        };
         match kept {
-            Some(kept) => ledger.truncate(kept + 1),
+            Some(kept) => {
+                ledger.truncate(kept + 1);
+                ledger[kept].rewind_note = Some(rewind_note);
+            }
             None => ledger.clear(),
         }
+        *session
+            .fork_point
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(after.as_str().to_owned());
         Ok(())
     }
 
@@ -1781,11 +1838,11 @@ impl ClaudeProvider {
 }
 
 /// Make a rewind durable by appending a note, because the CLI persists a truncation only when
-/// the next entry is appended.
-async fn persist_rewind(session: &ClaudeBinding) -> Result<(), ProviderError> {
+/// the next entry is appended, and return the note's chain entry uuid.
+async fn persist_rewind(session: &ClaudeBinding) -> Result<String, ProviderError> {
     let note = UserInput::note(
         uuid::Uuid::new_v4().to_string(),
-        "[Forge: the conversation was rewound to an earlier point; later turns were discarded]",
+        "[Forge: the user rolled the conversation back to this point; later turns were discarded]",
     );
     let mut observer = session.state.track_command(&note.uuid, false).await?;
     session.conversation.write(&note).await?;
@@ -1795,7 +1852,7 @@ async fn persist_rewind(session: &ClaudeBinding) -> Result<(), ProviderError> {
         ProviderOperation::ThreadRewind,
     )
     .await
-    .map(|_| ())
+    .map(|_| note.uuid)
 }
 
 #[async_trait]
@@ -2801,7 +2858,14 @@ async fn run_prompt(
             session.ledger.lock().await.push(LedgerTurn {
                 prompt: prompt.clone(),
                 checkpoint: end.checkpoint.clone(),
+                rewind_note: None,
             });
+            end.checkpoint.clone_into(
+                &mut session
+                    .fork_point
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
         }
         let checkpoint = end
             .checkpoint

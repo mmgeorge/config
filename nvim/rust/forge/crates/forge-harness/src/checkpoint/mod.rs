@@ -13,4 +13,4 @@ pub(crate) use gate::CheckpointTask;
 pub use gate::{CheckpointGateError, ToolGate};
 pub use manifest::{CheckpointFile, CheckpointRecord};
 
-pub(crate) use restore::{RestoreJournal, RestorePreview, RestoreState};
+pub(crate) use restore::{RestoreJournal, RestorePreview, RestoreState, RunningRestoreClaim};

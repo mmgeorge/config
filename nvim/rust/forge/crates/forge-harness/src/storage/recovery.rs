@@ -180,7 +180,8 @@ pub(crate) enum DetachedSettlement {
 /// Settle one exchange that no runtime owner can still drive, as recovery records it.
 ///
 /// No provider survives the owner, so a running or finalizing exchange is interrupted at its
-/// last observed execution time, excluding the offline interval. Recovery persists the result;
+/// last observed execution time, excluding the offline interval, or cancelled when a
+/// cancellation had already begun collecting it. Recovery persists the result;
 /// a session preview applies it in memory to a session that no live owner holds, so the preview
 /// shows the interrupted exchange that resuming will show. Returns whether the exchange changed.
 pub(crate) fn interrupt_detached_exchange(
@@ -229,6 +230,13 @@ pub(crate) fn interrupt_detached_exchange(
     {
         return Ok(background_changed || consumption_changed);
     }
+    // A cancellation that began collecting the exchange, such as the stop an editor exit sends,
+    // decided its outcome before the host ended; only an exchange nobody stopped is interrupted.
+    let stopped = if exchange.cancellation_requested {
+        crate::exchange::ExchangeOutcome::Cancelled
+    } else {
+        crate::exchange::ExchangeOutcome::Interrupted
+    };
     if exchange.state() == ExchangeState::Finalizing {
         let outcome = match exchange.finalization_outcome() {
             Some(crate::exchange::ExchangeOutcome::Cancelled) => TurnOutcome::Interrupted,
@@ -251,9 +259,7 @@ pub(crate) fn interrupt_detached_exchange(
             }
         }
         if exchange.finalization_outcome() == Some(crate::exchange::ExchangeOutcome::Complete) {
-            exchange.phase = crate::exchange::ExchangePhase::Finalizing(
-                crate::exchange::ExchangeOutcome::Interrupted,
-            );
+            exchange.phase = crate::exchange::ExchangePhase::Finalizing(stopped);
         }
         if settlement == DetachedSettlement::Outcome
             && let Some(outcome) = exchange.finalization_outcome()
@@ -271,10 +277,10 @@ pub(crate) fn interrupt_detached_exchange(
         // so a child exchange finishes here.
         exchange
             .settle_running_turns(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
-        exchange.begin_finalization(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
+        exchange.begin_finalization(stopped, observed_at)?;
         exchange.collection = None;
     } else {
-        exchange.finish(crate::exchange::ExchangeOutcome::Interrupted, observed_at)?;
+        exchange.finish(stopped, observed_at)?;
     }
     Ok(true)
 }

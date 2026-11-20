@@ -91,7 +91,9 @@ T["provider_switch"] = function()
   pending_stop()
   pending_start({ session = { id = 'new-fixture_beta', provider = 'fixture_beta' } })
   assert(activated.session.id == 'new-fixture_beta' and saved == 'fixture_beta')
-  assert(activation_options.state == state and activation_options.open_mode == 'current')
+  -- The new chat is built behind the switching view, which stays the activation's source.
+  assert(activation_options.state == nil and activation_options.source_state == state
+    and activation_options.open_mode == 'current')
 end
 
 T["provider_switch_reports_its_start_and_can_keep_the_default"] = function()
@@ -163,6 +165,118 @@ T["provider_switch_checks_every_tab"] = function()
   eq(harness.provider_switch_available(), true)
 end
 
+T["provider_switch_tells_other_tabs_and_their_submit_switches_back"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+  local activity = dofile("nvim/lua/forge/tests/support/activity.lua")
+  dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
+  local session = require("forge.session")
+  local client = require("forge.client")
+  local config = require("forge.infra.config")
+  local controller = require("forge.views.harness.controller")
+  local diagnostic = require("forge.views.harness.diagnostic")
+  local health = require("forge.views.harness.health")
+  local harness = require("forge.views.harness")
+  notify.capture({ notifications = true })
+  stub(controller, "render", function() end)
+  stub(controller, "configure", function() end)
+  local saved_provider
+  stub(require("forge.harness.provider_preference"), "save", function(provider) saved_provider = provider end)
+  local activation_options
+  stub(require("forge.views.harness.session_navigation"), "activate", function(result, options)
+    activation_options = options
+    local target = session.harness_by_id[result.session.id] or session.new_harness_state()
+    target.session = result.session
+    target.host_error = nil
+    session.register_harness(result.session.id, target)
+    if options.on_settled then options.on_settled() end
+  end)
+  local pending_stop, pending_start, initialize_options
+  stub(client, "host_stop", function(_, callback) pending_stop = callback end)
+  stub(client, "session_initialize", function(callback, options) pending_start, initialize_options = callback, options end)
+  -- The host's stop notice reaches every subscribed tab before the stop completes.
+  local function stop_host()
+    for _, state in pairs(session.harness_by_id) do
+      if not state.switching_provider then
+        diagnostic.set(state, "host_error", "Forge host stopped", { category = "host", recovery = "reconnect" })
+      end
+    end
+    pending_stop()
+  end
+  config.options.harness.provider = "fixture_alpha"
+  local source = session.harness
+  source.session = { id = "source", provider = "fixture_alpha" }
+  local other = session.new_harness_state()
+  other.session = { id = "other-tab", provider = "fixture_alpha" }
+  session.register_harness("source", source)
+  session.register_harness("other-tab", other)
+  activity.set_busy(source, false)
+  activity.set_busy(other, false)
+
+  eq(harness.switch_provider("fixture_beta", { kind = "resume", session_id = "chosen", persist_default = false }), true)
+  -- The switching view says that a switch is running until the chosen session replaces it.
+  local running = health.notice(source)
+  eq({ running and running.text, running and running.animated }, { "Switching Harness to Fixture 2", true })
+  stop_host()
+  pending_start({ session = { id = "chosen", provider = "fixture_beta" } })
+  -- The chosen session is built hidden behind the source view, as a same-provider switch is.
+  eq({ activation_options.state, activation_options.source_state, activation_options.open_mode },
+    { nil, source, "current" })
+  eq(source.switching_provider, false)
+  -- Every other tab keeps a notice in its own view that names the provider the host now serves.
+  local detached = health.notice(other)
+  eq(detached and detached.text,
+    "Harness now serves Fixture 2. Submit or run :ForgeHarness to return to Fixture 1.")
+
+  -- A submit from that tab switches the host back to its provider and resumes its session there,
+  -- leaving the saved default alone and keeping the draft unsent.
+  other.composer_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(other.composer_buf, 0, -1, false, { "kept draft" })
+  controller.with_state(other, controller.submit)
+  eq(initialize_options, { session_id = "chosen" })
+  stop_host()
+  eq(initialize_options, { session_id = "other-tab" })
+  eq(health.notice(other).text, "Switching Harness to Fixture 1")
+  pending_start({ session = { id = "other-tab", provider = "fixture_alpha" } })
+  eq({ other.host_error, other.switching_provider, config.options.harness.provider, saved_provider },
+    { nil, false, "fixture_alpha", nil })
+  eq(vim.api.nvim_buf_get_lines(other.composer_buf, 0, -1, false), { "kept draft" })
+  -- The tab that switched away first is now the one that says how to come back.
+  eq(health.notice(session.harness_by_id["chosen"]).text,
+    "Harness now serves Fixture 1. Submit or run :ForgeHarness to return to Fixture 2.")
+end
+
+T["provider_switch_back_is_refused_while_another_tab_has_work"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+  local activity = dofile("nvim/lua/forge/tests/support/activity.lua")
+  dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
+  local session = require("forge.session")
+  local client = require("forge.client")
+  local diagnostic = require("forge.views.harness.diagnostic")
+  local harness = require("forge.views.harness")
+  local notices = notify.capture({ notifications = true })
+  local stopped = false
+  stub(client, "host_stop", function() stopped = true end)
+  require("forge.infra.config").options.harness.provider = "fixture_beta"
+  local live = session.harness
+  live.session = { id = "live", provider = "fixture_beta" }
+  local detached = session.new_harness_state()
+  detached.session = { id = "detached", provider = "fixture_alpha" }
+  diagnostic.set(detached, "host_error", "Harness now serves Fixture 2.", { category = "host", recovery = "reconnect" })
+  session.register_harness("live", live)
+  session.register_harness("detached", detached)
+  activity.set_busy(live, true)
+  -- The refusal is the reported outcome of the reconnect, so the caller keeps the draft and
+  -- reports nothing else.
+  require("forge.views.harness.controller").with_state(detached, function()
+    eq(harness.reconnect(detached), true)
+  end)
+  eq(stopped, false)
+  eq(detached.host_error ~= nil, true)
+  eq(notices:messages(), { "Finish or cancel pending work before switching providers" })
+end
+
 T["replace_session_preserves_requesting_tab_and_handles_failure"] = function()
   local session = require("forge.session")
   local client = require("forge.client")
@@ -215,7 +329,7 @@ T["new_session_traces_response_and_watches_the_created_view"] = function()
   end
   navigation.begin_new = function() return { state = state } end
   navigation.complete_pending = function() events[#events + 1] = "activated" end
-  navigation.render_pending = function() end
+  navigation.fail_pending = function() end
   require("forge.infra.notifications").error = function() end
   require("forge.client").session_create = function(_, callback) reply = callback end
   local harness = require("forge.views.harness")

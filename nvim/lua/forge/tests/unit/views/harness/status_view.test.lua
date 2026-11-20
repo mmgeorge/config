@@ -420,4 +420,28 @@ T["refresh_follows_the_host_label_deadline"] = function()
   eq(refreshes, 1)
 end
 
+
+-- A view whose host stopped or now serves another provider is no longer live, and its status rows
+-- still say so, because that notice is how the view explains what happened and how to come back.
+T["a_host_notice_stays_visible_after_the_view_stops_being_live"] = function()
+  local forge_buffer = require("forge.buffer")
+  local layout = require("forge.views.harness.layout")
+  local StatusView = require("forge.views.harness.status_view")
+  local transcript_buffer, transcript_window, _, composer_window = layout.open("status-host-notice")
+  local transcript = forge_buffer.open("status-host-notice", { buffer = transcript_buffer, generated = true,
+    expected_changedtick = vim.api.nvim_buf_get_changedtick(transcript_buffer), preserve_view = true })
+  local live = true
+  local view = StatusView.new({ transcript = transcript, transcript_window = transcript_window,
+    composer_window = composer_window, alive = function() return live end,
+    notice = function(message) error(message) end, recover = function() error("unexpected recovery") end })
+  MiniTest.finally(function() pcall(view.close, view) end)
+  local commands = require("forge.shared.view_command_set").new()
+  live = false
+  view:render({ status_notice = { text = "Presentation failed", animated = false } }, commands)
+  eq(view.window, nil)
+  view:render({ status_notice = { text = "Harness now serves Fixture 2.", animated = false, outlives_host = true } }, commands)
+  eq(view.window ~= nil and vim.api.nvim_win_is_valid(view.window), true)
+  eq(vim.api.nvim_buf_get_lines(view.buffer, 0, -1, false), { "  Harness now serves Fixture 2." })
+end
+
 return T

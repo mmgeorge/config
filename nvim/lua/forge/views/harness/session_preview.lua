@@ -92,8 +92,13 @@ end
 ---  uncovered; absent when nothing covers the window.
 function SessionPreview.render(snapshot, visible_height)
   if not active or not vim.api.nvim_buf_is_valid(active.buffer) then return end
+  local lines = snapshot.lines or {}
+  -- A session without exchanges would otherwise preview as a blank float over the transcript.
+  if not vim.iter(lines):any(function(line) return vim.trim(line) ~= "" end) then
+    lines = { "", "  This session has no exchanges yet." }
+  end
   vim.bo[active.buffer].modifiable = true
-  vim.api.nvim_buf_set_lines(active.buffer, 0, -1, false, snapshot.lines or {})
+  vim.api.nvim_buf_set_lines(active.buffer, 0, -1, false, lines)
   vim.bo[active.buffer].modifiable = false
   active.visible_height = visible_height
   show(active)

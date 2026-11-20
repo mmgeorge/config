@@ -113,11 +113,25 @@ pub(crate) struct ExchangeRollbackReview {
     /// Why rolling back to this exchange cannot rewind the provider; absent when it can.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rollback_unavailable: Option<String>,
+    /// The command that started this exchange's task, which a rollback of the start returns to
+    /// the composer; absent for every other exchange.
+    ///
+    /// A task start's prompt is the notice Harness wrote, so the composer receives the command
+    /// the user typed instead: `/goal <objective>`, whose objective is the goal's title, or
+    /// `/plan <request>`, whose request the plan record keeps because the title holds only its
+    /// first line. An execution start follows an accepted plan, which no command recreates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_command: Option<String>,
 }
 
 impl ExchangeRollbackReview {
-    /// Annotate every current, finished exchange of one ordered history with its rollback refusal.
-    pub(crate) fn list(exchanges: Vec<Exchange>, provider: &RewindProvider<'_>) -> Vec<Self> {
+    /// Annotate every current, finished exchange of one ordered history with its rollback refusal
+    /// and, for a task start, the command a rollback returns; `plan_list` is the session's plans.
+    pub(crate) fn list(
+        exchanges: Vec<Exchange>,
+        plan_list: &[crate::plan::PlanRecord],
+        provider: &RewindProvider<'_>,
+    ) -> Vec<Self> {
         let unavailable = (0..exchanges.len())
             .map(|position| {
                 let exchange = &exchanges[position];
@@ -131,10 +145,33 @@ impl ExchangeRollbackReview {
             .into_iter()
             .zip(unavailable)
             .map(|(exchange, rollback_unavailable)| Self {
+                task_command: task_command(&exchange, plan_list),
                 exchange,
                 rollback_unavailable,
             })
             .collect()
+    }
+}
+
+/// Name the command that started a task start's task, as the user typed it.
+///
+/// A plan start opens right after its plan is created, so its plan is the newest one created at or
+/// before the exchange.
+fn task_command(exchange: &Exchange, plan_list: &[crate::plan::PlanRecord]) -> Option<String> {
+    let crate::exchange::ExchangeOpening::TaskStarted { start } = &exchange.opening else {
+        return None;
+    };
+    match start.kind {
+        crate::task::TaskKind::Goal => {
+            (!start.title.is_empty()).then(|| format!("/goal {}", start.title))
+        }
+        crate::task::TaskKind::Plan => plan_list
+            .iter()
+            .filter(|plan| plan.created_at_ms <= exchange.created_at_ms)
+            .max_by_key(|plan| plan.created_at_ms)
+            .filter(|plan| !plan.request.trim().is_empty())
+            .map(|plan| format!("/plan {}", plan.request)),
+        crate::task::TaskKind::Execute => None,
     }
 }
 
@@ -369,7 +406,7 @@ mod tests {
         ));
         let refusal = rewind_target(&exchanges, 0, &provider).unwrap_err();
         assert_eq!(refusal.code(), "rollback_unsupported");
-        let review = ExchangeRollbackReview::list(exchanges, &provider);
+        let review = ExchangeRollbackReview::list(exchanges, &[], &provider);
         assert_eq!(review[0].rollback_unavailable, Some(refusal.to_string()));
         assert_eq!(review[1].rollback_unavailable, None);
 
@@ -386,6 +423,77 @@ mod tests {
             rewind_target(&exchanges, 0, &provider),
             Ok(Some(None))
         ));
+    }
+
+    /// Rolling back a task start names the command that started it, so the composer receives
+    /// `/goal <objective>` or `/plan <request>`; a plan's title is only the request's first line,
+    /// so the request comes from the plan the start opened.
+    #[test]
+    fn task_starts_name_the_command_a_rollback_returns() {
+        let task_start = |id: &str, ordinal: u64, kind: crate::task::TaskKind, title: &str| {
+            let mut exchange = finished_exchange(id, ordinal);
+            exchange.created_at_ms = ordinal as i64 * 10;
+            exchange.opening = crate::exchange::ExchangeOpening::TaskStarted {
+                start: crate::exchange::TaskStart {
+                    kind,
+                    title: title.into(),
+                },
+            };
+            exchange
+        };
+        let plan = |id: &str, request: &str, created_at_ms: i64| -> crate::plan::PlanRecord {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "session_id": "session", "request": request, "state": "cancelled",
+                "working_path": "plan.json", "model_revision": 0, "user_revision": 0,
+                "created_at_ms": created_at_ms, "updated_at_ms": created_at_ms,
+            }))
+            .unwrap()
+        };
+        let exchanges = vec![
+            finished_exchange("prompt", 1),
+            task_start("goal", 2, crate::task::TaskKind::Goal, "Port the parser"),
+            task_start("plan", 3, crate::task::TaskKind::Plan, "Add moneyHalve"),
+            task_start(
+                "execution",
+                4,
+                crate::task::TaskKind::Execute,
+                "Add moneyHalve",
+            ),
+        ];
+        let plan_list = vec![
+            plan("earlier", "Add moneyAllocate", 5),
+            plan(
+                "current",
+                "Add moneyHalve
+Keep the rounding rule.",
+                29,
+            ),
+        ];
+        let capability = crate::provider::ProviderCapability {
+            native_conversation_rewind: true,
+            ..Default::default()
+        };
+        let provider = RewindProvider {
+            label: "Codex",
+            capability: &capability,
+            native_history: true,
+        };
+        let review = ExchangeRollbackReview::list(exchanges, &plan_list, &provider);
+        assert_eq!(
+            review
+                .iter()
+                .map(|entry| entry.task_command.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some("/goal Port the parser"),
+                Some(
+                    "/plan Add moneyHalve
+Keep the rounding rule."
+                ),
+                None,
+            ]
+        );
     }
 
     /// Build a finished primary exchange whose provider turn reported `checkpoint-<id>`.

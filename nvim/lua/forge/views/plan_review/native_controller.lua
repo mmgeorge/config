@@ -526,7 +526,8 @@ end
 ---Follows the session's plan record. Only a newer model revision, a new submission, concerns an
 ---open review: review edits keep the revision, and their own replies update the review. A review
 ---shown in a window reloads to the new revision there, carrying its unsaved drafts; a hidden or
----closed review stays out of the way, and one notice says the revision is ready to reopen.
+---closed review stays out of the way, and one notice says the revision is ready to reopen, unless
+---the task accepts plans automatically: the host then accepts the revision without the reviewer.
 ---Review items no prompt delivered before the revision replaced their document stay pending,
 ---and one notice names them: the host keeps those edits in `manual_changes` and the comments it
 ---could not place on the new revision in `unplaced_review_comments`.
@@ -543,7 +544,9 @@ function M.observe(plan)
     and not review.owner.closed and vim.api.nvim_buf_is_valid(review.buf)
     and (vim.api.nvim_win_is_valid(review.win) and vim.api.nvim_win_get_buf(review.win) == review.buf and review.win
       or vim.fn.win_findbuf(review.buf)[1])
-  if not (window and M.open(plan, { window = window }) ~= false) then
+  local task = require("forge.views.harness.task").current(session.harness)
+  local accepted_automatically = task and task.auto_accept_plan and not (task.plan and task.plan.paused)
+  if not (window and M.open(plan, { window = window }) ~= false) and not accepted_automatically then
     notifications.info(("Plan revision %d is ready · op"):format(plan.model_revision), "ForgePlanReview")
   end
   M.report_pending_review(plan)

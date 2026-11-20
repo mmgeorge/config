@@ -708,6 +708,19 @@ impl SessionPresentation {
         Ok(patch)
     }
 
+    /// Replace one settled exchange inside the entry that owns it, keeping the session status.
+    pub(crate) fn settle_owned_exchange(
+        &mut self,
+        exchange: &Exchange,
+        status_thoughts: bool,
+    ) -> Result<TimelinePatch> {
+        let patch = self
+            .timeline
+            .settle_owned_exchange(exchange, status_thoughts)?;
+        self.project_patch(&patch);
+        Ok(patch)
+    }
+
     pub fn update_live(
         &mut self,
         interaction: Option<&Exchange>,
@@ -1172,14 +1185,20 @@ impl SessionPresentation {
             .document
             .block(&input.block)
             .context("transcript input block disappeared")?;
-        let stable_tool = input.action == "activate"
+        // A tool row and a spawn row keep their target across revisions: the block that carries
+        // the target still names the same call or child, so activating it from an older
+        // revision opens what the user saw. Running children revise the transcript several
+        // times a second, so a spawn row's revision was often stale by the time the input arrived.
+        let stable_target = input.action == "activate"
             && input.target.as_ref().is_some_and(|target| {
-                matches!(open.action.get(target), Some(TranscriptAction::Tool { .. }))
-                    && block
-                        .metadata
-                        .target
-                        .iter()
-                        .any(|candidate| &candidate.id == target)
+                matches!(
+                    open.action.get(target),
+                    Some(TranscriptAction::Tool { .. } | TranscriptAction::Agent { .. })
+                ) && block
+                    .metadata
+                    .target
+                    .iter()
+                    .any(|candidate| &candidate.id == target)
             });
         if input.revision == open.sections.document.document.revision() {
             let row = block
@@ -1196,7 +1215,7 @@ impl SessionPresentation {
                 "transcript input target changed"
             );
         } else {
-            ensure!(stable_tool, "transcript input revision changed");
+            ensure!(stable_target, "transcript input revision changed");
         }
         *sequence = input.sequence;
         Ok(open)
@@ -3374,10 +3393,154 @@ mod tests {
         Ok(())
     }
 
+    /// Time a published `Checking` status by the check run it reports.
+    ///
+    /// Between an Implement turn and its check run the status reads `Checking` with no running
+    /// clock, because no run exists yet. The run's progress then reached only the check rows, so
+    /// the heading read `Checking · 0s` for the whole run while the row beneath it counted up.
+    #[test]
+    fn checking_status_timer_advances_with_its_run() -> Result<()> {
+        use crate::session::state_machine::{SessionPhase, WorkflowActivity};
+        let clock = Arc::new(ManualClock(std::sync::atomic::AtomicI64::new(0)));
+        let mut owner = SessionPresentation::with_clock("session".into(), clock.clone());
+        owner.initialize(vec![TimelineEntry::Status {
+            id: "session:status".into(),
+            created_at_ms: 0,
+            status: SessionPhase::Working {
+                duration_ms: 0,
+                started_at_ms: None,
+                activity: WorkflowActivity::Checking,
+                reasoning_summary: None,
+                execution: None,
+            },
+            status_thoughts: false,
+            agents: Vec::new(),
+            checks: None,
+        }])?;
+        let document = DocumentId("checking-clock".into());
+        owner.open(
+            document.clone(),
+            ViewId("checking-clock-view".into()),
+            WidthProfile::default(),
+        )?;
+        let run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
+            "id":"run", "owner":{"kind":"session","session_id":"session"},
+            "revision":0, "shell":"system", "executable":null, "workspace":".",
+            "environment_digest":"fixture", "started_at_ms":1_000, "completed_at_ms":null,
+            "state":"running", "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null, "workspace_digest":{}, "commands":[]
+        }))?;
+        clock.0.store(1_000, std::sync::atomic::Ordering::Relaxed);
+        owner.update_checks(&run)?;
+        let mut headings = Vec::new();
+        for now_ms in [1_000, 2_000, 4_500] {
+            clock.0.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+            let revision = owner
+                .document(&document)?
+                .sections
+                .document
+                .document
+                .revision();
+            let synced = owner.sync(&document, revision)?;
+            headings.push(
+                synced
+                    .status
+                    .block
+                    .first()
+                    .and_then(|block| block.text.wire_rows().first().map(|row| (*row).to_owned()))
+                    .unwrap_or_default(),
+            );
+        }
+        assert!(
+            headings[0].starts_with("Checking · 0s")
+                && headings[1].starts_with("Checking · 1s")
+                && headings[2].starts_with("Checking · 3s"),
+            "the Checking heading did not follow its run: {headings:?}"
+        );
+        Ok(())
+    }
+
+    /// Enter Check with one change of the status height.
+    ///
+    /// Between an Implement turn and its check run's first record the status had one row,
+    /// `Checking · 0s`, and the run's rows arrived about 220 ms later, so the split changed in
+    /// two steps. The pending run now reads like the finished turn's row until its record
+    /// attaches, and `Checking` arrives together with the rows it will run.
+    #[test]
+    fn entering_check_changes_the_status_height_once() -> Result<()> {
+        use crate::session::state_machine::{SessionPhase, WorkflowActivity};
+        let clock = Arc::new(ManualClock(std::sync::atomic::AtomicI64::new(1_000)));
+        let mut owner = SessionPresentation::with_clock("session".into(), clock.clone());
+        owner.initialize(vec![TimelineEntry::Status {
+            id: "session:status".into(),
+            created_at_ms: 0,
+            status: SessionPhase::Working {
+                duration_ms: 0,
+                started_at_ms: None,
+                activity: WorkflowActivity::ChecksStarting,
+                reasoning_summary: None,
+                execution: None,
+            },
+            status_thoughts: false,
+            agents: Vec::new(),
+            checks: None,
+        }])?;
+        let document = DocumentId("entering-check".into());
+        owner.open(
+            document.clone(),
+            ViewId("entering-check-view".into()),
+            WidthProfile::default(),
+        )?;
+        let status_rows = |owner: &mut SessionPresentation| -> Result<Vec<String>> {
+            let revision = owner
+                .document(&document)?
+                .sections
+                .document
+                .document
+                .revision();
+            let synced = owner.sync(&document, revision)?;
+            Ok(synced
+                .status
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .map(str::to_owned)
+                .collect())
+        };
+        let pending = status_rows(&mut owner)?;
+        assert_eq!(
+            pending,
+            ["Working · 0s"],
+            "the pending run read as Checking"
+        );
+        let command = |id: &str| {
+            serde_json::json!({"id":id, "command":id, "state":"pending", "selected":true,
+                "started_at_ms":null, "completed_at_ms":null, "exit_code":null, "error":null,
+                "stdout":"unused", "stderr":"unused", "output":"unused", "output_bytes":0,
+                "preview":""})
+        };
+        let run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
+            "id":"run", "owner":{"kind":"session","session_id":"session"},
+            "revision":0, "shell":"system", "executable":null, "workspace":".",
+            "environment_digest":"fixture", "started_at_ms":1_000, "completed_at_ms":null,
+            "state":"running", "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null, "workspace_digest":{},
+            "commands":[command("typecheck"), command("lint")]
+        }))?;
+        owner.update_checks(&run)?;
+        let checking = status_rows(&mut owner)?;
+        assert!(
+            checking[0].starts_with("Checking · 0s") && checking.len() == 4,
+            "the run's first record did not bring Checking and its rows together: {checking:?}"
+        );
+        Ok(())
+    }
+
     fn interaction_entry(identity: &str) -> TimelineEntry {
         let mut interaction = Exchange {
             finalization_error: None,
             collection: None,
+            cancellation_requested: false,
             check_owner: None,
             output_store: None,
             archived_output: Default::default(),
@@ -3472,6 +3635,67 @@ mod tests {
             agent_by_id: HashMap::new(),
             exchange: (interaction).into(),
         }
+    }
+
+    /// `Enter` on a spawn row opens its child even when the transcript changed after the editor
+    /// captured the row. While children run, their events revise the transcript several times a
+    /// second, so the captured revision is usually older than the current one; the input was then
+    /// refused as "transcript input revision changed" and nothing opened.
+    #[test]
+    fn spawn_row_opens_its_child_after_the_transcript_changes() -> Result<()> {
+        let mut entry = interaction_entry("parent");
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        let delegation = crate::agent::Delegation {
+            id: "delegation".into(),
+            parent_exchange_id: "parent".into(),
+            parent_turn_id: None,
+            child_agent_id: "child-agent".into(),
+            child_exchange_id: "child-exchange".into(),
+            task: "Inspect the parser".into(),
+            created_at_ms: 0,
+        };
+        // Children run while their parent waits for them, so the parent's thought stays open.
+        exchange.phase = crate::exchange::ExchangePhase::Running;
+        exchange
+            .node_list
+            .push(crate::exchange::ExchangeNode::AgentReference { agent: delegation });
+        let document = DocumentId("timeline:spawn".into());
+        let view = ViewId("timeline:spawn:view".into());
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry.clone()])?;
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let captured = owner.snapshot(&document)?;
+        let spawn = captured
+            .block
+            .iter()
+            .find(|block| block.text.wire_rows()[0].starts_with("◇ Spawned"))
+            .context("spawn row is missing")?;
+        let target = spawn
+            .metadata
+            .target
+            .first()
+            .map(|target| target.id.clone())
+            .context("spawn row has no action target")?;
+        owner.reconcile(vec![entry, interaction_entry("later")])?;
+        let current = owner.snapshot(&document)?;
+        assert!(current.revision > captured.revision);
+        let action = owner.action(DocumentInput {
+            document: document.clone(),
+            revision: captured.revision,
+            view,
+            sequence: InputSequence(1),
+            action: "activate".into(),
+            block: spawn.id.clone(),
+            position: forge_buffer::block::TextPosition { row: 0, column: 0 },
+            target: Some(target),
+        })?;
+        assert!(
+            matches!(&action, TranscriptAction::Agent { run_id } if run_id == "child-agent"),
+            "{action:?}"
+        );
+        Ok(())
     }
 
     /// The status section shows each steering message once, from staging through acknowledgement,

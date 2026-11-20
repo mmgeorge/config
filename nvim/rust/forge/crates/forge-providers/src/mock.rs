@@ -1936,6 +1936,7 @@ impl MockProvider {
         let session = self
             .binding(binding, ProviderOperation::ThreadRewind)
             .await?;
+        self.control.arrive_rewind(&session.owner).await?;
         let _admission = session.admission.lock().await;
         ensure_open(&session, ProviderOperation::ThreadRewind)?;
         if session.active.lock().await.is_some() {
@@ -2467,7 +2468,15 @@ struct ResponseHold {
     owner: ThreadId,
     any_owner: bool,
     mode: Option<ExecutionMode>,
+    operation: HeldOperation,
     state: watch::Sender<HoldState>,
+}
+
+/// Name the native operation a test hold stops at.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HeldOperation {
+    Prompt,
+    Rewind,
 }
 
 #[derive(Default)]
@@ -2528,6 +2537,26 @@ impl MockControl {
     fn remove(&self, id: &TestHoldId) {
         self.holds.lock().unwrap().retain(|hold| hold.id != *id);
     }
+
+    /// Wait at the owner's armed rewind hold, if a test armed one.
+    async fn arrive_rewind(&self, owner: &ThreadId) -> Result<(), ProviderError> {
+        let hold = self
+            .holds
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|hold| {
+                hold.operation == HeldOperation::Rewind
+                    && hold.owner == *owner
+                    && matches!(*hold.state.borrow(), HoldState::Armed)
+            })
+            .cloned();
+        let Some(hold) = hold else {
+            return Ok(());
+        };
+        self.arrive_hold(hold, owner, ExecutionMode::Default, String::new())
+            .await
+    }
 }
 
 #[async_trait]
@@ -2549,6 +2578,26 @@ impl ProviderTestControl for MockControl {
                     owner: owner.clone(),
                     any_owner,
                     mode,
+                    operation: HeldOperation::Prompt,
+                    state,
+                }));
+                Ok(TestControlResult::Held { id })
+            }
+            TestControlCommand::HoldRewind => {
+                let id = TestHoldId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| {
+                    failure(
+                        ProviderOperation::ThreadRewind,
+                        ProviderFailureKind::Unknown,
+                    )
+                })?;
+                let (state, _) = watch::channel(HoldState::Armed);
+                self.holds.lock().unwrap().push_back(Arc::new(ResponseHold {
+                    scripted: false,
+                    id: id.clone(),
+                    owner: owner.clone(),
+                    any_owner: false,
+                    mode: None,
+                    operation: HeldOperation::Rewind,
                     state,
                 }));
                 Ok(TestControlResult::Held { id })
@@ -2602,6 +2651,7 @@ impl ProviderTestControl for MockControl {
                             owner: owner.clone(),
                             any_owner: false,
                             mode: None,
+                            operation: HeldOperation::Prompt,
                             state,
                         }));
                     }
@@ -2653,6 +2703,7 @@ impl ProviderTestControl for MockControl {
                 .iter()
                 .find(|hold| {
                     !hold.scripted
+                        && hold.operation == HeldOperation::Prompt
                         && (hold.any_owner || hold.owner == *owner)
                         && hold.mode.is_none_or(|expected| expected == mode)
                         && matches!(*hold.state.borrow(), HoldState::Armed)
@@ -3219,8 +3270,27 @@ async fn run_prompt_inner(
             TestPromptStep::FileWrite { path, text } => {
                 run_file_write(&session, request, &sink, &turn, path, text).await?;
             }
-            TestPromptStep::NativeSubagent { name, text } => {
-                run_native_subagent(&session, request, &sink, &turn, name, text).await?;
+            TestPromptStep::NativeSubagent {
+                name,
+                text,
+                finishes_after_cancel,
+            } => {
+                let cancellation = finishes_after_cancel.then_some(&mut cancelled);
+                run_native_subagent(&session, request, &sink, &turn, name, text, cancellation)
+                    .await?;
+                if finishes_after_cancel {
+                    retain_terminal(
+                        &session,
+                        &sink,
+                        &scope,
+                        Some(turn),
+                        TurnOutcome::Interrupted,
+                        &progress.covered,
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
             TestPromptStep::FileRead { path } => {
                 ensure_open(&session, ProviderOperation::TurnStart)?;
@@ -3518,6 +3588,9 @@ fn directory_planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPr
 /// that call. The child opens its own turn, reads a file behind a permission request made under
 /// its own authority, and reports its completion from inside its own scope before its turn
 /// terminal. The delegating call completes last.
+///
+/// With `cancellation`, the child waits after its read until the delegating turn is cancelled,
+/// so its response and finish reach the host only after the cancel request.
 async fn run_native_subagent(
     session: &MockSession,
     request: &PromptRequest,
@@ -3525,6 +3598,7 @@ async fn run_native_subagent(
     turn: &TurnAddress,
     name: String,
     text: String,
+    cancellation: Option<&mut watch::Receiver<bool>>,
 ) -> Result<(), ProviderError> {
     ensure_open(session, ProviderOperation::TurnStart)?;
     let protocol = || failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
@@ -3658,6 +3732,10 @@ async fn run_native_subagent(
             })),
         })
         .await?;
+    if let Some(cancelled) = cancellation {
+        // A closed channel means the invocation ended; the child reports its output either way.
+        let _ = cancelled.wait_for(|value| *value).await;
+    }
     let item_id =
         ItemId::new(uuid::Uuid::new_v4().to_string()).expect("allocated item ID is nonempty");
     writer

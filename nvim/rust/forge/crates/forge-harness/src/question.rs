@@ -2081,9 +2081,9 @@ pub(crate) fn project(
             .copied();
         placement.entry(exchange.id.clone()).or_default().push((
             anchor,
-            crate::exchange::ExchangeNode::QuestionPresented {
-                id: format!("question:{}", question.id.as_str()),
-                question: crate::plan::PlanQuestionSet {
+            crate::exchange::ExchangeNode::projected_question(
+                question.id.as_str(),
+                crate::plan::PlanQuestionSet {
                     id: question.id.as_str().into(),
                     questions: vec![crate::plan::PlanQuestion {
                         id: question.id.as_str().into(),
@@ -2111,7 +2111,7 @@ pub(crate) fn project(
                     }],
                 },
                 answer,
-            },
+            ),
         ));
     }
     for exchange in exchanges.iter_mut() {

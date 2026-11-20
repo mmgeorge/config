@@ -849,37 +849,15 @@ impl PlanReferenceIndex {
                 .map_err(|error| anyhow::anyhow!("Algorithm rename token changed: {error:#}"))?
                 .apply();
         }
-        let index = DeclarationIndex::extract(&definition_path, &parsed.proposed[&definition_path])
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         ensure!(
-            !index.symbol.iter().any(|candidate| candidate.name == name
-                && (!definition_path.ends_with(".rs") || candidate.property == symbol.property)
-                && same_scope(&candidate.scope, &symbol.scope))
-                && !index.import.iter().any(|import| !import.export
-                    && import.alias.as_deref() == Some(name)
-                    && same_scope(&import.scope, &symbol.scope)),
+            !names_in_scope(
+                &definition_path,
+                &original_parsed.proposed[&definition_path],
+                &symbol
+            )?
+            .contains(name),
             "`{name}` already exists in this scope"
         );
-        if definition_path.ends_with(".lua") {
-            let owner = symbol
-                .scope
-                .iter()
-                .cloned()
-                .chain(std::iter::once(name.to_owned()))
-                .collect::<Vec<_>>()
-                .join(".");
-            ensure!(
-                !DeclarationCalls::extract(
-                    &definition_path,
-                    &parsed.proposed[&definition_path],
-                    true
-                )
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?
-                .iter()
-                .any(|function| function.owner.replace(':', ".") == owner),
-                "`{name}` already exists in this scope"
-            );
-        }
         let mut edits = BTreeMap::<String, BTreeSet<(u32, u32)>>::new();
         edits
             .entry(definition_path.clone())
@@ -1160,6 +1138,51 @@ fn planned_module(
     ]
     .into_iter()
     .find(|candidate| candidate != importer && files.contains_key(candidate))
+}
+
+/// Collect the names a rename of `symbol` collides with in its scope of the proposed file at
+/// `definition_path`: declarations (in Rust, only those of the same item or property kind), local
+/// import aliases, and Lua function owners. The proposed file holds every declaration of the
+/// module, so the set covers names the workspace file already declares as well as names the plan
+/// adds. It includes the symbol's own name.
+pub(crate) fn names_in_scope(
+    definition_path: &str,
+    proposed: &str,
+    symbol: &forge_diff::syntax::DeclarationSymbol,
+) -> Result<BTreeSet<String>> {
+    let index = DeclarationIndex::extract(definition_path, proposed)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let mut names = index
+        .symbol
+        .iter()
+        .filter(|candidate| {
+            (!definition_path.ends_with(".rs") || candidate.property == symbol.property)
+                && same_scope(&candidate.scope, &symbol.scope)
+        })
+        .map(|candidate| candidate.name.clone())
+        .chain(
+            index
+                .import
+                .iter()
+                .filter(|import| !import.export && same_scope(&import.scope, &symbol.scope))
+                .filter_map(|import| import.alias.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    if definition_path.ends_with(".lua") {
+        let scope = symbol.scope.join(".");
+        for function in DeclarationCalls::extract(definition_path, proposed, true)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?
+        {
+            let owner = function.owner.replace(':', ".");
+            let name = match owner.rsplit_once('.') {
+                Some((owner_scope, name)) if owner_scope == scope => name,
+                None if scope.is_empty() => owner.as_str(),
+                _ => continue,
+            };
+            names.insert(name.to_owned());
+        }
+    }
+    Ok(names)
 }
 
 fn same_scope(previous: &[String], proposed: &[String]) -> bool {
@@ -1463,6 +1486,73 @@ export function moneySplit(amount: Money): Money[];
         let mut document = crate::plan::test_fixture("plan", "Allocation");
         document.design = Some(design);
         document
+    }
+
+    /// The allocation plan as a change to an existing `src/money.ts` that already declares
+    /// `moneyShare`: the plan adds `moneyAllocate` and `moneySplit` beside it.
+    pub(in crate::plan) fn existing_module_allocation_plan() -> crate::plan::PlanDocument {
+        let mut document = allocation_plan();
+        let design = document.design.as_mut().unwrap();
+        design.document.background = "Money can already be shared by basis points.".into();
+        let existing = "/** Take a share of an amount in basis points. */
+export function moneyShare(amount: Money, basisPoints: number): Money;
+";
+        design.baseline.insert(
+            "src/money.ts".into(),
+            crate::plan::DeclarationFile {
+                text: existing.into(),
+                source_digest: crate::plan::digest(existing.as_bytes()),
+                editable_text: existing.into(),
+            },
+        );
+        design
+            .proposed_source
+            .get_mut("src/money.ts")
+            .unwrap()
+            .push_str(&format!(
+                "
+{existing}"
+            ));
+        // The fingerprint covers the baseline too, so the parsed structure is derived after it.
+        design.parsed = Some(crate::plan::ParsedDeclarations {
+            source_fingerprint: design.source_fingerprint().unwrap(),
+            proposed: design.proposed_source.clone(),
+            ..crate::plan::ParsedDeclarations::default()
+        });
+        document
+    }
+
+    fn allocate_identity(index: &PlanReferenceIndex) -> String {
+        index
+            .definition
+            .iter()
+            .find(|((path, line, _), _)| path == "src/money.ts" && *line == 2)
+            .map(|(_, (identity, _))| identity.clone())
+            .unwrap()
+    }
+
+    /// Renaming a planned declaration to a name its module already has is refused with only that
+    /// reason, whether the workspace file already declares the name or the plan adds it.
+    #[test]
+    fn rename_refuses_a_name_that_exists_in_the_module() {
+        let workspace = tempfile::tempdir().unwrap();
+        let document = existing_module_allocation_plan();
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let identity = allocate_identity(&index);
+        let refusal = ["moneyShare", "moneySplit"].map(|name| {
+            index
+                .renamed(&document, &identity, name)
+                .err()
+                .map(|error| error.to_string())
+        });
+        assert_eq!(
+            refusal,
+            [
+                Some("`moneyShare` already exists in this scope".to_owned()),
+                Some("`moneySplit` already exists in this scope".to_owned()),
+            ]
+        );
+        assert!(index.renamed(&document, &identity, "moneyPortion").is_ok());
     }
 
     /// A rename rewrites the identifier wherever the plan names it as a whole identifier: inside

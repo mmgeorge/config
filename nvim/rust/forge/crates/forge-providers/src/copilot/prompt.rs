@@ -32,7 +32,6 @@ pub struct TurnOptions {
     /// Confirm the exact journaled input transport handoff independently of acceptance.
     pub dispatch: Option<forge_provider_api::submission::DispatchReporter>,
     pub submission_id: Option<forge_provider_api::SubmissionId>,
-    pub background_compaction_observed: bool,
     pub accepted: Option<tokio::sync::oneshot::Sender<std::result::Result<(), ProviderError>>>,
 }
 
@@ -358,10 +357,6 @@ pub async fn run(
                             output,
                             sink,
                         ).await?;
-                        continue;
-                    }
-                    if matches!(provider_event.event_type.as_str(), "session.compaction_start" | "session.compaction_complete")
-                        && options.background_compaction_observed && provider_event.agent_id.is_none() {
                         continue;
                     }
                     if provider_event.agent_id.is_none() && provider_event.event_type == "assistant.turn_start" {

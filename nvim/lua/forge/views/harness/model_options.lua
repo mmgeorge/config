@@ -23,6 +23,30 @@ function M.label(models, id, saved_label)
   return saved_label or id
 end
 
+--- Name the thinking level a provider uses for `effort` on `model`. A `default` selection sends no
+--- level, so the provider applies its own default: the catalog's `default_reasoning` when it names
+--- one of the model's levels, and an unnamed provider default otherwise, which reads `default`.
+---@param model table?
+---@param effort string?
+---@return string
+function M.thinking(model, effort)
+  if effort and effort ~= "default" then return effort end
+  local default_reasoning = model and model.default_reasoning
+  if default_reasoning and vim.tbl_contains(model.reasoning or {}, default_reasoning) then return default_reasoning end
+  return "default"
+end
+
+--- List the thinking choices offered for `model`, in provider order. A model whose provider
+--- default is not one of its named levels also offers `default`, first, so the choice the session
+--- holds is always one the picker and the effort keys can show and return to.
+---@param model table?
+---@return string[]
+function M.reasoning_choices(model)
+  local reasoning = model and model.reasoning or {}
+  if #reasoning == 0 or M.thinking(model, "default") ~= "default" then return vim.deepcopy(reasoning) end
+  return vim.list_extend({ "default" }, reasoning)
+end
+
 ---@param model table?
 ---@param capability table
 ---@return string[]

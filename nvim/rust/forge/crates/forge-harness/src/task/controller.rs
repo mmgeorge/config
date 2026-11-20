@@ -807,6 +807,10 @@ impl SessionTaskController {
                     ));
                 }
                 let previous = task.clone();
+                let observed_turn = format!(
+                    "{}:{}",
+                    completed_turn.exchange_ordinal, completed_turn.turn_ordinal
+                );
                 if let Some((checkpoint, previous_id)) = &workspace {
                     let WorkflowSnapshot::Goal { goal } = &mut task.workflow else {
                         anyhow::bail!("workspace evidence requires a Goal task");
@@ -903,6 +907,19 @@ impl SessionTaskController {
                     continuation,
                 });
                 let mut effects = crate::storage::TaskEffects::default();
+                if let Some(message) = blocked_notice(task, decision, control) {
+                    effects.event.push(crate::timeline::SessionEventRecord {
+                        id: format!(
+                            "{}:task-blocked:{}:{observed_turn}",
+                            self.session_id,
+                            task.id.as_str()
+                        ),
+                        session_id: self.session_id.clone(),
+                        owner: crate::timeline::TimelineOwner::session(&self.session_id),
+                        created_at_ms: now_ms,
+                        detail: crate::timeline::SessionEventKind::TaskAdvancement { message },
+                    });
+                }
                 if task.status().terminal() {
                     let outcome = super::TaskOutcome {
                         id: task.id.clone(),
@@ -2118,6 +2135,12 @@ impl SessionTaskController {
                     ),
                     "plan acceptance requires a Plan or Execute task"
                 );
+                // Each enablement is a new acceptance decision with its own operation identity;
+                // repeating `/plan accept on` while it is on keeps the identity unchanged.
+                if enabled && !task.auto_accept_plan {
+                    task.plan_acceptance_enablement =
+                        task.plan_acceptance_enablement.saturating_add(1);
+                }
                 task.auto_accept_plan = enabled;
                 // Turning automatic acceptance off withdraws an acceptance still waiting for
                 // its execution answers, so no question the user never asked for stays
@@ -2432,6 +2455,35 @@ fn outcome_effect(
         WorkflowSnapshot::Goal { .. } => {}
     }
     effects
+}
+
+/// Explain why a Goal or Execute task stopped continuing and what the user can do next.
+///
+/// The winbar only reads `blocked`, so the transcript row carries the cause: the model's own
+/// report, the total turn allowance, or the run of turns without workspace progress. Either
+/// stop is recoverable: `/task resume` starts a new allowance and `/task clear` ends the task.
+/// The status row names the same cause through [`super::Task::blocked_cause`].
+fn blocked_notice(
+    task: &super::active::TaskSnapshot,
+    decision: crate::goal::ContinuationDecision,
+    control: Option<&crate::goal::GoalControl>,
+) -> Option<String> {
+    let label = match &task.workflow {
+        WorkflowSnapshot::Goal { .. } => "Goal",
+        WorkflowSnapshot::Execute { .. } => "Execution",
+        WorkflowSnapshot::Plan { .. } => return None,
+    };
+    if !matches!(
+        decision,
+        crate::goal::ContinuationDecision::Blocked | crate::goal::ContinuationDecision::Stalled
+    ) {
+        return None;
+    }
+    let cause = super::state::suspension_reason(&task.workflow, TaskStatus::Blocked)
+        .blocked_cause(control.map(|control| control.message.as_str()))?;
+    Some(format!(
+        "{label} blocked: {cause}. Run /task resume to continue with a new allowance, or /task clear to end it."
+    ))
 }
 
 fn goal_view(task: &super::active::TaskSnapshot) -> Result<super::GoalSnapshot> {

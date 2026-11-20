@@ -129,22 +129,31 @@ pub(crate) struct ResumeRequest {
 }
 
 impl SessionCommand {
+    /// Get the acceptance a reviewer already decided for the submission now in review.
+    ///
+    /// An acceptance recorded while the task was paused, or one that first sent saved comments
+    /// back for revision, runs once the task can act on it, with the decision the reviewer
+    /// already made. A refused acceptance clears the record, so it never runs twice.
+    pub(crate) fn recorded_acceptance(task: &super::Task) -> Option<&ExecuteSelection> {
+        let super::WorkflowSnapshot::Plan { plan } = &task.workflow else {
+            return None;
+        };
+        if plan.paused || plan.artifact.state != crate::plan::PlanState::AwaitingReview {
+            return None;
+        }
+        plan.artifact
+            .review
+            .as_ref()
+            .and_then(|review| review.execution_request.as_ref())
+            .filter(|request| request.approval_mode.is_some())
+    }
+
     /// Promote a current full submission when the task enables automatic acceptance.
     pub(crate) fn approved_revision(task: &super::Task) -> Result<Option<Self>> {
         let super::WorkflowSnapshot::Plan { plan } = &task.workflow else {
             return Ok(None);
         };
-        // An acceptance recorded while the task was paused runs once the task resumes, with
-        // the decision the reviewer already made.
-        if !plan.paused
-            && plan.artifact.state == crate::plan::PlanState::AwaitingReview
-            && let Some(request) = plan
-                .artifact
-                .review
-                .as_ref()
-                .and_then(|review| review.execution_request.as_ref())
-                .filter(|request| request.approval_mode.is_some())
-        {
+        if let Some(request) = Self::recorded_acceptance(task) {
             return Ok(Some(Self {
                 operation_id: format!(
                     "recorded-acceptance:{}:{}:{}",
@@ -170,9 +179,14 @@ impl SessionCommand {
         }
         let choice = task.plan_execution.as_ref();
         Ok(Some(Self {
+            // The enablement count separates an acceptance that `/plan accept off` withdrew
+            // from the one a later `/plan accept on` starts for the same revision.
             operation_id: format!(
-                "review-revision:{}:{}:{}",
-                plan.artifact.id, plan.artifact.user_revision, plan.artifact.model_revision
+                "review-revision:{}:{}:{}:{}",
+                plan.artifact.id,
+                plan.artifact.user_revision,
+                plan.artifact.model_revision,
+                task.plan_acceptance_enablement
             ),
             action: SessionAction::Execute {
                 selection: ExecuteSelection {
@@ -556,6 +570,15 @@ mod tests {
             SessionCommand::approved_revision(&super::super::Task::try_from(task.clone())?)?
                 .unwrap()
                 .operation_id
+        );
+        let mut enabled_again = task.clone();
+        enabled_again.plan_acceptance_enablement += 1;
+        assert_ne!(
+            command.operation_id,
+            SessionCommand::approved_revision(&super::super::Task::try_from(enabled_again)?)?
+                .unwrap()
+                .operation_id,
+            "a later enablement must not replay the earlier acceptance"
         );
         let super::super::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
             unreachable!()

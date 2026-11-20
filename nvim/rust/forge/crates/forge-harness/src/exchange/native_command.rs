@@ -284,7 +284,7 @@ impl NativeCommandRun {
                 let NativeWork::Compaction(compaction) = &mut self.work else {
                     unreachable!("compaction facts belong to the active compaction work")
                 };
-                match compaction.update(event, broker, can_commit)? {
+                match compaction.update(event, broker, can_commit, self.selected.as_ref())? {
                     CompactionProgress::Collect(children) => {
                         self.begin_collection(children, foreground, services)
                     }

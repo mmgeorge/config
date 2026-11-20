@@ -1850,6 +1850,7 @@ fn normalize_compaction(update: &Value, thread_id: &str) -> Option<Compaction> {
             conversation_tokens: None,
             system_tokens: None,
             tool_definitions_tokens: None,
+            provider_explanation: None,
         },
     })
 }

@@ -69,6 +69,7 @@ M.empty_diff_rows = {}
 ---@field ready boolean
 ---@field unsubscribe? fun()
 ---@field switching_provider? boolean
+---@field switch_notice? string Status text while a provider switch or reconnect replaces this view's host.
 ---@field state_sync_pending? table Identity of the one active snapshot read.
 ---@field aborting_plan? boolean
 ---@field session table?
@@ -85,6 +86,7 @@ M.empty_diff_rows = {}
 ---@field capability table
 ---@field model_list table[]?
 ---@field model_provider string?
+---@field model_list_provisional? boolean `model_list` is the provider's latest catalog from another session, held until this session's own arrives.
 ---@field render_rows table<integer, table>
 ---@field fold_installed table<string, boolean>
 ---@field activity_expanded table<string, boolean>

@@ -262,12 +262,12 @@ impl TraceWriter {
         level: tracing::Level,
     ) -> TraceAdmission {
         let result = self.admit(admission, session_id, event, payload, level);
+        // Count only records the writer failed to keep. A verbose record that yields to another
+        // producer and a record from a logging period that a clear or level change ended are
+        // designed omissions; the `trace.loss` summary still reports both.
         if matches!(
             result,
-            TraceAdmission::Saturated
-                | TraceAdmission::Contended
-                | TraceAdmission::Obsolete
-                | TraceAdmission::EncodingFailed
+            TraceAdmission::Saturated | TraceAdmission::EncodingFailed
         ) {
             self.shared
                 .rejected_record_count
@@ -341,7 +341,8 @@ impl TraceWriter {
         }
     }
 
-    /// Get cumulative rejected diagnostics without consuming loss summaries.
+    /// Get cumulative diagnostics lost to a full queue or a failed encoding, without consuming
+    /// loss summaries.
     pub(super) fn rejected_record_count(&self) -> u64 {
         self.shared.rejected_record_count.load(Ordering::Acquire)
     }
@@ -960,4 +961,32 @@ pub(super) fn session_path(root: &Path, session_id: &str) -> PathBuf {
     crate::storage::state::directory(root)
         .join("logs")
         .join(format!("{name}.jsonl"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A verbose record that yields to another producer is a designed omission, not a lost record.
+    ///
+    /// The log viewer's header counted every such yield as a rejected record, so an ordinary
+    /// Trace session reported "23 records rejected" although nothing failed to be written.
+    #[test]
+    fn yielded_verbose_records_are_not_counted_as_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = TraceWriter::open(directory.path()).unwrap();
+        writer.configure(LogLevel::Trace, false).unwrap();
+        let admission = Admission::new();
+        let held = admission.commit.lock().unwrap();
+        let result = writer.record(
+            &admission,
+            "session",
+            "verbose",
+            &json!({}),
+            tracing::Level::TRACE,
+        );
+        drop(held);
+        assert_eq!(result, TraceAdmission::Contended);
+        assert_eq!(writer.rejected_record_count(), 0);
+    }
 }

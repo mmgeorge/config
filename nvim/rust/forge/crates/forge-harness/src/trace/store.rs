@@ -17,7 +17,9 @@ pub struct TraceStatus {
     pub level: LogLevel,
     pub path: String,
     pub configured: bool,
-    /// Count rejected optional diagnostics independently of execution outcomes.
+    /// Count diagnostics lost to a full queue or a failed encoding, independently of execution
+    /// outcomes. Verbose records that yield to another producer are designed omissions and are
+    /// not counted.
     pub rejected_record_count: u64,
 }
 

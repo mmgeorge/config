@@ -100,6 +100,55 @@ async fn session_list_reports_live_ownership() -> Result<()> {
     Ok(())
 }
 
+/// A session that `session.new` created is listed, as loaded, by the next listing.
+#[tokio::test]
+async fn session_list_includes_a_session_new_created() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let host = service();
+    host.open_session(1, initialize(&fixture, "mock")).await?;
+    let registry = host.registry().await?;
+    let source = registry.initial_session_id().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    host.dispatch(
+        Some(source.clone()),
+        Request {
+            id: 2,
+            method: "session.new".into(),
+            params: json!({"source_session_id": source}),
+        },
+        &sink,
+    )
+    .await?;
+    let created = response_for(&mut output, 2).await?;
+    let created_id = created["result"]["session"]["id"]
+        .as_str()
+        .with_context(|| format!("created session missing: {created}"))?
+        .to_owned();
+    for (request_id, scope) in [(3, "repo"), (4, "all")] {
+        host.dispatch(
+            None,
+            Request {
+                id: request_id,
+                method: "session.list".into(),
+                params: json!({"scope": scope, "workspace": fixture.path()}),
+            },
+            &sink,
+        )
+        .await?;
+        let response = response_for(&mut output, request_id).await?;
+        let entries = response["result"]
+            .as_array()
+            .with_context(|| format!("session list missing: {response}"))?;
+        let created_entry = entries
+            .iter()
+            .find(|entry| entry["id"] == created_id)
+            .with_context(|| format!("new session missing from the {scope} list: {response}"))?;
+        assert_eq!(created_entry["active"], true);
+    }
+    host.shutdown(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
 /// A deletion that fails after it stopped the target's input evicts that controller, so the
 /// session answers requests again and a retried deletion succeeds.
 #[tokio::test]

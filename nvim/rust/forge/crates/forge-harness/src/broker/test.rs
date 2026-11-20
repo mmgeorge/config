@@ -817,6 +817,7 @@ pub(super) fn completed_interaction(
         approval_mode: None,
         finalization_error: None,
         collection: None,
+        cancellation_requested: false,
         check_owner: None,
         output_store: None,
         archived_output: Default::default(),

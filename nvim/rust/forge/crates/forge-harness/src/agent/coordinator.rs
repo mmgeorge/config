@@ -507,6 +507,7 @@ impl AgentAdmission {
                     active_task_id: admission.task.id.clone(),
                     pending: VecDeque::new(),
                     cancellation,
+                    interrupted_by: None,
                     cleanup_failed: false,
                     repository: None,
                 },
@@ -563,6 +564,8 @@ struct ChildExecution {
     active_task_id: String,
     pending: VecDeque<String>,
     cancellation: watch::Sender<bool>,
+    /// Who requested the active task's interruption, so its report can name the cancel.
+    interrupted_by: Option<AgentSource>,
     cleanup_failed: bool,
     repository: Option<Arc<crate::repository_access::RepositoryReservation>>,
 }
@@ -1151,6 +1154,16 @@ impl AgentCoordinator {
         Ok(execution.cancellation.subscribe())
     }
 
+    /// Report who interrupted the child's active task, or `None` when no interrupt was requested.
+    pub fn interruption(&self, agent_id: &str, task_id: &str) -> Option<AgentSource> {
+        let state = self.state.lock().expect("agent state poisoned");
+        state
+            .execution_by_agent
+            .get(agent_id)
+            .filter(|execution| execution.active_task_id == task_id)
+            .and_then(|execution| execution.interrupted_by)
+    }
+
     /// Capture one child identity and its latest task under the coordinator lock.
     pub(crate) fn capture_target(&self, target: &str) -> Result<AgentTarget> {
         let state = self.state.lock().expect("agent state poisoned");
@@ -1223,7 +1236,8 @@ impl AgentCoordinator {
         Ok((agent, task))
     }
 
-    pub fn interrupt(&self, target: &str) -> Result<Vec<AgentTask>> {
+    /// Interrupt a child's active task and cancel its queued tasks on behalf of `source`.
+    pub fn interrupt(&self, target: &str, source: AgentSource) -> Result<Vec<AgentTask>> {
         let mut state = self.state.lock().expect("agent state poisoned");
         let agent = resolve_agent(&state, &self.session_id, target)?.clone();
         let queued: Vec<_> = state
@@ -1246,6 +1260,7 @@ impl AgentCoordinator {
         let Some(execution) = state.execution_by_agent.get_mut(&agent.id) else {
             return Ok(queued);
         };
+        execution.interrupted_by.get_or_insert(source);
         execution.cancellation.send_replace(true);
         let pending: Vec<_> = execution.pending.drain(..).collect();
         for id in &pending {
@@ -1631,6 +1646,7 @@ impl AgentCoordinator {
                 active_task_id: task.id.clone(),
                 pending,
                 cancellation,
+                interrupted_by: None,
                 cleanup_failed: false,
                 repository: None,
             },

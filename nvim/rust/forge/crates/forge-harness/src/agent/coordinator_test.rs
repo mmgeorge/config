@@ -138,7 +138,9 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
             .reserve_followup(&overflow, &first.agent.id, "next task", "parent", 2)
             .is_err()
     );
-    let cancelled = coordinator.interrupt(&first.agent.id).unwrap();
+    let cancelled = coordinator
+        .interrupt(&first.agent.id, AgentSource::User)
+        .unwrap();
     assert_eq!(cancelled.len(), MAX_PENDING_TASKS);
     assert!(*cancellation.borrow());
     assert!(

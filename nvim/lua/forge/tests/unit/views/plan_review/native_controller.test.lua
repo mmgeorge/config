@@ -754,7 +754,7 @@ end
 T["a rename shows its preview before applying and raises no notice"] = function()
   local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
   local plan_host = plan_review_host.start({ lines = { "pub struct Sample;", "pub fn sample() -> Sample;" },
-    rename = { symbol = "sample", name = "Sample", preview = {
+    rename = { symbol = "sample", name = "Sample", existing_names = { "Sample" }, preview = {
       { block = "plan:1", column = 11, length = 6 }, { block = "plan:2", column = 19, length = 6 } } } })
   local review = plan_host.open()
   local notices = notify.capture()
@@ -793,6 +793,54 @@ T["a rename shows its preview before applying and raises no notice"] = function(
   eq({ review = require("forge.session").harness.plan_review, owner = review.owner, closed = owner.closed == true },
     { review = review, owner = owner, closed = false })
   eq(notices:messages(), {})
+end
+
+-- The host lists the names that already exist in the renamed declaration's scope with its
+-- preview, those the workspace file declares as well as those the plan adds, so a colliding name
+-- is refused when it is entered, before any confirmation asks the reviewer to decide.
+T["a rename to a name that already exists in its scope is refused before confirmation"] = function()
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local plan_host = plan_review_host.start({ lines = { "pub fn share();", "pub fn sample();" },
+    rename = { symbol = "sample", name = "sample", existing_names = { "sample", "share" }, preview = {
+      { block = "plan:2", column = 7, length = 6 } } } })
+  local review = plan_host.open()
+  local notices = notify.capture()
+  local input, answer
+  stub(require("forge.infra.popup_window"), "incremental_input", function(options, callback) input, answer = options, callback end)
+  local confirmations = 0
+  stub(require("forge.infra.confirm"), "open", function() confirmations = confirmations + 1 end)
+  vim.api.nvim_set_current_win(review.win)
+  vim.api.nvim_win_set_cursor(review.win, { 2, 7 })
+  review.command_set.action_by_id.rename_entity.run({})
+  assert(input, "rename did not ask for the new name")
+  input.on_change("share")
+  answer("share")
+  local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
+  eq({ confirmations = confirmations, requests = #plan_host.requests,
+    preview = #vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, {}), notices = notices:messages() },
+    { confirmations = 0, requests = 0, preview = 0, notices = { "`share` already exists in this scope" } })
+end
+
+-- The name input closes from its own Insert-mode submit key, and the confirmation it opens must
+-- not record that ending Insert mode as the mode to return to: whichever way the reviewer answers,
+-- the review is left in Normal mode.
+T["closing the rename confirmation leaves the review in Normal mode"] = function()
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local plan_host = plan_review_host.start({ lines = { "pub struct Sample;", "pub fn sample() -> Sample;" },
+    rename = { symbol = "sample", name = "Sample", existing_names = { "Sample" }, preview = {
+      { block = "plan:1", column = 11, length = 6 } } } })
+  local review = plan_host.open()
+  vim.keymap.set("n", "<F2>", function() review.command_set.action_by_id.rename_entity.run({}) end, { buffer = review.buf })
+  for _, answer_key in ipairs({ "n", "y" }) do
+    vim.api.nvim_set_current_win(review.win)
+    vim.api.nvim_win_set_cursor(review.win, { 1, 11 })
+    -- A mode change a closing popup requests takes effect at the next key, so the case reads the
+    -- mode from a key typed after the answer, as the reviewer's next key would meet it.
+    vim.api.nvim_feedkeys(vim.keycode("<F2>Portion<CR>" .. answer_key .. "<Cmd>let g:rename_closed_mode = mode(1)<CR><Esc>"), "xt", false)
+    eq({ answer = answer_key, window = vim.api.nvim_get_current_win(), mode = vim.g.rename_closed_mode },
+      { answer = answer_key, window = review.win, mode = "n" })
+  end
+  eq(#plan_host.requests, 1, { fail_reason = "the confirmed rename sent no request" })
 end
 
 -- A review the reviewer hid, or closed, stays out of the way; one notice says the revision is
@@ -847,6 +895,20 @@ T["a new model revision of a closed review is announced once"] = function()
   controller.observe(plan)
   eq(scene.notices:messages(), { "Plan revision 2 is ready · op" })
   eq(require("forge.session").harness.plan_review, nil)
+end
+
+-- A task that accepts plans automatically accepts the new revision without the reviewer, so a
+-- notice inviting them to open it would describe a review that is no longer pending.
+T["a new model revision of a task that accepts plans automatically is not announced"] = function()
+  local scene = question_review()
+  vim.api.nvim_set_current_win(scene.review.win)
+  keymap.feed("q")
+  local harness = require("forge.session").harness
+  harness.session.active_task = { id = "task", kind = "plan", phase = "review", status = "waiting",
+    auto_accept_plan = true, plan = { paused = false, artifact = { title = "Allocate", state = "awaiting_review" } } }
+  local controller = require("forge.views.plan_review.native_controller")
+  controller.observe(scene.host.revise(revised_plan_lines))
+  eq(scene.notices:messages(), {})
 end
 
 -- A refused decision leaves the reviewer in the review with the host's whole reason; the reason

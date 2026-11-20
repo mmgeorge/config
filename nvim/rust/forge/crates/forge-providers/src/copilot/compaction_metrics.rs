@@ -223,6 +223,7 @@ impl From<NativeCompactionResult> for forge_provider_api::compaction::Compaction
             conversation_tokens,
             system_tokens,
             tool_definitions_tokens,
+            provider_explanation: None,
         }
     }
 }

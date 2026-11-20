@@ -4715,7 +4715,6 @@ impl CopilotProvider {
             receipt: Some(request.receipt),
             dispatch: Some(request.dispatch),
             submission_id: Some(submission_id.clone()),
-            background_compaction_observed: true,
             scope: request.scope.clone(),
             accepted: Some(accepted),
         };
@@ -5780,6 +5779,99 @@ mod retained_recovery_tests {
         provider.shutdown(context("warned-shutdown")).await.unwrap();
     }
 
+    /// A manual compaction reports the Harness thread it compacted, publishes one lifecycle
+    /// under the host operation identity, and returns the CLI's refusal in the CLI's words.
+    ///
+    /// The result once named the native Copilot session as its thread, so the host recorded a
+    /// compaction Copilot had performed as failed because its authority changed; the decoder a
+    /// finished turn leaves retained published the notifications a second time under the
+    /// native identity; and "Nothing to compact." arrived as a transport failure.
+    #[tokio::test(start_paused = true)]
+    async fn manual_compaction_reports_its_owner_once_and_the_refusal_in_the_cli_words() {
+        let (provider, opened, _root, _peer) = opened_helper_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+            HelperBehavior::CompleteTurn,
+        )
+        .await;
+        let binding = opened.binding.id;
+        let mut events = opened.events;
+        completed_turn_events(&provider, &binding, &mut events, "before-compaction").await;
+        let owner = provider
+            .binding(&binding, ProviderOperation::ThreadCompact)
+            .await
+            .unwrap()
+            .owner
+            .clone();
+        let compact = |operation: &str| {
+            let request = forge_provider_api::CompactionRequest {
+                scope: forge_provider_api::EventScope::SessionOperation {
+                    thread_id: owner.clone(),
+                    operation_id: forge_provider_api::OperationId::new(operation).unwrap(),
+                },
+            };
+            provider.thread_compact(context(operation), &binding, request)
+        };
+        let compacted = compact("first-compaction").await.unwrap().compaction;
+        assert_eq!(compacted.id, "first-compaction");
+        assert_eq!(compacted.thread_id, owner.as_str());
+        assert_eq!(
+            compacted.state,
+            forge_provider_api::CompactionState::Completed
+        );
+        assert_eq!(compacted.result.tokens_removed, Some(25));
+        assert_eq!(
+            compacted
+                .result
+                .context_window
+                .and_then(|context| context.current_tokens),
+            Some(52024)
+        );
+        let mut observed = Vec::new();
+        while let Some(envelope) = events.try_next().unwrap() {
+            if let ProviderEvent::Thread {
+                event: forge_provider_api::ThreadEvent::CompactionUpdated(compaction),
+                ..
+            } = envelope.event
+            {
+                observed.push((compaction.id.clone(), compaction.state));
+            }
+        }
+        assert_eq!(
+            observed,
+            [
+                (
+                    "first-compaction".to_owned(),
+                    forge_provider_api::CompactionState::Running
+                ),
+                (
+                    "first-compaction".to_owned(),
+                    forge_provider_api::CompactionState::Completed
+                ),
+            ]
+        );
+        let declined = compact("second-compaction").await.unwrap().compaction;
+        assert_eq!(declined.state, forge_provider_api::CompactionState::Failed);
+        assert_eq!(
+            declined
+                .result
+                .provider_explanation
+                .as_ref()
+                .map(forge_provider_api::SanitizedMessage::as_str),
+            Some("Nothing to compact.")
+        );
+        provider
+            .thread_close(context("compaction-close"), &binding)
+            .await
+            .unwrap();
+        provider
+            .shutdown(context("compaction-shutdown"))
+            .await
+            .unwrap();
+    }
+
     #[derive(Clone, Copy)]
     enum AbortAcknowledgement {
         Success,
@@ -5977,6 +6069,7 @@ mod retained_recovery_tests {
             .to_string_lossy()
             .replace('\\', "/");
         let mut send_count = 0_usize;
+        let mut compaction_count = 0_usize;
         let (reader, writer, peer) = super::super::test_peer::streams(move |request| {
             let result = match request["method"].as_str().unwrap() {
                 "status.get" => json!({"version":"1.0.103"}),
@@ -6155,6 +6248,44 @@ mod retained_recovery_tests {
                         return Vec::new();
                     }
                     json!({"cancelled":true})
+                }
+                // The first manual compaction succeeds with the CLI's notifications; the CLI
+                // declines the second because nothing new remains to compact.
+                "session.history.compact" => {
+                    compaction_count += 1;
+                    if compaction_count > 1 {
+                        return vec![json!({"jsonrpc":"2.0","id":request["id"],"error":{
+                            "code":-32603,
+                            "message":"Request session.history.compact failed with message: Nothing to compact."
+                        }})];
+                    }
+                    let notification = |id: &str, parent: &str, kind: &str, data: Value| {
+                        json!({"jsonrpc":"2.0","method":"session.event",
+                        "params":{"sessionId":request["params"]["sessionId"],"event":{"id":id,"parentId":parent,
+                            "type":kind,"timestamp":"2026-11-02T00:00:00Z","data":data}}})
+                    };
+                    return vec![
+                        notification(
+                            "compaction-start",
+                            "native-idle",
+                            "session.compaction_start",
+                            json!({"conversationTokens":649,"systemTokens":9196,"toolDefinitionsTokens":42201}),
+                        ),
+                        notification(
+                            "compaction-complete",
+                            "compaction-start",
+                            "session.compaction_complete",
+                            json!({"success":true,"preCompactionTokens":52049,"postCompactionTokens":52024}),
+                        ),
+                        super::super::test_peer::response(
+                            request,
+                            json!({
+                                "success":true,"tokensRemoved":25,"messagesRemoved":5,
+                                "summaryContent":"Compacted summary",
+                                "contextWindow":{"currentTokens":52024,"tokenLimit":128000,"messagesLength":1}
+                            }),
+                        ),
+                    ];
                 }
                 "session.abort" => {
                     if let Some(aborted) = aborted.take() {

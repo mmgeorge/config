@@ -1731,18 +1731,18 @@ do
     "completed-child interruption must remain scoped to the child")
   state.agent.run[1].task_name = "parser-review"
   state.agent.run[1].created_at_ms = os.time() * 1000
-  state.agent.summary.child = { state = "running", tool_count = 1, failed_count = 0 }
+  state.agent.summary.child = { state = "running", elapsed_ms = 0, tool_label = "1/1 tools" }
   controller.open_agent_picker()
   local picker = require("forge.views.picker")
   local picker_state = require("forge.views.picker.state")
   local picker_instance = picker._state_for_test()
   assert(picker_state.selected_option(picker_instance.state,picker_instance.spec).value.run.id == "child")
   local updated_agent = vim.deepcopy(state.agent)
-  updated_agent.summary.child = { state = "running", tool_count = 7, failed_count = 1 }
+  updated_agent.summary.child = { state = "running", elapsed_ms = 0, tool_label = "6/7 tools" }
   receive("provider_event", {kind="agent_updated",data=updated_agent},"native-controller")
   picker_instance = picker._state_for_test()
   local selected = picker_state.selected_option(picker_instance.state,picker_instance.spec)
-  assert(selected.value.run.id == "child" and selected.detail:find("7 tools called (1 failed)",1,true),
+  assert(selected.value.run.id == "child" and selected.detail:find("6/7 tools",1,true),
     "live agent events must refresh metrics without changing selection or polling state")
   picker.close(true)
   local child_permission = vim.deepcopy(permission)
@@ -4719,6 +4719,59 @@ T["transcript_timeout_recovers_and_ignores_late_response"] = function()
     "MockProvider response did not reach recovered transcript", { errors = errors })
   eq(owner.failure, nil)
   errors:assert_none()
+end
+
+-- requires-forge-host
+T["tabs_left_by_a_stopped_host_reconnect_from_their_own_view"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local workspace = temp.directory("host-reconnect")
+  local client = host.start({ config = true }).client
+  require("forge").setup({ harness = { provider = "mock" } })
+  stub(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  local session = require("forge.session")
+  local controller = require("forge.views.harness.controller")
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  MiniTest.finally(function()
+    for _, state in pairs(session.harness_by_id) do
+      pcall(require("forge.views.harness.workspace").release, state)
+      if state.presentation then pcall(state.presentation.close) end
+    end
+  end)
+  local function live(state)
+    return state.session and not state.host_error and not state.switching_provider
+      and state.presentation and state.presentation.ready and not state.presentation.syncing
+  end
+  require("forge").open_harness()
+  local first = session.harness
+  wait_until(function() return live(first) end, "Harness did not open", { errors = errors })
+  require("forge").new_harness_session()
+  local second = session.harness
+  wait_until(function() return second ~= first and live(second) end, "second session did not open", { errors = errors })
+  local stopped = false
+  client.host_stop(nil, function() stopped = true end)
+  wait_until(function() return stopped end, "host did not stop")
+  eq({ first.host_error ~= nil, second.host_error ~= nil }, { true, true })
+
+  -- A submit from a view whose host stopped reconnects that view and keeps its draft unsent.
+  buffer.set(second.composer_buf, { "draft kept across the reconnect" })
+  controller.submit()
+  wait_until(function() return live(second) end, "submit did not reconnect its view", { errors = errors })
+  eq(buffer.text(second.composer_buf), "draft kept across the reconnect")
+
+  -- `:ForgeHarness` in the other view reconnects it in place, without opening a tab.
+  vim.api.nvim_set_current_tabpage(first.timeline_tab)
+  local tab_count = #vim.api.nvim_list_tabpages()
+  require("forge").open_harness()
+  wait_until(function() return live(first) end, ":ForgeHarness did not reconnect its view", { errors = errors })
+  eq(#vim.api.nvim_list_tabpages(), tab_count)
+  buffer.set(first.composer_buf, { "Reconnected prompt" })
+  controller.submit()
+  wait_until(function() return buffer.text(first.transcript_buf):find("Reconnected prompt", 1, true)
+    and not require("forge.views.harness.activity").busy(first) end,
+    "reconnected view did not run a prompt", { errors = errors })
+  errors:assert_none()
+  eq(host.stop(), true)
 end
 
 return T
