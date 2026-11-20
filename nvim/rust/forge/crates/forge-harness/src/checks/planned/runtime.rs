@@ -112,7 +112,7 @@ pub(in crate::checks) async fn resolve_run(
         .planned_tests
         .as_mut()
         .context("planned inventory missing")?;
-    planned.resolve(before.id.clone(), &inventories);
+    planned.resolve(before.id.clone(), &inventories, &expected.config);
     deadline.check()?;
     if before.id != after.id
         || expected.digest != current.digest

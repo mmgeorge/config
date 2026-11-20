@@ -17,6 +17,9 @@ pub struct TurnInput {
     kind: Box<TurnKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notices: Vec<Notice>,
+    /// Review comments and edits still pending on the plan a discussion message concerns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_review: Option<PendingPlanReview>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     child_results: Vec<AgentResult>,
     /// Other collected checks delivered with the primary check result.
@@ -214,6 +217,26 @@ impl ReviewFeedback {
     }
 }
 
+/// Review comments the user saved and edits the user applied to a plan under review, before
+/// any decision on it.
+///
+/// A plan discussion carries them in the form a revision request uses, so a revision the
+/// discussion leads to keeps the edits and answers the comments.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingPlanReview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    feedback: Option<ReviewFeedback>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    edits: Vec<PlanEdit>,
+}
+
+impl PendingPlanReview {
+    /// Build pending review content, or `None` when there are neither comments nor edits.
+    pub fn new(feedback: Option<ReviewFeedback>, edits: Vec<PlanEdit>) -> Option<Self> {
+        (feedback.is_some() || !edits.is_empty()).then_some(Self { feedback, edits })
+    }
+}
+
 /// Test coverage chosen by a reviewer for one plan check.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -351,6 +374,11 @@ pub enum Notice {
     PermissionTimeout { feedback: String },
     /// The provider removed an interrupted tool-call suffix from its history.
     HistoryRepaired,
+    /// The user cancelled or rejected the previous plan in this conversation, so the new plan
+    /// must not continue it.
+    PlanAbandoned { title: String },
+    /// Harness refused the goal completion the previous turn requested; the goal is still active.
+    GoalCompletionRefused { reason: String },
 }
 
 impl TurnInput {
@@ -363,6 +391,7 @@ impl TurnInput {
         Self {
             kind: Box::new(kind),
             notices: Vec::new(),
+            pending_review: None,
             child_results: Vec::new(),
             additional_check_results: Vec::new(),
         }
@@ -378,6 +407,7 @@ impl TurnInput {
         (!results.is_empty()).then_some(Self {
             kind: Box::new(TurnKind::ChildResults),
             notices: Vec::new(),
+            pending_review: None,
             child_results: results,
             additional_check_results: Vec::new(),
         })
@@ -391,6 +421,22 @@ impl TurnInput {
     /// Get the side conditions this turn carries.
     pub fn notices(&self) -> &[Notice] {
         &self.notices
+    }
+
+    /// Carry the review comments and edits still pending on the plan under review.
+    ///
+    /// Only a plan discussion concerns a plan under review; a decision carries its own
+    /// `PlanReview`, so every other kind is returned unchanged.
+    pub fn with_pending_review(mut self, review: Option<PendingPlanReview>) -> Self {
+        if matches!(*self.kind, TurnKind::PlanDiscussion { .. }) {
+            self.pending_review = review;
+        }
+        self
+    }
+
+    /// Get the review comments and edits a plan discussion carries.
+    pub fn pending_review(&self) -> Option<&PendingPlanReview> {
+        self.pending_review.as_ref()
     }
 
     /// Get the child results this turn reports.
@@ -557,6 +603,9 @@ impl TurnInput {
         if let Some(text) = instructions::for_kind(&self.kind) {
             parts.push(text);
         }
+        if self.pending_review.is_some() {
+            parts.push(instructions::PENDING_REVIEW.into());
+        }
         for notice in &self.notices {
             parts.push(instructions::for_notice(notice));
         }
@@ -594,6 +643,9 @@ impl TurnInput {
             | TurnKind::PermissionTimeout { .. }
             | TurnKind::TaskStep { .. }
             | TurnKind::Background { .. } => {}
+        }
+        if let Some(review) = &self.pending_review {
+            write_plan_review(writer, "pending", review.feedback.as_ref(), &review.edits);
         }
         for result in &self.child_results {
             result.write(writer);
@@ -685,43 +737,12 @@ impl ResolvedQuestions {
 
 impl PlanReview {
     fn write(&self, writer: &mut Writer) {
-        let (decision, feedback, edits) = match self {
-            Self::Accepted { edits } => ("accepted", None, edits),
+        match self {
+            Self::Accepted { edits } => write_plan_review(writer, "accepted", None, edits),
             Self::ChangesRequested { feedback, edits } => {
-                ("changes_requested", Some(feedback), edits)
+                write_plan_review(writer, "changes_requested", Some(feedback), edits)
             }
-        };
-        writer.open("plan_review", &[("decision", decision.into())]);
-        if let Some(feedback) = feedback {
-            if let Some(overall) = &feedback.overall {
-                writer.element("overall", &[], overall);
-            }
-            writer.element("comments", &[], &feedback.comments);
         }
-        if !edits.is_empty() {
-            writer.open("plan_edits", &[]);
-            for edit in edits {
-                match edit {
-                    PlanEdit::Rename { from, to } => {
-                        writer.empty("rename", &[("from", from.clone()), ("to", to.clone())])
-                    }
-                    PlanEdit::RemoveTest { file, name } => writer.empty(
-                        "remove_test",
-                        &[("file", file.clone()), ("name", name.clone())],
-                    ),
-                    PlanEdit::SetCheck { id, enabled } => writer.empty(
-                        "set_check",
-                        &[("id", id.clone()), ("enabled", enabled.to_string())],
-                    ),
-                    PlanEdit::SetTestScope { id, scope } => writer.empty(
-                        "set_test_scope",
-                        &[("id", id.clone()), ("scope", scope.as_str().to_owned())],
-                    ),
-                }
-            }
-            writer.close();
-        }
-        writer.close();
     }
 
     /// Report whether the user applied review edits.
@@ -730,6 +751,46 @@ impl PlanReview {
             Self::Accepted { edits } | Self::ChangesRequested { edits, .. } => !edits.is_empty(),
         }
     }
+}
+
+/// Write one `<plan_review>` element with its comments and the edits the user applied.
+fn write_plan_review(
+    writer: &mut Writer,
+    decision: &str,
+    feedback: Option<&ReviewFeedback>,
+    edits: &[PlanEdit],
+) {
+    writer.open("plan_review", &[("decision", decision.into())]);
+    if let Some(feedback) = feedback {
+        if let Some(overall) = &feedback.overall {
+            writer.element("overall", &[], overall);
+        }
+        writer.element("comments", &[], &feedback.comments);
+    }
+    if !edits.is_empty() {
+        writer.open("plan_edits", &[]);
+        for edit in edits {
+            match edit {
+                PlanEdit::Rename { from, to } => {
+                    writer.empty("rename", &[("from", from.clone()), ("to", to.clone())])
+                }
+                PlanEdit::RemoveTest { file, name } => writer.empty(
+                    "remove_test",
+                    &[("file", file.clone()), ("name", name.clone())],
+                ),
+                PlanEdit::SetCheck { id, enabled } => writer.empty(
+                    "set_check",
+                    &[("id", id.clone()), ("enabled", enabled.to_string())],
+                ),
+                PlanEdit::SetTestScope { id, scope } => writer.empty(
+                    "set_test_scope",
+                    &[("id", id.clone()), ("scope", scope.as_str().to_owned())],
+                ),
+            }
+        }
+        writer.close();
+    }
+    writer.close();
 }
 
 impl CheckRepair {

@@ -7,6 +7,24 @@ function M.busy(state)
   return not state.host_error and state.activity ~= nil and state.activity.phase == "working"
 end
 
+-- Session phases the host reports only while a provider exchange still owns the turn.
+local turn_phase = {
+  working = true, finalizing = true, compacting = true, stopping = true,
+  awaiting_approval = true, waiting_for_agent = true, retrying_provider = true,
+}
+
+---Report whether a provider turn is running, from the session phase rather than owner activity.
+---
+---Owner activity also reads `working` while a queued command is applied, which never starts a
+---turn. A `working` phase whose activity is `handing_off` only predicts the next queued turn.
+---@param state table
+---@return boolean
+function M.turn_running(state)
+  local status = state.status
+  if state.host_error or type(status) ~= "table" or not turn_phase[status.kind] then return false end
+  return not (status.kind == "working" and status.activity == "handing_off")
+end
+
 ---Get the owner's fatal execution failure for status and prompt admission.
 ---@param state table
 ---@return string?

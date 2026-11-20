@@ -71,8 +71,11 @@ pub(crate) enum ObservedAgentError {
     #[error("observed native child lifecycle conflicts with its retained outcome")]
     Lifecycle,
     /// The ordered publisher cannot regress its binding sequence.
-    #[error("observed native child publication sequence regressed")]
-    Sequence,
+    #[error("observed native child publication sequence regressed from {previous} to {received}")]
+    Sequence { previous: u64, received: u64 },
+    /// The child already holds as many exchanges as an ordinal can count.
+    #[error("observed native child exchange ordinal overflowed")]
+    Ordinal,
     /// A child item or accounting event arrived without its own admitted start.
     #[error("observed native child event has no admitted turn")]
     MissingTurn,
@@ -368,7 +371,7 @@ impl ObservedAgent {
                 let ordinal = u64::try_from(next.exchanges.len())
                     .ok()
                     .and_then(|count| count.checked_add(1))
-                    .ok_or(ObservedAgentError::Sequence)?;
+                    .ok_or(ObservedAgentError::Ordinal)?;
                 let mut exchange = Exchange::observed(id, ordinal, address, started.started_at_ms)
                     .map_err(ObservedAgentError::Exchange)?;
                 for host in &next.host_events {
@@ -681,12 +684,16 @@ impl ObservedAgent {
             return Err(ObservedAgentError::Ownership);
         }
         if let Some(previous) = &self.publication {
+            let regressed = || ObservedAgentError::Sequence {
+                previous: previous.sequence.get(),
+                received: source.sequence.get(),
+            };
             if source.sequence < previous.sequence {
-                return Err(ObservedAgentError::Sequence);
+                return Err(regressed());
             }
             if source.sequence == previous.sequence {
                 if fingerprint != previous.fingerprint {
-                    return Err(ObservedAgentError::Sequence);
+                    return Err(regressed());
                 }
                 return Ok(false);
             }

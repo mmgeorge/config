@@ -344,11 +344,22 @@ Permission popups, like every Forge picker, close with `q` or `Esc` without
 approving or rejecting the tool; the request stays pending until you decide it.
 A permission popup opens with no decision selected, so an Enter typed into the
 composer just as the popup takes focus decides nothing; choose a decision with its
-key or the arrow keys first. A permission or question popup that opens while you
-are typing ignores your keys, except `q`, `Esc`, and `Ctrl-C`, until you have stopped
-typing for about a third of a second, and its footer reads **Waiting for typing to stop**
-meanwhile. When such a popup closes by itself just after you typed into it, keys typed in
-that moment are ignored too, rather than landing in the composer. When another picker replaces a pending permission
+key or the arrow keys first. A permission or question popup never opens by itself while
+the editor is in Insert, Replace, or Command-line mode, in any buffer: the request waits as if
+you had closed it with `q`, a notice such as **Approval waiting · oe** says so, and the popup
+opens when you leave that mode with the session in the current tab, or when you press `oe`.
+Answering or closing a popup that waited this way returns you to the window and mode you were
+in when the request arrived, so you continue typing in the composer where you stopped. Once you
+submit the last answer, the question popup closes at once: keys typed right after the submit key
+land in that window, not in the closing popup. A
+question opens by itself, like a permission request, when focus is in the session's transcript
+or composer. Every such popup ignores keys, except `q`, `Esc`, and `Ctrl-C`, for about a third
+of a second after it opens and until you stop typing for that long, and its footer reads
+**Waiting for typing to stop** meanwhile. When such a popup closes without your decision, as
+on expiry, keys pressed in the next third of a second are ignored too, rather than landing in
+the composer. Keys that a popup does not map do nothing in it, including keys you mapped
+globally, such as a `Y` mapped to paste. The status row, the transcript, and a popup's
+countdown keep updating while you sit at a `:` prompt. When another picker replaces a pending permission
 popup, the popup returns once that picker closes.
 
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
@@ -477,7 +488,9 @@ arrow keys, or `Ctrl-O`. Each tab retains its own search query, and **All** incl
 the workspace path for each session.
 Within each scope, **Active** sessions loaded in this Forge host appear first,
 including sessions whose editor views are closed. Saved sessions that are not loaded
-appear under **Inactive**. Searching keeps this section order.
+appear under **Inactive**. Searching keeps this section order. The picker opens with the
+current session highlighted. Choosing a session that another tab already shows moves it into the
+current tab and closes its former tab; the session you left stays under **Active**.
 The transcript area previews the highlighted session in a layer drawn over the transcript,
 below its winbar. The preview ends at the session's latest exchange, on the last row above
 the picker. Highlighting the current session removes the preview and shows its own
@@ -498,14 +511,23 @@ A session of another worktree is history-only; open Harness from that worktree t
 resume it. `Ctrl-J` deletes the selected saved session and closes every tab that shows it.
 After selecting an interaction, choose **Conversation only** to keep current files,
 or **Conversation and files** to restore its checkpoint too. Conversation-only
-rollback works without a file checkpoint. Confirming conversation rollback collects
-active execution before changing history and leaves the task paused. An unfinished
-restore requires recovery first. Rollback rewinds the provider's own conversation, so it
-requires a provider that supports native rewind (Codex, Copilot, and Claude). With
-Antigravity, `/undo` reports that conversation rollback is unsupported and changes nothing.
-Claude can rewind only to the end of an earlier interaction, not before the first one.
-A completed rollback returns the rolled-back prompt to the composer only when you have not
-typed there since confirming it, and it does not move focus out of another window.
+rollback works without a file checkpoint. `/undo` also opens the list while a turn runs.
+Confirming conversation rollback collects active execution before changing history and
+leaves the task paused; choosing **Conversation and files** collects it before showing the
+files to restore, so the preview describes settled files, and both options say that they
+stop the running turn. An unfinished restore requires recovery first. Rollback rewinds the
+provider's own conversation, so it requires a provider that supports native rewind (Codex,
+Copilot, and Claude). With Antigravity, `/undo` reports that conversation rollback is
+unsupported and changes nothing. Claude can rewind only to the end of an earlier
+interaction, not before the first one. An interaction that cannot be rolled back is marked
+unavailable in the list with its reason, and choosing it reports that reason and changes
+nothing. A failed rollback stays in `:messages` after its notice fades.
+Rolling back an interaction inside a goal leaves the goal paused; rolling back the
+interaction that started it, or an earlier one, removes the goal. The transcript drops every
+row of the rolled-back interactions, including task rows such as `Goal completed` and
+`Goal cleared`. A completed rollback returns the rolled-back prompt to the composer, a
+`/goal <objective>` command as typed, only when you have not typed there since confirming
+it, and it does not move focus out of another window.
 
 Live status occupies a non-focusable split immediately above the composer. It stays visible
 while the transcript scrolls through history, and disappears when no work, pending
@@ -644,6 +666,12 @@ cannot, so with them the prompt returns only when the interrupt arrives before t
 provider accepts it, which is a moment after you submit; once the provider has
 accepted the prompt, the exchange stays in history as cancelled even when nothing was
 shown.
+The exchange that `/goal <objective>` or `/plan <request>` started is never removed this
+way: interrupting its first turn before any reply keeps the exchange with its
+`Goal started` or `Plan started` row and a `Cancelled` heading, and the task stays paused
+until you resume it.
+A task command such as `/goal clear`, `/goal pause`, or `/task clear` sent while a turn is
+**Stopping** waits for the stop to finish and then applies to the task as the stop left it.
 Cancellation remains pending until native work and host settlement finish. Repeated
 `Ctrl-C` presses share the pending request. A stop that settles promptly shows only
 **Stopping**. If it is still pending after ten seconds, or its response times out, cleanup
@@ -700,7 +728,9 @@ The prompt inherits ordinary text-buffer editing and navigation mappings. Harnes
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
 question or approval, `op` for artifacts, `og` for agents, model selection, help,
-and closing Harness. These hotkeys also work with Read permissions.
+and closing Harness. The artifact list omits cancelled plans; their transcript rows still
+open them. Cancelling a plan also removes its editable planning directory, so a later plan
+never reads the cancelled draft as current work. These hotkeys also work with Read permissions.
 In Insert mode, `Ctrl-J` inserts a newline at the cursor and preserves the draft.
 `Ctrl-C` pressed in Insert mode keeps the composer in Insert mode at the same cursor,
 including when Neovim is busy and delivers the key as an interrupt rather than through
@@ -811,7 +841,8 @@ disables only the Background rows.
 Ask serves Plan Review questions created with `A` and defaults to the main planning
 model. Turn on **Override** to select a separate model, thinking level, and speed.
 Answers run in a forked session using the same provider and appear below their
-review questions without entering the main timeline.
+review questions without entering the main timeline. Answer sessions never appear in
+`/sessions` or **Resume session**, which list conversations newest created first.
 
 **Permissions** groups read/write scopes and extra directories under **Access**.
 Its **Tools** subsection contains Mode (Ask, Deny, or Approve), Approval timeout,
@@ -916,6 +947,8 @@ do not pause it.
 Approval timeouts run independently of the picker. An expired approval rejects
 that one request, not your instruction: the agent receives the rejection and
 continues the requested work in a follow-up turn without asking you to confirm.
+The agent does not repeat the expired request on its own, but when you ask for the
+operation again it requests it again for your approval.
 An idle session has no periodic timeout check. Changing a timeout affects future approvals without
 extending an existing deadline. Ordinary submitted messages update the display
 immediately, then Harness starts, steers, or queues them according to the actual
@@ -943,7 +976,8 @@ publication approval, declared inputs, and repository callbacks.
 The winbar also shows the selected workflow and phase: `plan · draft`,
 `plan · review`, `exec · implement`, `exec · check`, `exec · resolve`,
 `exec · verify`, or `goal · work`. Pausing preserves that label, such as
-`exec · check · paused`. Resuming Check runs Harness checks locally rather than
+`exec · check · paused`. A planning turn may resubmit its plan before it ends,
+so the label changes to `plan · review` only once the submitting turn settles. Resuming Check runs Harness checks locally rather than
 starting a model response. Plan acceptance keeps the same task identity as it
 enters Execute, and planning never enters Verify.
 
@@ -952,8 +986,12 @@ observable progress or the configured total allowance, which defaults to 20 turn
 Reads and phase changes do not replenish the allowance. Explicit task resume
 starts a new allowance while retaining the phase, accepted artifact, and findings.
 After a host restart, unfinished tasks require explicit resume before work starts.
-Accepting a paused plan with `oY` keeps the pause, so its tool-approval question stays
-hidden. A notice asks for `/task resume`, which presents the question.
+A review decision is an explicit resume: accepting a paused plan with `oY` or requesting
+changes with `oN` resumes the task, so an execution question appears at once.
+A revision that ends without resubmitting, after five turns without progress or at the
+total allowance, returns the plan to review at its last submitted revision with a
+`Plan revision stopped` row; the plan never fails, and the comments sent with the request
+stay in the review.
 
 PlanReview shows declaration changes with nearby context lines and enclosing
 declaration boundaries, using the regular diff grouping rules. Nearby method
@@ -977,13 +1015,16 @@ moving the cursor. Jump-back returns to the original Algorithm token.
 Unqualified lowercase calls represent abstract operations and have no declaration
 navigation target, even when a function of that name exists. They do not require
 implementation functions, and a name that resolves to nothing is not an error.
+Reference search (`or`) lists usages in declarations and source, not in Algorithm text.
 Every declaration a plan introduces, including enum variants and struct fields, needs a
 documentation comment (`///` in Rust, `/** */` in TypeScript) directly above it.
 Assign with `←` or `<-`, compare with `=`, `≠`, `is`, or `is not` (as in `target is none`),
 compute remainders with `%` or `mod`, and loop with
 `for each item in items` or `for item in items`.
 Each Algorithm and Change heading in PlanReview folds its block, and the caret before the heading
-shows its state: `▾` open, `▸` closed. Every block starts open. Folding changes only the display.
+shows its state: `▾` open, `▸` closed. Function bodies start collapsed; once a body is expanded,
+its blocks start open and show their carets. Folding changes only the display, and reopening a
+review starts again from these defaults.
 Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)` for a tuple
 struct or variant, or `CombatEntity()` for a marker. Keep construction separate from the
 operation that queues or inserts it. Name the fields and types a function uses inside its
@@ -1015,19 +1056,35 @@ While a planning response is running, follow-up instructions can revise and resu
 in that same response. A later edit requires a new submission before review. Submission never
 authorizes implementation.
 Approving a plan and requesting changes both open an optional-comment popup. Press
-`Enter` or `Ctrl-S` in normal or insert mode to submit, including an empty comment.
+`Enter` or `Ctrl-S` in normal or insert mode to submit. Approval accepts an empty
+comment. A change request needs an overall comment, a saved or unsaved inline comment, or
+a review edit; an empty request is refused with that reason and the review stays open.
 `Esc` or `Ctrl-C` cancels the decision. Approval comments remain with the accepted
 revision and are included in execution context. A plan changed while its popup is
 open must be reviewed again before the decision can be submitted.
 Accepting with inline comments asks the agent to revise the plan first. The revised
 submission returns for review unless automatic acceptance is enabled for the task.
 Each comment includes its source context and any question-and-answer thread it
-belongs to. Question-only threads are not sent as change requests. Feedback and revision
-work remain in the same exchange, labeled as requested changes rather than a new plan.
+belongs to. Question-only threads are not sent as change requests. Revision work continues
+the exchange that submitted the reviewed revision while that exchange is the latest one;
+after a later discussion or reply, the revision starts its own exchange labeled
+`Revision requested`, so a finished answer is never reopened. When no comment needs a
+change, the agent resubmits the unchanged plan.
+Review edits and saved comments travel with every message you send the planner while
+they are pending, including a question about the plan, so the review always shows what
+acceptance runs. Once a later revision replaces the document, edits and comments that
+reached the planner retire; any that did not stay pending, comments keep their lines when
+the new revision still has them, and a notice names the rest. Renaming a declaration
+highlights every place it changes, including signatures, code blocks, test descriptions,
+and planned exports, and asks for confirmation before applying; a name that already
+exists in the scope is refused. Turning a check off and back on, or a planner that writes
+Windows line endings, does not count as a change to the plan.
 Every new Plan task starts with automatic acceptance off.
 Use `/plan accept on` or `/plan accept off` at any time during a Plan or Execute task
-to change automatic acceptance without interrupting the agent. The winbar shows
-`Auto-accept: on/off`. Successful full submissions check this task setting; drafts and
+to change automatic acceptance without interrupting the agent. The winbar appends `pa`
+while it is on. Turning it on while a plan awaits review accepts that revision at once;
+turning it off withdraws an acceptance still waiting for its execution answers, and the plan
+returns to review. Successful full submissions check this task setting; drafts and
 failed submissions never authorize implementation. The setting survives submissions,
 pauses, and restarts until changed or the task ends. Requesting changes leaves it
 unchanged, as does accepting inline feedback. Turn it off before resubmission when
@@ -1042,6 +1099,11 @@ source definitions.
 Inside PlanReview, `ov` toggles All/Public declaration visibility. Plan review
 supports Semantic presentation only and does not bind `ox`. Configure visibility
 through `keymaps.diff.toggle_visibility`.
+
+Inside PlanReview, `ol` shows the captured definition of the entity under the
+cursor, and `os` shows the canonical plan document as JSON. Both open read-only
+popups. Configure them through `keymaps.plan_review.entity_info` and
+`keymaps.plan_review.schema`.
 
 Inside PlanReview, `oc` opens plan-specific check selection. Space toggles a
 check, with `●` for enabled and `○` for disabled. Visual `j` deletes selected

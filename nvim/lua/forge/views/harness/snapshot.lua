@@ -107,6 +107,14 @@ function HarnessSnapshot.apply(state, result)
   state.no_checkpoint = result.no_checkpoint == true
   state.restore_recovery = result.restore_recovery
   state.active_plan = result.active_plan
+  if result.active_plan then
+    -- The review module follows a newly submitted revision outside snapshot application: an open
+    -- review reloads in place, and a closed one gets a single notice that the revision is ready.
+    local plan = result.active_plan
+    vim.schedule(function()
+      if state.active_plan == plan then require("forge.views.plan_review.native_controller").observe(plan) end
+    end)
+  end
   require("forge.views.harness.questions").receive(state, result.questions)
   if result.active_elicitation and result.active_elicitation ~= vim.NIL then
     require("forge.views.harness.question_presentation").receive(state, result.active_elicitation, true)

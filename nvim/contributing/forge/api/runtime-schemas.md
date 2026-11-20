@@ -6,7 +6,7 @@ Optional fields serialize as JSON null unless an explicit skip rule says otherwi
 
 Session and snapshot revisions belong to one `runtime_epoch`. An asynchronous callback must still own the captured session, host generation, and epoch before applying these values. A snapshot does not transfer ownership of an interactive session. Exchange and timeline content arrive through their document or exchange APIs, rather than the skipped native fields below.
 
-`SessionPurpose` defaults to `conversation` for newly constructed session values. Stored sessions must still carry current host contract version 62; a missing or older version rejects before changed payloads decode. Internal Plan Review answer forks use `plan_review_answer`, remain available through explicit session access, and do not compete with user conversations during automatic startup selection. This purpose is selected by the native fork caller, not by the public request payload.
+`SessionPurpose` defaults to `conversation` for newly constructed session values. Stored sessions must still carry current host contract version 69, the disposable-state version `storage::state::VERSION`; a missing or older version rejects before changed payloads decode. Internal Plan Review answer forks use `plan_review_answer`, remain available through explicit session access, and do not compete with user conversations during automatic startup selection. This purpose is selected by the native fork caller, not by the public request payload.
 
 ## InitializeRequest
 
@@ -750,6 +750,13 @@ pub struct ProviderCapability {
     pub compaction: CompactionCapability,
     pub native_steer: bool,
     pub native_turn_rollback: bool,
+    #[serde(default)]
+    /// Discards settled conversation history after a recorded turn checkpoint.
+    pub native_conversation_rewind: bool,
+    #[serde(default)]
+    /// Rewinds only to a recorded turn checkpoint, so a conversation rollback cannot discard the
+    /// provider's whole conversation.
+    pub conversation_rewind_requires_checkpoint: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,
@@ -1374,7 +1381,6 @@ pub struct CheckRun<RunContext = Option<CheckRunContext>, CommandContext = Optio
     pub context: RunContext,
     #[serde(default)]
     pub lifecycle: Vec<CheckEvent>,
-    pub completed_plan: Option<String>,
     pub shell: crate::session::CheckShell,
     pub executable: Option<PathBuf>,
     pub workspace: String,

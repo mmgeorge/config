@@ -599,19 +599,14 @@ impl ExchangeDriver {
                 publish_input_observation(update.clone(), messages, services, trace, session, step);
                 // The change can withdraw or supply the message an idle status predicts, so the
                 // status is re-projected before the command completes.
-                let refreshed = broker.lock().await.owner_refresh_idle_status();
-                let published = refreshed.and_then(|events| {
-                    if !events.is_empty() {
-                        services.publications.publish_batch(events)?;
-                    }
-                    Ok(())
-                });
-                match published {
-                    Ok(()) => {}
-                    Err(error) => trace.record(session, "exchange.input.status_refresh_failed", serde_json::json!({
-                        "command_id":run.command.record.request.id.as_str(),"update_step":step,"reason":error.to_string(),
-                    })),
-                }
+                refresh_idle_status(
+                    &mut *broker.lock().await,
+                    services,
+                    trace,
+                    session,
+                    step,
+                    run.command.record.request.id.as_str(),
+                );
                 services.input.changed.notify_one();
                 match self.commands.committed(&run.command.record.request.id) {
                     Ok(Some(record)) if record.completion().is_some() => {
@@ -1282,6 +1277,35 @@ fn publish_input_observation(
             serde_json::json!({
                 "update_step":step,"reason":error.to_string(),
             }),
+        );
+    }
+}
+
+/// Re-project an idle status after a committed input change and publish what changed.
+///
+/// Between turns the status predicts the next queued turn as already `Working`. A change that
+/// settles or withdraws that message without an exchange event, such as an input command or a
+/// turn that failed before it started, leaves the prediction standing unless the status is
+/// projected again. `source` names the input or command for the failure trace.
+pub(super) fn refresh_idle_status(
+    broker: &mut HarnessBroker,
+    services: &OwnerServices,
+    trace: &TraceStore,
+    session: &str,
+    step: u64,
+    source: &str,
+) {
+    let published = broker.owner_refresh_idle_status().and_then(|events| {
+        if !events.is_empty() {
+            services.publications.publish_batch(events)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = published {
+        trace.record(
+            session,
+            "exchange.input.status_refresh_failed",
+            serde_json::json!({"command_id":source,"update_step":step,"reason":error.to_string()}),
         );
     }
 }

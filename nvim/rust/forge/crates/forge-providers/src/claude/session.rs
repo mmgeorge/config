@@ -118,10 +118,12 @@ struct TurnDecoder {
 
 /// One API message's latest usage report and whether its output count is final.
 ///
-/// Input counts are fixed when the message starts. The output count is final only in the
-/// message's `message_delta` or in an assistant frame carrying a `stop_reason`; the CLI copies
-/// the `message_start` count into the assistant frames of a message still streaming, so an
-/// earlier count is the few tokens generated before the stream began, not an estimate.
+/// Input counts are fixed when the message starts. The output count is final only in a
+/// `message_delta` that names a stop reason; the CLI copies the `message_start` count into the
+/// message's assistant frames and into the `message_delta` it writes to close an abandoned
+/// stream, so any other count is the few tokens generated before the stream began, not an
+/// estimate. A frame's `stop_reason` does not prove its count final, because an interrupted
+/// answer was reported as five output tokens from such frames.
 struct MessageUsage {
     message_id: String,
     usage: Usage,
@@ -1038,13 +1040,32 @@ impl ClaudeSessionState {
                     if let (Some(message), Some(usage)) =
                         (decoder.current_api_message.clone(), &usage)
                     {
-                        record_message_usage(&mut decoder, &message, usage, OutputCount::Final);
+                        // The API ends every message it finished with a stop reason. The CLI
+                        // closes an abandoned stream with its own `message_delta`, which copies
+                        // the partial message's null stop reason and its start count.
+                        let count = if stop_reason.is_some() {
+                            OutputCount::Final
+                        } else {
+                            OutputCount::Provisional
+                        };
+                        record_message_usage(&mut decoder, &message, usage, count);
                     }
-                    // Text in an API message that stopped to call a tool precedes that call.
-                    if stop_reason.as_deref() == Some("tool_use") {
-                        classify_pending(&mut decoder, &address, Some(AgentMessageRole::Commentary))
-                    } else {
-                        Vec::new()
+                    // Text in an API message that stopped to call a tool precedes that call. A
+                    // message that ended the model's turn is its reply, known here rather than
+                    // at the result the CLI sends after its post-turn work; other stop reasons
+                    // leave the role to the turn's end.
+                    match stop_reason.as_deref() {
+                        Some("tool_use") => classify_pending(
+                            &mut decoder,
+                            &address,
+                            Some(AgentMessageRole::Commentary),
+                        ),
+                        Some("end_turn") => classify_pending(
+                            &mut decoder,
+                            &address,
+                            Some(AgentMessageRole::Response),
+                        ),
+                        _ => Vec::new(),
                     }
                 }
                 StreamEvent::ContentBlockStop { .. }
@@ -1078,12 +1099,7 @@ impl ClaudeSessionState {
                 decoder.current_api_message = Some(message_id.clone());
             }
             if let Some(usage) = &frame.message.usage {
-                let count = if frame.message.stop_reason.is_some() {
-                    OutputCount::Final
-                } else {
-                    OutputCount::Provisional
-                };
-                record_message_usage(&mut decoder, &message_id, usage, count);
+                record_message_usage(&mut decoder, &message_id, usage, OutputCount::Provisional);
             }
             for block in frame.message.content {
                 let index = {
@@ -1342,27 +1358,59 @@ impl ClaudeSessionState {
             return Ok(());
         };
         let streamed_usage = std::mem::take(&mut self.decoder.lock().await.message_usage);
+        // A turn the CLI did not finish successfully may have cut off its last message, whether
+        // the adapter interrupted it or the CLI ended it for a reason the adapter does not know.
+        let unfinished = result.interrupted() || active.interrupting || result.subtype != "success";
+        // A message cut off before its final output count leaves the turn's output unknown
+        // rather than understated. An aborted result that carries usage sums the same start
+        // counts, so the rule applies to its output as well; its input figures stand. Without
+        // any retained message nothing shows that the result's output count is final.
+        let output_known =
+            !streamed_usage.is_empty() && streamed_usage.iter().all(|message| message.output_final);
+        let branch = match &result.usage {
+            Some(usage) if !usage.is_empty() => "result",
+            _ if unfinished => "streamed",
+            _ => "none",
+        };
+        // Record what decided the reported output, since the stream frames themselves are not
+        // retained anywhere.
+        let message_finals = streamed_usage
+            .iter()
+            .map(|message| {
+                if message.output_final {
+                    "final"
+                } else {
+                    "provisional"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(target: "forge::provider", event_name = "provider.usage.settled",
+            provider = "claude", subtype = result.subtype.as_str(),
+            terminal_reason = result.terminal_reason.as_deref().unwrap_or(""),
+            unfinished, output_known, branch, message_finals = message_finals.as_str());
         let usage = match result.usage {
-            Some(usage) if !usage.is_empty() => Some(usage),
-            // An aborted result counts nothing, so its messages' own reports supply the figures,
-            // or none when no message reported any. A message cut off before its final output
-            // count leaves the turn's output unknown rather than understated.
-            _ if result.interrupted() || active.interrupting => {
-                let output_known = streamed_usage.iter().all(|message| message.output_final);
-                streamed_usage
-                    .into_iter()
-                    .map(|message| message.usage)
-                    .reduce(|mut total, usage| {
-                        total.accumulate(&usage);
-                        total
-                    })
-                    .map(|mut total| {
-                        if !output_known {
-                            total.output_tokens = None;
-                        }
-                        total
-                    })
+            Some(mut usage) if !usage.is_empty() => {
+                if unfinished && !output_known {
+                    usage.output_tokens = None;
+                }
+                Some(usage)
             }
+            // An aborted result that counts nothing leaves the messages' own reports to supply
+            // the figures, or none when no message reported any.
+            _ if unfinished => streamed_usage
+                .into_iter()
+                .map(|message| message.usage)
+                .reduce(|mut total, usage| {
+                    total.accumulate(&usage);
+                    total
+                })
+                .map(|mut total| {
+                    if !output_known {
+                        total.output_tokens = None;
+                    }
+                    total
+                }),
             usage => usage,
         };
         if let Some(usage) = usage {
@@ -1656,10 +1704,22 @@ impl ClaudeSessionState {
         tokio::select! {
             biased;
             _ = active.revocation.cancelled() => Err("The Forge turn ended".to_owned()),
-            outcome = provider_tools.call(&active.address.scope, call) => {
-                outcome.map_err(|error| error.to_string())
+            outcome = provider_tools.call_reply(&active.address.scope, call) => {
+                host_tool_result(outcome)
             }
         }
+    }
+}
+
+/// Map a Harness tool reply to the MCP call outcome, where `Err` becomes an `isError` result.
+///
+/// A refused or failed call answers with its reason as text; reporting it as a success made the
+/// CLI, and the timeline after it, count the call as successful.
+fn host_tool_result(outcome: Result<control::ToolReply, ProviderError>) -> Result<String, String> {
+    match outcome {
+        Ok(reply) if reply.is_failure() => Err(reply.text),
+        Ok(reply) => Ok(reply.text),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -2157,7 +2217,25 @@ pub(crate) fn timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::without_cwd_reset;
+    use super::{host_tool_result, without_cwd_reset};
+
+    /// A Harness tool that refused or failed is an MCP error result carrying its reason, so the
+    /// CLI records a failed call; an answered call stays a success.
+    #[test]
+    fn refused_and_failed_calls_are_native_failures_with_their_reason() {
+        use forge_provider_api::control::ToolReply;
+        assert_eq!(
+            host_tool_result(Ok(ToolReply::failed(
+                "plan_phase_done failed with 1 error: task changed"
+            ))),
+            Err("plan_phase_done failed with 1 error: task changed".to_owned())
+        );
+        assert!(host_tool_result(Err(forge_provider_api::ProviderError::Cancelled)).is_err());
+        assert_eq!(
+            host_tool_result(Ok(ToolReply::succeeded("text"))),
+            Ok("text".to_owned())
+        );
+    }
 
     /// The CLI's directory-restore footer is dropped, and ordinary output stays intact.
     #[test]

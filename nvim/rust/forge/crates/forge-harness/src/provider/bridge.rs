@@ -620,7 +620,7 @@ impl ProviderBridge {
             .await?;
         if self.binding_collection.ambiguous(&initialized.binding.id) {
             return Err(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
+                forge_provider_api::ObservationFailure::ownership_conflict(),
             ));
         }
         if initialized.binding.thread_id != owner.thread_id() {
@@ -695,7 +695,7 @@ impl ProviderBridge {
         if !admitted {
             self.binding_collection.reject(&binding.id);
             let _ = session.sender.send(Err(EventDeliveryError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
+                forge_provider_api::ObservationFailure::ownership_conflict(),
             )));
             return BoundSession {
                 binding,
@@ -876,7 +876,7 @@ impl ProviderBridge {
         let included_inputs = submission.included_inputs()?;
         if included_inputs.len() != request.recovered_input.len() {
             return Err(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
+                forge_provider_api::ObservationFailure::ownership_conflict(),
             ));
         }
         let mut recovered_inputs = Vec::with_capacity(request.recovered_input.len());
@@ -919,7 +919,7 @@ impl ProviderBridge {
             .as_mut()
             .ok_or_else(|| {
                 ProviderError::Observation(
-                    forge_provider_api::ObservationFailure::OwnershipConflict,
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
                 )
             })?
             .lock()
@@ -1276,7 +1276,7 @@ impl ProviderBridge {
     /// Fence a provider that acknowledges a different normalized input than was admitted.
     async fn invalid_acceptance(&self, binding: &BindingId) -> Result<(), ProviderError> {
         let primary = ProviderError::Observation(
-            forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+            forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
         );
         let context = OperationControl::fresh(ProviderOperation::ThreadClose)?.context();
         self.register_binding_operation(&context, binding).await?;
@@ -1605,7 +1605,7 @@ impl ProviderBridge {
             })
             .ok_or_else(|| {
                 ProviderError::Observation(
-                    forge_provider_api::ObservationFailure::OwnershipConflict,
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
                 )
             })?;
         self.core_events.operations().register(
@@ -2046,12 +2046,12 @@ impl ProviderBridge {
                     || settlement.turn_id
                         != scope.turn_id().map_err(|_| {
                             ProviderError::Observation(
-                                forge_provider_api::ObservationFailure::OwnershipConflict,
+                                forge_provider_api::ObservationFailure::ownership_conflict(),
                             )
                         })?
                 {
                     return Err(ProviderError::Observation(
-                        forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                        forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
                     ));
                 }
                 self.wait_watermark(&scope.owner(), settlement.watermark)
@@ -2133,7 +2133,7 @@ impl ProviderBridge {
                         .await
                 }
                 Ok(_) => Err(ProviderError::Observation(
-                    forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                    forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
                 )),
                 Err(ProviderError::Failure(failure))
                     if failure.operation() == ProviderOperation::TurnInterrupt
@@ -2486,7 +2486,7 @@ impl ProviderBridge {
                     .load(std::sync::atomic::Ordering::Acquire)
             {
                 return Err(ProviderError::Observation(
-                    forge_provider_api::ObservationFailure::OwnershipConflict,
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
                 ));
             }
             if self.binding_collection.collected() {
@@ -2652,9 +2652,11 @@ impl ProviderBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(binding)
             .cloned()
-            .ok_or(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
-            ))?;
+            .ok_or_else(|| {
+                ProviderError::Observation(
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
+                )
+            })?;
         let status = ownership
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2682,9 +2684,11 @@ impl ProviderBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(binding)
             .cloned()
-            .ok_or(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
-            ))?;
+            .ok_or_else(|| {
+                ProviderError::Observation(
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
+                )
+            })?;
         ownership
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2698,7 +2702,7 @@ impl ProviderBridge {
         scope: &forge_provider_api::InvocationScope,
     ) -> Result<super::ObservedAgentAssociation, ProviderError> {
         let rejected = || {
-            ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+            ProviderError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
         };
         let turn = scope.turn_id().map_err(|_| rejected())?;
         let registrations = self
@@ -2739,9 +2743,11 @@ impl ProviderBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(binding)
             .cloned()
-            .ok_or(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
-            ))?;
+            .ok_or_else(|| {
+                ProviderError::Observation(
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
+                )
+            })?;
         ownership
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2855,9 +2861,11 @@ impl ProviderBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(binding)
             .cloned()
-            .ok_or(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
-            ))?;
+            .ok_or_else(|| {
+                ProviderError::Observation(
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
+                )
+            })?;
         let sessions = self.sessions.lock().await;
         sessions
             .values()
@@ -2874,9 +2882,11 @@ impl ProviderBridge {
                         .is_some_and(|ownership| Arc::ptr_eq(ownership, &original))
             })
             .cloned()
-            .ok_or(ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
-            ))
+            .ok_or_else(|| {
+                ProviderError::Observation(
+                    forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
+                )
+            })
     }
 
     /// Wait for authoritative event consumption through an operation's publication boundary.
@@ -2912,7 +2922,7 @@ impl ProviderBridge {
         ProviderError,
     > {
         let rejected = || {
-            ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+            ProviderError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
         };
         let host = self
             .sessions
@@ -3172,6 +3182,91 @@ fn input_rejection(operation: ProviderOperation, error: ProviderError) -> Provid
     error
 }
 
+/// Record which ownership check refused a native observation, naming identifiers and kinds only.
+///
+/// Every ownership check reports the same `OwnershipConflict`, so without this record the host
+/// log can say that an event was refused but not which check refused it or which event it was.
+fn record_ownership_conflict(
+    owner: &ThreadOwner,
+    binding: &forge_provider_api::BindingId,
+    stage: &'static str,
+    observation: Option<&forge_provider_api::BoundProviderEvent>,
+    scope: Option<&super::EventScope>,
+    conflict: bool,
+) {
+    if !conflict {
+        return;
+    }
+    let site = forge_provider_api::lifecycle::take_ownership_conflict_site();
+    let event = observation.map(|observation| ownership_identity(&observation.event));
+    tracing::warn!(
+        target: "forge::provider",
+        event_name = "provider.ownership_conflict",
+        session_id = owner.session_id().as_str(),
+        stage,
+        site = site.as_deref().unwrap_or("unknown"),
+        admitted_owner = %owner.thread_id(),
+        binding_id = binding.as_str(),
+        observation_binding_id = observation.map(|observation| observation.binding_id.as_str().to_owned()),
+        sequence = observation.map(|observation| observation.sequence.get()),
+        event = event.map(|event| event.to_string()),
+        resolved_scope = scope.map(|scope| format!("{scope:?}")),
+        "provider observation refused for ownership"
+    );
+}
+
+/// Report whether an observation delivery failure is an ownership refusal.
+fn delivery_conflict(error: &EventDeliveryError) -> bool {
+    matches!(
+        error,
+        EventDeliveryError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+            | EventDeliveryError::OwnershipMismatch { .. }
+    )
+}
+
+/// Keep only the identity and kind fields of a native event, never its content.
+fn ownership_identity(event: &ProviderEvent) -> serde_json::Value {
+    let encoded = serde_json::to_value(event).unwrap_or_default();
+    let mut identity = serde_json::Map::new();
+    const IDENTITIES: [&str; 6] = [
+        "kind",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "agent_id",
+        "parent_turn_id",
+    ];
+    let mut kinds = Vec::new();
+    let mut nested = Some(&encoded);
+    while let Some(level) = nested {
+        for key in IDENTITIES {
+            if key != "kind"
+                && let Some(value) = level.get(key)
+            {
+                identity.entry(key).or_insert_with(|| value.clone());
+            }
+        }
+        if let Some(kind) = level.get("kind") {
+            kinds.push(kind.clone());
+        }
+        if let Some(agent) = level.get("agent") {
+            if let Some(value) = agent.get("thread_id") {
+                identity.insert("agent_thread_id".into(), value.clone());
+            }
+            if let Some(delegation) = agent.get("delegation") {
+                for key in ["parent_thread_id", "parent_turn_id", "parent_item_id"] {
+                    if let Some(value) = delegation.get(key) {
+                        identity.insert(key.into(), value.clone());
+                    }
+                }
+            }
+        }
+        nested = level.get("event").filter(|inner| inner.is_object());
+    }
+    identity.insert("kinds".into(), kinds.into());
+    identity.into()
+}
+
 /// Check binding identity before forwarding an event without reinterpreting its lifecycle.
 async fn relay_events(
     native: Arc<dyn NativeProvider>,
@@ -3380,6 +3475,14 @@ async fn relay_events(
                 let scope = match resolved {
                     Ok(scope) => scope,
                     Err(error) => {
+                        record_ownership_conflict(
+                            &owner,
+                            &binding,
+                            "resolve",
+                            Some(&observation),
+                            None,
+                            delivery_conflict(&error),
+                        );
                         let _ = sender.send(Err(error.clone()));
                         return retire_failed_observer(
                             &native,
@@ -3410,37 +3513,60 @@ async fn relay_events(
                 } else {
                     None
                 };
-                let observed_context = if invocation.is_none() {
-                    if let Some(child) = scope.invocation() {
-                        let ownership = host
-                            .observation
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .ownership
-                            .clone()
-                            .ok_or(EventDeliveryError::InvalidTransportData)?;
-                        let association = ownership
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .observed_child(
-                                &child.owner().thread_id(),
-                                &child
-                                    .turn_id()
-                                    .map_err(|_| EventDeliveryError::InvalidTransportData)?,
-                            )?;
-                        let authority = host
-                            .observed_authorities
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .get(&association.parent().invocation_id)
-                            .cloned()
-                            .ok_or(EventDeliveryError::InvalidTransportData)?;
-                        Some(authority.context_for(&host, &association)?)
+                let observed_context = (|| -> Result<_, ProviderError> {
+                    Ok(if invocation.is_none() {
+                        if let Some(child) = scope.invocation() {
+                            let ownership = host
+                                .observation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .ownership
+                                .clone()
+                                .ok_or(EventDeliveryError::InvalidTransportData)?;
+                            let association = ownership
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .observed_child(
+                                    &child.owner().thread_id(),
+                                    &child
+                                        .turn_id()
+                                        .map_err(|_| EventDeliveryError::InvalidTransportData)?,
+                                )?;
+                            let authority = host
+                                .observed_authorities
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&association.parent().invocation_id)
+                                .cloned()
+                                .ok_or(EventDeliveryError::InvalidTransportData)?;
+                            Some(authority.context_for(&host, &association)?)
+                        } else {
+                            None
+                        }
                     } else {
                         None
+                    })
+                })();
+                let observed_context = match observed_context {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let conflict = match &error {
+                            ProviderError::Observation(
+                                forge_provider_api::ObservationFailure::OwnershipConflict,
+                            ) => true,
+                            ProviderError::Delivery(delivery) => delivery_conflict(delivery),
+                            _ => false,
+                        };
+                        record_ownership_conflict(
+                            &owner,
+                            &binding,
+                            "observed_context",
+                            Some(&observation),
+                            Some(&scope),
+                            conflict,
+                        );
+                        return Err(error);
                     }
-                } else {
-                    None
                 };
                 let additional = match invocation {
                     Some(invocation) => invocation.observe(&observation.event),
@@ -3466,6 +3592,14 @@ async fn relay_events(
                 let additional = match additional {
                     Ok(events) => events,
                     Err(error) => {
+                        record_ownership_conflict(
+                            &owner,
+                            &binding,
+                            "host_events",
+                            Some(&observation),
+                            Some(&scope),
+                            delivery_conflict(&error),
+                        );
                         let _ = sender.send(Err(error.clone()));
                         return retire_failed_observer(
                             &native,
@@ -3614,9 +3748,18 @@ async fn relay_events(
                     }
                 }
             }
-            Ok(Some(_)) => {
-                let failure = forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict;
+            Ok(Some(observation)) => {
+                let failure =
+                    forge_provider_api::lifecycle::ObservationFailure::ownership_conflict();
                 let error = EventDeliveryError::Observation(failure);
+                record_ownership_conflict(
+                    &owner,
+                    &binding,
+                    "foreign_binding",
+                    Some(&observation),
+                    None,
+                    true,
+                );
                 let _ = sender.send(Err(error.clone()));
                 return retire_failed_observer(
                     &native,
@@ -3648,6 +3791,14 @@ async fn relay_events(
                 return Ok(());
             }
             Err(error) => {
+                record_ownership_conflict(
+                    &owner,
+                    &binding,
+                    "receive",
+                    None,
+                    None,
+                    delivery_conflict(&error),
+                );
                 let _ = sender.send(Err(error.clone()));
                 return retire_failed_observer(
                     &native,

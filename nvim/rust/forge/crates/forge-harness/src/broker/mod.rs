@@ -75,9 +75,8 @@ mod new_session;
 mod observation;
 mod owner_control;
 pub(crate) use checkpoint_settlement::FinalCheckpointResult;
-pub(crate) use owner_control::{ExchangeControlSelection, ExchangeControlView};
+pub(crate) use owner_control::{ExchangeControlSelection, ExchangeControlView, interrupt_pauses};
 pub(crate) use prior_finalization::PriorFinalization;
-mod plan_checks_update;
 pub(crate) mod plan_entry;
 mod project_checks;
 pub(crate) use check_admission::AutomaticCheckAction;
@@ -629,6 +628,9 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) _agent_lease: crate::agent::AgentToolLease,
     pub(crate) _check_lease: crate::checks::CheckToolLease,
     pub(crate) pending_session_observations: std::collections::VecDeque<OwnerObservation>,
+    /// Keeps the session-wide intake off `session_events` while this foreground consumes it,
+    /// so the inbox has one consumer and a native child's events apply in native order.
+    pub(crate) inbox_claim: Option<crate::provider::session_execution::SessionInboxClaim>,
     pub(crate) observation_publication_in_flight: bool,
     pub(crate) finalization: Option<Box<foreground_finalization::ForegroundFinalization>>,
     pub(crate) failure_cleanup_active: bool,
@@ -1692,7 +1694,7 @@ impl ForegroundTransaction {
                     },
                     ready = self.session_events.notified(), if self.failure_inbox_open && !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => match ready {
                         Ok(()) => return Ok(ForegroundSignal::SessionObservationsReady),
-                        Err(_) => { self.failure_inbox_open = false; continue; }
+                        Err(_) => { self.failure_inbox_open = false; self.inbox_claim = None; continue; }
                     },
                     changed = self.agent_revision.changed(), if self.failure_child_collection && !self.agent_command_active => {
                         changed.context("agent coordinator closed during failure settlement")?;
@@ -1804,6 +1806,24 @@ pub(crate) enum ProviderAttempt {
     },
 }
 
+/// Why an open exchange that no continuation will resume is being closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ParkedClosure {
+    /// A new admission replaces it.
+    Superseded,
+    /// The task that owned it was cleared.
+    Cleared,
+}
+
+/// What closing a parked exchange left in the session's history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ParkedDisposition {
+    /// The exchange remains with a terminal or finalizing outcome.
+    Closed,
+    /// The exchange held no output and was deleted.
+    Removed,
+}
+
 /// Signature shared by the exchange methods that record accepted typed input.
 type AcceptedInputAppend = fn(
     &mut Exchange,
@@ -1905,6 +1925,20 @@ impl RetractionEligibility {
     fn output_free() -> Self {
         Self::OutputFree {
             user_message_items: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Create the eligibility of an exchange from what opened it.
+    ///
+    /// The exchange that a task command started records that task's start, and the task
+    /// outlives an interrupt as a paused task, so deleting the exchange would leave a task whose
+    /// start the transcript no longer shows. Only other openings may be retracted.
+    fn for_opening(opening: &crate::exchange::ExchangeOpening) -> Self {
+        match opening {
+            crate::exchange::ExchangeOpening::TaskStarted { .. } => Self::Consumed,
+            crate::exchange::ExchangeOpening::User { .. }
+            | crate::exchange::ExchangeOpening::NativeAgent
+            | crate::exchange::ExchangeOpening::TaskContinuation { .. } => Self::output_free(),
         }
     }
 
@@ -2765,10 +2799,15 @@ impl HarnessBroker {
             &data_root,
             &session.id,
         )?);
+        let exchanged_inputs = exchanges
+            .iter()
+            .filter_map(|exchange| exchange.input_message_id.clone())
+            .collect();
         let input = Arc::new(crate::input::SessionInputQueue::open(
             &data_root,
             &session.id,
             &submission_store,
+            &exchanged_inputs,
         )?);
         let observer = Arc::new(observation::BrokerObserver {
             check_inbox: Arc::new(crate::input::SessionInputQueue::open_channel(
@@ -3045,8 +3084,9 @@ impl HarnessBroker {
             } else {
                 None
             },
-            // Plan, Execute, and Goal turns carry their workflow material as the `<task>` section.
-            task_instructions: match mode {
+            // A paused task is named as paused in every turn; otherwise Plan, Execute, and Goal
+            // turns carry their workflow material as the `<task>` section.
+            task_instructions: self.paused_task_instructions().or_else(|| match mode {
                 PromptMode::Plan | PromptMode::PlanDiscussion => {
                     plan.as_ref()
                         .map(|plan| crate::provider::TaskInstructions::Plan {
@@ -3060,7 +3100,7 @@ impl HarnessBroker {
                     })
                 }),
                 _ => None,
-            },
+            }),
             resolved_question_digest_set: plan
                 .as_ref()
                 .map(|plan| {
@@ -3272,23 +3312,6 @@ impl HarnessBroker {
         if method == RuntimeMethod::SessionPromptSubmit {
             return self.dispatch_local_prompt(request).await;
         }
-        let edit_trace = matches!(
-            method,
-            RuntimeMethod::SessionPlanEntityRename
-                | RuntimeMethod::SessionPlanTestDelete
-                | RuntimeMethod::SessionPlanCheckUpdate
-        )
-        .then(|| {
-            crate::plan::edit_trace::PlanEditTrace::new(
-                Arc::clone(&self.trace),
-                &self.session.id,
-                &request.method,
-                &request.params,
-            )
-        });
-        let dispatch_stage = edit_trace
-            .as_ref()
-            .map(|trace| trace.stage("broker.dispatch"));
         self.timeline_reconciled_after_dispatch = false;
         self.trace.record(
             &self.session.id,
@@ -3312,9 +3335,6 @@ impl HarnessBroker {
         } else {
             self.active_operation_id = None;
         }
-        let mutation_stage = edit_trace
-            .as_ref()
-            .map(|trace| trace.stage("broker.mutation"));
         let command = (|| -> Result<_> {
             let mut candidate = request.clone();
             if candidate.params.get("operation_id").is_none()
@@ -3346,9 +3366,6 @@ impl HarnessBroker {
                 }
             }
         };
-        if let Some(stage) = mutation_stage {
-            stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }}));
-        }
         if let Err(error) = self.refresh_input_schedule() {
             outcome = Err(error.context("publish input deadline"));
         }
@@ -3357,9 +3374,6 @@ impl HarnessBroker {
                 if method.settles_task() {
                     self.active_wait_projection = None;
                 }
-                let reconcile_stage = edit_trace
-                    .as_ref()
-                    .map(|trace| trace.stage("broker.timeline_reconcile"));
                 let timeline_patch = match self.reconcile_after_dispatch() {
                     Ok(timeline_patch) => timeline_patch,
                     Err(error) => {
@@ -3373,9 +3387,6 @@ impl HarnessBroker {
                         };
                     }
                 };
-                if let Some(stage) = reconcile_stage {
-                    stage.complete(json!({}));
-                }
                 if !timeline_patch.is_empty() {
                     match self.event("document_changed", timeline_patch.notification()) {
                         Ok(timeline_event) => event.push(timeline_event),
@@ -3391,9 +3402,6 @@ impl HarnessBroker {
                         }
                     }
                 }
-                let response_stage = edit_trace
-                    .as_ref()
-                    .map(|trace| trace.stage("broker.response_and_trace"));
                 match Response::success(id, value) {
                     Ok(response) => {
                         self.trace.record(
@@ -3409,12 +3417,6 @@ impl HarnessBroker {
                             "request_succeeded",
                             json!({ "request_id": id, "event_count": event.len() }),
                         );
-                        if let Some(stage) = response_stage {
-                            stage.complete(json!({"count":event.len()}));
-                        }
-                        if let Some(stage) = dispatch_stage {
-                            stage.complete(json!({"status":"completed"}));
-                        }
                         DispatchResult { response, event }
                     }
                     Err(error) => DispatchResult {
@@ -3504,7 +3506,11 @@ impl HarnessBroker {
             RuntimeMethod::SessionPlanAccept => Box::pin(std::future::ready(
                 self.dispatch_session_command("session.plan.accept", params),
             )),
-            RuntimeMethod::SessionPlanCheckUpdate => Box::pin(self.update_plan_checks(params)),
+            RuntimeMethod::SessionPlanEntityRename
+            | RuntimeMethod::SessionPlanTestDelete
+            | RuntimeMethod::SessionPlanCheckUpdate => Box::pin(async {
+                anyhow::bail!("review edits must be submitted through the task command owner")
+            }),
             RuntimeMethod::SessionPlanChangesRequest => Box::pin(std::future::ready(
                 self.dispatch_session_command("session.plan.changes.request", params),
             )),
@@ -3689,8 +3695,6 @@ impl HarnessBroker {
             RuntimeMethod::SessionPromptHistoryRecord => self
                 .observer
                 .record_prompt_history(params, self.clock.now_ms()),
-            RuntimeMethod::SessionPlanEntityRename => self.rename_plan_entity(params),
-            RuntimeMethod::SessionPlanTestDelete => self.delete_plan_tests(params),
             RuntimeMethod::SessionPlanCancel => {
                 self.dispatch_session_command("session.plan.cancel", params)
             }
@@ -6482,7 +6486,7 @@ impl HarnessBroker {
                 .clone()
                 .map(ChecklistTracker::from_snapshot)
                 .unwrap_or_default(),
-            retraction_eligibility: RetractionEligibility::output_free(),
+            retraction_eligibility: RetractionEligibility::for_opening(&interaction.opening),
             active_wait: None,
         });
         Ok(())
@@ -6507,7 +6511,14 @@ impl HarnessBroker {
             } else {
                 None
             };
-            let task_owner = task.as_ref().map(|task| task.id.as_str().to_owned());
+            // Every exchange of the selected task shares the task's change baseline, including the
+            // exchange that delivers the task's still-pending input, whose permit is withheld until
+            // delivery is accepted. Otherwise that exchange would start a new baseline and drop
+            // changes an earlier, cancelled turn of the same task made.
+            let task_owner = self
+                .task_controller
+                .current()?
+                .map(|task| task.id.as_str().to_owned());
             let owner = interaction
                 .check_owner
                 .as_ref()
@@ -9660,13 +9671,12 @@ impl HarnessBroker {
                     crate::session::state_machine::ExecutionStatusSnapshot::from(&execution.record)
                         .apply(&mut status)
                 }
-                _ if task.status() == crate::task::TaskStatus::Paused => {
-                    status = crate::session::state_machine::SessionPhase::Paused
-                }
+                _ if task.status() == crate::task::TaskStatus::Paused => status = status.paused(),
                 _ => {}
             }
         }
-        self.observer.hand_off_phase(status)
+        self.observer
+            .hand_off_phase(&self.store, runtime.active_task.as_ref(), status)
     }
 
     #[cfg(test)]
@@ -9691,23 +9701,41 @@ impl HarnessBroker {
     /// title rather than the internal instruction that becomes the exchange prompt.
     /// Close an open exchange that no continuation will resume, keeping checkpoint capture owned.
     ///
-    /// The outcome follows the provider turns the exchange actually started. A still-running
-    /// turn makes it interrupted, and recorded turns complete it. An exchange without any turn
-    /// never reached the provider, so it is cancelled rather than reported as completed work.
-    /// A captured baseline leaves the exchange finalizing for prior finalization to settle.
-    pub(super) fn close_superseded_exchange(
+    /// A Harness-authored continuation in which the model produced nothing is removed instead:
+    /// it holds no work, so a closed copy would only draw its notice above an empty heading. The
+    /// exchange a user prompt or task start opened is always kept, since it records that input.
+    ///
+    /// A cleared task cancels the work it collected, so its exchange is cancelled. Otherwise the
+    /// outcome follows the provider turns the exchange actually started when a new admission
+    /// supersedes it. A still-running turn makes it interrupted, and recorded turns complete it.
+    /// An exchange without any turn never reached the provider, so it is cancelled rather than
+    /// reported as completed work. A captured baseline leaves the exchange finalizing for prior
+    /// finalization to settle.
+    pub(super) fn close_parked_exchange(
         &mut self,
         exchange: &mut Exchange,
+        closure: ParkedClosure,
         now_ms: i64,
-    ) -> Result<()> {
-        let outcome = if exchange
+    ) -> Result<ParkedDisposition> {
+        if exchange.is_output_free_continuation() {
+            self.store.delete_exchange(&exchange.id)?;
+            if self
+                .exchange_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.exchange_id == exchange.id)
+            {
+                self.exchange_runtime = None;
+            }
+            return Ok(ParkedDisposition::Removed);
+        }
+        let outcome = if closure == ParkedClosure::Cleared || exchange.turn.is_empty() {
+            crate::exchange::ExchangeOutcome::Cancelled
+        } else if exchange
             .turn
             .iter()
             .any(|turn| turn.state() == crate::turn::TurnState::Running)
         {
             crate::exchange::ExchangeOutcome::Interrupted
-        } else if exchange.turn.is_empty() {
-            crate::exchange::ExchangeOutcome::Cancelled
         } else {
             crate::exchange::ExchangeOutcome::Complete
         };
@@ -9716,7 +9744,8 @@ impl HarnessBroker {
         } else {
             exchange.finish(outcome, now_ms)?;
         }
-        self.store.save_exchange(exchange)
+        self.store.save_exchange(exchange)?;
+        Ok(ParkedDisposition::Closed)
     }
 
     fn stage_interaction_for_turn(
@@ -9758,13 +9787,19 @@ impl HarnessBroker {
             // The provider can repeat a thread's cumulative token total into the next turn.
             metrics = crate::exchange::ExchangeMetrics::following(&previous.metrics);
             if latest.state == ExchangeState::Running {
-                self.close_superseded_exchange(&mut previous, now_ms)?;
-                effects.push(
-                    self.prepare_live_interaction(
+                match self.close_parked_exchange(
+                    &mut previous,
+                    ParkedClosure::Superseded,
+                    now_ms,
+                )? {
+                    ParkedDisposition::Closed => effects.push(self.prepare_live_interaction(
                         publication::LiveUpdate::StateChanged,
                         &previous,
-                    )?,
-                );
+                    )?),
+                    ParkedDisposition::Removed => {
+                        effects.push(AppliedProviderEvent::Timeline(self.reconcile_timeline()?))
+                    }
+                }
             }
         }
         Ok((
@@ -9816,180 +9851,6 @@ impl HarnessBroker {
         ))
     }
 
-    fn delete_plan_tests(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let trace = crate::plan::edit_trace::PlanEditTrace::new(
-            Arc::clone(&self.trace),
-            &self.session.id,
-            "session.plan.test.delete",
-            &params,
-        );
-        let mutation = trace.stage("delete.total");
-        let plan_id = required_text(&params, "plan_id")?;
-        let expected_digest = required_text(&params, "digest")?;
-        let expected_version = params
-            .get("expected_version")
-            .and_then(Value::as_u64)
-            .context("test deletion requires the reviewed plan version")?;
-        let selected: Vec<crate::plan::DesignTestSelection> = serde_json::from_value(
-            params
-                .get("tests")
-                .cloned()
-                .context("test selection is missing")?,
-        )?;
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("plan record is missing")?;
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another session"
-        );
-        anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview,
-            "only plans awaiting review can have tests deleted"
-        );
-        anyhow::ensure!(
-            plan.review_digest.as_deref() == Some(&expected_digest),
-            "plan changed before test deletion"
-        );
-        let (document, rendered, checksum) = self.plan_file.remove_tests(
-            &self.session.id,
-            &plan.id,
-            expected_version,
-            &expected_digest,
-            &selected,
-            Some(&trace),
-        )?;
-        let records = trace.stage("delete.persist_records");
-        plan.document_version = document.version;
-        plan.review_digest = Some(checksum);
-        plan.review = None;
-        plan.manual_changes
-            .extend(crate::plan::removed_test_edits(&selected));
-        plan.updated_at_ms = self.clock.now_ms();
-        self.publish_plan(&plan)?;
-
-        self.save_session()?;
-        records.complete(json!({"count":selected.len(), "version":document.version}));
-        let payload = json!({ "plan": plan, "content": rendered.markdown, "document": document });
-        mutation.complete(json!({"version":document.version}));
-        Ok((
-            payload.clone(),
-            vec![self.event("plan_tests_deleted", payload)?],
-        ))
-    }
-
-    async fn update_plan_checks(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let result = self.prepare_plan_checks_update(params)?.run().await?;
-        self.commit_plan_checks_update(result)
-    }
-
-    fn rename_plan_entity(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let trace = crate::plan::edit_trace::PlanEditTrace::new(
-            Arc::clone(&self.trace),
-            &self.session.id,
-            "session.plan.entity.rename",
-            &params,
-        );
-        let mutation = trace.stage("rename.total");
-        let preflight = trace.stage("rename.preflight");
-        let plan_id = required_text(&params, "plan_id")?;
-        let symbol = params.get("symbol").and_then(Value::as_str);
-        let entity_name = params
-            .get("entity_name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let new_name = required_text(&params, "name")?;
-        anyhow::ensure!(!new_name.trim().is_empty(), "entity name cannot be empty");
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("active plan record is missing")?;
-        anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview,
-            "plan does not await review"
-        );
-        let document = self
-            .plan_file
-            .read_working_document(&self.session.id, &plan.id)?;
-        if let Some(expected_version) = params.get("expected_version").and_then(Value::as_u64) {
-            anyhow::ensure!(
-                document.version == expected_version,
-                "plan version changed before entity rename"
-            );
-        }
-        if let Some(expected) = params.get("digest").and_then(Value::as_str) {
-            anyhow::ensure!(
-                plan.review_digest.as_deref() == Some(expected),
-                "plan changed before rename"
-            );
-            anyhow::ensure!(
-                crate::plan::digest(&serde_json::to_vec(&document)?) == expected,
-                "working plan changed before rename"
-            );
-        }
-        preflight.complete(json!({"version":document.version}));
-        let (previous_name, document, rendered, digest) = if let Some(identity) = symbol {
-            anyhow::ensure!(
-                params.get("expected_version").and_then(Value::as_u64) == Some(document.version),
-                "rename requires the current plan version"
-            );
-            self.plan_file.rename_symbol(
-                &self.session.id,
-                &plan.id,
-                document.version,
-                identity,
-                &new_name,
-                Some(&trace),
-            )?
-        } else {
-            let previous = document
-                .entity_changes
-                .iter()
-                .find(|entity| entity.name == entity_name)
-                .map(|entity| entity.name.clone())
-                .with_context(|| format!("program entity `{entity_name}` does not exist"))?;
-            let result = self.plan_file.rename_added_entity(
-                &self.session.id,
-                &plan.id,
-                &entity_name,
-                new_name.clone(),
-            )?;
-            let rendered = self.plan_file.render_review(&result.document)?;
-            let digest = crate::plan::digest(&crate::codec::to_vec(&result.document)?);
-            (previous, result.document, rendered, digest)
-        };
-        let records = trace.stage("rename.persist_records");
-        let version = document.version;
-        plan.document_version = version;
-        plan.title.clone_from(&document.title);
-        plan.review_digest = Some(digest);
-        plan.review = None;
-        plan.manual_changes
-            .push(forge_provider_api::forge::PlanEdit::Rename {
-                from: previous_name.to_string(),
-                to: new_name.to_string(),
-            });
-        plan.updated_at_ms = self.clock.now_ms();
-        self.publish_plan(&plan)?;
-
-        self.save_session()?;
-        records.complete(json!({"version":version}));
-        let payload = json!({
-            "plan": &plan,
-            "content": &rendered.markdown,
-            "document": &document,
-            "previous_name": previous_name,
-            "name": new_name,
-        });
-        mutation.complete(json!({"version":version}));
-        Ok((
-            payload.clone(),
-            vec![self.event("plan_entity_renamed", payload)?],
-        ))
-    }
-
     async fn continue_plan_review(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let plan = self.active_plan_review()?;
         let acceptance = plan
@@ -10009,13 +9870,18 @@ impl HarnessBroker {
         )
     }
 
+    /// Apply one goal turn's evidence, settling any terminal request it carried.
+    ///
+    /// Harness refuses a completion request whose source it cannot certify. The refusal keeps the
+    /// goal active and reaches the model through the continuation's notice; it never fails the
+    /// foreground, because a failed foreground closes the provider thread the goal still needs.
     fn apply_goal_evidence_strict(
         &mut self,
         evidence: crate::goal::TurnEvidence,
         permit: Option<crate::task::TaskPermit>,
         completed_turn: crate::task::TaskTurnId,
         control: Option<&crate::goal::GoalControl>,
-        workspace: Option<(&execution::ReservedWorkspace, Option<String>)>,
+        workspace: Option<(&foreground_goal_effect::GoalWorkspace, Option<String>)>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
         if let Some(control) = control
@@ -10045,6 +9911,8 @@ impl HarnessBroker {
         if task.kind() == crate::task::TaskKind::Plan {
             return Err(crate::task::StaleTask.into());
         }
+        let mut evidence = evidence;
+        let mut refused_control = None;
         if task.kind() == crate::task::TaskKind::Goal
             && (evidence.structured_complete
                 || control.is_some_and(|control| {
@@ -10054,12 +9922,32 @@ impl HarnessBroker {
             let (workspace, _) = workspace
                 .as_ref()
                 .context("goal completion requires reserved workspace evidence")?;
-            anyhow::ensure!(
-                self.check_runner
-                    .verification_satisfied(workspace.checkpoint())?,
-                "required whole-check verification remains pending; run the originating checks before completing the goal"
-            );
+            // A refused completion is an ordinary turn outcome: the goal stays active and its next
+            // turn tells the model why, instead of failing the foreground that asked.
+            let refusal =
+                match workspace {
+                    foreground_goal_effect::GoalWorkspace::Reserved(reserved) => (!self
+                        .check_runner
+                        .verification_satisfied(reserved.checkpoint())?)
+                    .then_some(foreground_goal_effect::GOAL_VERIFICATION_PENDING),
+                    foreground_goal_effect::GoalWorkspace::Unprotected { .. } => {
+                        Some(foreground_goal_effect::GOAL_WORKSPACE_BUSY)
+                    }
+                };
+            if let Some(reason) = refusal {
+                evidence.structured_complete = false;
+                self.trace.record(
+                    &self.session.id,
+                    "goal.completion_refused",
+                    json!({"reason":reason}),
+                );
+                refused_control = control.map(|control| crate::goal::GoalControl {
+                    refusal: Some(reason.into()),
+                    ..control.clone()
+                });
+            }
         }
+        let control = refused_control.as_ref().or(control);
         let workspace =
             workspace.map(|(workspace, previous)| (workspace.checkpoint().clone(), previous));
         let observed = match control {
@@ -10123,6 +10011,30 @@ impl HarnessBroker {
 
     fn active_goal(&self) -> Result<GoalRecord> {
         self.current_goal()?.context("no active goal")
+    }
+
+    /// Name the session's task as paused while it is paused, for every turn's `<task>` section.
+    fn paused_task_instructions(&self) -> Option<crate::provider::TaskInstructions> {
+        use forge_provider_api::forge::{PausedTask, PausedTaskKind};
+        let task = self.task_controller.current().ok().flatten()?;
+        if task.status() != crate::task::TaskStatus::Paused {
+            return None;
+        }
+        let (kind, objective) = match &task.workflow {
+            crate::task::WorkflowSnapshot::Goal { goal } => {
+                (PausedTaskKind::Goal, goal.objective.clone())
+            }
+            crate::task::WorkflowSnapshot::Plan { plan } => {
+                (PausedTaskKind::Plan, plan.artifact.request.clone())
+            }
+            crate::task::WorkflowSnapshot::Execute { execution } => {
+                (PausedTaskKind::Execute, execution.title.clone())
+            }
+        };
+        Some(crate::provider::TaskInstructions::Paused(PausedTask {
+            kind,
+            objective,
+        }))
     }
 
     fn current_goal(&self) -> Result<Option<GoalRecord>> {
@@ -10822,7 +10734,13 @@ impl HarnessBroker {
     /// Deliver queued session observations in provider order under broker ownership.
     pub(crate) fn drain_session_events(&mut self) -> Result<Vec<SessionEvent>> {
         let mut updates = std::mem::take(&mut self.settlement_events);
-        for observation in self.observer.session_events().drain()? {
+        let inbox = self.observer.session_events();
+        // A live foreground applies the inbox in its own publication order; it hands any
+        // remainder back when its claim ends.
+        if inbox.foreground_claimed() {
+            return Ok(updates);
+        }
+        for observation in inbox.drain()? {
             updates.extend(self.observe_session_event(observation)?);
         }
         Ok(updates)

@@ -202,13 +202,15 @@ impl HarnessBroker {
 
     /// Cancel local/waiting work after foreground and native collection have settled.
     /// Preserve terminal history if natural completion won before this transition.
+    ///
+    /// Only a task with a turn to stop pauses; see [`interrupt_pauses`].
     pub(crate) fn owner_cancel_local(
         &mut self,
         target: Option<&crate::provider::ExchangeId>,
     ) -> Result<(Option<PriorFinalization>, Vec<SessionEvent>)> {
         let mut events = self.drain_session_events()?;
         if let Some(task) = self.task_controller.current()?
-            && !task.status().terminal()
+            && interrupt_pauses(task.status())
         {
             self.task_controller.change(
                 &mut self.store,
@@ -316,14 +318,37 @@ impl HarnessBroker {
                 .is_some())
     }
 
+    /// Clear the stop label from a parked exchange once the command that stopped it commits.
+    fn owner_release_parked_collection(&mut self) -> Result<Vec<SessionEvent>> {
+        let Some(mut exchange) = self
+            .store
+            .exchange_in_state(&self.session.id, ExchangeState::Running)?
+            .filter(|exchange| exchange.is_parked() && exchange.collection.is_some())
+        else {
+            return Ok(Vec::new());
+        };
+        exchange.collection = None;
+        self.store.save_exchange(&exchange)?;
+        let patch = self.reconcile_live_interaction(Some(&exchange), None)?;
+        Ok(if patch.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.event("document_changed", patch.notification())?]
+        })
+    }
+
     /// Close the exchange that task-control collection parked once no task remains to resume it.
     ///
     /// Task controls collect through reconfiguration, which parks the selected exchange and
     /// relies on the next admission to close it. A committed control that leaves no current
     /// task schedules no such admission, so the parked exchange would otherwise stay running.
+    ///
+    /// A control that keeps its task, such as a pause, instead releases the stop label the
+    /// collection left on the parked exchange, so it reads as paused only once the control has
+    /// committed rather than between the collection and the commit.
     pub(crate) fn owner_close_orphaned_parked_exchange(&mut self) -> Result<Vec<SessionEvent>> {
         if self.task_controller.current()?.is_some() {
-            return Ok(Vec::new());
+            return self.owner_release_parked_collection();
         }
         let Some(mut exchange) = self
             .store
@@ -334,16 +359,23 @@ impl HarnessBroker {
         };
         self.questions.cancel_chat(Some(&exchange.id))?;
         exchange.set_awaiting_input(false);
-        self.close_superseded_exchange(&mut exchange, self.clock.now_ms())?;
+        let disposition = self.close_parked_exchange(
+            &mut exchange,
+            super::ParkedClosure::Cleared,
+            self.clock.now_ms(),
+        )?;
         self.save_session()?;
-        let mut events = vec![self.event(
-            if exchange.is_finished() {
-                "exchange_complete"
-            } else {
-                "exchange_updated"
-            },
-            json!({"id":exchange.id,"state":exchange.state()}),
-        )?];
+        let mut events = Vec::new();
+        if disposition == super::ParkedDisposition::Closed {
+            events.push(self.event(
+                if exchange.is_finished() {
+                    "exchange_complete"
+                } else {
+                    "exchange_updated"
+                },
+                json!({"id":exchange.id,"state":exchange.state()}),
+            )?);
+        }
         let patch = self.reconcile_timeline()?;
         if !patch.is_empty() {
             events.push(self.event("document_changed", patch.notification())?);
@@ -417,5 +449,24 @@ impl HarnessBroker {
                 !exchange.is_finished()
                     && exchange.disposition() == crate::exchange::HistoryDisposition::Current
             }))
+    }
+}
+
+/// Report whether cancelling or shutting down pauses a task in this status.
+///
+/// An interrupt stops a task's admitted or pending attempt, and a repeated interrupt keeps a paused
+/// task paused. A task that waits for the user's answer or plan review, or is blocked on a recorded
+/// constraint, has no turn to stop, so pausing it would only turn `plan · review` into
+/// `plan · review · paused` and demand an explicit resume before the review could proceed, both
+/// after a stray `Ctrl-C` and across every host restart.
+pub(crate) fn interrupt_pauses(status: crate::task::TaskStatus) -> bool {
+    use crate::task::TaskStatus;
+    match status {
+        TaskStatus::Ready | TaskStatus::Running | TaskStatus::Stopping | TaskStatus::Paused => true,
+        TaskStatus::Waiting
+        | TaskStatus::Blocked
+        | TaskStatus::Completed
+        | TaskStatus::Cancelled
+        | TaskStatus::Failed => false,
     }
 }

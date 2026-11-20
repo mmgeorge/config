@@ -849,7 +849,27 @@ impl ExchangeDriver {
                             events.extend(retirement);
                             Ok(events)
                         }
-                        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+                        // The closed generation's rows are already marked unavailable in storage;
+                        // publish that change too, or the editor keeps their live clocks running.
+                        (Err(error), Ok(retirement)) => {
+                            let published = retirement.into_iter().try_for_each(|event| {
+                                retain_publication(
+                                    event,
+                                    output.as_ref(),
+                                    services,
+                                    trace,
+                                    session,
+                                    step,
+                                )
+                            });
+                            Err(match published {
+                                Ok(()) => error,
+                                Err(retirement) => error.context(format!(
+                                    "closed binding publication failed: {retirement:#}"
+                                )),
+                            })
+                        }
+                        (Ok(_), Err(error)) => Err(error),
                         (Err(error), Err(retirement)) => Err(error
                             .context(format!("closed binding publication failed: {retirement:#}"))),
                     };
@@ -872,6 +892,22 @@ impl ExchangeDriver {
                         Ok(())
                     })
                     .map_err(ProviderObservationError::Commit);
+                if let Err(ProviderObservationError::Commit(error)) = &observed
+                    && error.chain().any(|cause| {
+                        cause.downcast_ref::<forge_provider_api::ObservationFailure>()
+                            == Some(&forge_provider_api::ObservationFailure::OwnershipConflict)
+                    })
+                {
+                    trace.record(
+                        session,
+                        "provider.ownership_conflict",
+                        serde_json::json!({
+                            "stage": "observation_commit",
+                            "site": forge_provider_api::lifecycle::take_ownership_conflict_site(),
+                            "update_step": step,
+                        }),
+                    );
+                }
                 let _ = reply.send(observed);
             }
             OwnerEvent::ReconnectSnapshot {

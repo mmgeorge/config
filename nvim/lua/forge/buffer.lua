@@ -807,6 +807,8 @@ function M.apply_async(session, update, alive, done)
       status = result and result.kind or "Failed",
     })
     done(result)
+    -- A view applied while the user sits at a `:` prompt is otherwise drawn only when they leave it.
+    require("forge.infra.command_line_redraw").request()
   end, function()
     if vim.api.nvim_buf_is_valid(session.buffer) then
       observed_tick = vim.api.nvim_buf_get_changedtick(session.buffer)

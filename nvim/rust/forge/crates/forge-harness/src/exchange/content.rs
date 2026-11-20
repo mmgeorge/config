@@ -463,7 +463,10 @@ impl Exchange {
                     .is_some_and(|entry_position| entry_position <= position)
                     || entry.anchor() == self.id)
                     && match entry {
-                        ExchangeEntry::Steering { .. } => false,
+                        // A consumed steering message ends the reasoning before it: a tool that
+                        // follows it starts a new group below the message instead of joining the
+                        // paragraph written before the user changed the instructions.
+                        ExchangeEntry::Steering { .. } => true,
                         ExchangeEntry::Event { id } => self.node_list.iter().any(|node| {
                             node.id() == id
                                 && matches!(

@@ -345,6 +345,7 @@ fn capability(id: &str) -> ProviderCapability {
             native_steer: true,
             native_turn_rollback: true,
             native_conversation_rewind: true,
+            conversation_rewind_requires_checkpoint: false,
             model_selection: true,
             effort_selection: true,
             fast_mode: true,
@@ -407,6 +408,8 @@ fn capability(id: &str) -> ProviderCapability {
             },
             native_steer: true,
             native_conversation_rewind: true,
+            // The CLI resumes only at a transcript entry, so it cannot rewind past every turn.
+            conversation_rewind_requires_checkpoint: true,
             model_selection: true,
             effort_selection: true,
             permission_control: true,

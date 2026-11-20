@@ -31,6 +31,7 @@ mod verification;
 pub(crate) use tools::model_check_operations;
 
 pub use activity::{CheckActivity, CheckCommandActivity};
+pub(crate) use applicability::ChangeInventory;
 pub use applicability::{CheckApplicability, CheckTrigger};
 pub(crate) use automatic::AutomaticChecks;
 #[cfg(test)]

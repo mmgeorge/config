@@ -107,9 +107,11 @@ impl MarkdownRenderer {
         Self::project_source(id, source, profile, false)
     }
 
-    /// Presents file links as their original labels, retaining destinations and physical rows.
-    /// Web links, code examples, and other Markdown remain in source form.
-    pub fn file_link_labels(
+    /// Presents labelled links, file and web alike, as their labels, retaining destinations as
+    /// link targets and physical rows. A view measures soft wrapping with `linebreak` on the
+    /// buffer text, concealed or not, so a destination left in the row would wrap it early.
+    /// Unlabelled links, code examples, and other Markdown remain in source form.
+    pub fn link_labels(
         id: BlockId,
         source: &str,
         profile: &WidthProfile,
@@ -121,7 +123,7 @@ impl MarkdownRenderer {
         id: BlockId,
         source: &str,
         profile: &WidthProfile,
-        file_labels: bool,
+        labels: bool,
     ) -> Result<RenderedMarkdown, ContractError> {
         id.validate()?;
         profile.validate()?;
@@ -140,14 +142,14 @@ impl MarkdownRenderer {
             .collect();
         let mut metadata = BlockMetadata::default();
         let mut link = Vec::new();
-        let mut file_link: Option<(Range<usize>, Option<Range<usize>>)> = None;
+        let mut labelled_link: Option<(Range<usize>, Option<Range<usize>>)> = None;
         let mut omission = Vec::new();
         for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
             if matches!(event, Event::End(TagEnd::Link)) {
-                if let Some((whole, Some(label))) = file_link.take() {
+                if let Some((whole, Some(label))) = labelled_link.take() {
                     omission.extend([whole.start..label.start, label.end..whole.end]);
                 }
-            } else if let Some((_, label)) = &mut file_link {
+            } else if let Some((_, label)) = &mut labelled_link {
                 match label {
                     Some(label) => {
                         label.start = label.start.min(range.start);
@@ -164,8 +166,8 @@ impl MarkdownRenderer {
                 Event::Start(Tag::CodeBlock(_)) => "@markup.raw.block",
                 Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) => "@markup.raw",
                 Event::Start(Tag::Link { dest_url, .. }) => {
-                    if file_labels && file_destination(&dest_url) {
-                        file_link = Some((range.clone(), None));
+                    if labels {
+                        labelled_link = Some((range.clone(), None));
                     }
                     let target = TargetId(format!("markdown-source-link:{}:{}", id.0, range.start));
                     let first = start
@@ -231,7 +233,7 @@ impl MarkdownRenderer {
         let text = if omission.is_empty() {
             BufferText::from_rows(&row)?
         } else {
-            project_file_labels(source, &start, &omission, &mut metadata)?
+            project_link_labels(source, &start, &omission, &mut metadata)?
         };
         let source = (0..row.len())
             .map(|row| MarkdownSourceRange {
@@ -471,32 +473,7 @@ impl MarkdownRenderer {
     }
 }
 
-fn file_destination(destination: &str) -> bool {
-    if destination.is_empty()
-        || destination.starts_with(['#', '?'])
-        || destination.starts_with("//")
-    {
-        return false;
-    }
-    if destination
-        .get(..5)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
-    {
-        return true;
-    }
-    let bytes = destination.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
-    {
-        return true;
-    }
-    let prefix = destination.split(['/', '\\']).next().unwrap_or_default();
-    !prefix.contains(':')
-}
-
-fn project_file_labels(
+fn project_link_labels(
     source: &str,
     row_start: &[usize],
     omission: &[Range<usize>],
@@ -751,5 +728,55 @@ impl RenderState<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labelled(source: &str) -> RenderedMarkdown {
+        MarkdownRenderer::link_labels(BlockId("response".into()), source, &WidthProfile::default())
+            .unwrap()
+    }
+
+    /// A concealed destination still counts toward the window's `linebreak` measurement, so a
+    /// web link in source form wrapped its row early. The row holds the label instead, and the
+    /// destination stays reachable through the link's target.
+    #[test]
+    fn web_link_rows_hold_their_label_and_keep_the_destination() {
+        let rendered =
+            labelled("Supported (see [Vitest writing tests](https://vitest.dev/guide/)).");
+        assert_eq!(
+            rendered.block.text.row(0),
+            Some("Supported (see Vitest writing tests).")
+        );
+        assert_eq!(rendered.link.len(), 1);
+        assert_eq!(rendered.link[0].destination, "https://vitest.dev/guide/");
+        let target = &rendered.block.metadata.target[0];
+        assert_eq!(target.id, rendered.link[0].target);
+        assert_eq!(
+            (target.range.start.column, target.range.end.column),
+            (15, 35)
+        );
+    }
+
+    #[test]
+    fn file_links_and_unlabelled_links_keep_their_projection() {
+        let rendered = labelled("Read [the guide](docs/guide.md) and [](https://example.com).");
+        assert_eq!(
+            rendered.block.text.row(0),
+            Some("Read the guide and [](https://example.com).")
+        );
+        assert_eq!(rendered.link.len(), 2);
+    }
+
+    #[test]
+    fn plain_source_projection_keeps_web_links_in_source_form() {
+        let source = "See [docs](https://example.com).";
+        let rendered =
+            MarkdownRenderer::source(BlockId("source".into()), source, &WidthProfile::default())
+                .unwrap();
+        assert_eq!(rendered.block.text.row(0), Some(source));
     }
 }

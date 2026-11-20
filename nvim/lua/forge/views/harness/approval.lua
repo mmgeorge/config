@@ -125,7 +125,7 @@ local function submit(instance, cancel)
     instance.submitting = false
     if active == instance and resolved then
       active = nil
-      picker.close(false)
+      picker.close(false, "user")
     end
   end)
 end

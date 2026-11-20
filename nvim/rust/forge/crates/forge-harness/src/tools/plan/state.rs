@@ -9,7 +9,7 @@ pub(super) async fn apply_edit(
     mut invocation: ControlToolInvocation,
     mut output: ProviderCompletion,
 ) -> Result<ControlToolResult> {
-    runtime.require_readable_plan()?;
+    runtime.require_plan_mutation()?;
     crate::tools::error::ensure!(
         !runtime.context.has_active_elicitation,
         "resolve pending Harness questions before editing the design"

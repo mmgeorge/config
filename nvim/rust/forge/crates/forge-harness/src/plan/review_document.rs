@@ -822,15 +822,14 @@ impl EditablePlanReview<'_> {
         }
         let reanchor = trace.map(|trace| trace.stage("review.retain_annotations"));
         let previous = document.document.snapshot();
+        // A comment keeps its row inside its section, as a review edit's own re-anchoring does;
+        // the first row with the same target would be the section heading.
         let remap = |line| {
-            let anchor = document.source.rendered.navigation.resolve_line(line)?;
-            if let Some(current) = source
-                .rendered
-                .navigation
-                .anchor
-                .iter()
-                .find(|current| current.target == anchor.target)
-            {
+            if let Some(current) = super::review_annotation::relocate_row(
+                &document.source.rendered,
+                &source.rendered,
+                line,
+            ) {
                 return Some(current.clone());
             }
             for previous_block in &previous.block {
@@ -965,8 +964,45 @@ impl EditablePlanReview<'_> {
             .selected_algorithm(anchor, row, column)
             .or_else(|| index.selected(&selected_anchor, saved_column))
             .context("select a resolved symbol defined in the plan")?;
-        let (_, symbol) = index.rename_definition(&document.source.document, identity)?;
+        let (definition_path, symbol) =
+            index.rename_definition(&document.source.document, identity)?;
         let mut preview = Vec::new();
+        // Narrative rows, test descriptions, and flows carry the inline-code mentions the rename
+        // rewrites; declaration rows, doc comments included, change only through their tokens.
+        let narrative =
+            super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""))?;
+        // Narrative blocks hold one row each, so the open-fence state carries from row to row
+        // through consecutive narrative blocks, as it does through the text they render.
+        let mut fence = false;
+        for block in document.document.snapshot().block {
+            let kind = if block.id.0.contains(":description:") {
+                super::references::NarrativeText::TestDescription
+            } else if block.id.0.starts_with("plan:metadata:") {
+                super::references::NarrativeText::Prose
+            } else {
+                fence = false;
+                continue;
+            };
+            let Some(row) = block.text.row(0) else {
+                continue;
+            };
+            let mut description_fence = false;
+            let fence = if kind == super::references::NarrativeText::TestDescription {
+                &mut description_fence
+            } else {
+                &mut fence
+            };
+            for column in super::references::narrative_mentions(
+                row,
+                &narrative,
+                &definition_path,
+                &symbol,
+                kind,
+                fence,
+            ) {
+                preview.push(serde_json::json!({"block":block.id,"column":column,"length":symbol.name.len()}));
+            }
+        }
         let mut resolver = crate::declaration::DeclarationResolver::planned(
             &document.source.workspace,
             design,
@@ -2356,6 +2392,384 @@ impl ReadOnlyPlanReview {
 mod tests {
 
     use super::*;
+
+    /// A comment on prose rows, which share their section's navigation target, keeps its rows
+    /// by their rendered text when a review edit moves later rows.
+    #[tokio::test]
+    async fn comment_on_shared_section_rows_keeps_its_text_after_test_deletion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
+        crate::checks::configure_fixture(&file.workspace);
+        let mut canonical = crate::plan::document::test_fixture("plan", "Review prose.");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Expose shared state.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior.".into()];
+        design.document.design =
+            "Use a focused state owner.\n\nReturn every share in order.\n\nReject an empty part count."
+                .into();
+        design.document.tests = vec![crate::plan::design_tests::DesignTestFile {
+            file: "tests.rs".into(),
+            cases: ["first_case", "second_case"]
+                .map(|name| crate::plan::design_tests::DesignTestCase {
+                    name: name.into(),
+                    target: None,
+                    change: crate::plan::design_tests::DesignTestChange::New,
+                    description: "covers one case".into(),
+                })
+                .into(),
+        }];
+        design.proposed_source.insert(
+            "state.rs".into(),
+            "/// Owns shared state.\npub struct State;\n".into(),
+        );
+        design.parsed = crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())
+            .unwrap()
+            .parsed;
+        canonical.design = Some(design);
+        file.write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (submitted, rendered, checksum) = file
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let rows = rendered.markdown.lines().collect::<Vec<_>>();
+        let line_of = |rows: &[&str], text: &str| {
+            rows.iter()
+                .position(|row| row.contains(text))
+                .map(|index| index as u32 + 1)
+                .unwrap()
+        };
+        let start = line_of(&rows, "Return every share in order.");
+        let end = line_of(&rows, "Reject an empty part count.");
+        let working = file.plan_dir("session", "plan").join("working.json");
+        ReviewAnnotationStore::open(
+            working.clone(),
+            crate::plan::digest(&std::fs::read(&working).unwrap()),
+        )
+        .unwrap()
+        .replace(vec![ReviewAnnotation {
+            parent_id: None,
+            id: "comment".into(),
+            kind: ReviewAnnotationKind::Comment,
+            reply: None,
+            anchor: None,
+            source: crate::plan::PlanAnnotationInput {
+                start_line: start,
+                end_line: end,
+                body: "Explain both rules.".into(),
+            },
+        }])
+        .unwrap();
+        let (_, rendered, _) = file
+            .remove_tests(
+                "session",
+                "plan",
+                submitted.version,
+                &checksum,
+                &[crate::plan::DesignTestSelection {
+                    file: "tests.rs".into(),
+                    name: "first_case".into(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let saved = ReviewAnnotationStore::open(
+            working.clone(),
+            crate::plan::digest(&std::fs::read(&working).unwrap()),
+        )
+        .unwrap()
+        .annotation()
+        .to_vec();
+        let rows = rendered.markdown.lines().collect::<Vec<_>>();
+        let source = &saved[0].source;
+        assert_eq!(
+            (
+                rows[source.start_line as usize - 1],
+                rows[source.end_line as usize - 1]
+            ),
+            (
+                rows[line_of(&rows, "Return every share in order.") as usize - 1],
+                rows[line_of(&rows, "Reject an empty part count.") as usize - 1]
+            )
+        );
+    }
+
+    /// The rename preview lists every inline-code mention the rename rewrites, in narrative rows,
+    /// test descriptions, flow text, and Mermaid labels, beside the declaration itself.
+    #[test]
+    fn rename_preview_lists_narrative_mentions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
+        crate::checks::configure_fixture(&file.workspace);
+        let canonical = crate::plan::references::tests::scoring_plan();
+        file.write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = file
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let source = file
+            .capture_review_source("session", "plan", None, &checksum)
+            .unwrap();
+        let id = DocumentId("rename".into());
+        let document = ReadOnlyPlanReview::new(
+            id.clone(),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        let snapshot = document.snapshot();
+        let rendered = snapshot
+            .block
+            .iter()
+            .map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>();
+        let (block, row, column) = snapshot
+            .block
+            .iter()
+            .find_map(|block| {
+                block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(row, text)| {
+                        text.find("fn score(")
+                            .map(|column| (block.clone(), row, column + 3))
+                    })
+            })
+            .unwrap_or_else(|| panic!("no declaration row in {rendered:#?}"));
+        let target = block
+            .metadata
+            .target
+            .iter()
+            .find(|target| {
+                (target.range.start.row, target.range.start.column) <= (row, column)
+                    && (row, column) < (target.range.end.row, target.range.end.column)
+            })
+            .or_else(|| block.metadata.target.first())
+            .cloned();
+        let store = PlanReviewStore::default();
+        let admission = store.admit(id.clone()).unwrap();
+        store.insert(document, admission).unwrap();
+        let result = store
+            .action(DocumentInput {
+                document: id,
+                revision: snapshot.revision,
+                view: ViewId("view".into()),
+                sequence: InputSequence(1),
+                action: "rename_entity".into(),
+                block: block.id.clone(),
+                position: forge_buffer::block::TextPosition { row, column },
+                target: target.map(|target| target.id),
+            })
+            .unwrap();
+        let rows = snapshot
+            .block
+            .iter()
+            .map(|block| {
+                (
+                    block.id.0.clone(),
+                    block.text.row(0).unwrap_or("").to_owned(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut previewed = result["rename"]["preview"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|edit| {
+                let block = edit["block"].as_str()?;
+                let column = edit["column"].as_u64()? as usize;
+                let row = &rows[block];
+                (block.starts_with("plan:metadata:") || block.contains(":description:"))
+                    .then(|| (row.trim().to_owned(), row[column..column + 5].to_owned()))
+            })
+            .collect::<Vec<_>>();
+        previewed.sort();
+        let mut expected = [
+            "A[\"`play`\"] --> B[\"`score`\"]",
+            "Call `score` once per round; `play` drives it.",
+            "Each round calls `score`.",
+            "- Keep `score` pure and leave `scored` alone.",
+            "`Rounds::score` returns the round.",
+            "`score` returns its round.",
+        ]
+        .map(|row| (row.to_owned(), "score".to_owned()))
+        .to_vec();
+        expected.sort();
+        assert_eq!(previewed, expected);
+    }
+
+    /// A rename rewrites rows of a section that holds a saved multi-row comment; the comment keeps
+    /// its rows, matched by their text or their place in the section, rather than moving to the
+    /// section's first row, which shares the rows' navigation target.
+    #[test]
+    fn rename_keeps_a_saved_comment_on_its_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
+        crate::checks::configure_fixture(&file.workspace);
+        let mut canonical = crate::plan::references::tests::scoring_plan();
+        canonical.design.as_mut().unwrap().document.design =
+            "Each round has a total.\n\nKeep the totals.\n\n`score` returns the round.\n\nRecord the winner."
+                .into();
+        file.write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (submitted, rendered, checksum) = file
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let line_of = |rendered: &crate::plan::RenderedPlan, text: &str| {
+            rendered
+                .markdown
+                .lines()
+                .position(|row| row.contains(text))
+                .map(|index| index as u32 + 1)
+                .unwrap()
+        };
+        let (start, end) = (
+            line_of(&rendered, "Keep the totals."),
+            line_of(&rendered, "`score` returns the round."),
+        );
+        let target = |line| {
+            rendered
+                .navigation
+                .resolve_line(line)
+                .unwrap()
+                .target
+                .clone()
+        };
+        let working = file.plan_dir("session", "plan").join("working.json");
+        ReviewAnnotationStore::open(
+            working.clone(),
+            crate::plan::digest(&std::fs::read(&working).unwrap()),
+        )
+        .unwrap()
+        .replace(vec![ReviewAnnotation {
+            parent_id: None,
+            id: "comment".into(),
+            kind: ReviewAnnotationKind::Comment,
+            reply: None,
+            anchor: Some(super::super::ReviewAnnotationAnchor {
+                start: target(start),
+                end: target(end),
+            }),
+            source: crate::plan::PlanAnnotationInput {
+                start_line: start,
+                end_line: end,
+                body: "Explain both rules.".into(),
+            },
+        }])
+        .unwrap();
+        let id = DocumentId("rename".into());
+        let document = ReadOnlyPlanReview::new(
+            id.clone(),
+            ViewId("view".into()),
+            file.capture_review_source("session", "plan", None, &checksum)
+                .unwrap(),
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        let store = PlanReviewStore::default();
+        let admission = store.admit(id.clone()).unwrap();
+        store.insert(document, admission).unwrap();
+        let index =
+            crate::plan::references::PlanReferenceIndex::planned(&submitted, &file.workspace)
+                .unwrap();
+        let identity = index
+            .definition
+            .iter()
+            .find(|((path, line, _), _)| path == "Rounds.rs" && *line == 2)
+            .map(|(_, (identity, _))| identity.clone())
+            .unwrap();
+        let working_document = file.read_working_document("session", "plan").unwrap();
+        assert_eq!(working_document.version, submitted.version);
+        let (_, _, renamed, digest) = file
+            .rename_symbol_from_document("session", &working_document, &identity, "tally", None)
+            .unwrap();
+        let mut source = super::super::review_source::EditableReviewSource::try_from(
+            file.capture_review_source("session", "plan", None, &digest)
+                .unwrap(),
+        )
+        .unwrap();
+        store.prepare_update(&id, &mut source).unwrap();
+        store.update(&id, source, submitted.version, None).unwrap();
+        let saved = ReviewAnnotationStore::open(
+            working.clone(),
+            crate::plan::digest(&std::fs::read(&working).unwrap()),
+        )
+        .unwrap()
+        .annotation()
+        .to_vec();
+        let rows = renamed.markdown.lines().collect::<Vec<_>>();
+        let source = &saved
+            .first()
+            .expect("the rename dropped the comment")
+            .source;
+        assert_eq!(
+            (
+                rows[source.start_line as usize - 1],
+                rows[source.end_line as usize - 1]
+            ),
+            ("Keep the totals.", "`tally` returns the round.")
+        );
+    }
+
+    /// Open a stored plan whose flows still carry CRLF line endings from an earlier writer.
+    #[test]
+    fn stored_crlf_flows_open_in_review() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
+        crate::checks::configure_fixture(&file.workspace);
+        let mut canonical = crate::plan::document::test_fixture("plan", "Review a flow.");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Expose shared state.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior.".into()];
+        design.document.design = "Use a focused state owner.".into();
+        design.document.flows =
+            "## Flow\r\nRuns once.\r\n\r\n```mermaid\r\nflowchart TD\r\n  a --> b\r\n```".into();
+        design.proposed_source.insert(
+            "state.rs".into(),
+            "/// Owns shared state.\npub struct State;\n".into(),
+        );
+        design.parsed = crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())
+            .unwrap()
+            .parsed;
+        canonical.design = Some(design);
+        file.write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = file
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let source = file
+            .capture_review_source("session", "plan", Some(1), &checksum)
+            .unwrap();
+        let document = ReadOnlyPlanReview::new(
+            DocumentId("flows".into()),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        let flow_heading = document
+            .snapshot()
+            .block
+            .into_iter()
+            .find(|block| block.id.0 == "plan:metadata:flows:0")
+            .unwrap();
+        assert_eq!(flow_heading.text.wire_rows(), ["## Flow"]);
+        assert!(
+            flow_heading
+                .metadata
+                .decoration
+                .iter()
+                .any(|decoration| decoration.range.end.column == "## Flow".len())
+        );
+    }
 
     /// Keep code and same-section prose questions bound to their own saved selections.
     #[test]

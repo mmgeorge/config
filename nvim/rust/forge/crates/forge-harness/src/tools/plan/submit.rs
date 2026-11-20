@@ -17,7 +17,7 @@ pub(super) fn definition() -> ControlToolDefinition {
                 available sources. Proven invalid references return actionable errors and remain editable. \
                 Unavailable or unsupported evidence remains in saved diagnostics and permits submission. \
                 Existing planned tests receive static discovery warnings without building or running tests. Success \
-                confirms submission and the current version. No implementation build or second model review runs. \
+                confirms submission and the current version. Harness submits the current saved version; supply                 only plan_id, and during execution also a reason. No implementation build or second model review runs. \
                 Harness accepts full submissions automatically only when the task's auto-accept policy is \
                 enabled; the user controls it with /plan accept on or /plan accept off. Wait for Harness \
                 execution instructions rather than treating submission itself as implementation authority. In \
@@ -115,10 +115,9 @@ pub(super) async fn execute(
         submission.plan_id == document.plan_id,
         "submitted plan id does not match the active plan"
     );
-    crate::tools::error::ensure!(
-        submission.expected_version == document.version,
-        "submitted version does not match active version"
-    );
+    // Harness owns the submitted version: the recorded invocation names the version this turn
+    // validated, and the broker's compare-and-swap rejects a document that changed after it.
+    invocation.arguments["expected_version"] = json!(document.version);
     if let Some(design) = &document.design {
         let workspace = runtime
             .context
@@ -166,6 +165,13 @@ pub(super) async fn execute(
                     .context("revision response has no canonical document")?,
             )?;
             runtime.context.execution.as_mut().unwrap().generation = generation;
+            // The review decision renews the task; this invocation adopts that renewal.
+            if let Some(progress) = &runtime.context.task_authority_progress {
+                progress.await_execution_review(
+                    &runtime.context.execution.as_ref().unwrap().execution_id,
+                    generation,
+                )?;
+            }
             runtime.context.plan_state = Some(plan_state);
             runtime.plan_document = Some(document);
             let mut message =

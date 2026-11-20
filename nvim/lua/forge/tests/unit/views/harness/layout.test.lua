@@ -115,4 +115,30 @@ T["transcript_never_scrolls_smoothly_and_composer_leaves_global_untouched"] = fu
   MiniTest.expect.equality(vim.go.smoothscroll, true)
 end
 
+
+-- Focus moved from an Insert-mode composer into the transcript, as a mouse click does, kept
+-- Insert mode there, and Enter split a rendered transcript row until the replica rejected the
+-- buffer. Entering the transcript leaves Insert mode, so it never takes typed edits.
+T["entering_the_transcript_leaves_insert_mode"] = function()
+  require("forge.infra.config").setup({})
+  local layout = require("forge.views.harness.layout")
+  local transcript_buf, transcript_win, composer_buf = layout.open("insert-entry")
+  local stop_count = 0
+  local original_cmd = vim.cmd
+  vim.cmd = setmetatable({}, { __index = original_cmd, __call = function(_, command)
+    if command == "stopinsert" then stop_count = stop_count + 1 end
+    return original_cmd(command)
+  end })
+  MiniTest.finally(function() vim.cmd = original_cmd end)
+  vim.keymap.set("i", "<F2>", function()
+    stop_count = 0
+    vim.api.nvim_set_current_win(transcript_win)
+  end, { buffer = composer_buf })
+  vim.api.nvim_feedkeys(vim.keycode("i<F2>"), "xt", false)
+  vim.cmd = original_cmd
+  MiniTest.expect.equality(
+    { vim.api.nvim_get_current_buf() == transcript_buf, stop_count > 0, vim.bo[transcript_buf].modifiable },
+    { true, true, false })
+end
+
 return T

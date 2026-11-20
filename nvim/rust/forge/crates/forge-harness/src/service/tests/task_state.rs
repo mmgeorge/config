@@ -296,22 +296,35 @@ async fn directory_planning_submits_real_files_and_preserves_review_snapshot() -
 /// Approval retains the planning invocation until its own native terminal result.
 #[tokio::test]
 async fn plan_acceptance_waits_for_planning_and_keeps_cancel_available() -> Result<()> {
-    plan_acceptance_case(false, false).await
+    plan_acceptance_case(false, false, false).await
 }
 
 /// A later explicit cancellation supersedes approval without admitting Execute.
 #[tokio::test]
 async fn cancellation_supersedes_pending_plan_acceptance() -> Result<()> {
-    plan_acceptance_case(true, false).await
+    plan_acceptance_case(true, false, false).await
 }
 
 /// Automatic approval uses the same non-interrupting native and collection boundary.
 #[tokio::test]
 async fn automatic_plan_acceptance_waits_for_planning() -> Result<()> {
-    plan_acceptance_case(false, true).await
+    plan_acceptance_case(false, true, false).await
 }
 
-async fn plan_acceptance_case(cancel: bool, automatic: bool) -> Result<()> {
+/// A progress scan between a phase request and the end of its turn leaves the request standing.
+///
+/// The foreground scans execution progress every five seconds. A scan that committed after
+/// `plan_phase_done` changed the execution record the request had fingerprinted, so settlement
+/// refused it as "execution control changed before commit" and failed the turn, which also
+/// paused the task.
+#[tokio::test]
+async fn progress_scan_after_a_phase_request_keeps_the_request() -> Result<()> {
+    plan_acceptance_case(false, false, true).await
+}
+
+/// Drive one planning-to-execution case. `scan` lets the foreground's progress scan commit
+/// while the Implement turn's phase request waits for the turn to end.
+async fn plan_acceptance_case(cancel: bool, automatic: bool, scan: bool) -> Result<()> {
     use crate::exchange::command::{
         Command, CommandId, CommandRequest, InputControl, PlanExecutionSelection, TaskCommand,
     };
@@ -651,6 +664,25 @@ async fn plan_acceptance_case(cancel: bool, automatic: bool) -> Result<()> {
             root.path().join("src/owner.rs"),
             "/// Own state.\npub struct Owner;\n",
         )?;
+        if scan {
+            // Outside Verify a scan reports empty progress, so progress an earlier Verify scan
+            // left behind is what the next scan changes.
+            let task = controller.task_controller.current()?.unwrap();
+            let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else {
+                anyhow::bail!("the Implement turn has no execution");
+            };
+            let mut stale = execution.record.clone();
+            stale
+                .progress
+                .warning
+                .push("Progress from an earlier Verify scan".into());
+            controller.task_controller.apply(
+                &mut SqliteStore::open(&controller.data_root)?,
+                &task.permit(),
+                crate::task::TaskEvent::ExecutionUpdated(Box::new(stale)),
+                1,
+            )?;
+        }
         script
             .dispatch(
                 &session_id,
@@ -668,6 +700,39 @@ async fn plan_acceptance_case(cancel: bool, automatic: bool) -> Result<()> {
                 ),
             )
             .await??;
+            if scan && barrier == "implement-requested" {
+                let fingerprint = |store: &SqliteStore| -> Result<Vec<u8>> {
+                    let execution = controller
+                        .task_controller
+                        .current()?
+                        .and_then(|task| match &task.workflow {
+                            crate::task::WorkflowSnapshot::Execute { execution } => {
+                                Some(execution.record.id.clone())
+                            }
+                            _ => None,
+                        })
+                        .context("the Implement turn has no execution")?;
+                    Ok(serde_json::to_vec(
+                        &store
+                            .load_plan_execution(&execution)?
+                            .context("execution is missing")?,
+                    )?)
+                };
+                let requested = fingerprint(&store)?;
+                // The scan timer runs on the Tokio clock, so advancing it past one period lets
+                // the foreground scan while the phase request waits.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                tokio::time::resume();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while fingerprint(&store)? == requested {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .context("no progress scan committed during the phase request")??;
+            }
             assert_eq!(
                 controller.task_controller.current()?.unwrap().phase(),
                 crate::task::TaskPhase::Implement
@@ -692,6 +757,17 @@ async fn plan_acceptance_case(cancel: bool, automatic: bool) -> Result<()> {
         })
         .await
         .context("phase request did not finish through native collection and checking")??;
+        let mut rows = Vec::new();
+        for entry in &controller.observer.snapshot()?.timeline {
+            if matches!(entry, crate::timeline::TimelineEntry::Exchange { .. }) {
+                rows.extend(crate::buffer::projection::tests::project_rows(entry)?);
+            }
+        }
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("◇ Plan complete: Structured plan")),
+            "the completed task rendered no completion row: {rows:#?}"
+        );
         assert!(
             store
                 .list_exchange(&session_id)?
@@ -751,6 +827,671 @@ fn goal_command_request(transport: &str, command: &str, id: u64) -> Request {
 async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_rpc_pause() -> Result<()>
 {
     task_control_aliases_collect_active_work_and_replay_owner_receipts_case("rpc", "pause").await
+}
+
+/// Clearing a task during its running turn settles that turn's exchange before answering.
+///
+/// The clear collected the turn and parked its exchange for the next admission, which a cleared
+/// task never schedules. The command answered success while the exchange still read `Paused` and
+/// the status `◷ Paused`, and the `cleared` row appeared only after the next prompt.
+#[tokio::test]
+async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_rpc_clear() -> Result<()>
+{
+    task_control_aliases_collect_active_work_and_replay_owner_receipts_case("rpc", "clear").await
+}
+
+/// Record the heading phases the stopped exchange passes through while `/task <action>` stops a
+/// running goal turn, sampling the committed exchange at every scheduling point.
+async fn task_control_heading_phases(action: &str) -> Result<Vec<String>> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    controller.task_controller.change(
+        &mut SqliteStore::open(&controller.data_root)?,
+        None,
+        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+            "Stop the running goal turn".into(),
+            Default::default(),
+            1,
+        ))),
+        1,
+    )?;
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    let held = script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let hold_id = held["id"].as_str().unwrap().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.input.apply".into(),
+                params: json!({"id":"held-task-input","action":{"kind":"submit","message":{
+            "id":"held-task-input","text":"Inspect startup","intent":"auto","attachments":[]}}}),
+            },
+            &sink,
+        )
+        .await?;
+    script
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold_id })
+        .await?;
+    let store = SqliteStore::read_only(&controller.data_root)?;
+    let stopped = store.latest_exchange(&session_id)?.unwrap().id;
+    // The heading reads the collection label first, then a paused clock after an interrupted
+    // turn, then the exchange's terminal state.
+    let heading = |store: &SqliteStore| -> Result<String> {
+        let exchange = store
+            .load_exchange(&stopped)?
+            .context("exchange disappeared")?;
+        Ok(if exchange.collection.is_some() {
+            "stopping".into()
+        } else if exchange.activity() == crate::exchange::ExchangeActivity::Paused {
+            "paused".into()
+        } else if exchange.is_finished() {
+            format!("{:?}", exchange.state()).to_lowercase()
+        } else {
+            "working".into()
+        })
+    };
+    let mut phases = vec![heading(&store)?];
+    let request = goal_command_request("rpc", action, 10);
+    let dispatched = service.dispatch(Some(session_id.clone()), request, &sink);
+    let sampled = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let current = heading(&store)?;
+            if phases.last() != Some(&current) {
+                phases.push(current);
+            }
+            let task = controller.task_controller.current()?;
+            let settled = if action == "pause" {
+                task.is_some_and(|task| task.status() == crate::task::TaskStatus::Paused)
+            } else {
+                task.is_none()
+            };
+            if settled && controller.coordinator.execution.available_permits() == 1 {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    let (dispatched, sampled) = tokio::join!(dispatched, sampled);
+    dispatched?;
+    sampled.context("the task control never settled")??;
+    let final_heading = heading(&store)?;
+    if phases.last() != Some(&final_heading) {
+        phases.push(final_heading);
+    }
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    reader.await??;
+    Ok(phases)
+}
+
+/// Clearing a running goal reads `Stopping` from the stop until the cleared exchange settles.
+///
+/// The stop's restart collection left the exchange with no collection label and an interrupted
+/// turn, which reads as `Paused`, until the clear committed and closed it, so the status went
+/// `Working → Stopping → Paused → Stopping → Idle` within a few hundred milliseconds.
+#[tokio::test]
+async fn task_clear_never_publishes_paused_while_stopping() -> Result<()> {
+    let phases = task_control_heading_phases("clear").await?;
+    assert_eq!(
+        phases,
+        ["working", "stopping", "cancelled"],
+        "the clear passed through an intermediate state"
+    );
+    Ok(())
+}
+
+/// Pausing a running goal ends `Paused` and never returns to `Stopping` once it reads paused.
+#[tokio::test]
+async fn task_pause_settles_paused_without_reopening_stopping() -> Result<()> {
+    let phases = task_control_heading_phases("pause").await?;
+    assert_eq!(
+        phases.last().map(String::as_str),
+        Some("paused"),
+        "{phases:?}"
+    );
+    let first_pause = phases.iter().position(|phase| phase == "paused").unwrap();
+    assert!(
+        phases[first_pause..].iter().all(|phase| phase == "paused"),
+        "the pause flashed through another phase: {phases:?}"
+    );
+    Ok(())
+}
+
+/// A task control sent while `Ctrl-C` stops the running goal turn applies once the stop settles.
+///
+/// The control captured the task revision when it arrived. The stop then paused the task, which
+/// advanced that revision, so the control was refused with "the selected task changed before the
+/// command could apply" and the goal stayed paused.
+async fn task_control_sent_while_stopping(action: &str) -> Result<Option<crate::task::Task>> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    controller.task_controller.change(
+        &mut SqliteStore::open(&controller.data_root)?,
+        None,
+        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+            "Stop the running goal turn".into(),
+            Default::default(),
+            1,
+        ))),
+        1,
+    )?;
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    let held = script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let hold_id = held["id"].as_str().unwrap().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let frame_list = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let received = frame_list.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            received
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(frame.bytes())?);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.input.apply".into(),
+                params: json!({"id":"held-task-input","action":{"kind":"submit","message":{
+            "id":"held-task-input","text":"Inspect startup","intent":"auto","attachments":[]}}}),
+            },
+            &sink,
+        )
+        .await?;
+    script
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold_id })
+        .await?;
+    let running = controller.task_controller.current()?.unwrap();
+    let cancel = service.dispatch(
+        Some(session_id.clone()),
+        Request {
+            id: 9,
+            method: "session.turn.cancel".into(),
+            params: json!({"operation_id":"stop-before-control","restore_prompt_if_no_output":true}),
+        },
+        &sink,
+    );
+    let control = async {
+        // Send the control only after the stop has been admitted, as a key typed during
+        // `Stopping` does.
+        tokio::task::yield_now().await;
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                goal_command_request("transition", action, 10),
+                &sink,
+            )
+            .await
+    };
+    let (cancelled, controlled) = tokio::join!(cancel, control);
+    cancelled?;
+    controlled?;
+    let response = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(frame) = frame_list
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|frame| frame["id"] == 10)
+            {
+                break frame.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the task control was never answered")?;
+    assert!(
+        response.get("error").is_none(),
+        "the control sent while stopping was refused: {response}"
+    );
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while controller.coordinator.execution.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the stopped turn never released execution")?;
+    let current = controller.task_controller.current()?;
+    if let Some(task) = &current {
+        assert_eq!(task.id, running.id, "the control replaced the task");
+    }
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    reader.abort();
+    let _ = reader.await;
+    Ok(current)
+}
+
+#[tokio::test]
+async fn task_clear_sent_while_stopping_applies_after_the_stop() -> Result<()> {
+    let current = task_control_sent_while_stopping("clear").await?;
+    assert!(current.is_none(), "the goal survived its clear");
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_pause_sent_while_stopping_applies_after_the_stop() -> Result<()> {
+    let current = task_control_sent_while_stopping("pause").await?;
+    assert_eq!(
+        current.map(|task| task.status()),
+        Some(crate::task::TaskStatus::Paused)
+    );
+    Ok(())
+}
+
+/// An output-free `Ctrl-C` of the turn that a task command started keeps that exchange.
+///
+/// The interrupt treated the task's first input like an unanswered prompt and deleted the exchange
+/// with its task-start row, while the task stayed paused with its objective in neither the
+/// composer nor the queue, so `/goal resume` later ran an objective the transcript no longer showed.
+async fn interrupted_task_start_keeps_its_exchange(command: &str) -> Result<crate::task::Task> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    let held = script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let hold_id = held["id"].as_str().unwrap().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"start-task","text":command}),
+            },
+            &sink,
+        )
+        .await?;
+    script
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold_id })
+        .await?;
+    let store = SqliteStore::read_only(&controller.data_root)?;
+    let started = store
+        .latest_exchange(&session_id)?
+        .context("the task start has no exchange")?;
+    assert!(
+        matches!(
+            started.opening,
+            crate::exchange::ExchangeOpening::TaskStarted { .. }
+        ),
+        "{:?}",
+        started.opening
+    );
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 3,
+                method: "session.turn.cancel".into(),
+                params: json!({"operation_id":"interrupt-start","restore_prompt_if_no_output":true}),
+            },
+            &sink,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let settled = controller.coordinator.execution.available_permits() == 1
+                && store
+                    .load_exchange(&started.id)?
+                    .is_none_or(|exchange| exchange.is_finished());
+            if settled {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the interrupt never settled")??;
+    let exchange = store
+        .load_exchange(&started.id)?
+        .context("the interrupt deleted the exchange that started the task")?;
+    assert_eq!(exchange.state(), crate::exchange::ExchangeState::Cancelled);
+    let task = controller
+        .task_controller
+        .current()?
+        .context("the interrupt removed the task")?;
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    reader.abort();
+    let _ = reader.await;
+    Ok(task)
+}
+
+#[tokio::test]
+async fn interrupted_goal_start_keeps_its_exchange_and_pauses() -> Result<()> {
+    let task = interrupted_task_start_keeps_its_exchange("/goal Inspect startup").await?;
+    assert_eq!(task.status(), crate::task::TaskStatus::Paused);
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_plan_start_keeps_its_exchange_and_pauses() -> Result<()> {
+    let task = interrupted_task_start_keeps_its_exchange("/plan Inspect startup").await?;
+    assert_eq!(task.status(), crate::task::TaskStatus::Paused);
+    Ok(())
+}
+
+/// Resuming a paused task publishes the resumed task before the input it schedules.
+///
+/// The task input reached the editor first, so for one frame the status read `◷ Paused` beside a
+/// "Queued follow-up inputs • Execute continued" row: the queue was still drawn as paused because
+/// the session snapshot that resumed the task arrived after the input.
+#[tokio::test]
+async fn task_resume_publishes_the_resumed_task_before_its_input() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let mut store = SqliteStore::open(&controller.data_root)?;
+    controller.task_controller.change(
+        &mut store,
+        None,
+        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+            "Resume the paused goal".into(),
+            Default::default(),
+            1,
+        ))),
+        1,
+    )?;
+    let task = controller.task_controller.current()?.unwrap();
+    controller.task_controller.change(
+        &mut store,
+        Some(&task.revision),
+        crate::task::TaskChange::Pause,
+        1,
+    )?;
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let published = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = published.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            let event: serde_json::Value = serde_json::from_slice(frame.bytes())?;
+            let entry = match event["event"].as_str() {
+                Some("session_changed") => event["payload"]["snapshot"]["status"]["kind"]
+                    .as_str()
+                    .map(|kind| format!("status {kind}")),
+                Some("input_changed")
+                    if event["payload"]["snapshot"]["messages"]
+                        .as_array()
+                        .is_some_and(|messages| {
+                            messages
+                                .iter()
+                                .any(|message| message["purpose"]["kind"] != "user")
+                        }) =>
+                {
+                    Some("task input".to_owned())
+                }
+                _ => None,
+            };
+            if let Some(entry) = entry {
+                recorded.lock().unwrap().push(entry);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            goal_command_request("transition", "resume", 10),
+            &sink,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if published
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "task input")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the resumed task never scheduled its input")?;
+    let order = published.lock().unwrap().clone();
+    let input = order
+        .iter()
+        .position(|entry| entry == "task input")
+        .unwrap();
+    assert!(
+        order[..input]
+            .iter()
+            .any(|entry| entry.starts_with("status ") && entry != "status paused"),
+        "the task input was published while the task still read paused: {order:?}"
+    );
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    reader.abort();
+    let _ = reader.await;
+    Ok(())
+}
+
+/// A continuation that `/goal pause` stops before the model produced anything leaves no row.
+///
+/// The pause parked the continuation exchange, and the next prompt closed it as a completed,
+/// empty exchange: the transcript kept its continuation notice and an empty `Thought 0s` heading
+/// above the new prompt.
+#[tokio::test]
+async fn paused_output_free_continuation_leaves_no_exchange() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let mut writer = SqliteStore::open(&controller.data_root)?;
+    controller.task_controller.change(
+        &mut writer,
+        None,
+        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+            "Continue the paused goal".into(),
+            Default::default(),
+            1,
+        ))),
+        1,
+    )?;
+    let task = controller.task_controller.current()?.unwrap();
+    controller.task_controller.change(
+        &mut writer,
+        Some(&task.revision),
+        crate::task::TaskChange::Pause,
+        1,
+    )?;
+    drop(writer);
+    let script = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    let held = script
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let hold_id = held["id"].as_str().unwrap().to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            goal_command_request("transition", "resume", 10),
+            &sink,
+        )
+        .await?;
+    script
+        .dispatch(&session_id, MockResponseCommand::Wait { id: hold_id })
+        .await?;
+    let store = SqliteStore::read_only(&controller.data_root)?;
+    let continuation = store
+        .latest_exchange(&session_id)?
+        .context("the resumed goal has no exchange")?;
+    assert!(
+        matches!(
+            continuation.opening,
+            crate::exchange::ExchangeOpening::TaskContinuation { .. }
+        ),
+        "{:?}",
+        continuation.opening
+    );
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            goal_command_request("transition", "pause", 11),
+            &sink,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let paused = controller
+                .task_controller
+                .current()?
+                .is_some_and(|task| task.status() == crate::task::TaskStatus::Paused);
+            if paused && controller.coordinator.execution.available_permits() == 1 {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the pause never settled")??;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 12,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"after-pause","text":"Which file did you create last?"}),
+            },
+            &sink,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let answered = store
+                .latest_exchange(&session_id)?
+                .is_some_and(|latest| latest.id != continuation.id && latest.is_finished());
+            if answered && controller.coordinator.execution.available_permits() == 1 {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the prompt after the pause never settled")??;
+    let remaining = store.load_exchange(&continuation.id)?;
+    assert!(
+        remaining.is_none(),
+        "the output-free continuation stayed as {:?}",
+        remaining.map(|exchange| exchange.state())
+    );
+    assert!(
+        controller.task_controller.current()?.is_some(),
+        "closing the continuation removed the paused goal"
+    );
+    service.shutdown(Duration::from_secs(2)).await?;
+    drop(sink);
+    reader.abort();
+    let _ = reader.await;
+    Ok(())
 }
 
 /// Run one transport and action variant of the scenario described above, each in its own test so a
@@ -861,6 +1602,24 @@ async fn task_control_aliases_collect_active_work_and_replay_owner_receipts_case
             .unwrap()
             .is_ok()
     );
+    if action == "clear" {
+        let collected = store
+            .load_exchange(&original)?
+            .context("the cleared task lost its exchange")?;
+        assert_eq!(
+            collected.state(),
+            crate::exchange::ExchangeState::Cancelled,
+            "the cleared task's exchange did not settle before the command answered"
+        );
+        let timeline = serde_json::to_value(&controller.observer.snapshot()?.timeline)?;
+        assert!(
+            timeline.as_array().into_iter().flatten().any(|entry| {
+                entry["event"]["kind"]["kind"] == "task_finished"
+                    || entry["event"]["kind"] == "task_finished"
+            }),
+            "the cleared row was missing when the command answered: {timeline}"
+        );
+    }
     service
         .dispatch(Some(session_id.clone()), request, &sink)
         .await?;
@@ -1222,5 +1981,70 @@ async fn task_pause_completes_at_local_commit_and_replay_preserves_fifo() -> Res
         crate::exchange::journal::CommandState::Finished { .. }
     ));
     controller.finish_exchange_owner().await?;
+    Ok(())
+}
+
+/// A turn that delivers a task's input keeps the task's change baseline.
+///
+/// Check selection compares the workspace with the first checkpoint of the task's change owner.
+/// The exchange that resumes a goal starts while the task's input is still pending delivery; when
+/// that exchange became its own change owner, it replaced the task's baseline with its own
+/// starting checkpoint, so files an earlier, cancelled turn of the same goal had created no
+/// longer counted as task changes and automatic checks reported "No matching task changes".
+#[tokio::test]
+async fn a_resumed_goal_turn_keeps_the_task_change_owner() -> Result<()> {
+    // Checkpoints, and with them check change owners, exist only in a Git workspace.
+    let root = crate::broker::test::git_repository();
+    crate::checks::configure_fixture(root.path());
+    let data = tempfile::tempdir()?;
+    let mut request = initialize(&root, "mock");
+    request.data_root = data.path().to_string_lossy().into_owned();
+    let service = service();
+    service.open_session(1, request).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let mut store = SqliteStore::open(&controller.data_root)?;
+    controller.task_controller.change(
+        &mut store,
+        None,
+        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+            "Keep the task change baseline".into(),
+            Default::default(),
+            1,
+        ))),
+        1,
+    )?;
+    let task = controller.task_controller.current()?.unwrap();
+    controller.task_controller.change(
+        &mut store,
+        Some(&task.revision),
+        crate::task::TaskChange::Pause,
+        1,
+    )?;
+    let (sink, _output) = forge_protocol::outbound::channel();
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            goal_command_request("transition", "resume", 10),
+            &sink,
+        )
+        .await?;
+    let owner = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(owner) = store
+                .latest_exchange(&session_id)?
+                .and_then(|exchange| exchange.check_owner)
+            {
+                return Ok::<_, anyhow::Error>(owner);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the resumed goal turn never captured its starting checkpoint")??;
+    assert_eq!(owner, task.id.as_str());
+    service.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }

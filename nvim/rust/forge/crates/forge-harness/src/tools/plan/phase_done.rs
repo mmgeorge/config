@@ -40,7 +40,7 @@ pub(super) async fn execute(
     _output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     let identity = serde_json::to_string(&invocation)?;
-
+    runtime.require_running_execution()?;
     let execution = runtime
         .context
         .execution

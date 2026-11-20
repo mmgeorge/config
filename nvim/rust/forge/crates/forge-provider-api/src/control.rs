@@ -74,6 +74,51 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// Classify a completed host tool call for the provider's native result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolOutcome {
+    /// The tool did what was asked; its text is the answer, even when the answer is negative.
+    Succeeded,
+    /// The host refused or failed the request; its text is the reason the model reads.
+    Failed,
+}
+
+/// Carry a host tool's model-visible text together with its outcome.
+///
+/// Adapters report `Failed` through the native failure field (Claude `isError`, Codex
+/// `success: false`, Copilot `resultType: "failure"`), so the provider and the timeline show a
+/// failed call with its reason instead of a success whose text happens to describe an error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolReply {
+    /// Text returned to the model.
+    pub text: String,
+    /// Whether the call succeeded or was refused.
+    pub outcome: ToolOutcome,
+}
+
+impl ToolReply {
+    /// Build a successful reply.
+    pub fn succeeded(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            outcome: ToolOutcome::Succeeded,
+        }
+    }
+
+    /// Build a refused or failed reply whose text states the reason.
+    pub fn failed(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            outcome: ToolOutcome::Failed,
+        }
+    }
+
+    /// Get whether the host refused or failed the call.
+    pub fn is_failure(&self) -> bool {
+        self.outcome == ToolOutcome::Failed
+    }
+}
+
 /// Execute host tools while their authority and mutable state remain with the host.
 #[async_trait]
 pub trait ProviderTools: Send + Sync {
@@ -83,6 +128,18 @@ pub trait ProviderTools: Send + Sync {
         scope: &crate::InvocationScope,
         call: ToolCall,
     ) -> Result<String, ProviderError>;
+
+    /// Admit and execute a model call, returning its text and whether the host refused it.
+    ///
+    /// Hosts that classify refusals override this; the default reports every answered call as
+    /// a success. An `Err` remains a transport or authority failure without model-visible text.
+    async fn call_reply(
+        &self,
+        scope: &crate::InvocationScope,
+        call: ToolCall,
+    ) -> Result<ToolReply, ProviderError> {
+        self.call(scope, call).await.map(ToolReply::succeeded)
+    }
 
     /// Execute for an independently registered native child using its original parent authority.
     /// Hosts must explicitly support this boundary; root execution is never a fallback.
@@ -97,6 +154,18 @@ pub trait ProviderTools: Send + Sync {
             crate::ProviderFailureKind::Authorization,
         )
         .into())
+    }
+
+    /// Execute for a native child and report whether the host refused the call.
+    async fn call_observed_child_reply(
+        &self,
+        parent: &crate::InvocationScope,
+        child: &crate::TurnAddress,
+        call: ToolCall,
+    ) -> Result<ToolReply, ProviderError> {
+        self.call_observed_child(parent, child, call)
+            .await
+            .map(ToolReply::succeeded)
     }
 
     /// Explain to the model why a tool registered for the conversation is unavailable in this

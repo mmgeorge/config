@@ -49,6 +49,23 @@ T["render_shows_the_tail_above_the_picker"] = function()
   eq(topline(), 60 - window_height + 1)
 end
 
+-- A float relative to a window is placed from the window's first text row, below its winbar, in
+-- a running editor. Offsetting it by the winbar left the transcript's first row uncovered above
+-- the preview, which read as a duplicated row.
+T["the preview covers the transcript from its first text row"] = function()
+  local preview = require("forge.views.harness.session_preview")
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, buffer.scratch({ "session transcript" }))
+  vim.wo[window].winbar = "transcript winbar"
+  local text_height = vim.api.nvim_win_get_height(window)
+  local state = preview.open(window)
+  preview.render({ lines = numbered_lines(60) })
+  local config = vim.api.nvim_win_get_config(state.window)
+  eq({ config.row, config.height }, { 0, text_height })
+  preview.render({ lines = numbered_lines(60) }, 8)
+  eq({ vim.api.nvim_win_get_config(state.window).row, vim.api.nvim_win_get_height(state.window) }, { 0, 8 })
+end
+
 T["hide_and_close_leave_the_transcript_window_alone"] = function()
   local preview = require("forge.views.harness.session_preview")
   local window = vim.api.nvim_get_current_win()
@@ -60,9 +77,6 @@ T["hide_and_close_leave_the_transcript_window_alone"] = function()
   local view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
   local state = preview.open(window)
   preview.render({ lines = numbered_lines(3) }, 10)
-  -- The float starts below the winbar, which stays visible.
-  eq(vim.api.nvim_win_get_config(state.window).row, 1)
-  eq(vim.api.nvim_win_get_height(state.window), 9)
   preview.hide()
   eq(state.window, nil)
   preview.render({ lines = numbered_lines(3) }, 10)

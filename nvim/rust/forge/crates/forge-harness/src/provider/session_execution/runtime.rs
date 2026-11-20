@@ -1340,6 +1340,9 @@ struct Driver {
     failed: bool,
     healthy: Arc<AtomicBool>,
     first_failure: Option<ObservationFailure>,
+    /// Identifiers of the last native observation this driver began reducing, so an ownership
+    /// refusal record names the event even when the refusal surfaces from the receive loop.
+    last_observed: Option<serde_json::Value>,
     cleanup_failure: Option<Arc<forge_provider_api::error::ObservationCleanup>>,
     retiring: Option<OwnerCloseReason>,
     idle: SessionObserver,
@@ -1561,6 +1564,7 @@ impl SessionExecution {
             failed: false,
             healthy: healthy.clone(),
             first_failure: None,
+            last_observed: None,
             cleanup_failure: None,
             retiring: None,
             idle: SessionObserver::Inbox(observer.clone()),
@@ -1613,7 +1617,7 @@ impl SessionExecution {
                                         break;
                                     },
                                     Err(crate::provider::events::EventDeliveryError::Observation(failure)) => { driver.fail_observation(failure); break; },
-                                    Err(crate::provider::events::EventDeliveryError::OwnershipMismatch { .. }) => { driver.fail_observation(ObservationFailure::OwnershipConflict); break; },
+                                    Err(crate::provider::events::EventDeliveryError::OwnershipMismatch { .. }) => { driver.fail_observation(ObservationFailure::ownership_conflict()); break; },
                                     Err(error) => { driver.fail_all(&error.to_string()); break; },
                                 }
                             }
@@ -1656,7 +1660,7 @@ impl SessionExecution {
                             driver.fail_observation(failure); break;
                         },
                         Err(crate::provider::events::EventDeliveryError::OwnershipMismatch { .. }) => {
-                            driver.fail_observation(ObservationFailure::OwnershipConflict); break;
+                            driver.fail_observation(ObservationFailure::ownership_conflict()); break;
                         },
                         Err(error) => { driver.fail_all(&error.to_string()); break; }
                     },
@@ -1702,7 +1706,7 @@ impl SessionExecution {
                                     ..
                                 },
                             ) => {
-                                driver.fail_observation(ObservationFailure::OwnershipConflict);
+                                driver.fail_observation(ObservationFailure::ownership_conflict());
                                 break;
                             }
                             Err(
@@ -2306,6 +2310,20 @@ impl Driver {
     /// Reduce a binding event before acknowledging its stream position to operation waiters.
     async fn native_event(&mut self, envelope: crate::provider::bridge::ProviderObservation) {
         let crate::provider::bridge::ProviderObservation { event, native } = envelope;
+        self.last_observed = Some(serde_json::json!({
+            "binding_id": native.as_ref().map(|(binding, _)| binding.as_str().to_owned()),
+            "sequence": native.as_ref().map(|(_, sequence)| sequence.get()),
+            "category": match &event {
+                OwnerObservation::Event(event) => event_category(event),
+                OwnerObservation::HostFileChange { .. } => "host_file_change",
+                OwnerObservation::InputAcceptance { .. } => "input_acceptance",
+            },
+            "scope": match &event {
+                OwnerObservation::Event(event) => format!("{:?}", event.scope()),
+                OwnerObservation::HostFileChange { scope, .. }
+                | OwnerObservation::InputAcceptance { scope, .. } => format!("{scope:?}"),
+            },
+        }));
         let event = match event {
             OwnerObservation::Event(event) => event,
             OwnerObservation::HostFileChange {
@@ -2321,7 +2339,7 @@ impl Driver {
                         .observed_scope(&scope)
                         .is_ok_and(|association| association.binding_id() == &binding_id)
                 {
-                    self.fail_observation(ObservationFailure::OwnershipConflict);
+                    self.fail_observation(ObservationFailure::ownership_conflict());
                     return;
                 }
                 self.idle_observation(OwnerObservation::HostFileChange {
@@ -2337,7 +2355,7 @@ impl Driver {
                 presentation,
             } => {
                 if native.is_some() || scope.owner() != self.owner || !self.state.contains(&scope) {
-                    self.fail_observation(ObservationFailure::OwnershipConflict);
+                    self.fail_observation(ObservationFailure::ownership_conflict());
                     return;
                 }
                 self.publish_acceptance(scope, receipt, presentation);
@@ -2365,7 +2383,7 @@ impl Driver {
             {
                 self.refuse_native_event(
                     native.as_ref(),
-                    ObservationFailure::OwnershipConflict,
+                    ObservationFailure::ownership_conflict(),
                     FailureOrigin::Observation,
                 )
                 .await;
@@ -2390,7 +2408,7 @@ impl Driver {
         {
             self.refuse_native_event(
                 native.as_ref(),
-                ObservationFailure::OwnershipConflict,
+                ObservationFailure::ownership_conflict(),
                 FailureOrigin::Observation,
             )
             .await;
@@ -2421,7 +2439,7 @@ impl Driver {
             if &source.binding_id != binding || source.sequence != *sequence {
                 self.refuse_native_event(
                     native.as_ref(),
-                    ObservationFailure::OwnershipConflict,
+                    ObservationFailure::ownership_conflict(),
                     FailureOrigin::Observation,
                 )
                 .await;
@@ -2496,7 +2514,7 @@ impl Driver {
             return Ok(());
         }
         if !self.state.contains(scope) {
-            return Err(ObservationFailure::OwnershipConflict);
+            return Err(ObservationFailure::ownership_conflict());
         }
         let NativeEvent::Turn {
             thread_id,
@@ -2520,7 +2538,7 @@ impl Driver {
                 if &scope.owner().thread_id() != thread_id
                     || scope.turn_id().ok().as_ref() != Some(turn_id)
                 {
-                    return Err(ObservationFailure::OwnershipConflict);
+                    return Err(ObservationFailure::ownership_conflict());
                 }
                 Ok(())
             }
@@ -2617,7 +2635,7 @@ impl Driver {
                     self.reserve_input(scope, reservation, ReservationOrigin::PreparedForeground)
                 {
                     self.fail_observation_with_origin(
-                        ObservationFailure::OwnershipConflict,
+                        ObservationFailure::ownership_conflict(),
                         FailureOrigin::Error(error),
                     );
                 }
@@ -2901,7 +2919,7 @@ impl Driver {
                         }
                         Ok(false) => {}
                         Err(_) => {
-                            self.fail_observation(ObservationFailure::OwnershipConflict);
+                            self.fail_observation(ObservationFailure::ownership_conflict());
                         }
                     }
                 }
@@ -3579,7 +3597,7 @@ impl Driver {
         let collected_without_start = not_started.is_some();
         if let Some(error) = not_started {
             if control_reply.is_some() || !matches!(self.state.cancel_unstarted(&scope), Ok(true)) {
-                self.fail_observation(ObservationFailure::OwnershipConflict);
+                self.fail_observation(ObservationFailure::ownership_conflict());
                 return;
             }
             result = Err(error);
@@ -3648,7 +3666,7 @@ impl Driver {
             {
                 self.idle_event(event);
             } else {
-                self.fail_observation(ObservationFailure::OwnershipConflict);
+                self.fail_observation(ObservationFailure::ownership_conflict());
             }
             return;
         }
@@ -3674,7 +3692,19 @@ impl Driver {
             return;
         };
         if !self.state.contains(&scope) {
-            self.fail_observation(ObservationFailure::OwnershipConflict);
+            self.fail_observation(ObservationFailure::ownership_conflict());
+            return;
+        }
+        // A native agent's start and finish come from the delegating turn, but its own content
+        // carries the child's scope and reaches the session inbox. Both travel the inbox in
+        // native order, so the child's content always finds the record its start created.
+        if let HarnessEvent::Native {
+            event: boxed_native_event,
+            ..
+        } = &event
+            && matches!(boxed_native_event.as_ref(), NativeEvent::Agent { .. })
+        {
+            self.idle_event(event);
             return;
         }
         let native_turn = match &event {
@@ -3708,7 +3738,7 @@ impl Driver {
                     | TurnEvent::ChecklistUpdated(_) => Ok(()),
                 };
                 if result.is_err() {
-                    self.fail_observation(ObservationFailure::OwnershipConflict);
+                    self.fail_observation(ObservationFailure::ownership_conflict());
                     return;
                 }
             }
@@ -3884,7 +3914,7 @@ impl Driver {
                 .validate_acceptance(&scope, receipt.receipt_id(), &record.attempt_id)
                 .is_err()
         {
-            self.fail_observation(ObservationFailure::OwnershipConflict);
+            self.fail_observation(ObservationFailure::ownership_conflict());
             return;
         }
         let observation = OwnerObservation::InputAcceptance {
@@ -3941,12 +3971,12 @@ impl Driver {
                         {
                             Ok(association) => idle.registered_observed_sink(&association),
                             Err(_) => {
-                                self.fail_observation(ObservationFailure::OwnershipConflict);
+                                self.fail_observation(ObservationFailure::ownership_conflict());
                                 return;
                             }
                         },
                         OwnerObservation::InputAcceptance { .. } => {
-                            self.fail_observation(ObservationFailure::OwnershipConflict);
+                            self.fail_observation(ObservationFailure::ownership_conflict());
                             return;
                         }
                     }
@@ -4323,6 +4353,19 @@ impl Driver {
     }
 
     fn fail_observation_with_origin(&mut self, failure: ObservationFailure, origin: FailureOrigin) {
+        if failure == ObservationFailure::OwnershipConflict {
+            self.trace.record(
+                self.owner.session_id().as_str(),
+                "provider.ownership_conflict",
+                serde_json::json!({
+                    "stage": "session_execution",
+                    "site": forge_provider_api::lifecycle::take_ownership_conflict_site(),
+                    "admitted_owner": self.owner.thread_id().to_string(),
+                    "already_failed": self.failed,
+                    "last_observed": self.last_observed.as_ref().map(ToString::to_string),
+                }),
+            );
+        }
         if self.failed {
             return;
         }
@@ -4752,6 +4795,7 @@ mod tests {
                 failed: false,
                 healthy: Arc::new(AtomicBool::new(true)),
                 first_failure: None,
+                last_observed: None,
                 cleanup_failure: None,
                 retiring: None,
                 idle: SessionObserver::Inbox(Arc::default()),

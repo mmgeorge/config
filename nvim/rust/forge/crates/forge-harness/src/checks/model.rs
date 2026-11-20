@@ -143,6 +143,22 @@ impl<CommandContext> CommandCheck<CommandContext> {
                 ));
             }
         }
+        // A format adapter reports its outcome per file; its saved command output is often empty.
+        if let Some(super::adapter::AdapterResult::Format(result)) = &self.result {
+            use super::adapter::events::FormatStatus;
+            for file in &result.files {
+                let status = match file.status {
+                    Some(FormatStatus::Unformatted) => "Unformatted",
+                    Some(FormatStatus::Failed) => "Failed",
+                    None => "Not run",
+                    Some(FormatStatus::Formatted | FormatStatus::Changed) => continue,
+                };
+                located.push(match &file.message {
+                    Some(message) => format!("{}: {status}: {message}", file.path),
+                    None => format!("{}: {status}", file.path),
+                });
+            }
+        }
         let mut findings = vec![summary];
         findings.extend(located);
         findings
@@ -169,7 +185,6 @@ pub struct CheckRun<RunContext = Option<CheckRunContext>, CommandContext = Optio
     pub context: RunContext,
     #[serde(default)]
     pub lifecycle: Vec<CheckEvent>,
-    pub completed_plan: Option<String>,
     pub shell: crate::session::CheckShell,
     pub executable: Option<PathBuf>,
     pub workspace: String,
@@ -205,7 +220,6 @@ struct RawCheckRun<RunContext, CommandContext> {
     context: RunContext,
     #[serde(default)]
     lifecycle: Vec<CheckEvent>,
-    completed_plan: Option<String>,
     shell: crate::session::CheckShell,
     executable: Option<PathBuf>,
     workspace: String,
@@ -238,7 +252,6 @@ where
             revision,
             context,
             lifecycle,
-            completed_plan,
             shell,
             executable,
             workspace,
@@ -268,7 +281,6 @@ where
             revision,
             context,
             lifecycle,
-            completed_plan,
             shell,
             executable,
             workspace,
@@ -614,7 +626,6 @@ impl<RunContext, CommandContext> CheckRun<RunContext, CommandContext> {
             revision: self.revision,
             context: run_context(self.context),
             lifecycle: self.lifecycle,
-            completed_plan: self.completed_plan,
             shell: self.shell,
             executable: self.executable,
             workspace: self.workspace,
@@ -671,7 +682,6 @@ impl TryFrom<CheckRun> for PreparedCheckRun {
             revision: run.revision,
             context,
             lifecycle: run.lifecycle,
-            completed_plan: run.completed_plan,
             shell: run.shell,
             executable: run.executable,
             workspace: run.workspace,
@@ -784,6 +794,37 @@ mod finding_tests {
         ] {
             assert!(command(state).findings().is_empty(), "{state:?}");
         }
+    }
+
+    /// A failed formatter names each file it reported, because an adapter's structured result,
+    /// not its saved command output, holds the outcome.
+    #[test]
+    fn format_findings_name_each_unsuccessful_file() {
+        let check: CommandCheck = serde_json::from_value(json!({
+            "selected":true,"id":"formatter","command":"prettier","state":"failed",
+            "started_at_ms":1,"completed_at_ms":2,"exit_code":1,"error":null,
+            "stdout":"stdout","stderr":"stderr","output":"formatter.log","output_bytes":0,"preview":"",
+            "result":{"category":"format","operation":"check","selection":{"paths":[]},"widened":null,
+                "files":[
+                    {"path":"tests/money.test.ts","status":"unformatted","message":null,"diff":null},
+                    {"path":"src/broken.ts","status":"failed","message":"unexpected token","diff":null},
+                    {"path":"src/money.ts","status":"formatted","message":null,"diff":null}],
+                "truncated_bytes":0,"error":null,"protocol_error":null,"exit":1,"cancelled":false,"unsupported":false}
+        }))
+        .unwrap();
+        let findings = check.findings().join(
+            "
+",
+        );
+        assert!(
+            findings.contains("tests/money.test.ts: Unformatted"),
+            "{findings}"
+        );
+        assert!(
+            findings.contains("src/broken.ts: Failed: unexpected token"),
+            "{findings}"
+        );
+        assert!(!findings.contains("src/money.ts"), "{findings}");
     }
 
     /// Keep declaration findings before each failed command's summary and located diagnostics.

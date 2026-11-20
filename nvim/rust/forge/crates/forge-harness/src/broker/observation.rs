@@ -116,18 +116,22 @@ impl BrokerObserver {
             native_steer,
         })
     }
-    /// Keep an idle phase working while a queued user turn is about to start.
+    /// Keep an idle phase working while the next turn or check run is about to start.
     ///
     /// The finished exchange resolves to idle a few owner steps before the next queued message
-    /// is claimed and admitted. Publishing that idle phase closed the status row and reopened it
-    /// at every hand-off. The substitute carries no running clock, so it reads `Working · 0s`,
-    /// which is also what the admitted exchange first publishes. Its `HandingOff` activity tells
-    /// the editor that the settled exchange is followed by a queued turn, so the editor does not
-    /// reveal the finished exchange a moment before the successor replaces it at the tail. An
-    /// owner that cannot execute is excluded, because it would never start the turn and the row
-    /// would never clear.
+    /// is claimed and admitted, and before a task's reserved continuation becomes queued input or
+    /// its verification checks start. Publishing that idle phase closed the status row and
+    /// reopened it at every hand-off. The substitute carries no running clock, so it reads
+    /// `Working · 0s`, which is also what the admitted exchange first publishes. Its `HandingOff`
+    /// activity tells the editor that the settled exchange is followed by another turn, so the
+    /// editor does not reveal the finished exchange a moment before the successor replaces it at
+    /// the tail. Pending verification checks read `Checking · 0s` instead: no exchange replaces
+    /// the finished one, and the check run's own status follows. An owner that cannot execute is
+    /// excluded, because it would never start the work and the row would never clear.
     pub(crate) fn hand_off_phase(
         &self,
+        store: &SqliteStore,
+        task: Option<&crate::task::Task>,
         status: crate::session::state_machine::SessionPhase,
     ) -> Result<crate::session::state_machine::SessionPhase> {
         use crate::session::state_machine::{SessionPhase, WorkflowActivity};
@@ -141,7 +145,7 @@ impl BrokerObserver {
             .phase
             == crate::exchange::ActivityPhase::Unavailable;
         let input = self.input.snapshot()?;
-        if unavailable || input.messages.is_empty() {
+        if unavailable || input.messages.is_empty() && task.is_none() {
             return Ok(status);
         }
         // Unreadable admission state fails the owner's own offer, which reports it; no turn
@@ -149,17 +153,26 @@ impl BrokerObserver {
         let Ok(readiness) = self.input_readiness() else {
             return Ok(status);
         };
-        if !crate::exchange::successor_turn_pending(
-            input,
+        let gates = readiness.turn_offer_gates();
+        let task_successor = crate::exchange::task_successor_pending(
+            task,
+            &input,
             &self.questions,
-            readiness.turn_offer_gates(),
-        )? {
-            return Ok(status);
-        }
+            gates,
+            |turn| store.continuation_source_complete(&self.session_id, turn),
+        )?;
+        let activity = match task_successor {
+            Some(crate::exchange::TaskSuccessor::Checks) => WorkflowActivity::Checking,
+            Some(crate::exchange::TaskSuccessor::Turn) => WorkflowActivity::HandingOff,
+            None if crate::exchange::successor_turn_pending(input, &self.questions, gates)? => {
+                WorkflowActivity::HandingOff
+            }
+            None => return Ok(status),
+        };
         Ok(SessionPhase::Working {
             duration_ms: 0,
             started_at_ms: None,
-            activity: WorkflowActivity::HandingOff,
+            activity,
             reasoning_summary: None,
             execution: None,
         })
@@ -477,7 +490,7 @@ impl BrokerObserver {
             .as_ref()
             .is_some_and(|task| task.status() == crate::task::TaskStatus::Paused)
         {
-            status = crate::session::state_machine::SessionPhase::Paused;
+            status = status.paused();
         }
         if status == crate::session::state_machine::SessionPhase::Idle
             && self.agent_coordinator.active_count() > 0
@@ -504,7 +517,10 @@ impl BrokerObserver {
             status = crate::session::state_machine::SessionPhase::Compacting { started_at_ms };
         }
         if questions.required_pending()
-            && !matches!(status, crate::session::state_machine::SessionPhase::Paused)
+            && !matches!(
+                status,
+                crate::session::state_machine::SessionPhase::Paused { .. }
+            )
             && !interaction
                 .last()
                 .is_some_and(|exchange| exchange.state() == crate::exchange::ExchangeState::Running)
@@ -528,26 +544,13 @@ impl BrokerObserver {
         // phase only when its next step begins. The exchange heading reads that committed record,
         // so a phase that only settles the target exchange yields to the record once it finishes;
         // provider recovery still stops the session after the exchange has settled.
-        if let Some(progress) = cancellation.as_ref().filter(|progress| {
-            progress.phase.active()
-                && (progress.phase == crate::exchange::CancellationPhase::Recovering
-                    || !progress.exchange_id.as_ref().is_some_and(|target| {
-                        interaction.iter().any(|exchange| {
-                            exchange.id == target.as_str() && exchange.is_finished()
-                        })
-                    }))
-        }) {
-            status = crate::session::state_machine::SessionPhase::Stopping {
-                collection: match progress.phase {
-                    crate::exchange::CancellationPhase::Acquiring
-                    | crate::exchange::CancellationPhase::Collecting => {
-                        crate::exchange::ExchangeCollection::Pending
-                    }
-                    _ => crate::exchange::ExchangeCollection::Settling,
-                },
-            };
+        if let Some(stopping) = cancellation
+            .as_ref()
+            .and_then(|progress| cancellation_stopping(progress, &interaction))
+        {
+            status = stopping;
         }
-        let status = self.hand_off_phase(status)?;
+        let status = self.hand_off_phase(store, task, status)?;
         self.trace.record(
             &source_session.id,
             "status_projected",
@@ -645,9 +648,14 @@ impl BrokerObserver {
             .map(|progress| json!({"applied":progress.applied,"files":progress.files})),
             active_plan,
             active_elicitation,
+            // A cancelled or rejected plan is no longer current work; its transcript rows
+            // still open it by identity.
             artifact: plan_list
                 .iter()
-                .filter(|plan| !plan.working_path.is_empty())
+                .filter(|plan| {
+                    !plan.working_path.is_empty()
+                        && !matches!(plan.state, PlanState::Cancelled | PlanState::Rejected)
+                })
                 .map(ArtifactSummary::from)
                 .collect(),
             timeline,
@@ -746,7 +754,7 @@ impl BrokerObserver {
             .and_then(Value::as_str)
             .unwrap_or("repo");
         let session = if scope == "all" {
-            store.list_session(None)?
+            store.list_user_session(None)?
         } else {
             let workspace = params
                 .get("workspace")
@@ -760,17 +768,9 @@ impl BrokerObserver {
                     }
                 })
                 .unwrap_or_else(|| session.workspace.clone());
-            store.list_session(Some(&workspace))?
+            store.list_user_session(Some(&workspace))?
         };
-        Ok((
-            serde_json::to_value(
-                session
-                    .into_iter()
-                    .filter(|session| session.background.is_none())
-                    .collect::<Vec<_>>(),
-            )?,
-            Vec::new(),
-        ))
+        Ok((serde_json::to_value(session)?, Vec::new()))
     }
 
     pub(super) fn preview_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -836,7 +836,10 @@ impl BrokerObserver {
         Ok((serde_json::to_value(preview)?, Vec::new()))
     }
 
-    pub(super) fn list_exchange_review(&self) -> Result<Vec<Exchange>> {
+    /// List the session's exchanges with the reason, if any, that rolling back to each is refused.
+    pub(super) fn list_exchange_review(
+        &self,
+    ) -> Result<Vec<crate::exchange::rollback::ExchangeRollbackReview>> {
         let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let session = store
             .load_session(&self.session_id)?
@@ -845,7 +848,21 @@ impl BrokerObserver {
         for interaction in &mut interaction_list {
             interaction.comment = store.list_exchange_comment(&interaction.id)?;
         }
-        Ok(interaction_list)
+        let capability = self
+            .metadata
+            .read()
+            .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
+            .capability
+            .clone();
+        let provider = crate::exchange::rollback::RewindProvider {
+            label: &session.provider_label,
+            capability: &capability,
+            native_history: session.provider_session_id.is_some(),
+        };
+        Ok(crate::exchange::rollback::ExchangeRollbackReview::list(
+            interaction_list,
+            &provider,
+        ))
     }
 
     pub(super) fn record_prompt_history(
@@ -1005,7 +1022,7 @@ impl BrokerObserver {
         }
         for run in &execution.check_runs {
             if let Some(planned) = &run.planned_tests {
-                report.push_str(&format!("\n### Planned test results Â· {}\n\n", run.id));
+                report.push_str(&format!("\n### Planned test results · {}\n\n", run.id));
                 for line in planned.review_lines() {
                     report.push_str(&format!("- {line}\n"));
                 }
@@ -1014,7 +1031,7 @@ impl BrokerObserver {
         report.push_str("\n### Verification assessments\n\n");
         for evidence in &execution.verification {
             report.push_str(&format!(
-                "- Revision {} Â· {:?}: {}\n  Observed in: {}\n",
+                "- Revision {} · {:?}: {}\n  Observed in: {}\n",
                 evidence.revision,
                 evidence.report.status,
                 evidence.summary,
@@ -1032,7 +1049,7 @@ impl BrokerObserver {
         report.push_str("\n### Revision history\n\n");
         for revision in &execution.revision_history {
             report.push_str(&format!(
-                "- Revision {} Â· {} approval: {}\n",
+                "- Revision {} · {} approval: {}\n",
                 revision.revision, revision.approval, revision.reason
             ));
         }
@@ -1077,4 +1094,73 @@ struct PlanChoice {
     implemented: bool,
     state: PlanState,
     digest: Option<String>,
+}
+
+/// Get the stopping phase a cancellation operation imposes on the session, if any.
+///
+/// An operation that only settles its target exchange yields once that exchange has settled or
+/// been withdrawn, as a cancelled output-free prompt is; provider recovery still stops the
+/// session after the exchange has settled.
+fn cancellation_stopping(
+    progress: &crate::exchange::CancellationProgress,
+    interaction: &[Exchange],
+) -> Option<crate::session::state_machine::SessionPhase> {
+    use crate::exchange::CancellationPhase;
+    let target_settled = progress.exchange_id.as_ref().is_some_and(|target| {
+        interaction
+            .iter()
+            .find(|exchange| exchange.id == target.as_str())
+            .is_none_or(Exchange::is_finished)
+    });
+    (progress.phase.active()
+        && (progress.phase == CancellationPhase::Recovering || !target_settled))
+        .then_some(crate::session::state_machine::SessionPhase::Stopping {
+            collection: match progress.phase {
+                CancellationPhase::Acquiring | CancellationPhase::Collecting => {
+                    crate::exchange::ExchangeCollection::Pending
+                }
+                _ => crate::exchange::ExchangeCollection::Settling,
+            },
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(
+        phase: crate::exchange::CancellationPhase,
+        exchange_id: &str,
+    ) -> crate::exchange::CancellationProgress {
+        crate::exchange::CancellationProgress {
+            operation_id: crate::exchange::command::CommandId::new("cancel").unwrap(),
+            exchange_id: Some(exchange_id.into()),
+            revision: 1,
+            phase,
+            response_timed_out: false,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            blockers: Default::default(),
+        }
+    }
+
+    /// A cancellation that withdrew its output-free prompt stops nothing once the exchange is
+    /// gone. The owner deletes the exchange inside a command step but records the settled phase
+    /// only when its next step begins, and the missing exchange read as unfinished, so `Stopping`
+    /// stayed for about half a second after the prompt had returned to the composer.
+    #[test]
+    fn withdrawn_cancellation_target_stops_nothing() {
+        use crate::exchange::CancellationPhase;
+        for phase in [CancellationPhase::Draining, CancellationPhase::Settling] {
+            assert_eq!(
+                cancellation_stopping(&progress(phase, "withdrawn"), &[]),
+                None
+            );
+        }
+        assert!(
+            cancellation_stopping(&progress(CancellationPhase::Recovering, "withdrawn"), &[])
+                .is_some(),
+            "provider recovery outlives the exchange it settled"
+        );
+    }
 }

@@ -94,6 +94,7 @@ impl PlanFileStore {
                 accepted_revision: None,
                 user_revision: 0,
                 manual_changes: Vec::new(),
+                unplaced_review_comments: Vec::new(),
                 review_digest: None,
                 accepted_digest: None,
                 elicitation: None,

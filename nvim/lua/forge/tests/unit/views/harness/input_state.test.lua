@@ -352,6 +352,55 @@ T["unanswered_submission_surfaces_after_the_notice_delay"] = function()
   eq(#state.queue, 1)
 end
 
+-- The host produces a task's planning and continuation input itself, and an idle owner claims it
+-- at once; drawing it as a queued follow-up flashed a row for the moment before that claim. Such
+-- input waits out the notice delay like this view's own submissions, while input another view
+-- submitted, and everything in a paused queue, still shows at once.
+T["host_produced_input_surfaces_only_after_the_notice_delay"] = function()
+  local deferred = dofile("nvim/lua/forge/tests/support/deferred.lua")
+  local fixture = placement_fixture("host-produced-input", "idle")
+  local state, input = fixture.state, fixture.input
+  local timers = deferred.install({ input.submission_notice_delay_ms })
+  local revision = 0
+  local function publish(message, suspended)
+    revision = revision + 1
+    input.receive(state, { revision = revision, suspended = suspended or false,
+      upsert = { vim.deepcopy(message) }, removed = {} })
+  end
+  local planning = { id = "task-input:plan", text = "Add a function moneyAllocate", revision = 1, delivery = "queued",
+    intent = "auto", purpose = { kind = "task_entry", revision = "plan", id = "plan" } }
+
+  -- Claimed within the delay, the task's input never gains a row.
+  publish(planning)
+  eq(#state.queue, 0)
+  planning.delivery, planning.route = "delivering", "turn"
+  publish(planning)
+  planning.delivery = "accepted"
+  publish(planning)
+  timers.fire(input.submission_notice_delay_ms)
+  for _, render in ipairs(fixture.renders) do eq(render.queue + render.handoff, 0) end
+
+  -- Unclaimed past the delay, it shows as waiting.
+  local continuation = { id = "task-input:continue", text = "Continue the plan", revision = 1, delivery = "queued",
+    intent = "auto", purpose = { kind = "task_continuation", revision = "plan", id = "continue",
+      completed_turn_id = "turn", reason = "budget" } }
+  publish(continuation)
+  eq(#state.queue, 0)
+  eq(timers.fire(input.submission_notice_delay_ms), 1)
+  eq(#state.queue, 1)
+
+  -- Another view's submission and a paused queue's task input both show at once.
+  local foreign = { id = "other-view", text = "From another tab", revision = 1, delivery = "queued",
+    intent = "auto", purpose = { kind = "user" } }
+  publish(foreign)
+  eq(#state.queue, 2)
+  local paused = { id = "task-input:paused", text = "Resume the plan", revision = 1, delivery = "queued",
+    intent = "auto", purpose = { kind = "task_continuation", revision = "plan", id = "paused",
+      completed_turn_id = "turn", reason = "paused" } }
+  publish(paused, true)
+  eq(#state.queue, 3)
+end
+
 T["submission_after_a_cancellation_never_renders_a_queue_row"] = function()
   local fixture = placement_fixture("after-cancellation", "idle")
   local state, input = fixture.state, fixture.input

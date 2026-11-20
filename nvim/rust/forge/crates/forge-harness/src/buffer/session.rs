@@ -1700,17 +1700,21 @@ fn toggle_inline_output(
         )
         .max(1);
     let renderer = super::transcript::TranscriptRenderer::new(&width)?;
+    let mut tool_heading = crate::buffer::transcript::ToolHeading::of(
+        call,
+        crate::turn::ToolInstant {
+            wall_ms: now_ms,
+            active_ms: captured.active_ms,
+        },
+        expanded,
+    );
+    if let Some(state) = source.heading_state() {
+        tool_heading.state = state;
+    }
     let mut heading = renderer.tool_header(
         heading_id,
         previous_heading.metadata.target[0].id.clone(),
-        crate::buffer::transcript::ToolHeading::of(
-            call,
-            crate::turn::ToolInstant {
-                wall_ms: now_ms,
-                active_ms: captured.active_ms,
-            },
-            expanded,
-        ),
+        tool_heading,
     )?;
     heading.metadata.layout = layout.clone();
     heading.metadata.fold = previous_heading.metadata.fold.clone();
@@ -3056,6 +3060,158 @@ mod tests {
         Ok(())
     }
 
+    /// A tool row shows how it ended whether it was opened before or after the call stopped.
+    ///
+    /// Opening a tool loaded only its output body; the outcome line beneath it comes from the
+    /// entry's projection, which the tool toggle did not redo. A tool opened after its deadline
+    /// stopped it showed `no output` alone until a later turn re-projected the entry, and on Claude
+    /// Code, with no later turn, never showed `Failed: timed out` at all.
+    #[test]
+    fn expanded_tool_shows_its_timeout_when_the_exchange_records_it() -> Result<()> {
+        use forge_provider_api::ItemStart;
+        // The running tool, then the same exchange once its deadline stopped it.
+        let exchange = |timed_out: bool, stopped: bool| -> Result<Exchange> {
+            let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+                "id":"held", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Run the held command", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            exchange.resume(0)?;
+            let address = crate::turn::test_support::address(&exchange, "turn");
+            exchange.start_turn(address.clone(), 0)?;
+            let start = ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: "shell".into(),
+                title: "sleep 45sec".into(),
+                arguments: forge_provider_api::InspectableArguments::new(serde_json::json!({})),
+            });
+            let updates = if stopped {
+                crate::turn::test_support::tool_updates(
+                    &start,
+                    crate::provider::ToolStatus::Interrupted,
+                    None,
+                    Default::default(),
+                )
+            } else {
+                Vec::new()
+            };
+            crate::turn::test_support::tool(&mut exchange, &address, "held", start, updates, 1)?;
+            if timed_out {
+                exchange
+                    .tool_timeout
+                    .push(crate::provider::tool_timeout::ToolTimeoutRecord {
+                        thread_id: address.thread_id.clone(),
+                        turn_id: address.turn_id.clone(),
+                        item_id: forge_provider_api::ItemId::new("held")?,
+                        title: "sleep 45sec".into(),
+                        timeout_ms: 15_000,
+                    });
+            }
+            Ok(exchange)
+        };
+        let document = DocumentId("timeline:timeout".into());
+        let view = ViewId("timeline:timeout:view".into());
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(Vec::new())?;
+        owner.update_live(
+            Some(&exchange(false, false)?),
+            None,
+            crate::session::state_machine::SessionPhase::Idle,
+            false,
+        )?;
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let text = |owner: &SessionPresentation| -> Result<String> {
+            Ok(owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                ))
+        };
+        // Open every fold, as a reader expanding the transcript does.
+        let mut sequence = 0;
+        let mut expand_all = |owner: &mut SessionPresentation| -> Result<()> {
+            let mut opened = std::collections::HashSet::new();
+            loop {
+                let folded = owner
+                    .snapshot(&document)?
+                    .block
+                    .iter()
+                    .filter_map(|block| block.metadata.node.clone())
+                    .filter(|node| {
+                        node.display != forge_buffer::node::NodeDisplay::Full
+                            && opened.insert(node.id.0.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if folded.is_empty() {
+                    return Ok(());
+                }
+                for node in folded {
+                    sequence += 1;
+                    owner.dispatch(
+                        PresentationRequest::Node {
+                            request: super::super::nodes::NodeRequest {
+                                document: document.clone(),
+                                view: view.clone(),
+                                sequence,
+                                node: node.id.0.clone(),
+                                generation: node.generation,
+                                action: super::super::nodes::NodeAction::SetExpansion {
+                                    expanded: true,
+                                },
+                                rows: 80,
+                                width: WidthProfile::default(),
+                            },
+                        },
+                        &Default::default(),
+                    )?;
+                }
+                ensure!(sequence < 64, "expansion never settled");
+            }
+        };
+        expand_all(&mut owner)?;
+        let before = text(&owner)?;
+        ensure!(
+            before.contains("sleep 45sec") && !before.contains("Failed: timed out"),
+            "{before}"
+        );
+        // The broker records the expiry before the provider reports the call it interrupted.
+        for stopped in [false, true] {
+            owner.update_live(
+                Some(&exchange(true, stopped)?),
+                None,
+                crate::session::state_machine::SessionPhase::Idle,
+                false,
+            )?;
+            let during = text(&owner)?;
+            ensure!(
+                during.contains("Failed: timed out after 15s; execution stopped."),
+                "the open tool kept its earlier body (stopped: {stopped}): {during}"
+            );
+        }
+        // A reader who opens the tool only after the call stopped sees the same line.
+        let mut reopened = SessionPresentation::new("session".into());
+        reopened.initialize(Vec::new())?;
+        reopened.update_live(
+            Some(&exchange(true, true)?),
+            None,
+            crate::session::state_machine::SessionPhase::Idle,
+            false,
+        )?;
+        reopened.open(document.clone(), view.clone(), WidthProfile::default())?;
+        expand_all(&mut reopened)?;
+        let late = text(&reopened)?;
+        ensure!(
+            late.contains("Failed: timed out after 15s; execution stopped."),
+            "a tool opened after it stopped showed no outcome: {late}"
+        );
+        Ok(())
+    }
+
     /// Presentation time the test sets explicitly.
     struct ManualClock(std::sync::atomic::AtomicI64);
     impl crate::broker::Clock for ManualClock {
@@ -3117,6 +3273,103 @@ mod tests {
                 (2_990, "Working · 2s".to_owned(), Some(10)),
                 (3_000, "Working · 3s".to_owned(), Some(1_000)),
             ]
+        );
+        Ok(())
+    }
+
+    /// Advance the check heading and a running check row at each second while checks run.
+    ///
+    /// During a Check phase every timed value in the status split stayed fixed for six seconds
+    /// although the editor kept synchronizing, so each sync must render a new status revision.
+    #[test]
+    fn running_check_labels_change_at_every_second_boundary() -> Result<()> {
+        use crate::checks::{CheckActivity, CheckCommandActivity, CheckState};
+        let command = |title: &str, state, started_at_ms, completed_at_ms| CheckCommandActivity {
+            title: title.into(),
+            selection: None,
+            started_at_ms: Some(started_at_ms),
+            completed_at_ms,
+            state,
+            output_line: None,
+            progress: None,
+        };
+        let clock = Arc::new(ManualClock(std::sync::atomic::AtomicI64::new(0)));
+        let mut owner = SessionPresentation::with_clock("session".into(), clock.clone());
+        owner.initialize(vec![TimelineEntry::Status {
+            id: "session:status".into(),
+            created_at_ms: 0,
+            status: crate::session::state_machine::SessionPhase::Idle,
+            status_thoughts: false,
+            agents: Vec::new(),
+            checks: Some(CheckActivity {
+                run_id: "run".into(),
+                duration_ms: 400,
+                started_at_ms: Some(500),
+                completed_count: 1,
+                total_count: 2,
+                command_list: vec![
+                    command("Type check", CheckState::Passed, 0, Some(400)),
+                    command("ESLint", CheckState::Running, 500, None),
+                ],
+            }),
+        }])?;
+        let document = DocumentId("check-labels".into());
+        owner.open(
+            document.clone(),
+            ViewId("check-view".into()),
+            WidthProfile::default(),
+        )?;
+        let mut samples = Vec::new();
+        let mut revisions = Vec::new();
+        for now_ms in [600, 1_100, 2_100, 3_100] {
+            clock.0.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+            let revision = owner
+                .document(&document)?
+                .sections
+                .document
+                .document
+                .revision();
+            let synced = owner.sync(&document, revision)?;
+            let rows = synced
+                .status
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let heading = rows.first().cloned().unwrap_or_default();
+            let running = rows
+                .iter()
+                .find(|row| row.contains("ESLint"))
+                .cloned()
+                .unwrap_or_default();
+            samples.push((heading, running.trim().to_owned()));
+            revisions.push(synced.status.revision);
+        }
+        assert_eq!(
+            samples,
+            [
+                (
+                    "Checking · 1/2 finished · 0s".to_owned(),
+                    "└─ ⠋ ESLint · running · 0s".to_owned()
+                ),
+                (
+                    "Checking · 1/2 finished · 1s".to_owned(),
+                    "└─ ⠋ ESLint · running · 0s".to_owned()
+                ),
+                (
+                    "Checking · 1/2 finished · 2s".to_owned(),
+                    "└─ ⠋ ESLint · running · 1s".to_owned()
+                ),
+                (
+                    "Checking · 1/2 finished · 3s".to_owned(),
+                    "└─ ⠋ ESLint · running · 2s".to_owned()
+                ),
+            ]
+        );
+        assert!(
+            revisions.windows(2).all(|pair| pair[0] < pair[1]),
+            "a changed label kept its status revision: {revisions:?}"
         );
         Ok(())
     }

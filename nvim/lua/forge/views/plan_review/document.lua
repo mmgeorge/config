@@ -101,13 +101,20 @@ function M.attach(options, callback)
   end
   function owner.recovery()
     if not owner.ready then return nil, "Plan review is not ready" end
+    local source_text = {}
+    for _, row in ipairs(owner.source or {}) do
+      if row.source_line > 0 then source_text[row.source_line] = row.text end
+    end
     return { annotation = comments.capture(options.buffer), saved_source_digest = owner.saved_source_digest,
-      pending_operation = owner.pending_operation and vim.deepcopy(owner.pending_operation) }
+      source_text = source_text, pending_operation = owner.pending_operation and vim.deepcopy(owner.pending_operation) }
   end
-  function owner.close()
+  ---Closes the review. A buffer with unsaved drafts stays attached so reopening the same revision
+  ---recovers them, unless `drafts_recovered` says the caller already holds them from `recovery`.
+  ---@param drafts_recovered? boolean
+  function owner.close(drafts_recovered)
     if owner.closed then return true end
     if owner.saving or owner.submission_pending then return false end
-    if vim.api.nvim_buf_is_valid(options.buffer) and vim.bo[options.buffer].modified then return true end
+    if not drafts_recovered and vim.api.nvim_buf_is_valid(options.buffer) and vim.bo[options.buffer].modified then return true end
     owner.closed = true
     comments.detach(options.buffer, false)
     if owner.gutter_selection then owner.gutter_selection.close() end
@@ -136,6 +143,17 @@ function M.attach(options, callback)
   end
   owner.reply_by_id = {}
   owner.pending_reply_by_id = {}
+  ---A saved question that holds no answer and has no request in flight states why, and names
+  ---the save key that asks it again, so a lost answer is never an empty thread.
+  ---@param id string|integer
+  ---@param body string
+  ---@param reason string
+  local function unanswered(id, body, reason)
+    local save_key = require("forge.shared.keymaps").view_keys_for("plan_review", "save")[1]
+    local regenerate = save_key and (" · %s to regenerate"):format(save_key) or ""
+    return { id = id, replies_body = body,
+      replies = { { heading = "Plan answer", body_lines = { "No answer · " .. reason .. regenerate } } } }
+  end
   local function show_answers(annotation)
     local updates = {}
     for _, item in ipairs(annotation or {}) do
@@ -151,7 +169,9 @@ function M.attach(options, callback)
         local heading = seconds and ("Thought for %d %s"):format(seconds, seconds == 1 and "second" or "seconds") or "Answered"
         updates[#updates + 1] = reply and { id = item.id, replies_body = reply.question_body,
           replies = { { heading = heading, body_lines = vim.split(reply.body, "\n", { plain = true }) } } }
-          or pending and pending.replies_body == item.source.body and pending or { id = item.id, replies = {} }
+          or pending and pending.replies_body == item.source.body and pending
+          or vim.trim(item.source.body or "") ~= "" and unanswered(item.id, item.source.body, "interrupted")
+          or { id = item.id, replies = {} }
       end
     end
     if #updates > 0 then comments.update(options.buffer, updates) end
@@ -238,8 +258,8 @@ function M.attach(options, callback)
               return
             end
             if answer_failure then
-              update.replies = {}
-              comments.update(options.buffer, { update })
+              local reason = vim.split(tostring(answer_failure), "\n", { plain = true })[1]
+              comments.update(options.buffer, { unanswered(update.id, update.replies_body, "failed: " .. reason) })
               if options.notice then options.notice(answer_failure) end
             else
               show_answers(answer_result.annotation)
@@ -299,6 +319,16 @@ function M.attach(options, callback)
   end
   local function attach_projection(opened, source_document, focused_id)
     owner.optimistic_source = nil
+    if options.rebase and options.recovery then
+      local dropped
+      options.recovery, dropped = M.rebase_recovery(options.recovery, opened)
+      options.rebase = nil
+      if #dropped > 0 and options.notice then
+        local lines = { "The plan was revised. These unsaved comments match no line of the new revision and were removed:" }
+        for _, item in ipairs(dropped) do lines[#lines + 1] = "- " .. item.source.body end
+        options.notice(table.concat(lines, "\n"))
+      end
+    end
     local recovered = options.recovery ~= nil
     local captured = options.recovery and options.recovery.annotation or opened.annotation or {}
     local baseline = {}
@@ -525,12 +555,21 @@ function M.attach(options, callback)
   owner.view = open_view(options.window)
   owner.source_width = require("forge.width").capture(options.window)
   local started = perf.now()
+  -- Drafts rebased onto a new revision were written against another saved source, so only a
+  -- same-revision recovery asks the host to confirm the saved source digest.
+  local recovered_digest = options.recovery and not options.rebase and options.recovery.saved_source_digest or nil
   request({ operation = "plan_open", document = owner.document, view = owner.view.id,
     plan_id = options.plan.id, digest = options.plan.review_digest, revision = options.plan.historical_revision,
-    saved_source_digest = options.recovery and options.recovery.saved_source_digest,
+    saved_source_digest = recovered_digest,
     width = owner.source_width }, function(opened, failure)
     perf.event("harness", "plan.review.open_response", { elapsed_ms = perf.elapsed_ms(started), status = failure and "error" or "ok" })
     if failure then callback(nil, failure) return end
+    if options.rebase and options.recovery and options.recovery.pending_operation
+      and #options.recovery.pending_operation > 0 then
+      -- Queued edits name the replaced revision, so the new revision cannot run them.
+      options.recovery.pending_operation = nil
+      if options.notice then options.notice("The plan was revised before queued review edits ran; repeat them on the new revision") end
+    end
     if options.recovery_provider then
       local recovered, recovery_failure = options.recovery_provider()
       if not recovered then callback(nil, recovery_failure) return end
@@ -615,7 +654,15 @@ function M.attach(options, callback)
     end)
   end
 
-  function owner.action(action, receive, window)
+  ---Sends one projection action. `receive` gets failures that stop the action before the request
+  ---and the reply of a capture that is still current. When `settled` is given it instead gets
+  ---every reply exactly once, current or stale, after any returned patch has been applied.
+  ---@param action string
+  ---@param receive fun(result: table?, failure: string?, captured: table?)
+  ---@param window? integer
+  ---@param settled? fun(result: table?, failure: string?)
+  ---@return boolean requested
+  function owner.action(action, receive, window, settled)
     if not owner.attached() then return false end
     if action == "comment" or action == "question" then
       comments.add_at_cursor(options.buffer, false, { kind = action == "question" and "question" or nil,
@@ -647,12 +694,15 @@ function M.attach(options, callback)
         count = result and result.rename and #result.rename.preview or 0,
       }) end
       local reference_preview = action:find("reveal_reference:", 1, true) == 1
-      if not owner.is_current(captured, not reference_preview) then
-        if reference_preview then receive({ cancelled = true }, nil, captured) end
-        return
-      end
-      if not error and result.patch and result.patch ~= vim.NIL then
-        if action == "toggle_declaration" then
+      local current = owner.is_current(captured, not reference_preview)
+      -- The host has already applied an accepted action to its document, so the returned patch
+      -- applies whenever its base is still the replica's revision, even after a newer input or a
+      -- cursor move made this capture stale. Dropping it would leave every later input on an
+      -- older revision than the host's. Staleness suppresses only the cursor effect and callback.
+      local patched = not error and result.patch and result.patch ~= vim.NIL
+      if not error and not patched and result.public_only ~= nil then owner.public_only = result.public_only end
+      if patched and alive() and captured.document == owner.document and captured.revision == owner.replica.revision then
+        if current and action == "toggle_declaration" then
           local node = owner.replica.sequence.node[captured.block]
           local collapse = node and node.entry.metadata.collapse and node.entry.metadata.collapse[1]
           if collapse then
@@ -660,9 +710,18 @@ function M.attach(options, callback)
               view.window, collapse.opening)
           end
         end
-        local applied, projection_failure = apply_action_projection(result, captured, view)
-        if not applied then receive(nil, projection_failure, captured) return end
+        local applied, projection_failure = apply_action_projection(result, captured, current and view or nil)
+        if not applied then
+          if settled then settled(nil, projection_failure) elseif current then receive(nil, projection_failure, captured) end
+          return
+        end
         captured = applied
+        if result.public_only ~= nil then owner.public_only = result.public_only end
+      end
+      if settled then settled(result, error) return end
+      if not current then
+        if reference_preview then receive({ cancelled = true }, nil, captured) end
+        return
       end
       receive(result, error, captured)
     end)
@@ -695,6 +754,65 @@ function M.attach(options, callback)
     return selected, captured, failure, checks
   end
   return owner
+end
+
+---Moves unsaved drafts written against an earlier revision onto a newly opened one.
+---
+---A draft the host already holds takes the host's re-anchored lines. Any other draft moves to the
+---new line whose text equals its old line's text, choosing the occurrence nearest its old position;
+---its end keeps the same distance from its start when that line still has the same text, and
+---otherwise moves to the nearest line with the old end's text. A draft with no such line is
+---returned in `dropped` so the caller can report its text, and so are replies whose parent moved
+---nowhere.
+---@param recovery {annotation: table[], source_text?: table<integer, string>}
+---@param opened {source_row: table[], annotation?: table[]}
+---@return table recovery
+---@return table[] dropped
+function M.rebase_recovery(recovery, opened)
+  local line_by_text = {}
+  local text_by_line = {}
+  for _, row in ipairs(opened.source_row) do
+    if row.source_line > 0 and row.target ~= nil and row.target ~= vim.NIL then
+      line_by_text[row.text] = line_by_text[row.text] or {}
+      table.insert(line_by_text[row.text], row.source_line)
+      text_by_line[row.source_line] = row.text
+    end
+  end
+  local function nearest(text, line)
+    local best
+    for _, candidate in ipairs(text and line_by_text[text] or {}) do
+      if not best or math.abs(candidate - line) < math.abs(best - line) then best = candidate end
+    end
+    return best
+  end
+  local saved = {}
+  for _, item in ipairs(opened.annotation or {}) do saved[tostring(item.id)] = item.source end
+  local old_text = recovery.source_text or {}
+  local retained, dropped, placed = {}, {}, {}
+  for _, item in ipairs(recovery.annotation or {}) do
+    local source = saved[tostring(item.id)]
+    local start_line, end_line
+    if source then
+      start_line, end_line = source.start_line, source.end_line
+    else
+      start_line = nearest(old_text[item.source.start_line], item.source.start_line)
+      if start_line then
+        local shifted = start_line + item.source.end_line - item.source.start_line
+        end_line = text_by_line[shifted] == old_text[item.source.end_line] and shifted
+          or nearest(old_text[item.source.end_line], shifted)
+      end
+    end
+    local parent_placed = item.parent_id == nil or item.parent_id == vim.NIL or placed[tostring(item.parent_id)]
+    if start_line and end_line and parent_placed then
+      item = vim.deepcopy(item)
+      item.source.start_line, item.source.end_line = math.min(start_line, end_line), math.max(start_line, end_line)
+      retained[#retained + 1] = item
+      placed[tostring(item.id)] = true
+    else
+      dropped[#dropped + 1] = item
+    end
+  end
+  return vim.tbl_extend("force", recovery, { annotation = retained }), dropped
 end
 
 return M

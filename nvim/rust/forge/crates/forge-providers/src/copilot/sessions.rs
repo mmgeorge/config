@@ -281,7 +281,6 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
 
         // Preserve the old binding until preparation succeeds; same-ID resume must
         // unregister its SDK router before registering the replacement.
-        let fresh_resume = active.is_none() && selection.session_id.is_some();
         let previous_repair = active.as_ref().and_then(|binding| binding.repair.clone());
         let retained_id = match active.as_ref() {
             Some(binding) => match binding.history {
@@ -368,8 +367,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             if isolated_text {
                 super::session::confirm_isolated_instructions(&session).await?;
             }
-            let repair = if fresh_resume {
-                history_repair::repair(&session).await?
+            // Repair every resume of retained native history, including a replacement binding
+            // after an access change: a prompt the host interrupted before Copilot answered it
+            // stays the history's last request, and the next prompt's turn would carry it out.
+            let repair = if retained_id.is_some() {
+                history_repair::repair(&session).await?.or(previous_repair)
             } else {
                 previous_repair
             };

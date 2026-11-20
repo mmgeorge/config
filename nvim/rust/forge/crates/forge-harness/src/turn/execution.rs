@@ -126,6 +126,11 @@ impl Turn {
         self.started_at_ms
     }
 
+    /// Return when the turn ended, or `None` while it runs.
+    pub fn completed_at_ms(&self) -> Option<i64> {
+        self.completed_at_ms
+    }
+
     /// Return the current execution state.
     pub fn state(&self) -> TurnState {
         self.state

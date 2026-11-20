@@ -17,7 +17,10 @@ pub(super) struct ExchangeLayout<'exchange> {
 }
 
 impl<'exchange> ExchangeLayout<'exchange> {
-    /// Places review admission first and generated results before the outer response.
+    /// Places review admission first, generated results before the outer response, and an
+    /// execution's completion or failure after it. An execution transition recorded after the
+    /// response's turn ended, such as a revision the user accepted between two turns, is not a
+    /// result of that turn and keeps its place after the response.
     /// Question clarifications retain their branch ownership. Missing turn or message references fail.
     pub fn new(exchange: &'exchange Exchange) -> Result<Self> {
         let questions = QuestionHistory::new(exchange);
@@ -52,6 +55,19 @@ impl<'exchange> ExchangeLayout<'exchange> {
                 _ => {}
             }
         }
+        let response_completed_at_ms = first_response_turn.and_then(|response_turn| {
+            exchange
+                .turn
+                .iter()
+                .find(|turn| turn.id() == response_turn)
+                .and_then(crate::turn::Turn::completed_at_ms)
+        });
+        let recorded_after_response = |event: &crate::plan::ExchangePlanEvent| {
+            event
+                .occurred_at_ms
+                .zip(response_completed_at_ms)
+                .is_some_and(|(occurred_at_ms, completed_at_ms)| occurred_at_ms > completed_at_ms)
+        };
         let mut position = 0;
         activity.retain(|node| {
             let before_response = position < later_turn_start;
@@ -90,7 +106,7 @@ impl<'exchange> ExchangeLayout<'exchange> {
                     }
                     crate::plan::PlanEventContent::Execution { .. }
                     | crate::plan::PlanEventContent::Resolution { .. }
-                        if before_response =>
+                        if before_response && !recorded_after_response(event) =>
                     {
                         results.push(*node);
                         false

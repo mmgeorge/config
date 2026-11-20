@@ -86,12 +86,15 @@ impl PlanPrompt {
         pending(elicitation, input, PendingScope::Conversation)
     }
 
-    /// Revise the saved plan for the user's review comments.
+    /// Revise the saved plan for the user's review comments, including comments saved on an
+    /// earlier revision that no prompt delivered and whose lines the current revision lacks.
     pub(crate) fn revision(
         review_feedback: String,
         overall_comment: Option<&str>,
         edits: Vec<PlanEdit>,
+        unplaced_comments: &[String],
     ) -> TurnInput {
+        let review_feedback = with_unplaced_comments(review_feedback, unplaced_comments);
         let feedback = ReviewFeedback::new(overall_comment.map(str::to_owned), review_feedback)
             .or_else(|| ReviewFeedback::new(None, "No review comments were attached.".into()))
             .expect("fallback review feedback is not empty");
@@ -101,7 +104,16 @@ impl PlanPrompt {
     }
 
     /// Start execution after the user accepted the plan.
-    pub(crate) fn accepted(edits: Vec<PlanEdit>) -> TurnInput {
+    ///
+    /// Harness enforces the accepted document's check selection itself, so check-selection
+    /// edits stay in the timeline but are left out of the model's input.
+    pub(crate) fn accepted(mut edits: Vec<PlanEdit>) -> TurnInput {
+        edits.retain(|edit| {
+            !matches!(
+                edit,
+                PlanEdit::SetCheck { .. } | PlanEdit::SetTestScope { .. }
+            )
+        });
         TurnInput::new(TurnKind::PlanReview {
             review: PlanReview::Accepted { edits },
         })
@@ -115,6 +127,21 @@ impl PlanPrompt {
             PlanExecutionPromptKind::ResumeAfterInterruption => TaskStep::ExecuteResume,
         })
     }
+}
+
+/// Append review comments that have no lines in the current revision to rendered feedback.
+pub(crate) fn with_unplaced_comments(mut feedback: String, unplaced_comments: &[String]) -> String {
+    for body in unplaced_comments {
+        if !feedback.is_empty() && !feedback.ends_with('\n') {
+            feedback.push('\n');
+        }
+        feedback.push_str(
+            "Comment saved on an earlier revision, whose lines this revision no longer has:\n",
+        );
+        feedback.push_str(body.trim_end());
+        feedback.push('\n');
+    }
+    feedback
 }
 
 /// Build one Harness-started task step.
@@ -262,6 +289,37 @@ pub(crate) fn test_scope_edits(
 mod tests {
     use super::*;
 
+    /// Execution follows the accepted document, whose check selection Harness enforces, so the
+    /// accepted-plan input reports renames and deletions but not check-selection edits.
+    #[test]
+    fn accepted_input_omits_check_selection_edits() {
+        let input = PlanPrompt::accepted(vec![
+            PlanEdit::SetCheck {
+                id: "lint".into(),
+                enabled: false,
+            },
+            PlanEdit::Rename {
+                from: "Old".into(),
+                to: "New".into(),
+            },
+            PlanEdit::SetTestScope {
+                id: "test".into(),
+                scope: forge_provider_api::forge::PlanTestScope::WholeSuite,
+            },
+        ]);
+        assert_eq!(
+            input.kind(),
+            &TurnKind::PlanReview {
+                review: PlanReview::Accepted {
+                    edits: vec![PlanEdit::Rename {
+                        from: "Old".into(),
+                        to: "New".into(),
+                    }],
+                },
+            }
+        );
+    }
+
     /// Keep the user's planning request as the input itself.
     #[test]
     fn draft_is_the_users_request() {
@@ -312,7 +370,7 @@ mod tests {
             PlanPrompt::checks_saved("9c1e"),
             PlanPrompt::feedback(answers),
             PlanPrompt::withdrawn("no material decision remains"),
-            PlanPrompt::revision("comment".into(), None, Vec::new()),
+            PlanPrompt::revision("comment".into(), None, Vec::new(), &[]),
             PlanPrompt::accepted(Vec::new()),
             PlanPrompt::execution(PlanExecutionPromptKind::Start),
             PlanPrompt::execution(PlanExecutionPromptKind::Continue),

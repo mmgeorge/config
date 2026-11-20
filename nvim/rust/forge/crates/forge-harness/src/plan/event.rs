@@ -60,6 +60,11 @@ pub struct ExchangePlanEvent {
     pub id: String,
     /// Source boundary captured when the event was recorded.
     pub node_count: usize,
+    /// When the event happened, from its durable record. The source boundary cannot tell a
+    /// result the turn produced from a decision recorded after the turn ended, because both
+    /// follow the turn's last node; the time can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at_ms: Option<i64>,
     /// Resolved content for the exchange's renderer.
     pub content: PlanEventContent,
 }

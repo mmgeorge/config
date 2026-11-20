@@ -134,6 +134,30 @@ impl SessionCommand {
         let super::WorkflowSnapshot::Plan { plan } = &task.workflow else {
             return Ok(None);
         };
+        // An acceptance recorded while the task was paused runs once the task resumes, with
+        // the decision the reviewer already made.
+        if !plan.paused
+            && plan.artifact.state == crate::plan::PlanState::AwaitingReview
+            && let Some(request) = plan
+                .artifact
+                .review
+                .as_ref()
+                .and_then(|review| review.execution_request.as_ref())
+                .filter(|request| request.approval_mode.is_some())
+        {
+            return Ok(Some(Self {
+                operation_id: format!(
+                    "recorded-acceptance:{}:{}:{}",
+                    plan.artifact.id, plan.artifact.user_revision, plan.artifact.model_revision
+                ),
+                action: SessionAction::Execute {
+                    selection: request.clone(),
+                },
+                response: CommandResponse::Snapshot,
+                display_text: None,
+                metadata: BTreeMap::new(),
+            }));
+        }
         if !task.auto_accept_plan
             || plan.paused
             // Saved reviewer decisions require a new explicit execute/continue, even when answered.

@@ -107,11 +107,22 @@ pub(crate) struct PlanChangeRequest(PlanReviewSelection);
 
 impl PlanChangeRequest {
     /// Capture the exact reviewed artifact, task authority, and caller feedback.
+    ///
+    /// A request carrying no overall comment, no inline comment, and no review edit is
+    /// refused here, before any command record exists, because the planner would receive
+    /// nothing to revise and could only end its turns without a submission.
     pub(crate) fn capture(
         plan: &crate::plan::PlanRecord,
         current: Option<&Task>,
         request: &PlanReviewRequest,
     ) -> Result<Self, TaskCommandFailure> {
+        let commented = request
+            .comment
+            .as_deref()
+            .is_some_and(|comment| !comment.trim().is_empty());
+        if !commented && request.annotations.is_empty() && plan.manual_changes.is_empty() {
+            return Err(TaskCommandFailure::EmptyRevisionRequest);
+        }
         Ok(Self(PlanReviewSelection::capture(plan, current, request)?))
     }
     /// Get captured source and feedback for guarded preparation.

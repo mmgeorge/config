@@ -185,7 +185,7 @@ impl SessionOpening {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = OpenState::Closed(None);
             let conflict = ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
+                forge_provider_api::ObservationFailure::ownership_conflict(),
             );
             return Err(match observed.completion_failure {
                 Some(primary) => ProviderError::Combined {
@@ -283,7 +283,7 @@ impl SessionOpening {
                     return Ok(());
                 }
                 return Err(ProviderError::Observation(
-                    forge_provider_api::ObservationFailure::OwnershipConflict,
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
                 ));
             }
             let closing = provider.thread_close(context.clone(), &binding);

@@ -36,13 +36,33 @@ function M.configure_gutterless_window(win)
   vim.wo[win].statuscolumn = ""
 end
 
-local function keep_composer_normal_on_entry(buf)
+---Depth of deliberate Insert-mode focus changes in progress, during which composer entry keeps
+---the mode. Neovim ignores `startinsert` while Insert mode is still active, so a guard that stopped
+---Insert mode could not be undone by the caller that wants the composer to stay in it.
+local insert_entry_depth = 0
+
+---Move focus with `action` while composer entry keeps Insert mode, for a caller that returns the
+---user to Insert mode in the composer it focuses.
+---@param action fun()
+function M.enter_composer_in_insert(action)
+  insert_entry_depth = insert_entry_depth + 1
+  local ok, failure = pcall(action)
+  insert_entry_depth = insert_entry_depth - 1
+  if not ok then error(failure, 0) end
+end
+
+---Leave Insert mode whenever focus enters `buf`, unless a caller enters the composer in Insert
+---mode on purpose. The composer starts each visit in Normal mode; the transcript never takes typed
+---edits, which a mouse click from an Insert-mode composer would otherwise send to its rows.
+---@param buf integer
+---@param description string
+local function keep_normal_on_entry(buf, description)
   vim.api.nvim_clear_autocmds({ group = composer_mode_group, buffer = buf })
   vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
     group = composer_mode_group,
     buffer = buf,
-    callback = function() vim.cmd("stopinsert") end,
-    desc = "Keep Harness input in Normal mode when focused",
+    callback = function() if insert_entry_depth == 0 then vim.cmd("stopinsert") end end,
+    desc = description,
   })
 end
 
@@ -74,6 +94,7 @@ function M.create_transcript_buffer(session_id)
   vim.bo[buf].filetype = "ForgeHarness"
   vim.bo[buf].modifiable = false
   M.configure_transcript_buffer(buf)
+  keep_normal_on_entry(buf, "Keep the Harness transcript out of Insert mode")
   return buf
 end
 
@@ -138,7 +159,7 @@ function M.open(timeline_key, open_mode)
   vim.api.nvim_set_option_value("smoothscroll", true, { scope = "local", win = composer_win })
   vim.wo[composer_win].winfixheight = true
   input_gutter.apply(composer_win)
-  keep_composer_normal_on_entry(composer_buf)
+  keep_normal_on_entry(composer_buf, "Keep Harness input in Normal mode when focused")
   return transcript_buf, transcript_win, composer_buf, composer_win, tabpage
 end
 

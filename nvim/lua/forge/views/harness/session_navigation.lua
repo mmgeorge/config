@@ -37,11 +37,18 @@ end
 ---  was invoked from it. Entering a composer otherwise leaves Insert mode.
 local function focus_state(state, insert)
   if not valid_view(state) then return false end
-  vim.api.nvim_set_current_tabpage(state.timeline_tab)
   local target = state.composer_win
-  if target and vim.api.nvim_win_is_valid(target) then
-    vim.api.nvim_set_current_win(target)
-    if insert then vim.cmd("startinsert!") end
+  local function enter()
+    vim.api.nvim_set_current_tabpage(state.timeline_tab)
+    if target and vim.api.nvim_win_is_valid(target) then vim.api.nvim_set_current_win(target) end
+  end
+  if insert and target and vim.api.nvim_win_is_valid(target) then
+    -- Entering the composer keeps Insert mode when the user chose the session from it; a mode
+    -- that has already ended, as after a picker, starts again.
+    layout.enter_composer_in_insert(enter)
+    if vim.api.nvim_get_mode().mode:sub(1, 1) ~= "i" then vim.cmd("startinsert!") end
+  else
+    enter()
   end
   activate_state(state)
   return true
@@ -191,9 +198,10 @@ function M.activate(result, options)
   -- restored when this activation does not take focus.
   local selected_state = session.harness
   local source_state = options.source_state or options.state or selected_state
-  -- Opening a session that no tab displays in the current tab targets the current view's windows.
-  -- A retained session would otherwise reopen through `layout.open` in a new last tab while the
-  -- source tab closes. A session displayed elsewhere keeps its tab, and the source tab closes.
+  -- Opening a session in the current tab targets the current view's windows. A retained session
+  -- would otherwise reopen through `layout.open` in a new last tab while the source tab closes. A
+  -- session already displayed in another tab moves into the current tab, its former tab closes,
+  -- and the session the current tab showed stays loaded without a view.
   local state = options.state
     or (options.open_mode == "current" and not (existing and valid_view(existing))
       and valid_view(source_state) and source_state or nil)
@@ -206,8 +214,11 @@ function M.activate(result, options)
       local previous_tab = existing.timeline_tab
       require("forge.views.harness.workspace").release(existing)
       require("forge.views.harness.workspace").release(state)
-      vim.api.nvim_win_set_buf(state.transcript_win, existing.transcript_buf)
-      vim.api.nvim_win_set_buf(state.composer_win, existing.composer_buf)
+      local function swap_buffers()
+        vim.api.nvim_win_set_buf(state.transcript_win, existing.transcript_buf)
+        vim.api.nvim_win_set_buf(state.composer_win, existing.composer_buf)
+      end
+      if options.insert then layout.enter_composer_in_insert(swap_buffers) else swap_buffers() end
       existing.transcript_win, existing.composer_win, existing.timeline_tab =
         state.transcript_win, state.composer_win, state.timeline_tab
       state.transcript_win, state.composer_win, state.timeline_tab = nil, nil, nil

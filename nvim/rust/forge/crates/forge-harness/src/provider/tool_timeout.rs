@@ -262,6 +262,15 @@ impl ToolWatchdog {
                 | ItemStart::FileChange(descriptor)
                 | ItemStart::ToolCall(descriptor),
             ) => {
+                // An approval or execution report can arm the deadline first, under the item
+                // identifier; the start supplies the title the expiry names.
+                if let Some(
+                    ToolDeadline::Running { title, .. }
+                    | ToolDeadline::AwaitingApproval { title, .. },
+                ) = state.tools.get_mut(&address)
+                {
+                    title.clone_from(&descriptor.title);
+                }
                 state.tools.entry(address).or_insert_with(|| {
                     if descriptor.name == "question_ask"
                         && descriptor.arguments.value()["wait"].as_bool() == Some(true)
@@ -824,6 +833,44 @@ mod tests {
         );
         tokio::time::advance(Duration::from_millis(200)).await;
         assert_eq!(pending.await?.unwrap().address, command);
+        Ok(())
+    }
+
+    /// A tool whose deadline was armed before its start event still expires under its own title.
+    ///
+    /// An approval or execution report can reach the watchdog before the item's start, which
+    /// armed the deadline under the item identifier. The start kept that placeholder, so the
+    /// expiry read "Stopped: `25781846-…` exceeded its 15s tool timeout".
+    #[tokio::test(start_paused = true)]
+    async fn early_deadline_takes_the_title_from_the_item_start() -> Result<()> {
+        for early in ["approval", "execution"] {
+            let watchdog = watchdog()?;
+            let command = address("command");
+            watchdog.observe(&match early {
+                "approval" => approval(&command, "first", "requested"),
+                _ => item(
+                    &command,
+                    ItemEvent::Tool {
+                        event: ToolItemEvent::ExecutionStarted,
+                    },
+                ),
+            })?;
+            watchdog.observe(&item(
+                &command,
+                ItemEvent::Started(ItemStart::CommandExecution(ToolDescriptor {
+                    semantics: Default::default(),
+                    name: "shell".into(),
+                    title: "sleep 45sec".into(),
+                    arguments: InspectableArguments::new(serde_json::json!({})),
+                })),
+            ))?;
+            if early == "approval" {
+                watchdog.observe(&approval(&command, "first", "resolved"))?;
+            }
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let expired = watchdog.expired().await?.unwrap();
+            assert_eq!(expired.record().title, "sleep 45sec", "armed by {early}");
+        }
         Ok(())
     }
 

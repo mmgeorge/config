@@ -247,6 +247,13 @@ impl HeldDispatch {
         }
     }
 
+    /// Yield until the session trace records `event`, however many owner steps that takes.
+    async fn traced(&self, event: &str) {
+        while !self.trace_events().any(|recorded| recorded == event) {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Get the event names the session trace has recorded so far, oldest first.
     ///
     /// The trace writer appends on its own thread, so the file is read only after a flush; an
@@ -428,7 +435,9 @@ async fn failed_send_keeps_cancel_available_and_never_resends() -> Result<()> {
     let mut fixture = HeldDispatch::start(HoldPoint::DuringSend).await?;
     let scenario = async {
         fixture.release(HeldSendEnd::Fail);
-        fixture.settle().await;
+        // The failed send restarts the provider. A fixed number of yields raced that restart
+        // under load and sent cancel before the owner had settled the failed turn.
+        fixture.traced("exchange.restart.finished").await;
         let cancelled = fixture.spawn_command(cancel());
         cancelled
             .await?
@@ -485,7 +494,7 @@ async fn model_change_before_send_waits_and_applies() -> Result<()> {
 }
 
 /// A restart whose provider initialization fails leaves the session failed, and cancel reports it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_restart_fails_the_session_and_reports_it() -> Result<()> {
     let mut fixture = HeldDispatch::start(HoldPoint::DuringSend).await?;
     let scenario = async {
@@ -494,7 +503,19 @@ async fn failed_restart_fails_the_session_and_reports_it() -> Result<()> {
             .initialization_fails
             .store(true, Ordering::Release);
         fixture.release(HeldSendEnd::Fail);
-        fixture.settle().await;
+        // Cancel only once the owner has recorded the failed restart; a fixed number of yields
+        // raced the restart under load and sent cancel while it was still running. The paused
+        // clock runs this bound out at once when the restart never fails.
+        tokio::time::timeout(std::time::Duration::from_secs(3600), async {
+            while !fixture
+                .trace_events()
+                .any(|event| event == "exchange.restart.failed")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("the session trace never recorded the failed restart")?;
         let cancelled = fixture.spawn_command(cancel()).await?;
         assert!(
             matches!(
@@ -519,7 +540,12 @@ async fn failed_restart_fails_the_session_and_reports_it() -> Result<()> {
     }
     .await;
     // A failed session must still shut down, and its listener reports the stream no restart replaced.
-    let observation = fixture.finish_reporting_observation().await?;
+    let observation = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        fixture.finish_reporting_observation(),
+    )
+    .await
+    .context("the failed session never shut down")??;
     scenario?;
     assert!(
         observation.is_err(),

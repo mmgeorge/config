@@ -20,17 +20,18 @@ local render_view
 local resize_group = vim.api.nvim_create_augroup("ForgePickerLayout", { clear = true })
 
 -- A picker that takes focus by itself, such as a permission review or a question, can open while
--- the user is typing in another window, and the next letters or Enter would then pick a decision
--- the user never saw. Such a picker sets `input_settle_ms`. When it opens within that interval of
--- a typed key it settles: it discards every typed key except its close and interrupt keys until
--- the keyboard has been quiet for the interval, each discarded key restarting it. A guarded picker
--- that closes without a decision shortly after taking a key discards keys for the same interval,
--- so keys aimed at it do not land in the window beneath.
+-- the user is typing, and the next letters or Enter would then pick a decision the user never saw.
+-- Its owner holds it while the editor is in a typing mode; such a picker also sets
+-- `input_settle_ms`, and every open of it settles: it discards every typed key except its close and
+-- interrupt keys until the keyboard has been quiet for the interval, each discarded key restarting
+-- it. The keyboard observer discards keys after mappings resolve, so neither a picker mapping nor a
+-- global one runs. Only the release timer ends the settling, and it redraws the footer in the same
+-- step, so the "waiting" notice is shown exactly while keys are discarded. A guarded picker that
+-- closes for any reason but the user's own decision or close, as on expiry or a host resolution,
+-- discards keys for the same interval, so keys aimed at it do not land in the window beneath.
 Picker.focus_taking_settle_ms = 350
 local settle_namespace = vim.api.nvim_create_namespace("ForgePickerInputSettle")
----@type number? Loop time of the last typed key, in milliseconds.
-local last_typed_ms = nil
----@type {instance?: table, until_ms: number, interval_ms: number, pass_keys: table<string, boolean>}?
+---@type {instance?: table, until_ms: number, interval_ms: number, pass_keys: table<string, boolean>, release_pending?: boolean}?
 local input_settle = nil
 
 local function settle_pass_keys(instance)
@@ -48,27 +49,22 @@ local function end_settling(guard)
   if input_settle ~= guard then return end
   input_settle = nil
   local instance = guard.instance
-  if instance and instance.settle_timer then
-    instance.settle_timer:stop()
-    instance.settle_timer:close()
-    instance.settle_timer = nil
-  end
-  if instance then instance.settling = false end
-  -- The keyboard observer runs under textlock, so the footer redraws after it returns.
-  vim.schedule(function()
-    if instance and instance == active and not instance.settling then render_view(instance) end
-  end)
+  if not instance then return end
+  instance.settling = false
+  if instance == active then render_view(instance) end
 end
 
+---Release the guard once the keyboard has been quiet for its interval. The check runs on a fixed
+---interval timer, which never runs under the keyboard observer's textlock.
+---@param guard table
 local function schedule_settle_end(guard)
-  local instance = guard.instance
-  if not instance then return end
-  instance.settle_timer = instance.settle_timer or vim.uv.new_timer()
-  instance.settle_timer:stop()
-  instance.settle_timer:start(math.max(1, math.ceil(guard.until_ms - vim.uv.now())), 0, vim.schedule_wrap(function()
+  if guard.release_pending then return end
+  guard.release_pending = true
+  vim.defer_fn(function()
+    guard.release_pending = false
     if input_settle ~= guard then return end
     if vim.uv.now() >= guard.until_ms then end_settling(guard) else schedule_settle_end(guard) end
-  end))
+  end, guard.interval_ms)
 end
 
 ---@param instance? table Picker that settles, or nil after a guarded picker closed by itself.
@@ -82,19 +78,46 @@ local function begin_settling(instance, until_ms, interval_ms, pass_keys)
   schedule_settle_end(guard)
 end
 
+local editing_special_key = { [vim.keycode("<Del>")] = true, [vim.keycode("<Insert>")] = true }
+
+---Report whether a key typed in a picker's list resolves to something the picker allows: one of
+---the list buffer's own mappings, the command line, or a special key such as a mouse click. A
+---built-in Normal-mode command, or a global mapping such as `Y` mapped to `P`, would edit the
+---unmodifiable list and raise E21, so the picker takes it without effect.
+---@param typed string Raw key sequence after mapping resolution.
+---@return boolean
+local function picker_accepts(typed)
+  if typed == ":" or vim.fn.maparg(typed, "n", false, true).buffer == 1 then return true end
+  return typed:byte(1) == 0x80 and not editing_special_key[typed]
+end
+
+---True while the keys a discarded mapping produced are still arriving. A mapping's right-hand
+---side after its first key reaches the observer with no typed keys, so it is discarded with the
+---key that started it; the next typed key, or the next main-loop turn, ends the run.
+local discarding_mapping = false
+
 vim.on_key(function(_, typed)
-  if not typed or typed == "" then return end
-  local now = vim.uv.now()
-  last_typed_ms = now
-  local guard = input_settle
-  if guard and now >= guard.until_ms then end_settling(guard) guard = nil end
-  if not guard or guard.pass_keys[typed] then
-    if active then active.last_typed_ms = now end
+  if not typed or typed == "" then
+    if discarding_mapping then return "" end
     return
   end
-  guard.until_ms = now + guard.interval_ms
-  schedule_settle_end(guard)
-  return ""
+  discarding_mapping = false
+  local guard = input_settle
+  if guard and not guard.pass_keys[typed] then
+    -- The loop clock is cached while a batch of keys is processed, and a stale time would end the
+    -- interval early while keys still arrive.
+    vim.uv.update_time()
+    guard.until_ms = vim.uv.now() + guard.interval_ms
+    schedule_settle_end(guard)
+    return ""
+  end
+  local instance = active
+  if instance and vim.api.nvim_get_current_buf() == instance.buf and vim.api.nvim_get_mode().mode == "n"
+    and not picker_accepts(typed) then
+    discarding_mapping = true
+    vim.schedule(function() discarding_mapping = false end)
+    return ""
+  end
 end, settle_namespace)
 
 local function valid_window(win)
@@ -193,6 +216,7 @@ local function update_deadline_timer(instance)
     if active == instance and valid_window(instance.win) then
       local width = vim.api.nvim_win_get_width(instance.win)
       vim.api.nvim_win_set_config(instance.win, { title = title_chunks(instance, width), title_pos = "left" })
+      require("forge.infra.command_line_redraw").request()
     end
   end))
 end
@@ -521,7 +545,11 @@ local function finish(instance, result)
   local callback = instance.spec.on_confirm
   local should_close = nil
   if callback then should_close = callback(result, Picker) end
-  if should_close ~= false and instance == active then Picker.close(false) end
+  if should_close ~= false and instance == active then
+    -- The confirmation is the user's decision, so the keys after it are theirs as well.
+    instance.decided = true
+    Picker.close(false)
+  end
 end
 
 local function submit_input(instance)
@@ -709,7 +737,6 @@ local function field_action(instance, action, direction)
 end
 
 local function confirm(instance, with_feedback)
-  instance.acted = true
   if field_action(instance, "activate") then return end
   local page = picker_state.page(instance.state, instance.spec)
   local option = picker_state.selected_option(instance.state, instance.spec)
@@ -775,7 +802,6 @@ end
 ---@param instance table
 ---@param action table
 local function run_action(instance, action)
-  instance.acted = true
   if action.callback then action.callback(selection_context(instance), Picker) end
 end
 
@@ -985,6 +1011,22 @@ open_search = function(instance, focus)
   end
 end
 
+---@type ForgePopupOrigin? Where a picker opened by `Picker.present_from` returns when it closes.
+local presentation_origin = nil
+
+---Run `present`, and make a picker it opens return to `origin` when it closes, instead of to the
+---window and mode at its open. A popup that waited while the user typed opens only after they
+---left that mode, so the place it opens from is not the place it interrupted.
+---@param origin ForgePopupOrigin
+---@param present fun()
+function Picker.present_from(origin, present)
+  local previous = presentation_origin
+  presentation_origin = origin
+  local presented, failure = pcall(present)
+  presentation_origin = previous
+  if not presented then error(failure, 0) end
+end
+
 ---@param spec ForgePickerSpec
 function Picker.open(spec)
   -- A picker that replaces another, such as the next step of a chain opened from a confirm
@@ -996,7 +1038,8 @@ function Picker.open(spec)
   spec.host = spec.host or {}
   spec.host.window_list = spec.host.window_list or { spec.host.control_win or vim.api.nvim_get_current_win() }
   local origin = popup_window.capture_origin()
-  if replaced_origin and vim.api.nvim_win_is_valid(replaced_origin.win) then origin = replaced_origin end
+  if replaced_origin and vim.api.nvim_win_is_valid(replaced_origin.win) then origin = replaced_origin
+  elseif presentation_origin and vim.api.nvim_win_is_valid(presentation_origin.win) then origin = presentation_origin end
   local control_win = spec.host.control_win or origin.win
   assert(vim.api.nvim_win_is_valid(control_win), "picker control window must be valid")
   local state = picker_state.new(spec)
@@ -1019,12 +1062,9 @@ function Picker.open(spec)
     spec.placement or (spec.size_ratio and "center" or nil))
   vim.b[instance.buf].miniclue_disable = true
   active = instance
-  instance.opened_ms = vim.uv.now()
   if spec.input_settle_ms then
-    if input_settle and not input_settle.instance then input_settle = nil end
-    if last_typed_ms and instance.opened_ms - last_typed_ms < spec.input_settle_ms then
-      begin_settling(instance, last_typed_ms + spec.input_settle_ms, spec.input_settle_ms, settle_pass_keys(instance))
-    end
+    vim.uv.update_time()
+    begin_settling(instance, vim.uv.now() + spec.input_settle_ms, spec.input_settle_ms, settle_pass_keys(instance))
   end
   update_deadline_timer(instance)
   render_view(instance)
@@ -1117,6 +1157,8 @@ end
 ---`on_close(resume, reason)` hears `"user"` only when the user's own key closed the picker; every
 ---other close, including replacement by `Picker.open`, reports `"programmatic"`, so an owner can
 ---tell a dismissal from a displacement.
+---An owner that closes a guarded picker after the user's decision, such as once the host accepted
+---it, passes `"user"` as well; any other close discards the keys typed in the next interval.
 ---@param notify? boolean
 ---@param reason? "user"|"programmatic"
 function Picker.close(notify, reason)
@@ -1124,12 +1166,14 @@ function Picker.close(notify, reason)
   if not instance then return end
   local resume = Picker.capture_state()
   if instance.timer then instance.timer:stop() instance.timer:close() instance.timer = nil end
-  if input_settle and input_settle.instance == instance then end_settling(input_settle) end
+  if input_settle and input_settle.instance == instance then
+    input_settle = nil
+    instance.settling = false
+  end
   local interval_ms = instance.spec.input_settle_ms
-  local now = vim.uv.now()
-  local closed_by_itself = reason ~= "user" and not instance.acted and not instance.replaced
-  if interval_ms and closed_by_itself and instance.last_typed_ms and now - instance.last_typed_ms < interval_ms then
-    begin_settling(nil, now + interval_ms, interval_ms, settle_pass_keys(instance))
+  if interval_ms and reason ~= "user" and not instance.decided and not instance.replaced then
+    vim.uv.update_time()
+    begin_settling(nil, vim.uv.now() + interval_ms, interval_ms, settle_pass_keys(instance))
   end
   set_picker_cursor_hidden(instance, false)
   active = nil

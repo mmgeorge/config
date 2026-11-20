@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::provider::ProviderError;
@@ -62,6 +62,10 @@ impl WatchdogKey {
 pub(crate) struct SessionObservationInbox {
     pending: Mutex<VecDeque<OwnerObservation>>,
     ready: Notify,
+    /// Live foregrounds that consume this inbox themselves, in their own publication order.
+    foreground_claims: AtomicUsize,
+    /// Wakes the session-wide intake when events arrive or the last foreground claim ends.
+    unclaimed_ready: Notify,
     closed: Arc<AtomicBool>,
     monitor_closed: Arc<Notify>,
     failure_reported: AtomicBool,
@@ -130,7 +134,7 @@ impl SessionObservationInbox {
             .is_some_and(|previous| previous != &binding)
         {
             return Err(ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
             ));
         }
         *self
@@ -163,6 +167,7 @@ impl SessionObservationInbox {
         self.closed.store(true, Ordering::Release);
         self.monitor_closed.notify_waiters();
         self.ready.notify_waiters();
+        self.unclaimed_ready.notify_waiters();
     }
 
     /// Report whether the native owner has ended observation.
@@ -200,6 +205,7 @@ impl SessionObservationInbox {
         {
             drop(pending);
             self.ready.notify_one();
+            self.notify_unclaimed();
             return Ok(());
         }
         if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
@@ -241,6 +247,7 @@ impl SessionObservationInbox {
         pending.push_back(observation);
         drop(pending);
         self.ready.notify_one();
+        self.notify_unclaimed();
         Ok(())
     }
 
@@ -255,7 +262,7 @@ impl SessionObservationInbox {
             } => {
                 if scope != change.scope {
                     return Err(ProviderError::Observation(
-                        forge_provider_api::ObservationFailure::OwnershipConflict,
+                        forge_provider_api::ObservationFailure::ownership_conflict(),
                     ));
                 }
                 let mut pending = self
@@ -277,6 +284,7 @@ impl SessionObservationInbox {
                 });
                 drop(pending);
                 self.ready.notify_one();
+                self.notify_unclaimed();
                 Ok(())
             }
             OwnerObservation::InputAcceptance {
@@ -313,6 +321,7 @@ impl SessionObservationInbox {
         });
         drop(pending);
         self.ready.notify_one();
+        self.notify_unclaimed();
         Ok(())
     }
 
@@ -640,6 +649,55 @@ impl SessionObservationInbox {
                     .is_some()))
     }
 
+    /// Make a live foreground the inbox's only consumer until the returned claim drops.
+    ///
+    /// A foreground drains this inbox into its own queue and applies one event per publication
+    /// acknowledgment, while the session-wide intake drains it directly. With both consuming, the
+    /// intake applied a native child's later events while the foreground still held its earlier
+    /// ones, and the child's record then refused the earlier events as a sequence regression.
+    pub(crate) fn claim_for_foreground(self: &Arc<Self>) -> SessionInboxClaim {
+        self.foreground_claims.fetch_add(1, Ordering::AcqRel);
+        SessionInboxClaim {
+            inbox: Arc::clone(self),
+        }
+    }
+
+    /// Wake the session-wide intake only when no foreground consumes the new event itself.
+    fn notify_unclaimed(&self) {
+        if !self.foreground_claimed() {
+            self.unclaimed_ready.notify_one();
+        }
+    }
+
+    /// Get whether a live foreground currently consumes this inbox.
+    ///
+    /// A closed inbox receives no further events, so its remainder no longer races a
+    /// foreground's queue; any owner may drain it, as replacing a closed generation requires.
+    pub(crate) fn foreground_claimed(&self) -> bool {
+        self.foreground_claims.load(Ordering::Acquire) != 0 && !self.is_closed()
+    }
+
+    /// Report pending work for the session-wide intake, which waits while a foreground consumes.
+    pub(crate) fn has_unclaimed_pending(&self) -> Result<bool> {
+        if self.foreground_claimed() {
+            return Ok(false);
+        }
+        self.has_pending()
+    }
+
+    /// Wait until the session-wide intake may drain: events are pending and no foreground
+    /// consumes them, or the inbox closed.
+    pub(crate) async fn unclaimed_notified(&self) -> Result<()> {
+        let notified = self.unclaimed_ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_closed() || self.has_unclaimed_pending()? {
+            return Ok(());
+        }
+        notified.await;
+        Ok(())
+    }
+
     /// Wait for pending events without losing a notification between inspection and sleep.
     pub(crate) async fn notified(&self) -> Result<()> {
         let notified = self.ready.notified();
@@ -658,6 +716,19 @@ impl SessionObservationInbox {
         }
         notified.await;
         Ok(())
+    }
+}
+
+/// Hold a foreground's sole consumption of the session inbox; dropping it hands any events
+/// left behind back to the session-wide intake.
+pub(crate) struct SessionInboxClaim {
+    inbox: Arc<SessionObservationInbox>,
+}
+
+impl Drop for SessionInboxClaim {
+    fn drop(&mut self) {
+        self.inbox.foreground_claims.fetch_sub(1, Ordering::AcqRel);
+        self.inbox.unclaimed_ready.notify_one();
     }
 }
 
@@ -867,6 +938,43 @@ mod tests {
                 unit: crate::session::TimeoutUnit::S,
             },
         )?))
+    }
+
+    /// A live foreground is the inbox's only consumer: the session-wide intake sees nothing
+    /// to drain while the claim holds, and is woken to drain the remainder when it ends.
+    ///
+    /// A native child's events once reached both consumers. The foreground queued 116 through
+    /// 130 behind its publication acknowledgments while the intake applied 131 directly, so the
+    /// child's record refused every earlier event as a sequence regression.
+    #[tokio::test]
+    async fn foreground_claim_keeps_the_intake_off_the_inbox_until_it_ends() -> Result<()> {
+        use futures_util::FutureExt;
+        let inbox = Arc::new(SessionObservationInbox::default());
+        let child = crate::provider::InvocationScope::new(
+            crate::provider::ThreadOwner::root("session"),
+            "exchange",
+        );
+        let claim = inbox.claim_for_foreground();
+        inbox.push(tool_started(&child, "earlier")?)?;
+        inbox.push(tool_started(&child, "later")?)?;
+        assert!(
+            inbox.has_pending()?,
+            "the foreground must still see its events"
+        );
+        assert!(!inbox.has_unclaimed_pending()?);
+        let intake = inbox.unclaimed_notified();
+        tokio::pin!(intake);
+        assert!(
+            intake.as_mut().now_or_never().is_none(),
+            "the intake woke beside a foreground"
+        );
+        let earlier = inbox.drain_up_to(1)?;
+        assert_eq!(earlier.len(), 1);
+        drop(claim);
+        intake.await?;
+        assert!(inbox.has_unclaimed_pending()?);
+        assert_eq!(inbox.drain()?.len(), 1);
+        Ok(())
     }
 
     /// A continuation runs under a successor invocation of the same exchange, and its hung tool

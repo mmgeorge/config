@@ -153,7 +153,6 @@ impl TaskCheckFinalization {
     pub(super) fn into_interrupted(self) -> (OwnedTaskChecks, CheckRun) {
         let mut run = self.run;
         run.interrupt();
-        run.completed_plan = None;
         (self.state, run)
     }
 }
@@ -469,9 +468,12 @@ impl HarnessBroker {
             .design
             .clone()
             .context("accepted declarations are missing")?;
+        // Check results belong to the turn that requested Check, not to a later chat exchange.
         let interaction = self
             .store
-            .latest_exchange(&self.session.id)?
+            .list_exchange(&self.session.id)?
+            .into_iter()
+            .find(|exchange| exchange.ordinal == turn.id.exchange_ordinal)
             .context("plan checks require their execution exchange")?;
         let baseline = execution
             .baseline_checkpoint
@@ -486,8 +488,13 @@ impl HarnessBroker {
             );
         }
         let deadline = self.check_runner.plan_deadline()?;
+        let inventory = if baseline.is_some() {
+            crate::checks::ChangeInventory::Pending
+        } else {
+            crate::checks::ChangeInventory::Unavailable
+        };
         let attempt = self
-            .prepare_task_check_candidate(&interaction, &execution, &design, None)?
+            .prepare_task_check_candidate(&interaction, &execution, &design, inventory)?
             .into_record();
         let scan = TaskCheckScan {
             conformance: self.prepare_execution_conformance(&execution, &design)?,
@@ -535,7 +542,10 @@ impl HarnessBroker {
             &state.interaction,
             &state.execution,
             &state.design,
-            scan.files,
+            scan.files.map_or(
+                crate::checks::ChangeInventory::Unavailable,
+                crate::checks::ChangeInventory::Known,
+            ),
         )?;
         let mut run = self
             .check_runner
@@ -561,7 +571,7 @@ impl HarnessBroker {
         interaction: &Exchange,
         execution: &PlanExecutionRecord,
         design: &crate::plan::DeclarationDesign,
-        files: Option<Vec<String>>,
+        inventory: crate::checks::ChangeInventory,
     ) -> Result<crate::checks::PreparedCheckRun> {
         let shell = self.session.shell;
         let ExecutionCheckSelection {
@@ -600,8 +610,7 @@ impl HarnessBroker {
                     }),
                     overrides: enabled,
                     task_overrides: overrides,
-                    files,
-                    has_scope: true,
+                    inventory,
                     shell,
                     trigger: "Plan execution".into(),
                     task_id,
@@ -689,7 +698,6 @@ impl HarnessBroker {
                         execution.state = PlanExecutionState::Complete;
                         execution.completed_at_ms = run.completed_at_ms;
                         goal.state = GoalState::Complete;
-                        run.completed_plan = Some(state.accepted.title.clone());
                     }
                 }
             }
@@ -860,7 +868,6 @@ impl HarnessBroker {
             };
             run.state = crate::checks::failure_state(error, fallback);
             run.completed_at_ms = Some(self.clock.now_ms());
-            run.completed_plan = None;
             for command in &mut run.commands {
                 if matches!(command.state, CheckState::Pending | CheckState::Running) {
                     command.state = if command.started_at_ms.is_some() {
@@ -1013,5 +1020,199 @@ impl HarnessBroker {
             self.clock.now_ms(),
         )?;
         self.reserve_execution_continuation(acknowledgment.source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Checking execution whose source turn is exchange 1 and whose only check is an
+    /// automatic lint adapter triggered by documentation, so source edits select no process.
+    struct CheckingExecution {
+        broker: HarnessBroker,
+        // Declared last: fields drop in order, and Windows cannot delete files still open.
+        _workspace: tempfile::TempDir,
+        _data: tempfile::TempDir,
+    }
+
+    /// Accept a reviewed plan, capture its baseline, and reserve Check from exchange 1, then
+    /// record a later chat exchange.
+    async fn checking_execution() -> Result<CheckingExecution> {
+        let workspace = super::super::test::repository();
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            serde_json::to_vec(&json!({"checks":{"lint":{
+                "trigger":{"auto":true,"paths":["docs/**"]},
+                "action":{"category":"lint","adapter":{"script":{"command":["unused"]}}}
+            }}}))?,
+        )?;
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.save_session()?;
+        let mut document = crate::plan::test_fixture("check-plan", "Check ownership");
+        let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
+        design.document.objective = "Check ownership".into();
+        design.document.background = "A check fixture".into();
+        design.document.design = "Keep state in its owner.".into();
+        design.proposed_source.insert(
+            "src/owner.rs".into(),
+            "/// Own application state.\npub struct Owner;\n".into(),
+        );
+        design.parsed =
+            crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())?.parsed;
+        document.design = Some(design);
+        let mut plan = broker
+            .plan_file
+            .prepare_entry(
+                &broker.session.id,
+                "Check ownership".into(),
+                Some(document),
+                1,
+            )?
+            .record;
+        let (document, _, digest) = broker.plan_file.submit_document_revision(
+            &broker.session.id,
+            &plan.id,
+            1,
+            plan.document_version,
+        )?;
+        plan.document_version = document.version;
+        plan.submitted_version = Some(document.version);
+        plan.model_revision = 1;
+        plan.review_digest = Some(digest.clone());
+        plan.state = PlanState::AwaitingReview;
+        broker.store.save_plan(&plan)?;
+        broker.snapshot()?;
+        broker.dispatch_session_command(
+            "session.plan.accept",
+            json!({"plan_id":plan.id,"digest":digest,"approval_mode":"ask","plan_compact":false}),
+        )?;
+        broker.ensure_execution_baseline().await?;
+        let task = broker
+            .task_controller
+            .current()?
+            .context("execution task")?;
+        broker
+            .task_controller
+            .update(&mut broker.store, &task.permit(), 2, |task| {
+                let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow
+                else {
+                    anyhow::bail!("expected execution");
+                };
+                execution.record.phase = crate::plan::PlanPhase::Checking;
+                task.entry.as_mut().unwrap().delivery = crate::task::TaskInputDelivery::Accepted;
+                Ok(())
+            })?;
+        for (id, ordinal, kind) in [
+            ("implement-exchange", 1, "plan_execution"),
+            ("chat-exchange", 2, "chat"),
+        ] {
+            let exchange: Exchange = serde_json::from_value(json!({
+                "id":id,"session_id":broker.session.id,
+                "agent_id":broker.session.primary_agent_id,"ordinal":ordinal,
+                "prompt":"Implement ownership","state":"complete","kind":kind,
+                "plan_id":plan.id,"created_at_ms":ordinal,"completed_at_ms":ordinal + 1,
+                "attributed_matches_checkpoint":true,"node_list":[]
+            }))?;
+            broker.store.save_exchange(&exchange)?;
+        }
+        let task = broker
+            .task_controller
+            .current()?
+            .context("execution task")?;
+        assert!(broker.task_controller.reserve_checks(
+            &mut broker.store,
+            &task.permit(),
+            crate::task::TaskTurnId {
+                exchange_ordinal: 1,
+                turn_ordinal: 0
+            },
+            3,
+        )?);
+        broker.reconcile_timeline()?;
+        std::fs::create_dir_all(workspace.path().join("src"))?;
+        std::fs::write(
+            workspace.path().join("src/owner.rs"),
+            "/// Own application state.\npub struct Owner;\n",
+        )?;
+        Ok(CheckingExecution {
+            broker,
+            _workspace: workspace,
+            _data: data,
+        })
+    }
+
+    /// The attempt published before the first scan waits for its changes instead of claiming a
+    /// finished configuration error, and it belongs to the turn that requested Check rather than
+    /// to a later chat exchange.
+    #[tokio::test]
+    async fn initial_attempt_waits_for_changes_under_the_requesting_exchange() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let (state, _scan) = fixture.broker.begin_owned_task_checks()?;
+        let attempt = state.attempt();
+        assert_eq!(
+            attempt.owner.exchange_id(),
+            Some("implement-exchange"),
+            "the attempt joined the later chat exchange"
+        );
+        let lint = attempt
+            .commands
+            .iter()
+            .find(|command| {
+                command
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| context.definition_id == "lint")
+            })
+            .context("lint command missing")?;
+        assert_eq!(lint.state, CheckState::Pending, "{:?}", lint.error);
+        let activity = crate::checks::CheckActivity::from_run(attempt).context("attempt runs")?;
+        assert_eq!(activity.completed_count, 0);
+        Ok(())
+    }
+
+    /// Pausing during the initial scan keeps nothing that reads as a finished result, and
+    /// resuming runs Check again to completion instead of entering Resolve.
+    #[tokio::test]
+    async fn interrupted_check_resumes_into_a_completed_execution() -> Result<()> {
+        let mut fixture = checking_execution().await?;
+        let broker = &mut fixture.broker;
+        let (state, _scan) = broker.begin_owned_task_checks()?;
+        let (state, run) = state.into_interrupted();
+        let (sink, _updates) = crate::broker::publication::channel();
+        drop(broker.retain_interrupted_task_check(state, run, sink)?);
+        let retained = broker
+            .current_execution()?
+            .context("execution missing")?
+            .check_runs
+            .last()
+            .cloned()
+            .context("interrupted attempt was not retained")?;
+        assert_eq!(retained.state, CheckState::Interrupted);
+        assert!(
+            retained
+                .commands
+                .iter()
+                .all(|command| command.state != CheckState::ConfigurationError),
+            "an interrupt persisted provisional configuration errors"
+        );
+        let (mut state, scan) = broker.begin_owned_task_checks()?;
+        let scan = scan.run().await?;
+        let run = broker.prepare_owned_task_check_run(&mut state, scan)?;
+        // The only configured check matches no changed path, so this launches no process.
+        let result = run.run().await?;
+        let scan = broker.prepare_task_check_postscan(&state)?.run().await?;
+        let mut finalization = broker.prepare_task_check_finalization(state, result, scan)?;
+        let report = finalization.capture_report().await?;
+        let completed = finalization.run.clone();
+        drop(broker.commit_task_check_finalization(finalization, report)?);
+        assert!(
+            broker.task_controller.current()?.is_none(),
+            "the task did not complete"
+        );
+        assert_eq!(completed.owner.exchange_id(), Some("implement-exchange"));
+        Ok(())
     }
 }

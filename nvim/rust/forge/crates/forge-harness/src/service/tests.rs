@@ -1,12 +1,15 @@
 mod approval_deadline;
 mod bootstrap;
 mod fork;
+mod native_agents;
 mod owner_cancel;
 mod owner_dispatch;
 mod owner_fixture;
 mod owner_storage_failure;
 mod owner_transition;
+mod plan_review_workflow;
 mod reconnect_overlap;
+mod rollback;
 mod session_lifecycle;
 mod session_reopen;
 mod settings_defaults;
@@ -1131,6 +1134,454 @@ async fn queued_follow_up_hand_off_never_publishes_idle() -> Result<()> {
     assert!(
         phases[..idle].iter().any(|phase| phase == "handing_off"),
         "the hand-off between the turns was not marked as one: {phases:?}"
+    );
+    service.shutdown(Duration::from_secs(5)).await?;
+    drop(sink);
+    reader.await??;
+    Ok(())
+}
+
+/// Keep a goal working from a finished turn until the continuation it reserved starts.
+///
+/// The goal reserves its continuation in task state when the turn's evidence is applied, and the
+/// continuation becomes queued input only after the finished input is removed. The hand-off
+/// predicted only queued user messages, so the session published an idle phase in between and
+/// the editor closed the status split for a frame at every goal turn.
+#[tokio::test]
+async fn goal_continuation_hand_off_never_publishes_idle() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let provider = controller.provider_handle();
+    let control = provider.mock_response_control().unwrap();
+    let hold = || MockResponseCommand::Hold {
+        mode: None,
+        any_session: false,
+    };
+    let held_id = |held: &Value| held["id"].as_str().unwrap().to_owned();
+    let first = held_id(&control.dispatch(&session_id, hold()).await?);
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    // Each published phase with the clock it reads, from the observed session snapshot.
+    let published = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<i64>)>::new()));
+    let recorded = published.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            let event: Value = serde_json::from_slice(frame.bytes())?;
+            let status = &event["payload"]["snapshot"]["status"];
+            if event["event"] == "session_changed"
+                && let Some(kind) = status["kind"].as_str()
+            {
+                let phase = status["activity"]
+                    .as_str()
+                    .filter(|activity| *activity == "handing_off")
+                    .unwrap_or(kind);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((phase.to_owned(), status["started_at_ms"].as_i64()));
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "session.goal.set".into(),
+                params: json!({"operation_id":"goal-hand-off","objective":"Keep working"}),
+            },
+            &sink,
+        )
+        .await?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Wait { id: first.clone() })
+        .await?;
+    let second = held_id(&control.dispatch(&session_id, hold()).await?);
+    control
+        .dispatch(&session_id, MockResponseCommand::Release { id: first })
+        .await?;
+    control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Wait { id: second.clone() },
+        )
+        .await?;
+    // The continuation's own clock marks the end of the hand-off; the channel is ordered, so
+    // every hand-off publication was recorded before it.
+    let phases = loop {
+        let phases = published.lock().unwrap().clone();
+        let clocks: std::collections::BTreeSet<_> =
+            phases.iter().filter_map(|(_, clock)| *clock).collect();
+        if clocks.len() >= 2 {
+            break phases;
+        }
+        tokio::task::yield_now().await;
+    };
+    let first_clock = phases.iter().find_map(|(_, clock)| *clock);
+    let working = phases
+        .iter()
+        .position(|(_, clock)| clock.is_some())
+        .context("the goal published no working phase")?;
+    let continued = phases
+        .iter()
+        .position(|(_, clock)| clock.is_some() && *clock != first_clock)
+        .context("the continuation published no working phase")?;
+    let hand_off: Vec<_> = phases[working..continued]
+        .iter()
+        .map(|(phase, _)| phase.as_str())
+        .collect();
+    assert!(
+        hand_off.iter().all(|phase| *phase != "idle"),
+        "the goal published an idle phase between its turns: {hand_off:?}"
+    );
+    assert!(
+        hand_off.contains(&"handing_off"),
+        "the goal's hand-off between turns was not marked as one: {hand_off:?}"
+    );
+    control
+        .dispatch(&session_id, MockResponseCommand::Cancel { id: second })
+        .await?;
+    service.shutdown(Duration::from_secs(5)).await?;
+    drop(sink);
+    reader.await??;
+    Ok(())
+}
+
+/// A queued turn that fails before it starts leaves the status idle, not `Working · 0s`.
+///
+/// While the follow-up was claimed, the status predicted its turn as already working. The turn
+/// failed before dispatch and its input settled without any exchange event, so nothing projected
+/// the status again and the `Working · 0s` hand-off stayed until the next turn.
+#[tokio::test]
+async fn queued_turn_that_fails_before_starting_leaves_the_status_idle() -> Result<()> {
+    use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{TestInputAcceptance, TestPromptScript, TestPromptTerminal};
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let control = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    let first = control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let published = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = published.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(frame) = output.recv().await? {
+            let event: Value = serde_json::from_slice(frame.bytes())?;
+            if event["event"] == "document_changed"
+                && let Some(kind) = event["payload"]["status"]["kind"].as_str()
+            {
+                recorded.lock().unwrap().push(kind.to_owned());
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let submit = |id: &str, intent: InputIntent| InputOperation {
+        id: format!("operation-{id}"),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Submit {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
+                id: id.into(),
+                text: format!("input {id}"),
+                purpose: crate::input::InputPurpose::User,
+                intent,
+                attachments: vec![],
+                config: None,
+            })),
+        },
+    };
+    controller
+        .coordinator
+        .submissions
+        .apply(submit("active", InputIntent::Auto))?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Wait { id: first.clone() })
+        .await?;
+    // The mock assigns a script to the next prompt it starts, so the follow-up's failure is
+    // scripted only once the held first turn has started.
+    control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![],
+                    terminal: TestPromptTerminal::RejectedBeforeDispatch(
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    ),
+                },
+            },
+        )
+        .await?;
+    controller
+        .coordinator
+        .submissions
+        .apply(submit("follow-up", InputIntent::Queue))?;
+    control
+        .dispatch(&session_id, MockResponseCommand::Release { id: first })
+        .await?;
+    // The rejected follow-up settles as a failed entry once no turn holds the session.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let settled = controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .iter()
+                .any(|message| {
+                    message.id == "follow-up"
+                        && message.delivery() == crate::input::InputDelivery::Failed
+                });
+            let finished = SqliteStore::read_only(&controller.data_root)?
+                .list_exchange(&session_id)?
+                .iter()
+                .all(crate::exchange::Exchange::is_finished);
+            if settled && finished && controller.coordinator.execution.available_permits() == 1 {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the failed follow-up never settled")??;
+    // The owner publishes the refreshed status after it settles the input, so the published
+    // phases must leave `working` without any further turn.
+    let left_working = tokio::time::timeout(Duration::from_secs(4), async {
+        while published
+            .lock()
+            .unwrap()
+            .last()
+            .is_none_or(|phase| phase == "working")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let phases = published.lock().unwrap().clone();
+    assert!(
+        left_working.is_ok(),
+        "the status kept the failed turn's hand-off: {phases:?}"
+    );
+    service.shutdown(Duration::from_secs(5)).await?;
+    drop(sink);
+    reader.await??;
+    Ok(())
+}
+
+/// A question a running tool waits on stops the exchange clock, as an approval does.
+///
+/// The model's turn stays open while its question tool waits for the user's answer, and that wait
+/// counted as model work: the heading and status read `Working · 213s` under a popup that said
+/// work was paused, and the tool's own duration included the wait. A pending question with a
+/// waiting tool is a user-wait blocker that pauses the clock and reads as waiting for an answer.
+#[tokio::test]
+async fn waiting_question_pauses_the_exchange_clock_until_answered() -> Result<()> {
+    use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
+        TestPromptTerminal,
+    };
+    let fixture = tempfile::tempdir()?;
+    let service = service();
+    service
+        .open_session(1, initialize(&fixture, "mock"))
+        .await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let control = controller
+        .provider_handle()
+        .mock_response_control()
+        .unwrap();
+    control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        TestPromptStep::ToolCall {
+                            name: "question_ask".into(),
+                            arguments: json!({"wait":true,"questions":[
+                                {"header":"Scope","question":"Which scope?","options":[]}]}),
+                        },
+                        TestPromptStep::Message {
+                            content: TestMessageContent::Response,
+                            text: "Scoped".into(),
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    controller.coordinator.submissions.apply(InputOperation {
+        id: "operation-ask".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Submit {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
+                id: "ask".into(),
+                text: "Ask me the scope".into(),
+                purpose: crate::input::InputPurpose::User,
+                intent: InputIntent::Auto,
+                attachments: vec![],
+                config: None,
+            })),
+        },
+    })?;
+    let store = SqliteStore::read_only(&controller.data_root)?;
+    // Wait for the exchange to record the wait; the outer bound only guards a hung run.
+    let (question, waiting) = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let question = controller
+                .questions
+                .snapshot()?
+                .questions
+                .into_iter()
+                .find(crate::question::QuestionRecord::pending);
+            let exchange = store.list_exchange(&session_id)?.into_iter().next();
+            if let (Some(question), Some(exchange)) = (question, exchange)
+                && exchange.metrics.awaiting_user()
+            {
+                break Ok::<_, anyhow::Error>((question, exchange));
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the waiting question never paused its exchange")??;
+    assert!(
+        waiting.execution_started_at_ms().is_none(),
+        "the exchange clock kept running while its tool waited for an answer"
+    );
+    assert_eq!(
+        waiting.activity(),
+        crate::exchange::ExchangeActivity::AwaitingInput
+    );
+    // The status reads the same wait, so the status split shows its waiting row instead of
+    // falling to idle beside a heading that reads `Waiting for your answer`.
+    let status = controller.observer.snapshot()?.status;
+    assert!(
+        matches!(
+            &status,
+            crate::session::state_machine::SessionPhase::AwaitingInput {
+                exchange_id: Some(id),
+                ..
+            } if *id == waiting.id
+        ),
+        "a question that its tool waits on left the status at {status:?}"
+    );
+    controller
+        .exchange_owner
+        .question_events()
+        .change(crate::exchange::QuestionChange::user(
+            crate::question::QuestionCommand {
+                operation_id: "answer-scope".into(),
+                question_id: question.id,
+                revision: question.content.revision,
+                action: crate::question::QuestionAction::Answer {
+                    answer: crate::question::QuestionAnswer::Other {
+                        text: "Workspace".into(),
+                    },
+                },
+            },
+        )?)
+        .await?;
+    let settled = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(exchange) = store
+                .list_exchange(&session_id)?
+                .into_iter()
+                .find(crate::exchange::Exchange::is_finished)
+            {
+                break Ok::<_, anyhow::Error>(exchange);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("the answered question never let its turn finish")??;
+    assert_eq!(settled.state(), crate::exchange::ExchangeState::Complete);
+    // The answered question sits where the answer was given: after the call that asked it and
+    // before the response that followed, not as the exchange's last row.
+    let observed = controller
+        .observer
+        .snapshot()?
+        .exchange
+        .into_iter()
+        .find(|exchange| exchange.id == settled.id)
+        .context("the settled exchange is missing from the snapshot")?;
+    let position = |matches: &dyn Fn(&crate::exchange::ExchangeNode) -> bool| {
+        observed.node_list.iter().position(matches)
+    };
+    let asked = position(&|node| {
+        matches!(
+            node,
+            crate::exchange::ExchangeNode::TurnContent {
+                item: crate::turn::TurnItem::Tool { .. },
+                ..
+            }
+        )
+    })
+    .context("the question call has no row")?;
+    let answered = position(&|node| {
+        matches!(
+            node,
+            crate::exchange::ExchangeNode::QuestionPresented { .. }
+        )
+    })
+    .context("the answered question has no row")?;
+    let response = position(&|node| {
+        matches!(
+            node,
+            crate::exchange::ExchangeNode::TurnContent {
+                item: crate::turn::TurnItem::Message { .. },
+                ..
+            }
+        )
+    })
+    .context("the response has no row")?;
+    assert!(
+        asked < answered && answered < response,
+        "the answered question is out of order: call {asked}, question {answered}, response {response}"
     );
     service.shutdown(Duration::from_secs(5)).await?;
     drop(sink);

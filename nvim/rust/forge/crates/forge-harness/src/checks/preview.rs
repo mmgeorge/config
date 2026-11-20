@@ -65,7 +65,8 @@ pub(super) async fn resolve(
         include: included.to_vec(),
         ..Default::default()
     });
-    let applicability = super::applicability::resolve(&request, config, Some(files), true)?;
+    let inventory = super::ChangeInventory::Known(files.to_vec());
+    let applicability = super::applicability::resolve(&request, config, &inventory)?;
     let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
         ids: applicability
             .iter()
@@ -77,7 +78,7 @@ pub(super) async fn resolve(
     let selection = if request.ids.is_empty() {
         BTreeMap::new()
     } else {
-        request.selections(config, files, true)?
+        request.selections(config, &inventory)?
     };
     let mut result = Vec::new();
     let preparing = config

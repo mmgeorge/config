@@ -150,7 +150,7 @@ impl SessionIntake {
                             for retained in &retired {
                                 if retained.lock().await.decoder.owns_event(&event) {
                                     if original.is_some() {
-                                        return Err(ProviderError::Observation(ObservationFailure::OwnershipConflict));
+                                        return Err(ProviderError::Observation(ObservationFailure::ownership_conflict()));
                                     }
                                     original = Some(retained.clone());
                                 }

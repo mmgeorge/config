@@ -333,7 +333,7 @@ impl PermissionCoordinator {
             .map(|target| {
                 Ok(ResolvedPermissionTarget {
                     target_id: target.target_id.clone(),
-                    decision: choice_decision(&choice)?,
+                    decision: automatic_decision(&choice)?,
                     source: ApprovalDecisionSource::ApprovalMode,
                     rules: Vec::new(),
                     directory_grants: Vec::new(),
@@ -1540,30 +1540,12 @@ impl PermissionCoordinator {
             rule_list: Vec::new(),
             directory: None,
         };
-        // An automatic denial names the policy that made it, so the tool row explains the refusal
-        // the same way for every provider.
-        let reason = match resolution {
-            ApprovalResolution::DenyPolicy => {
-                Some("A saved permission rule or Harness access policy rejects this operation.")
-            }
-            ApprovalResolution::DenyMode => {
-                Some("The approval mode denies requests that need confirmation.")
-            }
-            _ => None,
-        };
         let targets = request
             .target_list
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                let mut decision = choice_decision(&choice)?;
-                if let (
-                    super::host_event::PermissionDecision::Deny { reason: denial, .. },
-                    Some(reason),
-                ) = (&mut decision, reason)
-                {
-                    *denial = SanitizedMessage::new(reason)?;
-                }
+                let decision = automatic_decision(&choice)?;
                 Ok(ResolvedPermissionTarget {
                     target_id: ApprovalTargetId::new(index.to_string())?,
                     decision,
@@ -2039,6 +2021,25 @@ fn approval_scope(
         (_, None) => ApprovalScope::Thread {
             thread_id: thread_id()?,
         },
+    })
+}
+
+/// Convert an automatic choice to its decision, naming the policy behind an automatic denial.
+///
+/// Every automatic denial, whether made when a request arrives or when a mode change decides a
+/// pending one, carries the same reason, so the tool row explains it the same way for every
+/// provider instead of showing a generic "Permission denied".
+fn automatic_decision(choice: &ApprovalChoice) -> Result<super::host_event::PermissionDecision> {
+    let reason = match choice.resolution {
+        ApprovalResolution::DenyPolicy => {
+            "A saved permission rule or Harness access policy rejects this operation."
+        }
+        ApprovalResolution::DenyMode => "The approval mode denies requests that need confirmation.",
+        _ => return choice_decision(choice),
+    };
+    Ok(super::host_event::PermissionDecision::Deny {
+        scope: PermissionRuleScope::Once,
+        reason: SanitizedMessage::new(reason)?,
     })
 }
 

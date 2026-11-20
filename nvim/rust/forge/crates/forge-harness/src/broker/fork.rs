@@ -1,5 +1,6 @@
 use super::{HarnessBroker, resolve_fork_name};
-use crate::exchange::{Exchange, HistoryDisposition};
+use crate::exchange::HistoryDisposition;
+use crate::exchange::rollback::NativeBoundary;
 use crate::provider::{
     PromptMode, ProviderCapability, ProviderForkRequest, ProviderForkResult, ProviderInput,
     ProviderRequest, ProviderTimingRecord,
@@ -50,33 +51,6 @@ pub struct ForkPreparation {
     pub provider_request: Option<ProviderForkRequest>,
     pub timing: Vec<ProviderTimingRecord>,
     pub total_duration_ms: f64,
-}
-
-/// Names the native history position that matches a set of inherited exchanges.
-enum NativeBoundary {
-    /// The newest inherited provider turn reported this checkpoint.
-    Checkpoint(String),
-    /// An inherited exchange ran provider turns and recorded no checkpoint after them.
-    Unrecorded,
-    /// No inherited exchange ran a provider turn.
-    Empty,
-}
-
-impl NativeBoundary {
-    /// Find the boundary after the newest inherited exchange that ran a provider turn.
-    ///
-    /// Conversation rollback selects its rewind position by the same rule.
-    fn after<'exchange>(inherited: impl DoubleEndedIterator<Item = &'exchange Exchange>) -> Self {
-        for exchange in inherited.rev() {
-            if let Some(checkpoint) = &exchange.provider_checkpoint_id {
-                return Self::Checkpoint(checkpoint.clone());
-            }
-            if !exchange.turn.is_empty() {
-                return Self::Unrecorded;
-            }
-        }
-        Self::Empty
-    }
 }
 
 /// Build one native fork attempt for a durable child.
@@ -233,7 +207,7 @@ pub fn prepare_provider_fork(
                             &**entry,
                             TimelineEntry::Exchange { exchange, .. }
                                 if exchange.disposition() == HistoryDisposition::Current
-                                    && (exchange.provider_checkpoint_id.is_some()
+                                    && (exchange.native_checkpoint().is_some()
                                         || !exchange.turn.is_empty())
                         )
                 )
@@ -258,7 +232,7 @@ pub fn prepare_provider_fork(
 
     let recorded_checkpoint_id = match &native_boundary {
         NativeBoundary::Checkpoint(checkpoint) => Some(checkpoint.clone()),
-        NativeBoundary::Unrecorded | NativeBoundary::Empty => None,
+        NativeBoundary::Unrecorded { .. } | NativeBoundary::Empty => None,
     };
     // A settled fork must name an immutable position, because the live conversation is moving.
     let copies_native_history = match (boundary, &native_boundary) {
@@ -274,7 +248,7 @@ pub fn prepare_provider_fork(
             );
             true
         }
-        (ForkBoundary::Settled, NativeBoundary::Unrecorded) => anyhow::bail!(
+        (ForkBoundary::Settled, NativeBoundary::Unrecorded { .. }) => anyhow::bail!(
             "cannot fork while the session is running: its last finished exchange recorded no provider checkpoint. Fork again when its turn finishes"
         ),
         // A fork that inherited provider turns holds them in its native conversation, and records

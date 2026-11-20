@@ -6,9 +6,9 @@ use serde::Serialize;
 pub struct CheckActivity {
     /// Durable run whose progress is currently visible.
     pub run_id: String,
-    /// Execution time accumulated by completed commands.
+    /// Run time already elapsed when the run was suspended; zero while it advances.
     pub duration_ms: u64,
-    /// Current execution interval, absent while an interrupted run is suspended.
+    /// Start of the run's execution interval, absent while an interrupted run is suspended.
     pub started_at_ms: Option<i64>,
     /// Selected checks whose commands all reached a terminal state, including skips and failures.
     pub completed_count: usize,
@@ -38,35 +38,26 @@ impl CheckActivity {
                 .and_modify(|finished| *finished &= completed)
                 .or_insert(completed);
         }
-        let duration_ms = run
-            .commands
-            .iter()
-            .filter(|command| {
-                matches!(
-                    command.state,
-                    CheckState::Passed | CheckState::Failed | CheckState::Blocked
-                )
-            })
-            .filter_map(|command| command.elapsed_ms(0))
-            .fold(0_u64, u64::saturating_add);
-        let started_at_ms = if let Some(command) = run
-            .commands
-            .iter()
-            .find(|command| command.state == CheckState::Running)
-        {
-            command.started_at_ms
-        } else if run
+        // The run is one execution interval from its start: discovery, scans, and the gaps
+        // between commands are check work, so the timer never restarts when a command starts.
+        // An interrupted command suspends the run at its last recorded boundary.
+        let (duration_ms, started_at_ms) = if run
             .commands
             .iter()
             .any(|command| command.state == CheckState::Interrupted)
         {
-            None
-        } else {
-            run.commands
+            let suspended_at_ms = run
+                .commands
                 .iter()
-                .filter_map(|command| command.completed_at_ms)
+                .filter_map(|command| command.completed_at_ms.or(command.started_at_ms))
                 .max()
-                .or(Some(run.started_at_ms))
+                .unwrap_or(run.started_at_ms);
+            (
+                suspended_at_ms.saturating_sub(run.started_at_ms).max(0) as u64,
+                None,
+            )
+        } else {
+            (0, Some(run.started_at_ms))
         };
         let command_list = run
             .commands
@@ -154,5 +145,43 @@ impl CheckCommandActivity {
                 .saturating_sub(started)
                 .max(0) as u64
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a running run that started at zero whose first command started at `started_at_ms`.
+    fn running_run(started_at_ms: Option<i64>) -> CheckRun {
+        let state = if started_at_ms.is_some() {
+            "running"
+        } else {
+            "pending"
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": "run", "owner": {"kind": "session", "session_id": "session"}, "revision": 0,
+            "shell": "system", "executable": null, "workspace": ".", "environment_digest": "fixture",
+            "started_at_ms": 0, "completed_at_ms": null, "state": "running",
+            "progress": crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity": null, "workspace_digest": {},
+            "commands": [
+                {"id":"typecheck", "command":"typecheck", "state":state, "selected":true,
+                 "started_at_ms":started_at_ms, "completed_at_ms":null, "exit_code":null,
+                 "error":null, "stdout":"unused", "stderr":"unused", "output":"unused",
+                 "output_bytes":0, "preview":""}
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// The run timer counts from the run's start, so the preparation before the first command
+    /// is not discarded when that command starts.
+    #[test]
+    fn the_run_timer_continues_when_the_first_command_starts() {
+        let before = CheckActivity::from_run(&running_run(None)).unwrap();
+        assert_eq!(before.elapsed_ms(1_400), 1_400);
+        let after = CheckActivity::from_run(&running_run(Some(1_200))).unwrap();
+        assert_eq!(after.elapsed_ms(1_400), 1_400);
     }
 }

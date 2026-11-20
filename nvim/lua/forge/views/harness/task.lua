@@ -35,13 +35,34 @@ function M.phase(task)
 end
 
 ---@param task ForgeHarnessActiveTask
+---@param turn_running? boolean a provider turn is still running for the session
 ---@return string
-function M.label(task)
+function M.label(task, turn_running)
   local workflow = task.kind == "execute" and "exec" or task.kind
-  local label = workflow .. " · " .. M.phase(task)
+  local phase = M.phase(task)
+  -- A planning turn may resubmit its plan before it ends, so a submission becomes the one to
+  -- review only once the turn that made it settles.
+  if task.kind == "plan" and phase == "review" and turn_running then phase = "draft" end
+  local label = workflow .. " · " .. phase
   local status = M.status(task)
   if status ~= "running" and status ~= "waiting" then label = label .. " · " .. status end
   return label
+end
+
+---Tell the user how to carry out a plan acceptance the host only recorded.
+---
+---An acceptance made while the task is paused keeps the pause. Once no review or acceptance
+---question remains to answer, the user resumes the task to execute the accepted plan.
+---@param state table
+---@param elicitation? table the question set still open after the acceptance or its last answer
+---@return boolean reported
+function M.report_recorded_acceptance(state, elicitation)
+  local task = M.current(state)
+  if elicitation == vim.NIL then elicitation = nil end
+  if not task or task.status ~= "paused" or (elicitation
+    and (elicitation.owner == "plan_review" or elicitation.owner == "plan_acceptance")) then return false end
+  notifications.info("Plan acceptance recorded. The task is paused; run /task resume to execute.", "ForgePlanReview")
+  return true
 end
 
 ---@param task ForgeHarnessActiveTask
@@ -55,7 +76,8 @@ end
 ---@param state table
 ---@param action table
 ---@param refresh fun()
----@param settled fun(failure: string?, background: boolean?)
+---@param settled fun(failure: string?, background: boolean?, detail: table?) `detail` carries the
+---  host's structured error, whose `code` tells a committed change from a rejected one.
 ---@param method? string
 function M.transition(state, action, refresh, settled, method)
   if state.host_error then settled(state.host_error) return end
@@ -74,7 +96,7 @@ function M.transition(state, action, refresh, settled, method)
         category = detail and detail.code or "command", severity = "error" })
       notifications.error(failure, "Harness task")
     end
-    settled(failure)
+    settled(failure, nil, detail)
     refresh()
   end)
 end

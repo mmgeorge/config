@@ -62,6 +62,32 @@ impl TaskCommand {
         }
     }
 
+    /// Reject a command whose captured task was removed or replaced before the command runs.
+    ///
+    /// Pause, clear, resume, and acceptance policy act on the task as it is when they run: a
+    /// stop or a turn that settled while they waited in the FIFO advances the task revision
+    /// without changing what the user asked for, so only the task identity must still match.
+    /// Every other command keeps its exact captured revision, because it was decided against
+    /// that task state.
+    pub(crate) fn validate_target(&self, current: Option<&Task>) -> Result<(), TaskCommandFailure> {
+        match self {
+            Self::Pause(target) | Self::Clear(target) => target.validate_identity(current),
+            Self::Resume(request) => request.target().validate_identity(current),
+            Self::SetAutoAccept(policy) => policy.target.validate_identity(current),
+            Self::StartGoal(_)
+            | Self::StartPlan(_)
+            | Self::AttachPlan(_)
+            | Self::ForkPlan(_)
+            | Self::Replan(_)
+            | Self::ExecutePlan(_)
+            | Self::EditPlan(_)
+            | Self::RequestPlanChanges(_)
+            | Self::CancelPlan(_) => self
+                .target()
+                .map_or(Ok(()), |target| target.validate(current)),
+        }
+    }
+
     /// Get a bounded intent name without logging task objectives or plan contents.
     pub(super) fn name(&self) -> &'static str {
         match self {
@@ -525,6 +551,18 @@ impl TaskSelection {
             None => Err(TaskCommandFailure::MissingTask),
         }
     }
+
+    /// Reject an absent or replaced task while accepting revisions the same task made since capture.
+    pub(crate) fn validate_identity(
+        &self,
+        current: Option<&Task>,
+    ) -> Result<(), TaskCommandFailure> {
+        match current {
+            Some(task) if task.id == self.id => Ok(()),
+            Some(_) => Err(TaskCommandFailure::Changed),
+            None => Err(TaskCommandFailure::MissingTask),
+        }
+    }
 }
 
 impl TryFrom<RawTaskSelection> for TaskSelection {
@@ -638,6 +676,11 @@ pub(crate) enum TaskCommandFailure {
     /// The selected saved plan or its owning session no longer exists.
     #[error("the selected saved plan is missing")]
     PlanMissing,
+    /// A change request with no comment and no review edit gives the planner nothing to revise.
+    #[error(
+        "the change request has no comment; add an overall or inline comment before requesting changes"
+    )]
+    EmptyRevisionRequest,
     /// Content or approval state changed after the saved plan was selected.
     #[error("the selected saved plan changed before the command could apply")]
     PlanChanged,
@@ -656,6 +699,10 @@ pub(crate) enum TaskCommandFailure {
     /// Task preparation failed before task installation or native dispatch.
     #[error("task preparation failed")]
     PreparationUnavailable,
+    /// Task preparation refused the command for a domain reason the user can act on, such as a
+    /// planning directory that changed after submission.
+    #[error("task preparation failed: {reason}")]
+    PreparationRefused { reason: String },
     /// A retained preparation worker did not settle within its observation deadline.
     #[error("task preparation exceeded its observation deadline")]
     PreparationTimedOut,
@@ -674,6 +721,12 @@ pub(crate) enum TaskCommandFailure {
     /// Task storage could not certify its read or mutation.
     #[error("task state could not be read or committed")]
     StateUnavailable,
+    /// The task rejected this command in its current state; task storage remains healthy.
+    #[error("the task command could not be applied to the current task")]
+    Rejected,
+    /// The task rejected this command for the stated domain reason; task storage remains healthy.
+    #[error("{reason}")]
+    RejectedBecause { reason: String },
 }
 
 /// Preserve only domain facts committed before synchronization or initial input handoff completes.
@@ -756,6 +809,28 @@ impl From<TaskCommandCheckpoint> for StoredTaskCheckpoint {
 }
 
 impl TaskCommandFailure {
+    /// Classify an error from a task commit.
+    ///
+    /// A typed failure keeps its identity and a storage failure leaves task state uncertified.
+    /// Any other cause is a domain rule that refused this command while storage stayed healthy,
+    /// so it rejects only this command instead of closing the session's command queue.
+    pub(crate) fn from_commit_error(error: anyhow::Error) -> Self {
+        match error.downcast::<Self>() {
+            Ok(failure) => failure,
+            Err(error) if crate::exchange::storage_failure(&error) => Self::StateUnavailable,
+            Err(error) => Self::RejectedBecause {
+                reason: format!("{error:#}"),
+            },
+        }
+    }
+
+    /// Refuse a preparation for the domain reason in `error`, so the editor can say why.
+    pub(crate) fn preparation(error: &anyhow::Error) -> Self {
+        Self::PreparationRefused {
+            reason: format!("{error:#}"),
+        }
+    }
+
     /// Get the stable task error code without parsing display text or native messages.
     pub(crate) fn code(&self) -> &'static str {
         match self {
@@ -763,18 +838,22 @@ impl TaskCommandFailure {
             Self::PlanAttachmentUnavailable => "plan_attachment_unavailable",
             Self::InvalidPlanSelection => "plan_selection_invalid",
             Self::PlanMissing => "plan_missing",
+            Self::EmptyRevisionRequest => "plan_revision_empty",
             Self::PlanChanged => "plan_changed",
             Self::PlanForeignSession => "plan_foreign_session",
             Self::PlanForeignWorkspace => "plan_foreign_workspace",
             Self::PlanRevisionUnavailable => "plan_revision_unavailable",
             Self::InvalidObjective => "task_objective_required",
-            Self::PreparationUnavailable => "task_preparation_unavailable",
+            Self::PreparationUnavailable | Self::PreparationRefused { .. } => {
+                "task_preparation_unavailable"
+            }
             Self::PreparationTimedOut => "task_preparation_timeout",
             Self::MissingTask => "task_missing",
             Self::Changed => "task_changed",
             Self::InvalidPolicyTask => "task_policy_unavailable",
             Self::IdentityConflict => "command_identity_conflict",
             Self::StateUnavailable => "task_state_unavailable",
+            Self::Rejected | Self::RejectedBecause { .. } => "task_command_rejected",
         }
     }
 }
@@ -798,19 +877,6 @@ pub(crate) enum TaskSynchronizationFailure {
     /// The committed postcondition could not be read for final validation.
     #[error("committed task state is unavailable for synchronization validation")]
     StateUnavailable,
-}
-
-impl TaskSynchronizationFailure {
-    /// Get the stage-specific failure code without losing the committed task outcome.
-    pub(crate) fn code(&self) -> &'static str {
-        match self {
-            Self::InputPreparationUnavailable => "task_input_preparation_unavailable",
-            Self::DispatchLost => "provider_dispatch_unconfirmed",
-            Self::Interrupted => "command_interrupted",
-            Self::TargetChanged => "task_changed",
-            Self::StateUnavailable => "task_state_unavailable",
-        }
-    }
 }
 
 #[derive(Deserialize, Serialize)]

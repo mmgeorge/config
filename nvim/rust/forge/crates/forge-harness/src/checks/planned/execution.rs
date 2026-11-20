@@ -98,14 +98,16 @@ impl PlannedTestExecution {
         &mut self,
         snapshot: String,
         inventories: &[PlannedInventory],
+        config: &crate::checks::CheckConfig,
     ) {
-        let entries = super::resolution::resolve(&self.requested, DiscoverMode::Exact, inventories)
-            .into_iter()
-            .map(|resolution| ResolvedTest {
-                resolution,
-                result: None,
-            })
-            .collect();
+        let entries =
+            super::resolution::resolve(&self.requested, DiscoverMode::Exact, inventories, config)
+                .into_iter()
+                .map(|resolution| ResolvedTest {
+                    resolution,
+                    result: None,
+                })
+                .collect();
         self.state = ResolutionState::Resolved {
             snapshot,
             entries,
@@ -143,10 +145,31 @@ impl PlannedTestExecution {
             .collect()
     }
 
-    /// Get whether every entry has an exact presence or absence outcome before execution.
-    pub(in crate::checks) fn resolved(&self) -> bool {
-        matches!(&self.state, ResolutionState::Resolved { entries, .. }
-            if entries.iter().all(|entry| !matches!(entry.resolution.outcome, Outcome::Problem(_))))
+    /// Name why no check of this run may start, or nothing when execution may proceed.
+    ///
+    /// Only an attempt without one complete resolution of its captured source blocks execution.
+    /// A resolved attempt whose entries include missing or ambiguous tests still runs every
+    /// check, selecting the planned tests that resolved, so the gate fails on the unresolved
+    /// entries alone and the checks that do not depend on them report their own outcomes.
+    pub(in crate::checks) fn execution_blocker(&self) -> Option<String> {
+        match &self.state {
+            ResolutionState::Pending => Some("planned test resolution has not completed".into()),
+            ResolutionState::Invalidated { reason, .. } => Some(reason.clone()),
+            ResolutionState::Resolved { .. } => None,
+        }
+    }
+
+    /// Explain why planned tests could not be bound to discovered cases, omitting case outcomes.
+    pub(crate) fn resolution_findings(&self) -> Vec<String> {
+        match &self.state {
+            ResolutionState::Pending => vec!["Planned test resolution has not completed".into()],
+            ResolutionState::Invalidated { reason, .. } => vec![reason.clone()],
+            ResolutionState::Resolved { entries, .. } => entries
+                .iter()
+                .filter(|entry| matches!(entry.resolution.outcome, Outcome::Problem(_)))
+                .filter_map(|entry| entry.resolution.warning())
+                .collect(),
+        }
     }
 
     /// Invalidate the complete resolution when its source or configuration changes.
@@ -470,6 +493,7 @@ impl TryFrom<RawExecution> for PlannedTestExecution {
             &result.requested,
             DiscoverMode::Exact,
             result.inventories(),
+            inputs.config(),
         );
         ensure!(
             result
@@ -514,8 +538,11 @@ impl TryFrom<RawExecution> for PlannedTestExecution {
                         "planned case identity is empty"
                     );
                     ensure!(
-                        case.target.is_none(),
-                        "target selector cannot have a resolved adapter case"
+                        case.target.as_deref().is_none_or(|target| inputs
+                            .config()
+                            .test_target(target)
+                            .is_ok_and(|definition| definition.id == candidate.check)),
+                        "a targeted case resolved outside its target check"
                     );
                     ensure!(
                         selected.insert((&candidate.check, &candidate.id)),
@@ -593,13 +620,31 @@ fn source_location(path: &str, line: Option<u32>) -> String {
 }
 
 #[cfg(test)]
+impl PlannedTestExecution {
+    /// Resolve the fixture's four authored `tests.rs` cases against an exact inventory of
+    /// `tests` that discovered only the named cases, as a completed discovery would.
+    pub(crate) fn resolved_fixture(discovered: &[&str]) -> Self {
+        let mut execution = tests::execution(tests::requested(), Default::default()).unwrap();
+        execution.resolve(
+            "snapshot".into(),
+            &[tests::inventory_of(discovered)],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
+        execution
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::checks::adapter::{Discovery, TestItem};
     use serde_json::json;
 
     /// Bind fixture execution to a complete configuration and an empty, owned verification ledger.
-    fn execution(
+    pub(super) fn execution(
         requested: Vec<DesignTestFile>,
         scopes: BTreeMap<String, crate::plan::PlanTestScope>,
     ) -> Result<PlannedTestExecution> {
@@ -649,7 +694,7 @@ mod tests {
     }
 
     /// Build a validated authored inventory containing each coverage obligation.
-    fn requested() -> Vec<DesignTestFile> {
+    pub(super) fn requested() -> Vec<DesignTestFile> {
         serde_json::from_value(json!([{"file":"tests.rs","cases":[
             {"name":"new_case","change":"new","description":"new coverage"},
             {"name":"modified_case","change":"modified","description":"changed coverage"},
@@ -661,11 +706,17 @@ mod tests {
 
     /// Supply exact discovered cases with opaque identity and known source ownership.
     fn inventory() -> PlannedInventory {
+        inventory_of(&["new_case", "modified_case", "reused_case"])
+    }
+
+    /// Supply an exact inventory of `tests.rs` that discovered only the named cases.
+    pub(super) fn inventory_of(discovered: &[&str]) -> PlannedInventory {
         PlannedInventory::new(
             "tests".into(),
             Ok(Discovery::new(
-                ["new_case", "modified_case", "reused_case"]
-                    .into_iter()
+                discovered
+                    .iter()
+                    .copied()
                     .map(|name| TestItem {
                         id: name.to_string().try_into().unwrap(),
                         parent: None,
@@ -738,7 +789,6 @@ mod tests {
             revision: 0,
             context: Some(context),
             lifecycle: Vec::new(),
-            completed_plan: None,
             shell: Default::default(),
             executable: None,
             workspace: std::env::temp_dir()
@@ -767,7 +817,14 @@ mod tests {
     #[test]
     fn restored_run_rejects_detached_planned_results() {
         let mut execution = execution(requested(), Default::default()).unwrap();
-        execution.resolve("snapshot".into(), &[inventory()]);
+        execution.resolve(
+            "snapshot".into(),
+            &[inventory()],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         let first = command(Some(CaseStatus::Failed));
         let mut last = command(Some(CaseStatus::Passed));
         last.id = "run:1".into();
@@ -859,7 +916,14 @@ mod tests {
     #[test]
     fn restored_run_requires_complete_consistent_resolution_inputs() {
         let mut planned = execution(requested(), Default::default()).unwrap();
-        planned.resolve("snapshot".into(), &[inventory()]);
+        planned.resolve(
+            "snapshot".into(),
+            &[inventory()],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         let commands = vec![command(Some(CaseStatus::Passed))];
         planned.record_results(&commands);
         let source = run_record(planned, commands);
@@ -919,8 +983,16 @@ mod tests {
     fn planned_gate_requires_each_present_case_and_preserves_absence() {
         let mut execution = execution(requested(), Default::default()).unwrap();
         assert!(!execution.satisfied());
-        execution.resolve("snapshot".into(), &[inventory()]);
-        assert!(execution.resolved());
+        execution.resolve(
+            "snapshot".into(),
+            &[inventory()],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
+        assert!(execution.execution_blocker().is_none());
+        assert!(execution.resolution_findings().is_empty());
         assert_eq!(execution.selections()["tests"].ids.len(), 3);
         for status in [
             None,
@@ -942,6 +1014,36 @@ mod tests {
         execution.invalidate("source changed".into());
         assert!(!execution.satisfied());
         assert_eq!(execution.findings(), vec!["source changed"]);
+    }
+
+    /// A missing planned test fails the gate without stopping execution or selecting nothing:
+    /// the present tests stay selected, and only the missing one is a resolution finding.
+    #[test]
+    fn a_missing_planned_test_keeps_execution_and_present_selections() {
+        let mut execution = PlannedTestExecution::resolved_fixture(&["new_case", "reused_case"]);
+        assert_eq!(execution.execution_blocker(), None);
+        let findings = execution.resolution_findings();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].contains("planned test modified_case"),
+            "{findings:?}"
+        );
+        assert_eq!(
+            execution.selections()["tests"]
+                .ids
+                .iter()
+                .map(TestItemId::as_str)
+                .collect::<Vec<_>>(),
+            ["new_case", "reused_case"]
+        );
+        assert!(!execution.satisfied());
+        execution.invalidate("source changed".into());
+        assert_eq!(
+            execution.execution_blocker().as_deref(),
+            Some("source changed")
+        );
+        let pending = super::tests::execution(requested(), Default::default()).unwrap();
+        assert!(pending.execution_blocker().is_some());
     }
 
     /// Preserve supplementary provenance and verify absence only from the retained exact inventory.
@@ -984,7 +1086,14 @@ mod tests {
         )
         .unwrap()));
         let mut execution = execution(requested(), Default::default()).unwrap();
-        execution.resolve("snapshot".into(), &[discovered]);
+        execution.resolve(
+            "snapshot".into(),
+            &[discovered],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         execution.record_results(&[command(Some(CaseStatus::Passed))]);
         let restored: PlannedTestExecution =
             serde_json::from_slice(&serde_json::to_vec(&execution).unwrap()).unwrap();
@@ -1011,7 +1120,14 @@ mod tests {
     #[test]
     fn empty_and_removal_only_inventories_have_distinct_gates() {
         let mut empty = execution(Vec::new(), Default::default()).unwrap();
-        empty.resolve("snapshot".into(), &[]);
+        empty.resolve(
+            "snapshot".into(),
+            &[],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         assert!(empty.satisfied());
         assert!(empty.selections().is_empty());
         let mut requested = requested();
@@ -1019,9 +1135,23 @@ mod tests {
             .cases
             .retain(|case| case.change == DesignTestChange::Removed);
         let mut removed = execution(requested, Default::default()).unwrap();
-        removed.resolve("snapshot".into(), &[]);
+        removed.resolve(
+            "snapshot".into(),
+            &[],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         assert!(!removed.satisfied());
-        removed.resolve("snapshot".into(), &[inventory()]);
+        removed.resolve(
+            "snapshot".into(),
+            &[inventory()],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         assert!(removed.satisfied());
         assert!(removed.selections().is_empty());
     }
@@ -1035,7 +1165,14 @@ mod tests {
             serde_json::from_value(serde_json::to_value(pending).unwrap()).unwrap();
         assert!(!pending.satisfied());
         let mut execution = execution(requested(), Default::default()).unwrap();
-        execution.resolve("snapshot".into(), &[inventory()]);
+        execution.resolve(
+            "snapshot".into(),
+            &[inventory()],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         let source = serde_json::to_value(execution).unwrap();
         let mut missing_scopes = source.clone();
         missing_scopes
@@ -1097,7 +1234,14 @@ mod tests {
             execution.scope("other"),
             crate::plan::PlanTestScope::Planned
         );
-        execution.resolve("snapshot".into(), &[inventory()]);
+        execution.resolve(
+            "snapshot".into(),
+            &[inventory()],
+            &crate::checks::CheckConfig {
+                version: 2,
+                definitions: Vec::new(),
+            },
+        );
         execution.record_results(&[command(Some(CaseStatus::Skipped))]);
         assert!(!execution.satisfied());
         execution.record_results(&[command(Some(CaseStatus::Passed))]);

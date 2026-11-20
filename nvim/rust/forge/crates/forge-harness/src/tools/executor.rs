@@ -82,6 +82,9 @@ impl ControlToolExecutor {
             admission.active += 1;
             Execution { owner: self }
         };
+        if let Some(authority) = &self.authority {
+            authority.adopt_execution_review()?;
+        }
         let permit = self
             .authority
             .as_ref()

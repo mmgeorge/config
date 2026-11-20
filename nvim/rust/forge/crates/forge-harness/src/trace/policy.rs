@@ -104,6 +104,14 @@ pub(super) fn diagnostic_field(key: &str) -> bool {
             | "consumed_sequence"
             | "response_id"
             | "native_sequence"
+            | "site"
+            | "stage"
+            | "admitted_owner"
+            | "observation_binding_id"
+            | "resolved_scope"
+            | "last_observed"
+            | "already_failed"
+            | "placement_failure"
             | "binding_id"
             | "kind"
             | "event"
@@ -159,6 +167,12 @@ pub(super) fn diagnostic_field(key: &str) -> bool {
             | "obsolete_count"
             | "contention_count"
             | "storage_cause"
+            | "subtype"
+            | "terminal_reason"
+            | "unfinished"
+            | "output_known"
+            | "branch"
+            | "message_finals"
     )
 }
 

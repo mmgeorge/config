@@ -849,6 +849,20 @@ impl SqliteStore {
         )
     }
 
+    /// List the sessions a user resumes or switches to, newest created first.
+    ///
+    /// Background conversations and the forked sessions that answer plan review questions
+    /// are internal, so they never appear beside the conversations they serve.
+    pub fn list_user_session(&self, workspace: Option<&str>) -> Result<Vec<HarnessSession>> {
+        let mut sessions = self.list_session(workspace)?;
+        sessions.retain(|session| {
+            session.background.is_none()
+                && session.purpose == crate::session::SessionPurpose::Conversation
+        });
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at_ms));
+        Ok(sessions)
+    }
+
     /// Load plan lifecycle events in their insertion order.
     pub fn list_plan_lifecycle(&self, session_id: &str) -> Result<Vec<PlanLifecycleRecord>> {
         self.list_payload(
@@ -1451,6 +1465,33 @@ pub(crate) mod test {
                 .connection
                 .query_row("SELECT COUNT(*) FROM session_record", [], |row| row.get(0))?;
         assert_eq!(retained, 3);
+        Ok(())
+    }
+
+    /// User session lists hide answer forks and order conversations by creation, not by activity.
+    #[test]
+    fn user_session_list_hides_answer_sessions_and_orders_by_creation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(directory.path())?;
+        let mut older = session("older", "D:/work");
+        older.created_at_ms = 10;
+        older.updated_at_ms = 90;
+        let mut newer = session("newer", "D:/work");
+        newer.created_at_ms = 20;
+        newer.updated_at_ms = 30;
+        let mut answer = session("answer", "D:/work");
+        answer.purpose = crate::session::SessionPurpose::PlanReviewAnswer;
+        answer.created_at_ms = 40;
+        answer.updated_at_ms = 50;
+        for session in [&older, &newer, &answer] {
+            store.save_session(session)?;
+        }
+        let listed = store
+            .list_user_session(Some("D:/work"))?
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        assert_eq!(listed, ["newer", "older"]);
         Ok(())
     }
 

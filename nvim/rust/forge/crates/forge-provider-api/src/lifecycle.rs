@@ -183,6 +183,41 @@ pub enum ObservationFailure {
     UnexpectedExecution,
 }
 
+impl ObservationFailure {
+    /// Construct an ownership conflict and record the source location that raised it.
+    ///
+    /// Many independent ownership checks report this one variant, so the variant alone cannot
+    /// say which check refused an event. The `provider.ownership_conflict.raised` record names
+    /// the rejecting site; the receiving owner records the event's identity beside it.
+    #[track_caller]
+    pub fn ownership_conflict() -> Self {
+        let site = std::panic::Location::caller();
+        RAISED_CONFLICT_SITE.set(Some(site));
+        tracing::warn!(
+            target: "forge::provider",
+            event_name = "provider.ownership_conflict.raised",
+            site = %site,
+            "provider ownership conflict raised"
+        );
+        Self::OwnershipConflict
+    }
+}
+
+thread_local! {
+    /// The most recent conflict site on this thread, read once by the owner that rejects the event.
+    static RAISED_CONFLICT_SITE: std::cell::Cell<Option<&'static std::panic::Location<'static>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Take the source location of the conflict most recently raised on this thread.
+///
+/// Ownership checks run synchronously in the receiving owner's update, so the owner that turns
+/// the failure into an observation record finds the rejecting site here and names it beside the
+/// event's identity. A conflict raised on another thread or already taken reads as `None`.
+pub fn take_ownership_conflict_site() -> Option<String> {
+    RAISED_CONFLICT_SITE.take().map(ToString::to_string)
+}
+
 impl fmt::Display for ObservationFailure {
     /// Describe the loss without treating it as native terminal evidence.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

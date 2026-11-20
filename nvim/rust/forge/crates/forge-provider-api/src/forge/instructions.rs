@@ -35,11 +35,14 @@ const PLAN_WITHDRAWN: &str = "Continue the existing Harness Plan task. The pendi
 
 const WORKFLOW_ANSWERS: &str = "Harness resolved the pending questions and recorded their response sources. Continue the original request using these responses.";
 
-const REVISION: &str = "Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment by editing the existing planning directory with your file-editing tool. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the plan ID and no expected version.";
+const REVISION: &str = "Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment by editing the existing planning directory with your file-editing tool. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the plan ID and no expected version, even when no comment required an edit: resubmitting the unchanged plan is the correct way to finish the revision, and ending the turn without plan_submit leaves the review unanswered.";
 
 const ACCEPTED: &str = "The user accepted the plan. Start the Execute task for it, and check the current workspace before implementing.";
 
 const PLAN_EDITS: &str = "The plan already includes the user's edits listed below. Keep them, and mention them when you acknowledge the decision.";
+
+/// Accompanies a plan discussion that carries review comments and edits pending on the plan.
+pub(crate) const PENDING_REVIEW: &str = "The plan_review element with decision=\"pending\" lists the review comments the user saved and the edits the user already applied to the plan. They are not a decision. Take them into account in your answer. When you revise the plan, keep those edits and address those comments in the same revision.";
 
 const CHECK_REPAIR: &str = "Automatic checks are blocking task completion. Fix the failures below and finish the repair turn, and Harness runs the checks again. You do not need to call check_run, though you may for earlier feedback. Do not run validation commands through terminal tools, and keep to the original task's scope. If the turn ends with the same failing inputs, automatic repair stops.";
 
@@ -56,6 +59,10 @@ const PERMISSION_TIMEOUT: &str =
 
 const HISTORY_REPAIRED: &str = "Recovery notice: an interrupted native tool-call suffix was removed from provider history. Its actions may already have completed or partially changed the workspace. Inspect the workspace before repeating writes; do not replay the interrupted request automatically.";
 
+const GOAL_COMPLETION_REFUSED: &str = "Harness refused the goal_complete request from the previous turn, so the goal is still active. Resolve the reason below before calling goal_complete again:";
+
+const PLAN_ABANDONED: &str = "The user cancelled the earlier plan \"{title}\" in this conversation. This is a new, unrelated plan: do not continue the cancelled plan or reuse its names, decisions, or review comments unless the user's request asks for them.";
+
 const EXECUTE_CONTINUE: &str = "Continue the same Execute task at its saved phase. Reuse confirmed work, and check whether existing evidence still applies.";
 
 const EXECUTE_RESUME: &str = "Resume the same Execute task after an interruption, keeping its plan, accepted revision, and phase. Check current files, completed tool results, and any background commands before retrying unfinished work. An interruption does not undo changes or stop a running command.";
@@ -70,7 +77,7 @@ const GOAL_RESUME: &str = "Resume working toward the goal in the task section.";
 
 const PLAN_RESUME: &str = "Resume the Harness Plan task for the request in the task section, keeping existing draft work in the planning directory.";
 
-const PLAN_CONTINUE: &str = "Continue the active planning task in its existing directory. The previous turn ended without submitting the plan or asking a question. Use ordinary file tools for docs/ and files/, then call plan_submit with the plan ID and no expected version. Prose alone does not submit a plan. Use question_ask only for a new open decision, and only when the user's question preferences allow it. Do not repeat answered questions. If a tool keeps failing, report the failure instead of repeating the same rejected request.";
+const PLAN_CONTINUE: &str = "Continue the active planning task in its existing directory. The previous turn ended without submitting the plan or asking a question. Use ordinary file tools for docs/ and files/, then call plan_submit with the plan ID and no expected version. Prose alone does not submit a plan. When the draft already answers every review comment, call plan_submit anyway; resubmitting an unchanged plan is a correct completion. Use question_ask only for a new open decision, and only when the user's question preferences allow it. Do not repeat answered questions. If a tool keeps failing, report the failure instead of repeating the same rejected request.";
 
 const CHECKS_SAVED: &str = "Project checks have been saved and validated at revision {revision}. Check setup is complete. Now begin the planning request in the task section.";
 
@@ -188,5 +195,12 @@ pub(crate) fn for_notice(notice: &Notice) -> String {
             .expect("every task step has instructions"),
         Notice::PermissionTimeout { feedback } => format!("{PERMISSION_TIMEOUT}\n{feedback}"),
         Notice::HistoryRepaired => HISTORY_REPAIRED.into(),
+        Notice::PlanAbandoned { title } => PLAN_ABANDONED.replace("{title}", title),
+        Notice::GoalCompletionRefused { reason } => {
+            format!(
+                "{GOAL_COMPLETION_REFUSED}
+{reason}"
+            )
+        }
     }
 }

@@ -17,6 +17,28 @@ impl HarnessBroker {
         self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))
     }
 
+    /// End observation of the native children a failed exchange delegated to.
+    ///
+    /// A failed turn reports nothing more for its children, so a child still active would keep
+    /// its live clock forever. Freezing it keeps its last native state and evidence.
+    pub(crate) fn retire_observed_children_of(&mut self, exchange_id: &str) -> Result<()> {
+        let records = self.store.list_observed_agents(&self.session.id)?;
+        for record in records.iter().filter(|record| {
+            record.parent_scope().exchange_id.as_str() == exchange_id
+                && record.availability() == crate::agent::ObservedAgentAvailability::Available
+                && !matches!(
+                    record.state(),
+                    crate::agent::ObservedAgentState::Finished(_)
+                )
+        }) {
+            self.store.mark_observed_agent_unavailable(
+                record.key().binding_id(),
+                record.key().agent_id(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Retain the actual native provider generation before managed-parent resources can disappear.
     fn observed_agent_proof(
         &mut self,
@@ -42,7 +64,24 @@ impl HarnessBroker {
     }
 
     /// Persist a trusted native lifecycle without creating managed task authority.
+    ///
+    /// A lifecycle the host cannot place ends observation of that one child; only a storage
+    /// failure fails the observation, because a native child is not the delegating turn.
     pub(super) fn apply_agent_lifecycle(
+        &mut self,
+        source: &NativeEventSource,
+        scope: &EventScope,
+        agent_id: &AgentId,
+        event: &AgentEvent,
+    ) -> Result<AppliedProviderEvent> {
+        match self.place_agent_lifecycle(source, scope, agent_id, event) {
+            Ok(applied) => Ok(applied),
+            Err(error) => self.reject_observed_child(Some(source), Some(agent_id), error),
+        }
+    }
+
+    /// Persist one native lifecycle under its retained registry proof.
+    fn place_agent_lifecycle(
         &mut self,
         source: &NativeEventSource,
         scope: &EventScope,
@@ -155,10 +194,95 @@ impl HarnessBroker {
     }
 
     /// Persist a native child's own item, turn, thread, or host-policy state under retained proof.
+    ///
+    /// Evidence the host cannot place ends observation of its child only. A storage failure
+    /// still fails the observation, because no later evidence could be committed either.
     pub(super) fn apply_observed_child(
         &mut self,
         observation: &HarnessEvent,
     ) -> Result<AppliedProviderEvent> {
+        match self.place_observed_child(observation) {
+            Ok(applied) => {
+                if let HarnessEvent::Native { source, .. } = observation {
+                    self.trace.record(
+                        &self.session.id,
+                        "agent.native_placed",
+                        serde_json::json!({
+                            "native_sequence": source.sequence.get(),
+                            "kind": observation_kind(observation),
+                        }),
+                    );
+                }
+                Ok(applied)
+            }
+            Err(error) => {
+                let (source, agent_id) = match observation {
+                    HarnessEvent::Native { source, event, .. } => (
+                        Some(source),
+                        match event.as_ref() {
+                            ProviderEvent::Agent { agent_id, .. } => Some(agent_id),
+                            _ => None,
+                        },
+                    ),
+                    HarnessEvent::Host { .. } => (None, None),
+                };
+                let scope_agent = observation.scope().owner();
+                let agent_id =
+                    agent_id.or_else(|| (!scope_agent.is_root()).then(|| scope_agent.agent_id()));
+                let error = error.context(format!("refused {}", observation_kind(observation)));
+                self.reject_observed_child(source, agent_id, error)
+            }
+        }
+    }
+
+    /// End observation of the one child whose evidence could not be placed, leaving the
+    /// delegating turn and the child's siblings running.
+    fn reject_observed_child(
+        &mut self,
+        source: Option<&NativeEventSource>,
+        agent_id: Option<&AgentId>,
+        error: anyhow::Error,
+    ) -> Result<AppliedProviderEvent> {
+        if crate::exchange::storage_failure(&error) {
+            return Err(error);
+        }
+        let marked = match agent_id {
+            Some(agent_id) => {
+                let records = self.store.list_observed_agents(&self.session.id)?;
+                let binding = records
+                    .iter()
+                    .find(|record| {
+                        record.key().agent_id() == agent_id
+                            && source.is_none_or(|source| {
+                                record.key().binding_id() == &source.binding_id
+                            })
+                    })
+                    .map(|record| record.key().binding_id().clone());
+                match binding {
+                    Some(binding) => self
+                        .store
+                        .mark_observed_agent_unavailable(&binding, agent_id)?
+                        .is_some(),
+                    None => false,
+                }
+            }
+            None => false,
+        };
+        self.trace.record(
+            &self.session.id,
+            "agent.native_rejected",
+            serde_json::json!({
+                "agent_id":agent_id,
+                "error_code":"observed_child_unplaced",
+                "placement_failure":format!("{error:#}"),
+                "outcome":if marked { "marked_unavailable" } else { "dropped" },
+            }),
+        );
+        Ok(AppliedProviderEvent::Timeline(self.reconcile_timeline()?))
+    }
+
+    /// Persist one native child observation under its retained registry proof.
+    fn place_observed_child(&mut self, observation: &HarnessEvent) -> Result<AppliedProviderEvent> {
         let scope = observation.scope();
         if let HarnessEvent::Native {
             source,
@@ -281,4 +405,22 @@ impl HarnessBroker {
         effects.push(AppliedProviderEvent::Timeline(self.reconcile_timeline()?));
         Ok(AppliedProviderEvent::Effects(effects))
     }
+}
+
+/// Name an observation by its nested event kinds alone, never its content.
+fn observation_kind(observation: &HarnessEvent) -> String {
+    let encoded = match observation {
+        HarnessEvent::Native { event, .. } => serde_json::to_value(event.as_ref()),
+        HarnessEvent::Host { event, .. } => serde_json::to_value(event),
+    }
+    .unwrap_or_default();
+    let mut kinds = Vec::new();
+    let mut level = Some(&encoded);
+    while let Some(current) = level {
+        if let Some(kind) = current.get("kind").and_then(serde_json::Value::as_str) {
+            kinds.push(kind.to_owned());
+        }
+        level = current.get("event").filter(|inner| inner.is_object());
+    }
+    kinds.join(".")
 }

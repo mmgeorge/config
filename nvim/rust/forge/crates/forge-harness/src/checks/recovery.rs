@@ -46,7 +46,6 @@ pub(crate) fn recover_runs(
         // Retire execution authority while preserving individual case observations.
         if run.state == CheckState::Running {
             result.interrupt();
-            result.completed_plan = None;
             for command in &mut result.commands {
                 if command.state == CheckState::Running {
                     command.state = CheckState::Interrupted;

@@ -88,6 +88,9 @@ pub(super) struct ExecutionControlProposal {
     execution_digest: String,
     plan_digest: String,
     execution: PlanExecutionRecord,
+    /// The scan-owned progress `execution` carried when it was loaded, which tells a commit
+    /// whether the control replaced it or a later scan's progress should stand.
+    loaded_progress: crate::plan::execution::SemanticProgress,
     plan: crate::plan::PlanRecord,
     nodes: Vec<ExchangeNode>,
     revised_manual: Vec<String>,
@@ -417,6 +420,20 @@ impl ExecutionScanJob {
     }
 }
 
+/// Fingerprint the execution state a control decided on, leaving out scan-owned progress.
+///
+/// The foreground rescans progress every few seconds while a turn runs. A control proposed
+/// before such a scan still describes the same execution, so the scan must not invalidate it:
+/// with progress in the fingerprint, a phase request that waited for its turn to end was refused
+/// as changed and failed the turn.
+fn control_fence_digest(execution: &PlanExecutionRecord) -> Result<String> {
+    let mut fenced = serde_json::to_value(execution)?;
+    if let Some(record) = fenced.as_object_mut() {
+        record.remove("progress");
+    }
+    Ok(crate::plan::digest(&serde_json::to_vec(&fenced)?))
+}
+
 impl HarnessBroker {
     /// Capture the resources and timestamp needed by an unlocked workspace scan.
     pub(super) fn prepare_workspace_capture(&self) -> WorkspaceCaptureJob {
@@ -690,7 +707,7 @@ impl HarnessBroker {
                 .then(|| self.prepare_workspace_capture()),
             operation: Box::new(operation),
             exchange: ExecutionControlExchange::capture(interaction),
-            execution_digest: crate::plan::digest(&serde_json::to_vec(&execution)?),
+            execution_digest: control_fence_digest(&execution)?,
             plan_digest: crate::plan::digest(&serde_json::to_vec(&plan)?),
             evidence,
         })
@@ -788,7 +805,7 @@ impl HarnessBroker {
             .load_plan(&captured_execution.plan_id)?
             .context("execution plan is missing")?;
         anyhow::ensure!(
-            crate::plan::digest(&serde_json::to_vec(&captured_execution)?) == execution_digest
+            control_fence_digest(&captured_execution)? == execution_digest
                 && crate::plan::digest(&serde_json::to_vec(&captured_plan)?) == plan_digest,
             "execution or accepted plan changed during control validation"
         );
@@ -800,6 +817,7 @@ impl HarnessBroker {
             .store
             .load_plan_execution(execution_id)?
             .context("execution is missing")?;
+        let loaded_progress = execution.progress.clone();
         let mut revised_manual = Vec::new();
         let mut goal = self.active_goal()?;
         let mut plan = self
@@ -851,7 +869,17 @@ impl HarnessBroker {
                     "plan:verification.md is editable only in Verify"
                 );
                 execution.verification_draft = Some(draft);
-                self.store.save_plan_execution(&execution)?;
+                // The active task owns the running execution record, and every read loads it
+                // from there, so the draft commits through the task like any other execution
+                // update. Writing only the execution table left the draft shadowed by the
+                // task's copy: plan_edit reported it saved while plan_read, plan_status, and
+                // plan_phase_done kept seeing the template.
+                self.task_controller.apply(
+                    &mut self.store,
+                    task_permit,
+                    crate::task::TaskEvent::ExecutionUpdated(Box::new(execution.clone())),
+                    now_ms,
+                )?;
                 let mut response = execution.response();
                 response["verification_draft"] =
                     serde_json::to_value(&execution.verification_draft)?;
@@ -1176,6 +1204,7 @@ impl HarnessBroker {
             execution_digest,
             plan_digest,
             execution,
+            loaded_progress,
             plan,
             nodes: proposed_interaction
                 .node_list
@@ -1318,6 +1347,7 @@ impl HarnessBroker {
             execution_digest,
             plan_digest,
             mut execution,
+            loaded_progress,
             plan,
             nodes,
             revised_manual,
@@ -1338,10 +1368,15 @@ impl HarnessBroker {
             .context("execution plan is missing")?;
         anyhow::ensure!(
             ExecutionControlExchange::capture(current_interaction) == exchange
-                && crate::plan::digest(&serde_json::to_vec(&current)?) == execution_digest
+                && control_fence_digest(&current)? == execution_digest
                 && crate::plan::digest(&serde_json::to_vec(&current_plan)?) == plan_digest,
             "execution control changed before commit"
         );
+        // A scan that committed after this control was proposed owns the newer progress unless
+        // the control computed progress of its own.
+        if execution.progress == loaded_progress {
+            execution.progress = current.progress.clone();
+        }
         anyhow::ensure!(
             !self.turn_cancellation.is_requested(),
             "execution interrupted during validation"

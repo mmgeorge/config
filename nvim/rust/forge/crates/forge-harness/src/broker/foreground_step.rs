@@ -427,12 +427,12 @@ impl HarnessBroker {
                 if transaction.failure.is_some() {
                     return self.advance_foreground_failure(dispatch);
                 }
-                transaction.state.interaction.collection = match disposition {
-                    ForegroundCollection::Cancel(_) => {
-                        Some(crate::exchange::ExchangeCollection::Settling)
-                    }
-                    ForegroundCollection::Restart => None,
-                };
+                // A restart collection keeps the stop's label too: the command that stopped the
+                // turn has not committed yet, and an unlabelled exchange whose turn was
+                // interrupted reads as paused until it does. Resuming or closing the exchange,
+                // or the command's own release of a parked exchange, clears it.
+                transaction.state.interaction.collection =
+                    Some(crate::exchange::ExchangeCollection::Settling);
                 Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::CollectionFailed => {
@@ -602,17 +602,45 @@ impl HarnessBroker {
         }
     }
 
-    /// Stop native work for a newly required question without holding broker state.
+    /// Pause the exchange clock while the user owes an answer, and stop native work for a newly
+    /// required question without holding broker state.
+    ///
+    /// A question whose answer resumes a waiting tool, or that the turn must stop for, leaves the
+    /// model idle until the user answers, so it suspends the clock as an approval does.
     fn handle_foreground_question_change(
-        &self,
+        &mut self,
         transaction: &mut ForegroundTransaction,
     ) -> Result<ForegroundAction> {
-        if !self
+        let snapshot = self.questions.snapshot()?;
+        let exchange = &mut transaction.state.interaction;
+        let awaited = snapshot
             .questions
-            .snapshot()?
-            .required_in_exchange(&transaction.state.interaction.id)
-        {
-            return Ok(ForegroundAction::Wait);
+            .iter()
+            .filter(|question| {
+                question.exchange_id == exchange.id
+                    && question.pending()
+                    && (question.delivery == crate::question::QuestionDelivery::ToolResult
+                        || question.requirement == crate::question::QuestionRequirement::Required)
+            })
+            .map(|question| question.id.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let waits_changed = exchange.observe_question_waits(&awaited, self.clock.now_ms());
+        if waits_changed {
+            self.store.save_exchange(exchange)?;
+        }
+        if !snapshot.required_in_exchange(&transaction.state.interaction.id) {
+            if !waits_changed {
+                return Ok(ForegroundAction::Wait);
+            }
+            let applied = self.prepare_live_interaction(
+                publication::LiveUpdate::StateChanged,
+                &transaction.state.interaction,
+            )?;
+            let delivery = self.prepare_provider_delivery(applied)?;
+            transaction.observation_publication_in_flight = true;
+            return Ok(ForegroundAction::Effect(
+                ForegroundJob::ObservationPublication(delivery),
+            ));
         }
         transaction.question_enabled = false;
         transaction.question_stop_pending = true;
@@ -727,6 +755,7 @@ impl HarnessBroker {
                 Ok(events) => {
                     if events.is_empty() && transaction.session_events.is_closed() {
                         transaction.failure_inbox_open = false;
+                        transaction.inbox_claim = None;
                     }
                     for event in events {
                         crate::provider::session_execution::OwnerObservation::retain_in(
@@ -737,6 +766,7 @@ impl HarnessBroker {
                 }
                 Err(error) => {
                     transaction.failure_inbox_open = false;
+                    transaction.inbox_claim = None;
                     failure = Some(match failure {
                         Some(native) => {
                             native.context(format!("session observation drain failed: {error}"))

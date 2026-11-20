@@ -1316,12 +1316,7 @@ impl HarnessBroker {
         // A user message during plan review is a plan discussion; its rules are the kind's fixed
         // instructions, so the user's words reach the model unmodified. The plan task section
         // names the plan, so no active-plan line is needed.
-        let mut input = staged.input.clone();
-        if staged.mode == PromptMode::PlanDiscussion {
-            input = input.retype_user_message(|input| {
-                forge_provider_api::forge::TurnKind::PlanDiscussion { input }
-            });
-        }
+        let input = self.plan_turn_input(staged.input.clone(), staged.mode)?;
         let mut request = self.provider_request(input, staged.mode)?;
         if let Some(configuration) = staged.task_configuration.as_ref() {
             configuration.apply(&self.session, &mut request);
@@ -1466,7 +1461,6 @@ impl HarnessBroker {
             Some(crate::task::WorkflowSnapshot::Plan { plan })
                 if plan.artifact.state == PlanState::ConfiguringChecks =>
             {
-                self.observer.set_check_editing(true)?;
                 self.check_setup = true;
                 admission.reset_check_setup = true;
                 PromptMode::Chat
@@ -1631,13 +1625,29 @@ impl HarnessBroker {
                 exchange.revise_plan(self.clock.now_ms())?;
                 self.store.save_exchange(&exchange)?;
             }
+            // A review decision that starts its own exchange names the decision, not a resume.
+            let origin = match (&origin, task.entry.as_ref()) {
+                (crate::exchange::ExchangeOpening::TaskContinuation { .. }, Some(entry))
+                    if review.is_none()
+                        && matches!(
+                            &admission.purpose,
+                            crate::input::InputPurpose::TaskEntry { start: None, .. }
+                        )
+                        && matches!(
+                            entry.instruction.kind(),
+                            forge_provider_api::forge::TurnKind::PlanReview { .. }
+                        ) =>
+                {
+                    crate::exchange::ExchangeOpening::task_continuation(entry.instruction.label())
+                }
+                _ => origin,
+            };
             let mut exchange_admission = ExchangeAdmission::chat(text.clone());
             exchange_admission.opening = origin;
             let mode = match &task.workflow {
                 crate::task::WorkflowSnapshot::Plan { plan }
                     if plan.artifact.state == PlanState::ConfiguringChecks =>
                 {
-                    self.observer.set_check_editing(true)?;
                     self.check_setup = true;
                     admission.reset_check_setup = true;
                     PromptMode::Chat
@@ -1695,6 +1705,22 @@ impl HarnessBroker {
             ),
             "Use /read full, /write, /write full, /ask, /deny, /allow, or /yolo"
         );
+        // A message during an Execute task is an execution discussion: the turn carries the
+        // execute task section and plan tools whatever the execution's state, so the model
+        // never reads "no task" while the editor shows the execution. Tools that change the
+        // execution still refuse while it is paused, blocked, or waiting for its entry.
+        if self
+            .task_controller
+            .current()?
+            .is_some_and(|task| task.kind() == crate::task::TaskKind::Execute)
+        {
+            return self.stage_foreground_interaction(
+                &text,
+                PromptMode::ExecutePlan,
+                Some(&ExchangeAdmission::chat(text.clone())),
+                ProviderInput::parse(&text),
+            );
+        }
         if self.task_controller.current()?.is_some_and(|task| {
             task.status() == crate::task::TaskStatus::Paused || !task.entry_accepted()
         }) {
@@ -1729,7 +1755,6 @@ impl HarnessBroker {
             .filter(|plan| plan.state == PlanState::ConfiguringChecks)
         {
             let exchange_admission = ExchangeAdmission::chat(text.clone());
-            self.observer.set_check_editing(true)?;
             self.check_setup = true;
             admission.reset_check_setup = true;
             let prompt = PlanPrompt::checks_setup(&plan.request);
@@ -2506,6 +2531,147 @@ mod tests {
         cancelled.phase =
             crate::exchange::ExchangePhase::fixture(ExchangeState::Interrupted, Some(2), None);
         assert!(cancelled.continue_check_result(3).is_err());
+        Ok(())
+    }
+
+    /// A user message during an Execute task carries the execution task section and plan tools,
+    /// whether the execution runs, waits, or stopped, so the model never reads "no task" while
+    /// the editor shows the execution.
+    #[test]
+    fn user_message_during_execution_is_an_execution_discussion() -> Result<()> {
+        for state in ["active", "blocked", "paused"] {
+            let workspace = super::super::test::repository();
+            let data = tempfile::tempdir()?;
+            let mut broker =
+                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+            broker.checkpoint = None;
+            let mut plan = broker
+                .plan_file
+                .prepare_entry(
+                    &broker.session.id,
+                    "Execute accepted plan".into(),
+                    Some(crate::plan::test_fixture("accepted-plan", "Execute")),
+                    1,
+                )?
+                .record;
+            plan.state = PlanState::Accepted;
+            broker.store.save_plan(&plan)?;
+            let record: crate::plan::PlanExecutionRecord = serde_json::from_value(json!({
+                "id":"execution", "session_id":broker.session.id, "plan_id":plan.id,
+                "state":state, "phase":"resolve", "original_revision":1,"revision":1,
+                "baseline_checkpoint":"captured-before-provider",
+                "generation":0, "lifecycle":[],"findings":[],
+                "progress":crate::plan::execution::SemanticProgress::default(),
+                "verification":[],"revision_history":[],"resume_after_review":false,
+                "observed_source":{},"observed_document_version":0,"observed_check":[],
+                "created_at_ms":1
+            }))?;
+            let previous = broker.task_controller.current()?;
+            broker.task_controller.change(
+                &mut broker.store,
+                previous.as_ref().map(|task| &task.revision),
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::execute(
+                    "Execute accepted plan".into(),
+                    record,
+                    Default::default(),
+                    1,
+                )?)),
+                2,
+            )?;
+            let (sink, _stream) = publication::channel();
+            let TurnTransaction::Admitting(mut admission) = broker.begin_foreground_dispatch(
+                Request {
+                    id: 1,
+                    method: "session.prompt.submit".into(),
+                    params: json!({"text":"Revert the draft edit"}),
+                },
+                sink,
+            )?
+            else {
+                unreachable!()
+            };
+            let staged = broker.normalize_foreground_interaction(&mut admission)?;
+            assert_eq!(
+                staged.mode,
+                PromptMode::ExecutePlan,
+                "execution state {state}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A user message while a goal is paused names that goal and says it is paused.
+    ///
+    /// The turn ran as plain chat with `<task kind="none">`, so the model answered that no
+    /// Harness task was active while the editor showed `goal · work · paused`.
+    #[test]
+    fn user_message_during_a_paused_goal_names_the_paused_goal() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.checkpoint = None;
+        let previous = broker.task_controller.current()?;
+        let installed = broker
+            .task_controller
+            .change(
+                &mut broker.store,
+                previous.as_ref().map(|task| &task.revision),
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
+                    "Ship the paused feature".into(),
+                    Default::default(),
+                    1,
+                ))),
+                2,
+            )?
+            .context("installed goal is missing")?;
+        broker.task_controller.change(
+            &mut broker.store,
+            Some(&installed.revision),
+            crate::task::TaskChange::Pause,
+            3,
+        )?;
+        let (sink, _stream) = publication::channel();
+        let TurnTransaction::Admitting(mut admission) = broker.begin_foreground_dispatch(
+            Request {
+                id: 1,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"What is left to do?"}),
+            },
+            sink,
+        )?
+        else {
+            unreachable!()
+        };
+        let staged = broker.normalize_foreground_interaction(&mut admission)?;
+        let request = broker.provider_request(
+            crate::provider::ProviderInput::from_user_text("What is left to do?"),
+            staged.mode,
+        )?;
+        let sections = request.standing_sections();
+        let rendered = forge_provider_api::forge::render(
+            &forge_provider_api::forge::TurnContext {
+                record: String::new(),
+                permissions: None,
+                aside: None,
+                agent: None,
+                task: sections.task,
+            },
+            &forge_provider_api::forge::TurnInput::user(forge_provider_api::PromptInput::Text(
+                String::new(),
+            )),
+            forge_provider_api::forge::ContextChannel::UserMessage,
+        )
+        .lead;
+        assert!(
+            rendered.contains("<task kind=\"goal\" state=\"paused\">")
+                && rendered.contains("Ship the paused feature"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("No Harness task is active"),
+            "{rendered}"
+        );
         Ok(())
     }
 

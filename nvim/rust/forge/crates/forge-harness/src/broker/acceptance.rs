@@ -83,10 +83,10 @@ impl BrokerObserver {
         let document = self
             .plan_file
             .read_working_document(&self.session_id, &plan.id)
-            .map_err(|_| TaskCommandFailure::PreparationUnavailable)?;
+            .map_err(|error| TaskCommandFailure::preparation(&error))?;
         let current_digest = crate::codec::to_vec(&document)
             .map(|bytes| crate::plan::digest(&bytes))
-            .map_err(|_| TaskCommandFailure::PreparationUnavailable)?;
+            .map_err(|error| TaskCommandFailure::preparation(&error.into()))?;
         if document.version != plan.document_version || current_digest != digest {
             return Err(TaskCommandFailure::PlanChanged);
         }
@@ -144,14 +144,17 @@ impl BrokerObserver {
                     ))
                 }
                 PlanEditChange::DeleteTests { tests } => {
-                    let (document, _, checksum) = self.plan_file.remove_tests(
-                        &self.session_id,
-                        &plan.id,
-                        plan.document_version,
-                        &digest,
-                        tests,
-                        None,
-                    )?;
+                    let (document, _, checksum) = self
+                        .plan_file
+                        .remove_tests(
+                            &self.session_id,
+                            &plan.id,
+                            plan.document_version,
+                            &digest,
+                            tests,
+                            None,
+                        )
+                        .await?;
                     Ok((document, checksum, removed_test_edits(tests)))
                 }
                 PlanEditChange::UpdateChecks {
@@ -183,16 +186,16 @@ impl BrokerObserver {
         }
         .await;
         let (document, checksum, edits) =
-            changed.map_err(|_| TaskCommandFailure::PreparationUnavailable)?;
+            changed.map_err(|error| TaskCommandFailure::preparation(&error))?;
         plan.document_version = document.version;
         plan.title = document.title;
         plan.review_digest = Some(checksum);
         plan.review = None;
-        plan.manual_changes.extend(edits);
+        crate::plan::record_manual_changes(&mut plan.manual_changes, edits);
         plan.updated_at_ms = now_ms;
         self.plan_file
             .seal_plan_artifacts(&plan)
-            .map_err(|_| TaskCommandFailure::PreparationUnavailable)?;
+            .map_err(|error| TaskCommandFailure::preparation(&error))?;
         let mut effects = crate::storage::TaskEffects::default();
         effects
             .source_plan
@@ -210,7 +213,7 @@ impl BrokerObserver {
             }
             crate::task::TaskChange::Update(Box::new(
                 crate::task::Task::try_from(draft)
-                    .map_err(|_| TaskCommandFailure::PreparationUnavailable)?,
+                    .map_err(|error| TaskCommandFailure::preparation(&error))?,
             ))
         } else {
             crate::task::TaskChange::Preserve
@@ -384,9 +387,11 @@ impl BrokerObserver {
                 let session = store
                     .load_session(&self.session_id)?
                     .context("session is missing")?;
-                design.check_workspace(Path::new(&session.workspace))?;
+                Self::check_design_baseline(&store, &session, &plan.id, design)?;
             }
             {
+                // Decide before a review edit records a revision in the latest exchange.
+                let continued_exchange = Self::revision_exchange(&store, &plan, anchor.as_ref())?;
                 self.prepare_review_revision(
                     &mut plan,
                     &reviewed,
@@ -406,6 +411,7 @@ impl BrokerObserver {
                         feedback.clone(),
                         review.comment.as_deref(),
                         plan.manual_changes.clone(),
+                        &plan.unplaced_review_comments,
                     );
                     plan.review = None;
                     if executing {
@@ -428,19 +434,22 @@ impl BrokerObserver {
                         )?;
                     } else {
                         PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, now_ms)?;
-                        plan.generation.reset_no_progress();
+                        // A review decision starts a fresh revision budget.
+                        plan.generation.reset();
                         let mut revised=current.filter(|task|matches!(&task.workflow,WorkflowSnapshot::Plan { plan:active } if active.artifact.id==plan.id)).map(Task::draft).unwrap_or_else(||crate::task::TaskSnapshot::plan(plan.clone(),now_ms));
                         if let WorkflowSnapshot::Plan { plan: active } = &mut revised.workflow {
                             active.artifact = plan.clone();
                             active.paused = false;
                         }
                         revised.request_entry(instruction, now_ms)?;
-                        revised
+                        let entry = revised
                             .entry
                             .as_mut()
-                            .context("revision entry is missing")?
-                            .review_exchange =
-                            anchor.as_ref().map(|anchor| anchor.exchange_id.clone());
+                            .context("revision entry is missing")?;
+                        // A revision in a new exchange continues the announced task rather
+                        // than starting it again.
+                        entry.resumed = continued_exchange.is_none();
+                        entry.review_exchange = continued_exchange;
                         task = Some(revised);
                     }
                     effects.lifecycle.push(self.review_lifecycle(
@@ -469,6 +478,30 @@ impl BrokerObserver {
         Ok(super::plan_entry::PreparedTaskChange { change, effects })
     }
 
+    /// Decide whether the reviewed document is a new revision of the submitted one.
+    ///
+    /// A review edit advances the document version even when a later edit undoes it, such as a
+    /// check toggled off and on again. Such a document matches the submission in everything but
+    /// its version, so it is not a new revision.
+    fn review_changed_submission(
+        &self,
+        plan: &PlanRecord,
+        reviewed: &crate::plan::review_source::PlanReviewSource,
+    ) -> Result<bool> {
+        if plan.submitted_version == Some(reviewed.document.version) {
+            return Ok(false);
+        }
+        if plan.model_revision == 0 {
+            return Ok(true);
+        }
+        let submitted = self.plan_file.read_submitted_document(
+            &self.session_id,
+            &plan.id,
+            plan.model_revision,
+        )?;
+        Ok(!submitted.plans_same_work(&reviewed.document)?)
+    }
+
     fn prepare_review_revision(
         &self,
         plan: &mut PlanRecord,
@@ -477,7 +510,7 @@ impl BrokerObserver {
         effects: &mut crate::storage::TaskEffects,
         now_ms: i64,
     ) -> Result<()> {
-        if plan.submitted_version == Some(reviewed.document.version) {
+        if !self.review_changed_submission(plan, reviewed)? {
             return Ok(());
         }
         anyhow::ensure!(
@@ -504,6 +537,37 @@ impl BrokerObserver {
             now_ms,
         ));
         Ok(())
+    }
+
+    /// Select the exchange a requested revision continues.
+    ///
+    /// The revision reopens the latest exchange only when that exchange recorded the reviewed
+    /// revision. A later discussion, question, or unrelated reply is finished work, so the
+    /// revision starts its own exchange instead of relabeling that answer when interrupted.
+    fn revision_exchange(
+        store: &crate::storage::SqliteStore,
+        plan: &PlanRecord,
+        latest: Option<&crate::plan::ExchangeAnchor>,
+    ) -> Result<Option<String>> {
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        let recorded = store
+            .list_plan_lifecycle(&plan.session_id)?
+            .into_iter()
+            .any(|lifecycle| {
+                lifecycle.plan_id == plan.id
+                    && lifecycle.model_revision == plan.model_revision
+                    && matches!(
+                        lifecycle.kind,
+                        PlanLifecycleKind::Created | PlanLifecycleKind::RevisionCreated
+                    )
+                    && lifecycle
+                        .anchor
+                        .as_ref()
+                        .is_some_and(|anchor| anchor.exchange_id == latest.exchange_id)
+            });
+        Ok(recorded.then(|| latest.exchange_id.clone()))
     }
 
     fn review_lifecycle(
@@ -535,7 +599,7 @@ impl BrokerObserver {
     fn finish_review_execution(
         &self,
         task: &mut crate::task::TaskSnapshot,
-        _plan: &PlanRecord,
+        plan: &PlanRecord,
         anchor: Option<crate::plan::ExchangeAnchor>,
         title: &str,
         now_ms: i64,
@@ -547,6 +611,24 @@ impl BrokerObserver {
         execution.record.resume_after_review = false;
         if resume {
             execution.record.state = PlanExecutionState::Active;
+        }
+        // The turn that submitted this revision is still running and carries on from the
+        // decision itself, so the decision keeps its execution generation, and with it the
+        // turn's observation authority, and queues no turn of its own.
+        if self.submitted_by_running_turn(plan)? {
+            if let Some(anchor) = anchor {
+                execution.record.append_lifecycle(
+                    anchor,
+                    now_ms,
+                    PlanExecutionLifecycleEvent::Phase {
+                        title: title.into(),
+                        phase: execution.record.phase,
+                        revision: execution.record.revision,
+                        state: execution.record.state,
+                    },
+                );
+            }
+            return Ok(());
         }
         execution.record.generation += 1;
         let review_exchange = anchor.as_ref().map(|anchor| anchor.exchange_id.clone());
@@ -574,6 +656,56 @@ impl BrokerObserver {
         Ok(())
     }
 
+    /// Report whether the running turn submitted the plan's current revision.
+    fn submitted_by_running_turn(&self, plan: &PlanRecord) -> Result<bool> {
+        let store = crate::storage::HistoryReader::current(&self.data_root)?;
+        let Some(exchange) = store.latest_exchange(&self.session_id)? else {
+            return Ok(false);
+        };
+        if exchange.is_finished() {
+            return Ok(false);
+        }
+        let submission = format!("{}:artifact:{}", exchange.id, plan.model_revision);
+        Ok(exchange.node_list.iter().any(|node| {
+            matches!(node, crate::exchange::ExchangeNode::ArtifactChange { change }
+                if change.id == submission && change.revision_request)
+        }))
+    }
+
+    /// Require the reviewed design's baselines to describe the sources the plan applies to.
+    ///
+    /// A plan reviewed before execution applies to the live workspace. A revision submitted
+    /// during Execute applies to the sources the execution started from, because Implement has
+    /// already edited the workspace; its baselines are checked against the execution checkpoint.
+    fn check_design_baseline(
+        store: &crate::storage::SqliteStore,
+        session: &crate::session::HarnessSession,
+        plan_id: &str,
+        design: &crate::plan::DeclarationDesign,
+    ) -> Result<()> {
+        let checkpoint = session
+            .active_task
+            .as_ref()
+            .and_then(|task| match &task.workflow {
+                crate::task::WorkflowSnapshot::Execute { execution }
+                    if execution.record.plan_id == plan_id
+                        && execution.record.pending_revision_reason.is_some() =>
+                {
+                    execution.record.baseline_checkpoint.clone()
+                }
+                _ => None,
+            });
+        let Some(checkpoint) = checkpoint else {
+            return design.check_workspace(Path::new(&session.workspace));
+        };
+        let checkpoint = store
+            .load_checkpoint(&checkpoint)?
+            .context("the execution checkpoint is missing")?;
+        design.check_baseline_sources("execution checkpoint", |path| {
+            checkpoint.read(&store.objects, path)
+        })
+    }
+
     /// Validate immutable execution input and freeze its normalized configuration without writing artifacts.
     pub(crate) fn validate_plan_execution(
         &self,
@@ -589,7 +721,7 @@ impl BrokerObserver {
             self.trace.record(&self.session_id, "exchange.plan_execution.validation_failed", json!({
                 "command_id":command.as_str(),"plan_id":selection.source().id().as_str(),"reason":format!("{error:#}"),
             }));
-            crate::exchange::command::TaskCommandFailure::PreparationUnavailable
+            crate::exchange::command::TaskCommandFailure::preparation(&error)
         })?;
         selection.source().validate(&captured.plan)?;
         let store = crate::storage::HistoryReader::current(&self.data_root)
@@ -650,11 +782,35 @@ impl BrokerObserver {
                 validated.request.approval_mode = Some(
                     review
                         .approval_mode()
-                        .map_err(|_| TaskCommandFailure::PreparationUnavailable)?,
+                        .map_err(|error| TaskCommandFailure::preparation(&error))?,
                 );
             }
         }
-        if validated.request.approval_mode.is_some() {
+        // A revision accepted during execution keeps the execution choices the user made
+        // when the plan first entered execution; only entering execution asks for them. The
+        // task holds them for the whole execution, across pauses and resumed entries.
+        if validated.request.approval_mode.is_none()
+            && let Some(recorded) = current.as_ref().and_then(|task| match &task.workflow {
+                crate::task::WorkflowSnapshot::Execute { execution }
+                    if execution.record.plan_id == plan.id
+                        && execution.record.pending_revision_reason.is_some() =>
+                {
+                    task.plan_execution.as_ref().map(|choice| &choice.execution)
+                }
+                _ => None,
+            })
+        {
+            validated.request.approval_mode = Some(recorded.approval_mode);
+            validated.request.plan_executor = Some(recorded.executor.clone());
+            validated.request.plan_compact = Some(recorded.compact);
+        }
+        // An explicit pause holds through a review decision: the decision is recorded, and
+        // `/task resume` carries it out.
+        let paused = current.as_ref().is_some_and(|task| {
+            matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan: active }
+                if active.artifact.id == plan.id && active.paused)
+        });
+        if validated.request.approval_mode.is_some() && !paused {
             return Ok(PlanExecutionPreparation::Ready(validated));
         }
         let mut review = match matching_review {
@@ -667,7 +823,7 @@ impl BrokerObserver {
                     .ok_or(TaskCommandFailure::PlanChanged)?,
                 &validated.approval_modes,
             )
-            .map_err(|_| TaskCommandFailure::PreparationUnavailable)?,
+            .map_err(|error| TaskCommandFailure::preparation(&error))?,
         };
         review.saved_source_digest = validated.request.saved_source_digest.clone();
         review.overall_comment = validated.request.comment.clone();
@@ -693,7 +849,7 @@ impl BrokerObserver {
                 }
                 crate::task::TaskChange::Update(Box::new(
                     crate::task::Task::try_from(draft)
-                        .map_err(|_| TaskCommandFailure::PreparationUnavailable)?,
+                        .map_err(|error| TaskCommandFailure::preparation(&error))?,
                 ))
             }
             None | Some(_) => crate::task::TaskChange::Preserve,
@@ -762,7 +918,7 @@ impl BrokerObserver {
             .design
             .as_ref()
             .context("execution requires a semantic plan")?;
-        design.check_workspace(Path::new(&session.workspace))?;
+        Self::check_design_baseline(&store, &session, &plan.id, design)?;
         // The reviewed snapshot describes project defaults; task preferences apply at execution admission.
         let checks = crate::checks::ConfigSnapshot::load(Path::new(&session.workspace))?;
         anyhow::ensure!(
@@ -817,7 +973,10 @@ impl BrokerObserver {
                 acceptance.overall_comment.clone(),
             ))
         } else {
-            None
+            // Comments saved in the review reach acceptance through no request field: the
+            // editor saves them beside the working document before it submits the decision.
+            let saved = self.plan_file.saved_review_comments(&reviewed)?;
+            (!saved.is_empty()).then(|| (saved, selection.comment.clone()))
         };
         if let Some((annotations, _)) = &feedback {
             crate::plan::resolve_annotations(&reviewed.rendered, annotations.clone())?;
@@ -849,6 +1008,15 @@ impl BrokerObserver {
         anyhow::ensure!(
             approval_modes.contains(&approval_mode),
             "execution requires an available approval decision"
+        );
+        anyhow::ensure!(
+            !session
+                .active_task
+                .as_ref()
+                .is_some_and(|task| matches!(&task.workflow,
+                crate::task::WorkflowSnapshot::Plan { plan: active }
+                    if active.artifact.id == plan.id && active.paused)),
+            "the plan task is paused; run /task resume to carry out the recorded acceptance"
         );
         let store = crate::storage::HistoryReader::current(&self.data_root)?;
         let digest = plan
@@ -974,7 +1142,7 @@ impl BrokerObserver {
             document_version: plan.document_version,
             review_digest: plan.review_digest.clone(),
         });
-        if plan.submitted_version != Some(reviewed.document.version) {
+        if self.review_changed_submission(&plan, &reviewed)? {
             anyhow::ensure!(
                 plan.document_version == reviewed.document.version,
                 "plan version changed before the review decision"
@@ -1103,16 +1271,24 @@ impl BrokerObserver {
             }
         }
         task.auto_accept_plan = planning_task.is_some_and(|task| task.auto_accept_plan);
-        task.plan_execution = planning_task.and_then(|task| task.plan_execution.clone());
+        let execution_choice = crate::task::ExecutionEntry {
+            approval_mode,
+            executor: session.plan_executor.clone(),
+            compact: session.plan_compact,
+        };
+        // The task keeps the choices for the whole execution: its entry is replaced when the
+        // execution resumes, and a revision accepted later reuses these instead of asking again.
+        task.plan_execution = Some(crate::task::PlanExecutionChoice {
+            execution: execution_choice.clone(),
+            comment: planning_task
+                .and_then(|task| task.plan_execution.as_ref())
+                .and_then(|choice| choice.comment.clone()),
+        });
         task.request_entry(instruction, now_ms)?;
         task.entry
             .as_mut()
             .context("execution entry is missing")?
-            .execution = Some(crate::task::ExecutionEntry {
-            approval_mode,
-            executor: session.plan_executor.clone(),
-            compact: session.plan_compact,
-        });
+            .execution = Some(execution_choice);
         self.plan_file.seal_plan_artifacts(&plan)?;
         effects.plan.push(plan);
         Ok((crate::task::Task::try_from(task)?, effects))
@@ -1131,6 +1307,18 @@ mod tests {
         HarnessBroker,
         PlanRecord,
     )> {
+        reviewed_execution_fixture_with(&[])
+    }
+
+    /// Create the submitted fixture plan with the given manual verification actions.
+    fn reviewed_execution_fixture_with(
+        manual_checks: &[&str],
+    ) -> Result<(
+        tempfile::TempDir,
+        tempfile::TempDir,
+        HarnessBroker,
+        PlanRecord,
+    )> {
         let workspace = super::super::test::repository();
         let data = tempfile::tempdir()?;
         let mut broker =
@@ -1141,6 +1329,7 @@ mod tests {
         design.document.objective = "Preserve ownership".into();
         design.document.background = "A review fixture".into();
         design.document.design = "Keep state in its owner.".into();
+        design.document.manual_checks = manual_checks.iter().map(|check| (*check).into()).collect();
         design.proposed_source.insert(
             "src/owner.rs".into(),
             "/// Own application state.\npub struct Owner;\n".into(),
@@ -1255,7 +1444,15 @@ mod tests {
     async fn resolving_execution(
         checkpointed_source: &[(&str, &str)],
     ) -> Result<ResolvingExecution> {
-        let (workspace, data, mut broker, plan) = reviewed_execution_fixture()?;
+        resolving_execution_with(checkpointed_source, &[]).await
+    }
+
+    /// Enter Resolve as `resolving_execution` does, for a plan with manual verification actions.
+    async fn resolving_execution_with(
+        checkpointed_source: &[(&str, &str)],
+        manual_checks: &[&str],
+    ) -> Result<ResolvingExecution> {
+        let (workspace, data, mut broker, plan) = reviewed_execution_fixture_with(manual_checks)?;
         for (path, source) in checkpointed_source {
             let target = workspace.path().join(path);
             std::fs::create_dir_all(target.parent().context("source path has a parent")?)?;
@@ -1474,7 +1671,9 @@ mod tests {
             )
             .expect_err("completion accepted unprotected evidence");
         assert!(error.to_string().contains("reserved workspace evidence"));
-        let snapshot = broker.prepare_workspace_capture().run_reserved().await?;
+        let snapshot = super::super::foreground_goal_effect::GoalWorkspace::Reserved(
+            broker.prepare_workspace_capture().run_reserved().await?,
+        );
         assert!(
             crate::checks::CheckReservation::acquire(
                 &(workspace.path()).join("harness-state"),
@@ -1802,6 +2001,123 @@ mod tests {
         Ok(())
     }
 
+    /// The Verify report that `plan_edit` saves is the one reads and phase completion see.
+    ///
+    /// The draft was written only to the execution table, which the active task's copy of the
+    /// execution shadows, so every save reported success while reads and `plan_phase_done` kept
+    /// the template, and Verify could never complete.
+    #[tokio::test]
+    async fn verification_report_is_read_back_and_completes_verify() -> Result<()> {
+        verification_report_case(false).await
+    }
+
+    /// The same holds after a Resolve revision was submitted and accepted mid-execution.
+    #[tokio::test]
+    async fn verification_report_survives_an_accepted_resolve_revision() -> Result<()> {
+        verification_report_case(true).await
+    }
+
+    async fn verification_report_case(after_revision: bool) -> Result<()> {
+        let mut fixture = resolving_execution_with(&[], &["Run the game once."]).await?;
+        if after_revision {
+            let submitted = submit_execution_revision(&mut fixture, 2).await?;
+            fixture.broker.dispatch_session_command(
+                "session.plan.accept",
+                json!({"plan_id":fixture.plan.id,"digest":submitted.review_digest,"approval_mode":"ask"}),
+            )?;
+            assert_eq!(
+                fixture
+                    .broker
+                    .store
+                    .load_plan(&fixture.plan.id)?
+                    .unwrap()
+                    .state,
+                PlanState::Accepted
+            );
+        }
+        let broker = &mut fixture.broker;
+        let task = broker.task_controller.current()?.unwrap();
+        broker
+            .task_controller
+            .update(&mut broker.store, &task.permit(), 10, |task| {
+                let crate::task::WorkflowSnapshot::Execute { execution } = &mut task.workflow
+                else {
+                    anyhow::bail!("expected execution");
+                };
+                // Verify follows a passing gate for the accepted revision.
+                let passing: crate::checks::CheckRun = serde_json::from_value(json!({
+                    "id":"passing-gate","owner":{"kind":"session","session_id":"session"},
+                    "revision":execution.record.revision,"shell":"system","executable":null,
+                    "workspace":".","environment_digest":"test","started_at_ms":0,
+                    "completed_at_ms":1,"state":"passed",
+                    "progress":crate::plan::execution::SemanticProgress::default(),
+                    "workspace_identity":null,"workspace_digest":{},"commands":[]
+                }))?;
+                execution.record.check_runs.push(passing);
+                execution.record.phase = crate::plan::PlanPhase::Verify;
+                execution.record.generation += 1;
+                Ok(())
+            })?;
+        let report = crate::plan::verification_artifact::template(&["Run the game once.".into()])
+            .replace(
+                "1. pending []",
+                "1. blocked [] No display is available to run the game.",
+            );
+        let control = |broker: &HarnessBroker| -> Result<_> {
+            let task = broker.task_controller.current()?.unwrap();
+            let execution = broker.current_execution()?.unwrap();
+            Ok((execution, task.permit()))
+        };
+        let (execution, permit) = control(broker)?;
+        broker
+            .handle_execution_control(
+                &execution.id,
+                execution.generation,
+                &permit,
+                ExecutionOperation::VerificationDraft(report.clone()),
+                &mut fixture.exchange,
+            )
+            .await?;
+        let (execution, permit) = control(broker)?;
+        assert_eq!(
+            execution.verification_draft.as_deref(),
+            Some(report.as_str()),
+            "the execution the task owns holds the saved report"
+        );
+        let inspected = broker
+            .handle_execution_control(
+                &execution.id,
+                execution.generation,
+                &permit,
+                ExecutionOperation::Inspect,
+                &mut fixture.exchange,
+            )
+            .await?;
+        assert_eq!(inspected["verification_draft"], json!(report));
+        let evidence = broker
+            .prepare_execution_control(
+                &execution.id,
+                execution.generation,
+                &permit,
+                ExecutionOperation::Phase(crate::plan::execution::PlanPhaseDone {
+                    phase: crate::plan::PlanPhase::Verify,
+                    revision: execution.revision,
+                    summary: "Verified".into(),
+                    verification: None,
+                }),
+                &fixture.exchange,
+            )?
+            .run()
+            .await?;
+        let crate::broker::execution::ExecutionControlStage::Pending(pending) =
+            broker.apply_execution_control(evidence, &mut fixture.exchange)?
+        else {
+            anyhow::bail!("Verify completion with a saved report must be requested");
+        };
+        assert_eq!(pending.acknowledgement()["result"], "requested");
+        Ok(())
+    }
+
     /// A phase tool acknowledges a proposal without changing the live execution.
     #[tokio::test]
     async fn phase_completion_remains_pending_without_normal_native_completion() -> Result<()> {
@@ -2059,6 +2375,143 @@ mod tests {
             saved.proposed_source["src/extra.rs"], expected.editable_text,
             "the proposal keeps the text the draft carried"
         );
+        Ok(())
+    }
+
+    /// Implement edits baseline files before Resolve revises the plan, so the revision's baselines
+    /// describe the execution checkpoint, not the workspace; accepting it must not refuse the
+    /// workspace edits that the execution itself made.
+    #[tokio::test]
+    async fn resolve_revision_is_accepted_after_implement_edited_a_baseline() -> Result<()> {
+        let mut execution_fixture = resolving_execution(&[]).await?;
+        std::fs::create_dir_all(execution_fixture._workspace.path().join("src"))?;
+        std::fs::write(
+            execution_fixture._workspace.path().join("src/owner.rs"),
+            "/// Implemented by the execution.
+pub fn owner() {}
+",
+        )?;
+        let submitted = submit_execution_revision(&mut execution_fixture, 2).await?;
+        let ResolvingExecution { broker, plan, .. } = &mut execution_fixture;
+        assert_eq!(submitted.state, PlanState::AwaitingReview);
+        broker.dispatch_session_command(
+            "session.plan.accept",
+            json!({"plan_id":plan.id,"digest":submitted.review_digest,"approval_mode":"ask"}),
+        )?;
+        let accepted = broker.store.load_plan(&plan.id)?.unwrap();
+        assert_eq!(accepted.state, PlanState::Accepted);
+        assert_eq!(accepted.model_revision, submitted.model_revision);
+        Ok(())
+    }
+
+    /// Accepting the revision that the still-running Resolve turn submitted lets that turn carry
+    /// on: the execution keeps its generation and the turn its observation authority, and no
+    /// Continue turn is queued behind it, so the turn's own `plan_phase_done` can still settle.
+    #[tokio::test]
+    async fn accepting_the_running_turns_revision_keeps_its_authority() -> Result<()> {
+        let mut execution_fixture = resolving_execution(&[]).await?;
+        execution_fixture.exchange = serde_json::from_value(json!({
+            "id":"resolve-exchange","session_id":execution_fixture.broker.session.id,
+            "agent_id":execution_fixture.broker.session.primary_agent_id,"ordinal":2,
+            "prompt":"Resolve the plan","state":"running","kind":"plan_execution",
+            "plan_id":execution_fixture.plan.id,"created_at_ms":3,
+            "attributed_matches_checkpoint":true,"node_list":[]
+        }))?;
+        execution_fixture
+            .broker
+            .store
+            .save_exchange(&execution_fixture.exchange)?;
+        let submitted = submit_execution_revision(&mut execution_fixture, 2).await?;
+        let ResolvingExecution {
+            broker,
+            plan,
+            exchange,
+            ..
+        } = &mut execution_fixture;
+        broker.store.save_exchange(exchange)?;
+        let before = broker.task_controller.current()?.unwrap();
+        broker.dispatch_session_command(
+            "session.plan.accept",
+            json!({"plan_id":plan.id,"digest":submitted.review_digest,"approval_mode":"ask"}),
+        )?;
+        assert_eq!(
+            broker.store.load_plan(&plan.id)?.unwrap().state,
+            PlanState::Accepted
+        );
+        let after = broker.task_controller.current()?.unwrap();
+        assert_eq!(after.observation_revision, before.observation_revision);
+        let generation = |task: &crate::task::Task| match &task.workflow {
+            crate::task::WorkflowSnapshot::Execute { execution } => execution.record.generation,
+            _ => unreachable!(),
+        };
+        assert_eq!(generation(&after), generation(&before));
+        assert_eq!(
+            after.entry.as_ref().map(|entry| entry.id.clone()),
+            before.entry.as_ref().map(|entry| entry.id.clone()),
+            "the decision queued a Continue turn"
+        );
+        Ok(())
+    }
+
+    /// A Resolve revision accepted after the execution was paused and resumed reuses the tool
+    /// approval chosen when the plan entered execution instead of asking for it again.
+    ///
+    /// The choice lived only on the execution's first task entry, and resuming the execution
+    /// replaced that entry, so accepting the revision opened "How should execution handle tool
+    /// approval?" a second time.
+    #[tokio::test]
+    async fn resolve_revision_after_resume_reuses_the_execution_tool_approval() -> Result<()> {
+        let mut execution_fixture = resolving_execution(&[]).await?;
+        {
+            let broker = &mut execution_fixture.broker;
+            let running = broker.task_controller.current()?.unwrap();
+            let paused = broker
+                .task_controller
+                .change(
+                    &mut broker.store,
+                    Some(&running.revision),
+                    crate::task::TaskChange::Pause,
+                    3,
+                )?
+                .unwrap();
+            broker.task_controller.change(
+                &mut broker.store,
+                Some(&paused.revision),
+                crate::task::TaskChange::ResumeWithEntry(crate::plan::task_step(
+                    forge_provider_api::forge::TaskStep::ExecuteContinue,
+                )),
+                4,
+            )?;
+            let resumed = broker.task_controller.current()?.unwrap();
+            broker
+                .task_controller
+                .update(&mut broker.store, &resumed.permit(), 5, |task| {
+                    task.entry.as_mut().unwrap().delivery =
+                        crate::task::TaskInputDelivery::Accepted;
+                    Ok(())
+                })?;
+        }
+        let submitted = submit_execution_revision(&mut execution_fixture, 2).await?;
+        let ResolvingExecution { broker, .. } = &mut execution_fixture;
+        let current = broker.task_controller.current()?;
+        let selection = crate::exchange::command::PlanExecutionSelection::capture(
+            &submitted,
+            current.as_ref(),
+            crate::task::command::ExecuteSelection {
+                plan_id: Some(submitted.id.clone()),
+                digest: submitted.review_digest.clone(),
+                ..Default::default()
+            },
+        )?;
+        let preparation = broker.observer.prepare_plan_execution(
+            &crate::exchange::command::CommandId::new("accept-resolve-revision")?,
+            &selection,
+            6,
+        )?;
+        let PlanExecutionPreparation::Ready(validated) = preparation else {
+            panic!("accepting the Resolve revision asked the execution questions again");
+        };
+        assert_eq!(validated.request().approval_mode, Some(ApprovalMode::Ask));
         Ok(())
     }
 

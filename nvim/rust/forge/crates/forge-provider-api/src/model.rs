@@ -92,6 +92,10 @@ pub struct ProviderCapability {
     #[serde(default)]
     /// Discards settled conversation history after a recorded turn checkpoint.
     pub native_conversation_rewind: bool,
+    #[serde(default)]
+    /// Rewinds only to a recorded turn checkpoint, so a conversation rollback cannot discard the
+    /// provider's whole conversation.
+    pub conversation_rewind_requires_checkpoint: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,

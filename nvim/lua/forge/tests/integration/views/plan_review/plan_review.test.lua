@@ -156,6 +156,8 @@ T["plan_optimistic_edit"] = function()
     preview = { { block = "first", column = 0, length = 8 }, { block = "second", column = 4, length = 8 } } }
   local input, answer, finish, committed
   popup.incremental_input = function(options, callback) input, answer = options, callback end
+  -- The reviewer confirms each rename as soon as the confirmation opens.
+  require("forge.infra.confirm").open = function(_, on_yes) on_yes() end
   local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
   local function marks() return vim.api.nvim_buf_get_extmarks(native, namespace, 0, -1, { details = true }) end
   local function commit(name, settle) committed, finish = name, settle end
@@ -457,6 +459,11 @@ T["plan_test_delete"] = function()
 
   pending = nil
   local popup = require("forge.infra.popup_window")
+  -- The reviewer confirms each rename as soon as the confirmation opens; the later test
+  -- deletion answers the real confirmation.
+  local confirm = require("forge.infra.confirm")
+  local open_confirmation = confirm.open
+  confirm.open = function(_, on_yes) on_yes() end
   popup.incremental_input = function(options, callback)
     options.on_change("ReviewedTests")
     callback("ReviewedTests")
@@ -483,6 +490,7 @@ T["plan_test_delete"] = function()
   assert(#rename_marks() == 0, "successful rename retained its overlay")
   assert(opened == 1 and closed == 0, "rename reopened the native document")
   assert(state.active_plan.id == "unrelated-current-plan", "editing a review changed the current plan")
+  confirm.open = open_confirmation
 
   pending = nil
   vim.api.nvim_win_set_cursor(window, { 3, 0 })
@@ -504,7 +512,12 @@ T["plan_test_delete"] = function()
     working_path = path, review_digest = "digest:4" }, review = presentation(owner.document) })
   assert(owner.version == 4 and owner.attached(), table.concat(notices:messages(), "\n"))
   assert(comments.capture(review.buf)[1].source.body == "Keep this new feedback", "deletion lost newer typing")
-  assert(vim.api.nvim_get_current_line() == focused_text, "deletion moved the cursor out of the current comment")
+  -- The queued save then collapses the saved comment, leaving the cursor on its compact row.
+  local cursor_row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  assert(vim.iter(owner.comment_state.range_list):any(function(range)
+    return tostring(range.annotation.id) == "late" and range.compact
+      and cursor_row >= range.first_row and cursor_row <= range.last_row
+  end), "deletion moved the cursor out of the current comment")
   assert(not vim.bo[review.buf].modified, "the queued save did not settle")
   assert(opened == 1 and closed == 0, "subsequent deletion reopened the native document")
 end

@@ -90,10 +90,11 @@ pub fn permission_from_copilot(
     }
 }
 
+use super::provider::NativeToolIdentity;
 use async_trait::async_trait;
 use forge_provider_api::permissions::PermissionResponse;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
-use github_copilot_sdk::hooks::{HookContext, PreToolUseInput, PreToolUseOutput, SessionHooks};
+use github_copilot_sdk::hooks::{HookActor, HookEvent, HookOutput, PreToolUseOutput, SessionHooks};
 use github_copilot_sdk::{PermissionRequestData, PermissionRequestKind, RequestId, SessionId};
 use std::sync::Arc;
 
@@ -152,18 +153,25 @@ struct Callback {
 
 #[async_trait]
 impl SessionHooks for Callback {
-    async fn on_pre_tool_use(
-        &self,
-        _input: PreToolUseInput,
-        _context: HookContext,
-    ) -> Option<PreToolUseOutput> {
-        match self.context.before_tool_native(None).await {
-            Ok(()) => None,
-            Err(_) => Some(PreToolUseOutput {
+    /// Route a pre-tool hook to the barrier of the agent that issued the tool.
+    ///
+    /// The hook names no tool call. A subagent's hook names the subagent in its actor metadata
+    /// and reports the subagent's own session ID; a root hook reports the root session.
+    async fn on_hook_with_actor(&self, event: HookEvent, actor: HookActor) -> HookOutput {
+        let HookEvent::PreToolUse { input, ctx } = event else {
+            return self.on_hook(event).await;
+        };
+        let child_session =
+            (input.session_id != ctx.session_id.as_str()).then_some(input.session_id.as_str());
+        let tool = match actor.agent_id().or(child_session) {
+            Some(native_agent) => NativeToolIdentity::ChildHook(native_agent),
+            None => NativeToolIdentity::RootHook,
+        };
+        match self.context.before_tool_native(tool).await {
+            Ok(()) => HookOutput::None,
+            Err(_) => HookOutput::PreToolUse(PreToolUseOutput {
                 permission_decision: Some("deny".into()),
-                permission_decision_reason: Some(
-                    "Host pre-execution barrier rejected this operation".into(),
-                ),
+                permission_decision_reason: Some(HOST_BARRIER_DENIAL.into()),
                 modified_args: None,
                 additional_context: None,
                 suppress_output: None,
@@ -171,6 +179,10 @@ impl SessionHooks for Callback {
         }
     }
 }
+
+/// Explain a pre-tool denial to the model and name Harness as the actor that refused it.
+pub(super) const HOST_BARRIER_DENIAL: &str =
+    "Harness refused this operation before it ran because its turn is no longer admitted";
 
 #[async_trait]
 impl PermissionHandler for Callback {
@@ -189,7 +201,7 @@ impl PermissionHandler for Callback {
         };
         if self
             .context
-            .before_tool_native(Some(tool_call_id))
+            .before_tool_native(NativeToolIdentity::Call(tool_call_id))
             .await
             .is_err()
         {
@@ -262,13 +274,14 @@ mod tests {
             &self,
             _: &str,
             _: forge_provider_api::control::ToolCall,
-        ) -> Result<String, forge_provider_api::ProviderError> {
+        ) -> Result<forge_provider_api::control::ToolReply, forge_provider_api::ProviderError>
+        {
             Err(forge_provider_api::ProviderError::Cancelled)
         }
 
         async fn before_tool_native(
             &self,
-            _: Option<&str>,
+            _: NativeToolIdentity<'_>,
         ) -> Result<(), forge_provider_api::ProviderError> {
             if self.barrier_open {
                 Ok(())
@@ -335,21 +348,27 @@ mod tests {
                 barrier_open,
             }));
             let result = callback
-                .on_pre_tool_use(
-                    serde_json::from_value(json!({
-                        "sessionId":"native", "timestamp":0.0, "cwd":".",
-                        "toolName":"read", "toolArgs":{}
-                    }))
-                    .unwrap(),
-                    HookContext {
-                        session_id: SessionId::new("native"),
+                .on_hook_with_actor(
+                    HookEvent::PreToolUse {
+                        input: serde_json::from_value(json!({
+                            "sessionId":"native", "timestamp":0.0, "cwd":".",
+                            "toolName":"read", "toolArgs":{}
+                        }))
+                        .unwrap(),
+                        ctx: github_copilot_sdk::hooks::HookContext {
+                            session_id: SessionId::new("native"),
+                        },
                     },
+                    HookActor::default(),
                 )
                 .await;
             if barrier_open {
-                assert!(result.is_none());
+                assert!(matches!(result, HookOutput::None));
             } else {
-                assert_eq!(result.unwrap().permission_decision.as_deref(), Some("deny"));
+                let HookOutput::PreToolUse(output) = result else {
+                    panic!("closed barrier omitted its pre-tool decision");
+                };
+                assert_eq!(output.permission_decision.as_deref(), Some("deny"));
             }
         }
     }

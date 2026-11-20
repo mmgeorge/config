@@ -283,6 +283,78 @@ pub(crate) fn successor_turn_pending(
     Ok(command.is_none() && matches!(message.purpose, InputPurpose::User) && gates.admit(&message))
 }
 
+/// Name the automatic task work that follows a settled exchange without user action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskSuccessor {
+    /// A task entry or continuation turn for the provider.
+    Turn,
+    /// The accepted plan's verification checks.
+    Checks,
+}
+
+/// Report the task work the owner will start next from committed task authority.
+///
+/// A task reserves its next turn in task state when the finished turn's evidence is applied; the
+/// queued input for it appears only after the finished input settles, and Execute checks have no
+/// queued input at all. Between those steps the session would otherwise read idle. This applies
+/// the facts the producers apply before they start that work: the task runs, its input is still
+/// pending, the exchange it continues completed (`source_complete`), no question, answer, queued
+/// user message, suspension, or approval holds it back, and a check continuation starts only when
+/// no check run is collecting.
+pub(crate) fn task_successor_pending(
+    task: Option<&crate::task::Task>,
+    input: &InputSnapshot,
+    questions: &QuestionController,
+    gates: TurnOfferGates,
+    source_complete: impl FnOnce(&crate::task::TaskTurnId) -> anyhow::Result<bool>,
+) -> Result<Option<TaskSuccessor>, InputOfferError> {
+    use crate::task::{TaskInputDelivery, TaskNextAction, TaskStatus};
+    let Some(task) = task.filter(|task| task.status() == TaskStatus::Running) else {
+        return Ok(None);
+    };
+    let user_waiting = input.messages.iter().any(|message| {
+        matches!(message.purpose, InputPurpose::User)
+            && !matches!(
+                message.delivery(),
+                InputDelivery::Accepted | InputDelivery::Delivering
+            )
+    });
+    if input.suspended
+        || user_waiting
+        || gates.has_approval
+        || questions_block_task_work(input, questions)?
+    {
+        return Ok(None);
+    }
+    if task
+        .entry
+        .as_ref()
+        .is_some_and(|entry| entry.delivery == TaskInputDelivery::Pending)
+    {
+        return Ok(
+            (task.next_action() == TaskNextAction::Model && !gates.checks_running)
+                .then_some(TaskSuccessor::Turn),
+        );
+    }
+    let Some((turn, continuation)) = task
+        .turn
+        .as_ref()
+        .and_then(|turn| turn.continuation.as_ref().map(|work| (turn, work)))
+        .filter(|(_, work)| work.delivery == TaskInputDelivery::Pending)
+    else {
+        return Ok(None);
+    };
+    let successor = match (continuation.work.is_checks(), task.next_action()) {
+        (false, TaskNextAction::Model) => TaskSuccessor::Turn,
+        (true, TaskNextAction::Checks) => TaskSuccessor::Checks,
+        _ => return Ok(None),
+    };
+    if gates.checks_running || !source_complete(&turn.id).map_err(InputOfferError::Queue)? {
+        return Ok(None);
+    }
+    Ok(Some(successor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +429,123 @@ mod tests {
             },
             open
         )?);
+        Ok(())
+    }
+
+    /// Predict reserved task work only while the owner would start it without the user.
+    ///
+    /// An Execute task that finished Implement reserves its verification checks with no queued
+    /// input, so the status read idle between the turn and the check run. The prediction must
+    /// also clear for every fact that holds the work back, or the status would never settle.
+    #[test]
+    fn task_successor_is_pending_only_for_work_the_owner_would_start() -> anyhow::Result<()> {
+        use crate::plan::{PlanExecutionRecord, PlanPhase};
+        use crate::task::{
+            Task, TaskContinuation, TaskInputDelivery, TaskInputId, TaskTurn, TaskTurnId, TaskWork,
+        };
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let questions = QuestionController::open(root.path(), "session")?;
+        let mut record: PlanExecutionRecord = serde_json::from_value(serde_json::json!({
+            "id":"execution", "session_id":"session", "plan_id":"accepted-plan",
+            "state":"active", "phase":"checking", "original_revision":1,"revision":1,
+            "generation":0, "lifecycle":[],"findings":[],
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "verification":[],"revision_history":[],"resume_after_review":false,
+            "observed_source":{},"observed_document_version":0,"observed_check":[],
+            "created_at_ms":1
+        }))?;
+        record.baseline_checkpoint = Some("captured-before-provider".into());
+        assert_eq!(record.phase, PlanPhase::Checking);
+        let mut task = Task::execute("Check the plan".into(), record, Default::default(), 1)?;
+        let completed = TaskTurnId {
+            exchange_ordinal: 1,
+            turn_ordinal: 1,
+        };
+        task.edit(|snapshot| {
+            if let Some(entry) = snapshot.entry.as_mut() {
+                entry.delivery = TaskInputDelivery::Accepted;
+            }
+            snapshot.turn = Some(TaskTurn {
+                id: completed.clone(),
+                continuation: Some(TaskContinuation {
+                    id: TaskInputId::fresh(),
+                    reason: "Run the accepted plan's verification checks".into(),
+                    display: None,
+                    delivery: TaskInputDelivery::Pending,
+                    work: TaskWork::Checks,
+                }),
+            });
+            Ok(())
+        })?;
+        let idle = InputSnapshot {
+            revision: 1,
+            messages: vec![],
+            suspended: false,
+            control_revision: 0,
+            control_operation_id: None,
+        };
+        let open = TurnOfferGates {
+            checks_running: false,
+            has_approval: false,
+            has_elicitation: false,
+        };
+        let successor = |task: &Task, input: &InputSnapshot, gates: TurnOfferGates, complete| {
+            task_successor_pending(Some(task), input, &questions, gates, |turn| {
+                assert_eq!(turn, &completed);
+                Ok(complete)
+            })
+        };
+        assert_eq!(
+            successor(&task, &idle, open, true)?,
+            Some(TaskSuccessor::Checks)
+        );
+        // The finished exchange has not completed, so the continuation cannot start yet.
+        assert_eq!(successor(&task, &idle, open, false)?, None);
+        // A collecting run or a pending approval holds the checks back.
+        let running = TurnOfferGates {
+            checks_running: true,
+            ..open
+        };
+        assert_eq!(successor(&task, &idle, running, true)?, None);
+        let approval = TurnOfferGates {
+            has_approval: true,
+            ..open
+        };
+        assert_eq!(successor(&task, &idle, approval, true)?, None);
+        let suspended = InputSnapshot {
+            suspended: true,
+            ..idle.clone()
+        };
+        assert_eq!(successor(&task, &suspended, open, true)?, None);
+        // A queued user message runs first, so the checks are not what starts next.
+        let user_waiting = InputSnapshot {
+            messages: vec![InputMessage::queued(crate::input::InputDraft {
+                id: "follow-up".into(),
+                text: "Continue".into(),
+                purpose: InputPurpose::User,
+                intent: InputIntent::Queue,
+                attachments: vec![],
+                config: None,
+            })],
+            ..idle.clone()
+        };
+        assert_eq!(successor(&task, &user_waiting, open, true)?, None);
+        // Accepted work already started; nothing remains to predict.
+        task.edit(|snapshot| {
+            if let Some(continuation) = snapshot
+                .turn
+                .as_mut()
+                .and_then(|turn| turn.continuation.as_mut())
+            {
+                continuation.delivery = TaskInputDelivery::Accepted;
+            }
+            Ok(())
+        })?;
+        assert_eq!(successor(&task, &idle, open, true)?, None);
+        assert_eq!(
+            task_successor_pending(None, &idle, &questions, open, |_| Ok(true))?,
+            None
+        );
         Ok(())
     }
 }

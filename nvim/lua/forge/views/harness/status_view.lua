@@ -26,6 +26,7 @@ local replica = require("forge.buffer")
 local position = require("forge.buffer_view")
 local spinner = require("forge.render.spinner")
 local hint = require("forge.views.harness.status_hint")
+local command_line_redraw = require("forge.infra.command_line_redraw")
 
 ---@param options {transcript: table, transcript_window: integer, composer_window?: integer, alive: fun(): boolean, notice: fun(message: string), recover: fun(document: table), refresh?: fun()}
 ---@return HarnessStatusView
@@ -143,6 +144,7 @@ function StatusView:render(context, commands)
   end
   self:update_animation()
   self:resize()
+  command_line_redraw.request()
 end
 
 function StatusView:update_animation()
@@ -170,6 +172,7 @@ function StatusView:update_animation()
         vim.api.nvim_buf_set_extmark(self.buffer, self.animation_namespace, marker.row, marker.column,
           { id = index + 1, virt_text = { { circle_frame, "ForgeStatusHint" } }, virt_text_pos = "overlay" })
       end
+      command_line_redraw.request()
     end
     self.timer = timer
     draw()

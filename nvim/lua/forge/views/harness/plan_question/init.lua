@@ -144,7 +144,7 @@ local function build_spec(elicitation, host)
           end
           -- The silent close skips `on_close`, so the host hears the close here; otherwise it
           -- would keep treating the question picker as open while the answers settle.
-          picker.close(false)
+          picker.close(false, "user")
           if host.closed then host.closed() end
           submission.continue_requested = true
           if submission.replica.pending() == 0 then continue_if_ready(submission, host)
@@ -158,7 +158,7 @@ local function build_spec(elicitation, host)
       local question_id = result.page.id
       local entry_kind = result.option.entry_kind
       if result.input_kind == "ask" then
-        picker.close(false)
+        picker.close(false, "user")
         host.ask({ question_id = question_id, text = result.text })
         return false
       end
@@ -202,7 +202,7 @@ local function build_spec(elicitation, host)
         submission.replica.remove(identity)
         if not next_elicitation then
           if picker.is_open("plan_question") then
-            picker.close(false)
+            picker.close(false, "user")
             if host.closed then host.closed() end
           end
           return

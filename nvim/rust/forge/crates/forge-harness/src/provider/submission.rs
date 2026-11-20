@@ -1111,7 +1111,7 @@ impl Submission {
                     .map_err(journal_failure)?;
                 if original.id != *id || original.request.owner()? != owner {
                     return Err(super::ProviderError::Observation(
-                        forge_provider_api::ObservationFailure::OwnershipConflict,
+                        forge_provider_api::ObservationFailure::ownership_conflict(),
                     ));
                 }
                 Ok(forge_provider_api::CoveredInput::new(

@@ -318,13 +318,19 @@ impl SessionTaskController {
             .with_task_mutation(|| restore(self.current()?))
     }
 
-    /// Clear task authority and replace rollback history in one durable transaction.
-    pub(crate) fn clear_for_rollback(
+    /// Replace rollback history and settle the task in one durable transaction.
+    ///
+    /// A task that began before the retained history ends keeps its identity and is paused, so
+    /// nothing resumes it on the user's behalf. A task whose start the rollback removes is cleared
+    /// without a finish row: its lifecycle leaves the timeline together with the rolled-back
+    /// interactions.
+    pub(crate) fn commit_rollback(
         &self,
         store: &mut SqliteStore,
         expected: Option<&TaskRevision>,
         replacement: &crate::session::HarnessSession,
         roots: &[String],
+        keeps_task: bool,
         now_ms: i64,
     ) -> Result<()> {
         ensure!(
@@ -334,9 +340,20 @@ impl SessionTaskController {
         let rollback = store.prepare_rollback(replacement, roots)?;
         store
             .commit_task_effects(&self.session_id, expected, now_ms, |active| {
-                let mut effects = clear_effect(&self.session_id, active.as_ref(), None, now_ms);
+                let mut effects = if keeps_task
+                    && active
+                        .as_ref()
+                        .is_some_and(|task| !task.status().terminal())
+                {
+                    Self::apply_change(active, TaskChange::Pause, now_ms)?;
+                    crate::storage::TaskEffects::default()
+                } else {
+                    let mut effects = clear_effect(&self.session_id, active.as_ref(), None, now_ms);
+                    effects.event.clear();
+                    *active = None;
+                    effects
+                };
                 effects.rollback = Some(Box::new(rollback));
-                *active = None;
                 Ok(((), effects))
             })?
             .context("rollback task commit unexpectedly reused a command")
@@ -369,6 +386,36 @@ impl SessionTaskController {
                 })
             },
         )
+    }
+
+    /// Withdraw the recorded acceptance of `plan_id` after execution refused it, so the review
+    /// neither replays the refused decision nor keeps its acceptance questions pending.
+    ///
+    /// Returns whether a recorded acceptance was withdrawn; a task without one is unchanged.
+    pub(crate) fn withdraw_refused_acceptance(
+        &self,
+        store: &mut SqliteStore,
+        plan_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let Some(task) = self.current()? else {
+            return Ok(false);
+        };
+        let recorded = matches!(&task.workflow, WorkflowSnapshot::Plan { plan }
+            if plan.artifact.id == plan_id
+                && plan.artifact.review.as_ref().is_some_and(|review| review.execution_request.is_some()));
+        if !recorded {
+            return Ok(false);
+        }
+        self.mutate(store, &task.permit(), now_ms, |draft| {
+            // The review returns to plain review at the same revision, as when automatic
+            // acceptance is turned off; inline comments stay saved beside the working document.
+            if let WorkflowSnapshot::Plan { plan } = &mut draft.workflow {
+                plan.artifact.review = None;
+                plan.artifact.updated_at_ms = now_ms;
+            }
+            Ok(true)
+        })
     }
 
     #[cfg(test)]
@@ -772,7 +819,7 @@ impl SessionTaskController {
                 }
                 let decision = match &mut task.workflow {
                     WorkflowSnapshot::Goal { goal } => {
-                        if let Some(control) = control {
+                        if let Some(control) = control.filter(|control| control.refusal.is_none()) {
                             goal.reported_status = Some(control.message.clone());
                         }
                         crate::goal::observe(&mut goal.state, &mut goal.continuation, evidence)
@@ -828,9 +875,22 @@ impl SessionTaskController {
                         id: super::TaskInputId::fresh(),
                         // The goal's objective travels in the `<task>` section.
                         work: super::TaskWork::Provider {
-                            instruction: crate::plan::task_step(
-                                forge_provider_api::forge::TaskStep::GoalContinue,
-                            ),
+                            instruction: {
+                                let mut instruction = crate::plan::task_step(
+                                    forge_provider_api::forge::TaskStep::GoalContinue,
+                                );
+                                // A refused completion reaches the model with its reason.
+                                if let Some(reason) =
+                                    control.and_then(|control| control.refusal.clone())
+                                {
+                                    instruction.push_notice(
+                                        forge_provider_api::forge::Notice::GoalCompletionRefused {
+                                            reason,
+                                        },
+                                    );
+                                }
+                                instruction
+                            },
                         },
                         reason: "The active task requires another turn".into(),
                         delivery: crate::task::TaskInputDelivery::Pending,
@@ -912,14 +972,18 @@ impl SessionTaskController {
             exchange_ordinal: exchange.ordinal,
             turn_ordinal: exchange.turn.len(),
         };
-        store.commit_task_change(
+        let anchor = crate::plan::ExchangeAnchor::capture(exchange);
+        let session_id = self.session_id.clone();
+        store
+            .commit_task_effects(
             &self.session_id,
             Some(permit.revision()),
             now_ms,
             |active| {
                 let task = active.as_mut().context("session has no active task")?;
                 permit.validate(Some(task))?;
-                task.edit(|task| {
+                let mut effects = crate::storage::TaskEffects::default();
+                let output = task.edit(|task| {
                     ensure!(
                         task.entry_accepted(),
                         "plan entry has not been acknowledged"
@@ -942,6 +1006,26 @@ impl SessionTaskController {
                             crate::plan::state_machine::PlanEvent::ChangesRequested,
                             now_ms,
                         )?;
+                        // The submitted revision no longer describes the planning directory,
+                        // so the timeline says why the plan left review.
+                        effects.lifecycle.push(crate::plan::PlanLifecycleRecord {
+                            title: plan.artifact.title.clone(),
+                            anchor: Some(anchor.clone()),
+                            id: uuid::Uuid::new_v4().to_string(),
+                            session_id: session_id.clone(),
+                            plan_id: plan.artifact.id.clone(),
+                            kind: crate::plan::PlanLifecycleKind::DraftWithdrawn,
+                            model_revision: plan.artifact.model_revision,
+                            user_revision: plan.artifact.user_revision,
+                            overall_comment: Some(
+                                "The planner changed the planning directory after submitting; it must submit again before review."
+                                    .into(),
+                            ),
+                            annotation: Vec::new(),
+                            question: None,
+                            answer: None,
+                            created_at_ms: now_ms,
+                        });
                     }
                     if canonical_progress {
                         plan.artifact.generation.canonical_revision = plan
@@ -958,14 +1042,45 @@ impl SessionTaskController {
                             | crate::plan::PlanState::Revising
                     );
                     if generating && !budget_allows {
-                        if plan.artifact.state == crate::plan::PlanState::ConfiguringChecks {
-                            plan.paused = true;
-                        } else {
-                            crate::plan::state_machine::PlanStateMachine::apply(
+                        match plan.artifact.state {
+                            crate::plan::PlanState::ConfiguringChecks => plan.paused = true,
+                            // A revision of a submitted plan that ends without resubmitting
+                            // returns to review at the last submitted revision; the user's
+                            // comments stay keyed to that unchanged working document.
+                            crate::plan::PlanState::Revising
+                                if plan.artifact.model_revision > 0
+                                    && plan.artifact.review_digest.is_some() =>
+                            {
+                                crate::plan::state_machine::PlanStateMachine::apply(
+                                    &mut plan.artifact,
+                                    crate::plan::state_machine::PlanEvent::RevisionAbandoned,
+                                    now_ms,
+                                )?;
+                                plan.artifact.generation.reset_no_progress();
+                                effects.lifecycle.push(crate::plan::PlanLifecycleRecord {
+                                    title: plan.artifact.title.clone(),
+                                    anchor: Some(anchor.clone()),
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    session_id: session_id.clone(),
+                                    plan_id: plan.artifact.id.clone(),
+                                    kind: crate::plan::PlanLifecycleKind::RevisionStopped,
+                                    model_revision: plan.artifact.model_revision,
+                                    user_revision: plan.artifact.user_revision,
+                                    overall_comment: Some(
+                                        "The planner ended its turns without resubmitting, so the plan returned to review unchanged."
+                                            .into(),
+                                    ),
+                                    annotation: Vec::new(),
+                                    question: None,
+                                    answer: None,
+                                    created_at_ms: now_ms,
+                                });
+                            }
+                            _ => crate::plan::state_machine::PlanStateMachine::apply(
                                 &mut plan.artifact,
                                 crate::plan::state_machine::PlanEvent::TransitionFailed,
                                 now_ms,
-                            )?;
+                            )?,
                         }
                     }
                     let continuing = generating && budget_allows;
@@ -1011,9 +1126,11 @@ impl SessionTaskController {
                         task.updated_at_ms = now_ms;
                     }
                     Ok(Some((artifact, continuing)))
-                })
+                })?;
+                Ok((output, effects))
             },
-        )
+        )?
+        .context("planning observation unexpectedly reused a command")
     }
 
     /// Records provider acceptance even if later user input cancelled the unsent intent.
@@ -1089,9 +1206,7 @@ impl SessionTaskController {
                 if error.is::<super::StaleTask>() {
                     TaskCommandFailure::Changed
                 } else {
-                    error
-                        .downcast::<TaskCommandFailure>()
-                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                    TaskCommandFailure::from_commit_error(error)
                 }
             })
     }
@@ -1195,7 +1310,7 @@ impl SessionTaskController {
                 TaskCommand::Pause(_) => TaskChange::Pause,
                 TaskCommand::Clear(_) => TaskChange::Clear,
                 TaskCommand::SetAutoAccept(policy) => {
-                    policy.target.validate(Some(current))?;
+                    policy.target.validate_identity(Some(current))?;
                     if !matches!(current.kind(), TaskKind::Plan | TaskKind::Execute) {
                         return Err(TaskCommandFailure::InvalidPolicyTask.into());
                     }
@@ -1274,9 +1389,7 @@ impl SessionTaskController {
                 if error.is::<super::StaleTask>() {
                     return TaskCommandFailure::Changed;
                 }
-                error
-                    .downcast::<TaskCommandFailure>()
-                    .unwrap_or(TaskCommandFailure::StateUnavailable)
+                TaskCommandFailure::from_commit_error(error)
             })?
             .ok_or(TaskCommandFailure::StateUnavailable)
     }
@@ -1331,9 +1444,7 @@ impl SessionTaskController {
                 ) {
                     TaskCommandFailure::IdentityConflict
                 } else {
-                    error
-                        .downcast::<TaskCommandFailure>()
-                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                    TaskCommandFailure::from_commit_error(error)
                 }
             })?
             .ok_or(TaskCommandFailure::StateUnavailable)
@@ -1435,9 +1546,7 @@ impl SessionTaskController {
                 ) {
                     TaskCommandFailure::IdentityConflict
                 } else {
-                    error
-                        .downcast::<TaskCommandFailure>()
-                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                    TaskCommandFailure::from_commit_error(error)
                 }
             })?
             .ok_or(TaskCommandFailure::StateUnavailable)
@@ -1560,9 +1669,7 @@ impl SessionTaskController {
                 ) {
                     TaskCommandFailure::IdentityConflict
                 } else {
-                    error
-                        .downcast::<TaskCommandFailure>()
-                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                    TaskCommandFailure::from_commit_error(error)
                 }
             })?
             .ok_or(TaskCommandFailure::StateUnavailable)
@@ -1717,9 +1824,7 @@ impl SessionTaskController {
                 if error.is::<super::StaleTask>() {
                     TaskCommandFailure::Changed
                 } else {
-                    error
-                        .downcast::<TaskCommandFailure>()
-                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                    TaskCommandFailure::from_commit_error(error)
                 }
             })?
             .ok_or(TaskCommandFailure::StateUnavailable)
@@ -1849,9 +1954,7 @@ impl SessionTaskController {
                 if error.is::<super::StaleTask>() {
                     TaskCommandFailure::Changed
                 } else {
-                    error
-                        .downcast::<TaskCommandFailure>()
-                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                    TaskCommandFailure::from_commit_error(error)
                 }
             })?
             .ok_or(TaskCommandFailure::StateUnavailable)
@@ -1895,11 +1998,7 @@ impl SessionTaskController {
             None => store.commit_task_effects(&self.session_id, None, now_ms, commit),
         };
         result
-            .map_err(|error| {
-                error
-                    .downcast::<TaskCommandFailure>()
-                    .unwrap_or(TaskCommandFailure::StateUnavailable)
-            })?
+            .map_err(TaskCommandFailure::from_commit_error)?
             .ok_or(TaskCommandFailure::StateUnavailable)
     }
 
@@ -1967,15 +2066,31 @@ impl SessionTaskController {
         change: TaskChange,
         now_ms: i64,
     ) -> Result<Option<Task>> {
-        let invalidate_observation = matches!(
-            &change,
-            TaskChange::Pause
-                | TaskChange::Resume
-                | TaskChange::ResumeWithEntry(_)
-                | TaskChange::ResumeWithChecks(_)
-                | TaskChange::Update(_)
-                | TaskChange::Install(_)
-        );
+        // An execution update that keeps its generation leaves the running turn's work valid,
+        // such as a review decision on the revision that turn submitted, so it keeps the turn's
+        // observation authority.
+        let keeps_generation = matches!(&change, TaskChange::Update(next)
+        if active.as_ref().is_some_and(|current| match (&current.workflow, &next.workflow) {
+            (
+                WorkflowSnapshot::Execute { execution: previous },
+                WorkflowSnapshot::Execute { execution: proposed },
+            ) => {
+                previous.record.id == proposed.record.id
+                    && previous.record.generation == proposed.record.generation
+                    && previous.record.phase == proposed.record.phase
+            }
+            _ => false,
+        }));
+        let invalidate_observation = !keeps_generation
+            && matches!(
+                &change,
+                TaskChange::Pause
+                    | TaskChange::Resume
+                    | TaskChange::ResumeWithEntry(_)
+                    | TaskChange::ResumeWithChecks(_)
+                    | TaskChange::Update(_)
+                    | TaskChange::Install(_)
+            );
         let mut draft = active.as_ref().map(Task::draft);
         Self::apply_draft_change(&mut draft, change, now_ms)?;
         if invalidate_observation && let Some(task) = &mut draft {
@@ -2004,6 +2119,19 @@ impl SessionTaskController {
                     "plan acceptance requires a Plan or Execute task"
                 );
                 task.auto_accept_plan = enabled;
+                // Turning automatic acceptance off withdraws an acceptance still waiting for
+                // its execution answers, so no question the user never asked for stays
+                // pending. The plan returns to plain review at the same revision.
+                if !enabled
+                    && let WorkflowSnapshot::Plan { plan } = &mut task.workflow
+                    && plan.artifact.review.as_ref().is_some_and(|review| {
+                        review.execution_request.is_some()
+                            && review.elicitation.has_pending_decisions()
+                    })
+                {
+                    plan.artifact.review = None;
+                    plan.artifact.updated_at_ms = now_ms;
+                }
                 task.updated_at_ms = now_ms;
             }
             TaskChange::Update(next) => {
@@ -2108,7 +2236,7 @@ impl SessionTaskController {
                         task.status(),
                         TaskStatus::Paused | TaskStatus::Blocked | TaskStatus::Failed
                     ),
-                    "task is not paused or blocked"
+                    "the task is not paused, blocked, or failed, so there is nothing to resume"
                 );
                 match &mut task.workflow {
                     WorkflowSnapshot::Goal { goal } => {

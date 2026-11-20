@@ -553,9 +553,8 @@ async fn list_sessions(
         .cloned()
         .collect();
     let sessions = store
-        .list_session((scope != "all").then_some(workspace.as_str()))?
+        .list_user_session((scope != "all").then_some(workspace.as_str()))?
         .into_iter()
-        .filter(|session| session.background.is_none())
         .map(|session| SessionListEntry {
             active: active_session_ids.contains(&session.id),
             session,

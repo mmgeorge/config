@@ -8,13 +8,9 @@
         "Working · 18s",
         "└─ Checking · 2/4 finished · 18s",
         "   ├─ ✓ format · passed · 1s",
-        "   ├─ ✗ lint · failed · 2s",
-        "   │  └─ unknown field",
-        "   ├─ ⠋ tests · running · 15s",
-        "   │  ├─ Building · Built test targets",
-        "   │  └─ Running session tests",
-        "   └─ ○ Lua host tests · queued",
-        "      └─ skill_marker_aligns_with_commentary",
+        "   ├─ ✗ lint · failed · 2s · unknown field",
+        "   ├─ ⠋ tests · running · 15s · Building · Built test targets · Running session tests",
+        "   └─ ○ Lua host tests · queued · skill_marker_aligns_with_commentary",
         "Reviewing the remaining diagnostics and checking 界界界 for a complete result"
       ],
       "metadata": {
@@ -27,32 +23,56 @@
           {
             "id": "status:working",
             "range": {
-              "start": { "row": 0, "column": 0 },
-              "end": { "row": 1, "column": 0 }
+              "start": {
+                "row": 0,
+                "column": 0
+              },
+              "end": {
+                "row": 1,
+                "column": 0
+              }
             }
           }
         ],
         "decoration": [
           {
             "range": {
-              "start": { "row": 5, "column": 10 },
-              "end": { "row": 5, "column": 13 }
+              "start": {
+                "row": 4,
+                "column": 10
+              },
+              "end": {
+                "row": 4,
+                "column": 13
+              }
             },
             "capture": "ForgeTimelineStatusSpinner",
             "priority": 110
           },
           {
             "range": {
-              "start": { "row": 1, "column": 0 },
-              "end": { "row": 10, "column": 0 }
+              "start": {
+                "row": 1,
+                "column": 0
+              },
+              "end": {
+                "row": 6,
+                "column": 0
+              }
             },
             "capture": "ForgeStatusHint",
             "priority": 100
           },
           {
             "range": {
-              "start": { "row": 10, "column": 0 },
-              "end": { "row": 11, "column": 0 }
+              "start": {
+                "row": 6,
+                "column": 0
+              },
+              "end": {
+                "row": 7,
+                "column": 0
+              }
             },
             "capture": "ForgeHarnessCommentary",
             "priority": 100

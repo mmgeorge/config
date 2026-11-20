@@ -48,9 +48,7 @@ impl Resolution {
                     describe(candidates),
                 ),
                 Problem::UnverifiedAbsence => "static discovery cannot verify removal; exact discovery is required after implementation".into(),
-                Problem::UnsupportedTarget(target) => format!(
-                    "target selector {target:?} is unsupported by test adapters; remove it and qualify the name or narrow the enabled checks",
-                ),
+                Problem::InvalidTarget { target, reason } => format!("target {target:?}: {reason}"),
                 Problem::Duplicate(candidate) => format!(
                     "duplicates another planned entry for {} in check {}",
                     candidate.id.as_str(), candidate.check,
@@ -81,7 +79,7 @@ pub(super) enum Problem {
     DiscoveryFailed { check: String, message: String },
     StillPresent(Vec<Candidate>),
     UnverifiedAbsence,
-    UnsupportedTarget(String),
+    InvalidTarget { target: String, reason: String },
     Duplicate(Candidate),
 }
 
@@ -104,38 +102,51 @@ pub(in crate::checks) fn submission_warnings(
             positions.insert((file, name), index + 1);
         }
     }
-    resolve(&design.document.tests, DiscoverMode::Static, inventories)
-        .into_iter()
-        .filter_map(|resolution| {
-            let message = resolution.warning()?;
-            let line = positions
-                .get(&(resolution.file.as_str(), resolution.name.as_str()))
-                .copied();
-            Some(
-                line.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "submitted test warning has no authored line: {}: {}",
-                        resolution.file,
-                        resolution.name
-                    )
-                })
-                .map(|line| super::PlannedTestWarning {
-                    file: resolution.file,
-                    name: resolution.name,
-                    change: resolution.change,
-                    line,
-                    message,
-                }),
-            )
-        })
-        .collect::<anyhow::Result<Vec<_>>>()
+    let config = &design
+        .check_configuration
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("planned test warnings require the check configuration"))?
+        .config;
+    resolve(
+        &design.document.tests,
+        DiscoverMode::Static,
+        inventories,
+        config,
+    )
+    .into_iter()
+    .filter_map(|resolution| {
+        let message = resolution.warning()?;
+        let line = positions
+            .get(&(resolution.file.as_str(), resolution.name.as_str()))
+            .copied();
+        Some(
+            line.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "submitted test warning has no authored line: {}: {}",
+                    resolution.file,
+                    resolution.name
+                )
+            })
+            .map(|line| super::PlannedTestWarning {
+                file: resolution.file,
+                name: resolution.name,
+                change: resolution.change,
+                line,
+                message,
+            }),
+        )
+    })
+    .collect::<anyhow::Result<Vec<_>>>()
 }
 
 /// Resolve all entries from one captured set of inventories; never choose one ambiguous check.
+///
+/// A case's target restricts its candidates to the test check `config` resolves it to.
 pub(super) fn resolve(
     planned: &[DesignTestFile],
     mode: DiscoverMode,
     inventories: &[PlannedInventory],
+    config: &crate::checks::CheckConfig,
 ) -> Vec<Resolution> {
     let failure = inventories
         .iter()
@@ -161,6 +172,11 @@ pub(super) fn resolve(
     for inventory in inventories {
         if let InventoryResult::Available(discovery) = inventory.discovery() {
             let mut locations = inventory.locations();
+            let parents: BTreeMap<_, _> = discovery
+                .items()
+                .iter()
+                .map(|item| (&item.id, item))
+                .collect();
             for item in discovery.items() {
                 let location = locations
                     .remove(&item.id)
@@ -169,7 +185,13 @@ pub(super) fn resolve(
                     owned_files.insert(path.to_owned());
                 }
                 if item.case {
-                    cases.push((inventory.check(), item, discovery.mode(), location));
+                    cases.push(DiscoveredCase {
+                        check: inventory.check(),
+                        item,
+                        labels: label_chain(item, &parents),
+                        mode: discovery.mode(),
+                        source: location,
+                    });
                 }
             }
         }
@@ -180,10 +202,16 @@ pub(super) fn resolve(
             if mode == DiscoverMode::Static && test.change == DesignTestChange::New {
                 continue;
             }
-            let outcome = if let Some(target) =
-                test.target.as_ref().filter(|target| !target.is_empty())
-            {
-                Outcome::Problem(Problem::UnsupportedTarget(target.clone()))
+            let target = test.target.as_deref().map(|target| {
+                config
+                    .test_target(target)
+                    .map(|definition| (target, definition))
+            });
+            let outcome = if let Some(Err(reason)) = &target {
+                Outcome::Problem(Problem::InvalidTarget {
+                    target: test.target.clone().unwrap_or_default(),
+                    reason: reason.clone(),
+                })
             } else if let Some((check, message)) = &failure {
                 Outcome::Problem(Problem::DiscoveryFailed {
                     check: check.clone(),
@@ -191,6 +219,9 @@ pub(super) fn resolve(
                 })
             } else {
                 let mut candidates = candidates(&cases, &file.file, &test.name);
+                if let Some(Ok((_, definition))) = &target {
+                    candidates.retain(|candidate| candidate.check == definition.id);
+                }
                 candidates
                     .sort_by(|left, right| (&left.check, &left.id).cmp(&(&right.check, &right.id)));
                 if test.change == DesignTestChange::Removed {
@@ -242,44 +273,78 @@ pub(super) fn resolve(
     resolutions
 }
 
+/// Retain one discovered case with the titles of its enclosing groups, outermost first.
+struct DiscoveredCase<'inventory> {
+    check: &'inventory str,
+    item: &'inventory TestItem,
+    labels: Vec<&'inventory str>,
+    mode: DiscoverMode,
+    source: SourceLocation,
+}
+
+/// Collect a case's own label after its ancestors' labels; validated trees have no cycles.
+fn label_chain<'item>(
+    item: &'item TestItem,
+    parents: &BTreeMap<&TestItemId, &'item TestItem>,
+) -> Vec<&'item str> {
+    let mut labels = vec![item.label.as_str()];
+    let mut parent = item.parent.as_ref();
+    while let Some(ancestor) = parent.and_then(|id| parents.get(id)) {
+        labels.push(ancestor.label.as_str());
+        parent = ancestor.parent.as_ref();
+    }
+    labels.reverse();
+    labels
+}
+
 /// Prefer file-owned cases globally, then permit locationless names only with exact discovery.
-fn candidates(
-    cases: &[(&str, &TestItem, DiscoverMode, SourceLocation)],
-    file: &str,
-    name: &str,
-) -> Vec<Candidate> {
-    let matching = cases
+///
+/// A case in the planned file also matches by its own label or by trailing group labels, so a
+/// plan can name a test by the title its source declares rather than an adapter's full name.
+fn candidates(cases: &[DiscoveredCase<'_>], file: &str, name: &str) -> Vec<Candidate> {
+    let qualified = |case: &&DiscoveredCase<'_>| {
+        case.item
+            .name
+            .as_deref()
+            .is_some_and(|found| names_match(found, name))
+    };
+    let located = cases
         .iter()
-        .filter(|(_, item, _, _)| {
-            item.name
-                .as_deref()
-                .is_some_and(|found| names_match(found, name))
-        })
-        .collect::<Vec<_>>();
-    let located = matching
-        .iter()
-        .copied()
-        .filter(|(_, _, _, source)| source.path() == Some(file))
+        .filter(|case| case.source.path() == Some(file))
+        .filter(|case| qualified(case) || labels_match(&case.labels, name))
         .collect::<Vec<_>>();
     let chosen = if located.is_empty() {
-        matching
-            .into_iter()
-            .filter(|(_, _, accuracy, source)| {
-                source.path().is_none() && *accuracy == DiscoverMode::Exact
-            })
+        cases
+            .iter()
+            .filter(qualified)
+            .filter(|case| case.source.path().is_none() && case.mode == DiscoverMode::Exact)
             .collect()
     } else {
         located
     };
     chosen
         .into_iter()
-        .map(|(check, item, _, source)| Candidate {
-            check: (*check).into(),
-            id: item.id.clone(),
-            name: item.name.clone().expect("matching requires a name"),
-            source: source.clone(),
+        .map(|case| Candidate {
+            check: case.check.into(),
+            id: case.item.id.clone(),
+            name: case
+                .item
+                .name
+                .clone()
+                .unwrap_or_else(|| case.item.label.clone()),
+            source: case.source.clone(),
         })
         .collect()
+}
+
+/// Match a planned name against trailing group and case labels joined by a common separator.
+fn labels_match(labels: &[&str], planned: &str) -> bool {
+    (1..=labels.len()).any(|count| {
+        let trailing = &labels[labels.len() - count..];
+        [" > ", " ", "::"]
+            .iter()
+            .any(|separator| trailing.join(separator) == planned)
+    })
 }
 
 /// Render qualified candidate identity without assigning semantics to the opaque item ID.
@@ -306,6 +371,22 @@ fn names_match(discovered: &str, planned: &str) -> bool {
 mod tests {
     use super::*;
     use crate::checks::adapter::Discovery;
+
+    /// Configure the test check `test`, labelled `Vitest`, that case targets may name.
+    fn config() -> crate::checks::CheckConfig {
+        serde_json::from_value(serde_json::json!({"test":{"action":{"label":"Vitest",
+            "category":"test","adapter":{"script":{"command":["unused"]}}}}}))
+        .unwrap()
+    }
+
+    /// Resolve against the fixture configuration.
+    fn resolve(
+        planned: &[DesignTestFile],
+        mode: DiscoverMode,
+        inventories: &[PlannedInventory],
+    ) -> Vec<Resolution> {
+        super::resolve(planned, mode, inventories, &config())
+    }
 
     /// Construct a discovered case with opaque identity and optional source ownership.
     fn item(id: &str, name: &str, path: Option<&str>) -> TestItem {
@@ -465,7 +546,84 @@ mod tests {
         );
     }
 
-    /// Report all duplicate entries and reject legacy targets rather than silently dropping them.
+    /// Construct a located group or case whose name joins its suite titles with spaces.
+    fn titled(id: &str, parent: Option<&str>, label: &str, case: bool, path: &str) -> TestItem {
+        TestItem {
+            id: id.to_owned().try_into().unwrap(),
+            parent: parent.map(|parent| parent.to_owned().try_into().unwrap()),
+            label: label.into(),
+            case,
+            name: case.then(|| format!("money {label}")),
+            path: Some(path.into()),
+            line: None,
+        }
+    }
+
+    /// A planned leaf title or trailing suite titles match inside the planned file only.
+    #[test]
+    fn leaf_and_suite_labels_resolve_within_the_planned_file() {
+        let file = "tests/money.test.ts";
+        let mut items = vec![
+            titled(file, None, "money.test.ts", false, file),
+            titled("money", Some(file), "money", false, file),
+            titled("money > splits", Some("money"), "splits", true, file),
+            titled("other.ts", None, "other.ts", false, "tests/other.ts"),
+            titled(
+                "other > rounds",
+                Some("other.ts"),
+                "rounds",
+                true,
+                "tests/other.ts",
+            ),
+        ];
+        let exact =
+            |items: &[TestItem]| vec![inventory("test", DiscoverMode::Exact, items.to_vec())];
+        for name in ["splits", "money > splits", "money splits"] {
+            let planned = planned(&[(file, name, DesignTestChange::New)]);
+            assert!(
+                matches!(&resolve(&planned, DiscoverMode::Exact, &exact(&items))[0].outcome,
+                    Outcome::Resolved(candidate) if candidate.id.as_str() == "money > splits"),
+                "{name} did not resolve"
+            );
+        }
+        let elsewhere = planned(&[(file, "rounds", DesignTestChange::New)]);
+        assert_eq!(
+            resolve(&elsewhere, DiscoverMode::Exact, &exact(&items))[0].outcome,
+            Outcome::Problem(Problem::NotFound)
+        );
+        items.push(titled("second", Some(file), "second", false, file));
+        items.push(titled(
+            "second > splits",
+            Some("second"),
+            "splits",
+            true,
+            file,
+        ));
+        let planned = planned(&[(file, "splits", DesignTestChange::New)]);
+        assert!(matches!(
+            &resolve(&planned, DiscoverMode::Exact, &exact(&items))[0].outcome,
+            Outcome::Problem(Problem::Ambiguous(candidates)) if candidates.len() == 2
+        ));
+    }
+
+    /// A target given as a test check's label selects that check's cases, as its ID does.
+    #[test]
+    fn a_target_label_selects_its_test_check() {
+        let file = "tests/money.test.ts";
+        let mut planned = planned(&[(file, "money splits", DesignTestChange::New)]);
+        planned[0].cases[0].target = Some("Vitest".into());
+        let inventories = vec![inventory(
+            "test",
+            DiscoverMode::Exact,
+            vec![item("money > splits", "money splits", Some(file))],
+        )];
+        assert!(matches!(
+            &resolve(&planned, DiscoverMode::Exact, &inventories)[0].outcome,
+            Outcome::Resolved(candidate) if candidate.check == "test"
+        ));
+    }
+
+    /// Report all duplicate entries and reject unknown targets rather than silently dropping them.
     #[test]
     fn duplicate_entries_and_unsupported_targets_are_not_execution_selections() {
         let mut planned = planned(&[
@@ -487,14 +645,26 @@ mod tests {
         planned[0].cases[0].target = Some("legacy-binary".into());
         assert_eq!(
             resolve(&planned, DiscoverMode::Exact, &inventories)[0].outcome,
-            Outcome::Problem(Problem::UnsupportedTarget("legacy-binary".into()))
+            Outcome::Problem(Problem::InvalidTarget {
+                target: "legacy-binary".into(),
+                reason:
+                    "the target names no configured test check; valid targets are `test` (Vitest)"
+                        .into(),
+            })
         );
     }
 
     /// Submission skips new cases and anchors missing existing tests to their authored lines.
     #[test]
     fn submission_warnings_name_artifact_lines_without_claiming_absence() -> anyhow::Result<()> {
-        let mut design = DeclarationDesign::default();
+        let mut design = DeclarationDesign {
+            check_configuration: Some(crate::checks::ConfigSnapshot {
+                digest: "fixture".into(),
+                config: config(),
+                helper_digest: Default::default(),
+            }),
+            ..Default::default()
+        };
         design.document.tests = planned(&[
             ("tests.rs", "new_test", DesignTestChange::New),
             ("tests.rs", "missing", DesignTestChange::Modified),

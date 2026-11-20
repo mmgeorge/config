@@ -843,7 +843,9 @@ impl CommandFailure {
             Self::Task(failure) => failure.code(),
             Self::Rollback(failure) => failure.code(),
             Self::Agent(failure) => failure.code(),
-            Self::TaskSynchronization { failure, .. } => failure.code(),
+            // The editor keeps a submitted draft out of the composer only when it knows the task
+            // change committed, so this variant has one code whatever stage failed after it.
+            Self::TaskSynchronization { .. } => "task_change_committed_dispatch_failed",
             Self::Compaction(failure) => failure.code(),
             Self::Input(_) => "input_rejected",
             Self::Interrupted => "command_interrupted",

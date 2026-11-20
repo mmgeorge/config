@@ -101,6 +101,7 @@ impl HarnessBroker {
             tool_timeout,
         )?);
         let session_events = self.observer.session_events();
+        let inbox_claim = Some(session_events.claim_for_foreground());
         session_events.watch_tools(&scope, &watchdog)?;
         session_events.start_tool_monitor(
             scope.clone(),
@@ -147,7 +148,13 @@ impl HarnessBroker {
                 permissions: self.permission_coordinator.clone(),
                 scope: scope.clone(),
                 authorization_sink: provider_event_sink.clone(),
-                editing: self.observer.check_editing.clone(),
+                // Check setup edits the project's checks in its own exchange; the session's
+                // check editing setting stays as the user chose it.
+                editing: if staged.exchange.check_setup.is_some() {
+                    Arc::new(AtomicBool::new(true))
+                } else {
+                    self.observer.check_editing.clone()
+                },
                 operations: crate::checks::model_check_operations(
                     staged.exchange.check_setup.is_some(),
                     self.agent_coordinator.active_count(),
@@ -259,6 +266,7 @@ impl HarnessBroker {
             _agent_lease: agent_lease,
             _check_lease: check_lease,
             pending_session_observations: std::collections::VecDeque::new(),
+            inbox_claim,
             observation_publication_in_flight: false,
             finalization: None,
             failure_cleanup_active: false,

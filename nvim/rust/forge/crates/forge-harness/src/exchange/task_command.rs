@@ -464,7 +464,14 @@ impl TaskCommandRun {
                 Ok(TaskCommandProgress::waiting())
             }
             TaskCommandEvent::ExecutionPrepared(result) => {
-                self.stage = TaskStage::Commit(TaskCommit::Execution(result.map_err(rejected)?));
+                let prepared = match result {
+                    Ok(prepared) => prepared,
+                    Err(failure) => {
+                        self.withdraw_refused_acceptance(&failure, services)?;
+                        return Err(rejected(failure));
+                    }
+                };
+                self.stage = TaskStage::Commit(TaskCommit::Execution(prepared));
                 Ok(TaskCommandProgress::waiting())
             }
             TaskCommandEvent::PreparationDeadline => Err(OperationFailure::JobDeadline),
@@ -718,6 +725,9 @@ impl TaskCommandRun {
                         rejected(error)
                     }
                 })?;
+                // The close below records its question and exchange changes through their own
+                // writer leases, which this thread cannot take while it holds the task commit's.
+                drop(store);
                 // Collection parked any running exchange for a later admission to close. A finite
                 // control that removed the task schedules none, so close it while control is held.
                 let closed = match &committed {
@@ -961,10 +971,8 @@ impl TaskCommandRun {
                 });
             }
         }
-        if let Command::Task(intent) = &self.command.record.request.command
-            && let Some(target) = intent.target()
-        {
-            target.validate(current.as_ref()).map_err(rejected)?;
+        if let Command::Task(intent) = &self.command.record.request.command {
+            intent.validate_target(current.as_ref()).map_err(rejected)?;
         }
         let source = match &self.command.record.request.command {
             Command::Task(intent) => intent.plan_source(),
@@ -999,11 +1007,18 @@ impl TaskCommandRun {
                 .validate_target(current.as_ref())
                 .map_err(rejected)?;
             let now_ms = owner_now_ms()?;
-            match services
-                .observer
-                .prepare_plan_execution(&self.command.record.request.id, &selection, now_ms)
-                .map_err(rejected)?
-            {
+            let preparation = match services.observer.prepare_plan_execution(
+                &self.command.record.request.id,
+                &selection,
+                now_ms,
+            ) {
+                Ok(preparation) => preparation,
+                Err(failure) => {
+                    self.withdraw_refused_acceptance(&failure, services)?;
+                    return Err(rejected(failure));
+                }
+            };
+            match preparation {
                 crate::broker::PlanExecutionPreparation::AwaitingInput {
                     change,
                     question_set,
@@ -1223,7 +1238,7 @@ impl TaskCommandRun {
                 let change = services
                     .observer
                     .prepare_task_change(&action, current.as_ref(), services.goal_max_turns, now_ms)
-                    .map_err(|_| rejected(TaskCommandFailure::PreparationUnavailable))?;
+                    .map_err(|error| rejected(TaskCommandFailure::preparation(&error)))?;
                 Ok(TaskCommit::Mutation {
                     intent: Box::new(intent),
                     prior,
@@ -1267,7 +1282,7 @@ impl TaskCommandRun {
                     .validate_storage(&store, observer.session_id())?;
                 let (task, mut effects) = observer
                     .prepare_execution(validated.request(), budget, now_ms)
-                    .map_err(|_| TaskCommandFailure::PreparationUnavailable)?;
+                    .map_err(|error| TaskCommandFailure::preparation(&error))?;
                 effects.terminal_commit = Some(crate::storage::TerminalCommit {
                     id: acceptance_id,
                     result: serde_json::json!({"approved":true}),
@@ -1353,7 +1368,7 @@ impl TaskCommandRun {
                 }
                 observer
                     .prepare_task_change(&action, current.as_ref(), budget, now_ms)
-                    .map_err(|_| TaskCommandFailure::PreparationUnavailable)
+                    .map_err(|error| TaskCommandFailure::preparation(&error))
                     .and_then(|prepared| {
                         let crate::broker::plan_entry::PreparedTaskChange {
                             change,
@@ -1575,6 +1590,37 @@ impl TaskCommandRun {
     }
 
     /// Reconcile a settled preparation against persisted authority before releasing its command.
+    /// Withdraw a recorded acceptance that execution refused for a domain reason, so the review
+    /// does not replay it. Storage and identity failures leave task state as it was.
+    fn withdraw_refused_acceptance(
+        &self,
+        failure: &TaskCommandFailure,
+        services: &OwnerServices,
+    ) -> Result<(), OperationFailure> {
+        if !matches!(
+            failure,
+            TaskCommandFailure::PreparationRefused { .. }
+                | TaskCommandFailure::PreparationUnavailable
+        ) {
+            return Ok(());
+        }
+        let plan_id = match &self.command.record.request.command {
+            Command::Task(TaskCommand::ExecutePlan(selection)) => selection.source().id(),
+            Command::ContinueWorkflow(request) => match request.execution() {
+                Some(selection) => selection.source().id(),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let mut store = crate::storage::writer::HistoryWriter::lease_for(&services.root)
+            .map_err(OperationFailure::Domain)?;
+        services
+            .tasks
+            .withdraw_refused_acceptance(&mut store, plan_id.as_str(), owner_now_ms()?)
+            .map_err(OperationFailure::Domain)?;
+        Ok(())
+    }
+
     fn reconcile_source_artifacts(&self, services: &OwnerServices) -> Result<(), OperationFailure> {
         let source = match &self.command.record.request.command {
             Command::Task(intent) => intent

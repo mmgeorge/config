@@ -64,6 +64,8 @@ T["plan_check_selection"] = function()
   assert(text:find("● Package tests", 1, true), text)
   keymap.invoke("<Space>")
   assert(pending and pending.params.enabled.tests == false, "picker did not disable the selected check")
+  -- The host decodes these fields as maps, so an empty Lua table must encode as an object.
+  eq(vim.json.encode(pending.params.test_scopes), "{}")
   local active = pending
   keymap.invoke("<Space>")
   assert(pending == active, "rapid toggles submitted concurrent plan edits")
@@ -91,6 +93,7 @@ T["plan_check_selection"] = function()
   keymap.invoke("y")
   assert(pending and pending.params.enabled.tests == false and #pending.params.tests == 0,
     "visual deletion did not become a plan-only disable")
+  eq(vim.json.encode(pending.params.test_scopes), "{}")
   version, enabled = 4, false
   pending.callback({ plan = { id = "plan", state = "awaiting_review", working_path = path, review_digest = "digest:4" },
     review = presentation(review.owner.document) })

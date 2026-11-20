@@ -367,6 +367,8 @@ T["questions"] = function()
   assert(not vim.bo[buffer].modified and comments.capture(buffer)[1].source.body == "Newer unsaved question?" and not owner.saving,
     "provider failure lost the saved question or blocked retry")
   assert(not buffer_support.text(buffer):find("Generating response", 1, true), "provider failure retained a generating placeholder")
+  assert(buffer_support.text(buffer):find("No answer · failed: Provider unavailable · <C-s> to regenerate", 1, true),
+    "provider failure left the question without an explicit failed state")
   vim.cmd("write")
   eq(pending[5].method, "session.plan.question.answer", { fail_reason = "retry did not resubmit the unanswered question" })
   pending[5].callback(response("Newer unsaved question?", "The interface establishes the ownership boundary."))
@@ -410,6 +412,35 @@ T["questions"] = function()
   end
   owner.action("comment", function() end)
   eq(comments.capture(buffer)[3].parent_id, "2", { fail_reason = "C on a follow-up answer lost the conversation" })
+  owner.close()
+  vim.api.nvim_buf_delete(buffer, { force = true })
+end
+
+T["question_whose_answer_did_not_survive_shows_interrupted"] = function()
+  local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
+  local client = require("forge.client")
+  local pending = {}
+  client.host_get_generation = function() return 1 end
+  client.host_is_accepting = function() return true end
+  client.request = function(request_specification, callback)
+    pending[#pending + 1] = { params = request_specification.params or {}, callback = encode_delivery(callback) }
+  end
+  local buffer = buffer_support.scratch(nil, { name = vim.fn.tempname() .. ".md" })
+  vim.api.nvim_win_set_buf(0, buffer)
+  local owner = require("forge.views.plan_review.document").attach({ session_id = "session", buffer = buffer,
+    window = vim.api.nvim_get_current_win(), plan = { id = "plan", review_digest = "canonical" },
+    notice = function() end }, function(_, failure) assert(not failure, failure) end)
+  -- The review reopens after an abrupt close: the saved question has no reply, and no answer job
+  -- runs in this editor.
+  pending[1].callback({ saved_source_digest = "saved", source_row = {
+    { id = "source", target = "source", text = "pub struct State;", source_line = 1,
+      block = "plan:source", position = { row = 0, column = 0 }, metadata = {} },
+  }, annotation = { { id = "1", kind = "question", source = { start_line = 1, end_line = 1, body = "Why own this state?" } } },
+  snapshot = { document = owner.document, revision = 0, block = {
+    { id = "plan:source", text = { "pub struct State;" }, metadata = { target = {}, editable_region = {}, decoration = {} } },
+  } } })
+  assert(buffer_support.text(buffer):find("No answer · interrupted · <C-s> to regenerate", 1, true),
+    "a question whose answer did not survive showed no state: " .. buffer_support.text(buffer))
   owner.close()
   vim.api.nvim_buf_delete(buffer, { force = true })
 end

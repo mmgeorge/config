@@ -860,9 +860,8 @@ fn started_text_message(message_id: &str, usage: Option<Value>) -> Vec<Value> {
 /// message already consumed its prompt; the adapter reports what that message's frames carried.
 ///
 /// Input counts are fixed when the message starts, but its output count is final only in its
-/// `message_delta` or in an assistant frame that carries a `stop_reason`. The CLI copies the
-/// `message_start` count into the assistant frames of a message still streaming, so a message cut
-/// off before either final report has no output figure, and the turn reports none.
+/// `message_delta`. The CLI copies the `message_start` count into the message's assistant frames,
+/// so a message cut off before that report has no output figure, and the turn reports none.
 #[tokio::test]
 async fn interrupted_result_without_usage_reports_the_streamed_message_usage() {
     let aborted = json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
@@ -906,15 +905,269 @@ async fn interrupted_result_without_usage_reports_the_streamed_message_usage() {
     let events = interrupted_turn_events(finished, aborted.clone()).await;
     assert_eq!(reported_usage(&events), usage(Some(412)));
 
-    // An assistant frame with a stop reason is final as well.
+    // An assistant frame that names a stop reason still carries the start count.
     let mut stopped = started_text_message("msg-1", Some(start_usage()));
     stopped.push(assistant("msg-1", json!("end_turn")));
     let events = interrupted_turn_events(stopped, aborted.clone()).await;
-    assert_eq!(reported_usage(&events), usage(Some(3)));
+    assert_eq!(reported_usage(&events), usage(None));
 
     // A turn aborted before any API message reported usage has no figures to show.
-    let events = interrupted_turn_events(started_text_message("msg-1", None), aborted).await;
+    let events =
+        interrupted_turn_events(started_text_message("msg-1", None), aborted.clone()).await;
     assert_eq!(reported_usage(&events), []);
+
+    // An aborted result can carry its own usage, summed from the same start counts. Its input
+    // stands, but its output is no more final than the streamed messages it was summed from.
+    let mut summed = aborted;
+    summed["usage"] = start_usage();
+    let mut streaming = started_text_message("msg-1", Some(start_usage()));
+    streaming.push(assistant("msg-1", Value::Null));
+    let events = interrupted_turn_events(streaming, summed.clone()).await;
+    assert_eq!(reported_usage(&events), usage(None));
+    let mut stopped = started_text_message("msg-1", Some(start_usage()));
+    stopped.push(assistant("msg-1", json!("end_turn")));
+    let events = interrupted_turn_events(stopped, summed).await;
+    assert_eq!(reported_usage(&events), usage(None));
+}
+
+/// Run one turn whose peer streams `frames` and ends it with `result` on its own, returning the
+/// turn's events. No interrupt marks the turn, as when the CLI ends it for a reason the adapter
+/// did not request or does not recognize.
+async fn ended_turn_events(
+    frames: Vec<Value>,
+    result: Value,
+) -> Vec<forge_provider_api::ProviderEvent> {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(move || {
+        let frames = frames.clone();
+        let result = result.clone();
+        Box::new(move |frame| {
+            let uuid = user_uuid(frame)?;
+            let mut reply = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            reply.extend(frames.clone());
+            reply.push(result.clone());
+            Some(reply)
+        })
+    });
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    start_prompt(&provider, &binding, "turn-1").await;
+    let (events, _) = until_completed(&mut opened.events).await;
+    provider.shutdown(operation_context()).await.unwrap();
+    events
+}
+
+/// An interrupted long answer never reports the start count its frames repeat as its output.
+///
+/// The frames replay a Claude Code session whose interrupted answer read `42.9k (99% cached)
+/// -> 5 · 0 tps`: one API message whose thinking and text frames both carry `stop_reason: null`
+/// and the `message_start` count `output_tokens: 5`, then the interrupt and its aborted result.
+/// The log kept no stream frames, so each way the count could have passed as final is replayed:
+/// a frame that names a stop reason without a `message_delta`, a message that left no usage
+/// record, the `message_delta` the CLI itself writes to close an abandoned stream, and a result
+/// the adapter did not recognize as its own interrupt. Only a `message_delta` that names a stop
+/// reason makes a message's output final.
+#[tokio::test]
+async fn interrupted_long_answer_never_reports_its_start_count() {
+    let native_usage = || {
+        json!({"input_tokens": 4, "cache_creation_input_tokens": 245,
+            "cache_read_input_tokens": 42640,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 245},
+            "output_tokens": 5, "service_tier": "standard", "inference_geo": "global",
+            "speed": "standard"})
+    };
+    let event = |event: Value| {
+        json!({"type": "stream_event", "event": event, "parent_tool_use_id": null,
+            "uuid": uuid::Uuid::new_v4().to_string()})
+    };
+    let assistant = |block: Value, stop_reason: Value, usage: Option<Value>| {
+        let mut message = json!({"model": "claude-haiku-5-5",
+            "id": "msg_011ChCnyRjSJUDQ3HntynsZt", "type": "message", "role": "assistant",
+            "content": [block], "stop_reason": stop_reason, "stop_sequence": null,
+            "stop_details": null, "container": null, "context_management": null});
+        if let Some(usage) = usage {
+            message["usage"] = usage;
+        }
+        json!({"type": "assistant", "parent_tool_use_id": null,
+            "uuid": uuid::Uuid::new_v4().to_string(), "message": message})
+    };
+    let answer = |stop_reason: Value, usage: Option<Value>| {
+        let mut start = json!({"id": "msg_011ChCnyRjSJUDQ3HntynsZt", "type": "message",
+            "role": "assistant", "content": [], "model": "claude-haiku-5-5"});
+        if let Some(usage) = &usage {
+            start["usage"] = usage.clone();
+        }
+        vec![
+            event(json!({"type": "message_start", "message": start})),
+            event(json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}})),
+            event(json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Drafting the answer."}})),
+            assistant(
+                json!({"type": "thinking", "thinking": "Drafting the answer.", "signature": ""}),
+                Value::Null,
+                usage.clone(),
+            ),
+            event(json!({"type": "content_block_stop", "index": 0})),
+            event(json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}})),
+            event(json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "A skip list is a set of sorted lists"}})),
+            assistant(
+                json!({"type": "text", "text": "A skip list is a set of sorted lists"}),
+                stop_reason,
+                usage,
+            ),
+        ]
+    };
+    let aborted = |terminal_reason: &str, usage: Option<Value>| {
+        let mut result = json!({"type": "result", "subtype": "error_during_execution",
+            "is_error": true, "duration_ms": 12000, "num_turns": 1,
+            "terminal_reason": terminal_reason, "uuid": uuid::Uuid::new_v4().to_string()});
+        if let Some(usage) = usage {
+            result["usage"] = usage;
+        }
+        result
+    };
+    let reported = |events: &[forge_provider_api::ProviderEvent]| {
+        reported_usage(events)
+            .into_iter()
+            .map(|usage| usage.output)
+            .collect::<Vec<_>>()
+    };
+
+    // The recorded sequence: every frame streaming, the result summing the start counts.
+    let events = interrupted_turn_events(
+        answer(Value::Null, Some(native_usage())),
+        aborted("aborted_streaming", Some(native_usage())),
+    )
+    .await;
+    assert_eq!(
+        reported(&events),
+        [None],
+        "the streaming frames' start count"
+    );
+
+    // A frame that names a stop reason still repeats the start count without a message_delta.
+    let events = interrupted_turn_events(
+        answer(json!("end_turn"), Some(native_usage())),
+        aborted("aborted_streaming", Some(native_usage())),
+    )
+    .await;
+    assert_eq!(
+        reported(&events),
+        [None],
+        "a stop reason without a message_delta"
+    );
+
+    // On an abort the CLI closes the abandoned stream itself: a `message_delta` that copies the
+    // partial message's null stop reason and its start count, then `message_stop`. Only a
+    // `message_delta` that names a stop reason ends a message the API finished.
+    let mut closed = answer(Value::Null, Some(native_usage()));
+    closed.push(event(json!({"type": "content_block_stop", "index": 1})));
+    closed.push(event(
+        json!({"type": "message_delta", "context_management": null,
+        "delta": {"container": null, "stop_details": null, "stop_reason": null,
+            "stop_sequence": null},
+        "usage": {"output_tokens": 5, "input_tokens": 4, "cache_creation_input_tokens": 245,
+            "cache_read_input_tokens": 42640}}),
+    ));
+    closed.push(event(json!({"type": "message_stop"})));
+    let events =
+        interrupted_turn_events(closed, aborted("aborted_streaming", Some(native_usage()))).await;
+    assert_eq!(
+        reported(&events),
+        [None],
+        "the CLI's closing message_delta for an abandoned stream"
+    );
+
+    // A message that left no usage record proves nothing about the result's output.
+    let events = interrupted_turn_events(
+        answer(Value::Null, None),
+        aborted("aborted_streaming", Some(native_usage())),
+    )
+    .await;
+    assert_eq!(reported(&events), [None], "no retained message usage");
+
+    // A result the adapter did not interrupt and does not recognize as an interrupt.
+    let events = ended_turn_events(
+        answer(Value::Null, Some(native_usage())),
+        aborted("aborted_by_user", Some(native_usage())),
+    )
+    .await;
+    assert_eq!(reported(&events), [None], "an unrecognized abort");
+}
+
+/// A reply whose API message ended the model's turn is the response before the result arrives.
+///
+/// The CLI sends its `result` only after post-turn work such as instruction hooks and context
+/// accounting, and the reply stayed unclassified, inside the exchange's live activity, until
+/// then. The `message_delta` that stops the message with `end_turn` already proves it is the
+/// reply, so the adapter classifies it there.
+#[tokio::test(start_paused = true)]
+async fn end_turn_classifies_the_reply_before_the_result() {
+    use forge_provider_api::message::{
+        AgentMessageRole, ItemEvent, MessageClassification, MessageItemEvent,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        Box::new(move |frame| {
+            if let Some(uuid) = user_uuid(frame) {
+                let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+                frames.extend(text_message("msg-1", &["ready"]));
+                return Some(frames);
+            }
+            // The test interrupts the turn this peer leaves open.
+            if frame["request"]["subtype"] == "interrupt" {
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    result_interrupted(),
+                ]);
+            }
+            None
+        })
+    });
+    let (provider, mut opened) = open(launcher, directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let request = prompt_request(
+        &binding,
+        "turn-1",
+        receipt("first"),
+        forge_provider_api::permissions::PermissionResponse::Allow,
+    );
+    let scope = request.scope.clone();
+    provider
+        .turn_start(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    let classified = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let envelope = opened.events.recv().await.unwrap().unwrap();
+            if let forge_provider_api::ProviderEvent::Item {
+                event:
+                    ItemEvent::Message {
+                        event: MessageItemEvent::Classified(MessageClassification::Known(role)),
+                    },
+                ..
+            } = envelope.event
+            {
+                return role;
+            }
+        }
+    })
+    .await
+    .expect("the reply stayed unclassified until the result");
+    assert_eq!(classified, AgentMessageRole::Response);
+    provider
+        .turn_interrupt(
+            operation_context(),
+            &binding,
+            forge_provider_api::CancelRequest { scope },
+        )
+        .await
+        .unwrap();
+    until_completed(&mut opened.events).await;
+    provider.shutdown(operation_context()).await.unwrap();
 }
 
 /// A completed turn reports the result's usage once, not again from its message frames.

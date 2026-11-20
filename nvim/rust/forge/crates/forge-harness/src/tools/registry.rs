@@ -31,12 +31,22 @@ pub(crate) fn is_read_only(name: &str) -> bool {
 /// availability requirement.
 fn advertised_definition(mut definition: ControlToolDefinition) -> ControlToolDefinition {
     if definition.name == "plan_submit" {
-        definition.input_schema["properties"]
-            .as_object_mut()
-            .expect("plan submit properties are an object")
-            .remove("authoring_snapshot");
+        remove_harness_submission_fields(&mut definition);
     }
     super::toolsets::with_requirement(definition)
+}
+
+/// Hide the plan_submit fields Harness fills in itself.
+///
+/// The catalog schema keeps them because Harness validates its own recorded invocation against
+/// it; the advertised schema is identical in every mode, so a provider that keeps an earlier
+/// turn's schema never sees a version requirement that a later turn enforces.
+fn remove_harness_submission_fields(definition: &mut ControlToolDefinition) {
+    let properties = definition.input_schema["properties"]
+        .as_object_mut()
+        .expect("plan submit properties are an object");
+    properties.remove("authoring_snapshot");
+    properties.remove("expected_version");
 }
 
 /// Show plan_submit only while authoring or in Resolve, and plan_edit also in Verify, where it
@@ -181,25 +191,12 @@ impl ControlToolRegistry {
             })
             .map(|mut definition| {
                 if definition.name == "plan_submit" {
-                    definition.input_schema["properties"].as_object_mut().expect("plan submit properties are an object")
-                        .remove("authoring_snapshot");
-                    if context.is_some_and(|context| context.execution.is_some()) {
-                        definition.input_schema["required"] = serde_json::json!(["plan_id", "expected_version"]);
-                    }
+                    remove_harness_submission_fields(&mut definition);
                 }
                 if definition.name == "plan_submit"
                     && context.is_some_and(|context| context.plan_authoring.is_some())
                 {
-                    definition.input_schema["required"] = serde_json::json!(["plan_id"]);
-                    definition.input_schema["properties"]
-                        .as_object_mut()
-                        .expect("plan submit properties are an object")
-                        .remove("expected_version");
                     definition.input_schema["properties"].as_object_mut().expect("plan submit properties are an object").remove("reason");
-                    definition.input_schema["properties"]
-                        .as_object_mut()
-                        .expect("plan submit properties are an object")
-                        .remove("authoring_snapshot");
                     definition.description = "Submit the active planning directory for review. Supply plan_id without an expected version. Harness snapshots docs/ and files/, reports parsing and reference diagnostics by file and line, and preserves the editable draft on failure. Later ordinary edits require resubmission. Wait for Harness execution instructions; submission alone never authorizes implementation.";
                 }
                 if definition.name == "plan_status" && context.is_some_and(|context| context.plan_authoring.is_some()) {
@@ -265,5 +262,39 @@ mod test {
         assert_eq!(visible(Some(PlanPhase::Resolve)), (true, true));
         assert_eq!(visible(Some(PlanPhase::Verify)), (true, false));
         assert_eq!(visible(Some(PlanPhase::Implement)), (false, false));
+    }
+
+    /// Harness owns the submitted version, so no advertised plan_submit schema asks the model
+    /// for one: a provider that keeps an earlier turn's schema still calls it correctly.
+    #[test]
+    fn plan_submit_never_advertises_an_expected_version() {
+        let registry = ControlToolRegistry;
+        let advertised = [
+            registry.definition_list_for(None),
+            registry.definition_list_for(Some(PlanPhase::Resolve)),
+            registry.registration_definitions(
+                &crate::provider::ThreadOwner::root("session"),
+                crate::provider::PromptMode::ExecutePlan,
+            ),
+            registry.definition_list_for_context(None, true),
+        ];
+        for list in advertised {
+            let submit = list
+                .iter()
+                .find(|definition| definition.name == "plan_submit")
+                .expect("plan_submit is advertised");
+            assert!(
+                submit.input_schema["properties"]
+                    .get("expected_version")
+                    .is_none(),
+                "{}",
+                submit.input_schema
+            );
+            assert!(
+                !submit.description.contains("expected_version"),
+                "{}",
+                submit.description
+            );
+        }
     }
 }

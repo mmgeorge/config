@@ -65,7 +65,6 @@ impl TaskCheckResult {
     pub(super) fn into_interrupted(self) -> CheckRun {
         let mut run = self.run;
         run.interrupt();
-        run.completed_plan = None;
         run
     }
 }

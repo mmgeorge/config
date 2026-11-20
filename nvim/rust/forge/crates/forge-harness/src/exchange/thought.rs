@@ -38,6 +38,28 @@ pub(crate) struct ExchangeContentView<'source> {
     pub part: Vec<EntryPart<'source>>,
 }
 
+impl<'source> ExchangeContentView<'source> {
+    /// Take the check runs of every commentary in this view for one owner to draw elsewhere.
+    ///
+    /// A commentary left with no text and no tool activity no longer has anything to draw, so
+    /// its part leaves the view rather than drawing an empty placeholder.
+    pub fn take_checks(&mut self) -> Vec<&'source crate::checks::CheckRun> {
+        let mut checks = Vec::new();
+        for commentary in &mut self.commentary {
+            checks.extend(std::mem::take(&mut commentary.checks));
+        }
+        let commentary = &self.commentary;
+        self.part.retain(|part| match part {
+            EntryPart::Commentary(index) => {
+                let view = &commentary[*index];
+                view.message.is_some() || view.has_activity()
+            }
+            EntryPart::Event(_) => true,
+        });
+        checks
+    }
+}
+
 impl Exchange {
     /// Resolves visible references from persisted commentary ownership.
     /// Missing message, turn, or activity references fail instead of dropping content.

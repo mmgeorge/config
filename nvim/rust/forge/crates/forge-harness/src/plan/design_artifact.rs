@@ -174,7 +174,17 @@ fn render(artifact: PlanArtifact, title: &str, document: &DesignDocument) -> Res
     })
 }
 
-/// Store an edited artifact verbatim, keeping the plan title in step with the overview heading.
+/// Convert CRLF and bare CR line endings to LF.
+///
+/// Authored text enters a plan only through this conversion, because every parser and projection
+/// splits rows on LF: a retained CR would make the stored text and its rendered rows disagree on
+/// each row's byte length.
+pub(crate) fn lf_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Store an edited artifact verbatim apart from LF line endings, keeping the plan title in step
+/// with the overview heading.
 ///
 /// Text identical to the document's rendering is dropped instead of stored, so an edit that
 /// restores the rendering leaves no trace.
@@ -184,6 +194,7 @@ pub(crate) fn store_authored(
     title: &mut String,
     design: &mut DeclarationDesign,
 ) -> Result<()> {
+    let text = lf_line_endings(&text);
     if artifact == PlanArtifact::Overview
         && let Some(heading) = text
             .lines()
@@ -291,6 +302,7 @@ pub(crate) fn parse_authored(
     );
     document.tests = parse_tests(
         &text(PlanArtifact::Tests)?,
+        Some(config),
         &mut ArtifactReport {
             path: PlanArtifact::Tests.path(),
             diagnostic: &mut diagnostic,
@@ -374,6 +386,7 @@ pub(crate) fn preview_authored(design: &DeclarationDesign) -> DesignDocument {
     if let Some((text, path)) = parse(PlanArtifact::Tests) {
         document.tests = parse_tests(
             &text,
+            None,
             &mut ArtifactReport {
                 path,
                 diagnostic: &mut ignored,
@@ -909,9 +922,15 @@ fn test_case(item: &str) -> Option<DesignTestCase> {
 }
 
 /// Parse `## file` sections of test items, reporting malformed items and invalid inventories.
-fn parse_tests(text: &str, report: &mut ArtifactReport<'_>) -> Vec<DesignTestFile> {
-    const SHAPE: &str = "tests are `- new|modified|removed|reused `name` [target: runner]: \
-                         scenario`, with an optional target";
+///
+/// With a configuration, each target must name a configured test check by its ID or label.
+fn parse_tests(
+    text: &str,
+    config: Option<&crate::checks::CheckConfig>,
+    report: &mut ArtifactReport<'_>,
+) -> Vec<DesignTestFile> {
+    const SHAPE: &str = "tests are `- new|modified|removed|reused `name` [target: check]: \
+                         scenario`, where the optional target is a test check's ID or label";
     let mut files: Vec<(usize, DesignTestFile, Vec<usize>)> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
@@ -993,7 +1012,15 @@ fn parse_tests(text: &str, report: &mut ArtifactReport<'_>) -> Vec<DesignTestFil
                 .as_ref()
                 .is_some_and(|target| target.is_empty() || target.chars().any(char::is_control))
             {
-                report.content(*line, &reference, "the target must be a runner name".into());
+                report.content(
+                    *line,
+                    &reference,
+                    "the target must name a test check".into(),
+                );
+            } else if let (Some(config), Some(target)) = (config, case.target.as_deref())
+                && let Err(reason) = config.test_target(target)
+            {
+                report.check(*line, &reference, reason);
             }
             if case.description.trim().is_empty() {
                 report.content(
@@ -1242,11 +1269,15 @@ mod test {
             text.contains("- reused `arena_bounds` [target: integration]: Clamp is unchanged.")
         );
         let mut diagnostic = Vec::new();
-        assert_eq!(parse_tests(&text, &mut report(&mut diagnostic)), files);
+        assert_eq!(
+            parse_tests(&text, None, &mut report(&mut diagnostic)),
+            files
+        );
         assert_eq!(diagnostic, Vec::new());
         let mut diagnostic = Vec::new();
         parse_tests(
             "- new `orphan`: no file\n## src/a.rs\n- added `x`: y\n- new `x`: y\n- new `x`: z\n",
+            None,
             &mut report(&mut diagnostic),
         );
         assert_eq!(
@@ -1317,6 +1348,25 @@ mod test {
         );
     }
 
+    /// An artifact written with CRLF or bare CR line endings is stored with LF, so the parsed
+    /// document and every projection of it agree on the bytes of each row.
+    #[test]
+    fn stored_artifacts_use_lf_line_endings() {
+        let mut design = DeclarationDesign::default();
+        let mut title = String::new();
+        store_authored(
+            PlanArtifact::Flows,
+            "## Flow\r\nRuns once.\r\n\r\n```mermaid\rflowchart TD\r\n  a --> b\r\n```\r\n".into(),
+            &mut title,
+            &mut design,
+        )
+        .unwrap();
+        assert_eq!(
+            design.artifact_text[PlanArtifact::Flows.path()],
+            "## Flow\nRuns once.\n\n```mermaid\nflowchart TD\n  a --> b\n```\n"
+        );
+    }
+
     /// Reserved paths resolve exactly, and unknown names inside the namespace are rejected.
     #[test]
     fn artifact_paths_are_reserved() {
@@ -1330,5 +1380,54 @@ mod test {
         );
         assert_eq!(PlanArtifact::from_path("src/plan.rs").unwrap(), None);
         assert!(PlanArtifact::from_path("plan:notes.md").is_err());
+    }
+
+    /// A test target names a configured test check by ID or label; submission refuses any other
+    /// target at its line and lists the valid targets.
+    #[test]
+    fn submission_refuses_a_test_target_that_names_no_test_check() -> Result<()> {
+        let config: crate::checks::CheckConfig = serde_json::from_value(serde_json::json!({
+            "test":{"action":{"label":"Vitest","category":"test",
+                "adapter":{"script":{"command":["unused"]}}}},
+            "lint":{"action":{"label":"ESLint","category":"lint",
+                "adapter":{"script":{"command":["unused"]}}}}
+        }))?;
+        let target_diagnostics = |target: &str| -> Result<Vec<DeclarationDiagnostic>> {
+            let mut design = DeclarationDesign::default();
+            design.artifact_text.insert(
+                PlanArtifact::Tests.path().into(),
+                format!(
+                    "## tests/money.test.ts
+- new `splits evenly` [target: {target}]: scenario
+"
+                ),
+            );
+            Ok(parse_authored("Money", &design, &config)?
+                .diagnostic
+                .into_iter()
+                .filter(|diagnostic| diagnostic.path == PlanArtifact::Tests.path())
+                .collect())
+        };
+        for valid in ["test", "Vitest", "vitest"] {
+            assert_eq!(
+                target_diagnostics(valid)?,
+                Vec::new(),
+                "{valid} was refused"
+            );
+        }
+        for invalid in ["Jest", "ESLint"] {
+            let diagnostic = target_diagnostics(invalid)?;
+            assert_eq!(
+                lines(&diagnostic),
+                vec![(2, "invalid_plan_check")],
+                "{invalid}"
+            );
+            assert!(
+                diagnostic[0].reason.contains("`test` (Vitest)"),
+                "{}",
+                diagnostic[0].reason
+            );
+        }
+        Ok(())
     }
 }

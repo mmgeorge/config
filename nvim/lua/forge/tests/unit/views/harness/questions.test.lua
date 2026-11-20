@@ -14,6 +14,9 @@ T["questions"] = function()
   require("forge").setup({ harness = { provider = "mock" } })
   local questions = require("forge.views.harness.questions")
   local picker = require("forge.views.picker")
+  -- The case types into question pickers as soon as they open or close; the settle guard that
+  -- discards those keys is covered by the picker's own cases.
+  dofile("nvim/lua/forge/tests/support/stub.lua")(picker, "focus_taking_settle_ms", nil)
   local input_state = require("forge.views.harness.input_state")
   local submitted = {}
   input_state.submit = function(target_state, text, attachments, intent, configuration, callback, retracted, target)
@@ -94,27 +97,38 @@ T["questions"] = function()
   eq(questions.count(state), 2)
   picker.close(false)
 
-  -- Confirmed drafts advance locally; only the committed batch closes the picker.
+  -- Confirmed drafts advance locally. Submitting the last answer closes the picker at once, so
+  -- keys typed after the submit key reach the window beneath; a failed save keeps the drafts and
+  -- shows the failure when the questions are reopened.
   state.questions = { revision = 4, questions = { question("first", "required"), question("second", "optional") } }
   state.question_picker_resume = nil
   questions.open(state, host)
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
   eq(picker._state_for_test().spec.page_list[picker._state_for_test().state.page_index].id, "second")
-  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
-  local last_answer = sent[#sent]
   instance = picker._state_for_test()
   local picker_window, picker_buffer = instance.win, instance.buf
-  assert(picker.is_open("questions"), "submitting the last answer closed before it was saved")
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  local last_answer = sent[#sent]
+  assert(not picker.is_open("questions"), "submitting the last answer left the picker taking keys")
+  assert(not vim.api.nvim_win_is_valid(picker_window), "submitted question window survived")
+  assert(not vim.api.nvim_buf_is_valid(picker_buffer), "submitted question buffer survived")
+  assert(vim.api.nvim_get_current_win() == host.control_win, "submission did not restore host focus")
   local notifications = require("forge.infra.notifications")
   local original_error = notifications.error
-  notifications.error = function() end
+  local failure_notices = {}
+  notifications.error = function(message) failure_notices[#failure_notices + 1] = message end
   local failed_operation = last_answer.spec.params.operation_id
   last_answer.callback(nil, "Answer could not be saved")
   notifications.error = original_error
-  assert(picker.is_open("questions") and questions.count(state) == 2,
-    "failed final answer closed the picker or resolved the question")
+  assert(not picker.is_open("questions") and questions.count(state) == 2,
+    "a failed final answer reopened the picker or resolved the question")
   eq(state.question_answer_state.failure, "Answer could not be saved")
+  assert(failure_notices[1] and failure_notices[1]:find("oe", 1, true), "the failure notice did not name the reopen key")
+  questions.open(state, host)
+  local shown = vim.tbl_map(function(item) return item.text end, picker._state_for_test().spec.page_list[1].content_list)
+  assert(vim.tbl_contains(shown, "Not saved: Answer could not be saved"), "reopened questions hid the failure")
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  if picker.is_open("questions") then keymap.invoke("<CR>", { buffer = picker._state_for_test().buf }) end
   last_answer = sent[#sent]
   eq(last_answer.spec.params.operation_id, failed_operation)
   local answered = vim.deepcopy(state.questions)
@@ -123,9 +137,6 @@ T["questions"] = function()
   answered.questions[2].resolution = { kind = "answered" }
   last_answer.callback(answered)
   assert(not picker.is_open("questions"), "final saved answer left an empty picker open")
-  assert(not vim.api.nvim_win_is_valid(picker_window), "completed question window survived")
-  assert(not vim.api.nvim_buf_is_valid(picker_buffer), "completed question buffer survived")
-  assert(vim.api.nvim_get_current_win() == host.control_win, "completion did not restore host focus")
   questions.open(state, host)
   assert(not picker.is_open("questions"), "reopening completed answers created an empty picker")
 
@@ -325,6 +336,61 @@ T["answers_stay_editable_until_the_last_question"] = function()
   eq(requests[1].spec.params.answers[2].action.answer.option_id, "tabs")
 end
 
+-- An answer given while the turn that asked is still running must reach the host as an answer to
+-- its question, never as a steering prompt; the host owns its delivery and labels it as a reply.
+T["an_answer_during_a_running_turn_is_sent_as_an_answer"] = function()
+  vim.o.columns, vim.o.lines = 120, 45
+  local config = vim.deepcopy(require("forge.infra.config").options)
+  config.harness.provider = "mock"
+  require("forge").setup(config)
+  local questions = require("forge.views.harness.questions")
+  local picker = require("forge.views.picker")
+  local requests = mock_client.record({ copy_params = true })
+  local state = { session = { id = "running-session" }, activity = { revision = 1, phase = "running" },
+    questions = { revision = 1, questions = { {
+      id = "layout", requirement = "required", resolution = { kind = "pending" }, discussion = {},
+      content = { revision = 1, header = "Layout", question = "Which layout?", options = {
+        { id = "tabs", label = "Tabs", description = "Compact" },
+      } },
+    } } } }
+  local window = vim.api.nvim_get_current_win()
+  questions.open(state, { window_list = { window }, control_win = window })
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  if #requests == 0 then keymap.invoke("<CR>", { buffer = picker._state_for_test().buf }) end
+  eq(vim.tbl_map(function(request) return request.spec.method end, requests), { "session.question.answer_batch" })
+  local answer = requests[1].spec.params.answers[1]
+  eq({ answer.question_id, answer.action.answer.option_id }, { "layout", "tabs" })
+end
+
+-- The question picker closes once the host accepts the user's answer. That close follows the
+-- user's own decision, so keys typed right after it belong to the composer; only a close the
+-- user did not cause, such as an expiry, discards keys for the settle interval.
+T["keys typed right after answering reach the window beneath"] = function()
+  vim.o.columns, vim.o.lines = 120, 45
+  local config = vim.deepcopy(require("forge.infra.config").options)
+  config.harness.provider = "mock"
+  require("forge").setup(config)
+  local questions = require("forge.views.harness.questions")
+  local picker = require("forge.views.picker")
+  local function layout(kind)
+    return { id = "layout", requirement = "required", resolution = { kind = kind }, discussion = {},
+      content = { revision = 1, header = "Layout", question = "Which layout?", options = {
+        { id = "tabs", label = "Tabs", description = "Compact" },
+      } } }
+  end
+  mock_client.respond({ ["session.question.answer_batch"] = { revision = 2, questions = { layout("answered") } } })
+  local state = { session = { id = "answering" }, questions = { revision = 1, questions = { layout("pending") } } }
+  local window = vim.api.nvim_get_current_win()
+  local composer = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "" })
+  questions.open(state, { window_list = { window }, control_win = window })
+  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
+  if picker.is_open() then keymap.invoke("<CR>", { buffer = picker._state_for_test().buf }) end
+  eq(picker.is_open(), false)
+  keymap.feed("ixy<Esc>")
+  eq(vim.api.nvim_buf_get_lines(composer, 0, -1, false), { "xy" })
+end
+
 T["incoming_changes_invalidate_only_affected_drafts"] = function()
   local config = vim.deepcopy(require("forge.infra.config").options)
   config.harness.provider = "mock"
@@ -368,9 +434,31 @@ T["incoming_changes_invalidate_only_affected_drafts"] = function()
   questions.open(state, host, "first")
   keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
   eq(#requests, 1)
-  keymap.invoke("<CR>", { buffer = picker._state_for_test().buf })
-  eq(#requests, 1)
+  -- The submitted picker is closed, so no repeated Enter can send the batch twice.
+  eq(picker.is_open("questions"), false)
   eq(requests[1].spec.params.answers[2].action.kind, "dismiss")
+end
+
+T["typed_other_answer_shows_as_its_draft"] = function()
+  local config = vim.deepcopy(require("forge.infra.config").options)
+  config.harness.provider = "mock"
+  require("forge").setup(config)
+  local questions = require("forge.views.harness.questions")
+  local picker = require("forge.views.picker")
+  mock_client.record({ copy_params = true })
+  local state = { session = { id = "other-session" }, questions = { revision = 1, questions = { {
+    id = "layout", requirement = "required", resolution = { kind = "pending" }, discussion = {},
+    content = { revision = 1, header = "Layout", question = "Which layout?", options = {
+      { id = "tabs", label = "Tabs", description = "Compact" },
+    } },
+  } } } }
+  -- Text typed after choosing "Other…" and left unsubmitted is the question's draft answer.
+  state.question_drafts = { layout = { other = "A collapsible drawer" } }
+  local window = vim.api.nvim_get_current_win()
+  questions.open(state, { window_list = { window }, control_win = window })
+  local content = vim.tbl_map(function(item) return item.text end, picker._state_for_test().spec.page_list[1].content_list)
+  assert(vim.tbl_contains(content, "Draft answer: Other… — A collapsible drawer"),
+    "the typed Other answer was not shown as a draft: " .. table.concat(content, " | "))
 end
 
 return T

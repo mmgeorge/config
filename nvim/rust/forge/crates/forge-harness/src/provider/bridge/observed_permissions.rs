@@ -50,7 +50,7 @@ impl ObservedPermissionAuthority {
         association: &crate::provider::ObservedAgentAssociation,
     ) -> Result<Vec<crate::provider::ObservedAgentAssociation>, ProviderError> {
         let rejected = || {
-            ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+            ProviderError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
         };
         let host = self.host.upgrade().ok_or_else(rejected)?;
         let ownership = host
@@ -106,7 +106,7 @@ impl ObservedPermissionAuthority {
             .before_tool(&child.scope)
             .await?;
         let rejected = || {
-            ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+            ProviderError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
         };
         let host = self.host.upgrade().ok_or_else(rejected)?;
         let ownership = host
@@ -134,7 +134,7 @@ impl ObservedPermissionAuthority {
         association: &crate::provider::ObservedAgentAssociation,
     ) -> Result<Arc<crate::permissions::provider::ProviderPermissionContext>, ProviderError> {
         let rejected = || {
-            ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+            ProviderError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
         };
         let scope = association.turn().cloned().ok_or_else(rejected)?;
         let turn_id = scope.turn_id().map_err(|_| rejected())?;
@@ -183,7 +183,7 @@ impl crate::permissions::provider::ObservedChildAuthority for ObservedPermission
         child: &forge_provider_api::TurnAddress,
     ) -> Result<Arc<crate::permissions::provider::ProviderPermissionContext>, ProviderError> {
         let rejected = || {
-            ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+            ProviderError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
         };
         // Validate the exact original native registration before policy inheritance.
         let host = self.host.upgrade().ok_or_else(rejected)?;

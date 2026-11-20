@@ -238,7 +238,7 @@ Supply a stable `operation_id` string. If absent, the service uses `_command.id`
 
 Task commands return `id`, `state: "completed"`, their typed `outcome`, and `command_result` with the command identity, FIFO sequence, revision, and outcome. Review adapters can add their captured plan/document projection. Completion reports the finite owner boundary, not the eventual provider answer. ExecutePlan can complete with `AwaitingInput` while required review decisions remain. Duplicate IDs with identical normalized intent return the retained outcome; conflicting reuse fails.
 
-The owner publishes committed session state and owns collection, preparation, and any exact input dispatch required by the command. Entry commands retain their generated input and finish at their finite dispatch boundary. Pause suspends future input admission without cancelling the current provider turn. Empty or terminal task slots remain valid when pausing ordinary chat. Stale source revisions, invalid plan identities/digests, missing artifacts, and invalid transitions fail. Provider work can continue after command acknowledgement, so observe the originating session rather than treating the callback as final task completion.
+The owner publishes committed session state and owns collection, preparation, and any exact input dispatch required by the command. Entry commands retain their generated input and finish at their finite dispatch boundary. Pause suspends future input admission without cancelling the current provider turn. Empty or terminal task slots remain valid when pausing ordinary chat. Stale source revisions, invalid plan identities/digests, missing artifacts, and invalid transitions fail. Pause, clear, resume, and `plan_accept` require only that the task they captured is still the session's task (`TaskCommand::validate_target`): a stop or a settled turn that advanced its revision while the command waited in the owner FIFO does not refuse them, so a `/goal clear` sent while a turn is stopping applies once the stop settles. Every other task command still requires the exact captured revision. Provider work can continue after command acknowledgement, so observe the originating session rather than treating the callback as final task completion.
 
 ## `session.command.operation.get`
 
@@ -417,7 +417,7 @@ List exchanges available for review.
 
 ### Contract
 
-No parameter fields. Returns the selected session's saved exchange metadata as an array, including saved comments. Empty history returns `[]`. This call does not load full tool-output bodies, resume exchanges, mutate task selection, or invoke a provider. No progress is emitted. Timeline presentation remains owned by `session.document`.
+No parameter fields. Returns the selected session's saved exchange metadata as an array, including saved comments. A current, finished exchange that a conversation rollback cannot rewind to also carries `rollback_unavailable`, the refusal text a rollback to it would return: the provider cannot rewind at all, an earlier retained interaction ran provider turns that reported no checkpoint, or the provider rewinds only to a recorded checkpoint and nothing before the exchange recorded one. Empty history returns `[]`. This call does not load full tool-output bodies, resume exchanges, mutate task selection, or invoke a provider. No progress is emitted. Timeline presentation remains owned by `session.document`.
 
 ## `session.exchange.recovery`
 
@@ -449,7 +449,7 @@ Apply a prepared rollback.
 
 ### Contract
 
-Accepts `scope`, defaulting to `workspace`. Workspace mode requires the captured `preview_id`, revalidates workspace identity, Git HEAD, current file content, and exchange history, then applies the restore and finalizes conversation rollback. Returns `{ "restored": true }`. Conversation mode requires `exchange_id` and captured `latest_exchange_id`, changes conversation history without restoring files, and returns `{ "restored": true, "scope": "conversation" }`. Both modes rewind the provider conversation natively; a provider without `native_conversation_rewind`, or a retained exchange with provider turns but no recorded checkpoint, rejects the rollback before any change. Both require settled exchange trees and no active children. A partial filesystem restore retains a journal and requires recovery before new workspace work. Stale previews, conflicts, unavailable checkpoints, and I/O failures remain errors.
+Accepts `scope`, defaulting to `workspace`. Workspace mode requires the captured `preview_id`, revalidates workspace identity, Git HEAD, current file content, and exchange history, then applies the restore and finalizes conversation rollback. Returns `{ "restored": true }`. Conversation mode requires `exchange_id` and captured `latest_exchange_id`, changes conversation history without restoring files, and returns `{ "restored": true, "scope": "conversation" }`. Both modes collect active execution first and leave a surviving task paused. Both modes rewind the provider conversation natively; a provider without `native_conversation_rewind`, a retained exchange with provider turns that reported no checkpoint, or a provider declaring `conversation_rewind_requires_checkpoint` with no retained checkpoint rejects the rollback before any change. A task whose start exchange is rolled back is cleared without a finish row; a task started before the retained history ends is kept and paused. Session rows recorded since the first rolled-back exchange began, except renames and fork origins, move to that exchange and leave the timeline with it. Both require settled exchange trees and no active children. A partial filesystem restore retains a journal and requires recovery before new workspace work. Stale previews, conflicts, unavailable checkpoints, and I/O failures remain errors.
 
 ## `session.exchange.rollback.prepare`
 
@@ -465,7 +465,7 @@ Capture a rollback preview for an exchange.
 
 ### Contract
 
-Requires `exchange_id` in the current session. Resolves its checkpoint owner, requires settled target-and-later exchange trees, verifies that the target is still in current workspace history, and prepares a durable restore preview. Returns `preview_id`, total `files`, `warning_count`, first `warnings` page, and optional `next_offset`. Preparation reads current workspace/checkpoints and saves the preview but does not restore files. Missing Git/checkpoints, active child work, unresolved restore recovery, or I/O failure rejects preparation.
+Requires `exchange_id` in the current session. Collects active execution first, as applying does, so a running or paused turn is stopped and its task left paused before the preview reads history. Resolves its checkpoint owner, requires settled target-and-later exchange trees, rejects a target whose conversation rewind is unavailable, verifies that the target is still in current workspace history, and prepares a durable restore preview. Returns `preview_id`, total `files`, `warning_count`, first `warnings` page, and optional `next_offset`. Preparation reads current workspace/checkpoints and saves the preview but does not restore files. Missing Git/checkpoints, active child work, unresolved restore recovery, or I/O failure rejects preparation.
 
 ## `session.exchange.rollback.preview`
 
@@ -507,8 +507,8 @@ Apply Clear to the session task slot through the retained goal alias.
 
 - **Context:** Explicit existing session.
 - **Input:** operation_id when supplied.
-- **Result and effects:** Returns the completed command receipt. Retires owned questions and records the cleared task outcome.
-- **Boundary:** Does not declare the objective achieved or cancel an active provider turn. Preserve the shared task command contract and response variant.
+- **Result and effects:** Returns the completed command receipt. Retires owned questions and records the cleared task outcome. A turn the clear collected leaves its exchange parked, and the command closes that exchange as cancelled before it answers, so the `cleared` row and the settled heading are present in the reply's state; `HarnessBroker::owner_close_orphaned_parked_exchange` runs after the task commit releases its history writer lease, because the close takes leases of its own.
+- **Boundary:** Does not declare the objective achieved. Preserve the shared task command contract and response variant.
 - **Inspected source:** [task/command.rs](../../../rust/forge/crates/forge-harness/src/task/command.rs), [service/task_state.rs](../../../rust/forge/crates/forge-harness/src/service/task_state.rs).
 
 **Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
@@ -855,13 +855,13 @@ Update the reviewed plan's selected checks.
 - **Input:** The plan check-selection update.
 - **Result and effects:** Returns the updated plan and selection state.
 - **Boundary:** This does not execute the checks.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
+- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service/task_state.rs`](../../../rust/forge/crates/forge-harness/src/service/task_state.rs) and [`nvim/rust/forge/crates/forge-harness/src/broker/acceptance.rs`](../../../rust/forge/crates/forge-harness/src/broker/acceptance.rs).
 
 **Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
 
 ### Contract
 
-Requires `plan_id`, current review `digest`, `expected_version`, and `enabled` (check-ID to boolean map). Optional `tests` is an array of [DesignTestSelection](runtime-schemas.md#designtestselection) to remove. Only a plan awaiting review in this session can change. Returns `{ "plan": ..., "content": ..., "document": ... }`, updates the saved version/digest, clears pending acceptance, appends a manual-change record, and publishes `plan_checks_updated`. Stale digest/version, invalid selections, or persistence/validation failure rejects the edit. It does not run the selected checks.
+Requires `plan_id`, current review `digest`, `expected_version`, and `enabled` (check-ID to boolean map). Optional `tests` is an array of [DesignTestSelection](runtime-schemas.md#designtestselection) to remove. Only a plan awaiting review in this session can change. It updates the saved version/digest and clears pending acceptance. The service routes the edit to the task command owner as `TaskCommand::EditPlan`, and `BrokerObserver::prepare_owner_plan_edit` appends it to the plan's `manual_changes`, which the review-delivery record and the retirement at the next model revision read; the broker refuses this method when it is dispatched to it directly. Returns `{ "plan": ..., "review_reload_required": true }`; when the request carries the open review document, the response carries the refreshed `review` instead of `review_reload_required`, or `review_error` when the edit committed but the review could not refresh. No dedicated session event follows. Stale digest/version, invalid selections, or persistence/validation failure rejects the edit. It does not run the selected checks.
 
 ## `session.plan.declaration.get`
 
@@ -887,13 +887,13 @@ Rename an entity in the reviewed plan model.
 - **Input:** The captured entity and replacement-name payload.
 - **Result and effects:** Returns the updated plan projection and revision.
 - **Boundary:** Validate the current plan/source identity and preserve unrelated draft content.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
+- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service/task_state.rs`](../../../rust/forge/crates/forge-harness/src/service/task_state.rs) and [`nvim/rust/forge/crates/forge-harness/src/broker/acceptance.rs`](../../../rust/forge/crates/forge-harness/src/broker/acceptance.rs).
 
 **Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
 
 ### Contract
 
-Requires `plan_id` and nonempty new `name`. Supply either `symbol` for a declaration identity or `entity_name` for a planned added entity. A symbol rename requires current `expected_version`; optional `digest` validates the reviewed and working content. Returns `{ "plan": ..., "content": ..., "document": ..., "previous_name": ..., "name": ... }`, updates review identity, clears acceptance, and publishes `plan_entity_renamed`. Only a plan awaiting review can change. Missing entity/symbol, stale version/digest, invalid rename, and persistence failure reject the edit. This edits the planned declaration, not workspace source.
+Requires `plan_id` and nonempty new `name`. Supply either `symbol` for a declaration identity or `entity_name` for a planned added entity. A symbol rename requires current `expected_version`; optional `digest` validates the reviewed and working content. It updates the saved version/digest and clears pending acceptance. The service routes the edit to the task command owner as `TaskCommand::EditPlan`, and `BrokerObserver::prepare_owner_plan_edit` appends it to the plan's `manual_changes`, which the review-delivery record and the retirement at the next model revision read; the broker refuses this method when it is dispatched to it directly. Returns `{ "plan": ..., "review_reload_required": true }`; when the request carries the open review document, the response carries the refreshed `review` instead of `review_reload_required`, or `review_error` when the edit committed but the review could not refresh. No dedicated session event follows. Only a plan awaiting review can change. Missing entity/symbol, stale version/digest, invalid rename, and persistence failure reject the edit. This edits the planned declaration, not workspace source.
 
 ## `session.plan.get`
 
@@ -951,13 +951,13 @@ Remove selected tests from the reviewed plan inventory.
 - **Input:** The captured test identities and plan edit context.
 - **Result and effects:** Returns the updated plan projection/revision.
 - **Boundary:** This edits the plan inventory, not arbitrary source files.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
+- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/service/task_state.rs`](../../../rust/forge/crates/forge-harness/src/service/task_state.rs) and [`nvim/rust/forge/crates/forge-harness/src/broker/acceptance.rs`](../../../rust/forge/crates/forge-harness/src/broker/acceptance.rs).
 
 **Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
 
 ### Contract
 
-Requires `plan_id`, current review `digest`, `expected_version`, and a nonempty `tests` array of [DesignTestSelection](runtime-schemas.md#designtestselection). Each selected test must exist in the captured plan inventory. Removes those tests from a plan awaiting review and returns `{ "plan": ..., "content": ..., "document": ... }`. It updates version/digest, clears pending acceptance, retains a manual-change record, and publishes `plan_tests_deleted`. This changes planned test metadata, not source test files. Wrong owner/state, stale review, unknown tests, or persistence failure is explicit.
+Requires `plan_id`, current review `digest`, `expected_version`, and a nonempty `tests` array of [DesignTestSelection](runtime-schemas.md#designtestselection). Each selected test must exist in the captured plan inventory. Removes those tests from a plan awaiting review. It updates version/digest and clears pending acceptance. The service routes the edit to the task command owner as `TaskCommand::EditPlan`, and `BrokerObserver::prepare_owner_plan_edit` appends it to the plan's `manual_changes`, which the review-delivery record and the retirement at the next model revision read; the broker refuses this method when it is dispatched to it directly. Returns `{ "plan": ..., "review_reload_required": true }`; when the request carries the open review document, the response carries the refreshed `review` instead of `review_reload_required`, or `review_error` when the edit committed but the review could not refresh. No dedicated session event follows. This changes planned test metadata, not source test files. Wrong owner/state, stale review, unknown tests, or persistence failure is explicit.
 
 ## `session.preview`
 
@@ -1285,7 +1285,7 @@ Cancel the selected session's current execution.
 
 ### Contract
 
-Accepts optional root `target` and `restore_prompt_if_no_output` (boolean, default false). It validates root control ownership, quiesces managed children, cancels root approvals, and collects provider cleanup before acknowledging cancellation. Returns `{ "cancel_requested": true }` for an active provider turn, or the settled broker cancellation result when already idle. Prompt restoration only applies when the turn can be retracted before output. Cleanup failure remains an error and prevents pretending the provider stopped. A cancel that stops foreground work or pauses an unfinished task also pauses queued input; one that finds neither leaves the queue running, so an interrupt sent while the status still read `Working` cannot strand queued messages. Pausing the selected task/input queue is a separate state action used by the UI before cancellation.
+Accepts optional root `target` and `restore_prompt_if_no_output` (boolean, default false). It validates root control ownership, quiesces managed children, cancels root approvals, and collects provider cleanup before acknowledging cancellation. Returns `{ "cancel_requested": true }` for an active provider turn, or the settled broker cancellation result when already idle. Prompt restoration only applies when the turn can be retracted before output. Cleanup failure remains an error and prevents pretending the provider stopped. A cancel that stops foreground work or pauses a task with an attempt to stop (`broker::interrupt_pauses`: ready, running, stopping, or already paused) also pauses queued input; a task waiting for an answer or plan review, or blocked, keeps its status, at cancellation and at shutdown alike; one that finds neither leaves the queue running, so an interrupt sent while the status still read `Working` cannot strand queued messages. Pausing the selected task/input queue is a separate state action used by the UI before cancellation.
 
 The retired `session.turn.restart` method is unsupported. Configuration commands
 own any required collection and replacement dispatch through the session FIFO.

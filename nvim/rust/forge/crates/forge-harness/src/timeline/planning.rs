@@ -28,6 +28,7 @@ pub(super) fn attach(
                 ExchangePlanEvent {
                     id: record.id.clone(),
                     node_count: anchor.node_count,
+                    occurred_at_ms: Some(record.created_at_ms),
                     content: PlanEventContent::Lifecycle {
                         title: if record.title.is_empty() {
                             plan.title.clone()
@@ -49,6 +50,7 @@ pub(super) fn attach(
                     ExchangePlanEvent {
                         id: format!("{}:lifecycle:{}", execution.id, record.sequence),
                         node_count: anchor.node_count,
+                        occurred_at_ms: Some(record.occurred_at_ms),
                         content: PlanEventContent::Execution {
                             event: record.event,
                         },
@@ -74,6 +76,7 @@ pub(super) fn attach(
                 ExchangePlanEvent {
                     id: resolution.id.clone(),
                     node_count: anchor.node_count,
+                    occurred_at_ms: Some(resolution.resolved_at_ms),
                     content: PlanEventContent::Resolution {
                         resolution,
                         deviation,

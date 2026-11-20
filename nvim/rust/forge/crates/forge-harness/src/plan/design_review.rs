@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use forge_buffer::block::{
     BlockAnchor, BlockMetadata, BufferBlock, Decoration, TargetRange, TextChunk, TextPosition,
     TextRange,
@@ -51,54 +51,6 @@ pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
         .collect::<String>();
     Ok(RenderedPlan {
         markdown,
-        navigation,
-    })
-}
-
-/// Replaces only the test inventory and shifts later canonical source anchors.
-pub(super) fn replace_test_inventory(
-    previous: &RenderedPlan,
-    document: &PlanDocument,
-) -> Result<RenderedPlan> {
-    let (start, end) = test_source_range(previous)?;
-    let design = document
-        .design
-        .as_ref()
-        .context("test edits require a declaration plan")?;
-    let (block, mut anchors) = test_inventory(design)?;
-    let rows = block
-        .iter()
-        .flat_map(|block| block.text.wire_rows())
-        .collect::<Vec<_>>();
-    let previous_rows = previous.markdown.lines().collect::<Vec<_>>();
-    ensure!(
-        end <= previous_rows.len(),
-        "test inventory exceeds saved source"
-    );
-    let mut output = previous_rows[..start]
-        .iter()
-        .map(|line| (*line).to_owned())
-        .collect::<Vec<_>>();
-    output.extend(rows.iter().map(|row| row.to_string()));
-    output.extend(previous_rows[end..].iter().map(|line| (*line).to_owned()));
-    let shift = rows.len() as i64 - (end - start) as i64;
-    let mut navigation = previous.navigation.clone();
-    navigation.plan_version = document.version;
-    navigation
-        .anchor
-        .retain(|anchor| (anchor.line as usize) <= start || anchor.line as usize > end);
-    for anchor in &mut navigation.anchor {
-        if anchor.line as usize > end {
-            anchor.line = (anchor.line as i64 + shift) as u32;
-        }
-    }
-    for anchor in &mut anchors {
-        anchor.line += start as u32;
-    }
-    navigation.anchor.extend(anchors);
-    navigation.anchor.sort_by_key(|anchor| anchor.line);
-    Ok(RenderedPlan {
-        markdown: output.join("\n") + "\n",
         navigation,
     })
 }
@@ -153,15 +105,14 @@ pub(super) fn project(
     if let Some(design) = &document.design {
         update_warning_status(&mut source, design, warning_status)?;
     }
-    // Render the complete flows section once so each row keeps its Mermaid fence context.
-    let flow_text = document
-        .design
-        .as_ref()
-        .context("declaration review has no design")?
-        .document
-        .flows
-        .trim_end_matches('\n')
-        .to_owned();
+    // Render the complete flows section once so each row keeps its Mermaid fence context. The
+    // text joins the flow rows themselves, so every decoration range fits the row it lands on.
+    let flow_text = source
+        .iter()
+        .filter(|row| row.id.0.starts_with("plan:metadata:flows:"))
+        .map(|row| row.text.wire_rows().join("\n"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let flow_markdown = forge_buffer::markdown::MarkdownRenderer::source(
         BlockId("plan:flow-markdown".into()),
         &flow_text,
@@ -1184,6 +1135,29 @@ fn section_header(id: BlockId, title: &str) -> Result<BufferBlock> {
     )?)
 }
 
+/// Classify a planned test file for its review heading.
+///
+/// A file with no baseline is new even when the plan describes its tests without proposing
+/// its source, because nothing exists for the plan to modify.
+fn test_file_change(
+    has_baseline: bool,
+    has_proposal: bool,
+    cases: &[super::design_tests::DesignTestCase],
+) -> FileChange {
+    if !has_baseline {
+        FileChange::Added
+    } else if !has_proposal {
+        FileChange::Deleted
+    } else if cases
+        .iter()
+        .all(|case| case.change == super::DesignTestChange::Reused)
+    {
+        FileChange::Unchanged
+    } else {
+        FileChange::Modified
+    }
+}
+
 pub(super) fn test_inventory(
     design: &super::DeclarationDesign,
 ) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
@@ -1307,23 +1281,11 @@ pub(super) fn test_inventory(
             .max(3);
         let start = block.len();
         let id = format!("plan:tests:file:{}", super::digest(file.file.as_bytes()));
-        let change = if !design.baseline.contains_key(&file.file)
-            && parsed.proposed.contains_key(&file.file)
-        {
-            FileChange::Added
-        } else if design.baseline.contains_key(&file.file)
-            && !parsed.proposed.contains_key(&file.file)
-        {
-            FileChange::Deleted
-        } else if file
-            .cases
-            .iter()
-            .all(|case| case.change == super::DesignTestChange::Reused)
-        {
-            FileChange::Unchanged
-        } else {
-            FileChange::Modified
-        };
+        let change = test_file_change(
+            design.baseline.contains_key(&file.file),
+            parsed.proposed.contains_key(&file.file),
+            &file.cases,
+        );
         let counts = file.cases.iter().fold((0, 0), |(added, removed), case| {
             (
                 added + u64::from(case.change == super::DesignTestChange::New),
@@ -2036,4 +1998,41 @@ fn fold(block: &mut [BufferBlock], start: usize, id: &str) -> Result<()> {
 
 fn pointer(path: &str) -> String {
     path.replace('~', "~0").replace('/', "~1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileChange, test_file_change};
+    use crate::plan::DesignTestChange;
+    use crate::plan::design_tests::DesignTestCase;
+
+    fn case(change: DesignTestChange) -> DesignTestCase {
+        DesignTestCase {
+            name: "refund_rejects_unknown_products".into(),
+            target: None,
+            change,
+            description: "Rejects a product absent from the order.".into(),
+        }
+    }
+
+    /// A test file that exists nowhere yet is new, whether or not the plan proposes its source.
+    #[test]
+    fn test_file_without_baseline_is_added() {
+        assert!(matches!(
+            test_file_change(false, false, &[case(DesignTestChange::New)]),
+            FileChange::Added
+        ));
+        assert!(matches!(
+            test_file_change(false, true, &[case(DesignTestChange::New)]),
+            FileChange::Added
+        ));
+        assert!(matches!(
+            test_file_change(true, true, &[case(DesignTestChange::New)]),
+            FileChange::Modified
+        ));
+        assert!(matches!(
+            test_file_change(true, true, &[case(DesignTestChange::Reused)]),
+            FileChange::Unchanged
+        ));
+    }
 }

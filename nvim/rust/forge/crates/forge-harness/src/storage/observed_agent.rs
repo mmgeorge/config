@@ -109,6 +109,26 @@ impl SqliteStore {
         Ok(records)
     }
 
+    /// End observation for one child whose later native evidence the host could not place, and
+    /// leave its siblings on the same binding observed.
+    pub(crate) fn mark_observed_agent_unavailable(
+        &mut self,
+        binding: &BindingId,
+        agent: &AgentId,
+    ) -> Result<Option<ObservedAgent>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut record) = load(&transaction, binding, agent)? else {
+            return Ok(None);
+        };
+        if record.mark_unavailable() {
+            write(&transaction, &record)?;
+        }
+        transaction.commit()?;
+        Ok(Some(record))
+    }
+
     /// Load observed children in first-association order for one retained host session.
     pub(crate) fn list_observed_agents(&self, session_id: &str) -> Result<Vec<ObservedAgent>> {
         select(

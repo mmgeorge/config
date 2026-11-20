@@ -5517,7 +5517,7 @@ async fn start_background_reader(
                                 ProviderOperation::TurnStart,
                                 ProviderFailureKind::WrongInvocation,
                             ),
-                            forge_provider_api::ObservationFailure::OwnershipConflict,
+                            forge_provider_api::ObservationFailure::ownership_conflict(),
                         )
                         .await);
                     }
@@ -5865,17 +5865,25 @@ async fn handle_native_request(
                         session.normalization.lock().await.replay_sensitive = true;
                         let result = match &owner {
                             super::normalization::NativeCallbackOwner::Root => {
-                                request.provider_tools.call(&request.scope, call).await
+                                request
+                                    .provider_tools
+                                    .call_reply(&request.scope, call)
+                                    .await
                             }
                             super::normalization::NativeCallbackOwner::ObservedChild(child) => {
                                 request
                                     .provider_tools
-                                    .call_observed_child(&request.scope, child, call)
+                                    .call_observed_child_reply(&request.scope, child, call)
                                     .await
                             }
                         };
                         match result {
-                            Ok(text) => super::decode::dynamic_tool_response(text, true),
+                            // A refused host call reports `success: false` with its reason, so
+                            // Codex and the timeline show a failed call rather than a success.
+                            Ok(reply) => {
+                                let success = !reply.is_failure();
+                                super::decode::dynamic_tool_response(reply.text, success)
+                            }
                             Err(_) => super::decode::dynamic_tool_response(
                                 "The requested tool could not be completed.".into(),
                                 false,
@@ -5949,6 +5957,26 @@ async fn handle_native_request(
                     ),
                 )
             })?;
+            // Codex turns a decline into "rejected by user" for the model, so a Harness policy
+            // refusal would read as the user's and its permitted route would never reach the
+            // model. A developer message queued into the running turn carries the real answer.
+            if let PermissionResponse::Deny {
+                reason: Some(reason),
+            } = &decision
+                && let Some(thread) = params["threadId"]
+                    .as_str()
+                    .and_then(|thread| forge_provider_api::ProviderSessionId::try_from(thread).ok())
+            {
+                let rpc = session.rpc.lock().await;
+                // Best effort: the declined item still shows the reason to the user, and a
+                // runtime that refuses the message must not turn the decline into a failure.
+                let _ = session
+                    .turn_context
+                    .lock()
+                    .await
+                    .deliver(&rpc, &thread, &[declined_call_note(reason)], || {})
+                    .await;
+            }
             super::approval::codex_response(message, &decision)
         }
         _ => {
@@ -5962,6 +5990,13 @@ async fn handle_native_request(
         return session.rpc.lock().await.reject_request(id).await;
     }
     session.rpc.lock().await.respond(id, response).await
+}
+
+/// Explain a declined approval to the model, which Codex tells only that the user rejected it.
+fn declined_call_note(reason: &str) -> String {
+    format!(
+        "Codex reports the tool call it just declined as \"rejected by user\". Harness answered that approval request, and this is its answer: {reason}"
+    )
 }
 
 fn input_text(input: &PromptInput) -> String {
@@ -7124,12 +7159,18 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Codex's decline reply has no reason field, so the declined item reports the host's reason.
+    /// Codex's decline reply has no reason field and tells the model the user rejected the call,
+    /// so the host's reason reaches the model as a developer message queued into the running
+    /// turn before the decline, and reaches the user on the declined item.
+    ///
+    /// Without the message, a model whose shell write Harness refused read the refusal as the
+    /// user's, never learned to use its file-editing tool, and blocked its goal waiting for an
+    /// approval the user was never asked for.
     #[tokio::test]
-    async fn host_denial_reason_reaches_the_declined_command() {
+    async fn host_denial_reason_reaches_the_model_and_the_declined_command() {
         use super::super::normalization::CodexOutput;
         use forge_provider_api::{ItemCompletion, ItemEvent};
-        use futures_util::StreamExt;
+        use futures_util::{SinkExt, StreamExt};
         async {
             let (_, session, _events, mut socket) =
                 compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None })
@@ -7159,12 +7200,33 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             let approval = json!({"id":21,"method":"item/commandExecution/requestApproval","params":{
                 "threadId":"compaction-thread","turnId":"native-turn","itemId":"shell-write",
                 "command":"Set-Content notes.txt wave","cwd":"."}});
-            handle_native_request(&session, &request, &approval)
-                .await
-                .unwrap();
-            let reply: Value =
-                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+            let native = async {
+                let injection: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(injection["method"], "thread/inject_items", "{injection}");
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":injection["id"],"result":{}}).to_string().into(),
+                    ))
+                    .await
                     .unwrap();
+                let reply: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                (injection, reply)
+            };
+            let (handled, (injection, reply)) = tokio::join!(
+                handle_native_request(&session, &request, &approval),
+                native
+            );
+            handled.unwrap();
+            assert_eq!(injection["params"]["threadId"], "compaction-thread");
+            let item = &injection["params"]["items"][0];
+            assert_eq!(item["role"], "developer");
+            let note = item["content"][0]["text"].as_str().unwrap();
+            assert!(note.contains(SHELL_WRITE_REASON), "{note}");
+            assert!(note.contains("rejected by user"), "{note}");
             assert_eq!(reply["result"], json!({"decision":"decline"}));
             let mut output = CodexOutput::default();
             session

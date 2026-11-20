@@ -3708,3 +3708,40 @@ async fn provider_and_command_changes_use_separate_diff_sources() {
             .any(|message| message.text() == "The nested module is ready.")
     );
 }
+
+/// Review edits have one recorder, the task command owner, so the delivery record and the
+/// retirement at the next model revision see every edit. The broker refuses the edit methods
+/// instead of recording edits on its own.
+#[tokio::test]
+async fn broker_refuses_review_edits_outside_the_task_command_owner() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "data_root":data.path(),"workspace":repository.path(),"client_id":"review-edit-owner",
+        "provider":{"kind":"mock","command":[]},"model":"mock-model","effort":"low"
+    }))?)?;
+    for (id, method) in [
+        (1, "session.plan.entity.rename"),
+        (2, "session.plan.test.delete"),
+        (3, "session.plan.check.update"),
+    ] {
+        let result = broker
+            .dispatch(Request {
+                id,
+                method: method.into(),
+                params: json!({"plan_id":"plan","digest":"digest","expected_version":1,
+                    "entity_name":"Old","name":"New","tests":[],"enabled":{}}),
+            })
+            .await;
+        let error = result
+            .response
+            .error()
+            .expect("the broker accepted a review edit");
+        assert!(
+            error.message.contains("task command owner"),
+            "{method}: {}",
+            error.message
+        );
+    }
+    Ok(())
+}

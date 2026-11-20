@@ -2,7 +2,7 @@ use super::{HARNESS_SYSTEM_MESSAGE, PromptMode, ProviderRequest};
 
 use super::context_delivery::StandingSections;
 use forge_provider_api::forge::{
-    ExecuteTask, GoalTask, Permissions, PlanTask, ReadAccess, Task, WriteAccess,
+    ExecuteTask, GoalTask, PausedTask, Permissions, PlanTask, ReadAccess, Task, WriteAccess,
 };
 
 /// Workflow material for an active task, delivered as the `<task>` section.
@@ -17,6 +17,8 @@ pub(crate) enum TaskInstructions {
     Execute(ExecuteTask),
     /// A Goal task's objective.
     Goal(GoalTask),
+    /// The session's task while it is paused, whatever the turn's mode.
+    Paused(PausedTask),
 }
 
 impl ProviderRequest {
@@ -73,12 +75,17 @@ impl ProviderRequest {
 
     /// Describe the active task, or the absence of a task.
     ///
-    /// The turn's interaction mode selects the task: planning and plan discussion use the
-    /// editable planning directory and contract, Execute and Goal turns use the instructions the
-    /// broker resolved, and every other turn has no task.
+    /// A paused task is named as paused in every mode, so a message sent while it is paused
+    /// never reads as a session without a task. Otherwise the turn's interaction mode selects
+    /// the task: planning and plan discussion use the editable planning directory and contract,
+    /// Execute and Goal turns use the instructions the broker resolved, and every other turn has
+    /// no task.
     fn task(&self) -> Task {
         let context = self.control_context.as_ref();
         let instructions = context.and_then(|context| context.task_instructions.as_ref());
+        if let Some(TaskInstructions::Paused(paused)) = instructions {
+            return Task::Paused(paused.clone());
+        }
         if matches!(self.mode, PromptMode::Plan | PromptMode::PlanDiscussion)
             && let Some(scope) = context.and_then(|context| context.plan_authoring.as_ref())
         {

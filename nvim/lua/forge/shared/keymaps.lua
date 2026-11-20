@@ -289,7 +289,7 @@ function M.show_view_help(group, command_set, title, context)
   for _, command_id in ipairs(command_set.order or {}) do
     local action = command_set.action_by_id[command_id]
     local spec = spec_by_id[command_id]
-    local keys = M.view_keys_for(group, command_id)
+    local keys = M.view_keys_for(spec and spec.keymap or group, command_id)
     if action and spec and #keys > 0 and (not action.enabled or action.enabled(context)) then
       bindings[#bindings + 1] = { keys = keys, spec = spec }
     end

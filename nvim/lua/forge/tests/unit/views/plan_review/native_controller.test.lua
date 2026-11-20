@@ -6,6 +6,7 @@ local buffer_support = dofile("nvim/lua/forge/tests/support/buffer.lua")
 local keymap = dofile("nvim/lua/forge/tests/support/keymap.lua")
 local temp = dofile("nvim/lua/forge/tests/support/temp.lua")
 local notify = dofile("nvim/lua/forge/tests/support/notify.lua")
+local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
 local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({
@@ -273,7 +274,7 @@ T["submission_close"] = function()
   package.loaded["forge.views.harness.controller"] = {
     refresh_winbar = function() end,
     activate_snapshot = function() error("Plan command receipt is not a session snapshot") end,
-    synchronize_state = function() end,
+    synchronize_state = function(settled) if settled then settled({}, nil) end end,
     render = function() end,
     present_plan_question = function() end,
     task_transition = function() error("approval issued a second execution command") end,
@@ -285,7 +286,10 @@ T["submission_close"] = function()
     assert(decision_mapping, "decision popup did not bind Enter")
     decision_mapping()
   end
-  harness.session = { id = "session" }
+  -- A paused plan whose acceptance raised questions: the questions come first, so the decision
+  -- reply sends no one to /task resume.
+  harness.session = { id = "session", active_task = { kind = "plan", status = "paused",
+    plan = { artifact = { review = { elicitation = { question_set = { questions = { { id = "mode" } } } } } } } } }
   harness.transcript_win = vim.api.nvim_get_current_win()
   local controller = require("forge.views.plan_review.native_controller")
   local comments = require("forge.draft_comments")
@@ -316,11 +320,16 @@ T["submission_close"] = function()
     local request = pending[#pending]
     assert(request.method == (action == "accept" and "session.plan.accept" or action == "abort_plan" and "session.plan.cancel" or "session.plan.changes.request"))
     eq(request.params.draft_annotation[1].source.body, "Preserve this feedback")
-    eq(#vim.fn.win_findbuf(review.buf), 0, { fail_reason = action .. " kept the review visible while awaiting its response" })
-    assert(vim.api.nvim_get_current_win() == harness.transcript_win)
-    assert(not review.owner.closed and review.owner.submission_pending, "hiding cancelled the pending submission")
+    -- The host may still refuse the decision, so the review stays where the reviewer is until it
+    -- answers.
+    eq(vim.fn.win_findbuf(review.buf), { review.win }, { fail_reason = action .. " hid the review before the host answered" })
+    eq(vim.api.nvim_get_current_win(), review.win)
+    assert(not review.owner.closed and review.owner.submission_pending, action .. " did not wait for its response")
     request.callback({}, nil)
+    eq(#vim.fn.win_findbuf(review.buf), 0, { fail_reason = action .. " kept the review visible after the host accepted" })
+    assert(vim.api.nvim_get_current_win() == harness.transcript_win)
     assert(review.owner.closed and not harness.plan_review, action .. " did not release its completed owner")
+    eq(vim.tbl_filter(function(entry) return entry.message:find("/task resume", 1, true) ~= nil end, notice), {})
   end
 
   local review = open_review()
@@ -484,6 +493,28 @@ T["prose comment preserves both selected range endpoints"] = function()
     "range comment moved before the end of its selected source")
 end
 
+-- `startinsert` does nothing in Visual mode, so a comment opened over a selection left the editor
+-- in V-LINE and the typed comment ran as commands.
+T["comment over a visual selection leaves Visual mode for the editor"] = function()
+  local scene = question_review()
+  focus_source(scene, "Requirements")
+  local heading_row = vim.api.nvim_win_get_cursor(scene.review.win)[1]
+  keymap.feed("V" .. string.rep("<Down>", row_containing(scene, requirement, heading_row) - heading_row))
+  eq(vim.api.nvim_get_mode().mode, "V")
+  local inserted = 0
+  local original_cmd = vim.cmd
+  vim.cmd = setmetatable({}, { __index = original_cmd, __call = function(_, command)
+    if command == "startinsert" then inserted = inserted + 1 end
+    return original_cmd(command)
+  end })
+  MiniTest.finally(function() vim.cmd = original_cmd end)
+  keymap.invoke("C", { buffer = scene.review.buf, mode = "x" })
+  vim.cmd = original_cmd
+  eq({ vim.api.nvim_get_mode().mode, inserted }, { "n", 1 })
+  local comment = scene.comments.capture(scene.review.buf)[1]
+  assert(comment and comment.source.end_line > comment.source.start_line, "the comment lost its selected range")
+end
+
 T["answer completes while another tab owns the cursor"] = function()
   local scene = question_review()
   local question = add_message(scene, "A", "Why does requested_change own this behavior?")
@@ -624,6 +655,335 @@ T["close during pending answer retains review then reopens"] = function()
   scene.host.answer(1, "The caller owns it.")
   reopen(scene)
   assert_answer(scene, question, "The caller owns it.")
+end
+
+-- Presses made while a visibility toggle awaits its reply collapse to their parity, and every
+-- reply's patch keeps the editor on the host's document revision.
+T["rapid visibility toggles converge on the parity of the presses"] = function()
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local plan_host = plan_review_host.start({ lines = { "pub struct Sample;", "pub fn sample();" } })
+  local review = plan_host.open()
+  local notices = notify.capture()
+  local completed = 0
+  local function press(count)
+    vim.api.nvim_set_current_win(review.win)
+    for _ = 1, count do review.command_set.action_by_id.toggle_visibility.run({}) end
+    while plan_host.actions[completed + 1] do
+      completed = completed + 1
+      plan_host.complete_action(completed)
+    end
+  end
+  press(10)
+  eq(notices:messages(), {})
+  eq({ host = plan_host.public_only, review = review.public_only }, { host = true, review = true })
+  eq(review.owner.replica.revision, plan_host.revision)
+  press(11)
+  eq(notices:messages(), {})
+  eq({ host = plan_host.public_only, review = review.public_only }, { host = false, review = false })
+  eq(review.owner.replica.revision, plan_host.revision)
+  press(1)
+  eq({ host = plan_host.public_only, review = review.public_only }, { host = true, review = true })
+end
+
+-- The revision a model submits after the review opened, with one line inserted above the
+-- declaration so every later source line moves.
+local revised_plan_lines = vim.list_extend({ "Overview" }, vim.deepcopy(question_plan_lines))
+
+T["a new revision reloads the open review and carries unsaved drafts by their text"] = function()
+  local scene = question_review()
+  local comment = add_message(scene, "C", "Keep this draft across the revision.")
+  assert(vim.bo[scene.review.buf].modified, "new comment was not dirty")
+  local tab_count, review_window = #vim.api.nvim_list_tabpages(), scene.review.win
+  local plan = scene.host.revise(revised_plan_lines)
+  require("forge.views.plan_review.native_controller").observe(plan)
+  local review = assert(require("forge.session").harness.plan_review, "review closed on the new revision")
+  eq(review.plan.review_digest, plan.review_digest, { fail_reason = "open review stayed on the old revision" })
+  eq({ tabs = #vim.api.nvim_list_tabpages(), window = review.win, focused = vim.api.nvim_get_current_win() },
+    { tabs = tab_count, window = review_window, focused = review_window })
+  eq(review.owner.saved_source_digest, "saved:2")
+  local carried = scene.comments.capture(review.buf)
+  eq(#carried, 1, { fail_reason = "the unsaved draft was not carried onto the new revision" })
+  eq({ body = carried[1].source.body, line = carried[1].source.start_line },
+    { body = comment.source.body, line = 6 })
+  eq(scene.notices:messages(), {})
+end
+
+-- A new model revision replaces the document under the review's own window: the reviewer keeps the
+-- tab and window they were in, whether that is the review or the Harness tab.
+T["a new model revision reloads the review in place without moving focus"] = function()
+  local scene = question_review()
+  local tab_count = #vim.api.nvim_list_tabpages()
+  local review_window = scene.review.win
+  vim.api.nvim_set_current_tabpage(scene.review.return_tab)
+  local focused = vim.api.nvim_get_current_win()
+  local plan = scene.host.revise(revised_plan_lines)
+  require("forge.views.plan_review.native_controller").observe(plan)
+  local review = assert(require("forge.session").harness.plan_review, "review closed on the new revision")
+  eq({ digest = review.plan.review_digest, window = review.win, tabs = #vim.api.nvim_list_tabpages(),
+    focused = vim.api.nvim_get_current_win() },
+    { digest = plan.review_digest, window = review_window, tabs = tab_count, focused = focused })
+  eq(vim.api.nvim_win_get_buf(review_window), review.buf)
+  assert(review.owner.attached(), "reloaded review did not attach")
+  row_containing({ review = review }, "Overview")
+  eq(scene.notices:messages(), {})
+end
+
+-- Review edits commit a new document version within the same model revision, and the reply of
+-- the edit itself updates the review, so the session's plan record never reloads it, even while
+-- the edit is still in flight.
+T["a check toggle raises no notice and does not reload the review"] = function()
+  local scene = question_review()
+  local review = scene.review
+  local owner = review.owner
+  local controller = require("forge.views.plan_review.native_controller")
+  stub(require("forge.views.plan_review.checks"), "open", function(_, apply) apply({ enabled = { lint = true } }) end)
+  vim.api.nvim_set_current_win(review.win)
+  review.command_set.action_by_id.checks.run({})
+  local request = assert(scene.host.requests[1], "check toggle sent no request")
+  eq(request.method, "session.plan.check.update")
+  controller.observe(scene.host.edit())
+  scene.host.complete_request(1)
+  controller.observe(scene.host.plan)
+  eq({ review = require("forge.session").harness.plan_review, owner = review.owner, closed = owner.closed == true },
+    { review = review, owner = owner, closed = false })
+  eq(review.plan.review_digest, scene.host.plan.review_digest)
+  eq(vim.api.nvim_get_current_win(), review.win)
+  eq(scene.notices:messages(), {})
+end
+
+T["a rename shows its preview before applying and raises no notice"] = function()
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local plan_host = plan_review_host.start({ lines = { "pub struct Sample;", "pub fn sample() -> Sample;" },
+    rename = { symbol = "sample", name = "Sample", preview = {
+      { block = "plan:1", column = 11, length = 6 }, { block = "plan:2", column = 19, length = 6 } } } })
+  local review = plan_host.open()
+  local notices = notify.capture()
+  local owner = review.owner
+  local controller = require("forge.views.plan_review.native_controller")
+  local input, answer
+  stub(require("forge.infra.popup_window"), "incremental_input", function(options, callback) input, answer = options, callback end)
+  vim.api.nvim_set_current_win(review.win)
+  vim.api.nvim_win_set_cursor(review.win, { 1, 11 })
+  review.command_set.action_by_id.rename_entity.run({})
+  assert(input, "rename did not ask for the new name")
+  input.on_change("Portion")
+  local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
+  local function previewed()
+    return vim.tbl_map(function(mark) return mark[4].virt_text and mark[4].virt_text[1][1] end,
+      vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, { details = true }))
+  end
+  -- An earlier edit's plan record arrives while the reviewer is still typing the new name.
+  controller.observe(plan_host.edit())
+  eq({ preview = previewed(), requests = #plan_host.requests }, { preview = { "Portion", "Portion" }, requests = 0 })
+  -- Entering the name keeps the preview on screen and asks before anything changes, so a name
+  -- typed and entered in one motion still shows every span it rewrites.
+  local confirmation
+  stub(require("forge.infra.confirm"), "open", function(lines, on_yes, on_no, options)
+    confirmation = { lines = lines, yes = on_yes, no = on_no, title = options and options.title }
+  end)
+  answer("Portion")
+  eq({ preview = previewed(), requests = #plan_host.requests, confirming = confirmation ~= nil },
+    { preview = { "Portion", "Portion" }, requests = 0, confirming = true })
+  eq(confirmation.lines[1], "Rename Sample to Portion in 2 places?")
+  confirmation.yes()
+  local request = assert(plan_host.requests[1], "rename sent no request")
+  eq({ method = request.method, name = request.params.name }, { method = "session.plan.entity.rename", name = "Portion" })
+  plan_host.complete_request(1)
+  controller.observe(plan_host.plan)
+  eq({ review = require("forge.session").harness.plan_review, owner = review.owner, closed = owner.closed == true },
+    { review = review, owner = owner, closed = false })
+  eq(notices:messages(), {})
+end
+
+-- A review the reviewer hid, or closed, stays out of the way; one notice says the revision is
+-- ready and names the reopening key.
+T["a new model revision of a hidden review is announced once"] = function()
+  local scene = question_review()
+  add_message(scene, "C", "Retain this across the hidden revision.")
+  vim.api.nvim_set_current_win(scene.review.win)
+  keymap.feed("q")
+  local focused = vim.api.nvim_get_current_win()
+  local tab_count = #vim.api.nvim_list_tabpages()
+  local controller = require("forge.views.plan_review.native_controller")
+  local plan = scene.host.revise(revised_plan_lines)
+  controller.observe(plan)
+  controller.observe(plan)
+  eq(scene.notices:messages(), { "Plan revision 2 is ready · op" })
+  eq({ focused = vim.api.nvim_get_current_win(), tabs = #vim.api.nvim_list_tabpages(),
+    shown = #vim.fn.win_findbuf(scene.review.buf) }, { focused = focused, tabs = tab_count, shown = 0 })
+  local review = scene.host.open()
+  eq(review.plan.review_digest, plan.review_digest)
+end
+
+-- Review items no prompt delivered stay pending on the new revision. The host keeps the edits
+-- and the comments it could not place on the record, and the editor names them once, so none is
+-- dropped silently.
+T["a new model revision names the review items that stay pending"] = function()
+  local scene = question_review()
+  vim.api.nvim_set_current_win(scene.review.win)
+  keymap.feed("q")
+  local controller = require("forge.views.plan_review.native_controller")
+  local plan = vim.deepcopy(scene.host.revise(revised_plan_lines))
+  plan.manual_changes = { { kind = "rename", from = "moneyAllocate", to = "moneyPortion" } }
+  plan.unplaced_review_comments = { "Say whether zero parts are rejected." }
+  controller.observe(plan)
+  controller.observe(plan)
+  eq(scene.notices:messages(), {
+    "Plan revision 2 is ready · op",
+    "Plan revision 2 did not receive these review items, which stay pending and go with your next"
+      .. " message or decision:\n- Renamed moneyAllocate to moneyPortion\n- Comment: Say whether zero parts are rejected.",
+  })
+end
+
+T["a new model revision of a closed review is announced once"] = function()
+  local scene = question_review()
+  vim.api.nvim_set_current_win(scene.review.win)
+  keymap.feed("q")
+  eq(require("forge.session").harness.plan_review, nil, { fail_reason = "saved PlanReview did not close" })
+  local controller = require("forge.views.plan_review.native_controller")
+  controller.observe(scene.host.edit())
+  local plan = scene.host.revise(revised_plan_lines)
+  controller.observe(plan)
+  controller.observe(plan)
+  eq(scene.notices:messages(), { "Plan revision 2 is ready · op" })
+  eq(require("forge.session").harness.plan_review, nil)
+end
+
+-- A refused decision leaves the reviewer in the review with the host's whole reason; the reason
+-- wraps to the notification width instead of running off it.
+T["a refused decision keeps the review open and reports the host's reason"] = function()
+  local scene = question_review()
+  local review = scene.review
+  local reason = "Plan acceptance was refused because the planning directory changed after the revision was submitted;"
+    .. " revise the plan with /plan retry, then review the new revision before accepting it again."
+  review.command_set.action_by_id.accept.run({})
+  local decision_buf = vim.api.nvim_get_current_buf()
+  eq(vim.bo[decision_buf].filetype, "ForgePlanDecision")
+  keymap.invoke("<CR>", { buffer = decision_buf, mode = "i" })
+  eq({ window = vim.api.nvim_get_current_win(), shown = vim.fn.win_findbuf(review.buf) },
+    { window = review.win, shown = { review.win } })
+  scene.host.complete_request(1, reason)
+  eq({ review = require("forge.session").harness.plan_review, window = vim.api.nvim_get_current_win(),
+    shown = vim.fn.win_findbuf(review.buf), tabs = #vim.api.nvim_list_tabpages() },
+    { review = review, window = review.win, shown = { review.win }, tabs = 2 })
+  eq(#scene.notices, 1)
+  local notice = scene.notices[1]
+  eq({ level = notice.level, text = (notice.message:gsub("\n", " ")) }, { level = vim.log.levels.ERROR, text = reason })
+  local width = 0
+  for _, line in ipairs(vim.split(notice.message, "\n")) do width = math.max(width, vim.fn.strdisplaywidth(line)) end
+  assert(width < #reason, "the refusal reason was not wrapped")
+end
+
+-- Submitting from the decision popup returns focus to the review, never to the transcript, and
+-- only the host's acceptance moves it to the composer.
+T["submitting a decision keeps focus in the review until the host accepts"] = function()
+  local scene = question_review()
+  local review = scene.review
+  local harness = require("forge.session").harness
+  vim.api.nvim_set_current_tabpage(review.return_tab)
+  vim.cmd("split")
+  harness.composer_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_set_current_tabpage(review.tab)
+  vim.api.nvim_set_current_win(review.win)
+  review.command_set.action_by_id.request_changes.run({})
+  local decision_buf = vim.api.nvim_get_current_buf()
+  local order = {}
+  vim.api.nvim_create_autocmd("WinEnter", { callback = function()
+    local window = vim.api.nvim_get_current_win()
+    order[#order + 1] = window == review.win and "review" or window == harness.transcript_win and "transcript"
+      or window == harness.composer_win and "composer" or "other"
+  end })
+  keymap.invoke("<CR>", { buffer = decision_buf, mode = "i" })
+  eq({ order = order, mode = vim.api.nvim_get_mode().mode }, { order = { "review" }, mode = "n" })
+  scene.host.complete_request(1)
+  eq(order[#order], "composer")
+  assert(not vim.tbl_contains(order, "transcript"), "focus passed through the transcript: " .. vim.inspect(order))
+  eq(scene.notices:messages(), {})
+end
+
+-- Closing a review returns to the Harness transcript, whose sign column takes two cells, and `op`
+-- from there opens the review in a new tab that copies the transcript's window options. The review
+-- presents its text at the same column however it was opened.
+T["reopening a review from the transcript keeps the text column"] = function()
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local plan_host = plan_review_host.start({ lines = question_plan_lines })
+  local transcript = vim.api.nvim_get_current_win()
+  vim.wo[transcript].signcolumn, vim.wo[transcript].statuscolumn = "yes:1", "%s"
+  vim.cmd("split")
+  vim.wo.signcolumn, vim.wo.foldcolumn, vim.wo.statuscolumn = "no", "0", ""
+  local scene = { host = plan_host, review = plan_host.open(), comments = require("forge.draft_comments") }
+  local function text_offset() return vim.fn.getwininfo(scene.review.win)[1].textoff end
+  local opened = text_offset()
+  local offsets = {}
+  for round = 1, 2 do
+    -- The second round holds an unsaved draft, so closing keeps the owner and `op` shows it again.
+    if round == 2 then focus_source(scene) add_message(scene, "C", "Keep the column.") end
+    vim.api.nvim_set_current_win(scene.review.win)
+    keymap.feed("q")
+    eq(vim.api.nvim_get_current_win(), transcript)
+    scene.review = plan_host.open()
+    offsets[round] = text_offset()
+  end
+  eq(offsets, { opened, opened })
+end
+
+-- `oY` while the task is paused records the acceptance and starts nothing. The reviewer learns that
+-- once there is nothing left to answer: at once when the acceptance raised no questions, and not
+-- while its questions still wait (the answer that completes them reports it instead).
+T["an acceptance recorded while paused names /task resume once nothing is left to answer"] = function()
+  local recorded = "Plan acceptance recorded. The task is paused; run /task resume to execute."
+  for _, case in ipairs({
+    { name = "no questions", status = "paused", expected = { recorded } },
+    { name = "questions wait", status = "paused", elicitation = { owner = "plan_acceptance" }, expected = {} },
+    { name = "running", status = "waiting", expected = {} },
+  }) do
+    local scene = question_review()
+    local harness = require("forge.session").harness
+    harness.session.active_task = { kind = "plan", status = case.status }
+    local controller = package.loaded["forge.views.harness.controller"]
+    controller.synchronize_state = function(settled)
+      harness.active_elicitation = case.elicitation
+      if settled then settled({}, nil) end
+    end
+    scene.review.command_set.action_by_id.accept.run({})
+    keymap.invoke("<CR>", { buffer = vim.api.nvim_get_current_buf(), mode = "i" })
+    local request = assert(scene.host.requests[1], "acceptance sent no request")
+    request.callback({ id = "accept", state = "completed", outcome = { outcome = "task", result = {
+      disposition = "awaiting_input", source = { id = "plan" }, task = { id = "task", revision = 2 },
+      question_set = { id = "set", revision = 1, answer_revision = 0 } } } })
+    local info = vim.tbl_map(function(entry) return entry.message end,
+      vim.tbl_filter(function(entry) return entry.level == vim.log.levels.INFO end, scene.notices))
+    eq({ case = case.name, notices = info }, { case = case.name, notices = case.expected })
+    harness.active_elicitation = nil
+  end
+end
+
+T["drafts whose text left the new revision are reported with their text"] = function()
+  local scene = question_review()
+  add_message(scene, "C", "Explain the removed declaration.")
+  local plan = scene.host.revise({ "Requirements", "", "Preserve the requested behavior at its owning boundary." })
+  require("forge.views.plan_review.native_controller").observe(plan)
+  local review = assert(require("forge.session").harness.plan_review)
+  eq(review.plan.review_digest, plan.review_digest)
+  eq(#scene.comments.capture(review.buf), 0)
+  local messages = table.concat(scene.notices:messages(), "\n")
+  assert(messages:find("Explain the removed declaration.", 1, true), "dropped draft was not reported: " .. messages)
+end
+
+T["op reopens a hidden review with unsaved drafts on a new revision"] = function()
+  local scene = question_review()
+  local comment = add_message(scene, "C", "Retain this across the hidden revision.")
+  vim.api.nvim_set_current_win(scene.review.win)
+  keymap.feed("q")
+  eq(vim.api.nvim_get_current_tabpage(), scene.review.return_tab, { fail_reason = "dirty PlanReview did not return to Harness" })
+  scene.host.revise(revised_plan_lines)
+  local review = scene.host.open()
+  eq(review.plan.review_digest, "digest:2", { fail_reason = "op did not open the new revision" })
+  eq(scene.notices:messages(), {})
+  local carried = scene.comments.capture(review.buf)
+  eq({ count = #carried, body = carried[1] and carried[1].source.body, line = carried[1] and carried[1].source.start_line },
+    { count = 1, body = comment.source.body, line = 6 })
+  assert(vim.bo[review.buf].modified, "carried draft lost its unsaved marker")
 end
 
 return T

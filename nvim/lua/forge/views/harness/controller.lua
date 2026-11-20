@@ -248,7 +248,7 @@ local function status_text()
   elseif activity.unavailable_reason(state) then
     append_status("Session unavailable: " .. activity.unavailable_reason(state), "ForgeHarnessGoal")
   elseif current_task then
-    append_status(task_control.label(current_task), "ForgeHarnessGoal")
+    append_status(task_control.label(current_task, activity.turn_running(state)), "ForgeHarnessGoal")
   end
   if state.configuration_error then
     append_status("Settings rejected: " .. state.configuration_error:gsub("%s+", " "), "ForgeHarnessToolFailure")
@@ -685,6 +685,10 @@ local function on_event(event, payload)
       state.active_elicitation = nil
       question_presentation.reset(state)
     end
+    -- A question the host raises on its own, such as automatic acceptance asking for execution
+    -- settings, arrives only in the snapshot, so a status that awaits an answer the editor does
+    -- not hold reads it.
+    if state.status.kind == "awaiting_input" and not M.holds_question(state) then M.synchronize_state() end
     schedule_render()
   elseif event == "provider_event" then
     if require("forge.event_contract").route("provider", payload.kind) == "ignore" then return end
@@ -746,8 +750,11 @@ local function on_event(event, payload)
     local _, previous_required = questions.count(state)
     questions.receive(state, payload)
     local _, required_count = questions.count(state)
+    local current_win = vim.api.nvim_get_current_win()
+    -- A new question opens by itself, like an approval, when focus is in this session's view.
     if required_count > previous_required and not require("forge.views.picker").is_open()
-      and vim.api.nvim_get_current_win() == state.transcript_win then
+      and (current_win == state.transcript_win or current_win == state.composer_win)
+      and not M.hold_while_typing(state, "questions", function() questions.open(state, picker_host(state)) end) then
       questions.open(state, picker_host(state))
     end
     M.refresh_winbar()
@@ -817,6 +824,83 @@ local function on_event(event, payload)
   end
 end
 
+-- A popup that takes focus while the user types receives the next letters and Enter as its
+-- decisions; one such run saved an "always allow" rule after the user paused for a second, so no
+-- key timing decides. An approval, plan question, or question never opens by itself while the
+-- editor is in Insert, Replace, or Command-line mode in any buffer. It waits in this list, as if
+-- the user had dismissed it, and one global hook opens the held popups in order when that mode
+-- ends, provided the session's view is in the current tab; otherwise they wait for the reopen key.
+-- Each entry keeps the window and mode the request interrupted, and a held popup returns there
+-- when it is answered or closed, so a user who was typing in the composer continues typing.
+---@type {state: table, kind: "approval"|"plan_question"|"questions", present: fun(), origin: ForgePopupOrigin}[]
+local held_popup_list = {}
+local held_popup_order = { approval = 1, plan_question = 2, questions = 3 }
+local held_popup_label = { approval = "Approval", plan_question = "Question", questions = "Question" }
+
+---@return boolean typing Whether the editor is in a mode that takes typed text.
+function M.typing_mode()
+  local mode = vim.api.nvim_get_mode().mode:sub(1, 1)
+  return mode == "i" or mode == "R" or mode == "c"
+end
+
+---@param entry {state: table}
+---@return boolean
+local function held_view_in_current_tab(entry)
+  local window = entry.state.transcript_win
+  return window ~= nil and vim.api.nvim_win_is_valid(window)
+    and vim.api.nvim_win_get_tabpage(window) == vim.api.nvim_get_current_tabpage()
+end
+
+---Open the first held popup whose view is in the current tab, and the next ones as each closes.
+function M.release_held_popups()
+  if #held_popup_list == 0 or M.typing_mode() or picker.is_open() then return end
+  -- Popups held for a view in another tab wait for the reopen key.
+  held_popup_list = vim.tbl_filter(held_view_in_current_tab, held_popup_list)
+  local entry = table.remove(held_popup_list, 1)
+  if not entry then return end
+  picker.present_from(entry.origin, entry.present)
+  if #held_popup_list > 0 then
+    vim.schedule(function() picker.when_idle(M.release_held_popups) end)
+  end
+end
+
+vim.api.nvim_create_autocmd({ "InsertLeave", "CmdlineLeave" }, {
+  group = vim.api.nvim_create_augroup("ForgeHarnessHeldPopup", { clear = true }),
+  callback = function() if #held_popup_list > 0 then vim.schedule(M.release_held_popups) end end,
+  desc = "Open Harness popups held while the user typed",
+})
+
+---Hold `present` when the user is typing; the caller then leaves the request pending.
+---@param state table
+---@param kind "approval"|"plan_question"|"questions"
+---@param present fun()
+---@return boolean held
+function M.hold_while_typing(state, kind, present)
+  if not M.typing_mode() then return false end
+  for _, entry in ipairs(held_popup_list) do
+    if entry.state == state and entry.kind == kind then entry.present = present return true end
+  end
+  held_popup_list[#held_popup_list + 1] = { state = state, kind = kind, present = present,
+    origin = { win = vim.api.nvim_get_current_win(), mode = vim.fn.mode(1) } }
+  table.sort(held_popup_list, function(left, right) return held_popup_order[left.kind] < held_popup_order[right.kind] end)
+  local key = keymaps.view_keys_for("harness", "reopen_question")[1]
+  notifications.info(held_popup_label[kind] .. " waiting" .. (key and (" · " .. key) or ""), "ForgeHarness")
+  return true
+end
+
+---Forget the popups held for `state`, which the user opened another way.
+---@param state table
+---@return ForgePopupOrigin? origin Where the earliest of them interrupted the user.
+local function release_held_for(state)
+  local origin
+  held_popup_list = vim.tbl_filter(function(entry)
+    if entry.state ~= state then return true end
+    origin = origin or entry.origin
+    return false
+  end, held_popup_list)
+  return origin
+end
+
 ---Show the first pending approval of `target_state`, or of the active state.
 ---
 ---The view's windows may be gone, for example after `q` closed the tab while the session kept its
@@ -831,6 +915,13 @@ function M.present_approval(reopen, target_state)
   if not reopen and state.dismissed_approval_id == request.request_id then return end
   local host = picker_host(state)
   if #host.window_list == 0 then return end
+  if not reopen and M.hold_while_typing(state, "approval", function()
+    if not state.approval_open then M.present_approval(true, state) end
+  end) then
+    state.dismissed_approval_id = request.request_id
+    if harness_state() == state then M.refresh_winbar() end
+    return
+  end
   local owner = type(request.execution_owner) == "table" and request.execution_owner or nil
   local child_id = owner and owner.agent_id ~= (state.session.primary_agent_id or (state.session.id .. ":agent:primary"))
     and owner.agent_id or nil
@@ -914,6 +1005,29 @@ function M.present_plan_question(force)
   -- A view closed with `q` keeps its subscription but has no window to anchor the picker; the
   -- question stays unpresented until the view reopens.
   if #host.window_list == 0 then return end
+  if not force and M.hold_while_typing(state, "plan_question", function()
+    M.with_state(state, function() M.present_plan_question(false) end)
+  end) then return end
+  ---Send one answer or skip, and adopt the question set that remains open after it.
+  local function settle_question(method, params, callback)
+    params.target = question_target
+    client.request({ session_id = session_id, method = method, params = params }, function(result, request_error, detail)
+      if request_error then
+        notifications.error(request_error, "Harness question")
+        callback(nil, request_error, detail)
+        return
+      end
+      state.active_plan = result.active_plan or state.active_plan
+      local remaining = result.active_elicitation ~= vim.NIL and result.active_elicitation or nil
+      question_presentation.receive(state, remaining, false)
+      -- The reply that settles the last review question reports an acceptance the paused task
+      -- only recorded; the review's decision reply stayed silent while these questions waited.
+      if not remaining and (owner == "plan_review" or owner == "plan_acceptance") then
+        task_control.report_recorded_acceptance(state, nil)
+      end
+      callback(remaining and remaining.elicitation)
+    end)
+  end
   question_presentation.mark_presented(state)
   state.plan_question_open = true
   require("forge.views.harness.plan_question").open(elicitation, {
@@ -923,32 +1037,8 @@ function M.present_plan_question(force)
     control_win = host.control_win,
     allow_ask = true,
     clarification_draft = draft,
-    answer = function(params, callback)
-      params.target = question_target
-      client.request({ session_id = session_id, method = "session.question.answer", params = params }, function(result, request_error, detail)
-        if request_error then
-          notifications.error(request_error, "Harness question")
-          callback(nil, request_error, detail)
-          return
-        end
-        state.active_plan = result.active_plan or state.active_plan
-        question_presentation.receive(state, result.active_elicitation, false)
-        callback(result.active_elicitation and result.active_elicitation.elicitation)
-      end)
-    end,
-    skip = function(params, callback)
-      params.target = question_target
-      client.request({ session_id = session_id, method = "session.question.skip", params = params }, function(result, request_error, detail)
-        if request_error then
-          notifications.error(request_error, "Harness question")
-          callback(nil, request_error, detail)
-          return
-        end
-        state.active_plan = result.active_plan or state.active_plan
-        question_presentation.receive(state, result.active_elicitation, false)
-        callback(result.active_elicitation and result.active_elicitation.elicitation)
-      end)
-    end,
+    answer = function(params, callback) settle_question("session.question.answer", params, callback) end,
+    skip = function(params, callback) settle_question("session.question.skip", params, callback) end,
     ask = function(params)
       state.plan_question_open = false
       prompt_history.record(params.text)
@@ -990,8 +1080,24 @@ function M.present_plan_question(force)
   })
 end
 
-function M.reopen_question()
+---Report whether the editor holds an approval or question it can present.
+---@param state table
+---@return boolean
+function M.holds_question(state)
+  return #(state.approval or {}) > 0
+    or (state.questions ~= nil and #(state.questions.questions or {}) > 0)
+    or (state.active_elicitation ~= nil and state.active_elicitation.elicitation ~= nil)
+end
+
+---@param synchronized? boolean the state was just read, so a missing question is final
+function M.reopen_question(synchronized)
   local state = harness_state()
+  local held_origin = release_held_for(state)
+  -- A popup the user opens while it is held returns, like a released one, to where it interrupted.
+  if held_origin then
+    picker.present_from(held_origin, function() M.reopen_question(synchronized) end)
+    return
+  end
   if #(state.approval or {}) > 0 then
     M.present_approval(true)
     return
@@ -1001,6 +1107,14 @@ function M.reopen_question()
     return
   end
   if not (state.active_elicitation and state.active_elicitation.elicitation) then
+    if not synchronized and state.status and state.status.kind == "awaiting_input" then
+      -- The status says a question waits, but this editor never received it: read the host's.
+      M.synchronize_state(function(_, failure)
+        if failure then notifications.warn(failure, "ForgeHarness") return end
+        if harness_state() == state then M.reopen_question(true) end
+      end, state)
+      return
+    end
     notifications.warn("No Harness approval or question awaits feedback", "ForgeHarness")
     return
   end
@@ -1199,9 +1313,34 @@ function M.open_replan_picker()
   task_control.plans(state, picker_host(state), false, M.task_transition)
 end
 
+---Open one artifact's review, or explain why a plan still being drafted has none yet.
+---@param state table
+---@param artifact { id: string, state?: string }
+---@param revision? integer
+function M.open_artifact(state, artifact, revision)
+  if artifact.state == "generating" or artifact.state == "configuring_checks" then
+    notifications.info("This plan is still being drafted; it opens once a revision is submitted", "Harness artifact")
+    return
+  end
+  local session_id, generation = state.session.id, client.host_get_generation()
+  client.request({ session_id = session_id, method = "session.plan.get",
+    params = { plan_id = artifact.id, revision = revision } }, function(plan, failure)
+    if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then return end
+    if failure then notifications.error(failure, "Harness artifact") return end
+    require("forge.views.plan_review").open(plan)
+  end)
+end
+
 function M.open_artifact_picker()
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
+  -- A plan awaiting review opens directly, also while its task is paused after a restart.
+  local active = state.active_plan
+  if active and active.state == "awaiting_review"
+    and not (state.status and state.status.kind == "awaiting_plan_review") then
+    M.open_artifact(state, active)
+    return
+  end
   if state.presentation and state.status and state.status.kind == "awaiting_plan_review" then
     state.presentation.status_action(function(action)
       client.request({ session_id = session_id, method = "session.plan.get", params = { plan_id = action.plan_id, revision = action.revision } }, function(plan, failure)
@@ -1227,14 +1366,7 @@ function M.open_artifact_picker()
     end, artifact_list)
   open_choice_picker(state, "Select Artifact", nil, option_list, function(artifact)
     if not artifact or not current() then return end
-    client.request({ session_id = session_id, method = "session.plan.get", params = { plan_id = artifact.id } }, function(plan, request_error)
-      if not current() then return end
-      if request_error then
-        notifications.error(request_error, "Harness artifact")
-        return
-      end
-      require("forge.views.plan_review").open(plan)
-    end)
+    M.open_artifact(state, artifact)
   end, "This session has no artifacts.")
 end
 
@@ -1243,8 +1375,9 @@ end
 ---@field ordinal integer
 ---@field prompt string
 ---@field opening? ForgeExchangeOpening
----@field state "complete"|"failed"|"cancelled"
+---@field state "complete"|"failed"|"cancelled"|"interrupted"
 ---@field checkpoint_before string
+---@field rollback_unavailable? string Why the host cannot roll back to this interaction.
 
 ---Put `text` in the composer and focus it for an immediate follow-up.
 ---
@@ -1286,6 +1419,17 @@ local function restore_composer_prompt(text, composer_free)
   return true
 end
 
+---Report a rollback failure and keep it in `:messages`.
+---
+---The notice fades, and a rollback the user confirmed must still explain afterwards why nothing
+---changed, so the failure also enters message history.
+---@param message string
+---@param title? string
+local function report_undo_failure(message, title)
+  notifications.error(message, title or "Harness undo")
+  pcall(vim.api.nvim_echo, { { (title or "Harness undo") .. ": " .. tostring(message), "ErrorMsg" } }, true, {})
+end
+
 ---@param preview table
 ---@param interaction table?
 local function confirm_restore_preview(preview, interaction)
@@ -1309,12 +1453,12 @@ local function confirm_restore_preview(preview, interaction)
     if choice == "more" then
       client.request({ session_id = session_id, method = "session.exchange.rollback.preview", params = { preview_id = preview.preview_id, offset = preview.next_offset } }, function(page, err)
         if not current() then return end
-        if err then notifications.error(err, "Harness undo") return end
+        if err then report_undo_failure(err) return end
         confirm_restore_preview(page, interaction)
       end)
       return
     end
-    if state.restore_applying or activity.busy(state) then return end
+    if state.restore_applying then return end
     local operation = {}
     state.restore_applying = operation
     local composer_free = state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
@@ -1331,11 +1475,11 @@ local function confirm_restore_preview(preview, interaction)
         return
       end
       if err then
-        notifications.error(err, "Harness undo")
+        report_undo_failure(err)
         if err:find("preview is stale", 1, true) and interaction then
           client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(refreshed, failure)
             if not current() then return end
-            if failure then notifications.error(failure, "Harness undo") return end
+            if failure then report_undo_failure(failure) return end
             confirm_restore_preview(refreshed, interaction)
           end)
         end
@@ -1346,18 +1490,34 @@ local function confirm_restore_preview(preview, interaction)
   end)
 end
 
----Return a rolled-back exchange's input to the composer when the user wrote it. A task start or
----continuation carries Harness-authored instructions, which the user never typed and the next
----task transition regenerates, so the composer stays untouched for those exchanges.
+---Name the composer text that recreates a rolled-back exchange, or nil when the user wrote none.
+---
+---A goal start returns as the `/goal <objective>` command that started it, since the objective
+---is the goal's title. Other task starts and continuations carry Harness-authored instructions,
+---which the user never typed and the next task transition regenerates.
+---@param interaction ForgeRollbackInteraction
+---@return string?
+function M.rolled_back_prompt(interaction)
+  local opening = interaction.opening
+  if type(opening) == "table" and opening.kind == "task_started" and type(opening.start) == "table"
+    and opening.start.kind == "goal" and (opening.start.title or "") ~= "" then
+    return "/goal " .. opening.start.title
+  end
+  if require("forge.render.harness.exchange_opening").notice(opening) then return nil end
+  return interaction.prompt or ""
+end
+
+---Return a rolled-back exchange's input to the composer when the user wrote it.
 ---
 ---A native rewind can take seconds, so `composer_free` (from `composer_draft.observe` when the user
 ---confirmed the rollback) keeps the prompt out of a composer that now holds newer work.
 ---@param interaction ForgeRollbackInteraction
 ---@param composer_free? fun(): boolean
 function M.restore_rolled_back_prompt(interaction, composer_free)
-  if require("forge.render.harness.exchange_opening").notice(interaction.opening) then return end
-  if not restore_composer_prompt(interaction.prompt or "", composer_free) and composer_free
-    and (interaction.prompt or "") ~= "" then
+  local prompt = M.rolled_back_prompt(interaction)
+  if not prompt then return end
+  if not restore_composer_prompt(prompt, composer_free) and composer_free
+    and prompt ~= "" then
     notifications.warn("The rolled-back prompt was not restored because the composer holds newer text",
       "Harness undo")
   end
@@ -1368,23 +1528,26 @@ end
 local function confirm_rollback(interaction, latest_exchange_id)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
-  if activity.busy(state) or state.restore_applying then return end
+  if state.restore_applying then return end
+  -- Both scopes collect active execution before they change anything, and leave the task paused.
+  local stops = activity.busy(state) and "Stops the running turn. " or ""
   local choices = {
     { label = "Cancel", value = "cancel" },
-    { label = "Conversation only", detail = "Keep all current files", value = "conversation" },
+    { label = "Conversation only", detail = stops .. "Keep all current files", value = "conversation" },
   }
   if interaction.checkpoint_before and not state.no_checkpoint then
-    choices[#choices + 1] = { label = "Conversation and files", detail = "Restore this interaction's checkpoint", value = "workspace" }
+    choices[#choices + 1] = { label = "Conversation and files",
+      detail = stops .. "Restore this interaction's checkpoint", value = "workspace" }
   end
   open_choice_picker(state, "Rollback interaction", "Choose what to roll back", choices, function(choice)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_get_generation() ~= generation then return end
-    if not choice or choice == "cancel" or activity.busy(state) or state.restore_applying then return end
+    if not choice or choice == "cancel" or state.restore_applying then return end
     if choice == "workspace" then
       client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(preview, err)
         if harness_state() ~= state or not state.session or state.session.id ~= session_id
           or client.host_get_generation() ~= generation then return end
-        if err then notifications.error(err, "Harness undo") return end
+        if err then report_undo_failure(err) return end
         confirm_restore_preview(preview, interaction)
       end)
       return
@@ -1396,9 +1559,13 @@ local function confirm_rollback(interaction, latest_exchange_id)
       and require("forge.views.harness.composer_draft").observe(state.composer_buf) or function() return false end
     M.task_transition({ action = "undo", rollback = {
       scope = "conversation", exchange_id = interaction.id, latest_exchange_id = latest_exchange_id,
-    } }, nil, function(applied)
+    } }, nil, function(applied, failure)
       if state.restore_applying ~= operation then return end
       state.restore_applying = nil
+      -- The task command already showed the failure as a notice; message history keeps it.
+      if not applied and failure then
+        pcall(vim.api.nvim_echo, { { "Harness undo: " .. tostring(failure), "ErrorMsg" } }, true, {})
+      end
       if not applied or not state.session or state.session.id ~= session_id
         or client.host_get_generation() ~= generation then return end
       M.with_state(state, function() M.restore_rolled_back_prompt(interaction, composer_free) end)
@@ -1406,13 +1573,11 @@ local function confirm_rollback(interaction, latest_exchange_id)
   end)
 end
 
----Open settled interaction history before choosing a rollback scope.
+---Open finished interaction history before choosing a rollback scope.
+---
+---The list opens during a running turn too: confirming a rollback collects that turn first.
 local function open_exchange_undo_picker(recovery)
   local state = harness_state()
-  if activity.busy(state) then
-    notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
-    return
-  end
   -- Every rollback rewinds the provider conversation natively; Harness never replays history.
   if not (state.capability and state.capability.native_conversation_rewind == true) then
     notifications.warn("Conversation rollback is unsupported: the current provider cannot rewind its conversation", "Harness undo")
@@ -1424,7 +1589,7 @@ local function open_exchange_undo_picker(recovery)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_get_generation() ~= generation then return end
     if request_error then
-      notifications.error(request_error, "Harness undo")
+      report_undo_failure(request_error)
       return
     end
     local rollback_state = { complete = true, failed = true, cancelled = true, interrupted = true }
@@ -1436,10 +1601,14 @@ local function open_exchange_undo_picker(recovery)
       then
         local host_notice = require("forge.render.harness.exchange_opening").notice(interaction.opening)
         local prompt = host_notice or vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
+        -- The host names a rollback it cannot perform, so the option says so before any choice.
+        local unavailable = type(interaction.rollback_unavailable) == "string" and interaction.rollback_unavailable
+          or nil
+        local detail = tostring(interaction.state) .. " · " .. (prompt ~= "" and prompt or "[empty prompt]")
         option_list[#option_list + 1] = {
           id = interaction.id,
-          label = "Exchange " .. tostring(interaction.ordinal),
-          detail = tostring(interaction.state) .. " · " .. (prompt ~= "" and prompt or "[empty prompt]"),
+          label = "Exchange " .. tostring(interaction.ordinal) .. (unavailable and " · unavailable" or ""),
+          detail = unavailable and (unavailable .. " · " .. detail) or detail,
           value = interaction,
         }
       end
@@ -1458,9 +1627,11 @@ local function open_exchange_undo_picker(recovery)
           client.request({ session_id = session_id, method = "session.exchange.recovery", params = { action = "undo" } }, function(preview, err)
             if harness_state() ~= state or not state.session or state.session.id ~= session_id
               or client.host_get_generation() ~= generation then return end
-            if err then notifications.error(err, "Harness recovery") return end
+            if err then report_undo_failure(err, "Harness recovery") return end
             confirm_restore_preview(preview)
           end)
+        elseif type(interaction.rollback_unavailable) == "string" then
+          report_undo_failure(interaction.rollback_unavailable)
         else
           confirm_rollback(interaction, interaction_list[#interaction_list].id)
         end
@@ -1473,8 +1644,8 @@ end
 ---Open interaction history directly unless an unfinished file restore needs recovery.
 function M.open_undo_picker()
   local state = harness_state()
-  if activity.busy(state) or state.restore_applying then
-    notifications.warn("Cancel or finish the active turn before restoring files", "Harness undo")
+  if state.restore_applying then
+    notifications.warn("A rollback is already in progress", "Harness undo")
     return
   end
   if not state.session then return end
@@ -1482,7 +1653,7 @@ function M.open_undo_picker()
   client.request({ session_id = session_id, method = "session.exchange.recovery", params = {} }, function(recovery, err)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_get_generation() ~= generation then return end
-    if err then notifications.error(err, "Harness recovery") return end
+    if err then report_undo_failure(err, "Harness recovery") return end
     if not recovery or recovery == vim.NIL then open_exchange_undo_picker() return end
     if not recovery.pending then open_exchange_undo_picker(recovery) return end
     local choices = { { label = "Cancel", value = "cancel" } }
@@ -1496,7 +1667,7 @@ function M.open_undo_picker()
       client.request({ session_id = session_id, method = "session.exchange.recovery", params = { action = choice } }, function(result, failure)
         if harness_state() ~= state or not state.session or state.session.id ~= session_id
           or client.host_get_generation() ~= generation then return end
-        if failure then notifications.error(failure, "Harness recovery") synchronize_state() return end
+        if failure then report_undo_failure(failure, "Harness recovery") synchronize_state() return end
         if choice == "undo" then confirm_restore_preview(result) else synchronize_state() end
       end)
     end)
@@ -2491,9 +2662,12 @@ function M.task_transition(action, submitted_text, completed, method)
       vim.api.nvim_buf_get_lines(buffer, 0, -1, false), attachment.capture(buffer).attachments,
       function() return harness_state() == state and state.composer_buf == buffer end)
   end
-  task_control.transition(state, action, M.render, function(failure)
-    if failure and restore_draft then restore_draft() end
-    if completed then completed(not failure) end
+  task_control.transition(state, action, M.render, function(failure, _, detail)
+    -- A task change that committed before its dispatch failed consumed the submission; the host
+    -- reports the failure, and offering the text again would invite a second, duplicate change.
+    local committed = detail and detail.code == "task_change_committed_dispatch_failed"
+    if failure and restore_draft and not committed then restore_draft() end
+    if completed then completed(not failure, failure) end
     if harness_state() == state then M.render() end
   end, method)
 end

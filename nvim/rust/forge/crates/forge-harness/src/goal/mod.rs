@@ -51,6 +51,10 @@ pub(crate) struct GoalControl {
     pub permit: crate::task::TaskPermit,
     pub termination: GoalTermination,
     pub message: String,
+    /// Why Harness declined this request after the turn ended. The goal then stays active, and
+    /// its next turn carries the reason to the model. Never persisted with the request itself.
+    #[serde(skip)]
+    pub refusal: Option<String>,
 }
 
 /// Represents the broker action selected after a goal turn ends.

@@ -17,6 +17,8 @@ pub enum PlanEvent {
     Cancelled,
     RetryRequested,
     TransitionFailed,
+    /// A revision ended without a submission; review resumes at the last submitted revision.
+    RevisionAbandoned,
 }
 
 /// Coordinates deterministic plan lifecycle transitions for the broker.
@@ -43,6 +45,11 @@ impl PlanStateMachine {
                 PlanEvent::PlanSubmitted,
             ) => PlanState::AwaitingReview,
             (PlanState::AwaitingReview, PlanEvent::ChangesRequested) => PlanState::Revising,
+            (PlanState::Revising, PlanEvent::RevisionAbandoned)
+                if plan.model_revision > 0 && plan.review_digest.is_some() =>
+            {
+                PlanState::AwaitingReview
+            }
             (PlanState::AwaitingReview, PlanEvent::Accepted) => PlanState::Accepted,
             (PlanState::Failed, PlanEvent::RetryRequested) => {
                 if plan.model_revision > 0 {
@@ -80,6 +87,7 @@ impl PlanStateMachine {
                 | PlanEvent::Accepted
                 | PlanEvent::Cancelled
                 | PlanEvent::TransitionFailed
+                | PlanEvent::RevisionAbandoned
         ) {
             plan.elicitation = None;
         }

@@ -37,6 +37,14 @@ pub struct ToolOutputView {
     heading: Option<(crate::turn::ToolCall, crate::turn::ToolInstant)>,
     owner: String,
     pub(super) group: String,
+    /// How the call ended when it did not succeed, shown beneath its output when expanded.
+    ///
+    /// The line travels with the output view so a tool opened after it ended renders it too;
+    /// opening a tool re-renders only this view, not the entry that projected it.
+    outcome: Option<String>,
+    /// The row marker state when Harness knows more than the provider reported, as when the
+    /// tool deadline stopped a call the provider calls interrupted.
+    heading_state: Option<crate::turn::ToolState>,
 }
 
 /// Locates retained output without keeping its bytes in the timeline.
@@ -300,6 +308,24 @@ impl ToolOutputView {
         self.heading.as_ref().map(|(call, now)| (call, *now))
     }
 
+    /// Record how the call ended and the marker state Harness assigns it.
+    pub(super) fn conclude(
+        &mut self,
+        outcome: Option<String>,
+        heading_state: Option<crate::turn::ToolState>,
+    ) {
+        self.outcome = outcome;
+        self.heading_state = heading_state;
+    }
+
+    pub(super) fn outcome(&self) -> Option<&str> {
+        self.outcome.as_deref()
+    }
+
+    pub(super) fn heading_state(&self) -> Option<crate::turn::ToolState> {
+        self.heading_state
+    }
+
     /// Keeps the parser and saved bytes while adopting newly projected heading ownership.
     pub(super) fn retain(&mut self, replacement: &Self) -> bool {
         if let (Some(source), Some(next)) = (&self.database, &replacement.database) {
@@ -326,6 +352,8 @@ impl ToolOutputView {
             return false;
         }
         self.heading = replacement.heading.clone();
+        self.outcome.clone_from(&replacement.outcome);
+        self.heading_state = replacement.heading_state;
         self.owner.clone_from(&replacement.owner);
         self.group.clone_from(&replacement.group);
         true
@@ -379,6 +407,8 @@ impl ToolOutputView {
             heading: None,
             owner: String::new(),
             group: String::new(),
+            outcome: None,
+            heading_state: None,
         }
     }
 

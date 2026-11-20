@@ -179,6 +179,8 @@ pub enum Task {
     Execute(ExecuteTask),
     /// A Goal task is pursuing an objective.
     Goal(GoalTask),
+    /// A task exists but is paused, so the turn answers the user without working on it.
+    Paused(PausedTask),
 }
 
 /// A Plan task's editable directory, its guide, the user's request, and the planning contract.
@@ -220,11 +222,41 @@ pub struct GoalTask {
     pub objective: String,
 }
 
+/// A paused task's kind and what it pursues.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PausedTask {
+    pub kind: PausedTaskKind,
+    /// The goal's objective, the plan's request, or the execution's plan title.
+    pub objective: String,
+}
+
+/// Kind of a paused task, written as the section's `kind` attribute.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PausedTaskKind {
+    Plan,
+    Execute,
+    Goal,
+}
+
+impl PausedTaskKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Execute => "execute",
+            Self::Goal => "goal",
+        }
+    }
+}
+
 /// Sentence that makes every user message during planning input to the plan.
 const PLAN_INPUT_RULE: &str = "Treat each user message during this task as input to the plan: the request on the first turn, and feedback after that.";
 
 /// Completion rule for a Goal task.
 const GOAL_RULE: &str = "Continue working until the goal is complete. Report completion with goal_complete only when all required work is done, or a concrete blocker with goal_blocked when no allowed progress remains.";
+
+/// Rule for a turn while the session's task is paused.
+const PAUSED_RULE: &str = "This task is paused. Answer the user's message without working on the task: do not continue, complete, block, or clear it. The task stays the session's task, and the user resumes it with /task resume.";
 
 /// Text for a turn without an active task.
 const NO_TASK: &str = "No Harness task is active for this turn. Do not start, clear, or complete a task, and earlier task instructions no longer apply.";
@@ -275,6 +307,18 @@ impl Task {
                 writer.text(GOAL_RULE);
                 writer.close();
             }
+            Self::Paused(paused) => {
+                writer.open(
+                    "task",
+                    &[
+                        ("kind", paused.kind.name().into()),
+                        ("state", "paused".into()),
+                    ],
+                );
+                writer.element("objective", &[], &paused.objective);
+                writer.text(PAUSED_RULE);
+                writer.close();
+            }
         }
     }
 
@@ -283,7 +327,7 @@ impl Task {
         match self {
             Self::Plan(plan) => Some(&plan.plan_id),
             Self::Execute(execute) => Some(&execute.plan_id),
-            Self::None | Self::Goal(_) => None,
+            Self::None | Self::Goal(_) | Self::Paused(_) => None,
         }
     }
 }

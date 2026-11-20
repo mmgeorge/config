@@ -217,4 +217,23 @@ T["vanished_child_returns_presentation_to_main"] = function()
   eq(shown, nil)
 end
 
+-- A review the user closed must still hear of a newer revision, because the review module owns
+-- the one "Plan revision N is ready" notice; the snapshot reported plans only to an open review.
+T["closed_plan_review_still_observes_a_new_plan_revision"] = function()
+  local snapshot = require("forge.views.harness.snapshot")
+  package.loaded["forge.lsp.startup"] = { start = function() end }
+  local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
+  local observed = {}
+  local review = require("forge.views.plan_review.native_controller")
+  local original = review.observe
+  review.observe = function(plan) observed[#observed + 1] = plan end
+  MiniTest.finally(function() review.observe = original end)
+  local plan = { id = "plan", state = "awaiting_review", model_revision = 2, working_path = "plan.md" }
+  local state = { session = { id = "closed-review" } }
+  snapshot.apply(state, { session = { id = "closed-review" }, active_plan = plan })
+  eq(state.plan_review, nil)
+  wait_until(function() return #observed == 1 end, "a closed review was not told of the new plan revision")
+  eq(observed[1].model_revision, 2)
+end
+
 return T

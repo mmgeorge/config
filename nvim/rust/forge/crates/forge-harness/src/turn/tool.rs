@@ -176,6 +176,11 @@ impl ToolCall {
     /// A tool started on its exchange's tool clock excludes the approval and input waits
     /// that pause that clock; other tools fall back to wall time.
     pub fn elapsed_ms(&self, now: ToolInstant) -> Option<u64> {
+        // A denied call never executed. Some providers announce a call as running before its
+        // approval, so its recorded interval measures the wait, not execution.
+        if self.state == ToolState::Denied {
+            return None;
+        }
         if let Some(start) = self.started_active_ms
             && let Some(end) = self.completed_active_ms.or_else(|| {
                 (self.state == ToolState::Running)

@@ -48,7 +48,7 @@ pub(crate) use question_answer::{
     PlanQuestionAnswerCommit, PlanQuestionAnswerError, PlanQuestionAnswerRequest, PlanQuestionOwner,
 };
 mod review_alignment;
-mod review_delivery;
+pub(crate) mod review_delivery;
 mod review_diff;
 mod review_file_layout;
 pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest, ParsedDeclarations};
@@ -103,6 +103,7 @@ pub use graph::{PlanGraph, ResolvedPlanEntity};
 pub use prompt::{PlanExecutionPromptKind, PlanPrompt};
 pub(crate) use prompt::{
     check_edits, removed_test_edits, resolved_questions, step as task_step, test_scope_edits,
+    with_unplaced_comments,
 };
 pub use render::{
     PlanNavigationAnchor, PlanNavigationIndex, PlanReviewReferenceKind, PlanReviewTarget,
@@ -156,9 +157,14 @@ pub struct PlanRecord {
     pub accepted_revision: Option<u32>,
     pub user_revision: u32,
     #[serde(default)]
-    /// Retains ordered edits the user applied with the review tools, which the next review
-    /// decision reports to the model.
+    /// Retains ordered edits the user applied with the review tools to the current model
+    /// revision. Every prompt to the planner while they are pending reports them, and a later
+    /// model revision retires the ones a prompt delivered.
     pub manual_changes: Vec<forge_provider_api::forge::PlanEdit>,
+    /// Saved review comments that no prompt delivered and whose lines a later model revision no
+    /// longer has. They stay pending, without a line, until a prompt to the planner carries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unplaced_review_comments: Vec<String>,
     pub review_digest: Option<String>,
     pub accepted_digest: Option<String>,
     #[serde(default)]
@@ -174,6 +180,36 @@ pub struct PlanRecord {
     pub validation_warning: Vec<PlanViolation>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// Append review edits to a plan's manual change list, keeping check selections as the net
+/// difference from the submitted revision.
+///
+/// Review tools send only the choices that change the visible selection, and both check
+/// selection and test coverage scope are binary, so an earlier entry for the same id records the
+/// submitted value's opposite. A later entry for that id with a different value therefore
+/// restores the submitted choice, and both entries leave the list.
+pub(crate) fn record_manual_changes(
+    changes: &mut Vec<forge_provider_api::forge::PlanEdit>,
+    edits: impl IntoIterator<Item = forge_provider_api::forge::PlanEdit>,
+) {
+    use forge_provider_api::forge::PlanEdit;
+    for edit in edits {
+        let earlier = changes.iter().position(|change| match (change, &edit) {
+            (PlanEdit::SetCheck { id: earlier, .. }, PlanEdit::SetCheck { id, .. })
+            | (PlanEdit::SetTestScope { id: earlier, .. }, PlanEdit::SetTestScope { id, .. }) => {
+                earlier == id
+            }
+            _ => false,
+        });
+        match earlier {
+            Some(index) if changes[index] == edit => {}
+            Some(index) => {
+                changes.remove(index);
+            }
+            None => changes.push(edit),
+        }
+    }
 }
 
 impl PlanRecord {
@@ -202,6 +238,11 @@ pub enum PlanLifecycleKind {
     RevisionCreated,
     Accepted,
     Cancelled,
+    /// A revision ended without a submission, so the plan returned to review.
+    RevisionStopped,
+    /// The planner changed its planning directory after submitting, so the submitted revision
+    /// was withdrawn from review and the plan returned to draft.
+    DraftWithdrawn,
 }
 
 /// Represents one immutable plan lifecycle event in the session timeline.
@@ -1288,26 +1329,6 @@ impl PlanFileStore {
         Ok(result)
     }
 
-    /// Rename one introduced definition and freeze its revision using only saved plan files.
-    pub(crate) fn rename_symbol(
-        &self,
-        session_id: &str,
-        plan_id: &str,
-        expected_version: u64,
-        identity: &str,
-        name: &str,
-        trace: Option<&PlanEditTrace>,
-    ) -> Result<(String, PlanDocument, RenderedPlan, String)> {
-        let document = measure(trace, "rename.read_validate", || {
-            self.read_working_document(session_id, plan_id)
-        })?;
-        anyhow::ensure!(
-            document.version == expected_version,
-            "plan version changed before rename"
-        );
-        self.rename_symbol_from_document(session_id, &document, identity, name, trace)
-    }
-
     /// Rename from the exact canonical document captured by the owner command.
     pub(crate) fn rename_symbol_from_document(
         &self,
@@ -1335,18 +1356,6 @@ impl PlanFileStore {
             trace,
         )?;
         Ok((definition.name, document, rendered, digest))
-    }
-
-    /// Rename one newly added entity and persist the complete canonical document.
-    pub fn rename_added_entity(
-        &self,
-        session_id: &str,
-        plan_id: &str,
-        entity_name: &str,
-        new_name: String,
-    ) -> Result<PlanEditResult> {
-        let document = self.read_working_document(session_id, plan_id)?;
-        self.rename_added_entity_from_document(session_id, &document, entity_name, new_name)
     }
 
     /// Rename an introduced entity while guarding the owner's captured canonical document.
@@ -1730,7 +1739,10 @@ impl PlanFileStore {
     }
 
     /// Publish a reviewed test-inventory edit without changing declarations or project files.
-    pub(crate) fn remove_tests(
+    ///
+    /// Planned tests feed the check preview, so deletion is the check-selection edit with only
+    /// tests removed: it recomputes the preview and persists the full render of the result.
+    pub(crate) async fn remove_tests(
         &self,
         session_id: &str,
         plan_id: &str,
@@ -1739,54 +1751,19 @@ impl PlanFileStore {
         selected: &[DesignTestSelection],
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let mut document = measure(trace, "delete.read_validate", || {
-            self.read_working_document(session_id, plan_id)
-        })?;
-        anyhow::ensure!(
-            document.version == expected_version,
-            "plan version changed before test deletion"
-        );
-        anyhow::ensure!(
-            digest(&crate::plan::codec::to_vec(&document)?) == expected_digest,
-            "plan changed before test deletion"
-        );
-        let original = document.clone();
-        let before = measure(trace, "delete.render_previous", || {
-            self.render_review(&document)
-        })?;
-        let path = self.plan_dir(session_id, plan_id).join("working.json");
-        let annotation = measure(trace, "delete.read_annotations", || {
-            Ok(review_annotation::ReviewAnnotationStore::open(
-                path.clone(),
-                digest(&fs::read(&path)?),
-            )?
-            .annotation()
-            .to_vec())
-        })?;
-        measure(trace, "delete.semantic_edit", || {
-            let design = document
-                .design
-                .as_mut()
-                .context("test deletion requires a declaration design")?;
-            design_tests::remove(&mut design.document.tests, selected)?;
-            design_artifact::revert_authored(PlanArtifact::Tests, design);
-            Ok(())
-        })?;
-        document.version = document
-            .version
-            .checked_add(1)
-            .context("plan version exhausted")?;
-        let rendered = measure(trace, "delete.update_test_rows", || {
-            design_review::replace_test_inventory(&before, &document)
-        })?;
-        self.persist_annotated_edit(
+        self.update_checks(
             session_id,
-            &original,
-            PlanReviewRevision::new(plan_id, document, rendered)?,
-            &before,
-            annotation,
+            plan_id,
+            expected_version,
+            expected_digest,
+            PlanCheckSelection {
+                enabled: &std::collections::BTreeMap::new(),
+                test_scopes: &std::collections::BTreeMap::new(),
+                removed_tests: selected,
+            },
             trace,
         )
+        .await
     }
 
     /// Updates check selection without changing repository defaults or discarding review annotations.
@@ -1824,13 +1801,15 @@ impl PlanFileStore {
             .design
             .as_mut()
             .context("check selection requires a declaration design")?;
-        let config = &design
-            .check_configuration
-            .as_ref()
-            .context("plan has no configured checks")?
-            .config;
-        design.document.set_checks(config, changes, test_scopes)?;
-        design_artifact::revert_authored(PlanArtifact::Checks, design);
+        if !changes.is_empty() || !test_scopes.is_empty() {
+            let config = &design
+                .check_configuration
+                .as_ref()
+                .context("plan has no configured checks")?
+                .config;
+            design.document.set_checks(config, changes, test_scopes)?;
+            design_artifact::revert_authored(PlanArtifact::Checks, design);
+        }
         if !tests.is_empty() {
             design_tests::remove(&mut design.document.tests, tests)?;
             design_artifact::revert_authored(PlanArtifact::Tests, design);
@@ -1874,35 +1853,7 @@ impl PlanFileStore {
         let (document, rendered, checksum) =
             self.persist_review_draft_locked(session_id, revision, trace)?;
         let reanchor = trace.map(|trace| trace.stage("delete.reanchor_annotations"));
-        let mut retained = Vec::new();
-        for mut item in annotation {
-            let find = |line| {
-                before.navigation.resolve_line(line).and_then(|previous| {
-                    rendered.navigation.anchor.iter().find(|current| {
-                        current.target == previous.target && current.label == previous.label
-                    })
-                })
-            };
-            let (Some(start), Some(end)) =
-                (find(item.source.start_line), find(item.source.end_line))
-            else {
-                continue;
-            };
-            if item.parent_id.as_ref().is_some_and(|parent| {
-                !retained
-                    .iter()
-                    .any(|saved: &ReviewAnnotation| &saved.id == parent)
-            }) {
-                continue;
-            }
-            item.source.start_line = start.line.min(end.line);
-            item.source.end_line = start.line.max(end.line);
-            item.anchor = Some(review_annotation::ReviewAnnotationAnchor {
-                start: start.target.clone(),
-                end: end.target.clone(),
-            });
-            retained.push(item);
-        }
+        let (retained, _) = review_annotation::relocate_annotations(before, &rendered, annotation);
         if !retained.is_empty() {
             review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?
                 .replace(retained)?;
@@ -2082,6 +2033,69 @@ pub fn digest(content: &[u8]) -> String {
 
 #[cfg(test)]
 mod test {
+    /// Selecting a check and then clearing it, or changing a coverage scope and changing it back,
+    /// leaves no check entry, while renames and deletions stay in order.
+    #[test]
+    fn manual_changes_keep_the_net_check_selection() {
+        use forge_provider_api::forge::{PlanEdit, PlanTestScope};
+        let mut changes = Vec::new();
+        super::record_manual_changes(
+            &mut changes,
+            [
+                PlanEdit::Rename {
+                    from: "Old".into(),
+                    to: "New".into(),
+                },
+                PlanEdit::SetCheck {
+                    id: "lint".into(),
+                    enabled: true,
+                },
+                PlanEdit::SetTestScope {
+                    id: "test".into(),
+                    scope: PlanTestScope::WholeSuite,
+                },
+                PlanEdit::SetCheck {
+                    id: "format".into(),
+                    enabled: false,
+                },
+            ],
+        );
+        super::record_manual_changes(
+            &mut changes,
+            [
+                PlanEdit::SetCheck {
+                    id: "lint".into(),
+                    enabled: false,
+                },
+                PlanEdit::SetTestScope {
+                    id: "test".into(),
+                    scope: PlanTestScope::Planned,
+                },
+                PlanEdit::RemoveTest {
+                    file: "tests.rs".into(),
+                    name: "case".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            changes,
+            vec![
+                PlanEdit::Rename {
+                    from: "Old".into(),
+                    to: "New".into(),
+                },
+                PlanEdit::SetCheck {
+                    id: "format".into(),
+                    enabled: false,
+                },
+                PlanEdit::RemoveTest {
+                    file: "tests.rs".into(),
+                    name: "case".into(),
+                },
+            ]
+        );
+    }
+
     #[test]
     fn input_timeout_preserves_confirmed_answers_and_marks_automatic_fallbacks() {
         use crate::session::ResolutionSource;

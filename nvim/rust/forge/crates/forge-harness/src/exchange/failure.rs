@@ -47,13 +47,6 @@ pub(super) enum StoppedCommand {
 #[error("owner storage is unavailable")]
 pub(super) struct OwnerStorageUnavailable;
 
-/// Report whether a domain error came from owner storage rather than from domain validation.
-///
-/// Storage failure fences the session for its lifetime, because no later command can certify its
-/// outcome. A domain rule that refused the command, such as continuing a task that is not
-/// running, leaves storage healthy, so classifying it as storage failure made one rejected
-/// command disable the whole session. Only SQLite, file I/O, and the owner's storage error types
-/// count as storage; everything else is a rejection of this command.
 /// Report whether a failure says the provider may hold an effect the host did not commit.
 fn delivery_uncertain(error: &anyhow::Error) -> bool {
     matches!(
@@ -62,7 +55,14 @@ fn delivery_uncertain(error: &anyhow::Error) -> bool {
     )
 }
 
-pub(super) fn storage_failure(error: &anyhow::Error) -> bool {
+/// Report whether a domain error came from owner storage rather than from domain validation.
+///
+/// Storage failure fences the session for its lifetime, because no later command can certify its
+/// outcome. A domain rule that refused the command, such as continuing a task that is not
+/// running, leaves storage healthy, so classifying it as storage failure made one rejected
+/// command disable the whole session. Only SQLite, file I/O, and the owner's storage error types
+/// count as storage; everything else is a rejection of this command.
+pub(crate) fn storage_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<rusqlite::Error>()
             || cause.is::<std::io::Error>()
@@ -237,6 +237,32 @@ mod tests {
             Some("database is locked".into()),
         )
         .into()
+    }
+
+    /// A task commit error that names neither a typed task failure nor storage rejects only its
+    /// command, so the queue stays open; a storage error still leaves task state uncertified.
+    #[test]
+    fn task_commit_errors_reject_the_command_unless_storage_failed() {
+        use super::super::command::TaskCommandFailure;
+        let rejected = TaskCommandFailure::from_commit_error(anyhow::anyhow!(
+            "plan retry requires a failed plan"
+        ));
+        assert!(matches!(
+            rejected,
+            TaskCommandFailure::RejectedBecause { .. }
+        ));
+        assert!(matches!(
+            OperationFailure::Domain(rejected.into()).into_stopped_command(),
+            StoppedCommand::Failed(_)
+        ));
+        assert!(matches!(
+            TaskCommandFailure::from_commit_error(busy()),
+            TaskCommandFailure::StateUnavailable
+        ));
+        assert!(matches!(
+            TaskCommandFailure::from_commit_error(TaskCommandFailure::Changed.into()),
+            TaskCommandFailure::Changed
+        ));
     }
 
     /// Contention that rolled the outcome back is a retryable failure, not unknown state that

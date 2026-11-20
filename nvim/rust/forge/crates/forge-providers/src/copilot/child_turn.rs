@@ -98,7 +98,7 @@ impl CopilotChildTurn {
             return match previous {
                 Ok(previous) if previous.outcome() == result.outcome() => Ok(()),
                 Ok(_) | Err(_) => Err(ProviderError::Observation(
-                    forge_provider_api::ObservationFailure::OwnershipConflict,
+                    forge_provider_api::ObservationFailure::ownership_conflict(),
                 )),
             };
         }

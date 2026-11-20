@@ -225,7 +225,9 @@ impl SessionController {
                         .context("install root provider intake")?;
                 }
                 loop {
-                    if events.has_pending()? {
+                    // A live foreground consumes the inbox itself; draining beside it would
+                    // apply a native child's later events before the earlier ones it holds.
+                    if events.has_unclaimed_pending()? {
                         let Some(controller) = controller.upgrade() else {
                             return Ok(());
                         };
@@ -270,7 +272,7 @@ impl SessionController {
                         }
                         return Ok(());
                     }
-                    events.notified().await?;
+                    events.unclaimed_notified().await?;
                 }
             }
             .await;

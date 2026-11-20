@@ -491,6 +491,75 @@ T["continuation_sync"] = function()
   end
 end
 
+-- Owner activity reads `working` while any command is being applied, so a review that only
+-- applied an interrupt, an acceptance, or another command flashed `plan · draft`. Only a planning
+-- turn that is still running, which the session phase reports, keeps a submitted plan in draft.
+T["plan_review_label_follows_a_running_turn_rather_than_owner_activity"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local header = ""
+  require("forge.shared.keymaps").apply_view_winbar = function(_, _, _, _, segments)
+    header = table.concat(vim.tbl_map(function(segment) return segment.text end, segments))
+  end
+  state.command_set = controller.command_set()
+  state.transcript_win = vim.api.nvim_get_current_win()
+  state.host_error, state.sync_error, state.connection_error = nil, nil, nil
+  state.session = { id = "plan-label", provider = "fixture_alpha", model = "test", resolved_model = "test",
+    active_task = { kind = "plan", phase = "review", status = "waiting" } }
+  state.runtime_epoch = "epoch"
+  state.activity = { revision = 1, phase = "working" }
+  state.status = { kind = "awaiting_plan_review", plan_id = "plan", revision = 1 }
+  controller.refresh_winbar()
+  assert(header:find("plan · review", 1, true), header)
+  state.status = { kind = "working", activity = "planning", duration_ms = 0 }
+  controller.refresh_winbar()
+  assert(header:find("plan · draft", 1, true), header)
+  state.activity = { revision = 2, phase = "idle" }
+  state.status = { kind = "awaiting_plan_review", plan_id = "plan", revision = 1 }
+  controller.refresh_winbar()
+  assert(header:find("plan · review", 1, true), header)
+end
+
+-- An acceptance made while the task is paused is only recorded. When it raised execution
+-- questions, the review's decision reply cannot say so, because the questions come first; the
+-- answer that settles the last of them reports how to carry the acceptance out, once.
+T["last_acceptance_answer_on_a_paused_task_reports_the_recorded_acceptance"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local recorded = "Plan acceptance recorded. The task is paused; run /task resume to execute."
+  controller.render, controller.refresh_winbar = function() end, function() end
+  local host
+  local plan_question = require("forge.views.harness.plan_question")
+  local original_open = plan_question.open
+  plan_question.open = function(_, options) host = options end
+  MiniTest.finally(function() plan_question.open = original_open end)
+  mock_client.respond({
+    ["session.question.answer"] = { active_plan = { id = "plan" } },
+  })
+  local notices = notify.capture({ min_level = vim.log.levels.INFO, notifications = true })
+  local function answer_last(task_status)
+    host = nil
+    state.session = { id = "acceptance-" .. task_status, model = "test",
+      active_task = { kind = "plan", phase = "review", status = task_status } }
+    state.host_error, state.plan_question_open, state.question_clarification = nil, false, nil
+    state.status, state.activity = { kind = "awaiting_input" }, nil
+    state.transcript_win = vim.api.nvim_get_current_win()
+    state.active_elicitation = { owner = "plan_review", plan_id = "plan", elicitation = {
+      revision = 1, question_set = { id = "execution-" .. task_status, questions = { { id = "model" } } } } }
+    controller.present_plan_question(true)
+    assert(host, "the plan question did not open")
+    local settled = 0
+    host.answer({ question_id = "model", response = { kind = "selected", option = "default" } },
+      function() settled = settled + 1 end)
+    eq(settled, 1)
+  end
+  answer_last("paused")
+  eq(notices:messages(), { recorded })
+  notices:clear()
+  answer_last("running")
+  eq(notices:messages(), {})
+end
+
 T["effort_selection"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")
@@ -639,6 +708,31 @@ T["task_command_clears_composer_before_reply"] = function()
   buffer.set(state.composer_buf, { "newer draft" })
   superseded.callback(nil, "task is already active", { code = "conflict" })
   eq(buffer.text(state.composer_buf), "newer draft")
+end
+
+-- A task change that committed before its dispatch failed already consumed the submission, so
+-- the composer stays empty and the failure stays visible instead of offering the text again.
+T["committed_task_change_keeps_the_composer_empty_after_dispatch_failure"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  require("forge.views.harness.prompt_history").record = function() end
+  controller.render, controller.refresh_winbar = function() end, function() end
+  state.session = { id = "task-committed", model = "test" }
+  state.host_error, state.execution_notice = nil, nil
+  state.queue, state.pending_steer, state.capability = {}, {}, {}
+  state.composer_buf = buffer.scratch()
+  local failures = notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local requests = mock_client.record()
+  buffer.set(state.composer_buf, { "/plan Port the renderer" })
+  controller.submit()
+  local committed = requests[#requests]
+  eq(committed.spec.method, "session.command.apply")
+  committed.callback(nil, "the task changed but its work could not be dispatched",
+    { code = "task_change_committed_dispatch_failed" })
+  eq(buffer.text(state.composer_buf), "")
+  eq(#failures, 1)
+  eq(require("forge.views.harness.diagnostic").get(state, "execution_notice", "error").text,
+    "the task changed but its work could not be dispatched")
 end
 
 -- Enter submits the composer rather than accepting a completion, so every submission closes the
@@ -1382,6 +1476,181 @@ T["approval_waits_for_a_window"] = function()
   assert(opened == 1 and state.approval_open and state.presented_approval_id == "late")
 end
 
+---Report `mode` from `nvim_get_mode` for the rest of the case and return a setter.
+local function stub_mode(initial)
+  local mode = initial
+  local original = vim.api.nvim_get_mode
+  dofile("nvim/lua/forge/tests/support/stub.lua")(vim.api, "nvim_get_mode", function()
+    return { mode = mode, blocking = false }
+  end)
+  MiniTest.finally(function() vim.api.nvim_get_mode = original end)
+  return function(next_mode) mode = next_mode end
+end
+
+---Prepare an approval that waits in a view of the current tab, with presentation recorded.
+local function held_approval_scene()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local approval = require("forge.views.harness.approval")
+  controller.refresh_winbar = function() end
+  local opened = {}
+  approval.open = function(request) opened[#opened + 1] = "approval:" .. request.request_id end
+  state.session = { id = "typing" }
+  state.transcript_win = vim.api.nvim_get_current_win()
+  state.composer_buf = buffer.scratch()
+  state.approval = { { request_id = "typed-over", execution_kind = "managed", targets = {} } }
+  return state, controller, opened
+end
+
+-- A popup that took focus while the user typed took the next letters as decisions; one such run
+-- saved an "always allow" rule after a pause of a second, so no key timing decides. A popup never
+-- opens by itself in Insert, Replace, or Command-line mode in any buffer: the request waits like
+-- one the user dismissed, and leaving that mode opens it.
+T["approval_is_held_in_insert_mode_without_a_recent_key"] = function()
+  local set_mode = stub_mode("i")
+  local state, controller, opened = held_approval_scene()
+  local notices = notify.capture({ min_level = vim.log.levels.INFO, notifications = true })
+  controller.present_approval(false, state)
+  eq({ opened, state.approval_open, state.dismissed_approval_id }, { {}, false, "typed-over" })
+  eq(#notices, 1)
+  assert(notices[1].message:find("oe", 1, true), "the notice did not name the reopen key")
+  set_mode("n")
+  -- Insert mode ended in a buffer that is not the composer.
+  vim.api.nvim_exec_autocmds("InsertLeave", { buffer = buffer.scratch() })
+  wait_until(function() return #opened == 1 end, "leaving Insert mode did not open the held approval")
+end
+
+T["approval_is_held_in_replace_and_command_line_mode"] = function()
+  local set_mode = stub_mode("R")
+  local state, controller, opened = held_approval_scene()
+  controller.present_approval(false, state)
+  eq(opened, {})
+  set_mode("c")
+  vim.api.nvim_exec_autocmds("InsertLeave", {})
+  vim.wait(20, function() return #opened > 0 end, 5)
+  eq(opened, {})
+  set_mode("n")
+  vim.api.nvim_exec_autocmds("CmdlineLeave", {})
+  wait_until(function() return #opened == 1 end, "leaving Command-line mode did not open the held approval")
+end
+
+-- Held popups share one list, so holding a question keeps the approval held before it, and the
+-- approval opens first.
+T["held_popups_open_in_order_after_insert_mode"] = function()
+  local set_mode = stub_mode("i")
+  local state, controller, opened = held_approval_scene()
+  local client = require("forge.client")
+  local receive
+  client.session_events_subscribe = function(callback) receive = callback return function() end end
+  quiet_state_read(controller)
+  mock_client.record()
+  require("forge.views.harness.workspace").attach = function() end
+  require("forge.views.harness.prompt_history").attach = function() end
+  local questions = require("forge.views.harness.questions")
+  questions.open = function() opened[#opened + 1] = "questions" end
+  questions.receive = function(target, payload) target.questions = payload end
+  state.transcript_buf = buffer.scratch()
+  controller.attach()
+  state.composer_win = vim.api.nvim_get_current_win()
+  controller.present_approval(false, state)
+  receive("questions_changed", { revision = 1, questions = { {
+    id = "layout", requirement = "required", resolution = { kind = "pending" }, discussion = {},
+    content = { revision = 1, header = "Layout", question = "Which layout?", options = {} },
+  } } }, "typing")
+  eq(opened, {})
+  set_mode("n")
+  vim.api.nvim_exec_autocmds("InsertLeave", {})
+  wait_until(function() return #opened == 2 end, "the held popups did not open")
+  eq(opened, { "approval:typed-over", "questions" })
+end
+
+-- A question that arrived with focus in the composer waited for `oe` even in Normal mode.
+T["question_opens_from_the_composer_in_normal_mode"] = function()
+  stub_mode("n")
+  local state, controller, opened = held_approval_scene()
+  state.approval = {}
+  local client = require("forge.client")
+  local receive
+  client.session_events_subscribe = function(callback) receive = callback return function() end end
+  quiet_state_read(controller)
+  mock_client.record()
+  require("forge.views.harness.workspace").attach = function() end
+  require("forge.views.harness.prompt_history").attach = function() end
+  local questions = require("forge.views.harness.questions")
+  questions.open = function() opened[#opened + 1] = "questions" end
+  questions.receive = function(target, payload) target.questions = payload end
+  state.transcript_buf = buffer.scratch()
+  controller.attach()
+  vim.cmd("split")
+  state.composer_win = vim.api.nvim_get_current_win()
+  receive("questions_changed", { revision = 1, questions = { {
+    id = "layout", requirement = "required", resolution = { kind = "pending" }, discussion = {},
+    content = { revision = 1, header = "Layout", question = "Which layout?", options = {} },
+  } } }, "typing")
+  eq(opened, { "questions" })
+end
+
+---Hold a real question popup while the user types in the composer, then leave Insert mode so it
+---opens, as a question that arrives mid-sentence does.
+---@return table state, table picker
+local function held_question_in_composer()
+  vim.o.columns, vim.o.lines = 120, 45
+  local config = vim.deepcopy(require("forge.infra.config").options)
+  config.harness.provider = "mock"
+  require("forge").setup(config)
+  local picker = require("forge.views.picker")
+  -- The case types as soon as the popup opens; the settle guard is covered by the picker's cases.
+  dofile("nvim/lua/forge/tests/support/stub.lua")(picker, "focus_taking_settle_ms", nil)
+  MiniTest.finally(function() pcall(picker.close, false) end)
+  local state, controller = held_approval_scene()
+  state.approval = {}
+  local client = require("forge.client")
+  local receive
+  client.session_events_subscribe = function(callback) receive = callback return function() end end
+  quiet_state_read(controller)
+  mock_client.record()
+  require("forge.views.harness.workspace").attach = function() end
+  require("forge.views.harness.prompt_history").attach = function() end
+  state.transcript_buf = buffer.scratch()
+  controller.attach()
+  vim.cmd("split")
+  state.composer_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(state.composer_win, state.composer_buf)
+  buffer.set(state.composer_buf, { "" })
+  vim.keymap.set("i", "<F2>", function()
+    receive("questions_changed", { revision = 1, questions = { {
+      id = "layout", requirement = "required", resolution = { kind = "pending" }, discussion = {},
+      content = { revision = 1, header = "Layout", question = "Which layout?", options = {
+        { id = "tabs", label = "Tabs", description = "Compact" },
+      } },
+    } } }, "typing")
+  end, { buffer = state.composer_buf })
+  -- Typed after the keys under test, this records that they reached the composer in Insert mode.
+  vim.keymap.set("i", "<F3>", function() state.typed_in_composer_insert_mode = true end, { buffer = state.composer_buf })
+  keymap.feed("i<F2><Esc>")
+  eq(picker.is_open("questions"), false)
+  wait_until(function() return picker.is_open("questions") end, "leaving Insert mode did not open the held question")
+  return state, picker
+end
+
+-- A held question opens only once the user leaves Insert mode, so where focus is when it opens is
+-- not where it interrupted them. Submitting the last answer returns to the composer in Insert
+-- mode at once, so keys typed right after the submit key are text in the composer: they neither
+-- land in the closing popup's input nor run as Normal-mode commands.
+T["answering_a_held_question_returns_to_insert_mode_in_the_composer"] = function()
+  local state, picker = held_question_in_composer()
+  keymap.feed("o<CR>One point<C-s>xy<F3><Esc>")
+  eq({ picker.is_open(), state.typed_in_composer_insert_mode }, { false, true })
+  eq(buffer.lines(state.composer_buf), { "xy" })
+end
+
+T["closing_a_held_question_returns_to_insert_mode_in_the_composer"] = function()
+  local state, picker = held_question_in_composer()
+  keymap.feed("qxy<F3><Esc>")
+  eq({ picker.is_open(), state.typed_in_composer_insert_mode }, { false, true })
+  eq(buffer.lines(state.composer_buf), { "xy" })
+end
+
 T["approval_returns_after_replacement"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")
@@ -1458,6 +1727,87 @@ T["rollback_respects_newer_composer_text"] = function()
   vim.wait(20, function() return false end, 5)
   eq(buffer.line(state.composer_buf, 1), "Original prompt")
   eq(vim.api.nvim_get_current_win(), other_window)
+end
+
+---Open `/undo` on one listed interaction, recording every picker and rollback request it makes.
+local function undo_scene(interaction, busy)
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local picker = require("forge.views.picker")
+  controller.render, controller.refresh_winbar = function() end, function() end
+  local scene = { specs = {}, transitions = {}, warnings = {}, errors = {}, history = {} }
+  require("forge.infra.notifications").warn = function(message) scene.warnings[#scene.warnings + 1] = message end
+  require("forge.infra.notifications").error = function(message) scene.errors[#scene.errors + 1] = message end
+  dofile("nvim/lua/forge/tests/support/stub.lua")(vim.api, "nvim_echo", function(chunks, history)
+    if history then scene.history[#scene.history + 1] = chunks[1][1] end
+  end)
+  client.request = function(request_specification, callback)
+    if request_specification.method == "session.exchange.recovery" then callback(vim.NIL)
+    elseif request_specification.method == "session.exchange.list" then callback({ interaction }) end
+  end
+  picker.open = function(spec) scene.specs[#scene.specs + 1] = spec end
+  controller.task_transition = function(action, _, completed)
+    scene.transitions[#scene.transitions + 1] = { action = action, completed = completed }
+  end
+  state.session = { id = "undo-scene" }
+  state.capability = { native_conversation_rewind = true }
+  state.composer_buf = buffer.scratch()
+  dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, busy)
+  controller.open_undo_picker()
+  scene.state, scene.controller = state, controller
+  return scene
+end
+
+-- `/undo` during a running turn opens the interaction list; confirming a rollback collects the
+-- turn on the host, so the editor neither refuses the command nor discards it.
+T["undo_during_a_running_turn_opens_the_interaction_list"] = function()
+  local interaction = { id = "exchange", ordinal = 1, state = "complete", disposition = "current",
+    prompt = "Original prompt", checkpoint_before = "checkpoint" }
+  local scene = undo_scene(interaction, true)
+  eq(scene.warnings, {})
+  eq(#scene.specs, 1)
+  scene.specs[1].on_confirm({ option = { value = interaction } })
+  eq(#scene.specs, 2)
+  local scope = scene.specs[2].page_list[1].option_list
+  eq(vim.tbl_map(function(option) return option.label end, scope),
+    { "Cancel", "Conversation only", "Conversation and files" })
+  assert(scope[2].detail:find("Stops the running turn", 1, true), scope[2].detail)
+  scene.specs[2].on_confirm({ option = { value = "conversation" } })
+  eq(#scene.transitions, 1)
+  eq(scene.transitions[1].action.rollback.exchange_id, "exchange")
+end
+
+-- A rollback the host cannot perform says so on its option, and choosing it reports the reason,
+-- kept in message history, without offering a scope to confirm.
+T["undo_names_an_unavailable_rollback_before_confirmation"] = function()
+  local reason = "Conversation rollback is unsupported here: Claude Code can rewind only to the end of an earlier interaction"
+  local interaction = { id = "first", ordinal = 1, state = "complete", disposition = "current",
+    prompt = "First prompt", checkpoint_before = "checkpoint", rollback_unavailable = reason }
+  local scene = undo_scene(interaction, false)
+  local option = scene.specs[1].page_list[1].option_list[1]
+  assert(option.label:find("unavailable", 1, true), option.label)
+  assert(option.detail:find(reason, 1, true), option.detail)
+  scene.specs[1].on_confirm({ option = { value = interaction } })
+  eq(#scene.specs, 1)
+  eq(scene.errors, { reason })
+  eq(#scene.history, 1)
+  assert(scene.history[1]:find(reason, 1, true), scene.history[1])
+end
+
+-- Rolling back the exchange a `/goal` started returns that command, as typed, to the composer.
+T["rolled_back_goal_start_returns_its_command_to_the_composer"] = function()
+  local interaction = { id = "goal", ordinal = 2, state = "complete", disposition = "current",
+    prompt = "Goal started", checkpoint_before = "checkpoint",
+    opening = { kind = "task_started", start = { kind = "goal", title = "Add a test for every export" } } }
+  local scene = undo_scene(interaction, false)
+  scene.specs[1].on_confirm({ option = { value = interaction } })
+  scene.specs[2].on_confirm({ option = { value = "conversation" } })
+  scene.transitions[1].completed(true)
+  vim.wait(20, function() return false end, 5)
+  eq(buffer.line(scene.state.composer_buf, 1), "/goal Add a test for every export")
+  eq(scene.controller.rolled_back_prompt({ prompt = "Goal continued",
+    opening = { kind = "task_continuation", reason = "The active task requires another turn" } }), nil)
 end
 
 T["select_agent_reverts_on_failure"] = function()
@@ -1585,6 +1935,69 @@ T["btw_forks_an_aside_and_sends_its_question"] = function()
   eq(requests[3].spec.params, { session_id = "origin" })
   requests[3].callback({ session = { id = "plain-fork" } })
   eq(#submitted, 1)
+end
+
+T["reopen_question_reads_a_question_the_editor_never_received"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local notices = notify.capture({ notifications = true })
+  state.session, state.status, state.approval = { id = "accepting" }, { kind = "awaiting_input" }, {}
+  state.questions, state.active_elicitation = nil, nil
+  local presented = 0
+  stub(controller, "present_plan_question", function() presented = presented + 1 end)
+  stub(controller, "synchronize_state", function(callback)
+    state.active_elicitation = { owner = "plan_acceptance", elicitation = { question_set = { questions = { {} } } } }
+    callback({ session = state.session })
+  end)
+  controller.reopen_question()
+  eq(presented, 1)
+  notices:assert_none()
+end
+
+T["document_change_awaiting_an_unheld_question_reads_state"] = function()
+  local client = require("forge.client")
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local requests = mock_client.record()
+  local receive
+  client.session_events_subscribe = function(callback) receive = callback return function() end end
+  quiet_state_read(controller)
+  require("forge.views.harness.workspace").attach = function() end
+  require("forge.views.harness.prompt_history").attach = function() end
+  state.session = { id = "reviewing", provider = "mock" }
+  state.runtime_epoch, state.status, state.approval = "current-epoch", { kind = "awaiting_plan_review" }, {}
+  state.composer_buf, state.transcript_buf = buffer.scratch(), buffer.scratch()
+  controller.attach()
+  local count = #requests
+  receive("document_changed", { session_id = "reviewing", revision = 7, status = { kind = "awaiting_input" } }, "reviewing")
+  eq(#requests, count + 1)
+  eq(requests[#requests].spec.method, "session.state.get")
+end
+
+T["artifact_picker_opens_a_paused_plan_awaiting_review"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local requests = mock_client.record()
+  state.session, state.status = { id = "restarted" }, { kind = "paused" }
+  state.active_plan = { id = "plan-1", state = "awaiting_review" }
+  state.artifact = { { id = "plan-1", state = "awaiting_review" }, { id = "plan-0", state = "accepted" } }
+  controller.open_artifact_picker()
+  eq(#requests, 1)
+  eq(requests[1].spec.method, "session.plan.get")
+  eq(requests[1].spec.params.plan_id, "plan-1")
+end
+
+T["artifact_still_drafting_reports_info"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local requests = mock_client.record()
+  local notices = notify.capture({ notifications = true })
+  state.session = { id = "drafting" }
+  controller.open_artifact(state, { id = "plan-2", state = "generating" })
+  eq(#requests, 0)
+  eq(#notices, 1)
+  eq(notices[1].level, vim.log.levels.INFO)
 end
 
 return T

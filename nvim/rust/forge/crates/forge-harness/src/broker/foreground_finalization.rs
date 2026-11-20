@@ -1901,11 +1901,9 @@ impl HarnessBroker {
                 "reason":"planning stopped without submitting the canonical plan"}),
             )?);
         }
-        if let Some(task) = self.task_controller.current()?
-            && let Some(command) = crate::task::command::SessionCommand::approved_revision(&task)?
-        {
-            events.extend(self.commit_session_command(command)?.1);
-        }
+        // Automatic acceptance of the submitted revision belongs to the input coordinator,
+        // which records the acceptance and starts execution once this turn settles. Accepting
+        // here as well would start execution beside that recorded acceptance and then refuse it.
         Ok(events)
     }
 
@@ -2277,6 +2275,7 @@ impl HarnessBroker {
                         .flatten();
                     let job = foreground_goal_effect::GoalProgressJob {
                         capture: self.prepare_workspace_capture(),
+                        unprotected_capture: self.prepare_workspace_capture(),
                         previous,
                         previous_id,
                         permit,

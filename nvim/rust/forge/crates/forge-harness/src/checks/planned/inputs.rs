@@ -43,6 +43,11 @@ impl ResolutionInputs {
         .try_into()
     }
 
+    /// Get the captured configuration that resolves planned test targets.
+    pub(super) fn config(&self) -> &crate::checks::CheckConfig {
+        &self.context.snapshot.config
+    }
+
     /// Get the exact enabled test checks, independent of triggers and automatic selection.
     pub(super) fn participants(&self) -> Vec<&str> {
         self.context

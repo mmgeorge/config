@@ -213,6 +213,49 @@ pub struct CheckConfig {
 }
 
 impl CheckConfig {
+    /// Resolve a planned test's target to the test check it names.
+    ///
+    /// A target matches a test check's ID, or else its label, ignoring case, when exactly one
+    /// check matches. The error explains the mismatch and lists every valid target.
+    pub(crate) fn test_target(&self, target: &str) -> Result<&CheckDefinition, String> {
+        let tests = || {
+            self.definitions
+                .iter()
+                .filter(|definition| definition.category == super::CheckCategory::Test)
+        };
+        let by_id = tests()
+            .filter(|definition| definition.id.eq_ignore_ascii_case(target))
+            .collect::<Vec<_>>();
+        let matches = if by_id.is_empty() {
+            tests()
+                .filter(|definition| definition.name.to_lowercase() == target.to_lowercase())
+                .collect()
+        } else {
+            by_id
+        };
+        let valid = || {
+            let listed = tests()
+                .map(|definition| format!("`{}` ({})", definition.id, definition.name))
+                .collect::<Vec<_>>();
+            if listed.is_empty() {
+                "no test check is configured".to_owned()
+            } else {
+                format!("valid targets are {}", listed.join(", "))
+            }
+        };
+        match matches.as_slice() {
+            [definition] => Ok(definition),
+            [] => Err(format!(
+                "the target names no configured test check; {}",
+                valid()
+            )),
+            _ => Err(format!(
+                "the target matches several test checks; name one by its ID; {}",
+                valid()
+            )),
+        }
+    }
+
     /// Reject unknown plan selections; execution admission applies live task enablement.
     pub(crate) fn validate_selection(&self, ids: &[String]) -> Result<()> {
         for id in ids {

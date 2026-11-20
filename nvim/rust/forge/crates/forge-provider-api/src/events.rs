@@ -513,7 +513,7 @@ impl ProviderEventSink {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match ownership.registered_turns.entry(address.turn_id.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) if entry.get() != address => Err(
-                EventDeliveryError::Observation(crate::ObservationFailure::OwnershipConflict),
+                EventDeliveryError::Observation(crate::ObservationFailure::ownership_conflict()),
             ),
             std::collections::hash_map::Entry::Occupied(_) => Ok(()),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -539,7 +539,7 @@ impl ProviderEventSink {
             && compaction.thread_id != thread_id.as_str()
         {
             return Err(EventDeliveryError::Observation(
-                crate::ObservationFailure::OwnershipConflict,
+                crate::ObservationFailure::ownership_conflict(),
             ));
         }
         let (thread, turn) = match event {
@@ -570,8 +570,39 @@ impl ProviderEventSink {
                     .is_none_or(|scope| scope.turn_id().as_ref() != Ok(turn))
             })
         {
+            // Name the misaddressed event and the writer's own scope: the adapter chose the
+            // writer, so only this pair shows which of its routing decisions was wrong.
+            let kinds = serde_json::to_value(event)
+                .ok()
+                .map(|encoded| {
+                    let mut kinds = Vec::new();
+                    let mut level = Some(&encoded);
+                    while let Some(current) = level {
+                        if let Some(kind) = current.get("kind").and_then(serde_json::Value::as_str)
+                        {
+                            kinds.push(kind.to_owned());
+                        }
+                        level = current.get("event").filter(|inner| inner.is_object());
+                    }
+                    kinds.join(".")
+                })
+                .unwrap_or_default();
+            tracing::warn!(
+                target: "forge::provider",
+                event_name = "provider.ownership_conflict.scope",
+                kind = kinds.as_str(),
+                thread_id = thread.map(crate::ThreadId::as_str),
+                turn_id = turn.map(crate::TurnId::as_str),
+                admitted_owner = self.scope.thread_id().as_str(),
+                resolved_scope = self
+                    .scope
+                    .invocation()
+                    .and_then(|scope| scope.turn_id().ok())
+                    .map(|turn| turn.as_str().to_owned()),
+                "provider event addressed outside its writer's scope"
+            );
             return Err(EventDeliveryError::Observation(
-                crate::ObservationFailure::OwnershipConflict,
+                crate::ObservationFailure::ownership_conflict(),
             ));
         }
         Ok(())
@@ -620,7 +651,7 @@ impl ProviderEventSink {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let invalid =
-                || EventDeliveryError::Observation(crate::ObservationFailure::OwnershipConflict);
+                || EventDeliveryError::Observation(crate::ObservationFailure::ownership_conflict());
             let retired =
                 || EventDeliveryError::Observation(crate::ObservationFailure::UnexpectedExecution);
             let key = (thread_id.clone(), turn_id.clone());
@@ -1466,7 +1497,7 @@ impl AdapterActivityWriter {
             || address.scope.turn_id().as_ref() != Ok(&address.turn_id)
         {
             return Err(EventDeliveryError::Observation(
-                crate::ObservationFailure::OwnershipConflict,
+                crate::ObservationFailure::ownership_conflict(),
             ));
         }
         self.sink.register_turn(&address)?;

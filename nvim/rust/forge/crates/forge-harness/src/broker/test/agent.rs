@@ -1640,16 +1640,15 @@ async fn root_failure_settles_unfinished_children_before_finalizing() -> Result<
     )?;
     broker.provider = fixture.provider_handle();
     broker.agent_coordinator.set_enabled(true);
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        broker.run_interaction(
+    // The interaction's own completion is the record this test needs. A wall-clock bound
+    // here fired under load before finalization finished; nextest's limit still ends a hang.
+    let outcome = broker
+        .run_interaction(
             "Delegate".into(),
             PromptMode::Chat,
             Some(ExchangeAdmission::chat("Delegate".into())),
-        ),
-    )
-    .await
-    .context("root failure finalization did not finish")?;
+        )
+        .await;
     assert!(outcome.is_err(), "the root provider failure must surface");
     let tasks = broker.store.list_agent_task(&broker.session.id)?;
     assert_eq!(tasks.len(), 1);

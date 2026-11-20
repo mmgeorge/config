@@ -1,5 +1,6 @@
 local M = {}
 local popup = require("forge.infra.popup_window")
+local settle_namespace = vim.api.nvim_create_namespace("ForgePlanDecisionSettle")
 
 ---@class ForgePlanDecisionOptions
 ---@field title string
@@ -21,9 +22,31 @@ function M.open(options, callback)
   vim.wo[window].winbar = "Enter / Ctrl-S submit · Esc cancel"
   local finished = false
   local parent_closed
+  -- The popup takes focus as soon as its key is pressed, so keys typed right behind that key, such
+  -- as a repeated `oY`, would become comment text or submit it. Keys already waiting in the
+  -- typeahead when it opens are read and dropped here. Like the pickers that take focus by
+  -- themselves, it then discards every key, except its cancel keys, until the keyboard has been
+  -- quiet for the settle interval; each discarded key restarts the interval. A key with no typed
+  -- keys, such as one a key-hint plugin feeds back after reading it, is discarded the same way.
+  while vim.fn.getchar(1) ~= 0 do vim.fn.getchar(0) end
+  local settle_ms = require("forge.views.picker").focus_taking_settle_ms
+  vim.uv.update_time()
+  local settle_until = vim.uv.now() + settle_ms
+  local pass_keys = { [vim.keycode("<Esc>")] = true, [vim.keycode("<C-c>")] = true }
+  vim.on_key(function(_, typed)
+    if not settle_until or (typed and pass_keys[typed]) then return end
+    if vim.api.nvim_get_current_buf() ~= buffer then return end
+    vim.uv.update_time()
+    local now = vim.uv.now()
+    if now >= settle_until then settle_until = nil return end
+    settle_until = now + settle_ms
+    return ""
+  end, settle_namespace)
+  local function release_settle() vim.on_key(nil, settle_namespace) end
   local function complete(value)
     if finished then return end
     finished = true
+    release_settle()
     if parent_closed then vim.api.nvim_del_autocmd(parent_closed) parent_closed = nil end
     popup.close(window)
     callback(value)
@@ -45,6 +68,7 @@ function M.open(options, callback)
   vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true, callback = function()
     if finished then return end
     finished = true
+    release_settle()
     if parent_closed then vim.api.nvim_del_autocmd(parent_closed) parent_closed = nil end
     callback(nil)
   end })

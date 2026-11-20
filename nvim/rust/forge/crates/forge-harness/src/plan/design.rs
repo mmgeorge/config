@@ -595,6 +595,19 @@ impl DeclarationDesign {
 
     /// Reject submission against changed workspace sources or newly occupied destinations.
     pub fn check_workspace(&self, workspace: &Path) -> Result<()> {
+        self.check_baseline_sources("workspace", |path| {
+            Ok(workspace_source(workspace, path)?.map(String::into_bytes))
+        })
+    }
+
+    /// Require every captured baseline to match the sources `read` returns, and every new file
+    /// to be absent from them. `origin` names those sources in the refusal, such as the live
+    /// workspace or the checkpoint an execution started from.
+    pub(crate) fn check_baseline_sources(
+        &self,
+        origin: &str,
+        read: impl Fn(&str) -> Result<Option<Vec<u8>>>,
+    ) -> Result<()> {
         let paths = if self.authoring_fingerprint.is_some() {
             self.baseline
                 .keys()
@@ -605,17 +618,17 @@ impl DeclarationDesign {
             self.changed_paths().into_iter().collect()
         };
         for path in paths {
-            let source = workspace_source(workspace, &path)?.map(String::into_bytes);
+            let source = read(&path)?;
             match self.baseline.get(&path) {
                 Some(before) => ensure!(
                     source
                         .as_ref()
                         .is_some_and(|source| super::digest(source) == before.source_digest),
-                    "{path}: workspace changed since extraction. Start a fresh design baseline."
+                    "{path}: {origin} changed since extraction. Start a fresh design baseline."
                 ),
                 None => ensure!(
                     source.is_none(),
-                    "{path}: proposed destination already exists. Start a fresh design baseline."
+                    "{path}: proposed destination already exists in the {origin}. Start a fresh design baseline."
                 ),
             }
         }

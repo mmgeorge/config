@@ -9,6 +9,27 @@ local buffer = require("forge.buffer")
 
 local function notice(message) notifications.error(message, "ForgePlanReview") end
 
+---Reports the host's refusal of a review decision. The reason is the reviewer's only guide to what
+---to change, so it is wrapped to the notifier's width rather than cut at the window edge, and it
+---stays on screen longer than a routine notice; the notifier keeps it in its history.
+---@param message string
+local function report_refusal(message)
+  local width = math.max(40, math.floor(vim.o.columns * 0.4) - 4)
+  vim.notify(table.concat(require("forge.render.display_text").wrap(message, width), "\n"), vim.log.levels.ERROR,
+    { title = "ForgePlanReview", timeout = 15000 })
+end
+
+---The newest model revision of each plan this editor has opened or announced, by session and plan.
+---A plan record whose model revision is newer is a new submission; review edits keep the revision.
+---@type table<string, integer>
+local revision_seen = {}
+
+---@param plan table
+---@return string?
+local function revision_key(plan)
+  local current = session.harness.session
+  return current and current.id and plan.id and (current.id .. "\0" .. plan.id) or nil
+end
 
 ---@param review table
 ---@param on_projected fun()
@@ -20,20 +41,26 @@ local function toggle_task_fold(review, on_projected)
   })
 end
 
-local function hide_review(review)
+---@param review table
+---@param focus_win? integer the window in the return tab to focus instead of the one the review left
+local function hide_review(review, focus_win)
   if vim.api.nvim_tabpage_is_valid(review.tab) and review.tab ~= review.return_tab and vim.fn.tabpagenr("$") > 1 then
     vim.api.nvim_set_current_tabpage(review.tab)
     vim.cmd("tabclose")
   end
   if vim.api.nvim_tabpage_is_valid(review.return_tab) then
-    vim.api.nvim_set_current_tabpage(review.return_tab)
-    if vim.api.nvim_win_is_valid(review.return_win) then vim.api.nvim_set_current_win(review.return_win) end
+    if not (focus_win and vim.api.nvim_win_is_valid(focus_win) and vim.api.nvim_win_get_tabpage(focus_win) == review.return_tab) then
+      focus_win = vim.api.nvim_win_is_valid(review.return_win) and review.return_win or nil
+    end
+    if focus_win then vim.api.nvim_set_current_win(focus_win) else vim.api.nvim_set_current_tabpage(review.return_tab) end
   end
 end
 
-local function close_review(review)
+---@param review table
+---@param focus_win? integer
+local function close_review(review, focus_win)
   if not review.owner.close() then notice("Plan review has an explicit operation in progress") return false end
-  hide_review(review)
+  hide_review(review, focus_win)
   if session.harness.plan_review == review
     and (not vim.api.nvim_buf_is_valid(review.buf) or not vim.bo[review.buf].modified) then
     session.harness.plan_review = nil
@@ -97,7 +124,17 @@ local function refresh_winbar(review)
 end
 
 local function adopt_revision(review, result)
-  if result.review_error then notice(result.review_error) return false end
+  if result.review_error then
+    notice(result.review_error)
+    -- The edit committed a new plan revision that this projection could not follow, so reload the
+    -- review from the committed plan rather than leave it on the replaced revision.
+    if type(result.plan) == "table" and result.plan.id == review.plan.id then
+      vim.schedule(function()
+        if session.harness.plan_review == review then M.open(result.plan) end
+      end)
+    end
+    return false
+  end
   local updated, failure = review.owner.update(result.plan, result.review)
   if not updated then notice(failure) return false end
   review.plan = result.plan
@@ -105,8 +142,38 @@ local function adopt_revision(review, result)
   return true
 end
 
+---Start typing the body of a new comment or question. A message added over a selection is created
+---in Visual mode, where `startinsert` does nothing, so the selection ends first; it has already
+---given the message its range.
+local function edit_message()
+  if vim.api.nvim_get_mode().mode:match("^[vVsS\22\19]") then vim.cmd("normal! " .. vim.keycode("<Esc>")) end
+  vim.cmd("startinsert")
+end
+
+---Toggles All/Public visibility with at most one request in flight. Each request is captured at
+---the revision the previous reply produced; presses made while one waits are counted, and an odd
+---count sends one more toggle after the reply, so rapid presses end in the state their parity
+---selects.
+local function toggle_visibility(review)
+  local toggle = review.visibility_toggle
+  if toggle then toggle.queued = toggle.queued + 1 return end
+  toggle = { queued = 0 }
+  review.visibility_toggle = toggle
+  local requested = review.owner.action("toggle_visibility", function(_, failure)
+    if failure then notice(failure) end
+  end, nil, function(_, failure)
+    if review.visibility_toggle == toggle then review.visibility_toggle = nil end
+    if failure then notice(failure) return end
+    review.public_only = review.owner.public_only
+    refresh_winbar(review)
+    if toggle.queued % 2 == 1 and not review.owner.closed then toggle_visibility(review) end
+  end)
+  if not requested then review.visibility_toggle = nil end
+end
+
 local function action(review, name)
   if review.cancel_definition then review.cancel_definition() review.cancel_definition = nil end
+  if name == "toggle_visibility" then toggle_visibility(review) return end
   if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
     notice("Only plans awaiting review can be renamed") return
   end
@@ -119,14 +186,9 @@ local function action(review, name)
     if failure then notice(failure) return end
     if name == "toggle_declaration" then
       effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
-    elseif name == "toggle_visibility" then
-      review.public_only = result.public_only
-      review.owner.public_only = result.public_only
-      refresh_winbar(review)
     elseif name == "comment" or name == "question" then
       if result.local_draft then
-
-        vim.cmd("startinsert")
+        edit_message()
         return
       end
       local _, row = review.owner.replica.sequence:position(result.block)
@@ -134,8 +196,7 @@ local function action(review, name)
       if row and view then
         vim.api.nvim_set_current_win(view.window)
         vim.api.nvim_win_set_cursor(view.window, { row + result.row + 1, 0 })
-
-        vim.cmd("startinsert")
+        edit_message()
       end
     elseif name == "delete" then
       return
@@ -208,43 +269,31 @@ local function submit(review, method, params)
     if session.harness ~= submitted_state or not submitted_state.session
       or submitted_state.session.id ~= review.session_id then return end
     controller.refresh_winbar()
-    if failure then
-      notice(failure)
-      if session.harness.session and session.harness.session.id == review.session_id
-        and (not session.harness.plan_review or session.harness.plan_review == review) then M.open(review.plan) end
-      return
-    end
+    -- The review stays open until the host answers, so a refusal leaves the reviewer where they
+    -- were, with the reason.
+    if failure then report_refusal(tostring(failure)) return end
     local current = session.harness.plan_review
     local completed = current and current.buf == review.buf and current.plan.id == review.plan.id
       and current.plan.review_digest == review.plan.review_digest
       and current.plan.historical_revision == review.plan.historical_revision and current or review
-    if not completed.owner.closed then close_review(completed) end
-    if method == "session.plan.accept" or method == "session.plan.changes.request" then
-      -- A decision starts a new exchange like a composer submission does, so it resumes
-      -- following the transcript tail. Live follow is gated on composer focus, which
-      -- closing the review would otherwise leave on the transcript window.
-      local harness = session.harness
-      if harness.composer_win and vim.api.nvim_win_is_valid(harness.composer_win)
-        and vim.api.nvim_win_get_tabpage(harness.composer_win) == vim.api.nvim_get_current_tabpage() then
-        vim.api.nvim_set_current_win(harness.composer_win)
-      end
-      if harness.presentation and harness.presentation.follow_tail then harness.presentation.follow_tail() end
-    end
-    controller.synchronize_state(method == "session.plan.accept" and function(_, sync_failure)
-      if sync_failure or session.harness ~= submitted_state then return end
-      -- Acceptance respects a pause, so questions it commits stay hidden until the task resumes.
-      local task = require("forge.views.harness.task")
-      local current = task.current(submitted_state)
-      local review_state = current and current.plan and current.plan.artifact and current.plan.artifact.review
-      local questions = review_state and review_state.elicitation and review_state.elicitation.question_set.questions
-      if current and task.status(current) == "paused" and questions and #questions > 0 then
-        notifications.warn("Plan acceptance needs answers. The task is paused; run /task resume to answer them.",
-          "ForgePlanReview")
-      end
+    local harness = session.harness
+    local decision = method == "session.plan.accept" or method == "session.plan.changes.request"
+    -- A decision starts a new exchange like a composer submission does, so it resumes following
+    -- the transcript tail. Live follow is gated on composer focus, so the review hands focus
+    -- straight to the composer rather than through the transcript window.
+    if not completed.owner.closed then close_review(completed, decision and harness.composer_win or nil) end
+    if decision and harness.presentation and harness.presentation.follow_tail then harness.presentation.follow_tail() end
+    -- The read presents any question the decision raised. An acceptance made while the task is
+    -- paused is only recorded (`awaiting_input` with the task still paused); once it leaves
+    -- nothing to answer, the reviewer is told how to carry it out. Questions it raised are
+    -- answered first, and the answer that completes them reports the same.
+    local outcome = type(result) == "table" and type(result.outcome) == "table" and result.outcome.result
+    local recorded = method == "session.plan.accept" and type(outcome) == "table" and outcome.disposition == "awaiting_input"
+    controller.synchronize_state(recorded and function(_, sync_failure)
+      if not sync_failure then require("forge.views.harness.task").report_recorded_acceptance(harness, harness.active_elicitation) end
     end or nil)
     controller.render()
   end)
-  if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end
 end
 
 local function update_checks(review, enabled, tests, receive, test_scopes)
@@ -253,7 +302,10 @@ local function update_checks(review, enabled, tests, receive, test_scopes)
     if receive then receive(false) end
     return
   end
-  local queued = review.owner.submit("session.plan.check.update", { enabled = enabled, tests = tests or {}, test_scopes = test_scopes or {}, expected_version = review.owner.version }, function(result, failure)
+  -- The host decodes `enabled` and `test_scopes` as maps; `vim.json` encodes an empty table as an
+  -- array, so an empty map must be sent as `vim.empty_dict()`.
+  local function map(value) return value and next(value) and value or vim.empty_dict() end
+  local queued = review.owner.submit("session.plan.check.update", { enabled = map(enabled), tests = tests or {}, test_scopes = map(test_scopes), expected_version = review.owner.version }, function(result, failure)
     local applied = false
     if failure then notice(failure) else applied = adopt_revision(review, result) end
     if receive then receive(applied) end
@@ -350,11 +402,32 @@ local function commands(review)
   return set
 end
 
-function M.open(plan)
+---Opens the review of `plan`. With `options.window`, the open review of the same plan reloads to
+---`plan` in that window: the replaced owner hands its unsaved drafts to the new one, and no tab is
+---created and focus does not move.
+---@param plan table
+---@param options? { window?: integer }
+---@return boolean? opened false when the review could not be replaced
+function M.open(plan, options)
   assert(type(plan) == "table" and type(plan.working_path) == "string", "PlanReview requires a physical plan path")
   local previous = session.harness.plan_review
-  local recovery
-  if previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest
+  local recovery, rebase
+  local window = options and options.window
+  local key = revision_key(plan)
+  if key and type(plan.model_revision) == "number" and not plan.historical_revision then
+    revision_seen[key] = math.max(revision_seen[key] or 0, plan.model_revision)
+  end
+  if window then
+    assert(previous and previous.plan.id == plan.id and vim.api.nvim_win_get_buf(window) == previous.buf,
+      "an in-place reload replaces the open review of the same plan")
+    if vim.bo[previous.buf].modified then
+      local failure
+      recovery, failure = previous.owner.recovery()
+      if not recovery then notice(failure) return false end
+      if not previous.owner.close(true) then return false end
+      rebase = true
+    elseif not previous.owner.close() then return false end
+  elseif previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest
     and previous.plan.historical_revision == plan.historical_revision and vim.api.nvim_buf_is_valid(previous.buf) then
     local refresh_execution = plan.state == "accepted" and not vim.bo[previous.buf].modified
     if refresh_execution and previous.owner.generation == client.host_get_generation() and previous.owner.attached() then
@@ -374,10 +447,26 @@ function M.open(plan)
       if not recovery then notice(failure) return end
       previous.owner.close()
     end
+  elseif previous and previous.plan.id == plan.id and not plan.historical_revision and not previous.plan.historical_revision
+    and vim.api.nvim_buf_is_valid(previous.buf) and vim.bo[previous.buf].modified
+    and previous.owner.generation == client.host_get_generation() and not previous.owner.closed and previous.owner.attached() then
+    -- A newer revision replaces the reviewed one. Its unsaved drafts move onto the new revision
+    -- by their source text, so the old owner releases the buffer once it has handed them over.
+    local failure
+    recovery, failure = previous.owner.recovery()
+    if not recovery then notice(failure) return end
+    if not previous.owner.close(true) then notice("Plan review has an explicit operation in progress") return end
+    rebase = true
+    hide_review(previous)
   elseif previous and not close_review(previous) then return end
-  local origin = session.harness.transcript_win
-  if not origin or not vim.api.nvim_win_is_valid(origin) then origin = vim.api.nvim_get_current_win() end
-  local origin_tab = vim.api.nvim_win_get_tabpage(origin)
+  local origin, origin_tab
+  if window then
+    origin, origin_tab = previous.return_win, previous.return_tab
+  else
+    origin = session.harness.transcript_win
+    if not origin or not vim.api.nvim_win_is_valid(origin) then origin = vim.api.nvim_get_current_win() end
+    origin_tab = vim.api.nvim_win_get_tabpage(origin)
+  end
   local native_buffer = vim.fn.bufnr(plan.working_path)
   if native_buffer >= 0 and vim.api.nvim_buf_is_loaded(native_buffer) and vim.bo[native_buffer].modified and not recovery then
     notice("The physical plan buffer has unsaved changes") return
@@ -394,12 +483,16 @@ function M.open(plan)
     vim.bo[native_buffer].modified = false
     vim.bo[native_buffer].modifiable = false
   end
-  vim.cmd("tabnew")
-  vim.api.nvim_win_set_buf(0, native_buffer)
-  local window = vim.api.nvim_get_current_win()
+  if window then
+    if vim.api.nvim_win_get_buf(window) ~= native_buffer then vim.api.nvim_win_set_buf(window, native_buffer) end
+  else
+    vim.cmd("tabnew")
+    vim.api.nvim_win_set_buf(0, native_buffer)
+    window = vim.api.nvim_get_current_win()
+  end
   vim.bo[native_buffer].bufhidden = "hide"
   vim.bo[native_buffer].swapfile = false
-  local review = { plan = plan, buf = native_buffer, win = window, tab = vim.api.nvim_get_current_tabpage(),
+  local review = { plan = plan, buf = native_buffer, win = window, tab = vim.api.nvim_win_get_tabpage(window),
     return_win = origin, return_tab = origin_tab, session_id = session.harness.session.id }
   session.harness.plan_review = review
   local loading_commands = command_set.new()
@@ -407,11 +500,17 @@ function M.open(plan)
   keymaps.setup_view_keymaps(native_buffer, "plan_review", loading_commands)
   keymaps.apply_view_winbar(window, "PlanReview", "plan_review", loading_commands, "Loading review")
   review.owner = require("forge.views.plan_review.document").attach({ plan = plan, session_id = review.session_id,
-    buffer = native_buffer, window = window, recovery = recovery, notice = notice,
-    recovery_provider = recovery and function() return assert(previous).owner.recovery() end or nil }, function(owner, failure)
+    buffer = native_buffer, window = window, recovery = recovery, rebase = rebase, notice = notice,
+    recovery_provider = recovery and not rebase and function() return assert(previous).owner.recovery() end or nil }, function(owner, failure)
     if failure then
       discard_failed_attachment(review)
-      if recovery then session.harness.plan_review = previous end
+      if recovery and not rebase then session.harness.plan_review = previous end
+      if rebase and #recovery.annotation > 0 then
+        -- The replaced review is closed, so the drafts survive only in this report.
+        local lines = { failure, "", "Unsaved comments from the previous revision:" }
+        for _, item in ipairs(recovery.annotation) do lines[#lines + 1] = "- " .. item.source.body end
+        failure = table.concat(lines, "\n")
+      end
       notice(failure)
       return
     end
@@ -422,6 +521,55 @@ function M.open(plan)
     keymaps.setup_view_keymaps(native_buffer, "plan_review", set)
     refresh_winbar(review)
   end)
+end
+
+---Follows the session's plan record. Only a newer model revision, a new submission, concerns an
+---open review: review edits keep the revision, and their own replies update the review. A review
+---shown in a window reloads to the new revision there, carrying its unsaved drafts; a hidden or
+---closed review stays out of the way, and one notice says the revision is ready to reopen.
+---Review items no prompt delivered before the revision replaced their document stay pending,
+---and one notice names them: the host keeps those edits in `manual_changes` and the comments it
+---could not place on the new revision in `unplaced_review_comments`.
+---@param plan table?
+function M.observe(plan)
+  if type(plan) ~= "table" or type(plan.working_path) ~= "string" or plan.historical_revision
+    or plan.state ~= "awaiting_review" or type(plan.model_revision) ~= "number" then return end
+  local key = revision_key(plan)
+  local seen = key and revision_seen[key]
+  if not seen or plan.model_revision <= seen then return end
+  revision_seen[key] = plan.model_revision
+  local review = session.harness.plan_review
+  local window = review and review.plan.id == plan.id and not review.plan.historical_revision and review.owner
+    and not review.owner.closed and vim.api.nvim_buf_is_valid(review.buf)
+    and (vim.api.nvim_win_is_valid(review.win) and vim.api.nvim_win_get_buf(review.win) == review.buf and review.win
+      or vim.fn.win_findbuf(review.buf)[1])
+  if not (window and M.open(plan, { window = window }) ~= false) then
+    notifications.info(("Plan revision %d is ready · op"):format(plan.model_revision), "ForgePlanReview")
+  end
+  M.report_pending_review(plan)
+end
+
+local edit_description = {
+  rename = function(edit) return ("Renamed %s to %s"):format(edit.from, edit.to) end,
+  remove_test = function(edit) return ("Removed planned test %s::%s"):format(edit.file, edit.name) end,
+  set_check = function(edit) return ("%s plan check %s"):format(edit.enabled and "Enabled" or "Disabled", edit.id) end,
+  set_test_scope = function(edit) return ("Set plan check %s tests to %s"):format(edit.id, edit.scope) end,
+}
+
+---Names the review edits and comments a new model revision did not receive.
+---@param plan table
+function M.report_pending_review(plan)
+  local lines = {}
+  for _, edit in ipairs(type(plan.manual_changes) == "table" and plan.manual_changes or {}) do
+    local describe = type(edit) == "table" and edit_description[edit.kind]
+    lines[#lines + 1] = "- " .. (describe and describe(edit) or vim.inspect(edit))
+  end
+  for _, body in ipairs(type(plan.unplaced_review_comments) == "table" and plan.unplaced_review_comments or {}) do
+    lines[#lines + 1] = "- Comment: " .. body
+  end
+  if #lines == 0 then return end
+  notifications.warn(("Plan revision %d did not receive these review items, which stay pending and go with your next"
+    .. " message or decision:\n%s"):format(plan.model_revision, table.concat(lines, "\n")), "ForgePlanReview")
 end
 
 return M

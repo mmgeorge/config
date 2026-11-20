@@ -973,6 +973,17 @@ impl ExchangeDriver {
         if let Err(error) = self.cancellation_publish(env, state, step) {
             self.startup_fail(&env.services, "Record cancellation progress", &error);
         }
+        // A fenced command queue can never certify another outcome, so the owner fails for good
+        // and reopening the session from `/sessions` replaces it, instead of the owner refusing
+        // every later command while it still looks usable.
+        if self.commands.storage_unavailable()
+            && !matches!(self.execution_state, ExecutionState::Failed)
+        {
+            self.failure_reason.get_or_insert_with(|| {
+                "Session state could not be committed. Select the session in /sessions and press Enter to reopen it.".into()
+            });
+            self.execution_fail(&env.services);
+        }
         let DriverEnv {
             trace,
             session_id,

@@ -144,6 +144,20 @@ pub(super) async fn start_controller(
     forge_protocol::outbound::MessageSender,
     tokio::task::JoinHandle<Result<()>>,
 )> {
+    start_recording_controller(root, native, Arc::default()).await
+}
+
+/// Start a controller like [`start_controller`], keeping every event frame sent to the editor.
+async fn start_recording_controller(
+    root: &tempfile::TempDir,
+    native: Arc<crate::provider::test_support::EventFixtureProvider>,
+    frames: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> Result<(
+    Arc<SessionController>,
+    crate::provider::test_support::ProviderTestSession,
+    forge_protocol::outbound::MessageSender,
+    tokio::task::JoinHandle<Result<()>>,
+)> {
     native.with_models(vec![serde_json::from_value(json!({
         "id":"fixture-model", "reasoning":["low","medium","high"],
         "context_window":[], "vision":false, "is_default":true,
@@ -158,7 +172,11 @@ pub(super) async fn start_controller(
     let controller = SessionController::new(broker).await?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
-        while output.recv().await?.is_some() {}
+        while let Some(frame) = output.recv().await? {
+            if let Ok(event) = serde_json::from_slice(frame.bytes()) {
+                frames.lock().expect("frame lock").push(event);
+            }
+        }
         Ok::<(), anyhow::Error>(())
     });
     controller.start_provider(&sink).await;
@@ -625,7 +643,7 @@ async fn follow_up_submitted_during_an_approval_reaches_the_provider_after_it_ex
 /// discarded, and the provider ran the turn again.
 #[tokio::test(start_paused = true)]
 async fn allowing_a_pending_approval_approves_it_without_stopping_the_turn() -> Result<()> {
-    let response = decide_pending_approval_by_mode("allow").await?;
+    let (response, _) = decide_pending_approval_by_mode("allow").await?;
     ensure!(
         matches!(response, PermissionResponse::Allow),
         "switching to Allow did not approve the pending request: {response:?}"
@@ -636,7 +654,7 @@ async fn allowing_a_pending_approval_approves_it_without_stopping_the_turn() -> 
 /// Switching to Deny rejects a pending request with the reason a new request gets under Deny.
 #[tokio::test(start_paused = true)]
 async fn denying_a_pending_approval_rejects_it_with_the_mode_reason() -> Result<()> {
-    let response = decide_pending_approval_by_mode("deny").await?;
+    let (response, resolution) = decide_pending_approval_by_mode("deny").await?;
     let PermissionResponse::Deny {
         reason: Some(reason),
     } = &response
@@ -648,12 +666,25 @@ async fn denying_a_pending_approval_rejects_it_with_the_mode_reason() -> Result<
             && reason.contains(forge_provider_api::forge::REJECT_ALL_GUIDANCE),
         "the rejection did not carry the Deny mode reason: {reason}"
     );
+    // The recorded decision explains itself on the tool row, as a new request under Deny does,
+    // instead of the generic "Permission denied".
+    let recorded = &resolution[0]["Resolved"]["targets"][0];
+    ensure!(
+        recorded["source"] == "ApprovalMode"
+            && recorded["decision"]["Deny"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("denies requests that need confirmation")),
+        "the recorded mode decision kept a generic reason: {resolution}"
+    );
     Ok(())
 }
 
 /// Change the approval mode while the first turn's request waits, and return how the provider's
-/// request was answered once the turn settled without a restart.
-async fn decide_pending_approval_by_mode(mode: &str) -> Result<PermissionResponse> {
+/// request was answered once the turn settled without a restart, with the exchange's recorded
+/// approval events.
+async fn decide_pending_approval_by_mode(
+    mode: &str,
+) -> Result<(PermissionResponse, serde_json::Value)> {
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let runs = Arc::new(AtomicUsize::new(0));
@@ -735,7 +766,14 @@ async fn decide_pending_approval_by_mode(mode: &str) -> Result<PermissionRespons
             serde_json::to_value(controller.observer.snapshot()?.session.approval_mode)? == mode,
             "the session did not keep the selected mode"
         );
-        Ok::<PermissionResponse, anyhow::Error>(response)
+        let resolution = SqliteStore::open(&controller.data_root)?
+            .list_exchange(controller.observer.session_id())?
+            .into_iter()
+            .find(|exchange| exchange.ordinal == 1)
+            .map(|exchange| serde_json::to_value(&exchange.approval_resolution))
+            .transpose()?
+            .unwrap_or_default();
+        Ok::<_, anyhow::Error>((response, resolution))
     }
     .await;
     let teardown = stop_controller(controller, provider, reader).await;
@@ -815,7 +853,9 @@ async fn tool_outliving_its_deadline_records_the_timeout_beside_the_tool() -> Re
             )
         },
     );
-    let (controller, provider, sink, reader) = start_controller(&root, native).await?;
+    let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (controller, provider, sink, reader) =
+        start_recording_controller(&root, native, frames.clone()).await?;
     let scenario = async {
         prompt::apply(
             &controller,
@@ -872,6 +912,20 @@ async fn tool_outliving_its_deadline_records_the_timeout_beside_the_tool() -> Re
                 .any(|row| row.contains("Failed: timed out after 10m; execution stopped.")),
             "the tool row did not record its timeout: {expanded:#?}"
         );
+        // The editor shows each provider error as a notice, and the expiry used to arrive twice.
+        let notices = frames
+            .lock()
+            .expect("frame lock")
+            .iter()
+            .filter(|frame| {
+                frame["event"] == "provider_event"
+                    && frame["payload"]["kind"] == "error"
+                    && frame["payload"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("exceeded its"))
+            })
+            .count();
+        ensure!(notices == 1, "the expiry was announced {notices} times");
         Ok::<(), anyhow::Error>(())
     }
     .await;

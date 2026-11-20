@@ -1999,7 +1999,34 @@ pub(crate) fn project(
     exchanges: &mut [crate::exchange::Exchange],
     snapshot: &QuestionSnapshot,
 ) -> Result<()> {
+    // Each question row sits after the `question_ask` call that asked it, where the answer was
+    // given, rather than after everything the turn produced since. A question operation's
+    // ordinal among its exchange's operations names that call; a row whose call cannot be found
+    // falls back to the end of the exchange.
+    let mut operation_list: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    let mut placement: std::collections::HashMap<
+        String,
+        Vec<(Option<usize>, crate::exchange::ExchangeNode)>,
+    > = std::collections::HashMap::new();
+    let mut call_positions: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
     for question in &snapshot.questions {
+        let operation = question
+            .id
+            .as_str()
+            .rsplit_once(':')
+            .map_or(question.id.as_str(), |(operation, _)| operation);
+        let operations = operation_list
+            .entry(question.exchange_id.as_str())
+            .or_default();
+        let ordinal = operations
+            .iter()
+            .position(|known| *known == operation)
+            .unwrap_or_else(|| {
+                operations.push(operation);
+                operations.len() - 1
+            });
         if let QuestionResolution::Answered { message_id, .. } = &question.resolution
             && exchanges.iter().any(|exchange| {
                 let opening_owns_reply = match &exchange.opening {
@@ -2047,9 +2074,14 @@ pub(crate) fn project(
                 Some(reason.clone())
             }
         };
-        exchange
-            .node_list
-            .push(crate::exchange::ExchangeNode::QuestionPresented {
+        let anchor = call_positions
+            .entry(exchange.id.clone())
+            .or_insert_with(|| exchange.question_call_positions())
+            .get(ordinal)
+            .copied();
+        placement.entry(exchange.id.clone()).or_default().push((
+            anchor,
+            crate::exchange::ExchangeNode::QuestionPresented {
                 id: format!("question:{}", question.id.as_str()),
                 question: crate::plan::PlanQuestionSet {
                     id: question.id.as_str().into(),
@@ -2059,7 +2091,7 @@ pub(crate) fn project(
                             "{}{}",
                             question.content.header,
                             if question.requirement == QuestionRequirement::Required {
-                                " Â· Required"
+                                " · Required"
                             } else {
                                 ""
                             }
@@ -2079,7 +2111,32 @@ pub(crate) fn project(
                     }],
                 },
                 answer,
-            });
+            },
+        ));
+    }
+    for exchange in exchanges.iter_mut() {
+        let Some(placed) = placement.remove(&exchange.id) else {
+            continue;
+        };
+        let mut node_list = Vec::with_capacity(exchange.node_list.len() + placed.len());
+        let mut trailing = Vec::new();
+        let mut anchored: std::collections::BTreeMap<usize, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for (anchor, node) in placed {
+            match anchor.filter(|anchor| *anchor < exchange.node_list.len()) {
+                Some(anchor) => anchored.entry(anchor).or_default().push(node),
+                None => trailing.push(node),
+            }
+        }
+        for (position, node) in std::mem::take(&mut exchange.node_list)
+            .into_iter()
+            .enumerate()
+        {
+            node_list.push(node);
+            node_list.extend(anchored.remove(&position).unwrap_or_default());
+        }
+        node_list.extend(trailing);
+        exchange.node_list = node_list;
     }
     Ok(())
 }

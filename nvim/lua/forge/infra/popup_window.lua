@@ -42,9 +42,21 @@ function M.capture_origin()
   return origin
 end
 
+---Return to the window and mode a popup interrupted.
+---
+---A popup often closes from one of its own Insert-mode mappings, such as the submit key of its
+---input. `:startinsert` does nothing while Insert mode is active, and `:stopinsert` ends it once the
+---mapping returns, so returning to an Insert-mode origin from Insert mode only moves to its window;
+---Insert mode then continues there, and the keys typed after the submit key are text in it.
 ---@param origin ForgePopupOrigin?
 function M.restore_origin(origin)
   if not origin then return end
+  local continue_insert = origin.mode:sub(1, 1) == "i" and vim.api.nvim_get_mode().mode:sub(1, 1) == "i"
+    and vim.api.nvim_win_is_valid(origin.win)
+  if continue_insert then
+    vim.api.nvim_set_current_win(origin.win)
+    return
+  end
   vim.cmd("stopinsert")
   if not vim.api.nvim_win_is_valid(origin.win) then return end
   vim.api.nvim_set_current_win(origin.win)

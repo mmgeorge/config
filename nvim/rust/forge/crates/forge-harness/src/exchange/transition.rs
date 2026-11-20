@@ -49,11 +49,19 @@ pub(super) enum StopIntent {
 }
 
 impl StopIntent {
-    /// Keep cancellation visible while its host settlement still owns the exchange.
-    fn collected_status(self) -> Option<super::ExchangeCollection> {
+    /// Get the label an exchange keeps once its turn is collected, or `None` to clear it.
+    ///
+    /// While the stopping command still runs, both intents keep the exchange labelled as
+    /// stopping until that command settles it: a reconfiguration's command resumes, closes, or
+    /// releases the parked exchange. A collection that arrives after its command already failed
+    /// leaves no command to do so, so a reconfiguration clears the label then, while a
+    /// cancellation stays visible until its host settlement ends.
+    fn collected_status(self, command_running: bool) -> Option<super::ExchangeCollection> {
         match self {
             Self::Cancel(_) => Some(super::ExchangeCollection::Settling),
-            Self::Reconfigure { .. } => None,
+            Self::Reconfigure { .. } => {
+                command_running.then_some(super::ExchangeCollection::Settling)
+            }
         }
     }
     /// Get collection scope without consulting semaphore counts or provider identity.
@@ -700,7 +708,7 @@ impl ExchangeStop {
                         target
                             .as_ref()
                             .map(crate::broker::ExchangeControlSelection::id),
-                        self.intent.collected_status(),
+                        self.intent.collected_status(true),
                     )
                     .map_err(transition_failure)?;
                 self.foreground_signals.push_back(
@@ -1337,7 +1345,7 @@ impl RetainedTransition {
         let events = broker
             .owner_collection_completed(
                 target.map(crate::broker::ExchangeControlSelection::id),
-                self.intent.collected_status(),
+                self.intent.collected_status(false),
             )
             .map_err(transition_failure)?;
         Ok(events)

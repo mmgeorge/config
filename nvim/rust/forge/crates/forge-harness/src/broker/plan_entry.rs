@@ -15,6 +15,82 @@ pub(crate) enum PlanTaskRequest {
 }
 
 impl HarnessBroker {
+    /// Get the plan the current Plan task works on.
+    fn current_plan_record(&self) -> Result<Option<PlanRecord>> {
+        Ok(self
+            .task_controller
+            .current()?
+            .and_then(|task| match &task.workflow {
+                WorkflowSnapshot::Plan { plan } => Some(plan.artifact.clone()),
+                _ => None,
+            }))
+    }
+
+    /// Prepare the planner's input for one dispatched turn while a plan awaits review or revision.
+    ///
+    /// A message during review is a plan discussion. It keeps the user's words unmodified and
+    /// carries the review comments and edits pending on the plan in the form a revision request
+    /// uses, so a revision the discussion leads to keeps the edits and answers the comments.
+    /// A revision request carries them itself. Either way the prompt delivered them, which this
+    /// records, so a later model revision retires them instead of replaying them at acceptance.
+    pub(crate) fn plan_turn_input(
+        &self,
+        input: ProviderInput,
+        mode: PromptMode,
+    ) -> Result<ProviderInput> {
+        use forge_provider_api::forge::{PlanReview, TurnKind};
+        if mode == PromptMode::PlanDiscussion {
+            let retyped = input.retype_user_message(|input| TurnKind::PlanDiscussion { input });
+            let review = self.pending_plan_review()?;
+            return Ok(
+                ProviderInput::new(retyped.turn().clone().with_pending_review(review))
+                    .with_attachments(retyped.attachments().to_vec()),
+            );
+        }
+        if matches!(
+            input.turn().kind(),
+            TurnKind::PlanReview {
+                review: PlanReview::ChangesRequested { .. }
+            }
+        ) && let Some(plan) = self.current_plan_record()?
+        {
+            self.plan_file.record_review_delivery(&plan)?;
+        }
+        Ok(input)
+    }
+
+    /// Collect the review comments and edits pending on the plan under review, and record that
+    /// the prompt about to carry them delivered them.
+    fn pending_plan_review(&self) -> Result<Option<forge_provider_api::forge::PendingPlanReview>> {
+        let Some(plan) = self.current_plan_record()? else {
+            return Ok(None);
+        };
+        let Some(digest) = plan.review_digest.as_deref() else {
+            return Ok(None);
+        };
+        let reviewed = self
+            .observer
+            .capture_plan_review(&plan.id, digest)
+            .context("read the review pending on the discussed plan")?;
+        let saved = self.plan_file.saved_review_comments(&reviewed)?;
+        let annotation = crate::plan::resolve_annotations(&reviewed.rendered, saved)?;
+        let comments = if annotation.is_empty() {
+            String::new()
+        } else {
+            crate::plan::render_review_feedback(&reviewed.document, &annotation)?
+        };
+        let comments =
+            crate::plan::with_unplaced_comments(comments, &plan.unplaced_review_comments);
+        let review = forge_provider_api::forge::PendingPlanReview::new(
+            forge_provider_api::forge::ReviewFeedback::new(None, comments),
+            plan.manual_changes.clone(),
+        );
+        if review.is_some() {
+            self.plan_file.record_review_delivery(&plan)?;
+        }
+        Ok(review)
+    }
+
     pub(super) fn dispatch_session_command(
         &mut self,
         method: &str,
@@ -106,12 +182,48 @@ impl BrokerObserver {
                 TaskChange::Install(Box::new(task))
             }
             SessionAction::NewPlan { text } => {
-                TaskChange::Install(Box::new(self.prepare_plan_task(
+                let mut task = self.prepare_plan_task(
                     PlanTaskRequest::New {
                         objective: text.clone(),
                     },
                     now_ms,
-                )?))
+                )?;
+                // The provider thread still holds the abandoned plan's turns, so the first
+                // planning turn says that plan is not to be continued.
+                let store = crate::storage::HistoryReader::current(&self.data_root)?;
+                // Cancelling a plan in review deletes its plan record and keeps its lifecycle,
+                // so the session's latest plan was cancelled when its record is gone or ended
+                // cancelled.
+                let starting = match &task.workflow {
+                    WorkflowSnapshot::Plan { plan } => Some(plan.artifact.id.clone()),
+                    _ => None,
+                };
+                let latest = store
+                    .list_plan_lifecycle(&self.session_id)?
+                    .into_iter()
+                    .filter(|event| Some(&event.plan_id) != starting.as_ref())
+                    .max_by_key(|event| event.created_at_ms);
+                let abandoned = match latest {
+                    Some(event) => match store.load_plan(&event.plan_id)? {
+                        None => Some(event.title),
+                        Some(plan) if plan.state == PlanState::Cancelled => Some(plan.title),
+                        Some(_) => None,
+                    },
+                    None => None,
+                };
+                if let Some(title) = abandoned {
+                    task.edit(|draft| {
+                        if let Some(entry) = draft.entry.as_mut() {
+                            entry.instruction.push_notice(
+                                forge_provider_api::forge::Notice::PlanAbandoned {
+                                    title: title.clone(),
+                                },
+                            );
+                        }
+                        Ok(())
+                    })?;
+                }
+                TaskChange::Install(Box::new(task))
             }
             SessionAction::Attach { plan_id } => {
                 TaskChange::Install(Box::new(self.prepare_plan_task(

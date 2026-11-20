@@ -327,6 +327,16 @@ impl ExchangeDriver {
                             output.clone(),
                             services,
                         ));
+                        // The committed task state precedes its input, so the editor never draws
+                        // a paused task beside the queued input that resuming it scheduled.
+                        publish_task_state(
+                            command_messages.as_ref(),
+                            services,
+                            trace,
+                            session_id,
+                            &id,
+                            step,
+                        );
                         // Retain native preparation before notifications can fail or observers disappear.
                         for update in start.updates {
                             publish_input_observation(

@@ -160,6 +160,16 @@ impl ExchangeDriver {
                         step,
                     );
                 }
+                // A turn that failed before it started settles its input here, after the status
+                // last predicted that input's turn as `Working`.
+                super::super::refresh_idle_status(
+                    &mut *broker.lock().await,
+                    services,
+                    trace,
+                    session_id,
+                    step,
+                    input.id.as_str(),
+                );
                 trace.record(session_id, "exchange.input.completed", serde_json::json!({
                         "input_id":input.id.as_str(),"input_revision":input.revision,"update_step":step,
                     }));

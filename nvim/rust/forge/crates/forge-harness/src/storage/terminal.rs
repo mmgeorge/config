@@ -183,10 +183,17 @@ impl SqliteStore {
     }
 }
 
+/// Commit a terminal receipt and settle its timeline row.
+///
+/// A plan acceptance names entering execution only when the commit installs the Execute task
+/// (`executing`). An acceptance that became a revision first commits on the planning task, and
+/// a revision accepted while the execution runs commits on the Execute task it keeps, so in both
+/// cases its pending row is removed; the revision writes its own lifecycle row.
 pub(super) fn commit(
     transaction: &rusqlite::Transaction<'_>,
     session: &str,
     receipt: TerminalCommit,
+    executing: bool,
 ) -> Result<()> {
     let state: String = transaction.query_row(
         "SELECT disposition FROM terminal_request WHERE session_id=?1 AND id=?2",
@@ -205,6 +212,13 @@ pub(super) fn commit(
         "UPDATE terminal_request SET disposition=?3 WHERE session_id=?1 AND id=?2",
         params![session, receipt.id, serde_json::to_string(&committed)?],
     )?;
+    if receipt.id.starts_with("plan_acceptance:") && !executing {
+        transaction.execute(
+            "DELETE FROM session_event_record WHERE id=?1 AND session_id=?2",
+            params![format!("{session}:terminal:{}", receipt.id), session],
+        )?;
+        return Ok(());
+    }
     update_presentation(
         transaction,
         session,
@@ -278,6 +292,7 @@ mod tests {
                     id: "request".into(),
                     result: serde_json::json!({"next":"checking"}),
                 },
+                false,
             )?;
             // Dropping the enclosing transaction must also undo its receipt.
         }
@@ -295,6 +310,7 @@ mod tests {
                 id: "request".into(),
                 result: serde_json::json!({"next":"checking"}),
             },
+            false,
         )?;
         tx.commit()?;
         let reopened = SqliteStore::open(root.path())?;
@@ -383,6 +399,123 @@ mod tests {
             store.terminal_disposition("session", "rejected")?,
             Some(TerminalDisposition::Rejected { .. })
         ));
+        Ok(())
+    }
+
+    /// Commit one plan acceptance whose pending row was recorded, with `install` producing the
+    /// task the commit leaves, and return the transcript rows the acceptance left.
+    fn acceptance_rows(
+        install: impl FnOnce(&crate::task::Task) -> Result<crate::task::Task>,
+        prepare_execute: bool,
+    ) -> Result<Vec<String>> {
+        use crate::plan::PlanExecutionRecord;
+        let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        if prepare_execute {
+            let previous = controller.current()?.unwrap();
+            let record: PlanExecutionRecord = serde_json::from_value(serde_json::json!({
+                "id":"execution", "session_id":"session", "plan_id":"accepted-plan",
+                "state":"active", "phase":"implement", "original_revision":1,"revision":1,
+                "generation":0, "lifecycle":[],"findings":[],
+                "progress":crate::plan::execution::SemanticProgress::default(),
+                "verification":[],"revision_history":[],"resume_after_review":false,
+                "observed_source":{},"observed_document_version":0,"observed_check":[],
+                "created_at_ms":1
+            }))?;
+            controller.change(
+                &mut store,
+                Some(&previous.revision),
+                crate::task::TaskChange::Install(Box::new(crate::task::Task::execute(
+                    "Execute the accepted plan".into(),
+                    record,
+                    Default::default(),
+                    2,
+                )?)),
+                2,
+            )?;
+        }
+        let before = controller.current()?.unwrap();
+        store.record_task_terminal_request(
+            "session",
+            "plan_acceptance:accept",
+            Some(&before.id),
+            &"intent",
+            Some(crate::timeline::SessionEventRecord {
+                id: "session:terminal:plan_acceptance:accept".into(),
+                session_id: "session".into(),
+                owner: crate::timeline::TimelineOwner::session("session"),
+                created_at_ms: 3,
+                detail: crate::timeline::SessionEventKind::TaskAdvancement {
+                    message: "Plan approved; execution is waiting".into(),
+                },
+            }),
+        )?;
+        let installed = install(&before)?;
+        store.commit_task_effects("session", Some(&before.revision), 4, |active| {
+            *active = Some(installed);
+            Ok((
+                (),
+                crate::storage::TaskEffects {
+                    terminal_commit: Some(TerminalCommit {
+                        id: "plan_acceptance:accept".into(),
+                        result: serde_json::json!(true),
+                    }),
+                    ..Default::default()
+                },
+            ))
+        })?;
+        Ok(store
+            .list_session_event("session")?
+            .into_iter()
+            .filter_map(|event| match event.detail {
+                crate::timeline::SessionEventKind::TaskAdvancement { message } => Some(message),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// An acceptance that installs the Execute task says execution started.
+    #[test]
+    fn an_acceptance_that_starts_execution_says_so() -> Result<()> {
+        let rows = acceptance_rows(
+            |_| {
+                let record = serde_json::from_value(serde_json::json!({
+                    "id":"execution", "session_id":"session", "plan_id":"accepted-plan",
+                    "state":"active", "phase":"implement", "original_revision":1,"revision":1,
+                    "generation":0, "lifecycle":[],"findings":[],
+                    "progress":crate::plan::execution::SemanticProgress::default(),
+                    "verification":[],"revision_history":[],"resume_after_review":false,
+                    "observed_source":{},"observed_document_version":0,"observed_check":[],
+                    "created_at_ms":1
+                }))?;
+                crate::task::Task::execute(
+                    "Execute the accepted plan".into(),
+                    record,
+                    Default::default(),
+                    4,
+                )
+            },
+            false,
+        )?;
+        assert_eq!(rows, ["Approved plan entered execution"]);
+        Ok(())
+    }
+
+    /// A revision accepted while its execution runs leaves no "entered execution" row.
+    ///
+    /// The execution was already running, so the row repeated the start and, recorded at the
+    /// session level, was drawn after the whole Resolve exchange; the revision's own lifecycle
+    /// row records the acceptance where it happened.
+    #[test]
+    fn a_revision_accepted_during_execution_adds_no_entered_execution_row() -> Result<()> {
+        let rows = acceptance_rows(
+            |current| {
+                let mut draft = current.draft();
+                draft.updated_at_ms = 4;
+                crate::task::Task::try_from(draft)
+            },
+            true,
+        )?;
+        assert!(rows.is_empty(), "{rows:?}");
         Ok(())
     }
 }

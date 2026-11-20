@@ -327,6 +327,46 @@ impl<'de> Deserialize<'de> for Exchange {
 }
 
 impl Exchange {
+    /// Get the timeline positions of the `question_ask` calls that asked questions, in order.
+    ///
+    /// Each successful call creates one question operation, so the n-th operation of this
+    /// exchange belongs to the n-th position. A failed call created none and is skipped.
+    pub(crate) fn question_call_positions(&self) -> Vec<usize> {
+        let tool = |turn_id: &str, tool_id: &str| {
+            self.entry.iter().find_map(|entry| match entry {
+                ExchangeEntry::Commentary { commentary } => commentary
+                    .tool
+                    .iter()
+                    .filter(|tools| tools.turn_id == turn_id)
+                    .find_map(|tools| tools.store.get(tool_id)),
+                _ => None,
+            })
+        };
+        self.node_list
+            .iter()
+            .enumerate()
+            .filter_map(|(position, node)| match node {
+                ExchangeNode::TurnContent {
+                    turn_id,
+                    item: crate::turn::TurnItem::Tool { id },
+                    ..
+                } => tool(turn_id, id)
+                    .filter(|call| {
+                        !call.failed
+                            && call
+                                .title
+                                .split('(')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .ends_with("question_ask")
+                    })
+                    .map(|_| position),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn awaiting_input(&self) -> bool {
         self.question.waiting()
     }
@@ -365,6 +405,20 @@ impl Exchange {
     }
     pub fn finalization_outcome(&self) -> Option<ExchangeOutcome> {
         self.phase.outcome()
+    }
+    /// Name the native history checkpoint that follows this exchange's provider turns.
+    ///
+    /// Every finished turn's native result carries the checkpoint its provider reported, whether
+    /// the turn completed, was cancelled or interrupted, or failed. Only completion settlement
+    /// copies it into `provider_checkpoint_id`, so the newest turn result is the authority and the
+    /// settled field covers records whose turns carry none.
+    pub fn native_checkpoint(&self) -> Option<&str> {
+        self.turn
+            .iter()
+            .rev()
+            .find_map(|turn| turn.completed()?.result().checkpoint_id())
+            .map(|checkpoint| checkpoint.as_str())
+            .or(self.provider_checkpoint_id.as_deref())
     }
     /// Create a causal root record for manual child admission without a root model turn.
     pub(crate) fn agent_admission(
@@ -1162,8 +1216,8 @@ impl Exchange {
         );
         self.collection = None;
         self.set_awaiting_input(self.elicitation().is_some());
-        if self.metrics.awaiting_approval() {
-            self.metrics.approval_resume = true;
+        if self.metrics.awaiting_user() {
+            self.metrics.user_wait_resume = true;
         } else {
             self.clock.resume(now_ms);
         }
@@ -1271,6 +1325,34 @@ impl Exchange {
         Ok(())
     }
 
+    /// Report a Harness-authored continuation in which the model produced nothing visible.
+    ///
+    /// A continuation stopped before its provider answered has only its opening notice and an
+    /// empty heading, so closing it would record a row with no content. Every visible item, from
+    /// model text and reasoning to questions, steering input, and timeline events, is a node; tool
+    /// calls and check runs live on commentary entries; host edits change files. A prompt echo
+    /// records neither, so an echoed continuation still counts as output-free. Exchanges that a
+    /// user prompt or a task start opened carry content of their own and never qualify.
+    pub(crate) fn is_output_free_continuation(&self) -> bool {
+        matches!(
+            self.opening,
+            super::ExchangeOpening::TaskContinuation { .. }
+        ) && self.node_list.is_empty()
+            && self.host_file_changes.is_empty()
+            && self.checklist.is_none()
+            && self.entry.iter().all(|entry| match entry {
+                super::ExchangeEntry::Commentary { commentary } => {
+                    commentary.tool.is_empty() && commentary.check.is_empty()
+                }
+                _ => false,
+            })
+            && self.turn.iter().all(|turn| {
+                turn.items()
+                    .iter()
+                    .all(|item| matches!(item, crate::turn::TurnItem::Message { .. }))
+            })
+    }
+
     /// Report an open exchange whose execution is paused with no provider turn still running.
     ///
     /// Collection leaves this state after [`Self::pause_for_restart`]. Only a continuation
@@ -1319,7 +1401,7 @@ impl Exchange {
             return ExchangeActivity::Settled;
         }
         if self.execution_started_at_ms().is_none()
-            && !self.metrics.approval_resume
+            && !self.metrics.user_wait_resume
             && self.turn.last().is_some_and(|turn| {
                 matches!(
                     turn.state(),
@@ -1334,8 +1416,9 @@ impl Exchange {
         if self.metrics.awaiting_approval() {
             return ExchangeActivity::AwaitingApproval;
         }
-        if self.execution_started_at_ms().is_none()
-            && (self.awaiting_input() || self.elicitation().is_some())
+        if self.metrics.awaiting_answer()
+            || self.execution_started_at_ms().is_none()
+                && (self.awaiting_input() || self.elicitation().is_some())
         {
             return ExchangeActivity::AwaitingInput;
         }
@@ -1360,17 +1443,22 @@ impl Exchange {
         })
     }
 
-    /// Suspends execution for permissions and accounts for other non-model activity.
+    /// Suspends execution while the user decides or answers, and accounts for other non-model
+    /// activity.
+    ///
+    /// An approval and a question a running tool waits on both stop the clock, so neither the
+    /// heading, the status, nor a tool's duration counts the user's time. The clock resumes when
+    /// the last such wait ends, if it was running when the first began.
     pub(crate) fn observe_blocker(&mut self, id: String, running: bool, now_ms: i64) {
-        let approval = id.starts_with("approval:");
-        if approval && running && !self.metrics.awaiting_approval() {
+        let user_wait = crate::exchange::metrics::UserWait::of(&id).is_some();
+        if user_wait && running && !self.metrics.awaiting_user() {
             let resume = self.execution_started_at_ms().is_some();
             self.pause(now_ms);
-            self.metrics.approval_resume = resume;
+            self.metrics.user_wait_resume = resume;
         }
         self.metrics.block(id, running, self.elapsed(now_ms));
-        if approval && !running && !self.metrics.awaiting_approval() {
-            let resume = std::mem::take(&mut self.metrics.approval_resume);
+        if user_wait && !running && !self.metrics.awaiting_user() {
+            let resume = std::mem::take(&mut self.metrics.user_wait_resume);
             if resume
                 && self.collection.is_none()
                 && self.state() == ExchangeState::Running
@@ -1385,9 +1473,44 @@ impl Exchange {
         }
     }
 
+    /// Match this exchange's answer waits to the questions its running tools wait on.
+    ///
+    /// Returns whether any wait began or ended.
+    pub(crate) fn observe_question_waits(
+        &mut self,
+        waiting: &std::collections::BTreeSet<String>,
+        now_ms: i64,
+    ) -> bool {
+        use crate::exchange::metrics::UserWait;
+        let ended = self
+            .metrics
+            .awaited_questions()
+            .filter(|question| !waiting.contains(*question))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let began = waiting
+            .iter()
+            .filter(|question| {
+                !self
+                    .metrics
+                    .awaited_questions()
+                    .any(|open| open == *question)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = !ended.is_empty() || !began.is_empty();
+        for question in began {
+            self.observe_blocker(UserWait::Answer.blocker(&question), true, now_ms);
+        }
+        for question in ended {
+            self.observe_blocker(UserWait::Answer.blocker(&question), false, now_ms);
+        }
+        changed
+    }
+
     /// Freeze the active interval before waiting for user input or finalization.
     pub fn pause(&mut self, now_ms: i64) {
-        self.metrics.approval_resume = false;
+        self.metrics.user_wait_resume = false;
         self.clock.pause(now_ms);
     }
 
@@ -2374,6 +2497,62 @@ mod test {
             prompt.id
         );
         assert_eq!(displayed(&exchange), order);
+    }
+
+    /// A tool that starts after a consumed steering message is owned after that message, not by
+    /// the reasoning paragraph written before it.
+    #[test]
+    fn tools_after_a_steering_message_are_owned_after_it() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let address = running_turn(&mut exchange, "first", 1);
+        let before = crate::turn::test_support::message(
+            &address,
+            "before",
+            Some(AgentMessageRole::Commentary),
+            "Reading files",
+        );
+        assert!(exchange.observe_event(&before, 2).unwrap());
+        let start = |name: &str| {
+            forge_provider_api::ItemStart::CommandExecution(forge_provider_api::ToolDescriptor {
+                semantics: Default::default(),
+                name: name.into(),
+                title: name.into(),
+                arguments: forge_provider_api::InspectableArguments::new(serde_json::json!({})),
+            })
+        };
+        crate::turn::test_support::tool(
+            &mut exchange,
+            &address,
+            "earlier",
+            start("earlier"),
+            [],
+            3,
+        )
+        .unwrap();
+        let steer = submission("steer");
+        let prompt = acknowledge(&mut exchange, &address, &steer, 4);
+        observe(&mut exchange, &echo(&address, "echo", &steer), 5);
+        crate::turn::test_support::tool(&mut exchange, &address, "later", start("later"), [], 6)
+            .unwrap();
+        exchange.reconcile_entries().unwrap();
+        let owner = |tool_id: &str| {
+            exchange
+                .entry
+                .iter()
+                .position(|entry| {
+                    matches!(entry, super::super::ExchangeEntry::Commentary { commentary }
+                        if commentary.tool.iter().any(|tools| tools.store.get(tool_id).is_some()))
+                })
+                .unwrap()
+        };
+        let steering = exchange
+            .entry
+            .iter()
+            .position(|entry| entry.id() == prompt.id)
+            .unwrap();
+        assert!(owner("earlier") < steering, "{:#?}", exchange.entry);
+        assert!(steering < owner("later"), "{:#?}", exchange.entry);
     }
 
     /// An echo that precedes acknowledgement reserves the input's position, even past completion.

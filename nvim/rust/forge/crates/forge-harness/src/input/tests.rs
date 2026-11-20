@@ -226,6 +226,44 @@ fn retry_of_a_failed_message_resumes_a_paused_queue() -> Result<()> {
     Ok(())
 }
 
+/// A user prompt that fails delivery pauses the queue, so the queue says it is held.
+///
+/// A failed entry stays first and blocks every later follow-up until it is retried, but the queue
+/// still read as running: a later prompt sat under "Queued follow-up inputs" with no paused
+/// marker and nothing to say that the retry key would send it.
+#[test]
+fn failed_user_delivery_pauses_the_queue_until_retried() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("first"))?;
+    input.claim("first", 1, InputRoute::Turn)?.unwrap();
+    let failed = input.delivery(
+        "first",
+        Some(InputDelivery::Failed),
+        None,
+        Some("Provider did not confirm message acceptance".into()),
+    )?;
+    assert!(
+        failed.suspended,
+        "the failed delivery left the queue running"
+    );
+    input.apply(submit("later"))?;
+    assert!(
+        input.snapshot()?.suspended,
+        "a queued follow-up resumed the queue behind its failed entry"
+    );
+    let retried = input.apply(InputOperation {
+        id: "retry".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Retry {
+            id: "first".into(),
+            revision: failed.upsert[0].revision,
+        },
+    })?;
+    assert!(!retried.suspended);
+    Ok(())
+}
+
 /// Release one visited message while the rest of the same edit stays reserved.
 #[test]
 fn release_of_one_message_keeps_the_rest_of_its_edit_reserved() -> Result<()> {

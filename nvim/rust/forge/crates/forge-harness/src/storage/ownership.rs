@@ -9,6 +9,15 @@ pub(crate) struct PreparedRollback {
     expected_session: String,
     expected_exchanges: Vec<(String, String)>,
     updates: Vec<Exchange>,
+    /// Session rows recorded during the rolled-back interactions, as stored and as re-owned.
+    retired_events: Vec<RetiredSessionEvent>,
+}
+
+/// Move one session row into the rolled-back history it was recorded during.
+struct RetiredSessionEvent {
+    id: String,
+    expected: String,
+    replacement: String,
 }
 
 impl PreparedRollback {
@@ -48,6 +57,13 @@ impl PreparedRollback {
                 "UPDATE exchange_record SET payload=?2 WHERE id=?1",
                 params![exchange.id, serde_json::to_string(exchange)?],
             )?;
+        }
+        for event in &self.retired_events {
+            let written = transaction.execute(
+                "UPDATE session_event_record SET payload=?3 WHERE id=?1 AND session_id=?2 AND payload=?4",
+                params![event.id, self.session.id, event.replacement, event.expected],
+            )?;
+            ensure!(written == 1, "rollback session event changed before commit");
         }
         transaction.execute(
             "UPDATE session_record SET payload=json_set(?2,'$.session.name',json_extract(payload,'$.session.name'),'$.session.active_task',json_extract(payload,'$.session.active_task')),updated_at_ms=?3 WHERE id=?1",
@@ -251,12 +267,60 @@ impl SqliteStore {
                 updates.push(exchange);
             }
         }
+        let retired_events = match roots
+            .first()
+            .and_then(|root| updates.iter().find(|exchange| &exchange.id == root))
+        {
+            Some(first) => self.retired_session_events(session_id, first)?,
+            None => Vec::new(),
+        };
         Ok(PreparedRollback {
             session: session.clone(),
             expected_session,
             expected_exchanges,
             updates,
+            retired_events,
         })
+    }
+
+    /// Re-own the session rows recorded since `first` began to `first`, so they retire with it.
+    ///
+    /// Task lifecycle, configuration, and compaction rows recorded during the rolled-back
+    /// interactions describe history the rollback removes; owned by the first rolled-back
+    /// exchange, the timeline hides them with it. A rename or a fork origin describes the session
+    /// itself and stays.
+    fn retired_session_events(
+        &self,
+        session_id: &str,
+        first: &Exchange,
+    ) -> Result<Vec<RetiredSessionEvent>> {
+        use crate::timeline::{SessionEventKind, SessionEventRecord, TimelineOwner};
+        let stored = self
+            .connection
+            .prepare("SELECT id,payload FROM session_event_record WHERE session_id=?1")?
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        let owner = TimelineOwner::exchange(first);
+        let mut retired = Vec::new();
+        for (id, expected) in stored {
+            let mut event: SessionEventRecord = super::decode(&expected)?;
+            if !matches!(event.owner, TimelineOwner::Session { .. })
+                || event.created_at_ms < first.created_at_ms
+                || matches!(
+                    event.detail,
+                    SessionEventKind::Renamed { .. } | SessionEventKind::Forked { .. }
+                )
+            {
+                continue;
+            }
+            event.owner = owner.clone();
+            retired.push(RetiredSessionEvent {
+                id,
+                expected,
+                replacement: super::encode(&event)?,
+            });
+        }
+        Ok(retired)
     }
 
     /// Commit rollback history and the replacement provider identity together.

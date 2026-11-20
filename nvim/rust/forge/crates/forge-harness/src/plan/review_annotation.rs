@@ -292,6 +292,88 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<Vec<String>> {
     Ok(roots)
 }
 
+/// Find the row of `after` that shows what row `line` of `before` showed.
+///
+/// Prose rows share their section's target, so a target names a run of rows rather than one
+/// row. The row keeps its place in that run: the same rendered text nearest its old offset, or
+/// the same offset when its text changed, as after a rename that rewrote it.
+pub(crate) fn relocate_row<'after>(
+    before: &super::RenderedPlan,
+    after: &'after super::RenderedPlan,
+    line: u32,
+) -> Option<&'after super::PlanNavigationAnchor> {
+    let previous = before.navigation.resolve_line(line)?;
+    let same = |anchor: &&super::PlanNavigationAnchor| {
+        anchor.target == previous.target && anchor.label == previous.label
+    };
+    let first_before = before
+        .navigation
+        .anchor
+        .iter()
+        .filter(same)
+        .map(|anchor| anchor.line)
+        .min()?;
+    let candidate = after
+        .navigation
+        .anchor
+        .iter()
+        .filter(same)
+        .collect::<Vec<_>>();
+    let first_after = candidate.iter().map(|anchor| anchor.line).min()?;
+    let expected = i64::from(first_after) + i64::from(line - first_before);
+    let text = before.markdown.lines().nth(line as usize - 1);
+    let after_rows = after.markdown.lines().collect::<Vec<_>>();
+    candidate
+        .iter()
+        .filter(|anchor| after_rows.get(anchor.line as usize - 1).copied() == text)
+        .min_by_key(|anchor| (i64::from(anchor.line) - expected).abs())
+        .or_else(|| {
+            candidate
+                .iter()
+                .find(|anchor| i64::from(anchor.line) == expected)
+        })
+        .copied()
+}
+
+/// Move saved annotations from one rendering of a plan to another.
+///
+/// Returns the annotations whose rows `after` still shows, with their lines and semantic anchors
+/// moved, and the ones it does not. A follow-up stays only with its parent.
+pub(crate) fn relocate_annotations(
+    before: &super::RenderedPlan,
+    after: &super::RenderedPlan,
+    annotation: Vec<ReviewAnnotation>,
+) -> (Vec<ReviewAnnotation>, Vec<ReviewAnnotation>) {
+    let mut retained = Vec::new();
+    let mut dropped = Vec::new();
+    for mut item in annotation {
+        let rows = (
+            relocate_row(before, after, item.source.start_line),
+            relocate_row(before, after, item.source.end_line),
+        );
+        let (Some(start), Some(end)) = rows else {
+            dropped.push(item);
+            continue;
+        };
+        if item.parent_id.as_ref().is_some_and(|parent| {
+            !retained
+                .iter()
+                .any(|saved: &ReviewAnnotation| &saved.id == parent)
+        }) {
+            dropped.push(item);
+            continue;
+        }
+        item.source.start_line = start.line.min(end.line);
+        item.source.end_line = start.line.max(end.line);
+        item.anchor = Some(ReviewAnnotationAnchor {
+            start: start.target.clone(),
+            end: end.target.clone(),
+        });
+        retained.push(item);
+    }
+    (retained, dropped)
+}
+
 pub(crate) fn resolve_annotations(
     rendered: &super::RenderedPlan,
     annotation_input: Vec<PlanAnnotationInput>,

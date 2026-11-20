@@ -103,13 +103,44 @@ impl LifecycleAction {
     }
 }
 
+/// A decision that waits for the user while its task is paused.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PausedWait {
+    /// A submitted plan revision awaits review.
+    PlanReview { plan_id: String, revision: u32 },
+}
+
+impl SessionPhase {
+    /// Pause the task this phase belongs to, keeping a plan review that waits for the user.
+    ///
+    /// A turn that is still stopping keeps that phase, because its pause has not taken effect
+    /// and showing Paused first would flash before Stopping returns.
+    pub(crate) fn paused(self) -> Self {
+        let waiting = match self {
+            stopping @ Self::Stopping { .. } => return stopping,
+            Self::AwaitingPlanReview { plan_id, revision } => {
+                Some(PausedWait::PlanReview { plan_id, revision })
+            }
+            Self::Paused { waiting } => waiting,
+            _ => None,
+        };
+        Self::Paused { waiting }
+    }
+}
+
 /// Represents the authoritative workflow phase exposed to one session timeline.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionPhase {
     #[default]
     Idle,
-    Paused,
+    /// The task is paused; `waiting` names a decision that still waits for the user, so the
+    /// status can say what resuming leads to.
+    Paused {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        waiting: Option<PausedWait>,
+    },
     Stopping {
         collection: crate::exchange::ExchangeCollection,
     },
@@ -240,7 +271,7 @@ impl ExecutionStatusSnapshot {
         if matches!(status, SessionPhase::Idle)
             && self.state == crate::plan::PlanExecutionState::Paused
         {
-            *status = SessionPhase::Paused;
+            *status = SessionPhase::Paused { waiting: None };
             return;
         }
         if !matches!(status, SessionPhase::Working { .. } | SessionPhase::Idle) {
@@ -307,7 +338,7 @@ impl SessionPhase {
             })
         });
         match exchange.map(Exchange::activity) {
-            Some(ExchangeActivity::Paused) => return Self::Paused,
+            Some(ExchangeActivity::Paused) => return Self::Paused { waiting: None },
             Some(ExchangeActivity::AwaitingApproval) => {
                 return Self::AwaitingApproval {
                     exchange_id: exchange.unwrap().id.clone(),
@@ -367,10 +398,14 @@ impl SessionPhase {
                 exchange_id: None,
             };
         }
+        // A tool waiting for the user's answer pauses the exchange's clock and reads as
+        // `AwaitingInput`; the question lives in the question controller rather than on the
+        // exchange, so without the activity the phase fell through to idle while it waited.
         if let Some(exchange) = exchange.filter(|exchange| {
             exchange.state() == ExchangeState::Running
-                && !executing
-                && (exchange.awaiting_input() || exchange.elicitation().is_some())
+                && (exchange.activity() == ExchangeActivity::AwaitingInput
+                    || !executing
+                        && (exchange.awaiting_input() || exchange.elicitation().is_some()))
         }) {
             return Self::AwaitingInput {
                 owner: ElicitationOwner::Interaction,
@@ -505,5 +540,37 @@ impl SessionPhase {
                     ..
                 }
         )
+    }
+}
+
+#[cfg(test)]
+mod paused_tests {
+    use super::{PausedWait, SessionPhase};
+
+    /// Pausing keeps what still waits: a stopping turn stays Stopping, a plan review stays
+    /// named, and other phases become a plain pause.
+    #[test]
+    fn paused_keeps_stopping_and_a_waiting_review() {
+        let stopping = SessionPhase::Stopping {
+            collection: crate::exchange::ExchangeCollection::Pending,
+        };
+        assert_eq!(stopping.clone().paused(), stopping);
+        assert_eq!(
+            SessionPhase::AwaitingPlanReview {
+                plan_id: "plan".into(),
+                revision: 2
+            }
+            .paused(),
+            SessionPhase::Paused {
+                waiting: Some(PausedWait::PlanReview {
+                    plan_id: "plan".into(),
+                    revision: 2
+                })
+            }
+        );
+        assert_eq!(
+            SessionPhase::Idle.paused(),
+            SessionPhase::Paused { waiting: None }
+        );
     }
 }

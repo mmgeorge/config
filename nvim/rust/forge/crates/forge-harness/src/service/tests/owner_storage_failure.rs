@@ -1,7 +1,7 @@
 use super::super::native_permission;
 use super::super::{HarnessBroker, SessionController, prompt};
 use super::bootstrap::initialize;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use forge_protocol::message::Request;
 use serde_json::json;
 use std::sync::Arc;
@@ -259,6 +259,23 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
         "{rejected:?}"
     );
     assert_eq!(controller.observer.snapshot()?.session.access, before);
+    // The fenced owner declares itself failed, so reopening the session replaces it.
+    async {
+        loop {
+            let activity = controller
+                .observer
+                .activity
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if activity.phase == crate::exchange::ActivityPhase::Unavailable {
+                return activity.unavailable_reason;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+    .await
+    .context("a fenced command queue left the owner available")?;
     assert!(!collected.load(Ordering::Acquire));
     assert_eq!(release.available_permits(), 0);
     release.add_permits(1);

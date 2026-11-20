@@ -18,11 +18,11 @@ type Result<T> = std::result::Result<T, ProviderError>;
 #[derive(Clone)]
 pub struct HistoryRepair;
 
-/// Remove only a proven incomplete trailing tool-call suffix, then verify repair.
+/// Remove a proven incomplete trailing suffix in one cut, then verify repair.
 pub async fn repair(session: &super::handle::CopilotSession) -> Result<Option<HistoryRepair>> {
     let session = session.inner.as_ref();
     let history = read_history(session).await?;
-    let Some(event_id) = incomplete_suffix(&history)? else {
+    let Some(event_id) = repair_cut(&history)? else {
         return Ok(None);
     };
     let preserved = history
@@ -42,10 +42,30 @@ pub async fn repair(session: &super::handle::CopilotSession) -> Result<Option<Hi
     let repaired = read_history(session).await?;
     if !repaired.iter().map(|event| event.id.as_str()).eq(preserved)
         || incomplete_suffix(&repaired)?.is_some()
+        || unanswered_request(&repaired).is_some()
     {
         return Err(failure(ProviderFailureKind::Protocol));
     }
     Ok(Some(HistoryRepair))
+}
+
+/// Choose the one event at which truncation leaves a settled history.
+///
+/// An incomplete tool call is cut at the message that declared it. When the request that turn
+/// answered was itself left unanswered before that declaration, removing only the call would
+/// leave the request as the history's last word, which the next prompt's turn would carry out
+/// and which verification rejects, so the cut moves back to that `user.message`.
+fn repair_cut(history: &[SessionEvent]) -> Result<Option<String>> {
+    let Some(boundary) = incomplete_suffix(history)? else {
+        return Ok(unanswered_request(history));
+    };
+    let index = history
+        .iter()
+        .position(|event| event.id == boundary)
+        .ok_or_else(|| failure(ProviderFailureKind::Protocol))?;
+    Ok(Some(
+        unanswered_request(&history[..index]).unwrap_or(boundary),
+    ))
 }
 
 /// Read the entire persisted primary history without imposing a content limit.
@@ -182,6 +202,35 @@ fn incomplete_suffix(history: &[SessionEvent]) -> Result<Option<String>> {
         }
     }
     Ok(Some(history[boundary].id.clone()))
+}
+
+/// Find a trailing user request the model never began answering.
+///
+/// The host settles a prompt it interrupted before Copilot answered it, but Copilot keeps the
+/// accepted `user.message` and its opened turn, and the next prompt's turn then carries out the
+/// interrupted request. Only turn opening, hooks, and the model selection a resume records may
+/// follow it; any answer, tool call, abort, or turn end means the model acted on the request
+/// and its history is kept.
+fn unanswered_request(history: &[SessionEvent]) -> Option<String> {
+    let primary = history
+        .iter()
+        .filter(|event| event.agent_id.is_none())
+        .collect::<Vec<_>>();
+    let request = primary
+        .iter()
+        .rposition(|event| event.parsed_type() == SessionEventType::UserMessage)?;
+    primary[request + 1..]
+        .iter()
+        .all(|event| {
+            matches!(
+                event.parsed_type(),
+                SessionEventType::AssistantTurnStart
+                    | SessionEventType::HookStart
+                    | SessionEventType::HookEnd
+                    | SessionEventType::SessionModelChange
+            )
+        })
+        .then(|| primary[request].id.clone())
 }
 
 /// Require an abort on this turn's ancestry, even when persisted after its terminal event.
@@ -365,6 +414,165 @@ mod tests {
             ),
         ]);
         assert_eq!(incomplete_suffix(&history)?, Some("tail-request".into()));
+        Ok(())
+    }
+
+    /// An interrupted request Copilot never answered is truncated at its `user.message`, in the
+    /// shape a resume after an access change records.
+    #[test]
+    fn unanswered_trailing_request_is_truncated() {
+        let mut history = vec![
+            child(
+                "answered",
+                "root",
+                "user.message",
+                json!({"content":"first"}),
+            ),
+            child(
+                "answer",
+                "answered",
+                "assistant.message",
+                json!({"messageId":"m1","content":"done"}),
+            ),
+            child(
+                "answer-end",
+                "answer",
+                "assistant.turn_end",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "hook",
+                "answer-end",
+                "hook.start",
+                json!({"hookInvocationId":"h","hookType":"userPromptSubmitted","input":{}}),
+            ),
+            child(
+                "hook-end",
+                "hook",
+                "hook.end",
+                json!({"hookInvocationId":"h","hookType":"userPromptSubmitted","success":true}),
+            ),
+            child(
+                "request",
+                "hook-end",
+                "user.message",
+                json!({"content":"Create notes/wave5.txt"}),
+            ),
+            child(
+                "start",
+                "request",
+                "assistant.turn_start",
+                json!({"turnId":"1"}),
+            ),
+            child(
+                "resume",
+                "start",
+                "session.model_change",
+                json!({"newModel":"gpt-5"}),
+            ),
+        ];
+        assert_eq!(unanswered_request(&history), Some("request".into()));
+        history.push(child(
+            "reply",
+            "resume",
+            "assistant.message",
+            json!({"messageId":"m2","content":"working"}),
+        ));
+        assert_eq!(unanswered_request(&history), None);
+    }
+
+    /// A turn that failed while its delegated call was pending is cut at its request in one
+    /// truncation, so the repaired history neither ends in the request nor holds the call.
+    #[test]
+    fn pending_call_of_an_unanswered_request_is_cut_at_the_request() -> Result<()> {
+        let history = vec![
+            child(
+                "answered",
+                "root",
+                "user.message",
+                json!({"content":"first"}),
+            ),
+            child(
+                "answer",
+                "answered",
+                "assistant.message",
+                json!({"messageId":"m1","content":"done"}),
+            ),
+            child(
+                "answer-end",
+                "answer",
+                "assistant.turn_end",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "request",
+                "answer-end",
+                "user.message",
+                json!({"content":"Find the parser"}),
+            ),
+            child(
+                "start",
+                "request",
+                "assistant.turn_start",
+                json!({"turnId":"1"}),
+            ),
+            child(
+                "delegate",
+                "start",
+                "assistant.message",
+                json!({"messageId":"m2","content":"","toolRequests":[{"name":"search_code_subagent","toolCallId":"search"}]}),
+            ),
+            child(
+                "delegated",
+                "delegate",
+                "tool.execution_start",
+                json!({"toolCallId":"search","toolName":"search_code_subagent"}),
+            ),
+        ];
+        assert_eq!(repair_cut(&history)?, Some("request".into()));
+        let repaired = &history[..3];
+        assert_eq!(incomplete_suffix(repaired)?, None);
+        assert_eq!(unanswered_request(repaired), None);
+        Ok(())
+    }
+
+    /// A request the turn had already acted on keeps its completed work; only the pending call
+    /// is cut.
+    #[test]
+    fn pending_call_after_completed_work_keeps_the_request() -> Result<()> {
+        let history = vec![
+            child(
+                "request",
+                "root",
+                "user.message",
+                json!({"content":"Find the parser"}),
+            ),
+            child(
+                "start",
+                "request",
+                "assistant.turn_start",
+                json!({"turnId":"0"}),
+            ),
+            child(
+                "read",
+                "start",
+                "assistant.message",
+                json!({"messageId":"m1","content":"","toolRequests":[{"name":"view","toolCallId":"view"}]}),
+            ),
+            child(
+                "read-done",
+                "read",
+                "tool.execution_complete",
+                json!({"toolCallId":"view","success":true}),
+            ),
+            child(
+                "delegate",
+                "read-done",
+                "assistant.message",
+                json!({"messageId":"m2","content":"","toolRequests":[{"name":"search_code_subagent","toolCallId":"search"}]}),
+            ),
+        ];
+        assert_eq!(repair_cut(&history)?, Some("delegate".into()));
         Ok(())
     }
 

@@ -102,6 +102,17 @@ pub struct CopilotEventDecoder {
     child_events: HashMap<String, forge_provider_api::InvocationScope>,
     /// Observed agent identity of each child thread this decoder minted.
     child_agents: HashMap<forge_provider_api::ThreadId, forge_provider_api::agent::AgentId>,
+    /// Latest description of each child, republished when its active state changes.
+    child_descriptions: HashMap<forge_provider_api::ThreadId, forge_provider_api::AgentDescription>,
+    /// Children Copilot runs in the background, which outlive the turn that started them.
+    background_children: HashSet<InvocationScope>,
+    /// Children whose terminal lifecycle this decoder has published.
+    finished_children: HashSet<InvocationScope>,
+    /// Synchronous children the delegating turn's abort ended before Copilot reported their end.
+    ///
+    /// Copilot reports such a child's cancellation only when its session shuts down, so the
+    /// decoder ends the child itself and discards the child's later native events.
+    interrupted_children: HashSet<InvocationScope>,
     callbacks: Option<std::sync::Arc<dyn super::provider::NativeCallbackRouter>>,
     turn_owner: Option<forge_provider_api::ProviderEventSink>,
     reported_event_types: ReportedEventTypes,
@@ -131,6 +142,10 @@ impl CopilotEventDecoder {
             children: HashMap::new(),
             child_events: HashMap::new(),
             child_agents: HashMap::new(),
+            child_descriptions: HashMap::new(),
+            background_children: HashSet::new(),
+            finished_children: HashSet::new(),
+            interrupted_children: HashSet::new(),
             reported_event_types: Default::default(),
             instructions: Default::default(),
         }
@@ -412,6 +427,15 @@ impl CopilotEventDecoder {
         if event.id.trim().is_empty() {
             return Err(Self::protocol("native event identity is empty"));
         }
+        if event
+            .agent_id
+            .as_ref()
+            .and_then(|child| self.children.get(child))
+            .is_some_and(|scope| self.interrupted_children.contains(scope))
+        {
+            self.observed.insert(event.id.clone(), snapshot);
+            return Ok(());
+        }
         if event.event_type == "session.error" {
             let error_writer = if let Some(child) = &event.agent_id {
                 let scope = self
@@ -502,6 +526,12 @@ impl CopilotEventDecoder {
                 self.callbacks.clone(),
             )?;
             child.observe(observed_at_ms).await?;
+            self.publish_child_state(
+                &address.scope,
+                forge_provider_api::AgentActiveState::Running,
+                sink,
+            )
+            .await?;
             let native_id = super::decode::string_field(&event.data, &["turnId"])
                 .unwrap_or_else(|| event.id.clone());
             self.turn.insert(
@@ -734,6 +764,10 @@ impl CopilotEventDecoder {
             // Native progress and root idle are consumed by the retained prompt owner.
             "assistant.streaming_delta" | "assistant.idle" => {}
             "session.idle" => {}
+            // A subagent reports its own context window under its `agentId`. Harness shows one
+            // figure, the root conversation's, and the child writer may publish only the child's
+            // thread, so a child report is dropped rather than readdressed to the root.
+            "session.usage_info" if thread != self.scope.thread_id.as_str() => {}
             "session.usage_info" => {
                 if let Some(usage) =
                     super::decode::unsigned_field(&event.data, &["currentTokens", "used"])
@@ -785,6 +819,10 @@ impl CopilotEventDecoder {
             "subagent.started" | "subagent.completed" | "subagent.failed" => {
                 self.agent(event, sink).await?;
             }
+            "abort" if event.agent_id.is_none() => {
+                self.interrupt_synchronous_children(observed_at_ms, sink)
+                    .await?;
+            }
             "session.compaction_start" | "session.compaction_complete" => {
                 self.compaction(event, &thread, output, sink).await?;
             }
@@ -822,9 +860,16 @@ impl CopilotEventDecoder {
             if event.event_type == "subagent.started"
                 && let Some(scope) = self.child_events.get(&event.id)
             {
+                let native_agents = self
+                    .children
+                    .iter()
+                    .filter(|(_, known)| *known == scope)
+                    .map(|(native_agent, _)| native_agent.clone())
+                    .collect::<Vec<_>>();
                 callbacks
                     .observe_native_child(
                         &self.scope,
+                        &native_agents,
                         TurnAddress {
                             thread_id: scope.thread_id.clone(),
                             turn_id: scope
@@ -872,29 +917,6 @@ impl CopilotEventDecoder {
             .get(&event.id)
             .cloned()
             .ok_or_else(|| Self::protocol("child terminal has no original ownership"))?;
-        let thread = self
-            .turn
-            .iter()
-            .find(|(_, turn)| turn.address.scope == scope)
-            .map(|(thread, _)| thread.clone());
-        let Some(thread) = thread else {
-            if let Some(callbacks) = &self.callbacks {
-                callbacks
-                    .observe_native_child(
-                        &self.scope,
-                        TurnAddress {
-                            thread_id: scope.thread_id.clone(),
-                            turn_id: scope
-                                .turn_id()
-                                .map_err(|_| Self::protocol("invalid child turn"))?,
-                            scope,
-                        },
-                        true,
-                    )
-                    .await?;
-            }
-            return Ok(());
-        };
         let outcome = if event.event_type == "subagent.failed" {
             TurnOutcome::Failed {
                 error: forge_provider_api::ProviderFailure::new(
@@ -913,6 +935,42 @@ impl CopilotEventDecoder {
             TurnOutcome::Completed {
                 stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
             }
+        };
+        self.settle_child(scope, outcome, completed_at_ms).await
+    }
+
+    /// End one child's turn with its outcome and release its callback authority.
+    ///
+    /// A child that never processed has no turn; its authority is released directly.
+    async fn settle_child(
+        &mut self,
+        scope: InvocationScope,
+        outcome: TurnOutcome,
+        completed_at_ms: i64,
+    ) -> Result<(), ProviderError> {
+        let thread = self
+            .turn
+            .iter()
+            .find(|(_, turn)| turn.address.scope == scope)
+            .map(|(thread, _)| thread.clone());
+        let Some(thread) = thread else {
+            if let Some(callbacks) = &self.callbacks {
+                callbacks
+                    .observe_native_child(
+                        &self.scope,
+                        &[],
+                        TurnAddress {
+                            thread_id: scope.thread_id.clone(),
+                            turn_id: scope
+                                .turn_id()
+                                .map_err(|_| Self::protocol("invalid child turn"))?,
+                            scope,
+                        },
+                        true,
+                    )
+                    .await?;
+            }
+            return Ok(());
         };
         let writer = self
             .turn
@@ -975,6 +1033,79 @@ impl CopilotEventDecoder {
             .ok_or_else(|| Self::protocol("child terminal lacks native driver"))?
             .complete(outcome, completed_at_ms)
             .await
+    }
+
+    /// Republish a live child's description with its new active state.
+    async fn publish_child_state(
+        &self,
+        child: &InvocationScope,
+        state: forge_provider_api::AgentActiveState,
+        sink: &AdapterActivityWriter,
+    ) -> Result<(), ProviderError> {
+        let (Some(agent_id), Some(agent)) = (
+            self.child_agents.get(&child.thread_id),
+            self.child_descriptions.get(&child.thread_id),
+        ) else {
+            return Ok(());
+        };
+        sink.send_wait(AdapterActivity::Agent {
+            agent_id: agent_id.clone(),
+            event: forge_provider_api::AgentEvent::Lifecycle {
+                event: forge_provider_api::AgentLifecycleEvent::Updated {
+                    agent: agent.clone(),
+                    state,
+                },
+            },
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// End every live synchronous child when the delegating turn is aborted.
+    ///
+    /// A synchronous child runs inside its delegating tool call, so the abort that ends the
+    /// root turn ends the child's work too. Copilot leaves the child's turn open and reports
+    /// its cancellation only at session shutdown, so the decoder publishes the child's end at
+    /// the abort and releases its callback authority, which refuses the child's later tools.
+    async fn interrupt_synchronous_children(
+        &mut self,
+        observed_at_ms: i64,
+        sink: &AdapterActivityWriter,
+    ) -> Result<(), ProviderError> {
+        let mut live = self
+            .children
+            .values()
+            .filter(|scope| {
+                !self.background_children.contains(*scope)
+                    && !self.finished_children.contains(*scope)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        live.sort_by(|left, right| left.thread_id.as_str().cmp(right.thread_id.as_str()));
+        live.dedup();
+        for scope in live {
+            let (Some(agent_id), Some(agent)) = (
+                self.child_agents.get(&scope.thread_id).cloned(),
+                self.child_descriptions.get(&scope.thread_id).cloned(),
+            ) else {
+                continue;
+            };
+            sink.send_wait(AdapterActivity::Agent {
+                agent_id,
+                event: forge_provider_api::AgentEvent::Lifecycle {
+                    event: forge_provider_api::AgentLifecycleEvent::Finished {
+                        agent,
+                        outcome: forge_provider_api::AgentOutcome::Interrupted,
+                    },
+                },
+            })
+            .await?;
+            self.finished_children.insert(scope.clone());
+            self.interrupted_children.insert(scope.clone());
+            self.settle_child(scope, TurnOutcome::Interrupted, observed_at_ms)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Register child ownership from explicit native delegation before admitting child content.
@@ -1063,6 +1194,17 @@ impl CopilotEventDecoder {
             ),
             task: super::decode::string_field(&event.data, &["task", "prompt", "agentDescription"]),
         };
+        if event.event_type == "subagent.started"
+            && super::decode::string_field(&event.data, &["executionMode"]).as_deref()
+                == Some("background")
+        {
+            self.background_children.insert(child.clone());
+        }
+        if event.event_type != "subagent.started" {
+            self.finished_children.insert(child.clone());
+        }
+        self.child_descriptions
+            .insert(child.thread_id.clone(), agent.clone());
         let lifecycle = match event.event_type.as_str() {
             "subagent.started" => forge_provider_api::AgentLifecycleEvent::Started {
                 agent,
@@ -1558,12 +1700,10 @@ impl CopilotEventDecoder {
         if complete && !tool.finished {
             let outcome = if succeeded {
                 ToolOutcome::Succeeded
-            } else if super::decode::is_denied(&event.data) {
+            } else if let Some(reason) = super::decode::denial_reason(&event.data) {
                 ToolOutcome::Denied {
-                    reason: forge_provider_api::diagnostic::SanitizedMessage::new(
-                        "Provider denied this operation",
-                    )
-                    .expect("static denial is nonempty"),
+                    reason: forge_provider_api::diagnostic::SanitizedMessage::new(reason)
+                        .expect("static denial is nonempty"),
                 }
             } else {
                 ToolOutcome::Failed {
@@ -2015,5 +2155,440 @@ mod disposition_tests {
             unmapped_disposition("session.warning"),
             UnmappedDisposition::Unsupported
         );
+    }
+}
+
+#[cfg(test)]
+mod native_agent_replay_tests {
+    use super::*;
+    use forge_provider_api::{BindingId, InvocationScope};
+    use serde_json::json;
+
+    const CALL: &str = "call_search";
+
+    /// Accept every callback binding, as the live router does for a registered child.
+    struct AcceptingCallbacks;
+
+    #[async_trait::async_trait]
+    impl super::super::provider::NativeCallbackRouter for AcceptingCallbacks {
+        async fn call_native(
+            &self,
+            _: &str,
+            _: forge_provider_api::control::ToolCall,
+        ) -> Result<forge_provider_api::control::ToolReply, ProviderError> {
+            Ok(forge_provider_api::control::ToolReply::succeeded(
+                String::new(),
+            ))
+        }
+        async fn authorize_native(
+            &self,
+            _: &str,
+            _: forge_provider_api::permissions::PermissionRequest,
+        ) -> forge_provider_api::permissions::PermissionResponse {
+            forge_provider_api::permissions::PermissionResponse::Cancelled
+        }
+        async fn before_tool_native(
+            &self,
+            _: super::super::provider::NativeToolIdentity<'_>,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn bind_native_call(
+            &self,
+            _: &str,
+            _: &InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn bind_observed_native_call(
+            &self,
+            _: &str,
+            _: &InvocationScope,
+            _: TurnAddress,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn release_native_call(&self, _: &str) {}
+    }
+
+    /// Build one native envelope with the identity, ancestry, and child scope Copilot records.
+    fn native(
+        id: &str,
+        parent: &str,
+        kind: &str,
+        agent: Option<&str>,
+        data: Value,
+    ) -> SessionEvent {
+        let mut envelope = json!({
+            "id": id, "parentId": parent, "type": kind,
+            "timestamp": "2026-11-19T16:54:46.860Z", "data": data,
+        });
+        if let Some(agent) = agent {
+            envelope["agentId"] = json!(agent);
+        }
+        serde_json::from_value(envelope).expect("fixture envelope is a session event")
+    }
+
+    /// The order Copilot persisted for a built-in Search Subagent, with placeholder content.
+    ///
+    /// The delegating turn requests the subagent beside another call, and the subagent's own
+    /// events carry `agentId` equal to that call's id. The child opens its turn only after its
+    /// configuration, model change, hooks, prompt, and system message, runs a tool behind a
+    /// permission request, and completes before the delegating call does.
+    fn recorded_search_subagent() -> Vec<SessionEvent> {
+        let child = Some(CALL);
+        vec![
+            native(
+                "root-start",
+                "input",
+                "assistant.turn_start",
+                None,
+                json!({"turnId":"0"}),
+            ),
+            native(
+                "root-request",
+                "root-start",
+                "assistant.message",
+                None,
+                json!({
+                    "messageId":"root-message","content":"",
+                    "toolRequests":[
+                        {"toolCallId":"call_view","name":"view","arguments":{"path":"src/a.ts"}},
+                        {"toolCallId":CALL,"name":"search_code_subagent","arguments":{"query":"placeholder"}},
+                    ],
+                }),
+            ),
+            native(
+                "view-start",
+                "root-request",
+                "tool.execution_start",
+                None,
+                json!({"toolCallId":"call_view","toolName":"view","arguments":{"path":"src/a.ts"}}),
+            ),
+            native(
+                "search-start",
+                "view-start",
+                "tool.execution_start",
+                None,
+                json!({"toolCallId":CALL,"toolName":"search_code_subagent","arguments":{"query":"placeholder"}}),
+            ),
+            native(
+                "started",
+                "search-start",
+                "subagent.started",
+                child,
+                json!({
+                    "toolCallId":CALL,"agentName":"search-subagent","agentDisplayName":"Search Subagent",
+                    "agentDescription":"Placeholder description.","model":"copilot-search-a",
+                }),
+            ),
+            native(
+                "view-done",
+                "started",
+                "tool.execution_complete",
+                None,
+                json!({"toolCallId":"call_view","success":true,"result":{"content":"placeholder"}}),
+            ),
+            native(
+                "configured",
+                "view-done",
+                "subagent.configured",
+                child,
+                json!({"model":"copilot-search-a","contextTier":"default","multiTurn":false}),
+            ),
+            native(
+                "selected",
+                "configured",
+                "subagent.selected",
+                child,
+                json!({"agentName":"search-subagent","agentDisplayName":"Search Subagent"}),
+            ),
+            native(
+                "child-model",
+                "selected",
+                "session.model_change",
+                child,
+                json!({"source":"agent","contextTier":"default","newModel":"copilot-search-a"}),
+            ),
+            native(
+                "child-hook",
+                "child-model",
+                "hook.start",
+                child,
+                json!({"hookInvocationId":"hook","hookType":"userPromptSubmitted","input":{}}),
+            ),
+            native(
+                "child-hook-end",
+                "child-hook",
+                "hook.end",
+                child,
+                json!({"hookInvocationId":"hook","hookType":"userPromptSubmitted","success":true}),
+            ),
+            native(
+                "child-prompt",
+                "child-hook-end",
+                "user.message",
+                child,
+                json!({"content":"Find placeholder code."}),
+            ),
+            native(
+                "child-system",
+                "child-prompt",
+                "system.message",
+                child,
+                json!({"content":"Placeholder system text."}),
+            ),
+            native(
+                "child-start",
+                "child-system",
+                "assistant.turn_start",
+                child,
+                json!({"turnId":"0","parentToolCallId":CALL}),
+            ),
+            // Copilot reports the subagent's own context window with the subagent's `agentId`.
+            native(
+                "child-context",
+                "child-start",
+                "session.usage_info",
+                child,
+                json!({"currentTokens":4096,"tokenLimit":128000}),
+            ),
+            native(
+                "child-request",
+                "child-context",
+                "assistant.message",
+                child,
+                json!({
+                    "messageId":"child-message","content":"",
+                    "toolRequests":[{"toolCallId":"call_grep","name":"grep","arguments":{"pattern":"placeholder"}}],
+                }),
+            ),
+            native(
+                "grep-start",
+                "child-request",
+                "tool.execution_start",
+                child,
+                json!({"toolCallId":"call_grep","toolName":"grep","arguments":{"pattern":"placeholder"}}),
+            ),
+            native(
+                "grep-permission",
+                "grep-start",
+                "permission.requested",
+                child,
+                json!({"requestId":"permission","permissionRequest":{"kind":"read","toolCallId":"call_grep"}}),
+            ),
+            native(
+                "grep-permitted",
+                "grep-permission",
+                "permission.completed",
+                child,
+                json!({"requestId":"permission","result":{"kind":"approved"}}),
+            ),
+            native(
+                "grep-done",
+                "grep-permitted",
+                "tool.execution_complete",
+                child,
+                json!({"toolCallId":"call_grep","success":true,"result":{"content":"placeholder"}}),
+            ),
+            native(
+                "child-answer",
+                "grep-done",
+                "assistant.message",
+                child,
+                json!({"messageId":"child-answer","content":"Placeholder findings."}),
+            ),
+            native(
+                "child-end",
+                "child-answer",
+                "assistant.turn_end",
+                child,
+                json!({"turnId":"0"}),
+            ),
+            native(
+                "completed",
+                "child-end",
+                "subagent.completed",
+                child,
+                json!({"toolCallId":CALL,"agentName":"search-subagent","agentDisplayName":"Search Subagent"}),
+            ),
+            native(
+                "search-done",
+                "completed",
+                "tool.execution_complete",
+                None,
+                json!({"toolCallId":CALL,"success":true,"result":{"content":"Placeholder findings."}}),
+            ),
+        ]
+    }
+
+    /// Replaying a recorded Search Subagent through the real decoder and writers keeps the
+    /// delegating turn alive: every child event is accepted under the child's own scope.
+    ///
+    /// The subagent's `session.usage_info` once went out on the child's writer addressed to the
+    /// root thread, which the writer refused as an ownership conflict, failing the whole turn.
+    #[tokio::test]
+    async fn recorded_search_subagent_completes_under_its_own_scope() -> anyhow::Result<()> {
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("session"),
+            "exchange",
+        );
+        let (owner, mut stream) =
+            forge_provider_api::events::channel(BindingId::new("binding").unwrap(), scope.clone());
+        let writer = owner.activity_writer();
+        let mut decoder = CopilotEventDecoder::new(scope.clone(), ".".into())
+            .with_callbacks(std::sync::Arc::new(AcceptingCallbacks))
+            .with_turn_owner(owner.clone());
+        let mut output = forge_provider_api::completion::ProviderCompletion {
+            provider_session_id: Some("native".try_into().unwrap()),
+            ..Default::default()
+        };
+        for event in recorded_search_subagent() {
+            decoder
+                .decode(&event, &mut output, &writer)
+                .await
+                .map_err(|error| anyhow::anyhow!("{} was refused: {error}", event.event_type))?;
+        }
+        let mut child_finished = false;
+        while let Some(envelope) = stream.try_next()? {
+            if let forge_provider_api::ProviderEvent::Agent {
+                event:
+                    forge_provider_api::AgentEvent::Lifecycle {
+                        event: forge_provider_api::AgentLifecycleEvent::Finished { .. },
+                    },
+                ..
+            } = &envelope.event
+            {
+                child_finished = true;
+            }
+        }
+        assert!(child_finished, "the subagent never finished");
+        assert!(
+            output.metrics.context_usage.is_none(),
+            "the subagent's context window replaced the root conversation's"
+        );
+        Ok(())
+    }
+
+    /// Decode the recorded events through a fresh decoder and return what it published.
+    async fn replay(
+        events: impl IntoIterator<Item = SessionEvent>,
+    ) -> anyhow::Result<Vec<forge_provider_api::ProviderEvent>> {
+        let scope = InvocationScope::new(
+            forge_provider_api::testing::root_thread("session"),
+            "exchange",
+        );
+        let (owner, mut stream) =
+            forge_provider_api::events::channel(BindingId::new("binding").unwrap(), scope.clone());
+        let writer = owner.activity_writer();
+        let mut decoder = CopilotEventDecoder::new(scope, ".".into())
+            .with_callbacks(std::sync::Arc::new(AcceptingCallbacks))
+            .with_turn_owner(owner.clone());
+        let mut output = forge_provider_api::completion::ProviderCompletion {
+            provider_session_id: Some("native".try_into().unwrap()),
+            ..Default::default()
+        };
+        for event in events {
+            decoder
+                .decode(&event, &mut output, &writer)
+                .await
+                .map_err(|error| anyhow::anyhow!("{} was refused: {error}", event.event_type))?;
+        }
+        let mut published = Vec::new();
+        while let Some(envelope) = stream.try_next()? {
+            published.push(envelope.event);
+        }
+        Ok(published)
+    }
+
+    /// Name each published subagent lifecycle by its kind and state.
+    fn lifecycle(published: &[forge_provider_api::ProviderEvent]) -> Vec<String> {
+        use forge_provider_api::AgentLifecycleEvent;
+        published
+            .iter()
+            .filter_map(|event| match event {
+                forge_provider_api::ProviderEvent::Agent {
+                    event: forge_provider_api::AgentEvent::Lifecycle { event },
+                    ..
+                } => Some(match event {
+                    AgentLifecycleEvent::Started { state, .. } => format!("started {state:?}"),
+                    AgentLifecycleEvent::Updated { state, .. } => format!("updated {state:?}"),
+                    AgentLifecycleEvent::Finished { outcome, .. } => {
+                        format!("finished {outcome:?}")
+                    }
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A subagent reads `running` once its own turn starts, not `starting` until it ends.
+    #[tokio::test]
+    async fn recorded_search_subagent_runs_once_its_turn_starts() -> anyhow::Result<()> {
+        let published = replay(recorded_search_subagent()).await?;
+        assert_eq!(
+            lifecycle(&published),
+            ["started Starting", "updated Running", "finished Completed"]
+        );
+        Ok(())
+    }
+
+    /// Cancelling the delegating turn ends a synchronous subagent with it.
+    ///
+    /// Copilot's abort ends the root turn while the subagent's turn stays open, and reports the
+    /// subagent's cancellation only when the session shuts down. Until then the subagent read
+    /// `starting`, its clock kept counting, and its open tool stayed running.
+    #[tokio::test]
+    async fn root_abort_interrupts_a_running_synchronous_subagent() -> anyhow::Result<()> {
+        let mut events = recorded_search_subagent()
+            .into_iter()
+            .take_while(|event| event.id != "grep-permission")
+            .collect::<Vec<_>>();
+        events.push(native(
+            "abort",
+            "grep-start",
+            "abort",
+            None,
+            json!({"reason":"user_initiated"}),
+        ));
+        let published = replay(events.clone()).await?;
+        assert_eq!(
+            lifecycle(&published),
+            [
+                "started Starting",
+                "updated Running",
+                "finished Interrupted"
+            ]
+        );
+        let grep_interrupted = published.iter().any(|event| {
+            matches!(
+                event,
+                forge_provider_api::ProviderEvent::Item {
+                    event: ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
+                        outcome: ToolOutcome::Interrupted,
+                        ..
+                    })),
+                    ..
+                }
+            )
+        });
+        assert!(grep_interrupted, "the subagent's open tool kept running");
+        // The cancellation Copilot reports at shutdown repeats the end the abort published.
+        events.push(native(
+            "late-completed",
+            "abort",
+            "subagent.completed",
+            Some(CALL),
+            json!({"toolCallId":CALL,"agentName":"search-subagent","cancelled":true}),
+        ));
+        assert_eq!(
+            lifecycle(&replay(events).await?),
+            [
+                "started Starting",
+                "updated Running",
+                "finished Interrupted"
+            ]
+        );
+        Ok(())
     }
 }

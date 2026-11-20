@@ -149,7 +149,7 @@ impl NativeCallbackRouter for HelperCallbacks {
         &self,
         call_id: &str,
         call: forge_provider_api::control::ToolCall,
-    ) -> Result<String, ProviderError> {
+    ) -> Result<forge_provider_api::control::ToolReply, ProviderError> {
         self.target
             .upgrade()
             .ok_or_else(|| {
@@ -175,7 +175,10 @@ impl NativeCallbackRouter for HelperCallbacks {
     }
 
     /// Reject native pre-tool work once its binding owner has been collected.
-    async fn before_tool_native(&self, call_id: Option<&str>) -> Result<(), ProviderError> {
+    async fn before_tool_native(
+        &self,
+        tool: super::provider::NativeToolIdentity<'_>,
+    ) -> Result<(), ProviderError> {
         self.target
             .upgrade()
             .ok_or_else(|| {
@@ -184,7 +187,7 @@ impl NativeCallbackRouter for HelperCallbacks {
                     ProviderFailureKind::BindingClosed,
                 )
             })?
-            .before_tool_native(call_id)
+            .before_tool_native(tool)
             .await
     }
 

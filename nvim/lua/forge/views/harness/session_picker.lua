@@ -142,6 +142,12 @@ build_spec = function(instance)
         if (entry.active == true) == is_active then option_list[#option_list + 1] = option(entry, scope) end
       end
     end
+    -- The picker opens on the calling session's own row, whose transcript is already on screen, so
+    -- no other session's preview covers it before the user moves.
+    local current_index = nil
+    for index, candidate in ipairs(option_list) do
+      if candidate.id == instance.owner_session_id then current_index = index break end
+    end
     local column_headers = { "Created", "Session", "Harness", "Mode" }
     if scope == "all" then column_headers[#column_headers + 1] = "Workspace" end
     page_list[#page_list + 1] = {
@@ -150,6 +156,7 @@ build_spec = function(instance)
       column_headers = column_headers,
       header_right = instance.provider,
       option_list = option_list,
+      selected_index = current_index,
       wrap_selection = false,
       empty_text = instance.entry_list_by_scope[scope] and "No matching Harness sessions." or "Loading sessions...",
       search = { start_in_normal = true, preserve_sections = true },

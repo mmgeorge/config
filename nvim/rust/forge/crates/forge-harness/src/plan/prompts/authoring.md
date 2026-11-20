@@ -69,14 +69,15 @@ Every declaration the plan introduces needs a documentation comment directly abo
 
 ## Design artifacts
 
-`docs/overview.md` starts with `# Title`, followed by Objective, Usage, Requirements, Background, Decisions, Design, and Manual checks sections. Objective, Background, and Design are required. List sections use `- item` with two-space continuation lines; decisions use `- **Decision.** Rationale.`. Manual checks state observations automated checks cannot establish.
+`docs/overview.md` starts with `# Title`, followed by Objective, Usage, Requirements, Background, Decisions, Design, and Manual checks sections. Objective, Background, and Design are required. List sections use `- item` with two-space continuation lines; decisions use `- **Decision.** Rationale.`. Manual checks state observations automated checks cannot establish; every item is a manual action Verify performs, so a plan without one omits the section rather than listing "None".
 
 `docs/flows.md` has one `## Title` per independently triggered flow, a one-to-two-line description naming its trigger, and exactly one closed Mermaid block. Use `sequenceDiagram` for cross-owner flows, `flowchart` for branching within one owner, and `stateDiagram-v2` for lifecycle transitions.
 
-`docs/tests.md` has one `## path/to/file` per file and items in the following form. Changes are new, modified, removed, or reused; the target is optional.
+`docs/tests.md` has one `## path/to/file` per file and items in the following form. Changes are new, modified, removed, or reused. Name a test by the title its source declares, optionally preceded by its enclosing group titles. Omit the target unless the same name matches cases in several test checks; a target is a test check's ID or label from `check_definition_list`, never a runner or tool name.
 
 ```text
-- new `exact_test_name` [target: runner]: scenario and expected result.
+- new `exact_test_name`: scenario and expected result.
+- new `exact_test_name` [target: unit]: scenario and expected result.
 ```
 
 `docs/checks.md` lists one saved check ID per line to select checks beyond automatic selection. Discover IDs with `check_definition_list`; Harness adds prerequisites. This file does not configure or authorize checks.

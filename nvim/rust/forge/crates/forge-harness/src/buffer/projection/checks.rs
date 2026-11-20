@@ -94,7 +94,8 @@ fn check_leaves(run: &CheckRun, category: CheckCategory) -> Vec<CheckLeaf<'_>> {
             .as_ref()
             .map_or(CheckCategory::TypeCheck, |context| context.category)
             != category
-            || matches!(check.state, CheckState::Pending | CheckState::Skipped)
+            || check.state == CheckState::Pending
+            || check.state == CheckState::Skipped && !check.selected
         {
             continue;
         }
@@ -175,12 +176,46 @@ fn category_label(category: CheckCategory) -> &'static str {
     }
 }
 
+/// Summarize executed checks, or name why a failed run started none of them.
 pub(super) fn check_summary(run: &CheckRun) -> String {
-    summarize_checks(run.commands.iter())
+    // A planned entry's own finding names what failed, such as an unknown target or a missing
+    // test. Present planned tests are excluded: their outcomes belong to the test rows.
+    let unresolved = run
+        .planned_tests
+        .as_ref()
+        .and_then(|planned| planned.resolution_findings().into_iter().next());
+    if let Some(summary) = summarize_checks(run.commands.iter()) {
+        return match unresolved {
+            Some(cause) if run.state == CheckState::Failed => format!("{summary} · {cause}"),
+            _ => summary,
+        };
+    }
+    let state = match run.state {
+        CheckState::Failed => "failed",
+        CheckState::Blocked => "blocked",
+        _ => return NO_AUTOMATIC_CHECKS.into(),
+    };
+    let cause = if let Some(cause) = unresolved {
+        Some(cause)
+    } else {
+        run.commands
+            .iter()
+            .filter(|command| command.selected && command.state == CheckState::Skipped)
+            .find_map(|command| command.error.clone())
+            .or_else(|| run.findings().into_iter().next())
+    };
+    cause.map_or_else(|| state.to_owned(), |cause| format!("{state} · {cause}"))
 }
 
+/// Reads better than a vacuous `0/0 passed` for a run that executed no command.
+const NO_AUTOMATIC_CHECKS: &str = "No automatic checks ran";
+
 /// Count each definition and test identity once while retaining every command execution.
-fn summarize_checks<'check>(commands: impl Iterator<Item = &'check CommandCheck>) -> String {
+///
+/// Returns nothing when every command was pending or skipped.
+fn summarize_checks<'check>(
+    commands: impl Iterator<Item = &'check CommandCheck>,
+) -> Option<String> {
     let mut latest = BTreeMap::new();
     let mut tests = BTreeMap::new();
     let mut runs = 0;
@@ -212,10 +247,9 @@ fn summarize_checks<'check>(commands: impl Iterator<Item = &'check CommandCheck>
             }
         }
     }
-    // Pending and skipped commands never executed a check,
-    // and a vacuous `0/0 passed` reads as success.
+    // Pending and skipped commands never executed a check.
     if latest.is_empty() {
-        return "No automatic checks ran".into();
+        return None;
     }
     let passed = latest
         .values()
@@ -226,10 +260,10 @@ fn summarize_checks<'check>(commands: impl Iterator<Item = &'check CommandCheck>
         let passed = tests.values().filter(|passed| **passed).count();
         summary.push_str(&format!(" · {passed}/{} tests passed", tests.len()));
     }
-    format!(
+    Some(format!(
         "{summary} · {runs} {}",
         if runs == 1 { "run" } else { "runs" }
-    )
+    ))
 }
 
 impl TimelineRenderer<'_> {
@@ -345,7 +379,9 @@ impl TimelineRenderer<'_> {
                             .as_ref()
                             .map_or(CheckCategory::TypeCheck, |context| context.category)
                             == category
-                    })),
+                    }))
+                    // Only selected checks that never started reach this fallback.
+                    .unwrap_or_else(|| "not started".into()),
                     duration as f64 / 1000.0
                 ),
                 None,
@@ -466,13 +502,6 @@ impl TimelineRenderer<'_> {
             self.finish_section(section, &category_id, true);
         }
         self.finish_section(checks, &format!("{}:checks", run.id), true);
-        if let Some(title) = &run.completed_plan {
-            self.literal(
-                &format!("{}:complete", run.id),
-                &format!("◇ Plan complete: {title}"),
-                None,
-            )?;
-        }
         Ok(())
     }
 
@@ -818,7 +847,10 @@ impl TimelineRenderer<'_> {
             title.clone(),
             if failed {
                 crate::turn::ToolState::Failed
-            } else if check.completed_at_ms.is_some() || elapsed.is_some() {
+            } else if check.completed_at_ms.is_some()
+                || elapsed.is_some()
+                || state == CheckState::Skipped
+            {
                 crate::turn::ToolState::Completed
             } else {
                 crate::turn::ToolState::Running
@@ -840,6 +872,11 @@ impl TimelineRenderer<'_> {
             }
         } else if let LeafResult::NotFound(_) = leaf.result {
             ToolOutputView::new(call_id, "The requested item has no case in the run plan.")
+        } else if state == CheckState::Skipped {
+            ToolOutputView::new(
+                call_id,
+                check.error.as_deref().unwrap_or("The check did not start."),
+            )
         } else {
             ToolOutputView::file(call_id, check.output.clone(), check.output_bytes)
         };
@@ -1033,6 +1070,179 @@ mod tests {
             check_summary(&run),
             "4/5 passed · 2/3 tests passed · 7 runs"
         );
+        Ok(())
+    }
+
+    /// Record one Plan-execution run on an empty exchange and render the exchange's rows.
+    fn exchange_rows(state: &str) -> Result<String> {
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"implement","session_id":"session","agent_id":"session:primary","ordinal":1,
+            "prompt":"Implement","state":"complete","kind":"plan_execution",
+            "created_at_ms":1,"completed_at_ms":2,"attributed_matches_checkpoint":true,
+            "node_list":[]
+        }))?;
+        let command = |id: &str, selected: bool, error: &str| {
+            json!({
+                "id":id,"command":"fixture","state":"skipped","selected":selected,
+                "started_at_ms":null,"completed_at_ms":null,"exit_code":null,"error":error,
+                "stdout":"unused","stderr":"unused","output":"unused","output_bytes":0,
+                "preview":"","result":null,
+                "context":{"purpose":"verify","definition_id":id,"name":id,"area":".",
+                    "reason":error,"matched_files":[],"category":id,"directory":".",
+                    "selection":{"kind":"all"},"resolved":null,"depends_on":[]}
+            })
+        };
+        let run: CheckRun = serde_json::from_value(json!({
+            "id":"plan-run","owner":crate::timeline::TimelineOwner::exchange(&exchange),
+            "revision":1,"shell":"system","executable":null,"workspace":".",
+            "environment_digest":"test","started_at_ms":10,"completed_at_ms":20,"state":state,
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},
+            "commands":[
+                command("lint", true, "Not started: planned test resolution has not completed"),
+                command("build", false, "Automatic execution disabled"),
+            ]
+        }))?;
+        exchange.record_check(run)?;
+        Ok(
+            crate::buffer::projection::tests::project_rows(&TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 1,
+                exchange: exchange.into(),
+                agent_by_id: HashMap::new(),
+            })?
+            .join("\n"),
+        )
+    }
+
+    /// A completed execution shows one completion row, after the response of the turn whose
+    /// checks completed it, although the passing run and the completion were both recorded
+    /// after that response.
+    #[test]
+    fn plan_completion_is_one_row_after_the_response() -> Result<()> {
+        use crate::turn::test_support;
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"implement","session_id":"session","agent_id":"session:primary","ordinal":1,
+            "prompt":"Implement","state":"running","kind":"plan_execution","created_at_ms":0,
+            "attributed_matches_checkpoint":false,"node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = test_support::address(&exchange, "implement");
+        exchange.start_turn(address.clone(), 0)?;
+        let response = "Implemented the allocation.";
+        exchange.observe_event(
+            &test_support::message(
+                &address,
+                "response",
+                Some(forge_provider_api::AgentMessageRole::Response),
+                response,
+            ),
+            1,
+        )?;
+        exchange.observe_event(
+            &test_support::message_completed(&address, "response", response),
+            1,
+        )?;
+        exchange.observe_event(
+            &test_support::completed_event(
+                &address,
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                2,
+            ),
+            2,
+        )?;
+        let run: CheckRun = serde_json::from_value(json!({
+            "id":"plan-run","owner":crate::timeline::TimelineOwner::exchange(&exchange),
+            "revision":1,"shell":"system","executable":null,"workspace":".",
+            "environment_digest":"test","started_at_ms":3,"completed_at_ms":4,"state":"passed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[]
+        }))?;
+        exchange.record_check(run)?;
+        exchange.node_list.push(serde_json::from_value(
+            json!({"kind":"plan_event","event":{
+                "id":"implement:complete","node_count":exchange.node_list.len(),
+                "content":{"kind":"execution","event":{"kind":"completed","title":"Allocate money"}}
+            }}),
+        )?);
+        exchange.finish(crate::exchange::ExchangeOutcome::Complete, 5)?;
+        let rows = crate::buffer::projection::tests::project_rows(&TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: exchange.into(),
+            agent_by_id: HashMap::new(),
+        })?;
+        let completion = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("Plan complete: Allocate money"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let response = rows.iter().position(|row| row.contains(response));
+        assert_eq!(completion.len(), 1, "{rows:#?}");
+        assert!(
+            response.is_some_and(|response| response < completion[0]),
+            "{rows:#?}"
+        );
+        Ok(())
+    }
+
+    /// A failed run whose selected checks never started names its cause and lists those checks,
+    /// leaving out checks that were never selected.
+    #[test]
+    fn exchange_results_report_a_failed_run_that_started_no_check() -> Result<()> {
+        let text = exchange_rows("failed")?;
+        assert!(!text.contains("No automatic checks ran"), "{text}");
+        assert!(
+            text.lines().any(|row| row.contains("Checks · failed · ")
+                && row.contains("planned test resolution has not completed")),
+            "{text}"
+        );
+        assert!(text.contains("lint · Skipped"), "{text}");
+        assert!(!text.contains("build"), "{text}");
+        Ok(())
+    }
+
+    /// A planned test that is missing is the only cause the heading names: a present planned
+    /// test without a result is not reported as "not run", whether or not any check executed.
+    #[test]
+    fn a_missing_planned_test_is_the_only_named_gate_failure() -> Result<()> {
+        let command = |id: &str, category: &str, state: &str| {
+            json!({
+                "id":id,"command":"fixture","state":state,"selected":true,
+                "started_at_ms":if state == "skipped" { json!(null) } else { json!(1) },
+                "completed_at_ms":if state == "skipped" { json!(null) } else { json!(2) },
+                "exit_code":null,"error":null,
+                "stdout":"unused","stderr":"unused","output":"unused","output_bytes":0,
+                "preview":"","result":null,
+                "context":{"purpose":"verify","definition_id":id,"name":id,"area":".",
+                    "reason":"selected","matched_files":[],"category":category,"directory":".",
+                    "selection":{"kind":"all"},"resolved":null,"depends_on":[]}
+            })
+        };
+        let run = |state: &str| -> Result<CheckRun> {
+            let mut run: CheckRun = serde_json::from_value(json!({
+                "id":"plan-run","owner":{"kind":"session","session_id":"session"},"revision":1,
+                "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+                "started_at_ms":10,"completed_at_ms":20,"state":"failed",
+                "progress":crate::plan::execution::SemanticProgress::default(),
+                "workspace_identity":null,"workspace_digest":{},
+                "commands":[command("typecheck", "typecheck", state), command("lint", "lint", state)]
+            }))?;
+            run.planned_tests = Some(crate::checks::PlannedTestExecution::resolved_fixture(&[
+                "new_case",
+                "reused_case",
+            ]));
+            Ok(run)
+        };
+        for state in ["skipped", "passed"] {
+            let summary = check_summary(&run(state)?);
+            assert!(summary.contains("planned test modified_case"), "{summary}");
+            assert!(!summary.contains("not run"), "{summary}");
+            assert!(!summary.contains("new_case"), "{summary}");
+        }
         Ok(())
     }
 
@@ -1453,8 +1663,8 @@ mod tests {
             text.contains("src/main.rs · 1 passed · 1 failed · 0.3s"),
             "{text}"
         );
-        assert!(text.contains("Run 1 · Passed · 0.1s"), "{text}");
-        assert!(text.contains("Run 2 · Failed · 0.2s"), "{text}");
+        assert!(text.contains("Run 1 · Passed · 100ms"), "{text}");
+        assert!(text.contains("Run 2 · Failed · 200ms"), "{text}");
         assert!(
             text.contains("Formatting · 0/1 passed · 2 runs · 0.3s"),
             "{text}"
@@ -1538,6 +1748,247 @@ mod tests {
             .find(|row| row.contains("src/main.rs · 0 passed · 2 failed"))
             .expect("failed file group omitted its outcome counts");
         assert_eq!(heading.trim(), "src/main.rs · 0 passed · 2 failed");
+        Ok(())
+    }
+
+    /// Observe one provider turn that streams the given messages and then completes.
+    fn observe_turn(
+        exchange: &mut crate::exchange::Exchange,
+        turn: &str,
+        messages: &[(&str, forge_provider_api::AgentMessageRole, &str)],
+        started_at_ms: i64,
+        completed_at_ms: Option<i64>,
+    ) -> Result<()> {
+        use crate::turn::test_support;
+        let address = test_support::address(exchange, turn);
+        exchange.start_turn(address.clone(), started_at_ms)?;
+        for (id, role, text) in messages {
+            exchange.observe_event(
+                &test_support::message(&address, *id, Some(*role), *text),
+                started_at_ms,
+            )?;
+            exchange.observe_event(
+                &test_support::message_completed(&address, id, text),
+                started_at_ms,
+            )?;
+        }
+        if let Some(completed_at_ms) = completed_at_ms {
+            exchange.observe_event(
+                &test_support::completed_event(
+                    &address,
+                    crate::turn::TurnOutcome::Completed {
+                        stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                    },
+                    completed_at_ms,
+                ),
+                completed_at_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record a passing check run anchored at the exchange's current source position.
+    fn record_passing_check(
+        exchange: &mut crate::exchange::Exchange,
+        started_at_ms: i64,
+    ) -> Result<()> {
+        let run: CheckRun = serde_json::from_value(json!({
+            "id":format!("run-{started_at_ms}"),
+            "owner":crate::timeline::TimelineOwner::exchange(exchange),
+            "revision":1,"shell":"system","executable":null,"workspace":".",
+            "environment_digest":"test","started_at_ms":started_at_ms,
+            "completed_at_ms":started_at_ms + 1,"state":"passed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[]
+        }))?;
+        exchange.record_check(run)
+    }
+
+    /// Append a plan event at the exchange's current source position.
+    fn push_plan_event(
+        exchange: &mut crate::exchange::Exchange,
+        id: &str,
+        occurred_at_ms: i64,
+        event: serde_json::Value,
+    ) -> Result<()> {
+        let node_count = exchange
+            .node_list
+            .iter()
+            .filter(|node| crate::timeline::ownership::source_node(node))
+            .count();
+        exchange.node_list.push(serde_json::from_value(json!({
+            "kind":"plan_event","event":{
+                "id":id,"node_count":node_count,"occurred_at_ms":occurred_at_ms,
+                "content":{"kind":"execution","event":event}
+            }
+        }))?);
+        Ok(())
+    }
+
+    fn rows_of(exchange: crate::exchange::Exchange) -> Result<Vec<String>> {
+        crate::buffer::projection::tests::project_rows_expanded(&TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: exchange.into(),
+            agent_by_id: HashMap::new(),
+        })
+    }
+
+    fn check_headings(rows: &[String]) -> usize {
+        rows.iter()
+            .filter(|row| {
+                row.trim_start_matches([' ', '▸', '▾'])
+                    .starts_with("Checks · ")
+            })
+            .count()
+    }
+
+    /// A finished check run of a live turn is drawn once, at the exchange's level, even while
+    /// the reader has the turn's Thought section open.
+    ///
+    /// The run was drawn inside the Thought by the commentary that owns it and again beneath the
+    /// Thought as the exchange's results, so an expanded live turn showed two `Checks` rows.
+    #[test]
+    fn a_check_run_of_a_live_turn_is_drawn_once() -> Result<()> {
+        use forge_provider_api::AgentMessageRole;
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"goal","session_id":"session","agent_id":"session:primary","ordinal":1,
+            "prompt":"Continue","state":"running","created_at_ms":0,
+            "attributed_matches_checkpoint":false,"node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        observe_turn(
+            &mut exchange,
+            "goal",
+            &[(
+                "commentary",
+                AgentMessageRole::Commentary,
+                "Checking the TypeScript types before running Vitest.",
+            )],
+            1,
+            None,
+        )?;
+        record_passing_check(&mut exchange, 2)?;
+        let rows = rows_of(exchange)?;
+        assert_eq!(check_headings(&rows), 1, "{rows:#?}");
+        Ok(())
+    }
+
+    /// In a Resolve exchange whose plan revision was accepted between two turns, the rows follow
+    /// the order of the events: the revision awaiting review, the first response, the
+    /// acceptance, the second turn's checks, its response, and the completion last.
+    ///
+    /// The checks were drawn right beneath the Thought heading, above the revision request,
+    /// and the acceptance recorded after the first turn ended was drawn above that turn's
+    /// response.
+    #[test]
+    fn resolve_rows_follow_the_order_of_their_events() -> Result<()> {
+        use forge_provider_api::AgentMessageRole;
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"resolve","session_id":"session","agent_id":"session:primary","ordinal":1,
+            "prompt":"Resolve","state":"running","created_at_ms":0,
+            "attributed_matches_checkpoint":false,"node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        observe_turn(
+            &mut exchange,
+            "request",
+            &[(
+                "request-commentary",
+                AgentMessageRole::Commentary,
+                "The planned test title is stale.",
+            )],
+            10,
+            None,
+        )?;
+        push_plan_event(
+            &mut exchange,
+            "resolve:awaiting",
+            11,
+            json!({"kind":"phase","title":"Plan revision awaiting review","phase":"resolve",
+                "revision":2,"state":"active"}),
+        )?;
+        let first_response = "The plan revision is awaiting review.";
+        let address = crate::turn::test_support::address(&exchange, "request");
+        for event in [
+            crate::turn::test_support::message(
+                &address,
+                "request-response",
+                Some(AgentMessageRole::Response),
+                first_response,
+            ),
+            crate::turn::test_support::message_completed(
+                &address,
+                "request-response",
+                first_response,
+            ),
+            crate::turn::test_support::completed_event(
+                &address,
+                crate::turn::TurnOutcome::Completed {
+                    stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+                },
+                20,
+            ),
+        ] {
+            exchange.observe_event(&event, 12)?;
+        }
+        push_plan_event(
+            &mut exchange,
+            "resolve:accepted",
+            30,
+            json!({"kind":"phase","title":"Plan revision accepted","phase":"resolve",
+                "revision":2,"state":"active"}),
+        )?;
+        let second_response = "The plan now names the test as the source does.";
+        observe_turn(
+            &mut exchange,
+            "verify",
+            &[
+                (
+                    "verify-commentary",
+                    AgentMessageRole::Commentary,
+                    "Verifying the test file against the accepted revision.",
+                ),
+                (
+                    "verify-response",
+                    AgentMessageRole::Response,
+                    second_response,
+                ),
+            ],
+            31,
+            Some(40),
+        )?;
+        record_passing_check(&mut exchange, 41)?;
+        push_plan_event(
+            &mut exchange,
+            "resolve:complete",
+            42,
+            json!({"kind":"completed","title":"Allocate money"}),
+        )?;
+        exchange.finish(crate::exchange::ExchangeOutcome::Complete, 43)?;
+        let rows = rows_of(exchange)?;
+        let position = |text: &str| {
+            rows.iter()
+                .position(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("no row contains {text:?}: {rows:#?}"))
+        };
+        let checks = rows
+            .iter()
+            .position(|row| row.contains("Checks · "))
+            .unwrap_or_else(|| panic!("no check row: {rows:#?}"));
+        let order = [
+            position("Plan revision awaiting review"),
+            position(first_response),
+            position("Plan revision accepted"),
+            checks,
+            position(second_response),
+            position("Plan complete: Allocate money"),
+        ];
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "{order:?} {rows:#?}"
+        );
+        assert_eq!(check_headings(&rows), 1, "{rows:#?}");
         Ok(())
     }
 }

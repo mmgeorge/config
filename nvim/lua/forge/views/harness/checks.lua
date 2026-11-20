@@ -314,7 +314,6 @@ function Checks.open(state, host)
   unsubscribe = client.session_events_subscribe(function(event, payload, event_session_id)
     if closed or event_session_id ~= session_id then return end
     if event == "checks_changed" or event == "state_invalidated" or event == "session_configured"
-      or event == "plan_checks_updated"
       or event == "provider_event" and payload.kind == "checks_configuration_error" then
       refresh()
     end

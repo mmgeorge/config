@@ -64,6 +64,8 @@ pub(crate) struct PlanSubmissionWrite {
     diff_text: String,
     declaration: Option<crate::exchange::DeclarationRevision>,
     warnings: Vec<crate::plan::PlanViolation>,
+    /// Saved review comments of the document this revision replaces.
+    review_comments: crate::plan::review_delivery::ReviewCommentSnapshot,
     guard: HostEffectGuard,
 }
 
@@ -181,6 +183,7 @@ impl PlanSubmissionJob {
             &original,
             document,
         )?;
+        let review_comments = store.review_comment_snapshot(&session_id, &plan.id)?;
         guard.begin_mutation();
         let result = task_controller
             .commit_plan_write(&permit, || store.commit_prepared_submission(prepared));
@@ -236,6 +239,7 @@ impl PlanSubmissionJob {
                 diff_text,
                 declaration,
                 warnings,
+                review_comments,
                 guard,
             },
         )))
@@ -637,6 +641,7 @@ impl HarnessBroker {
                     diff_text,
                     declaration,
                     warnings,
+                    review_comments,
                     guard,
                 } = *write;
                 let before = *before;
@@ -666,6 +671,17 @@ impl HarnessBroker {
                 plan.title = document.title.clone();
                 plan.review_digest = Some(digest);
                 plan.validation_warning = warnings;
+                // The new revision replaces the reviewed document: the review a prompt delivered
+                // retires with it, and what no prompt delivered stays pending on this revision.
+                let delivery = self.plan_file.review_delivery(&before)?;
+                let unplaced = self.plan_file.carry_review_comments(
+                    &self.session.id,
+                    &plan.id,
+                    review_comments,
+                    &delivery,
+                    &rendered,
+                )?;
+                plan.retire_delivered_review(&delivery, unplaced);
                 PlanStateMachine::apply(&mut plan, PlanEvent::PlanSubmitted, self.clock.now_ms())?;
                 self.task_controller.apply_with_plan_document(
                     &mut self.store,

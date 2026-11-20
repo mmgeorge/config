@@ -38,6 +38,13 @@ pub(crate) enum RepositoryAccessError {
     },
 }
 
+impl RepositoryAccessError {
+    /// Report contention with a live owner, which ends when that owner releases its access.
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self, Self::Busy(_) | Self::Journal(JournalError::Busy(_)))
+    }
+}
+
 /// Retain repository exclusion while delegating one execution slot at a time.
 #[derive(Debug)]
 #[must_use = "retain repository ownership until its operations have been collected"]

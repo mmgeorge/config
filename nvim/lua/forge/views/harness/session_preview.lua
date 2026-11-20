@@ -10,14 +10,14 @@ local active = nil
 -- the presentation the view owns. The float sits below every picker.
 local preview_zindex = 60
 
+---A float relative to a window is placed from the window's first text row, below its winbar, and
+---`nvim_win_get_height` counts only text rows, so the float covers the text area from row 0.
 ---@param preview table
 ---@return integer row, integer height Rows of the transcript window the float covers.
 local function float_geometry(preview)
-  local window = preview.transcript_win
-  local winbar_height = vim.wo[window].winbar ~= "" and 1 or 0
-  local height = vim.api.nvim_win_get_height(window)
+  local height = vim.api.nvim_win_get_height(preview.transcript_win)
   if preview.visible_height then height = math.min(height, preview.visible_height) end
-  return winbar_height, math.max(1, height - winbar_height)
+  return 0, math.max(1, height)
 end
 
 ---@param preview table

@@ -3219,6 +3219,9 @@ async fn run_prompt_inner(
             TestPromptStep::FileWrite { path, text } => {
                 run_file_write(&session, request, &sink, &turn, path, text).await?;
             }
+            TestPromptStep::NativeSubagent { name, text } => {
+                run_native_subagent(&session, request, &sink, &turn, name, text).await?;
+            }
             TestPromptStep::FileRead { path } => {
                 ensure_open(&session, ProviderOperation::TurnStart)?;
                 let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())
@@ -3507,6 +3510,216 @@ fn directory_planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPr
             arguments: serde_json::json!({"plan_id": plan_id}),
         },
     ]
+}
+
+/// Run one native subagent in the order and scoping Copilot reports a built-in subagent.
+///
+/// The delegating turn starts a tool call for the subagent, and the subagent's start follows
+/// that call. The child opens its own turn, reads a file behind a permission request made under
+/// its own authority, and reports its completion from inside its own scope before its turn
+/// terminal. The delegating call completes last.
+async fn run_native_subagent(
+    session: &MockSession,
+    request: &PromptRequest,
+    sink: &AdapterActivityWriter,
+    turn: &TurnAddress,
+    name: String,
+    text: String,
+) -> Result<(), ProviderError> {
+    ensure_open(session, ProviderOperation::TurnStart)?;
+    let protocol = || failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
+    let delegation_item =
+        ItemId::new(uuid::Uuid::new_v4().to_string()).expect("allocated item ID is nonempty");
+    let delegation = ToolDescriptor {
+        semantics: Default::default(),
+        name: "search_code_subagent".into(),
+        title: format!("Delegate to {name}"),
+        arguments: InspectableArguments::new(serde_json::json!({"query": text})),
+    };
+    sink.send_wait(AdapterActivity::Item {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        item_id: delegation_item.clone(),
+        event: ItemEvent::Started(ItemStart::ToolCall(delegation)),
+    })
+    .await?;
+    sink.send_wait(AdapterActivity::Item {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        item_id: delegation_item.clone(),
+        event: ItemEvent::Tool {
+            event: ToolItemEvent::ExecutionStarted,
+        },
+    })
+    .await?;
+    let agent_id = AgentId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| protocol())?;
+    let child_scope = InvocationScope::new(
+        turn.scope
+            .thread_id
+            .child(&agent_id)
+            .map_err(|_| protocol())?,
+        turn.scope.exchange_id.clone(),
+    );
+    let child = TurnAddress {
+        thread_id: child_scope.thread_id.clone(),
+        turn_id: child_scope.turn_id().map_err(|_| protocol())?,
+        scope: child_scope,
+    };
+    let agent = AgentDescription {
+        parent_agent_id: None,
+        delegation: Some(AgentDelegation {
+            parent_thread_id: turn.thread_id.clone(),
+            parent_turn_id: turn.turn_id.clone(),
+            parent_item_id: None,
+        }),
+        thread_id: Some(child.thread_id.clone()),
+        definition: Some(name.clone()),
+        nickname: Some(name),
+        task: None,
+    };
+    sink.send_wait(AdapterActivity::Agent {
+        agent_id: agent_id.clone(),
+        event: AgentEvent::Lifecycle {
+            event: AgentLifecycleEvent::Started {
+                agent: agent.clone(),
+                state: AgentActiveState::Starting,
+            },
+        },
+    })
+    .await?;
+    let parent = session.sink.invocation_sink(&turn.scope)?;
+    let publisher = parent.observed_turn_publisher(child.clone())?;
+    publisher.start_handle().observed(now_ms()).await?;
+    let writer = parent
+        .activity_writer()
+        .register_observed_turn(child.clone())?;
+    let path = "README.md".to_owned();
+    request
+        .permissions
+        .before_observed_child(&turn.scope, &child)
+        .await?;
+    let read = PermissionRequest {
+        id: uuid::Uuid::new_v4().to_string(),
+        provider: ProviderId::new("mock").expect("static provider identity is valid"),
+        subject: PermissionSubject::Unattached,
+        reason: None,
+        target_list: vec![PermissionTarget::Read { path: path.clone() }],
+    };
+    let read_allowed = matches!(
+        request
+            .permissions
+            .authorize_observed_child(&turn.scope, &child, read)
+            .await,
+        PermissionResponse::Allow
+    );
+    let read_item =
+        ItemId::new(uuid::Uuid::new_v4().to_string()).expect("allocated item ID is nonempty");
+    let read_tool = ToolDescriptor {
+        semantics: Default::default(),
+        name: "view".into(),
+        title: format!("Read {path}"),
+        arguments: InspectableArguments::new(serde_json::json!({"path": path})),
+    };
+    writer
+        .send_wait(AdapterActivity::Item {
+            thread_id: child.thread_id.clone(),
+            turn_id: child.turn_id.clone(),
+            item_id: read_item.clone(),
+            event: ItemEvent::Started(ItemStart::ToolCall(read_tool)),
+        })
+        .await?;
+    writer
+        .send_wait(AdapterActivity::Item {
+            thread_id: child.thread_id.clone(),
+            turn_id: child.turn_id.clone(),
+            item_id: read_item.clone(),
+            event: ItemEvent::Tool {
+                event: ToolItemEvent::ExecutionStarted,
+            },
+        })
+        .await?;
+    writer
+        .send_wait(AdapterActivity::Item {
+            thread_id: child.thread_id.clone(),
+            turn_id: child.turn_id.clone(),
+            item_id: read_item,
+            event: ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
+                outcome: if read_allowed {
+                    ToolOutcome::Succeeded
+                } else {
+                    ToolOutcome::Denied {
+                        reason: SanitizedMessage::new("The read was not permitted")
+                            .expect("static reason is nonempty"),
+                    }
+                },
+                descriptor: None,
+                output: None,
+                changes: Default::default(),
+            })),
+        })
+        .await?;
+    let item_id =
+        ItemId::new(uuid::Uuid::new_v4().to_string()).expect("allocated item ID is nonempty");
+    writer
+        .send_wait(AdapterActivity::Item {
+            thread_id: child.thread_id.clone(),
+            turn_id: child.turn_id.clone(),
+            item_id: item_id.clone(),
+            event: ItemEvent::Started(ItemStart::AgentMessage(AgentMessageStart {
+                text: text.clone(),
+                classification: MessageClassification::Known(AgentMessageRole::Response),
+            })),
+        })
+        .await?;
+    writer
+        .send_wait(AdapterActivity::Item {
+            thread_id: child.thread_id.clone(),
+            turn_id: child.turn_id.clone(),
+            item_id,
+            event: ItemEvent::Completed(ItemCompletion::AgentMessage(MessageCompletion {
+                text: text.clone(),
+                outcome: MessageOutcome::Completed,
+            })),
+        })
+        .await?;
+    writer
+        .send_wait(AdapterActivity::Agent {
+            agent_id,
+            event: AgentEvent::Lifecycle {
+                event: AgentLifecycleEvent::Finished {
+                    agent,
+                    outcome: AgentOutcome::Completed,
+                },
+            },
+        })
+        .await?;
+    publisher.native_ended().await;
+    let completed_at = now_ms();
+    let result = TurnResult::new(
+        TurnOutcome::Completed {
+            stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+        },
+        completed_at,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .map_err(|_| protocol())?;
+    publisher.completed(result, completed_at).await?;
+    sink.send_wait(AdapterActivity::Item {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        item_id: delegation_item,
+        event: ItemEvent::Completed(ItemCompletion::ToolCall(ToolCompletion {
+            outcome: ToolOutcome::Succeeded,
+            descriptor: None,
+            output: None,
+            changes: Default::default(),
+        })),
+    })
+    .await?;
+    Ok(())
 }
 
 /// Authorize and report a native file edit through the same provider boundary as real editors.

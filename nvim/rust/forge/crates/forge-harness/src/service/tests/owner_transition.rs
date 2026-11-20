@@ -494,11 +494,11 @@ pub(super) async fn settle_exchanges(
     count: usize,
 ) -> Result<()> {
     loop {
-        let exchanges =
-            crate::storage::SqliteStore::open(&controller.data_root)?.list_exchange(session_id)?;
-        if exchanges.len() == count
-            && exchanges.iter().all(|exchange| exchange.is_finished())
-            && controller.coordinator.execution.available_permits() == 1
+        // Read storage only once execution is idle and the queue has drained. Opening a writable
+        // store at every poll validated the schema each time and contended with the owner's own
+        // writes, which cost most of half a second per settled exchange; the pooled read-only
+        // handle sees every queued write without either cost.
+        if controller.coordinator.execution.available_permits() == 1
             && controller
                 .coordinator
                 .submissions
@@ -506,7 +506,11 @@ pub(super) async fn settle_exchanges(
                 .messages
                 .is_empty()
         {
-            return Ok(());
+            let exchanges = crate::storage::HistoryReader::current(&controller.data_root)?
+                .list_exchange(session_id)?;
+            if exchanges.len() == count && exchanges.iter().all(|exchange| exchange.is_finished()) {
+                return Ok(());
+            }
         }
         tokio::task::yield_now().await;
     }

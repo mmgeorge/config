@@ -230,6 +230,33 @@ fn plan_review_renders_decision_comments_and_edits() {
     assert!(scoped.contains("<set_test_scope id=\"tests\" scope=\"whole_suite\"/>"));
 }
 
+/// A plan discussion carries the comments and edits pending on the plan in the form a revision
+/// request uses, and no other kind can carry them.
+#[test]
+fn plan_discussion_renders_pending_review() {
+    let review = PendingPlanReview::new(
+        ReviewFeedback::new(None, "files/a.rs:4 Say whether zero is rejected.".into()),
+        vec![PlanEdit::RemoveTest {
+            file: "tests/a.rs".into(),
+            name: "rejects_zero".into(),
+        }],
+    );
+    let discussion = TurnInput::new(TurnKind::PlanDiscussion {
+        input: crate::PromptInput::Text("Rename the parameter.".into()),
+    })
+    .with_pending_review(review.clone());
+    let text = input_block(&discussion);
+    assert!(text.contains("Continue discussing the active plan"));
+    assert!(text.contains("keep those edits and address those comments"));
+    assert!(text.contains("<plan_review decision=\"pending\">\n<comments>\nfiles/a.rs:4 Say whether zero is rejected.\n</comments>\n<plan_edits>\n<remove_test file=\"tests/a.rs\" name=\"rejects_zero\"/>\n</plan_edits>\n</plan_review>"));
+    let restored: TurnInput =
+        serde_json::from_value(serde_json::to_value(&discussion).unwrap()).unwrap();
+    assert_eq!(restored, discussion);
+    let chat = TurnInput::user(crate::PromptInput::Text("hi".into())).with_pending_review(review);
+    assert!(chat.pending_review().is_none());
+    assert!(PendingPlanReview::new(None, Vec::new()).is_none());
+}
+
 /// Reject containers that would render an element without content.
 #[test]
 fn constructors_reject_empty_content() {

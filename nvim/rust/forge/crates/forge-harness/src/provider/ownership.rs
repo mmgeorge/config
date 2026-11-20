@@ -124,11 +124,11 @@ impl OwnershipRegistry {
             .get(agent_id)
             .and_then(EventScope::invocation)
             .cloned()
-            .ok_or_else(conflict)?;
+            .ok_or_else(|| conflict())?;
         let thread_id = self.agent_threads.get(agent_id).cloned();
         let turn = match turn_id {
             Some(turn_id) => {
-                let original = self.turns.get(turn_id).ok_or_else(conflict)?;
+                let original = self.turns.get(turn_id).ok_or_else(|| conflict())?;
                 if thread_id.as_ref() != Some(&original.thread_id) {
                     return Err(conflict());
                 }
@@ -160,7 +160,7 @@ impl OwnershipRegistry {
             .agent_threads
             .iter()
             .find_map(|(agent, original)| (original == thread).then_some(agent))
-            .ok_or_else(conflict)?;
+            .ok_or_else(|| conflict())?;
         self.observed_agent(agent, Some(turn))
     }
 
@@ -174,7 +174,7 @@ impl OwnershipRegistry {
             .agent_threads
             .iter()
             .find_map(|(agent, thread)| (thread == &address.thread_id).then_some(agent))
-            .ok_or_else(conflict)?;
+            .ok_or_else(|| conflict())?;
         if self.retired_agents.contains(agent)
             || self
                 .turns
@@ -261,7 +261,7 @@ impl OwnershipRegistry {
             .threads
             .get(&address.thread_id)
             .and_then(EventScope::invocation)
-            .ok_or_else(conflict)?;
+            .ok_or_else(|| conflict())?;
         if address.thread_id != address.scope.owner().thread_id()
             || address.thread_id == self.owner.thread_id()
             || address.scope.owner().session_id() != self.owner.session_id()
@@ -321,14 +321,14 @@ impl OwnershipRegistry {
                     .map(|owner| EventScope::Binding {
                         thread_id: owner.thread_id(),
                     })
-                    .ok_or_else(conflict)
+                    .ok_or_else(|| conflict())
             }
             ProviderEvent::Turn {
                 thread_id,
                 turn_id,
                 event,
             } => {
-                let turn = self.turns.get_mut(turn_id).ok_or_else(conflict)?;
+                let turn = self.turns.get_mut(turn_id).ok_or_else(|| conflict())?;
                 if &turn.thread_id != thread_id {
                     return Err(conflict());
                 }
@@ -350,7 +350,7 @@ impl OwnershipRegistry {
                 item_id,
                 event,
             } => {
-                let turn = self.turns.get(turn_id).ok_or_else(conflict)?;
+                let turn = self.turns.get(turn_id).ok_or_else(|| conflict())?;
                 if &turn.thread_id != thread_id {
                     return Err(conflict());
                 }
@@ -435,10 +435,10 @@ impl OwnershipRegistry {
                     .map(|owner| EventScope::Binding {
                         thread_id: owner.thread_id(),
                     })
-                    .ok_or_else(conflict)
+                    .ok_or_else(|| conflict())
             }
             WarningScope::Turn { thread_id, turn_id } => {
-                let turn = self.turns.get(turn_id).ok_or_else(conflict)?;
+                let turn = self.turns.get(turn_id).ok_or_else(|| conflict())?;
                 if &turn.thread_id != thread_id {
                     return Err(conflict());
                 }
@@ -449,7 +449,7 @@ impl OwnershipRegistry {
                 turn_id,
                 item_id,
             } => {
-                let turn = self.turns.get(turn_id).ok_or_else(conflict)?;
+                let turn = self.turns.get(turn_id).ok_or_else(|| conflict())?;
                 if &turn.thread_id != thread_id
                     || self
                         .items
@@ -461,7 +461,7 @@ impl OwnershipRegistry {
                 Ok(turn.scope.clone().into())
             }
             WarningScope::Agent { agent_id } => {
-                self.agents.get(agent_id).cloned().ok_or_else(conflict)
+                self.agents.get(agent_id).cloned().ok_or_else(|| conflict())
             }
             WarningScope::Operation { operation_id } => {
                 self.operations
@@ -486,7 +486,7 @@ impl OwnershipRegistry {
                     let turn = self
                         .turns
                         .get(&delegation.parent_turn_id)
-                        .ok_or_else(conflict)?;
+                        .ok_or_else(|| conflict())?;
                     if turn.thread_id != delegation.parent_thread_id {
                         return Err(conflict());
                     }
@@ -509,7 +509,7 @@ impl OwnershipRegistry {
                                 .as_ref()
                                 .and_then(|parent| self.agents.get(parent).cloned())
                         })
-                        .ok_or_else(conflict)?
+                        .ok_or_else(|| conflict())?
                 };
                 if let Some(parent_id) = &agent.parent_agent_id {
                     let mut ancestor = Some(parent_id.clone());
@@ -528,7 +528,7 @@ impl OwnershipRegistry {
                         return Err(conflict());
                     }
                     if parent_id != self.owner.agent_id() {
-                        let parent = self.agents.get(parent_id).ok_or_else(conflict)?;
+                        let parent = self.agents.get(parent_id).ok_or_else(|| conflict())?;
                         if parent.owner().session_id() != scope.owner().session_id() {
                             return Err(conflict());
                         }
@@ -602,7 +602,11 @@ impl OwnershipRegistry {
                 {
                     return Err(conflict());
                 }
-                let scope = self.agents.get(agent_id).cloned().ok_or_else(conflict)?;
+                let scope = self
+                    .agents
+                    .get(agent_id)
+                    .cloned()
+                    .ok_or_else(|| conflict())?;
                 if self
                     .threads
                     .get(thread_id)
@@ -661,8 +665,9 @@ fn item_kind(event: &forge_provider_api::message::ItemEvent) -> Option<ItemKind>
     }
 }
 /// Reject foreign or stale associations without reassigning their ownership.
+#[track_caller]
 fn conflict() -> EventDeliveryError {
-    EventDeliveryError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+    EventDeliveryError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
 }
 /// Build native-child test proofs through actual parent, thread, and turn registration.
 #[cfg(test)]

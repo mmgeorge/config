@@ -34,6 +34,21 @@ impl PermissionAuthoritySnapshot {
 pub(crate) struct TaskAuthorityProgress {
     current: std::sync::Mutex<TaskPermit>,
     admission: Arc<std::sync::Mutex<MutationAdmission>>,
+    execution_review: std::sync::Mutex<Option<ExecutionRevisionReview>>,
+}
+
+/// An execution revision this invocation submitted, and the review decision that answered it.
+///
+/// Submitting the revision, and later the review decision, renew the task's revision while
+/// the submitting turn is still running. The invocation adopts exactly those renewals of its own
+/// Resolve execution, so its plan reads stay available while the revision awaits review and its
+/// later plan tools stay admitted after the decision, as the revision workflow promises. Any
+/// other change, such as a pause, a phase change, or a replaced task, still makes it stale.
+#[derive(Clone, Debug)]
+struct ExecutionRevisionReview {
+    execution_id: String,
+    generation: u64,
+    decided: bool,
 }
 
 /// Keep terminal sealing separate from task revocation and provider collection.
@@ -49,6 +64,7 @@ impl TaskAuthorityProgress {
         Self {
             current: std::sync::Mutex::new(permit),
             admission: Arc::default(),
+            execution_review: std::sync::Mutex::default(),
         }
     }
     /// Freeze child revision authority while retaining the original invocation's mutation seal.
@@ -56,7 +72,80 @@ impl TaskAuthorityProgress {
         Self {
             current: std::sync::Mutex::new(permit),
             admission: self.admission.clone(),
+            execution_review: std::sync::Mutex::default(),
         }
+    }
+
+    /// Record that this invocation submitted an execution revision now awaiting review.
+    pub(crate) fn await_execution_review(&self, execution_id: &str, generation: u64) -> Result<()> {
+        *self
+            .execution_review
+            .lock()
+            .map_err(|_| anyhow::anyhow!("execution review lock poisoned"))? =
+            Some(ExecutionRevisionReview {
+                execution_id: execution_id.into(),
+                generation,
+                decided: false,
+            });
+        Ok(())
+    }
+
+    /// Adopt the task renewal of this invocation's own revision submission or its decision.
+    ///
+    /// The current task must be the same Execute task, still running Resolve in the same
+    /// execution. While the revision awaits review the generation is the submitted one; the
+    /// decision clears the pending revision and keeps that generation, or advances it once when
+    /// a later turn carries the decision. After the decision nothing further is adopted.
+    pub(crate) fn adopt_execution_review(&self, controller: &SessionTaskController) -> Result<()> {
+        let mut review = self
+            .execution_review
+            .lock()
+            .map_err(|_| anyhow::anyhow!("execution review lock poisoned"))?;
+        let Some(pending) = review.as_mut().filter(|review| !review.decided) else {
+            return Ok(());
+        };
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task authority progress lock poisoned"))?;
+        let Some(task) = controller.current()? else {
+            return Ok(());
+        };
+        if &task.id != current.task_id() || task.revision == *current.revision() {
+            return Ok(());
+        }
+        let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else {
+            return Ok(());
+        };
+        let record = &execution.record;
+        if record.id != pending.execution_id
+            || record.state != crate::plan::PlanExecutionState::Active
+            || record.phase != crate::plan::PlanPhase::Resolve
+        {
+            return Ok(());
+        }
+        let awaiting =
+            record.pending_revision_reason.is_some() && record.generation == pending.generation;
+        let decided = record.pending_revision_reason.is_none()
+            && (record.generation == pending.generation
+                || pending.generation.checked_add(1) == Some(record.generation));
+        if awaiting || decided {
+            *current = task.permit();
+            pending.generation = record.generation;
+            pending.decided = decided;
+        }
+        Ok(())
+    }
+
+    /// Get the execution generation this invocation adopted with its own revision, if any.
+    pub(crate) fn adopted_execution_generation(&self, execution_id: &str) -> Result<Option<u64>> {
+        Ok(self
+            .execution_review
+            .lock()
+            .map_err(|_| anyhow::anyhow!("execution review lock poisoned"))?
+            .as_ref()
+            .filter(|review| review.execution_id == execution_id)
+            .map(|review| review.generation))
     }
 
     pub(crate) fn permit(&self) -> Result<TaskPermit> {
@@ -140,6 +229,14 @@ impl TaskAuthority {
             permission_snapshot: context.permission_snapshot.clone(),
             permission_required: context.permission_required,
         })
+    }
+
+    /// Adopt a review decision on a revision this invocation submitted, before admission.
+    pub(crate) fn adopt_execution_review(&self) -> Result<()> {
+        if let (Some(progress), Some(controller)) = (&self.progress, &self.controller) {
+            progress.adopt_execution_review(controller)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn current_permit(&self) -> Result<Option<TaskPermit>> {

@@ -16,8 +16,14 @@ struct Callbacks {
 #[async_trait]
 impl NativeCallbackRouter for Callbacks {
     /// Reject calls whose invocation was cancelled before native admission.
-    async fn before_tool_native(&self, call: Option<&str>) -> Result<(), ProviderError> {
-        assert_eq!(call, Some("outer-call"));
+    async fn before_tool_native(
+        &self,
+        tool: crate::copilot::provider::NativeToolIdentity<'_>,
+    ) -> Result<(), ProviderError> {
+        assert!(matches!(
+            tool,
+            crate::copilot::provider::NativeToolIdentity::Call("outer-call")
+        ));
         if self.cancelled.load(Ordering::SeqCst) {
             Err(ProviderError::Cancelled)
         } else {
@@ -44,7 +50,7 @@ impl NativeCallbackRouter for Callbacks {
         &self,
         _: &str,
         _: forge_provider_api::control::ToolCall,
-    ) -> Result<String, ProviderError> {
+    ) -> Result<forge_provider_api::control::ToolReply, ProviderError> {
         panic!("shell fixture must not invoke a host tool")
     }
 

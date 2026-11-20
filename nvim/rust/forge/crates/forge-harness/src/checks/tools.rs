@@ -879,8 +879,10 @@ impl CheckSupervisor {
                 super::applicability::resolve(
                     &RunRequest::default(),
                     &config,
-                    changes.as_deref(),
-                    changes.is_some(),
+                    &changes.clone().map_or(
+                        super::ChangeInventory::Untracked,
+                        super::ChangeInventory::Known,
+                    ),
                 )
             })
             .transpose()?
@@ -970,8 +972,10 @@ impl CheckSupervisor {
                 request,
                 overrides: overrides.enabled.clone(),
                 task_overrides: overrides,
-                files: changes.clone(),
-                has_scope: changes.is_some(),
+                inventory: changes.map_or(
+                    super::ChangeInventory::Untracked,
+                    super::ChangeInventory::Known,
+                ),
                 shell,
                 trigger,
                 task_id,
@@ -1135,8 +1139,7 @@ impl CheckSupervisor {
                 request: Default::default(),
                 overrides: BTreeMap::new(),
                 task_overrides: Default::default(),
-                files: Some(Vec::new()),
-                has_scope: true,
+                inventory: super::ChangeInventory::Known(Vec::new()),
                 shell: CheckShell::default(),
                 trigger: "Configuration saved".into(),
                 task_id: None,

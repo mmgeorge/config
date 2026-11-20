@@ -757,10 +757,27 @@ end
 function M.saved(buf, captured)
   local state = assert(state_by_buf[buf], "comment view is not attached")
   state.baseline = vim.deepcopy(captured)
+  sync_focused_body(state)
+  local collapsed
   for _, annotation in ipairs(state.annotation_list) do
     for _, saved in ipairs(captured) do
-      if tostring(annotation.id) == saved.id then annotation.new = nil break end
+      if tostring(annotation.id) == saved.id then
+        annotation.new = nil
+        -- Collapsing is the save's visible acknowledgement. A body typed into after the save was
+        -- sent is still being edited, so it stays open.
+        if annotation.focused and capture_annotation(annotation).source.body == saved.source.body then
+          annotation.focused, collapsed = false, annotation
+        end
+        break
+      end
     end
+  end
+  if collapsed then
+    local win = displayed_window(state)
+    if win and win == vim.api.nvim_get_current_win() and vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
+      vim.cmd("stopinsert")
+    end
+    render(state, { annotation_id = collapsed.id })
   end
   vim.bo[buf].modified = not vim.deep_equal(M.capture(buf), state.baseline)
   if state.guard and state.guard.native then state.guard.native.modified = vim.bo[buf].modified end

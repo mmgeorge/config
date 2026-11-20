@@ -63,8 +63,7 @@ fn apply_preflight_rejects_mixed_categories_and_implicit_mutations() -> Result<(
                 }),
                 overrides: Default::default(),
                 task_overrides: Default::default(),
-                files: Some(Vec::new()),
-                has_scope: true,
+                inventory: super::ChangeInventory::Known(Vec::new()),
                 shell: Default::default(),
                 trigger: "apply preflight".into(),
                 task_id: None,
@@ -111,8 +110,7 @@ fn preparation_order_follows_operations_and_keeps_dependency_checks_readonly() -
                 request,
                 overrides: Default::default(),
                 task_overrides: Default::default(),
-                files: Some(Vec::new()),
-                has_scope: true,
+                inventory: super::ChangeInventory::Known(Vec::new()),
                 shell: Default::default(),
                 trigger: "operation order".into(),
                 task_id: None,
@@ -290,8 +288,7 @@ async fn adapter_empty_defaults_skip_but_explicit_empty_selectors_admit_all() ->
                     }),
                     overrides: Default::default(),
                     task_overrides: Default::default(),
-                    files: Some(Vec::new()),
-                    has_scope: true,
+                    inventory: super::ChangeInventory::Known(Vec::new()),
                     shell: Default::default(),
                     trigger: "empty selection".into(),
                     task_id: None,
@@ -365,8 +362,7 @@ fn custom_history_ignores_legacy_sidecars_and_excludes_other_versions() -> Resul
                 }),
                 overrides: Default::default(),
                 task_overrides: Default::default(),
-                files: Some(Vec::new()),
-                has_scope: true,
+                inventory: super::ChangeInventory::Known(Vec::new()),
                 shell: Default::default(),
                 trigger: "history test".into(),
                 task_id: None,
@@ -424,8 +420,7 @@ fn recovery_preserves_partial_results_and_committed_outcomes() -> Result<()> {
                 request: RunRequest::All,
                 overrides: Default::default(),
                 task_overrides: Default::default(),
-                files: None,
-                has_scope: false,
+                inventory: super::ChangeInventory::Untracked,
                 shell: Default::default(),
                 trigger: "recovery".into(),
                 task_id: None,
@@ -486,7 +481,6 @@ fn recovery_preserves_partial_results_and_committed_outcomes() -> Result<()> {
 
     let mut uncommitted = observed.clone();
     uncommitted.state = CheckState::Passed;
-    uncommitted.completed_plan = Some("Not yet committed".into());
     uncommitted.commands[0].state = CheckState::Passed;
     let Some(adapter::AdapterResult::Tests(result)) = &mut uncommitted.commands[0].result else {
         anyhow::bail!("test fixture lost its test result");
@@ -500,7 +494,6 @@ fn recovery_preserves_partial_results_and_committed_outcomes() -> Result<()> {
     let unfinished =
         super::recover_runs(data.path(), "checks-test", std::slice::from_ref(&admitted))?;
     assert_eq!(unfinished[0].state, CheckState::Interrupted);
-    assert!(unfinished[0].completed_plan.is_none());
     assert_eq!(unfinished[0].commands[0].state, CheckState::Passed);
 
     let mut committed = run.clone();
@@ -543,8 +536,7 @@ fn verification_requirements_survive_history_loss_and_reject_stale_passes() -> R
                 request: RunRequest::All,
                 overrides: Default::default(),
                 task_overrides: Default::default(),
-                files: Some(Vec::new()),
-                has_scope: true,
+                inventory: super::ChangeInventory::Known(Vec::new()),
                 shell: Default::default(),
                 trigger: "fix".into(),
                 task_id: Some("task".into()),
@@ -893,8 +885,7 @@ fn verification_identity_survives_policy_changes_but_rejects_tool_changes() -> R
                 enabled: [("format".into(), true)].into(),
                 ..Default::default()
             },
-            files: Some(Vec::new()),
-            has_scope: true,
+            inventory: super::ChangeInventory::Known(Vec::new()),
             shell: Default::default(),
             trigger: "test".into(),
             task_id: Some("task".into()),
@@ -1158,8 +1149,7 @@ fn required_verification_selects_readonly_prerequisites() -> Result<()> {
             request: RunRequest::All,
             overrides: Default::default(),
             task_overrides: Default::default(),
-            files: Some(Vec::new()),
-            has_scope: true,
+            inventory: super::ChangeInventory::Known(Vec::new()),
             shell: Default::default(),
             trigger: "test".into(),
             task_id: None,
@@ -1287,8 +1277,7 @@ fn discovery_reservation_excludes_runs_and_releases_without_history() -> Result<
             }),
             overrides: Default::default(),
             task_overrides: Default::default(),
-            files: Some(Vec::new()),
-            has_scope: true,
+            inventory: super::ChangeInventory::Known(Vec::new()),
             shell: Default::default(),
             trigger: "test discovery exclusion".into(),
             task_id: None,
@@ -1334,8 +1323,7 @@ fn script_evidence_does_not_reuse_an_undeclared_tool_identity() -> Result<()> {
                 }),
                 overrides: Default::default(),
                 task_overrides: Default::default(),
-                files: Some(Vec::new()),
-                has_scope: true,
+                inventory: super::ChangeInventory::Known(Vec::new()),
                 shell: Default::default(),
                 trigger: "evidence test".into(),
                 task_id: Some("task".into()),

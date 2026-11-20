@@ -6,7 +6,9 @@ mod runtime;
 pub(crate) use cleanup::{
     CleanupError, CleanupJoinFailure, CleanupWorkFailure, CleanupWorkKind, RetainedCleanupFailure,
 };
-pub(crate) use inbox::{NativeAvailabilityReceipt, ObservationEnd, SessionObservationInbox};
+pub(crate) use inbox::{
+    NativeAvailabilityReceipt, ObservationEnd, SessionInboxClaim, SessionObservationInbox,
+};
 pub(crate) use runtime::{
     ContinuationAttempt, ExchangeCollection, HostEffectAdmission, HostEffectGuard, HostEffectId,
     HostEffectKind, HostEffectOutput, NativeReady, OwnerCloseReason, RegistryError,

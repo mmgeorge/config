@@ -288,6 +288,7 @@ impl SqliteStore {
         let artifacts =
             crate::plan::PlanFileStore::new(self.data_root.clone(), std::path::PathBuf::new())?;
         let mut affected_plans = Vec::new();
+        let mut retired_plans = Vec::new();
         let result = (|| {
             let observed_payload: Option<String> = self.connection.query_row(
             "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1 AND json_extract(payload,'$.format_version')=?2",
@@ -319,6 +320,17 @@ impl SqliteStore {
                     .retain(|artifact| artifact.id != plan.artifact.id);
                 effects.plan.push(plan.artifact.clone());
             }
+            retired_plans = effects
+                .plan
+                .iter()
+                .filter(|plan| {
+                    matches!(
+                        plan.state,
+                        crate::plan::PlanState::Cancelled | crate::plan::PlanState::Rejected
+                    )
+                })
+                .map(|plan| plan.id.clone())
+                .collect();
             for plan in &effects.plan {
                 let claimed = match document.filter(|document| document.matches(plan)) {
                     Some(document) => document.claim_artifacts(plan)?,
@@ -556,7 +568,17 @@ impl SqliteStore {
             params![session_id, now_ms, encoded],
         )?;
             if let Some(receipt) = effects.terminal_commit {
-                super::terminal::commit(&transaction, session_id, receipt)?;
+                // Only the commit that installs an Execute task starts execution. A revision
+                // accepted while that task runs keeps the same task, and its own lifecycle row
+                // records the acceptance.
+                let executing = active.as_ref().is_some_and(|task| {
+                    task.kind() == crate::task::TaskKind::Execute
+                        && !previous.as_ref().is_some_and(|previous| {
+                            previous.id == task.id
+                                && previous.kind() == crate::task::TaskKind::Execute
+                        })
+                });
+                super::terminal::commit(&transaction, session_id, receipt, executing)?;
             }
             if let Some(commit) = effects.owner_task_commit {
                 crate::exchange::journal::commit_task_command(&transaction, session_id, commit)?;
@@ -575,6 +597,15 @@ impl SqliteStore {
                 match document.filter(|document| document.matches(&plan)) {
                     Some(document) => document.reconcile(&plan)?,
                     None => artifacts.reconcile_plan_artifacts(&plan)?,
+                }
+            }
+        }
+        // A committed cancellation retires the plan's editable tree; the commit already
+        // stands, so a removal failure is reported without failing it.
+        if result.is_ok() {
+            for id in retired_plans {
+                if let Err(error) = artifacts.authoring_remove(session_id, &id) {
+                    tracing::warn!(target: "forge::plan", session_id, plan_id = %id, error = %format!("{error:#}"), "Cancelled plan workspace was not removed");
                 }
             }
         }
@@ -605,9 +636,12 @@ pub(super) fn recover_active_task(
             }
         }
         WorkflowSnapshot::Plan { plan } => {
+            // A plan awaiting review runs nothing, so it keeps waiting for the reviewer, as it
+            // does after a clean shutdown.
             if !matches!(
                 plan.artifact.state,
-                crate::plan::PlanState::Accepted
+                crate::plan::PlanState::AwaitingReview
+                    | crate::plan::PlanState::Accepted
                     | crate::plan::PlanState::Cancelled
                     | crate::plan::PlanState::Rejected
             ) {

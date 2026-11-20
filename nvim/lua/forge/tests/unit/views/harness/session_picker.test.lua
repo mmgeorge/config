@@ -407,6 +407,19 @@ T["the current session shows its own transcript instead of a preview"] = functio
   eq(vim.tbl_filter(function(request) return request.spec.method == "session.preview" end, fixture.requests), {})
 end
 
+-- The first listed row was highlighted, so a newer session's preview covered the transcript as
+-- soon as the picker opened. The picker opens on the calling session's own row instead.
+T["the picker opens with the current session highlighted"] = function()
+  local workspace = vim.fn.getcwd()
+  local fixture = open_session_picker(
+    { id = "current", provider = "fixture_alpha", workspace = workspace },
+    { { id = "newer", provider = "fixture_alpha", workspace = workspace, created_at_ms = 2, active = true },
+      { id = "current", provider = "fixture_alpha", workspace = workspace, created_at_ms = 1, active = true } })
+  wait_until(function() return fixture.spec() ~= nil end, "the session picker did not open")
+  local page = fixture.spec().page_list[1]
+  eq(page.option_list[page.selected_index or 1].id, "current")
+end
+
 T["footer_and_help_describe_session_commands"] = function()
   require("forge.infra.config").setup({})
   local preview = require("forge.views.harness.session_preview")

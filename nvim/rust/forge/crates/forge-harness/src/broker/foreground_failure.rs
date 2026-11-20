@@ -568,25 +568,12 @@ impl HarnessBroker {
             return self.fail_foreground(transaction, expired.into());
         }
         // The provider reports the stopped invocation only as interrupted, so the exchange keeps
-        // the deadline as the reason its tool failed and its execution stopped.
+        // the deadline as the reason its tool failed and its execution stopped. The exchange's
+        // failure is the one notice; the transcript row keeps the reason after it fades.
         let record = expired.record();
         if !transaction.state.interaction.tool_timeout.contains(&record) {
             transaction.state.interaction.tool_timeout.push(record);
         }
-        let observation = crate::provider::HarnessEvent::Host {
-            scope: expired.address.turn.scope.clone().into(),
-            event: crate::provider::HostEvent::Failure {
-                failure: forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::TurnInterrupt,
-                    forge_provider_api::ProviderFailureKind::Timeout,
-                ),
-                message: forge_provider_api::SanitizedMessage::new(expired.to_string())
-                    .expect("timeout diagnostics are nonempty"),
-            },
-        };
-        transaction.pending_session_observations.push_back(
-            crate::provider::session_execution::OwnerObservation::Event(observation),
-        );
         self.fail_foreground(transaction, expired.into())
     }
 
@@ -1345,6 +1332,14 @@ impl HarnessBroker {
             // presentation. Publish the settled exchange through the same ordered
             // failure delivery before releasing its foreground owner.
             if failure.original.downcast_ref::<TurnRetracted>().is_none() {
+                // The failed turn reports nothing more for the native children it delegated to.
+                if let Err(error) =
+                    self.retire_observed_children_of(&transaction.state.interaction.id)
+                {
+                    failure
+                        .secondary
+                        .push(format!("retire failed exchange native agents: {error:#}"));
+                }
                 match self.reconcile_timeline() {
                     Ok(timeline) => {
                         let settled = AppliedProviderEvent::Timeline(timeline);
@@ -1841,6 +1836,35 @@ impl HarnessBroker {
         Ok(ForegroundAction::WaitForPublicationDrain)
     }
 
+    /// Release a failed foreground's settlement fence once its native work and jobs have joined.
+    ///
+    /// Nothing replays a failed foreground's host effects: its exchange is settled as failed, and
+    /// durable stores, not this in-memory ledger, hold whatever an interrupted effect committed.
+    /// Retaining the fence would only refuse every later prompt with "prior host settlement is
+    /// still pending" for the rest of the editor session. An effect left ambiguous or unpublished
+    /// is reported as a secondary failure after the fence is released.
+    fn release_failed_host_settlement(
+        &mut self,
+        settlement: &Arc<crate::provider::session_execution::SettlementCell>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.pending_host_settlement
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, settlement)),
+            "host settlement belongs to another transaction"
+        );
+        let unsettled = settlement
+            .seal_effects(&[])
+            .and_then(|()| settlement.validate_effects_settled());
+        let retired = settlement.checkout().map(|mut checkout| {
+            drop(checkout.take());
+        });
+        self.pending_host_settlement = None;
+        unsettled.context("failed foreground left a host effect unsettled")?;
+        retired.context("retire failed foreground settlement ticket")?;
+        Ok(())
+    }
+
     /// Release the owner only after cleanup, presentation and service job collection.
     pub(crate) fn finish_foreground_failure(
         &mut self,
@@ -1896,7 +1920,7 @@ impl HarnessBroker {
             TurnTransaction::Done(_) | TurnTransaction::Transitioning => None,
         };
         if !restarting
-            && let Some(permit) = failed_task
+            && let Some(permit) = failed_task.as_ref()
             && let Some(task) = self.task_controller.current()?
             && permit.validate_observation(Some(&task)).is_ok()
             && task.status() == crate::task::TaskStatus::Running
@@ -1911,6 +1935,20 @@ impl HarnessBroker {
                 crate::task::TaskChange::Pause,
                 self.clock.now_ms(),
             )?;
+        } else if !restarting
+            && let Some(permit) = failed_task
+            && let Some(task) = self.task_controller.current()?
+            && permit.validate_observation(Some(&task)).is_ok()
+            && task.kind() == crate::task::TaskKind::Plan
+        {
+            // A failed planning turn fails its draft, so the task reports the failure and
+            // `/plan retry` starts the draft again instead of finding nothing to resume.
+            self.task_controller.apply(
+                &mut self.store,
+                &task.permit(),
+                crate::task::TaskEvent::PlanGenerationFailed,
+                self.clock.now_ms(),
+            )?;
         }
         let settlement = match &*dispatch {
             TurnTransaction::Running { transaction, .. }
@@ -1921,21 +1959,12 @@ impl HarnessBroker {
             | TurnTransaction::Done(_)
             | TurnTransaction::Transitioning => None,
         };
-        let collected = (|| -> Result<()> {
-            if let Some(settlement) = settlement
-                && self.host_settlement().is_some()
-            {
-                // Native cleanup and all publication jobs have joined. Keep an
-                // ambiguous or unpublished host mutation fenced for repair.
-                settlement.seal_effects(&[])?;
-                settlement.validate_effects_settled()?;
-                let mut checkout = settlement.checkout()?;
-                drop(checkout.take());
-                drop(checkout);
-                self.clear_host_settlement(&settlement)?;
+        let collected = match settlement {
+            Some(settlement) if self.host_settlement().is_some() => {
+                self.release_failed_host_settlement(&settlement)
             }
-            Ok(())
-        })();
+            _ => Ok(()),
+        };
         // Steering admitted before the lane closed and never read by the native turn stays
         // `Prepared`. Release it now: its delivery observes the closed lane and returns the
         // message to the queue, rather than waiting for a transaction that a restart retains.

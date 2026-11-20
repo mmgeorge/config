@@ -25,12 +25,16 @@ function M.count(state)
   return pending, required
 end
 
+---True while the host's reply to the user's own answer is applied. A picker closed by that reply
+---follows the user's decision, so the keys typed after it are not discarded.
+local applying_answer_reply = false
+
 ---Refresh the owning question picker, closing completed answering sessions.
 ---@param state ForgeHarnessPresentationState
 local function refresh_picker(state, question_id)
   if not picker.is_open("questions") or active_state ~= state then return end
   if M.count(state) == 0 and not state.question_show_history then
-    picker.close()
+    picker.close(true, applying_answer_reply and "user" or nil)
   else
     local spec = build_spec(state, active_host)
     if question_id then
@@ -40,6 +44,18 @@ local function refresh_picker(state, question_id)
     end
     picker.update(spec)
   end
+end
+
+---Apply the host's reply to the user's own answer, which may close the picker.
+---@param state ForgeHarnessPresentationState
+---@param result ForgeQuestionView
+local function apply_answer_reply(state, result)
+  applying_answer_reply = true
+  local applied, failure = pcall(function()
+    if not M.receive(state, result) then refresh_picker(state) end
+  end)
+  applying_answer_reply = false
+  if not applied then error(failure, 0) end
 end
 
 local function submit(state, question, action)
@@ -58,7 +74,7 @@ local function submit(state, question, action)
       require("forge.infra.notifications").error(failure, "Harness question")
       refresh_picker(state)
     else
-      if not M.receive(state, result) then refresh_picker(state) end
+      apply_answer_reply(state, result)
     end
   end
   if action.kind == "clarify" then
@@ -117,17 +133,22 @@ local function stage_answer(state, question, action)
   local request = drafts.request
   local session_id = state.session.id
   drafts.saving = true
-  refresh_picker(state)
+  -- The last answer is the user's decision, so the picker closes with it and takes no further
+  -- keys: those typed right after the submit key reach the window and mode it returns to. A
+  -- failed save keeps the drafts, and reopening the questions shows the failure beside them.
+  if picker.is_open("questions") and active_state == state then picker.close(true, "user") end
   client.request({ session_id = session_id, method = "session.question.answer_batch", params = request }, function(result, failure)
     drafts.saving = false
     if failure then drafts.failure = failure end
     if not state.session or state.session.id ~= session_id or state.question_answer_state ~= drafts then return end
     if failure then
-      require("forge.infra.notifications").error(failure, "Harness questions")
+      local reopen_key = require("forge.shared.keymaps").view_keys_for("harness", "reopen_question")[1]
+      require("forge.infra.notifications").error(failure .. (reopen_key and (" · " .. reopen_key .. " reopen") or ""),
+        "Harness questions")
       refresh_picker(state)
     else
       drafts.request = nil
-      if not M.receive(state, result) then refresh_picker(state) end
+      apply_answer_reply(state, result)
     end
   end)
 end
@@ -174,6 +195,12 @@ local function page(state, question)
       if answer.feedback then label = label .. " — " .. answer.feedback end
     end
     details[#details + 1] = { text = "Draft answer: " .. label, group = "ForgePickerHint" }
+  elseif pending then
+    -- Text typed into "Other…" and not yet confirmed is still this question's answer in progress.
+    local typed = vim.trim(((state.question_drafts or {})[question.id] or {}).other or "")
+    if typed ~= "" then
+      details[#details + 1] = { text = "Draft answer: Other… — " .. typed, group = "ForgePickerHint" }
+    end
   end
   if drafts.failure then details[#details + 1] = { text = "Not saved: " .. drafts.failure, group = "ForgeHarnessToolFailure" } end
   if drafts.saving then details[#details + 1] = { text = "Saving answers…", group = "ForgePickerHint" } end

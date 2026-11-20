@@ -1,6 +1,142 @@
 //! Capture immutable rollback authority before the FIFO changes session history.
 use crate::checkpoint::{RestoreJournal, RestorePreview};
+use crate::exchange::{Exchange, HistoryDisposition};
 use serde::{Deserialize, Serialize};
+
+/// Name the native history position that matches a set of retained exchanges.
+pub(crate) enum NativeBoundary {
+    /// The newest retained provider turn reported this checkpoint.
+    Checkpoint(String),
+    /// A retained exchange ran provider turns and none of them reported a checkpoint.
+    Unrecorded {
+        /// The exchange whose turns have no checkpoint.
+        ordinal: u64,
+    },
+    /// No retained exchange ran a provider turn.
+    Empty,
+}
+
+impl NativeBoundary {
+    /// Find the boundary after the newest retained exchange that ran a provider turn.
+    ///
+    /// Conversation rollback and forking select their native position by this one rule.
+    pub(crate) fn after<'exchange>(
+        retained: impl DoubleEndedIterator<Item = &'exchange Exchange>,
+    ) -> Self {
+        for exchange in retained.rev() {
+            if let Some(checkpoint) = exchange.native_checkpoint() {
+                return Self::Checkpoint(checkpoint.to_owned());
+            }
+            if !exchange.turn.is_empty() {
+                return Self::Unrecorded {
+                    ordinal: exchange.ordinal,
+                };
+            }
+        }
+        Self::Empty
+    }
+}
+
+/// Describe the provider facts that decide whether its conversation can be rewound.
+pub(crate) struct RewindProvider<'session> {
+    pub(crate) label: &'session str,
+    pub(crate) capability: &'session crate::provider::ProviderCapability,
+    /// Whether the provider holds a conversation for this session at all.
+    pub(crate) native_history: bool,
+}
+
+/// Select where a conversation rollback to `first_removed` truncates native history.
+///
+/// `Ok(None)` means the provider holds no conversation yet, so nothing needs rewinding, and
+/// `Ok(Some(None))` empties the provider's conversation. Every refusal is known before any file or
+/// history changes, so the interaction list reports it on the option and preparation rejects it.
+pub(crate) fn rewind_target(
+    exchanges: &[Exchange],
+    first_removed: usize,
+    provider: &RewindProvider<'_>,
+) -> Result<Option<Option<String>>, RollbackFailure> {
+    if !provider.capability.native_conversation_rewind {
+        return Err(RollbackFailure::Unsupported {
+            reason: format!(
+                "Conversation rollback is unsupported: {} cannot rewind its conversation",
+                provider.label
+            ),
+        });
+    }
+    if !provider.native_history {
+        return Ok(None);
+    }
+    let retained = exchanges[..first_removed]
+        .iter()
+        .filter(|exchange| exchange.disposition() == HistoryDisposition::Current);
+    match NativeBoundary::after(retained) {
+        NativeBoundary::Checkpoint(checkpoint) => Ok(Some(Some(checkpoint))),
+        NativeBoundary::Unrecorded { ordinal } => Err(RollbackFailure::Unsupported {
+            reason: format!(
+                "Conversation rollback is unsupported here: interaction {ordinal} has no recorded provider checkpoint"
+            ),
+        }),
+        NativeBoundary::Empty if provider.capability.conversation_rewind_requires_checkpoint => {
+            Err(RollbackFailure::Unsupported {
+                reason: format!(
+                    "Conversation rollback is unsupported here: {} can rewind only to the end of an earlier interaction",
+                    provider.label
+                ),
+            })
+        }
+        NativeBoundary::Empty => Ok(Some(None)),
+    }
+}
+
+/// Decide whether a task survives the rollback of `removed` exchanges.
+///
+/// A task's start opens the first exchange created after it, so the task belongs to the retained
+/// history exactly when a retained exchange was created at or after the task. Rolling back an
+/// interaction inside a goal keeps the goal; rolling back its start removes it.
+pub(crate) fn rollback_keeps_task(
+    exchanges: &[Exchange],
+    removed: &[String],
+    task_created_at_ms: i64,
+) -> bool {
+    exchanges.iter().any(|exchange| {
+        exchange.disposition() == HistoryDisposition::Current
+            && !removed.contains(&exchange.id)
+            && exchange.created_at_ms >= task_created_at_ms
+    })
+}
+
+/// Present one exchange together with the reason a rollback to it is unavailable.
+#[derive(Serialize)]
+pub(crate) struct ExchangeRollbackReview {
+    #[serde(flatten)]
+    pub(crate) exchange: Exchange,
+    /// Why rolling back to this exchange cannot rewind the provider; absent when it can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rollback_unavailable: Option<String>,
+}
+
+impl ExchangeRollbackReview {
+    /// Annotate every current, finished exchange of one ordered history with its rollback refusal.
+    pub(crate) fn list(exchanges: Vec<Exchange>, provider: &RewindProvider<'_>) -> Vec<Self> {
+        let unavailable = (0..exchanges.len())
+            .map(|position| {
+                let exchange = &exchanges[position];
+                (exchange.is_finished() && exchange.disposition() == HistoryDisposition::Current)
+                    .then(|| rewind_target(&exchanges, position, provider).err())
+                    .flatten()
+                    .map(|failure| failure.to_string())
+            })
+            .collect::<Vec<_>>();
+        exchanges
+            .into_iter()
+            .zip(unavailable)
+            .map(|(exchange, rollback_unavailable)| Self {
+                exchange,
+                rollback_unavailable,
+            })
+            .collect()
+    }
+}
 
 /// Select a checkpoint and the history observed by the caller.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -124,8 +260,15 @@ impl RollbackCommand {
         }
     }
     /// Identify commands requiring execution collection.
+    ///
+    /// A files preview compares the workspace with the retained history's closing checkpoint, which
+    /// a running or paused exchange has not written yet, so preparation collects active execution
+    /// first, as applying does. Undoing a restore reads only its own journal.
     pub(crate) fn requires_collection(&self) -> bool {
-        matches!(self, Self::Apply(_) | Self::ResumeRestore(_))
+        matches!(
+            self,
+            Self::Prepare(_) | Self::Apply(_) | Self::ResumeRestore(_)
+        )
     }
 }
 /// Preserve preparation and restoration postconditions.
@@ -199,6 +342,71 @@ mod tests {
             token.validate(&preview),
             Err(RollbackFailure::StaleAuthority)
         ));
+    }
+
+    /// A provider that rewinds only to a recorded checkpoint cannot roll back the first
+    /// interaction, and the exchange list names that refusal on the first exchange alone, before
+    /// any preparation or confirmation.
+    #[test]
+    fn checkpoint_only_rewind_refuses_the_first_interaction() {
+        let exchanges = vec![
+            finished_exchange("first", 1),
+            finished_exchange("second", 2),
+        ];
+        let capability = crate::provider::ProviderCapability {
+            native_conversation_rewind: true,
+            conversation_rewind_requires_checkpoint: true,
+            ..Default::default()
+        };
+        let provider = RewindProvider {
+            label: "Claude Code",
+            capability: &capability,
+            native_history: true,
+        };
+        assert!(matches!(
+            rewind_target(&exchanges, 1, &provider),
+            Ok(Some(Some(checkpoint))) if checkpoint == "checkpoint-first"
+        ));
+        let refusal = rewind_target(&exchanges, 0, &provider).unwrap_err();
+        assert_eq!(refusal.code(), "rollback_unsupported");
+        let review = ExchangeRollbackReview::list(exchanges, &provider);
+        assert_eq!(review[0].rollback_unavailable, Some(refusal.to_string()));
+        assert_eq!(review[1].rollback_unavailable, None);
+
+        let rewinds_to_start = crate::provider::ProviderCapability {
+            conversation_rewind_requires_checkpoint: false,
+            ..capability.clone()
+        };
+        let provider = RewindProvider {
+            capability: &rewinds_to_start,
+            ..provider
+        };
+        let exchanges = vec![finished_exchange("first", 1)];
+        assert!(matches!(
+            rewind_target(&exchanges, 0, &provider),
+            Ok(Some(None))
+        ));
+    }
+
+    /// Build a finished primary exchange whose provider turn reported `checkpoint-<id>`.
+    fn finished_exchange(id: &str, ordinal: u64) -> Exchange {
+        let delegation = crate::agent::Delegation {
+            id: format!("delegation-{id}"),
+            parent_exchange_id: String::new(),
+            parent_turn_id: None,
+            child_agent_id: crate::session::HarnessSession::primary_agent_id("session"),
+            child_exchange_id: id.into(),
+            task: format!("prompt {id}"),
+            created_at_ms: ordinal as i64,
+        };
+        let mut exchange = Exchange::delegated("session", &delegation, ordinal);
+        exchange.phase = crate::exchange::ExchangePhase::fixture(
+            crate::exchange::ExchangeState::Complete,
+            Some(ordinal as i64),
+            None,
+        );
+        exchange.provider_checkpoint_id = Some(format!("checkpoint-{id}"));
+        exchange
     }
 
     /// Create file-free authority for deterministic comparison.

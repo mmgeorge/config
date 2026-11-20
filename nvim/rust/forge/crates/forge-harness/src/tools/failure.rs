@@ -472,8 +472,7 @@ pub(crate) fn control_tool_failure_text(
             format!("No changes were applied. Fix them and retry with expected_version {version}.")
         }),
         "plan_submit" if filesystem_planning => Some("Fix the reported files in the planning directory, then call plan_submit with the plan ID. No expected version is required.".into()),
-        "plan_submit" => active_version
-            .map(|version| format!("Fix them and retry with expected_version {version}.")),
+        "plan_submit" => Some("Fix them and call plan_submit again.".into()),
         "plan_phase_done"
             if code_hint.contains_key(
                 crate::declaration::DeclarationDiagnosticKind::VerificationReport.code(),

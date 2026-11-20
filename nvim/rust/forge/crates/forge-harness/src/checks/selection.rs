@@ -264,8 +264,7 @@ impl RunRequest {
     pub(crate) fn selections(
         &self,
         config: &CheckConfig,
-        files: &[String],
-        has_scope: bool,
+        inventory: &super::ChangeInventory,
     ) -> Result<BTreeMap<String, CheckSelection>> {
         let known: BTreeSet<_> = config
             .definitions
@@ -301,11 +300,12 @@ impl RunRequest {
                     CheckScope::All => CheckSelection::All,
                     CheckScope::Paths | CheckScope::Tests => {
                         ensure!(
-                            has_scope,
+                            inventory.tracked(),
                             "{} requires declared inputs or full context outside a task execution",
                             definition.id
                         );
-                        let paths = files
+                        let paths = inventory
+                            .files()
                             .iter()
                             .filter(|file| definition.trigger.matches_path(file))
                             .cloned()
@@ -423,7 +423,9 @@ mod adapter_selection_tests {
         )
         .unwrap();
         let request = RunRequest::try_from(request).unwrap();
-        let selected = request.selections(&config, &[], false).unwrap();
+        let selected = request
+            .selections(&config, &crate::checks::ChangeInventory::Untracked)
+            .unwrap();
         assert_eq!(
             selected["compiler"],
             CheckSelection::Paths {
@@ -439,7 +441,11 @@ mod adapter_selection_tests {
             let request =
                 RunRequest::try_from(serde_json::from_value::<CheckRunRequest>(value).unwrap())
                     .unwrap();
-            assert!(request.selections(&config, &[], false).is_err());
+            assert!(
+                request
+                    .selections(&config, &crate::checks::ChangeInventory::Untracked)
+                    .is_err()
+            );
         }
         let request = RunRequest::try_from(
             serde_json::from_value::<CheckRunRequest>(
@@ -469,14 +475,21 @@ mod adapter_selection_tests {
             ..Default::default()
         });
         assert_eq!(
-            request.selections(&config, &[], true).unwrap()["unit"],
+            request
+                .selections(&config, &crate::checks::ChangeInventory::Known(Vec::new()))
+                .unwrap()["unit"],
             selection
         );
         let request = RunRequest::default();
-        let empty = request.selections(&config, &[], true).unwrap();
+        let empty = request
+            .selections(&config, &crate::checks::ChangeInventory::Known(Vec::new()))
+            .unwrap();
         assert!(empty["unit"].default_empty());
         let selected = request
-            .selections(&config, &["tests/unit.lua".into()], true)
+            .selections(
+                &config,
+                &crate::checks::ChangeInventory::Known(vec!["tests/unit.lua".into()]),
+            )
             .unwrap();
         assert_eq!(
             selected["unit"],

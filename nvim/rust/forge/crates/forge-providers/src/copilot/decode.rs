@@ -192,13 +192,31 @@ pub fn unsigned_field(value: &Value, fields: &[&str]) -> Option<u64> {
         .find_map(|field| value.get(*field).and_then(Value::as_u64))
 }
 
-/// Recognizes both native denial codes without treating execution failures as rejections.
-pub fn is_denied(data: &Value) -> bool {
-    data.get("success").and_then(Value::as_bool) == Some(false)
+/// Name the actor that refused a denied tool, or `None` when the completion is no denial.
+///
+/// Both native denial codes count, while execution failures do not. Copilot prefixes a
+/// pre-tool hook's refusal with "Denied by preToolUse hook:", so Harness's own barrier is told
+/// apart from another hook and from a refusal the provider reports without naming an actor.
+pub fn denial_reason(data: &Value) -> Option<&'static str> {
+    let denied = data.get("success").and_then(Value::as_bool) == Some(false)
         && matches!(
             data.pointer("/error/code").and_then(Value::as_str),
             Some("denied" | "rejected")
-        )
+        );
+    if !denied {
+        return None;
+    }
+    let message = data
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(match message.strip_prefix("Denied by preToolUse hook:") {
+        Some(reason) if reason.trim() == super::permission::HOST_BARRIER_DENIAL => {
+            "Harness refused this operation before it ran"
+        }
+        Some(_) => "A Copilot pre-tool hook denied this operation",
+        None => "Provider denied this operation",
+    })
 }
 
 #[cfg(test)]
@@ -212,17 +230,46 @@ mod tests {
     #[test]
     fn rejected_shell_completions_are_denials() {
         let completion = |message: &str, code: &str| json!({"toolCallId":"call","success":false,"error":{"message":message,"code":code}});
-        assert!(super::is_denied(&completion(
+        assert!(super::denial_reason(&completion(
             "The user rejected this tool call. User feedback: Tool call rejected. Reason: Rejected by the user.",
             "denied",
-        )));
-        assert!(super::is_denied(&completion(
-            "The user rejected this tool call.",
-            "rejected"
-        )));
-        assert!(!super::is_denied(&completion(
-            "Shell operation failed",
-            "failure"
-        )));
+        ))
+        .is_some());
+        assert!(
+            super::denial_reason(&completion("The user rejected this tool call.", "rejected"))
+                .is_some()
+        );
+        assert!(super::denial_reason(&completion("Shell operation failed", "failure")).is_none());
+    }
+
+    /// A denial names the actor that refused the tool, as Copilot's completion message does.
+    ///
+    /// Every denial once read "Provider denied this operation", although the refusals of a
+    /// subagent's tools came from Harness's own pre-tool hook.
+    #[test]
+    fn denial_reason_names_the_refusing_actor() {
+        let completion = |message: &str| json!({"toolCallId":"call","success":false,"error":{"message":message,"code":"denied"}});
+        let harness = format!(
+            "Denied by preToolUse hook: {}",
+            super::super::permission::HOST_BARRIER_DENIAL
+        );
+        assert_eq!(
+            super::denial_reason(&completion(&harness)),
+            Some("Harness refused this operation before it ran")
+        );
+        assert_eq!(
+            super::denial_reason(&completion("Denied by preToolUse hook: blocked by policy")),
+            Some("A Copilot pre-tool hook denied this operation")
+        );
+        assert_eq!(
+            super::denial_reason(&completion("The user rejected this tool call.")),
+            Some("Provider denied this operation")
+        );
+        assert_eq!(
+            super::denial_reason(
+                &json!({"toolCallId":"call","success":false,"error":{"message":"Shell operation failed","code":"failure"}})
+            ),
+            None
+        );
     }
 }

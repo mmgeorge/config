@@ -827,6 +827,74 @@ impl<'plan> PlanTaskEntry<'plan> {
 }
 
 impl PlanDocument {
+    /// Report whether a reviewed document plans the same work as the submitted revision.
+    ///
+    /// A check toggle rewrites how the selection is spelled, such as an explicit list in place
+    /// of the default, and regenerates `docs/checks.md` and the authoring fingerprint that binds
+    /// it, so the documents compare by their effective selection instead. The fingerprint is a
+    /// digest of the authored text and baselines the comparison already reads, and text compares
+    /// with LF line endings, because a provider on Windows writes CRLF files that Harness's own
+    /// rewrite of the planning directory turns into LF.
+    pub(crate) fn plans_same_work(&self, reviewed: &Self) -> Result<bool> {
+        let comparable = |document: &Self| -> Result<serde_json::Value> {
+            let mut value = serde_json::to_value(document)?;
+            value["version"] = serde_json::Value::Null;
+            let Some(design) = value
+                .get_mut("design")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                return Ok(value);
+            };
+            let selection = design
+                .get("check_preview")
+                .and_then(serde_json::Value::as_array)
+                .map(|checks| {
+                    checks
+                        .iter()
+                        .map(|check| {
+                            serde_json::json!([check["id"], check["scope"], check["selected"]])
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for field in [
+                "check_preview",
+                "check_preview_source",
+                "authoring_fingerprint",
+            ] {
+                design.remove(field);
+            }
+            design.insert("check_selection".into(), selection.into());
+            if let Some(text) = design
+                .get_mut("artifact_text")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                text.remove(super::PlanArtifact::Checks.path());
+            }
+            for field in ["artifact_text", "proposed_source"] {
+                if let Some(text) = design
+                    .get_mut(field)
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    for value in text.values_mut() {
+                        if let Some(authored) = value.as_str() {
+                            *value = super::design_artifact::lf_line_endings(authored).into();
+                        }
+                    }
+                }
+            }
+            if let Some(plan) = design
+                .get_mut("document")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                plan.remove("checks");
+                plan.remove("disabled_checks");
+            }
+            Ok(value)
+        };
+        Ok(self == reviewed || comparable(self)? == comparable(reviewed)?)
+    }
+
     /// Apply one optimistic declaration patch without exposing the immutable baseline to edits.
     pub fn patch_design(
         &self,

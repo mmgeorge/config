@@ -123,6 +123,7 @@ impl PlanReferenceIndex {
         let mut lua_function = BTreeMap::<(String, String), (u32, u32)>::new();
         let mut lua_index = BTreeMap::new();
         let mut removed_symbol = BTreeSet::new();
+        let mut unresolved_module_import = Vec::new();
         if !baseline {
             for (path, file) in &design.baseline {
                 if !design.proposed_source.contains_key(path)
@@ -340,6 +341,8 @@ impl PlanReferenceIndex {
                         symbol,
                         None,
                     );
+                } else if import.source.is_some() && !import.glob && !import.namespace {
+                    unresolved_module_import.push((path.clone(), import.clone()));
                 }
             }
             let callable = DeclarationCalls::extract(path, text, true)
@@ -394,6 +397,7 @@ impl PlanReferenceIndex {
             }
             output.declaration.insert(path.clone(), index);
         }
+        output.resolve_planned_module_imports(&files, side, unresolved_module_import);
         let mut capture_by_path = BTreeMap::new();
         let mut capture_by_identity = BTreeMap::new();
         for (path, index) in &output.declaration {
@@ -590,6 +594,59 @@ impl PlanReferenceIndex {
             }
         }
         Ok(output)
+    }
+
+    /// Bind imports and re-exports that name another planned file by a relative module path,
+    /// such as a TypeScript barrel's `export { name } from "./module"`, to the declaration that
+    /// file defines under the imported name.
+    ///
+    /// The resolver reads modules through the workspace, where a file the plan adds does not
+    /// exist yet, so these sites would otherwise keep a renamed declaration's old name.
+    fn resolve_planned_module_imports(
+        &mut self,
+        files: &BTreeMap<String, String>,
+        side: &str,
+        imports: Vec<(String, forge_diff::syntax::DeclarationImport)>,
+    ) {
+        for (path, import) in imports {
+            let (Some(source), Some(name)) = (import.source.as_deref(), import.path.last()) else {
+                continue;
+            };
+            let Some(module) = planned_module(files, &path, source) else {
+                continue;
+            };
+            let rows = files[&module].lines().collect::<Vec<_>>();
+            let Some(identity) = self
+                .definition
+                .range((module.clone(), 0, 0)..=(module.clone(), u32::MAX, u32::MAX))
+                .find(|((_, line, column), _)| {
+                    rows.get(*line as usize - 1)
+                        .and_then(|row| row.get(*column as usize..))
+                        .is_some_and(|tail| {
+                            tail.starts_with(name.as_str())
+                                && !tail[name.len()..].starts_with(|character: char| {
+                                    character == '_' || character.is_alphanumeric()
+                                })
+                        })
+                })
+                .map(|(_, (identity, _))| identity.clone())
+            else {
+                continue;
+            };
+            self.push(
+                ReferenceSite {
+                    path: &path,
+                    side,
+                    owner: &import.scope.join("::"),
+                    line: import.position.line,
+                    column: import.position.column,
+                },
+                &import.path.join("::"),
+                "import",
+                identity,
+                None,
+            );
+        }
     }
 
     /// Locate a Calls definition in the selected snapshot or its unchanged source symbol.
@@ -801,7 +858,7 @@ impl PlanReferenceIndex {
                 && !index.import.iter().any(|import| !import.export
                     && import.alias.as_deref() == Some(name)
                     && same_scope(&import.scope, &symbol.scope)),
-            "a symbol or import with this name already exists in this scope"
+            "`{name}` already exists in this scope"
         );
         if definition_path.ends_with(".lua") {
             let owner = symbol
@@ -820,12 +877,12 @@ impl PlanReferenceIndex {
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?
                 .iter()
                 .any(|function| function.owner.replace(':', ".") == owner),
-                "a symbol with this name already exists in this scope"
+                "`{name}` already exists in this scope"
             );
         }
         let mut edits = BTreeMap::<String, BTreeSet<(u32, u32)>>::new();
         edits
-            .entry(definition_path)
+            .entry(definition_path.clone())
             .or_default()
             .insert((symbol.position.line, symbol.position.column));
         for reference in self.occurrence.iter().filter(|reference| {
@@ -938,6 +995,53 @@ impl PlanReferenceIndex {
                 .unwrap_or_default();
             design.parsed_insert(&path, declarations, calls)?;
         }
+        let symbols = super::review_symbols::NarrativeSymbols::new(
+            original_design,
+            std::path::Path::new(""),
+        )?;
+        let rewrite = |text: &mut String, kind: NarrativeText| {
+            for offset in
+                narrative_mentions(text, &symbols, &definition_path, &symbol, kind, &mut false)
+                    .into_iter()
+                    .rev()
+            {
+                text.replace_range(offset..offset + symbol.name.len(), name);
+            }
+        };
+        let rename = |text: &mut String| rewrite(text, NarrativeText::Prose);
+        let narrative = &mut design.document;
+        rename(&mut narrative.objective);
+        narrative.usage.iter_mut().for_each(rename);
+        narrative.requirements.iter_mut().for_each(rename);
+        rename(&mut narrative.background);
+        for decision in &mut narrative.decisions {
+            rename(&mut decision.decision);
+            rename(&mut decision.rationale);
+        }
+        rename(&mut narrative.design);
+        rename(&mut narrative.flows);
+        narrative.manual_checks.iter_mut().for_each(rename);
+        narrative
+            .tests
+            .iter_mut()
+            .flat_map(|file| &mut file.cases)
+            .for_each(|case| rewrite(&mut case.description, NarrativeText::TestDescription));
+        // Authored artifact text would otherwise keep presenting the old name.
+        for artifact in super::design_artifact::changed_artifacts(
+            &document.title,
+            original_design,
+            &document.title,
+            &design,
+        ) {
+            if matches!(
+                artifact,
+                super::design_artifact::PlanArtifact::Overview
+                    | super::design_artifact::PlanArtifact::Flows
+                    | super::design_artifact::PlanArtifact::Tests
+            ) {
+                super::design_artifact::revert_authored(artifact, &mut design);
+            }
+        }
         output.design = Some(design);
         output.version = output
             .version
@@ -1017,6 +1121,45 @@ impl PlanReferenceIndex {
                     .then_some(reference.symbol.as_str())
             })
     }
+}
+
+/// Find the planned file a relative module path names from `importer`, trying the extensions a
+/// TypeScript or JavaScript import may leave out or spell as `.js`.
+fn planned_module(
+    files: &BTreeMap<String, String>,
+    importer: &str,
+    source: &str,
+) -> Option<String> {
+    if !source.starts_with("./") && !source.starts_with("../") {
+        return None;
+    }
+    let mut parts = importer.split('/').collect::<Vec<_>>();
+    parts.pop();
+    for segment in source.split('/') {
+        match segment {
+            "." | "" => {}
+            ".." => {
+                parts.pop()?;
+            }
+            segment => parts.push(segment),
+        }
+    }
+    let base = parts.join("/");
+    let stem = [".js", ".mjs", ".cjs", ".jsx"]
+        .iter()
+        .find_map(|extension| base.strip_suffix(extension))
+        .unwrap_or(&base);
+    [
+        base.clone(),
+        format!("{stem}.ts"),
+        format!("{stem}.tsx"),
+        format!("{stem}.mts"),
+        format!("{stem}.js"),
+        format!("{base}/index.ts"),
+        format!("{base}/index.tsx"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate != importer && files.contains_key(candidate))
 }
 
 fn same_scope(previous: &[String], proposed: &[String]) -> bool {
@@ -1119,5 +1262,283 @@ fn lua_target(
         Some(lua_identity(file, owner))
     } else {
         None
+    }
+}
+
+/// How a rename reads one narrative text.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum NarrativeText {
+    /// Prose, where only code names declarations: inline code and fenced code blocks.
+    Prose,
+    /// A planned test's description, which names the code under test in plain words too.
+    TestDescription,
+}
+
+/// Find where narrative text names one planned declaration, as byte offsets of its name.
+///
+/// When no other proposed declaration shares the name, every whole-identifier occurrence is a
+/// mention: inside any inline-code span, such as a signature, on every row of a fenced code
+/// block, and anywhere in a test description. A name several declarations share is renamed only
+/// in an inline-code span whose whole content resolves to this declaration alone, since the
+/// reviewer's intent is otherwise unknown. Fence delimiter rows are never rewritten; `fence`
+/// carries whether the text so far left a fenced block open, so a caller reading the rows of one
+/// text one at a time passes the same flag to each.
+pub(super) fn narrative_mentions(
+    text: &str,
+    symbols: &super::review_symbols::NarrativeSymbols,
+    path: &str,
+    symbol: &forge_diff::syntax::DeclarationSymbol,
+    kind: NarrativeText,
+    fence: &mut bool,
+) -> Vec<usize> {
+    let names_symbol = |candidates: &[&super::review_symbols::Symbol]| {
+        matches!(
+            candidates,
+            [only] if only.destination.path.replace('\\', "/") == path.replace('\\', "/")
+                && only.destination.line == symbol.position.line
+                && only.destination.column == symbol.position.column
+        )
+    };
+    let unique = names_symbol(&symbols.matching(&symbol.name));
+    let identifier_character =
+        |character: char| character == '_' || character == '$' || character.is_alphanumeric();
+    let whole = |row: &str, start: usize, end: usize| {
+        let mut offsets = Vec::new();
+        for (offset, _) in row[start..end].match_indices(symbol.name.as_str()) {
+            let offset = start + offset;
+            let after = offset + symbol.name.len();
+            if row[..offset]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !identifier_character(character))
+                && row[after..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !identifier_character(character))
+            {
+                offsets.push(offset);
+            }
+        }
+        offsets
+    };
+    let identifier = |part: &str| {
+        let mut characters = part.chars();
+        characters
+            .next()
+            .is_some_and(|character| character == '_' || character.is_alphabetic())
+            && characters.all(|character| character == '_' || character.is_alphanumeric())
+    };
+    let mut mentions = Vec::new();
+    let mut row_start = 0;
+    for row in text.split('\n') {
+        let trimmed = row.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            *fence = !*fence;
+        } else if unique && (*fence || kind == NarrativeText::TestDescription) {
+            mentions.extend(
+                whole(row, 0, row.len())
+                    .into_iter()
+                    .map(|offset| row_start + offset),
+            );
+        } else {
+            let mut delimiters = row.match_indices('`').map(|(offset, _)| offset);
+            while let (Some(open), Some(close)) = (delimiters.next(), delimiters.next()) {
+                if unique {
+                    mentions.extend(
+                        whole(row, open + 1, close)
+                            .into_iter()
+                            .map(|offset| row_start + offset),
+                    );
+                    continue;
+                }
+                let content = &row[open + 1..close];
+                let normalized = content.replace("::", ".");
+                if normalized.split('.').all(identifier)
+                    && normalized.rsplit('.').next() == Some(symbol.name.as_str())
+                    && names_symbol(&symbols.matching(content))
+                {
+                    mentions.push(row_start + close - symbol.name.len());
+                }
+            }
+        }
+        row_start += row.len() + 1;
+    }
+    mentions
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::PlanReferenceIndex;
+
+    /// A plan whose narrative mentions `score` in every place a reviewer reads it, beside a
+    /// mention of another declaration and a longer name that merely starts with it.
+    pub(in crate::plan) fn scoring_plan() -> crate::plan::PlanDocument {
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Call `score` once per round; `play` drives it.".into();
+        design.document.requirements = vec!["Keep `score` pure and leave `scored` alone.".into()];
+        design.document.background = "Rounds have no scoring yet.".into();
+        design.document.design = "`Rounds::score` returns the round.".into();
+        design.document.flows =
+            "## Play\nEach round calls `score`.\n\n```mermaid\nflowchart TD\n  \
+            A[\"`play`\"] --> B[\"`score`\"]\n```"
+                .into();
+        design.document.tests = vec![crate::plan::design_tests::DesignTestFile {
+            file: "tests.rs".into(),
+            cases: vec![crate::plan::design_tests::DesignTestCase {
+                name: "scores_a_round".into(),
+                target: None,
+                change: crate::plan::design_tests::DesignTestChange::New,
+                description: "`score` returns its round.".into(),
+            }],
+        }];
+        design.proposed_source.insert(
+            "Rounds.rs".into(),
+            "/// Score one round.\npub fn score(round: u32) -> u32;\n\n/// Play every round.\npub fn play(rounds: u32);\n"
+                .into(),
+        );
+        design.parsed = crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())
+            .unwrap()
+            .parsed;
+        let mut document = crate::plan::test_fixture("plan", "Rounds");
+        document.design = Some(design);
+        document
+    }
+
+    fn score_identity(index: &PlanReferenceIndex) -> String {
+        index
+            .definition
+            .iter()
+            .find(|((path, line, _), _)| path == "Rounds.rs" && *line == 2)
+            .map(|(_, (identity, _))| identity.clone())
+            .unwrap()
+    }
+
+    /// A TypeScript plan that names `moneyAllocate` the ways a planner writes it: a signature in
+    /// inline code, a Usage code block, a test description, and a planned barrel re-export.
+    fn allocation_plan() -> crate::plan::PlanDocument {
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective =
+            "Add `moneyAllocate(amount: Money, parts: number): Money[]` beside `moneySplit`."
+                .into();
+        design.document.usage = Some(
+            "```ts
+const shares = moneyAllocate(total, 3);
+```"
+            .into(),
+        );
+        design.document.requirements =
+            vec!["`moneyAllocate` returns `parts` shares; `moneyAllocated` is unrelated.".into()];
+        design.document.design = "Keep moneyAllocate free of rounding drift.".into();
+        design.document.tests = vec![crate::plan::design_tests::DesignTestFile {
+            file: "tests/money.test.ts".into(),
+            cases: vec![crate::plan::design_tests::DesignTestCase {
+                name: "splits evenly".into(),
+                target: None,
+                change: crate::plan::design_tests::DesignTestChange::New,
+                description: "moneyAllocate splits 9 into three shares of 3.".into(),
+            }],
+        }];
+        design.proposed_source.insert(
+            "src/money.ts".into(),
+            "/** Allocate an amount into parts. */
+export function moneyAllocate(amount: Money, parts: number): Money[];
+
+/** Split an amount. */
+export function moneySplit(amount: Money): Money[];
+"
+            .into(),
+        );
+        design.proposed_source.insert(
+            "src/index.ts".into(),
+            "export {
+  moneyAllocate,
+  moneySplit,
+} from \"./money\";
+"
+            .into(),
+        );
+        design.parsed = crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())
+            .unwrap()
+            .parsed;
+        let mut document = crate::plan::test_fixture("plan", "Allocation");
+        document.design = Some(design);
+        document
+    }
+
+    /// A rename rewrites the identifier wherever the plan names it as a whole identifier: inside
+    /// a signature in inline code, in a code block, in a test description, and in a planned
+    /// re-export, while a longer name that starts with it stays.
+    #[test]
+    fn rename_rewrites_every_whole_identifier_use() {
+        let workspace = tempfile::tempdir().unwrap();
+        let document = allocation_plan();
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let identity = index
+            .definition
+            .iter()
+            .find(|((path, line, _), _)| path == "src/money.ts" && *line == 2)
+            .map(|(_, (identity, _))| identity.clone())
+            .unwrap();
+        let renamed = index
+            .renamed(&document, &identity, "moneyPortion")
+            .unwrap()
+            .design
+            .unwrap();
+        let narrative = &renamed.document;
+        assert_eq!(
+            (
+                narrative.objective.as_str(),
+                narrative.usage.as_deref().unwrap(),
+                narrative.requirements[0].as_str(),
+                narrative.tests[0].cases[0].description.as_str(),
+            ),
+            (
+                "Add `moneyPortion(amount: Money, parts: number): Money[]` beside `moneySplit`.",
+                "```ts
+const shares = moneyPortion(total, 3);
+```",
+                "`moneyPortion` returns `parts` shares; `moneyAllocated` is unrelated.",
+                "moneyPortion splits 9 into three shares of 3.",
+            )
+        );
+        let parsed = renamed.parsed().unwrap();
+        assert!(
+            parsed.proposed["src/index.ts"].contains("moneyPortion,")
+                && !parsed.proposed["src/index.ts"].contains("moneyAllocate"),
+            "{}",
+            parsed.proposed["src/index.ts"]
+        );
+    }
+
+    /// Renaming a declaration no other one shares the name of rewrites its inline-code mentions,
+    /// qualified ones included, in prose, test descriptions, flow text, and Mermaid labels.
+    #[test]
+    fn rename_rewrites_unique_inline_code_mentions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let document = scoring_plan();
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let renamed = index
+            .renamed(&document, &score_identity(&index), "tally")
+            .unwrap()
+            .design
+            .unwrap()
+            .document;
+        assert_eq!(
+            (
+                renamed.objective.as_str(),
+                renamed.requirements[0].as_str(),
+                renamed.design.as_str(),
+                renamed.tests[0].cases[0].description.as_str(),
+                renamed.flows.as_str(),
+            ),
+            (
+                "Call `tally` once per round; `play` drives it.",
+                "Keep `tally` pure and leave `scored` alone.",
+                "`Rounds::tally` returns the round.",
+                "`tally` returns its round.",
+                "## Play\nEach round calls `tally`.\n\n```mermaid\nflowchart TD\n  \
+                    A[\"`play`\"] --> B[\"`tally`\"]\n```",
+            )
+        );
     }
 }

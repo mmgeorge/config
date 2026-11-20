@@ -141,7 +141,9 @@ During execution, Check resolves the plan's new, modified, and reused tests to
 exact case IDs and runs those cases. Every required case must pass; a skipped
 case does not satisfy the plan even if its check passes. Removed tests require
 exact discovery to confirm their absence. Missing or ambiguous tests enter
-Resolve. With Planned selected, a test check owning no required cases is excluded
+Resolve; they fail the Check but stop no other check, so type checking,
+formatting, lint, and the planned tests that were found still run, and the
+Check heading names only the tests that are missing. With Planned selected, a test check owning no required cases is excluded
 after resolution. Whole suite still runs an enabled check with no planned cases,
 and every required planned case must pass even when the whole suite runs.
 Each Check retry resolves the tests again and records a new attempt. Results from
@@ -166,8 +168,14 @@ Resolve; Resolve retains `plan:checks.md` and `plan_edit`.
 
 `plan_submit` uses static discovery to check modified, reused, and removed test
 entries against enabled test adapters. Warnings identify the line in
-`plan:tests.md`, including ambiguous names across checks, missing tests, unsupported
-target selectors, and unavailable discovery. New tests wait for implementation.
+`plan:tests.md`, including ambiguous names across checks, missing tests, and
+unavailable discovery. New tests wait for implementation.
+Within its file, a planned test may be named by its own title, such as
+`splits evenly`, or with its enclosing groups, such as `money > splits evenly`;
+two cases that both match are ambiguous. The optional `[target: …]` names the
+test check that owns the test, by its ID or its label (`test` or `Vitest`),
+ignoring case. `plan_submit` refuses a target that names no test check, or
+several, and lists the valid targets.
 Static discovery does not verify removal or create passing test evidence; these
 warnings permit submission and do not replace execution-time checking.
 
@@ -467,6 +475,10 @@ verification, and creates a whole-check verification requirement that survives
 restart. With automatic checks disabled, the requirement stays pending until
 an explicit verification run or plan Checking satisfies it; it never starts
 a background check by itself.
+While the requirement is pending, a goal's completion request is refused: the
+goal stays active, and its next turn tells the model to run the originating
+checks first. A goal turn that ends while its own check run is still collecting
+also cannot complete the goal; the check result starts the next turn.
 Configured or task disabling leaves that requirement unresolved. Re-enable the
 check and run it again with whole-check coverage. Changes to automatic selection,
 scope, trigger, or display labels do not change the required tool identity;

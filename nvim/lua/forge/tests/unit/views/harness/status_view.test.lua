@@ -301,6 +301,42 @@ T["timeline_status"] = function()
 end
 
 
+-- Neovim draws no window by itself while Command-line mode reads a line, so a status published
+-- while the user sat at a `:` prompt stayed at its old text until the prompt was left, and an
+-- approval could expire unseen. The status split shows each publication at once instead.
+T["status_publications_draw_at_a_command_line_prompt"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.o.columns, child.o.lines = 80, 20
+  child.lua([[
+    vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
+    local layout = require("forge.views.harness.layout")
+    local transcript_buffer, transcript_window, _, composer_window = layout.open("command-line-status")
+    _G.status_view = require("forge.views.harness.status_view").new({
+      transcript = { document = "command-line-status", buffer = transcript_buffer },
+      transcript_window = transcript_window, composer_window = composer_window,
+      alive = function() return true end, notice = error, recover = function() end,
+    })
+    _G.publish = function(revision, text)
+      _G.status_view:apply({ document = "command-line-status:status", revision = revision, block = { { id = "status",
+        text = { text }, metadata = { target = {}, decoration = {}, editable_region = {},
+          status = { row = 0, animated = false, hint = "working" } } } } }, function() end)
+    end
+    _G.publish(1, "Working 1s")
+  ]])
+  local function screen() return table.concat(vim.tbl_map(table.concat, child.get_screenshot({ redraw = false }).text), "\n") end
+  wait_until(function() return screen():find("Working 1s", 1, true) ~= nil end, "the first status never drew")
+  child.type_keys(":ec")
+  eq(child.api.nvim_get_mode().mode, "c")
+  child.lua("_G.publish(2, 'Waiting for your approval')")
+  wait_until(function() return screen():find("Waiting for your approval", 1, true) ~= nil end,
+    "the status split did not draw while the editor was at a `:` prompt")
+  -- The prompt and its text survive the redraw.
+  local command_row = vim.split(screen(), "\n")[20]
+  eq({ child.api.nvim_get_mode().mode, child.fn.getcmdline(), vim.trim(command_row) }, { "c", "ec", ":ec" })
+end
+
 -- The hand-off flag in the recorded host status tells the transcript that a queued turn
 -- follows the settled exchange; ordinary work and an empty status report no hand-off.
 T["recorded_hand_off_status_reports_the_hand_off"] = function()

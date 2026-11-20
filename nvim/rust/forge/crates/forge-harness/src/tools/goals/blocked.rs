@@ -58,6 +58,7 @@ pub(super) fn record(
             permit: permit.clone(),
             termination: crate::goal::GoalTermination::Blocked,
             message: input.reason,
+            refusal: None,
         });
     }
     Ok(())

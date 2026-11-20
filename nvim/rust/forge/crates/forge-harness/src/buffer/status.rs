@@ -355,7 +355,10 @@ pub(super) struct RenderedStatus {
 fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
     match status {
         SessionPhase::Idle => "Idle".into(),
-        SessionPhase::Paused => "Paused".into(),
+        SessionPhase::Paused { waiting: None } => "Paused".into(),
+        SessionPhase::Paused {
+            waiting: Some(crate::session::state_machine::PausedWait::PlanReview { .. }),
+        } => "Paused · plan review waits · /task resume".into(),
         SessionPhase::Stopping { collection } => collection.label().into(),
         SessionPhase::Compacting { .. } => {
             let elapsed_seconds = status.elapsed_ms(now_ms) / 1_000;
@@ -478,7 +481,13 @@ fn check_heading(checks: &CheckActivity, now_ms: i64) -> String {
     )
 }
 
-/// Render every selected command, expanding live progress and retaining failure causes.
+/// Render one row per selected command, with live progress and failure causes on that row.
+///
+/// The run selects its commands when it starts, so the check tree reaches its height in one
+/// step and each command changes its text in place as it starts, reports progress, and finishes.
+/// Detail rows below each command once appeared and disappeared with every start and pass, and
+/// the status split changed height several times a second, scrolling the transcript beside it.
+/// A row wider than the window still wraps, so no detail is lost.
 fn append_checks(
     block: &mut BufferBlock,
     width: &WidthProfile,
@@ -503,7 +512,6 @@ fn append_checks(
     for (command_index, command) in checks.command_list.iter().enumerate() {
         let last = command_index + 1 == checks.command_list.len();
         let branch = if last { "└─" } else { "├─" };
-        let continuation = if last { "   " } else { "│  " };
         let (marker, outcome) = match command.state {
             CheckState::Pending => ("○", "queued"),
             CheckState::Running => ("⠋", "running"),
@@ -523,10 +531,6 @@ fn append_checks(
         if command.state == CheckState::Running {
             running_rows.push(lines.len());
         }
-        lines.push(format!(
-            "{root}{branch} {marker} {} · {outcome}{elapsed}",
-            command.title
-        ));
         let mut details = Vec::new();
         if let Some(selection) = &command.selection {
             details.push(selection.clone());
@@ -594,14 +598,14 @@ fn append_checks(
         {
             details.push(output_line.clone());
         }
-        for (detail_index, detail) in details.iter().enumerate() {
-            let detail_branch = if detail_index + 1 == details.len() {
-                "└─"
-            } else {
-                "├─"
-            };
-            lines.push(format!("{root}{continuation}{detail_branch} {detail}"));
-        }
+        let details: String = details
+            .iter()
+            .map(|detail| format!(" · {detail}"))
+            .collect();
+        lines.push(format!(
+            "{root}{branch} {marker} {} · {outcome}{elapsed}{details}",
+            command.title
+        ));
     }
     let rendered = TranscriptRenderer::new(width)?.literal(
         BlockId(format!("{}:checks", block.id.0)),
@@ -860,14 +864,115 @@ mod tests {
     };
     use std::path::Path;
 
+    /// Keep the check tree at one height while its commands start, report progress, and finish.
+    ///
+    /// Detail rows under each command appeared when it started and disappeared when it passed,
+    /// so the status split grew and shrank several times within a second of checks starting.
+    #[test]
+    fn check_tree_height_is_fixed_by_its_selected_commands() -> Result<()> {
+        let command = |title: &str, state: CheckState| CheckCommandActivity {
+            title: title.into(),
+            selection: None,
+            started_at_ms: (state != CheckState::Pending).then_some(0),
+            completed_at_ms: matches!(state, CheckState::Passed | CheckState::Failed)
+                .then_some(1_000),
+            state,
+            output_line: None,
+            progress: None,
+        };
+        let diagnostics =
+            AdapterProgress::Diagnostics(serde_json::from_value(serde_json::json!({
+                "targets_finished": 0, "targets_total": null, "errors": 0, "warnings": 0
+            }))?);
+        let mut typecheck_running = command("Type check", CheckState::Running);
+        typecheck_running.progress = Some(diagnostics);
+        let mut tests_queued = command("Tests", CheckState::Pending);
+        tests_queued.selection = Some("2 tests selected".into());
+        let mut tests_running = command("Tests", CheckState::Running);
+        tests_running.selection = Some("2 tests selected".into());
+        let mut events = TestEventSink::new(TestSelection::default(), Path::new("unused-output"))?;
+        events.accept(TestEvent::Phase {
+            name: TestPhase::Run,
+            message: None,
+        })?;
+        tests_running.progress = Some(AdapterProgress::Tests(events.progress()));
+        let mut tests_passed = command("Tests", CheckState::Passed);
+        tests_passed.selection = Some("2 tests selected".into());
+        let mut lint_failed = command("Lint", CheckState::Failed);
+        lint_failed.output_line = Some("unknown field".into());
+        let stages = [
+            vec![
+                command("Type check", CheckState::Pending),
+                command("Tests", CheckState::Pending),
+                command("Lint", CheckState::Pending),
+            ],
+            vec![
+                typecheck_running,
+                tests_queued.clone(),
+                command("Lint", CheckState::Pending),
+            ],
+            vec![
+                command("Type check", CheckState::Passed),
+                tests_running,
+                command("Lint", CheckState::Pending),
+            ],
+            vec![
+                command("Type check", CheckState::Passed),
+                tests_passed.clone(),
+                command("Lint", CheckState::Running),
+            ],
+            vec![
+                command("Type check", CheckState::Passed),
+                tests_passed,
+                lint_failed,
+            ],
+        ];
+        let working = SessionPhase::Working {
+            duration_ms: 0,
+            started_at_ms: Some(0),
+            activity: WorkflowActivity::Checking,
+            reasoning_summary: None,
+            execution: None,
+        };
+        for status in [&SessionPhase::Idle, &working] {
+            let mut heights = Vec::new();
+            for command_list in &stages {
+                let checks = CheckActivity {
+                    run_id: "run".into(),
+                    duration_ms: 0,
+                    started_at_ms: Some(0),
+                    completed_count: 0,
+                    total_count: command_list.len(),
+                    command_list: command_list.clone(),
+                };
+                let block = StatusView {
+                    id: "status",
+                    status,
+                    agents: &[],
+                    status_thoughts: false,
+                    checks: Some(&checks),
+                }
+                .render(&WidthProfile::default(), 2_000)?
+                .block
+                .unwrap();
+                heights.push(block.text.row_count());
+            }
+            assert!(
+                heights.iter().all(|height| *height == heights[0]),
+                "the check tree changed height as its commands progressed: {heights:?}"
+            );
+        }
+        Ok(())
+    }
+
     /// Omit unknown formatting coverage until the adapter reports a file outcome.
     #[test]
     fn format_details_require_reported_progress() {
         for (total, reported, expected) in [
-            (None, 0, None),
-            (Some(40), 0, Some("   └─ 0/40 files · 0 unformatted")),
-            (Some(40), 12, Some("   └─ 12/40 files · 0 unformatted")),
-            (None, 12, Some("   └─ 12 file outcomes · 0 unformatted")),
+            (None, 0, ""),
+            (Some(40), 0, " · 0/40 files · 0 unformatted"),
+            (Some(40), 12, " · 12/40 files · 0 unformatted"),
+            (None, 12, " · 12 file outcomes · 0 unformatted"),
         ] {
             let checks = CheckActivity {
                 run_id: "run".into(),
@@ -903,12 +1008,13 @@ mod tests {
             .unwrap()
             .block
             .unwrap();
-            let mut expected_rows = vec![
-                "Checking · 0/1 finished · 2s",
-                "└─ ⠋ Formatting · running · 2s",
-            ];
-            expected_rows.extend(expected);
-            assert_eq!(block.text.wire_rows(), expected_rows);
+            assert_eq!(
+                block.text.wire_rows(),
+                [
+                    "Checking · 0/1 finished · 2s".to_owned(),
+                    format!("└─ ⠋ Formatting · running · 2s{expected}"),
+                ]
+            );
         }
     }
 
@@ -939,14 +1045,14 @@ mod tests {
                     name: TestPhase::Build,
                     message: None,
                 },
-                "   └─ Building",
+                " · Building",
             ),
             (
                 TestEvent::Phase {
                     name: TestPhase::Build,
                     message: Some("Built forge-diff".into()),
                 },
-                "   └─ Building · Built forge-diff",
+                " · Building · Built forge-diff",
             ),
             (
                 TestEvent::Plan {
@@ -954,14 +1060,14 @@ mod tests {
                     widened: None,
                     items: Vec::new(),
                 },
-                "   └─ Building · Built forge-diff",
+                " · Building · Built forge-diff",
             ),
             (
                 TestEvent::Phase {
                     name: TestPhase::Run,
                     message: None,
                 },
-                "   └─ 0/0 tests · 0 failed",
+                " · 0/0 tests · 0 failed",
             ),
         ] {
             events.accept(event).unwrap();
@@ -978,9 +1084,8 @@ mod tests {
             assert_eq!(
                 rendered.block.unwrap().text.wire_rows(),
                 [
-                    "Checking · 0/1 finished · 27s",
-                    "└─ ⠋ Run Rust tests · running · 27s",
-                    expected,
+                    "Checking · 0/1 finished · 27s".to_owned(),
+                    format!("└─ ⠋ Run Rust tests · running · 27s{expected}"),
                 ]
             );
         }
@@ -1064,16 +1169,14 @@ mod tests {
         .block
         .unwrap();
         assert_eq!(
-            &block.text.wire_rows()[..8],
+            &block.text.wire_rows()[..6],
             &[
                 "Working · 18s",
                 "└─ Checking · 2/4 finished · 18s",
                 "   ├─ ✓ format · passed · 1s",
-                "   ├─ ✗ lint · failed · 2s",
-                "   │  └─ unknown field",
-                "   ├─ ⠋ tests · running · 15s",
-                "   │  ├─ Building · Built test targets",
-                "   │  └─ Running session tests",
+                "   ├─ ✗ lint · failed · 2s · unknown field",
+                "   ├─ ⠋ tests · running · 15s · Building · Built test targets · Running session tests",
+                "   └─ ○ Lua host tests · queued · skill_marker_aligns_with_commentary",
             ]
         );
         let document = BufferDocument::new(DocumentId("status-layout:status".into()), vec![block])?;
@@ -1097,10 +1200,21 @@ mod tests {
         .block
         .unwrap();
         let rows = block.text.wire_rows();
-        assert!(rows.contains(&"└─ ⠋ Lua host tests · running · 3s"));
-        assert!(rows.contains(&"   ├─ skill_marker_aligns_with_commentary"));
-        assert!(rows.contains(&"│  └─ Running session tests"));
-        assert!(rows.contains(&"   └─ Compiling forge"));
+        let text = rows.join(
+            "
+",
+        );
+        assert!(
+            text.contains(
+                "└─ ⠋ Lua host tests · running · 3s · skill_marker_aligns_with_commentary"
+            ),
+            "{rows:#?}"
+        );
+        assert!(text.contains("Compiling forge"), "{rows:#?}");
+        assert!(
+            text.contains("├─ ⠋ tests · running · 15s · Building · Built test targets"),
+            "{rows:#?}"
+        );
         let markers = block
             .metadata
             .decoration

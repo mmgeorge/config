@@ -51,6 +51,21 @@ local function display_entry(input, entry)
   return target
 end
 
+-- Purposes of input the host produces for a task itself, never submitted by any view.
+local host_produced_purpose = {
+  task_entry = true, task_continuation = true, workflow_continuation = true,
+  question_continuation = true, check_result = true,
+}
+
+---@param entry table
+---@return boolean
+local function host_produced(entry)
+  local purpose = entry.purpose
+  return type(purpose) == "table" and host_produced_purpose[purpose.kind] == true
+end
+
+local notice_overdue
+
 -- Get whether an unclaimed message belongs in the queued follow-up list.
 --
 -- Only the host knows where an automatic submission goes: an idle session starts it as a turn, an
@@ -59,7 +74,9 @@ end
 -- after a cancellation and for every steer. An automatic submission from this view therefore awaits
 -- its claim undrawn, in `awaiting_claim`, until the notice delay shows that it waits. The queue draws
 -- every other unsettled message: one the user queued, one that failed or is reserved for an edit,
--- any message while the queue is paused, and messages this view did not submit. An unanswered
+-- any message while the queue is paused, and messages another view submitted. Input the host
+-- produces for a task, such as its planning or continuation input, is claimed as promptly as an
+-- automatic submission, so `render` enters it in `awaiting_claim` too. An unanswered
 -- draft ignores a pause, because the host resumes the queue when it admits an automatic one.
 local function waits_in_queue(input, entry)
   if input.follow_up[entry.id] or not input.awaiting_claim[entry.id] then return true end
@@ -99,7 +116,14 @@ local function render(state)
           destination = steering
           input.running_steer[entry.id] = true
         else destination = input.follow_up[entry.id] and handoff or submitting end
-      else destination = waits_in_queue(input, entry) and queue or submitting end
+      else
+        if host_produced(entry) and entry.delivery == "queued" and not input.follow_up[entry.id]
+          and not input.awaiting_claim[entry.id] then
+          input.awaiting_claim[entry.id] = true
+          notice_overdue(state, input, entry.id)
+        end
+        destination = waits_in_queue(input, entry) and queue or submitting
+      end
       place(entry, destination)
     end
   end
@@ -124,7 +148,7 @@ end
 -- does through a stop or a provider restart, answers minutes later. Until then the prompt would
 -- exist nowhere on screen. The delay keeps an ordinary submission, answered and claimed at once,
 -- from opening the status split for one frame.
-local function notice_overdue(state, input, id)
+notice_overdue = function(state, input, id)
   vim.defer_fn(function()
     if state.input ~= input or not owns_input(state, input) then return end
     local confirmed = input.confirmed[index_of(input.confirmed, id) or 0]

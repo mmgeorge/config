@@ -953,7 +953,7 @@ mod tests {
             root,
             std::sync::Arc::new(crate::trace::TraceStore::open(root)?),
         )?;
-        SessionInputQueue::open(root, "session", &submissions)
+        SessionInputQueue::open(root, "session", &submissions, &Default::default())
     }
 
     /// Create caller input without native delivery evidence.

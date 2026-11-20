@@ -246,9 +246,8 @@ pub(crate) struct CheckAdmission {
     pub overrides: BTreeMap<String, bool>,
     /// Task settings before any reviewer exclusions are merged into enabled selections.
     pub task_overrides: super::CheckOverrides,
-    /// None means the task has no complete change inventory.
-    pub files: Option<Vec<String>>,
-    pub has_scope: bool,
+    /// Changed paths that select automatic checks and default path scopes.
+    pub inventory: super::ChangeInventory,
     pub shell: crate::session::CheckShell,
     pub trigger: String,
     pub task_id: Option<String>,
@@ -647,8 +646,7 @@ impl CheckSupervisor {
             request,
             overrides,
             task_overrides,
-            files,
-            has_scope,
+            inventory,
             shell,
             trigger,
             task_id,
@@ -701,10 +699,9 @@ impl CheckSupervisor {
                 snapshot,
                 overrides,
                 task_overrides,
-                changed_files: files.clone().unwrap_or_default(),
+                changed_files: inventory.files().to_vec(),
             },
             lifecycle: Vec::new(),
-            completed_plan: None,
             shell,
             executable: shell.executable().ok(),
             workspace: self.workspace.to_string_lossy().into_owned(),
@@ -729,8 +726,7 @@ impl CheckSupervisor {
             workspace_digest: BTreeMap::new(),
             commands: Vec::new(),
         };
-        let applicability =
-            super::applicability::resolve(&request, &effective, files.as_deref(), has_scope)?;
+        let applicability = super::applicability::resolve(&request, &effective, &inventory)?;
         let requested: std::collections::BTreeSet<_> = applicability
             .iter()
             .filter(|item| item.selected)
@@ -748,11 +744,7 @@ impl CheckSupervisor {
                 .map(|id| (id.clone(), CheckSelection::All))
                 .collect()
         } else {
-            effective_request.selections(
-                &effective,
-                files.as_deref().unwrap_or_default(),
-                has_scope,
-            )?
+            effective_request.selections(&effective, &inventory)?
         };
         let purposes: BTreeMap<_, _> = effective
             .definitions
@@ -804,8 +796,11 @@ impl CheckSupervisor {
                             .into(),
                     ),
                 )
-            } else if empty_default && files.is_none() && has_scope {
+            } else if empty_default && inventory == super::ChangeInventory::Unavailable {
                 (CheckState::ConfigurationError, Some("Task change inventory is unavailable. Supply declared inputs or explicitly select full context.".into()))
+            } else if inventory == super::ChangeInventory::Pending {
+                // The initial scan replaces this attempt before any command starts.
+                (CheckState::Pending, None)
             } else if empty_default {
                 (CheckState::Skipped, Some("No matching task changes".into()))
             } else if operation.is_none()
@@ -1348,15 +1343,18 @@ impl CheckSupervisor {
             if run.state == CheckState::Interrupted {
                 return Ok(());
             }
-            if run
+            // Missing or ambiguous planned tests fail the gate after the run; they never stop
+            // checks that do not depend on them. Only an attempt without one complete
+            // resolution of its captured source starts nothing.
+            if let Some(reason) = run
                 .planned_tests
                 .as_ref()
-                .is_some_and(|planned| !planned.resolved())
+                .and_then(super::PlannedTestExecution::execution_blocker)
             {
                 for command in &mut run.commands {
                     if command.state == CheckState::Pending {
                         command.state = CheckState::Skipped;
-                        command.error = Some("Not started: planned tests did not resolve".into());
+                        command.error = Some(format!("Not started: {reason}"));
                     }
                 }
                 run.state = CheckState::Failed;

@@ -239,12 +239,23 @@ pub(crate) struct SessionInputQueue {
 
 impl SessionInputQueue {
     /// Restore accepted input suspended, retaining delivery evidence without replaying it.
+    ///
+    /// `exchanged_inputs` names the inputs that already own an exchange in the transcript. A
+    /// prompt interrupted before dispatch is shown once: as that interrupted exchange when one
+    /// exists, otherwise as a failed queue entry the user retries explicitly.
     pub(crate) fn open(
         root: &std::path::Path,
         session_id: &str,
         submissions: &Arc<crate::provider::submission::SubmissionStore>,
+        exchanged_inputs: &std::collections::HashSet<String>,
     ) -> Result<Self> {
-        Self::open_channel(root, session_id, submissions, InputChannel::User)
+        Self::restore(
+            root,
+            session_id,
+            submissions,
+            InputChannel::User,
+            exchanged_inputs,
+        )
     }
 
     /// Restore one delivery channel without sharing its control or idempotency state.
@@ -253,6 +264,16 @@ impl SessionInputQueue {
         session_id: &str,
         submissions: &Arc<crate::provider::submission::SubmissionStore>,
         channel: InputChannel,
+    ) -> Result<Self> {
+        Self::restore(root, session_id, submissions, channel, &Default::default())
+    }
+
+    fn restore(
+        root: &std::path::Path,
+        session_id: &str,
+        submissions: &Arc<crate::provider::submission::SubmissionStore>,
+        channel: InputChannel,
+        exchanged_inputs: &std::collections::HashSet<String>,
     ) -> Result<Self> {
         // Load active input independently of completed interaction history.
         let mut journal = journal::InputJournal::open_channel(root, session_id, channel)?;
@@ -300,6 +321,11 @@ impl SessionInputQueue {
                             if channel == InputChannel::CheckResults {
                                 submissions.submission(id)?.retire_prepared()?;
                                 message.queue();
+                            } else if exchanged_inputs.contains(&message.id) {
+                                // The transcript already shows this prompt as an interrupted
+                                // exchange, so it settles there and never runs again.
+                                submissions.submission(id)?.retire_prepared()?;
+                                cancelled.insert(message.id.clone());
                             } else {
                                 message.set_delivery(
                                     InputDelivery::Failed,
@@ -837,6 +863,25 @@ impl SessionInputQueue {
             .and_then(InputMessage::submission_id)
     }
 
+    /// Resume a paused queue, keeping each prompt it held as its own turn.
+    ///
+    /// The held prompts were submitted one by one while nothing ran, so each is a separate
+    /// request. Left steerable, every prompt behind the first resumed one would join that turn
+    /// as steering, out of submission order.
+    fn resume_held(snapshot: &mut InputSnapshot, update: &mut InputUpdate) {
+        snapshot.suspended = false;
+        snapshot.control_revision += 1;
+        for message in snapshot.messages.iter_mut().filter(|message| {
+            message.intent == InputIntent::Auto
+                && matches!(message.purpose, InputPurpose::User)
+                && message.delivery() == InputDelivery::Queued
+        }) {
+            message.intent = InputIntent::Queue;
+            message.revision += 1;
+            update.upsert.push(message.clone());
+        }
+    }
+
     fn apply_action(
         snapshot: &mut InputSnapshot,
         action: InputAction,
@@ -857,14 +902,10 @@ impl SessionInputQueue {
                 // A retry asks to send this message now. A paused queue would hold it with
                 // nothing left to resume delivery, so the retry resumes the queue as well.
                 if snapshot.suspended {
-                    snapshot.suspended = false;
-                    snapshot.control_revision += 1;
+                    Self::resume_held(snapshot, update);
                 }
             }
-            InputAction::Resume => {
-                snapshot.suspended = false;
-                snapshot.control_revision += 1;
-            }
+            InputAction::Resume => Self::resume_held(snapshot, update),
             InputAction::Submit { message } => {
                 let mut message = *message;
                 message.revision = 1;
@@ -1242,6 +1283,14 @@ impl SessionInputQueue {
             message.set_delivery(delivery, submission_id, error)?;
             message.revision += 1;
             update.upsert.push(message.clone());
+            // A failed user prompt stays first and blocks every later follow-up until it is
+            // retried, so the queue is paused and says so, as restart recovery leaves it.
+            if self.channel == InputChannel::User
+                && delivery == InputDelivery::Failed
+                && matches!(message.purpose, InputPurpose::User)
+            {
+                state.snapshot.suspended = true;
+            }
         } else {
             state.snapshot.messages.remove(index);
             update.removed.push(id.into());

@@ -162,8 +162,8 @@ impl ActiveCommand {
                 broker
                     .cancel_question_delivery()
                     .map_err(super::transition::TransitionFailure::Domain)?;
-                // A cancel pauses the queue only when it stops something: foreground work or an
-                // unfinished task, which `owner_cancel_local` pauses below. With neither, the
+                // A cancel pauses the queue only when it stops something: foreground work or a
+                // task with an attempt to stop, which `owner_cancel_local` pauses below. With neither, the
                 // status row may still have read `Working` after a turn ended, and pausing would
                 // strand every queued message, including one held open for editing, with
                 // nothing left to resume delivery.
@@ -171,7 +171,7 @@ impl ActiveCommand {
                     .tasks
                     .current()
                     .map_err(super::transition::TransitionFailure::Domain)?
-                    .is_some_and(|task| !task.status().terminal());
+                    .is_some_and(|task| crate::broker::interrupt_pauses(task.status()));
                 let mut input = if foreground_absent && !task_pauses {
                     None
                 } else {

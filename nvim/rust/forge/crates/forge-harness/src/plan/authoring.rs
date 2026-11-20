@@ -252,6 +252,22 @@ impl PlanFileStore {
             .join(plan_id)
     }
 
+    /// Remove the editable tree of a plan that no longer accepts edits.
+    ///
+    /// A cancelled plan's draft must not stay beside a later plan's directory, where its
+    /// files and review notes could be read as current work. The submitted revisions under
+    /// the plan directory remain, so transcript rows still open the cancelled plan.
+    pub(crate) fn authoring_remove(&self, session_id: &str, plan_id: &str) -> Result<()> {
+        let directory = self.authoring_directory(session_id, plan_id);
+        match std::fs::remove_dir_all(&directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("remove plan workspace {}", directory.display()))
+            }
+        }
+    }
+
     /// Create the initial editable tree without replacing an existing draft.
     pub(crate) fn authoring_create(&self, session_id: &str, document: &PlanDocument) -> Result<()> {
         let Some(design) = &document.design else {
@@ -332,7 +348,7 @@ impl PlanFileStore {
         }
         let inventory = directory_contents(&directory)?;
         let ledger = self.authoring_ledger(session_id, &document.plan_id)?;
-        let fingerprint = super::digest(&super::codec::to_vec(&(&inventory, &ledger.baseline))?);
+        let fingerprint = authoring_fingerprint(&inventory, &ledger.baseline)?;
         let path = self
             .plan_dir(session_id, &document.plan_id)
             .join("draft-observation.json");
@@ -491,9 +507,10 @@ impl PlanFileStore {
                     directory.join(&relative).display()
                 )
             })?;
-            design
-                .artifact_text
-                .insert(artifact.path().into(), text.clone());
+            design.artifact_text.insert(
+                artifact.path().into(),
+                super::design_artifact::lf_line_endings(text),
+            );
         }
         for (path, text) in &inventory {
             if let Some(path) = path.strip_prefix("files/") {
@@ -516,7 +533,7 @@ impl PlanFileStore {
         {
             document.title = title.trim().into();
         }
-        let fingerprint = super::digest(&super::codec::to_vec(&(&inventory, &design.baseline))?);
+        let fingerprint = authoring_fingerprint(&inventory, &design.baseline)?;
         let unchanged = design.authoring_fingerprint.as_ref() == Some(&fingerprint);
         design.authoring_fingerprint = Some(fingerprint);
         if !unchanged {
@@ -656,10 +673,7 @@ impl PlanFileStore {
             .design
             .as_mut()
             .context("review requires semantic structure")?;
-        design.authoring_fingerprint = Some(super::digest(&super::codec::to_vec(&(
-            &inventory,
-            &design.baseline,
-        ))?));
+        design.authoring_fingerprint = Some(authoring_fingerprint(&inventory, &design.baseline)?);
         Ok(())
     }
 
@@ -680,12 +694,12 @@ impl PlanFileStore {
         let root = self.authoring_directory(session_id, &document.plan_id);
         let current = directory_contents(&root)?;
         let desired = authored_inputs(document)?;
-        let current_fingerprint = super::digest(&super::codec::to_vec(&(
+        let current_fingerprint = authoring_fingerprint(
             &current,
             &self
                 .authoring_ledger(session_id, &document.plan_id)?
                 .baseline,
-        ))?);
+        )?;
         ensure!(
             [&original, document].into_iter().any(|candidate| candidate
                 .design
@@ -713,6 +727,25 @@ impl PlanFileStore {
 }
 
 /// Render only authored inputs, preserving text overrides and keeping host data outside the draft.
+/// Fingerprint what the planner authored: each file's text with LF line endings, and the
+/// captured baselines.
+///
+/// Providers on Windows may write CRLF files, and Harness rewrites the directory in its own LF
+/// form, so raw bytes would differ while the plan stays the same. Every side of the comparison,
+/// submission, settlement, and review, uses this one form.
+fn authoring_fingerprint(
+    inventory: &BTreeMap<String, String>,
+    baseline: &BTreeMap<String, DeclarationFile>,
+) -> Result<String> {
+    let authored = inventory
+        .iter()
+        .map(|(path, text)| (path, super::design_artifact::lf_line_endings(text)))
+        .collect::<BTreeMap<_, _>>();
+    Ok(super::digest(&super::codec::to_vec(&(
+        &authored, baseline,
+    ))?))
+}
+
 fn authored_inputs(document: &PlanDocument) -> Result<BTreeMap<String, String>> {
     let design = document
         .design
@@ -851,6 +884,48 @@ fn directory_contents(root: &Path) -> Result<BTreeMap<String, String>> {
     Ok(contents)
 }
 
+impl PlanFileStore {
+    /// Read the inline review comments saved on the reviewed working document.
+    ///
+    /// Every acceptance source reads them here: a decision from the review, automatic
+    /// acceptance, and the continuation after acceptance questions. A saved comment turns the
+    /// acceptance into a revision first. Questions and blank comments are not revision feedback,
+    /// and a follow-up carries its conversation so the planner sees what it answers.
+    pub(crate) fn saved_review_comments(
+        &self,
+        reviewed: &super::review_source::PlanReviewSource,
+    ) -> Result<Vec<super::PlanAnnotationInput>> {
+        let mut store = super::review_annotation::ReviewAnnotationStore::open(
+            reviewed.path.with_extension("json"),
+            reviewed.saved_digest.clone(),
+        )?;
+        if reviewed.saved_navigation.is_some() {
+            store.reanchor(&reviewed.rendered.navigation)?;
+        }
+        store
+            .annotation()
+            .iter()
+            .filter(|annotation| {
+                annotation.kind == super::ReviewAnnotationKind::Comment
+                    && !annotation.source.body.trim().is_empty()
+            })
+            .map(|annotation| {
+                let mut source = annotation.source.clone();
+                if annotation.parent_id.is_some() {
+                    let thread = store.thread_context(annotation)?;
+                    source.body = format!(
+                        "Conversation context:
+{thread}Requested change:
+{}",
+                        source.body
+                    );
+                }
+                Ok(source)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,6 +1019,143 @@ mod tests {
         Ok(())
     }
 
+    /// A planned-test deletion recomputes the check preview the tests feed and persists the full
+    /// render of the edited document, so the review captured from the draft opens again.
+    #[tokio::test]
+    async fn deleted_test_leaves_a_draft_review_that_opens() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        fs::write(
+            temporary.path().join(".forge.json"),
+            r#"{"checks":{"test":{"trigger":{"auto":true},"action":{"category":"test","adapter":{"script":{"command":["unused-test-runner"]}}}}}}"#,
+        )?;
+        let files = PlanFileStore::new(temporary.path().join("storage"), temporary.path())?;
+        let prepared = files.prepare_entry("session", "Document a plan.".into(), None, 1)?;
+        let plan_id = prepared.record.id;
+        let directory = files.authoring_directory("session", &plan_id);
+        fs::write(
+            directory.join("docs/overview.md"),
+            "# Plan\n\n## Objective\nKeep state.\n\n## Background\nNo changes yet.\n\n## Design\nRetain the public contract.\n",
+        )?;
+        fs::write(
+            directory.join("docs/tests.md"),
+            "## tests.rs\n- new `checks_state`: State stays independent.\n- new `checks_order`: Order stays stable.\n",
+        )?;
+        let original = files.read_working_document("session", &plan_id)?;
+        let mut document = files.authoring_import("session", &original)?;
+        let validated = document
+            .design
+            .as_ref()
+            .unwrap()
+            .validated(temporary.path(), &document.title)
+            .await?;
+        document.design = Some(validated.into_design());
+        assert!(document.design.as_ref().unwrap().check_preview_current()?);
+        let (_, _, checksum) = files.submit_validated_document_revision_if_unchanged(
+            "session",
+            &plan_id,
+            1,
+            original.version,
+            &original,
+            document.clone(),
+        )?;
+        let (reviewed, _, checksum) = files
+            .remove_tests(
+                "session",
+                &plan_id,
+                document.version,
+                &checksum,
+                &[super::super::DesignTestSelection {
+                    file: "tests.rs".into(),
+                    name: "checks_state".into(),
+                }],
+                None,
+            )
+            .await?;
+        assert!(reviewed.design.as_ref().unwrap().check_preview_current()?);
+        assert_eq!(
+            fs::read_to_string(files.plan_dir("session", &plan_id).join("working.md"))?,
+            files.render_review(&reviewed)?.markdown
+        );
+        files.capture_review_source("session", &plan_id, None, &checksum)?;
+        Ok(())
+    }
+
+    /// Toggling a check off and on again leaves the plan the planner submitted. The planned
+    /// tests select the test check without `docs/checks.md` naming it, and the toggle regenerates
+    /// that file, which a planner on Windows wrote with CRLF line endings, so the edited document
+    /// spells the same selection differently and carries another authoring fingerprint; neither
+    /// makes it a different plan.
+    #[tokio::test]
+    async fn undone_check_toggle_plans_the_submitted_work() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        fs::write(
+            temporary.path().join(".forge.json"),
+            r#"{"checks":{"test":{"trigger":{"auto":true},"action":{"category":"test","adapter":{"script":{"command":["unused-test-runner"]}}}}}}"#,
+        )?;
+        let files = PlanFileStore::new(temporary.path().join("storage"), temporary.path())?;
+        let prepared = files.prepare_entry("session", "Document a plan.".into(), None, 1)?;
+        let plan_id = prepared.record.id;
+        let directory = files.authoring_directory("session", &plan_id);
+        let crlf = |text: &str| text.replace('\n', "\r\n");
+        fs::write(
+            directory.join("docs/overview.md"),
+            crlf(
+                "# Plan\n\n## Objective\nKeep state.\n\n## Background\nNo changes yet.\n\n## Design\nRetain the public contract.\n",
+            ),
+        )?;
+        fs::write(
+            directory.join("docs/tests.md"),
+            crlf("## tests.rs\n- new `checks_state`: State stays independent.\n"),
+        )?;
+        fs::write(directory.join("docs/checks.md"), crlf("\n"))?;
+        let original = files.read_working_document("session", &plan_id)?;
+        let mut document = files.authoring_import("session", &original)?;
+        let validated = document
+            .design
+            .as_ref()
+            .unwrap()
+            .validated(temporary.path(), &document.title)
+            .await?;
+        document.design = Some(validated.into_design());
+        let (submitted, _, mut checksum) = files.submit_validated_document_revision_if_unchanged(
+            "session",
+            &plan_id,
+            1,
+            original.version,
+            &original,
+            document,
+        )?;
+        let mut reviewed = submitted.clone();
+        for enabled in [false, true] {
+            let (edited, _, edited_checksum) = files
+                .update_checks(
+                    "session",
+                    &plan_id,
+                    reviewed.version,
+                    &checksum,
+                    super::super::PlanCheckSelection {
+                        enabled: &BTreeMap::from([("test".to_owned(), enabled)]),
+                        test_scopes: &BTreeMap::new(),
+                        removed_tests: &[],
+                    },
+                    None,
+                )
+                .await?;
+            (reviewed, checksum) = (edited, edited_checksum);
+        }
+        assert_ne!(
+            reviewed, submitted,
+            "the toggles must respell the selection for this case to prove anything"
+        );
+        assert!(
+            files
+                .read_submitted_document("session", &plan_id, 1)?
+                .plans_same_work(&reviewed)?,
+            "an undone check toggle changed the planned work"
+        );
+        Ok(())
+    }
+
     /// Reject edits to reviewed drafts instead of accepting an obsolete snapshot.
     #[tokio::test]
     async fn review_updates_authored_tests_without_overwriting_newer_edits() -> Result<()> {
@@ -986,17 +1198,19 @@ mod tests {
             files.authoring_progress("session", &document)?,
             (false, false)
         );
-        let (reviewed, _, _) = files.remove_tests(
-            "session",
-            &plan_id,
-            document.version,
-            &checksum,
-            &[super::super::DesignTestSelection {
-                file: "tests.rs".into(),
-                name: "checks_state".into(),
-            }],
-            None,
-        )?;
+        let (reviewed, _, _) = files
+            .remove_tests(
+                "session",
+                &plan_id,
+                document.version,
+                &checksum,
+                &[super::super::DesignTestSelection {
+                    file: "tests.rs".into(),
+                    name: "checks_state".into(),
+                }],
+                None,
+            )
+            .await?;
         assert!(fs::read_to_string(directory.join("docs/tests.md"))?.is_empty());
         files.authoring_require_current("session", &reviewed)?;
         assert_eq!(
@@ -1161,6 +1375,76 @@ mod tests {
             let original = files.read_working_document("session", &plan_id)?;
             assert!(files.authoring_import("session", &original).is_err());
         }
+        Ok(())
+    }
+
+    /// Import authored docs written with CRLF as LF text, while the fingerprint still binds the
+    /// raw directory bytes.
+    #[test]
+    fn import_stores_authored_docs_with_lf_line_endings() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        crate::checks::configure_fixture(temporary.path());
+        let files = PlanFileStore::new(temporary.path().join("storage"), temporary.path())?;
+        let prepared = files.prepare_entry("session", "Document a flow.".into(), None, 1)?;
+        let plan_id = prepared.record.id;
+        let directory = files.authoring_directory("session", &plan_id);
+        fs::write(
+            directory.join("docs/flows.md"),
+            "## Flow\r\nRuns once.\r\n\r\n```mermaid\r\nflowchart TD\r\n  a --> b\r\n```\r\n",
+        )?;
+        let original = files.read_working_document("session", &plan_id)?;
+        let document = files.authoring_import("session", &original)?;
+        let design = document.design.as_ref().unwrap();
+        assert_eq!(
+            design.artifact_text[PlanArtifact::Flows.path()],
+            "## Flow\nRuns once.\n\n```mermaid\nflowchart TD\n  a --> b\n```\n"
+        );
+        files.authoring_require_current("session", &document)?;
+        Ok(())
+    }
+
+    /// A provider that writes CRLF plan files on Windows submits the same plan that Harness's
+    /// LF rewrite of the directory then holds, so settlement must not find the draft changed.
+    #[tokio::test]
+    async fn line_endings_alone_leave_a_submitted_draft_current() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        crate::checks::configure_fixture(temporary.path());
+        let files = PlanFileStore::new(temporary.path().join("storage"), temporary.path())?;
+        let prepared = files.prepare_entry("session", "Document a plan.".into(), None, 1)?;
+        let plan_id = prepared.record.id;
+        let directory = files.authoring_directory("session", &plan_id);
+        let overview = "# Plan\n\n## Objective\nKeep state.\n\n## Background\nNo changes yet.\n\n## Design\nRetain the public contract.\n";
+        let tests = "## tests.rs\n- new `checks_state`: State stays independent.\n";
+        fs::write(
+            directory.join("docs/overview.md"),
+            overview.replace('\n', "\r\n"),
+        )?;
+        fs::write(directory.join("docs/tests.md"), tests.replace('\n', "\r\n"))?;
+        let original = files.read_working_document("session", &plan_id)?;
+        let mut document = files.authoring_import("session", &original)?;
+        let validated = document
+            .design
+            .as_ref()
+            .unwrap()
+            .validated(temporary.path(), &document.title)
+            .await?;
+        document.design = Some(validated.into_design());
+        files.submit_validated_document_revision_if_unchanged(
+            "session",
+            &plan_id,
+            1,
+            original.version,
+            &original,
+            document.clone(),
+        )?;
+        fs::write(directory.join("docs/overview.md"), overview)?;
+        fs::write(directory.join("docs/tests.md"), tests)?;
+        let (_, dirty) = files.authoring_progress("session", &document)?;
+        assert!(
+            !dirty,
+            "rewriting the same plan with LF line endings marked the draft changed"
+        );
+        files.authoring_require_current("session", &document)?;
         Ok(())
     }
 }

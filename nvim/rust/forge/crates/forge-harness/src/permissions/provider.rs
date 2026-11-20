@@ -397,15 +397,11 @@ impl ProviderPermissionContext {
                 event_sink,
                 execution_kind,
             } => {
-                let reason = denial
-                    .reason
-                    .as_deref()
-                    .unwrap_or("Harness policy rejected this tool call.");
                 // A failed record leaves the provider's own denial on the row; the refusal stands.
                 let _ = PermissionCoordinator::record_policy_denial(
                     event_sink.as_ref(),
                     &recorded,
-                    reason,
+                    &denial.row_reason(),
                     execution_kind,
                 )
                 .await;
@@ -494,23 +490,25 @@ impl ProviderPermissionContext {
                 "Task authority changed before permission approval: {error:#}"
             )));
         }
-        if let Some(writer) = request.target_list.iter().find_map(|target| match target {
+        let shell_writer = request.target_list.iter().find_map(|target| match target {
             crate::permissions::matcher::PermissionTarget::Command { command, shell } => {
                 crate::permissions::command::shell_file_writer(command, shell.unwrap_or_default())
             }
             _ => None,
-        }) {
-            return refuse(Denial::shell_writer(writer));
-        }
-        if request.target_list.iter().any(|target| {
-            matches!(
-                target,
-                crate::permissions::matcher::PermissionTarget::Write { .. }
-                    | crate::permissions::matcher::PermissionTarget::UnknownFile {
-                        operation: crate::permissions::directory::DirectoryOperation::Write
-                    }
-            )
-        }) {
+        });
+        // Writes-off decides first: a shell writer is still a write, and sending the model to a
+        // file-editing tool that writes-off would refuse next only delays the real answer.
+        if shell_writer.is_some()
+            || request.target_list.iter().any(|target| {
+                matches!(
+                    target,
+                    crate::permissions::matcher::PermissionTarget::Write { .. }
+                        | crate::permissions::matcher::PermissionTarget::UnknownFile {
+                            operation: crate::permissions::directory::DirectoryOperation::Write
+                        }
+                )
+            })
+        {
             match self.coordinator.writes_disabled(Some(scope)) {
                 Ok(true) => return refuse(Denial::writes_off()),
                 Ok(false) => {}
@@ -520,6 +518,9 @@ impl ProviderPermissionContext {
                     )));
                 }
             }
+        }
+        if let Some(writer) = shell_writer {
+            return refuse(Denial::shell_writer(writer));
         }
         let protected = match self.coordinator.store().read() {
             Ok(store) => protected_target(&request, &store),
@@ -656,11 +657,10 @@ impl ProviderPermissionContext {
             Ok(ApprovalResolution::DenyMode) => {
                 RequestDecision::Respond(Denial::mode().response(Some(current_mode())))
             }
-            Ok(
-                ApprovalResolution::DenyOnce
-                | ApprovalResolution::DenyExact
-                | ApprovalResolution::DenyBroad,
-            ) => deny(Denial::user()),
+            Ok(ApprovalResolution::DenyOnce) => deny(Denial::user_once()),
+            Ok(ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad) => {
+                deny(Denial::user_rule())
+            }
             Ok(ApprovalResolution::Cancel) => {
                 RequestDecision::Respond(PermissionResponse::Cancelled)
             }
@@ -706,6 +706,11 @@ enum DenialNext {
     DoNotRetry,
     /// File edits have a permitted route; direct the model to it instead of forbidding retries.
     UseFileEditingTool,
+    /// The user refused this one call, or nobody answered it in time, so it stays refused only
+    /// until the user asks for it.
+    AwaitUserRequest,
+    /// Writes are off for the session; only the user can turn them back on.
+    EnableWrites,
 }
 
 /// Explain one refusal to the model: who decided, why, and what to do next.
@@ -733,19 +738,30 @@ impl Denial {
         }
     }
 
-    fn user() -> Self {
+    /// The user chose "Deny once": refuse this call without forbidding a later request.
+    fn user_once() -> Self {
         Self {
             source: DenialSource::User,
             reason: None,
+            next: DenialNext::AwaitUserRequest,
+        }
+    }
+
+    /// The user saved a deny rule, which keeps refusing every matching request.
+    fn user_rule() -> Self {
+        Self {
+            source: DenialSource::User,
+            reason: Some("The user saved a rule that denies this operation.".into()),
             next: DenialNext::DoNotRetry,
         }
     }
 
+    /// Nobody answered in time: refuse this call without forbidding a request the user makes.
     fn timeout() -> Self {
         Self {
             source: DenialSource::ApprovalTimeout,
             reason: None,
-            next: DenialNext::DoNotRetry,
+            next: DenialNext::AwaitUserRequest,
         }
     }
 
@@ -770,9 +786,30 @@ impl Denial {
     }
 
     fn writes_off() -> Self {
-        Self::policy(
-            "Filesystem writing is off for this session. Tell the user the change needs writes; they can enable them with /write.",
-        )
+        Self {
+            source: DenialSource::HarnessPolicy,
+            reason: Some(
+                "Filesystem writing is off for this session; the user can enable it with /write."
+                    .into(),
+            ),
+            next: DenialNext::EnableWrites,
+        }
+    }
+
+    /// Summarize the refusal for the tool row: its cause, then what happens next.
+    fn row_reason(&self) -> String {
+        let reason = self
+            .reason
+            .as_deref()
+            .unwrap_or("Harness policy rejected this tool call.");
+        match self.next {
+            DenialNext::UseFileEditingTool => {
+                format!("{reason} The model was told to make the edit with its file-editing tool.")
+            }
+            DenialNext::DoNotRetry | DenialNext::AwaitUserRequest | DenialNext::EnableWrites => {
+                reason.to_owned()
+            }
+        }
     }
 
     /// Render the model-facing text for the approval mode in force.
@@ -809,7 +846,15 @@ impl Denial {
                 }
             }
             DenialNext::UseFileEditingTool => parts.push(
-                "Do not write files from the shell. Make this edit now with your file-editing tool, such as apply_patch."
+                "Do not write files from the shell. Make this edit now with your file-editing tool."
+                    .into(),
+            ),
+            DenialNext::AwaitUserRequest => parts.push(
+                "Do not repeat this call in this turn unless the user asks you to; if the user asks, request it again and the user can approve it."
+                    .into(),
+            ),
+            DenialNext::EnableWrites => parts.push(
+                "Do not retry it or write through another tool. Tell the user the change needs writes, which they can enable with /write."
                     .into(),
             ),
         }
@@ -856,13 +901,13 @@ mod tests {
         assert!(message.contains("Harness policy rejected this tool call"));
         assert!(message.contains("writing is off"));
         assert!(message.contains("/write"));
-        assert!(message.contains("Do not retry or bypass this denial"));
+        assert!(message.contains("Do not retry it or write through another tool"));
     }
 
     /// Only the user's own rejection is attributed to the user.
     #[test]
     fn only_user_rejections_name_the_user_as_the_actor() {
-        let user = Denial::user().message(None);
+        let user = Denial::user_once().message(None);
         assert!(user.starts_with("The user rejected this tool call."));
         for denial in [
             Denial::policy("rule"),
@@ -876,6 +921,148 @@ mod tests {
         let deny_mode = Denial::mode().message(Some(ApprovalMode::Deny));
         assert!(deny_mode.contains("current approval mode denies"));
         assert!(deny_mode.contains(forge_provider_api::forge::REJECT_ALL_GUIDANCE));
+    }
+
+    /// A one-time user rejection forbids repeating the call only until the user asks for it.
+    ///
+    /// "Deny once" used to carry "Do not retry or bypass this denial", and Copilot then refused to
+    /// request the command again even when the user asked it to, citing that prohibition. Only a
+    /// saved deny rule keeps a standing prohibition.
+    #[test]
+    fn one_time_user_rejection_allows_a_new_request_when_the_user_asks() {
+        let once = Denial::user_once().message(Some(ApprovalMode::Ask));
+        assert!(
+            once.starts_with("The user rejected this tool call."),
+            "{once}"
+        );
+        assert!(once.contains("in this turn unless the user asks"), "{once}");
+        assert!(!once.contains("Do not retry or bypass"), "{once}");
+        let rule = Denial::user_rule().message(Some(ApprovalMode::Ask));
+        assert!(
+            rule.starts_with("The user rejected this tool call"),
+            "{rule}"
+        );
+        assert!(
+            rule.contains("Do not retry or bypass this denial"),
+            "{rule}"
+        );
+    }
+
+    /// An expired approval forbids only an automatic retry: when the user asks for the operation
+    /// again, the model requests it again.
+    ///
+    /// The expiry used to carry "Do not retry or bypass this denial", and Copilot then refused a
+    /// fresh explicit user request, citing that the prior tool response prohibited retrying.
+    #[test]
+    fn expired_approval_allows_a_new_request_when_the_user_asks() {
+        for mode in [Some(ApprovalMode::Ask), Some(ApprovalMode::Deny), None] {
+            let expired = Denial::timeout().message(mode);
+            assert!(
+                expired.starts_with("The approval request expired before the user answered"),
+                "{expired}"
+            );
+            assert!(expired.contains("unless the user asks"), "{expired}");
+            assert!(expired.contains("request it again"), "{expired}");
+            assert!(!expired.contains("Do not retry or bypass"), "{expired}");
+            assert!(
+                !expired.contains(forge_provider_api::forge::REJECT_ALL_GUIDANCE),
+                "{expired}"
+            );
+        }
+    }
+
+    /// No refusal names one provider's file tool, because each provider exposes its own.
+    ///
+    /// The shell-writer refusal named `apply_patch` to Claude Code, whose file tools are Write and
+    /// Edit.
+    #[test]
+    fn shell_writer_denial_names_no_provider_specific_tool() {
+        let message = Denial::shell_writer("Set-Content").message(Some(ApprovalMode::Ask));
+        assert!(message.contains("your file-editing tool"), "{message}");
+        assert!(!message.contains("apply_patch"), "{message}");
+    }
+
+    /// The tool row's short reason carries the next step, not only the cause.
+    ///
+    /// The row read only "`Set-Content` writes files through the shell, where Harness cannot check
+    /// the target path.", leaving the user to guess what the model was told to do instead.
+    #[test]
+    fn row_reasons_include_the_next_step() {
+        let shell = Denial::shell_writer("Set-Content").row_reason();
+        assert!(shell.contains("writes files through the shell"), "{shell}");
+        assert!(shell.contains("file-editing tool"), "{shell}");
+        let off = Denial::writes_off().row_reason();
+        assert!(off.contains("/write"), "{off}");
+    }
+
+    /// With writes off, a shell write is refused as a write, naming `/write`.
+    ///
+    /// The shell-writer check ran first, so a `Set-Content` command under `/write` off was told to
+    /// use the file-editing tool, which writes-off then refused as well.
+    #[tokio::test]
+    async fn shell_write_with_writes_off_is_refused_as_writes_off() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let coordinator =
+            PermissionCoordinator::load(root.path().join("permissions.json"), root.path())?;
+        let owner = crate::provider::ThreadOwner::root("session");
+        let scope = forge_provider_api::InvocationScope::new(owner.clone(), "writes-off-turn");
+        let provider_request = crate::provider::ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: root.path().display().to_string(),
+            input: crate::provider::ProviderInput::from_user_text("Write the notes"),
+            mode: crate::provider::PromptMode::Chat,
+            model: "default".into(),
+            effort: "default".into(),
+            context_window: None,
+            service_tier: crate::provider::ServiceTier::Standard,
+            access: crate::session::AccessPolicy {
+                sandbox: false,
+                write_access: crate::session::WriteScope::Off,
+                ..Default::default()
+            },
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: None,
+            submission: None,
+            acknowledged_child_reports: Vec::new(),
+            recovered_input: Vec::new(),
+            control_context: None,
+            child_agent: None,
+        };
+        let _directories = coordinator.directories(None, &provider_request, &scope)?;
+        let context = ProviderPermissionContext::new(coordinator);
+        let (events, _receiver) = crate::provider::events::channel(scope.clone());
+        context.configure(
+            owner,
+            ApprovalMode::Ask,
+            root.path().display().to_string(),
+            Some(events),
+        )?;
+        let response = context
+            .authorize(
+                &scope,
+                PermissionRequest {
+                    id: "shell-write".into(),
+                    provider: forge_providers::registry::nonselectable_id().unwrap(),
+                    subject: forge_provider_api::permissions::PermissionSubject::Unattached,
+                    reason: None,
+                    target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
+                        command: "Set-Content notes.txt hello".into(),
+                        shell: Some(forge_shell::shell::CommandShell::PowerShell),
+                    }],
+                },
+            )
+            .await;
+        let PermissionResponse::Deny {
+            reason: Some(reason),
+        } = response
+        else {
+            panic!("the shell write was not denied: {response:?}");
+        };
+        assert!(reason.contains("/write"), "{reason}");
+        assert!(!reason.contains("file-editing tool"), "{reason}");
+        Ok(())
     }
 
     /// Standing Allow policy cannot reopen writes after terminal intent, while reads remain available.

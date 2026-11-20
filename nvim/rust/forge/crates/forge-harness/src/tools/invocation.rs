@@ -75,7 +75,16 @@ impl ControlToolInvocation {
         };
         let captured =
             anyhow::Context::context(turn_permit, "task control has no admitted turn permit")?;
-        let current = controller.admit_dispatched(kind, captured)?;
+        // Reads change nothing, so an execution discussion reads its plan while the execution
+        // is paused or blocked; only the task identity and revision must still match.
+        let current = if kind == crate::task::TaskKind::Execute
+            && matches!(self.name.as_str(), "plan_read" | "plan_status")
+        {
+            captured.validate(controller.current()?.as_ref())?;
+            captured.clone()
+        } else {
+            controller.admit_dispatched(kind, captured)?
+        };
         if captured.revision() != current.revision() {
             return Err(crate::task::StaleTask.into());
         }

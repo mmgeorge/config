@@ -43,7 +43,8 @@ pub struct DesignTestCase {
     /// Includes the module qualification when needed to identify the test.
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional runner target used when a name belongs to multiple executables.
+    /// Names the test check that owns this test, by the check's ID or label, when the name
+    /// alone matches cases in several test checks.
     pub target: Option<String>,
     /// Distinguishes additions, edits, removals, and unchanged coverage.
     pub change: DesignTestChange,

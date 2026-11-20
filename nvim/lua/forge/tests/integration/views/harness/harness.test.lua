@@ -326,8 +326,7 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   eq(status.content.lines[1]:find("<C-c> interrupt · oe answer questions │ ", 1, true) ~= nil, true)
   eq(status.content.lines[2], "  ├─ Checking · 2/4 finished · 18s")
   eq(status.content.lines[3], "  │  ├─ ✓ format · passed · 1s")
-  eq(status.content.lines[9], "  │  └─ ○ Lua host tests · queued")
-  eq(status.content.lines[10], "  │     └─ skill_marker_aligns_with_commentary")
+  eq(status.content.lines[6], "  │  └─ ○ Lua host tests · queued · skill_marker_aligns_with_commentary")
   eq(table.concat(status.content.lines, "\n"):find("nvim/lua/forge/tests", 1, true), nil)
   eq(status.content.lines[#status.content.lines], "  └─ Should this apply to all sessions?")
   eq(table.concat(status.content.lines, "\n"):find("unknown field", 1, true) ~= nil, true)
@@ -336,8 +335,8 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   local marks = vim.api.nvim_buf_get_extmarks(status.buffer, status.animation_namespace, 0, -1, { details = true })
   eq(#marks, 2)
   local check_mark = marks[2]
-  eq(check_mark[2], 5)
-  local marker_column = status.content.lines[6]:find("⠋", 1, true) - 1
+  eq(check_mark[2], 4)
+  local marker_column = status.content.lines[5]:find("⠋", 1, true) - 1
   eq(check_mark[3], marker_column)
   current_time = 120
   tick()
@@ -4026,102 +4025,6 @@ do
 end
 end
 
--- A question response keeps its category while the provider has accepted but not consumed it.
--- requires-forge-host
-T["question_answers_never_become_steering"] = function()
-  local workspace = temp.directory("question-answer-steering")
-  local started = host.start({ config = true })
-  vim.fn.chdir(workspace)
-  require("forge").setup({ harness = { provider = "mock" } })
-  local client, session_id = started.client, nil
-  local function request(method, params)
-    local result, failure, done
-    client.request({ session_id = session_id, method = method, params = params or {} }, function(value, error)
-      result, failure, done = value, error, true
-    end)
-    wait_until(function() return done end, method .. " did not finish")
-    eq(failure, nil)
-    return result
-  end
-  local function poll(method, params, ready, message)
-    local result, failure, done
-    local active = true
-    MiniTest.finally(function() active = false end)
-    local function send()
-      if not active then return end
-      client.request({ session_id = session_id, method = method, params = params or {} }, function(value, error)
-        if not active then return end
-        result, failure = value, error
-        if failure then done = true return end
-        local checked, accepted = pcall(ready, value)
-        if not checked then failure, done = accepted, true return end
-        done = accepted
-        if not done then vim.defer_fn(send, 5) end
-      end)
-    end
-    send()
-    -- Each wait ends when the host publishes the awaited state; the limit only bounds a hung host,
-    -- which a loaded machine can slow well past the one-second default for a full provider hop.
-    wait_until(function() return done end, message, { timeout_ms = 4000,
-      context = function() return vim.inspect(result) end })
-    active = false
-    eq(failure, nil)
-    return result
-  end
-  local initialized
-  client.session_initialize(function(result, failure) eq(failure, nil) initialized = result end)
-  wait_until(function() return initialized end, "Harness did not initialize")
-  session_id = initialized.session.id
-  request("session.provider.mock_response", { operation = "script", script = {
-    steps = { { kind = "tool_call", name = "question_ask", arguments = { questions = {
-      { header = "Layout", question = "Which layout?", options = {} },
-    } } } }, terminal = "completed",
-  } })
-  request("session.prompt.submit", { text = "Ask about layout." })
-  local current = poll("session.state.get", {}, function(value)
-    return value.status.kind == "idle" and value.questions and #value.questions.questions == 1
-  end, "question did not settle")
-  local question = current.questions.questions[1]
-  local held = request("session.provider.mock_response", { operation = "hold" })
-  MiniTest.finally(function()
-    pcall(request, "session.provider.mock_response", { operation = "release", id = held.id })
-  end)
-  request("session.prompt.submit", { text = "Continue researching." })
-  request("session.provider.mock_response", { operation = "wait", id = held.id })
-  request("session.document", { operation = "open", document = "answer-stage", view = "answer-view",
-    width = { columns = 120, tabstop = 4 } })
-  request("session.question.answer", { command = {
-    operation_id = "answer-layout", question_id = question.id, revision = question.content.revision,
-    action = { kind = "answer", answer = { kind = "other", text = "Tabs" } },
-  } })
-  local message
-  poll("session.input.get", {}, function(input)
-    for _, candidate in ipairs(input.messages) do
-      if candidate.purpose.kind == "question" then message = candidate end
-    end
-    return message and message.delivery == "accepted"
-  end, "answer did not reach the held provider")
-  eq(message.route, "steering")
-  request("session.document", { operation = "staging", document = "answer-stage", sequence = 1,
-    queue = {}, steering = { { id = message.id, text = message.text, failed = false,
-      content = { kind = "question_response", responses = { message.purpose.reply } } } } })
-  poll("session.document", { operation = "snapshot", document = "answer-stage" }, function(document)
-    eq(vim.json.encode(document):find("Steering", 1, true), nil)
-    local answer_count = 0
-    for _, block in ipairs(document.block) do
-      for _, row in ipairs(block.text) do
-        if row:find("Answered 1 question", 1, true) then answer_count = answer_count + 1 end
-      end
-    end
-    return answer_count == 1
-  end, "accepted answer did not retain its question category")
-  local status = request("session.document", { operation = "snapshot", document = "answer-stage:status" })
-  eq(vim.json.encode(status):find("Steering active turn", 1, true), nil)
-  request("session.provider.mock_response", { operation = "release", id = held.id })
-  poll("session.state.get", {}, function(current_state) return current_state.status.kind == "idle" end, "held turn did not settle")
-  eq(host.stop(), true)
-end
-
 -- requires-forge-host
 T["question_answer_opens_new_exchange_once"] = function()
   local workspace = temp.directory("answer-opener")
@@ -4756,8 +4659,12 @@ T["steering_waits_for_consumption"] = function()
   eq(transcript_text():find("Steering: " .. steer_text, 1, true), nil)
   assert(not transcript_text():find("Short answer", 1, true), "the response preceded its consumed steering")
   mock_response({ operation = "release", id = "after-consumption" })
-  wait_until(function() return not activity.busy(session.harness) end, "the steered turn did not settle", wait_options)
-  assert(transcript_text():find("Short answer", 1, true), "the steered response did not render")
+  -- Settlement arrives on the session event stream, while the response reaches the transcript
+  -- through a later `sync` read that `replica.apply_async` applies across loop iterations, so
+  -- the turn can read as settled before its response is drawn.
+  wait_until(function()
+    return not activity.busy(session.harness) and transcript_text():find("Short answer", 1, true) ~= nil
+  end, "the steered turn did not settle with its response rendered", wait_options)
   assert(not status_text():find("Steering active turn", 1, true),
     "consumed steering returned to the status section:\n" .. status_text())
   diagnostics:assert_none()

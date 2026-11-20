@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use forge_provider_api::{
     BindingId, InvocationScope, ProviderError,
-    control::{ProviderTools, ToolCall},
+    control::{ProviderTools, ToolCall, ToolReply},
     error::{ProviderFailure, ProviderFailureKind, ProviderOperation},
     session::{HostEffectFailure, ProviderHostEffects},
     turn_control::{HostTurnStatus, TurnControl},
@@ -58,7 +58,7 @@ struct ObservedTools {
 }
 impl ObservedTools {
     /// Replay the original response and physical receipts without repeating committed file writes.
-    async fn call(&self, call: ToolCall) -> Result<String, ProviderError> {
+    async fn call(&self, call: ToolCall) -> Result<ToolReply, ProviderError> {
         let (record, fresh) = {
             let mut calls = self.calls.lock().map_err(|_| rejected())?;
             if let Some(record) = calls.get(&call.id) {
@@ -87,15 +87,15 @@ impl ObservedTools {
             };
             let result = match self.executor.execute(invocation.clone()).await {
                 Ok(outcome) => match outcome.result {
-                    Ok(result) => Ok(result.message),
-                    Err(error) => Ok(crate::tools::control_tool_failure_text(
+                    Ok(result) => Ok(ToolReply::succeeded(result.message)),
+                    Err(error) => Ok(ToolReply::failed(crate::tools::control_tool_failure_text(
                         &invocation,
                         &error,
                         outcome.plan_document.as_ref(),
                         None,
-                    )),
+                    ))),
                 },
-                Err(_) => Err(rejected()),
+                Err(error) => refused_before_execution(&invocation, error),
             };
             *record.state.lock().map_err(|_| rejected())? = HostCallState::Complete(result);
             record.changed.notify_waiters();
@@ -119,6 +119,26 @@ impl ObservedTools {
     }
 }
 
+/// Answer a call that the host refused before it produced any effect.
+///
+/// A cancelled turn stays a cancellation. Any other admission failure, such as a task that
+/// changed or stopped during the call, returns its reason to the model as a failed call, so the
+/// provider and the timeline show why instead of a bare failure or a success.
+fn refused_before_execution(
+    invocation: &ControlToolInvocation,
+    error: anyhow::Error,
+) -> Result<ToolReply, ProviderError> {
+    if error.is::<crate::broker::TurnCancelled>() {
+        return Err(ProviderError::Cancelled);
+    }
+    Ok(ToolReply::failed(crate::tools::control_tool_failure_text(
+        invocation,
+        &crate::tools::ToolError::Operation(error.into()),
+        None,
+        None,
+    )))
+}
+
 struct HostCall {
     name: String,
     arguments: serde_json::Value,
@@ -130,13 +150,13 @@ struct HostCall {
 enum HostCallState {
     Running,
     Published(HostCallPublication),
-    Complete(Result<String, ProviderError>),
+    Complete(Result<ToolReply, ProviderError>),
 }
 
 #[derive(Clone)]
 struct HostCallPublication {
     result: futures_util::future::Shared<
-        futures_util::future::BoxFuture<'static, Result<String, ProviderError>>,
+        futures_util::future::BoxFuture<'static, Result<ToolReply, ProviderError>>,
     >,
 }
 
@@ -617,7 +637,7 @@ impl HostInvocation {
         &self,
         call_id: forge_provider_api::control::ToolCallId,
         batch: super::HostEffectBatch,
-        message: String,
+        message: ToolReply,
     ) -> HostCallPublication {
         let owner = self.live_host_effects.clone();
         let scope = self.scope.clone();
@@ -659,7 +679,7 @@ impl HostInvocation {
         call: ToolCall,
         record: &HostCall,
         admitted: &mut AdmittedEffect<'_>,
-    ) -> Result<String, ProviderError> {
+    ) -> Result<ToolReply, ProviderError> {
         let call_id = call.id.clone();
         let invocation = ControlToolInvocation {
             call_id: Some(call.id),
@@ -674,16 +694,10 @@ impl HostInvocation {
         if outcome.is_err() {
             admitted.published = true;
         }
-        let outcome = outcome.map_err(|error| {
-            if error.is::<crate::broker::TurnCancelled>() {
-                ProviderError::Cancelled
-            } else {
-                ProviderError::Failure(ProviderFailure::new(
-                    ProviderOperation::TurnStart,
-                    ProviderFailureKind::Unknown,
-                ))
-            }
-        })?;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return refused_before_execution(&invocation, error),
+        };
         let mut completion = ProviderCompletion::default();
         let message = match &outcome.result {
             Ok(result) => {
@@ -695,9 +709,9 @@ impl HostInvocation {
                         ))
                     })?;
                 }
-                result.message.clone()
+                ToolReply::succeeded(result.message.clone())
             }
-            Err(error) => crate::tools::control_tool_failure_text(
+            Err(error) => ToolReply::failed(crate::tools::control_tool_failure_text(
                 &invocation,
                 error,
                 outcome.plan_document.as_ref(),
@@ -706,7 +720,7 @@ impl HostInvocation {
                     .as_ref()
                     .map(|authoring| authoring.directory())
                     .as_deref(),
-            ),
+            )),
         };
         let batch = self.completion.publish_batch(completion)?;
         let publication = self.publication(call_id, batch, message);
@@ -725,13 +739,28 @@ impl ProviderTools for HostInvocation {
         crate::tools::unavailable_tool_reason(name)
     }
 
-    /// Execute only a positively registered native child's independently forked host context.
     async fn call_observed_child(
         &self,
         parent: &InvocationScope,
         child: &forge_provider_api::TurnAddress,
         call: ToolCall,
     ) -> Result<String, ProviderError> {
+        self.call_observed_child_reply(parent, child, call)
+            .await
+            .map(|reply| reply.text)
+    }
+
+    async fn call(&self, scope: &InvocationScope, call: ToolCall) -> Result<String, ProviderError> {
+        self.call_reply(scope, call).await.map(|reply| reply.text)
+    }
+
+    /// Execute only a positively registered native child's independently forked host context.
+    async fn call_observed_child_reply(
+        &self,
+        parent: &InvocationScope,
+        child: &forge_provider_api::TurnAddress,
+        call: ToolCall,
+    ) -> Result<ToolReply, ProviderError> {
         if self
             .provider_closed
             .load(std::sync::atomic::Ordering::Acquire)
@@ -783,7 +812,13 @@ impl ProviderTools for HostInvocation {
         };
         tools.call(call).await
     }
-    async fn call(&self, scope: &InvocationScope, call: ToolCall) -> Result<String, ProviderError> {
+
+    /// Execute one call and report whether Harness refused it, with the refusal's reason.
+    async fn call_reply(
+        &self,
+        scope: &InvocationScope,
+        call: ToolCall,
+    ) -> Result<ToolReply, ProviderError> {
         if scope != &self.scope || !self.tools.contains(&call.name) {
             return Err(rejected());
         }

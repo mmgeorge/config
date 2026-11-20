@@ -140,6 +140,10 @@ pub enum TestPromptStep {
     Checklist {
         update: crate::ProviderChecklistUpdate,
     },
+    /// Run one native subagent the provider delegates to on its own, as Copilot runs a built-in
+    /// subagent: the agent's start, one response message in the agent's own turn, then its
+    /// completed finish.
+    NativeSubagent { name: String, text: String },
 }
 
 /// Control announcement and execution independently for a scripted native tool.

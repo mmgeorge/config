@@ -94,7 +94,7 @@ impl ControlTurnContext {
     ) -> std::result::Result<Self, crate::provider::ProviderError> {
         let rejected = || {
             crate::provider::ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
+                forge_provider_api::ObservationFailure::ownership_conflict(),
             )
         };
         let scope = association.turn().cloned().ok_or_else(rejected)?;
@@ -355,6 +355,7 @@ impl ControlToolRuntime {
                 "Native child context does not authorize parent workflow controls.".into(),
             ));
         }
+        self.adopt_execution_review()?;
         self.context.task_permit = self.context.current_task_permit()?;
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
             authority.validate_scope()?;
@@ -422,6 +423,7 @@ impl ControlToolRuntime {
             );
         }
         self.ensure_submission_active()?;
+        self.adopt_execution_review()?;
         self.context.task_permit = self.context.current_task_permit()?;
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
             authority.validate_scope()?;
@@ -501,6 +503,28 @@ impl ControlToolRuntime {
         }
     }
 
+    /// Continue under this invocation's own revision submission and its review decision.
+    ///
+    /// Both renew the task; the invocation adopts the renewal and the execution generation, so
+    /// its plan reads keep working while the revision awaits review and its later plan tools,
+    /// including phase completion, stay admitted after the decision.
+    fn adopt_execution_review(&mut self) -> Result<()> {
+        let Some(progress) = self.context.task_authority_progress.clone() else {
+            return Ok(());
+        };
+        if let Some(controller) = &self.context.task_controller {
+            progress.adopt_execution_review(controller)?;
+        }
+        if let Some(execution) = self.context.execution.as_mut()
+            && let Some(generation) =
+                progress.adopted_execution_generation(&execution.execution_id)?
+        {
+            execution.task_permit = progress.permit()?;
+            execution.generation = generation;
+        }
+        Ok(())
+    }
+
     /// Reject callbacks whose submission was cancelled before host execution.
     fn ensure_submission_active(&self) -> Result<()> {
         if self
@@ -520,7 +544,7 @@ impl ControlToolRuntime {
     }
 
     pub(super) fn require_editable_plan(&self) -> Result<()> {
-        self.require_readable_plan()?;
+        self.require_plan_mutation()?;
         crate::tools::error::ensure!(
             matches!(
                 self.context.plan_state,
@@ -531,8 +555,51 @@ impl ControlToolRuntime {
         Ok(())
     }
 
+    /// Admit a plan change: any Plan task, or an Execute task whose execution is running.
+    pub(super) fn require_plan_mutation(&self) -> Result<()> {
+        if self.context.mode == PromptMode::ExecutePlan {
+            return self.require_running_execution();
+        }
+        self.require_readable_plan()
+    }
+
+    /// Admit execution controls only while the dispatched execution runs.
+    ///
+    /// An execution discussion carries the Execute task even while its execution is paused,
+    /// blocked, or waiting for its first turn; reads stay available, and this refusal names
+    /// the state and the user's way out instead of a mode the model cannot see.
+    pub(super) fn require_running_execution(&self) -> Result<()> {
+        crate::tools::error::ensure!(
+            self.context.mode == PromptMode::ExecutePlan,
+            "execution controls require an Execute task; no accepted plan is executing"
+        );
+        crate::tools::error::ensure!(
+            self.context.execution.is_some(),
+            "the Execute task is not running (paused, blocked, or not yet started), so plan edits, revision submissions, and phase completion are refused. Plan reads still work. Tell the user; /task resume continues the execution"
+        );
+        let awaiting_review = match &self.context.task_controller {
+            Some(controller) => controller.current()?.is_some_and(|task| {
+                matches!(
+                    &task.workflow,
+                    crate::task::WorkflowSnapshot::Execute { execution }
+                        if execution.record.pending_revision_reason.is_some()
+                )
+            }),
+            None => false,
+        };
+        crate::tools::error::ensure!(
+            !awaiting_review,
+            "the submitted plan revision awaits the user's review, so plan edits, another submission, and phase completion wait for the decision. Plan reads still work"
+        );
+        Ok(())
+    }
+
     pub(super) fn require_readable_plan(&self) -> Result<()> {
-        if self.context.mode == PromptMode::ExecutePlan && self.context.execution.is_some() {
+        if self.context.mode == PromptMode::ExecutePlan {
+            crate::tools::error::ensure!(
+                self.plan_document.is_some(),
+                "the Execute task has no plan document to read"
+            );
             return Ok(());
         }
         crate::tools::error::ensure!(
@@ -540,7 +607,7 @@ impl ControlToolRuntime {
                 self.context.mode,
                 PromptMode::Plan | PromptMode::PlanDiscussion
             ),
-            "plan controls require Harness Plan mode"
+            "plan controls require a Plan or Execute task; no plan is active in this turn"
         );
         crate::tools::error::ensure!(
             matches!(
@@ -1046,10 +1113,7 @@ mod test {
             .await
             .unwrap();
 
-        let submit = call(
-            "plan_submit",
-            json!({"plan_id":"plan","expected_version":4}),
-        );
+        let submit = call("plan_submit", json!({"plan_id":"plan"}));
         let error = runtime.invoke(submit.clone()).await.unwrap_err();
         let failure =
             crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document(), None);
@@ -1060,7 +1124,7 @@ mod test {
         for expected in [
             "error[invalid_plan_artifact]: `## Goals`: unknown section",
             "error[invalid_plan_content]: `## Background`: the section is required",
-            "Fix them and retry with expected_version 4.",
+            "Fix them and call plan_submit again.",
         ] {
             assert!(
                 failure.contains(expected),
@@ -1203,17 +1267,14 @@ mod test {
         );
 
         let before_rejection = crate::codec::to_vec(runtime.plan_document().unwrap()).unwrap();
-        let submit = call(
-            "plan_submit",
-            json!({"plan_id":"plan","expected_version":5}),
-        );
+        let submit = call("plan_submit", json!({"plan_id":"plan"}));
         let error = runtime.invoke(submit.clone()).await.unwrap_err();
         let failure =
             crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document(), None);
         for expected in [
             "Game.rs:6:1: error[invalid_declaration_structure]:",
             "already has a behavior block",
-            "Fix them and retry with expected_version 5.",
+            "Fix them and call plan_submit again.",
         ] {
             assert!(
                 failure.contains(expected),
@@ -1251,10 +1312,7 @@ mod test {
         );
 
         let accepted = runtime
-            .invoke(call(
-                "plan_submit",
-                json!({"plan_id":"plan","expected_version":7}),
-            ))
+            .invoke(call("plan_submit", json!({"plan_id":"plan"})))
             .await
             .unwrap();
         assert!(
@@ -1340,10 +1398,7 @@ mod test {
             .await
             .unwrap();
         let rejected = runtime
-            .invoke(call(
-                "plan_submit",
-                json!({"plan_id":"plan","expected_version":3}),
-            ))
+            .invoke(call("plan_submit", json!({"plan_id":"plan"})))
             .await
             .unwrap_err();
         assert!(
@@ -1359,10 +1414,7 @@ mod test {
             .await
             .unwrap();
         let accepted = runtime
-            .invoke(call(
-                "plan_submit",
-                json!({"plan_id":"plan","expected_version":4}),
-            ))
+            .invoke(call("plan_submit", json!({"plan_id":"plan"})))
             .await
             .unwrap();
         assert!(
@@ -1376,6 +1428,238 @@ mod test {
                 .iter()
                 .all(|body| body.behavior.is_some())
         );
+    }
+
+    /// An execution discussion on a stopped execution reads its plan and refuses changes with
+    /// the execution's state and the user's way out, never with a mode the model cannot see.
+    #[tokio::test]
+    async fn stopped_execution_discussion_reads_and_explains_refused_controls() {
+        let mut context = planning_context();
+        context.mode = PromptMode::ExecutePlan;
+        context.plan_state = Some(PlanState::Accepted);
+        let workspace = context.workspace_root.clone().unwrap();
+        std::fs::write(workspace.join("Foo.rs"), "pub struct Foo;\n").unwrap();
+        context.plan_document.as_mut().unwrap().design =
+            Some(crate::plan::DeclarationDesign::open(&workspace).unwrap());
+        let mut runtime = ControlToolRuntime::new(context);
+        let invoke = |name: &str, arguments: serde_json::Value| ControlToolInvocation {
+            call_id: None,
+            task_permit: None,
+            name: name.into(),
+            arguments,
+        };
+        runtime
+            .invoke(invoke(
+                "plan_read",
+                json!({"plan_id":"plan","path":"Foo.rs"}),
+            ))
+            .await
+            .unwrap();
+        for refused in [
+            invoke(
+                "plan_edit",
+                json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: Foo.rs\n@@\n-pub struct Foo;\n+pub struct Revised;\n*** End Patch"}),
+            ),
+            invoke("plan_submit", json!({"plan_id":"plan","reason":"Revise"})),
+            invoke(
+                "plan_phase_done",
+                json!({"phase":"resolve","revision":1,"summary":"Done"}),
+            ),
+        ] {
+            let name = refused.name.clone();
+            let error = runtime.invoke(refused).await.unwrap_err().to_string();
+            assert!(error.contains("is not running"), "{name}: {error}");
+            assert!(error.contains("/task resume"), "{name}: {error}");
+            assert!(!error.contains("Plan mode"), "{name}: {error}");
+        }
+    }
+
+    /// The review decision on a revision this invocation submitted renews the task, and the
+    /// invocation keeps working under that renewal; an unrelated change leaves it stale.
+    #[tokio::test]
+    async fn review_decision_on_own_revision_keeps_later_plan_tools_admitted() {
+        use crate::task::{Task, TaskChange};
+        for decided_by_review in [true, false] {
+            let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+            let previous = controller.current().unwrap().unwrap();
+            let record: crate::plan::PlanExecutionRecord = serde_json::from_value(json!({
+                "id":"execution", "session_id":"session", "plan_id":"plan",
+                "state":"active", "phase":"resolve", "original_revision":1,"revision":1,
+                "generation":3, "baseline_checkpoint":"captured-before-provider",
+                "pending_revision_reason":"Clarify ownership",
+                "lifecycle":[],"findings":[],
+                "progress":crate::plan::execution::SemanticProgress::default(),
+                "verification":[],"revision_history":[],"resume_after_review":true,
+                "observed_source":{},"observed_document_version":0,"observed_check":[],
+                "created_at_ms":1
+            }))
+            .unwrap();
+            let installed = controller
+                .change(
+                    &mut store,
+                    Some(&previous.revision),
+                    TaskChange::Install(Box::new(
+                        Task::execute("Execute".into(), record, Default::default(), 1).unwrap(),
+                    )),
+                    2,
+                )
+                .unwrap()
+                .unwrap();
+            let mut context = planning_context();
+            context.mode = PromptMode::ExecutePlan;
+            context.plan_state = Some(PlanState::AwaitingReview);
+            let workspace = context.workspace_root.clone().unwrap();
+            std::fs::write(workspace.join("Foo.rs"), "pub struct Foo;\n").unwrap();
+            context.plan_document.as_mut().unwrap().design =
+                Some(crate::plan::DeclarationDesign::open(&workspace).unwrap());
+            context.bind_test_task_controller(controller.clone());
+            context
+                .task_authority_progress
+                .as_ref()
+                .unwrap()
+                .await_execution_review("execution", 3)
+                .unwrap();
+            let mut runtime = ControlToolRuntime::new(context);
+            let mut changed = installed.draft();
+            let crate::task::WorkflowSnapshot::Execute { execution } = &mut changed.workflow else {
+                unreachable!()
+            };
+            if decided_by_review {
+                execution.record.generation = 4;
+                execution.record.pending_revision_reason = None;
+            } else {
+                // A generation change with the revision still pending is not a review decision.
+                execution.record.generation = 4;
+            }
+            controller
+                .change(
+                    &mut store,
+                    Some(&installed.revision),
+                    TaskChange::Update(Box::new(Task::try_from(changed).unwrap())),
+                    3,
+                )
+                .unwrap();
+            let read = runtime
+                .invoke(ControlToolInvocation {
+                    call_id: None,
+                    task_permit: None,
+                    name: "plan_read".into(),
+                    arguments: json!({"plan_id":"plan","path":"Foo.rs"}),
+                })
+                .await;
+            if decided_by_review {
+                read.unwrap();
+                assert_eq!(
+                    runtime
+                        .context
+                        .task_permit
+                        .as_ref()
+                        .map(|permit| permit.revision()),
+                    controller
+                        .current()
+                        .unwrap()
+                        .as_ref()
+                        .map(|task| &task.revision)
+                );
+            } else {
+                assert!(read.is_err(), "an unrelated task change stays stale");
+            }
+        }
+    }
+
+    /// Submitting a Resolve revision renews the task while the submitting turn still runs.
+    /// That turn keeps reading its plan while the revision awaits review, and a change it
+    /// attempts is refused because of the pending review, not as a changed task.
+    #[tokio::test]
+    async fn revision_awaiting_review_keeps_reads_and_names_the_review() {
+        use crate::task::{Task, TaskChange};
+        let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let previous = controller.current().unwrap().unwrap();
+        let record: crate::plan::PlanExecutionRecord = serde_json::from_value(json!({
+            "id":"execution", "session_id":"session", "plan_id":"plan",
+            "state":"active", "phase":"resolve", "original_revision":1,"revision":1,
+            "generation":2, "baseline_checkpoint":"captured-before-provider",
+            "lifecycle":[],"findings":[],
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "verification":[],"revision_history":[],"resume_after_review":false,
+            "observed_source":{},"observed_document_version":0,"observed_check":[],
+            "created_at_ms":1
+        }))
+        .unwrap();
+        let installed = controller
+            .change(
+                &mut store,
+                Some(&previous.revision),
+                TaskChange::Install(Box::new(
+                    Task::execute("Execute".into(), record, Default::default(), 1).unwrap(),
+                )),
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        let mut context = planning_context();
+        context.mode = PromptMode::ExecutePlan;
+        context.plan_state = Some(PlanState::AwaitingReview);
+        let workspace = context.workspace_root.clone().unwrap();
+        std::fs::write(workspace.join("Foo.rs"), "pub struct Foo;\n").unwrap();
+        context.plan_document.as_mut().unwrap().design =
+            Some(crate::plan::DeclarationDesign::open(&workspace).unwrap());
+        context.bind_test_task_controller(controller.clone());
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        context.execution = Some(crate::plan::execution::ExecutionControlSender {
+            task_controller: controller.clone(),
+            task_permit: installed.permit(),
+            phase: crate::plan::PlanPhase::Resolve,
+            execution_id: "execution".into(),
+            generation: 2,
+            sender,
+        });
+        // The broker's submission: the revision is pending and the generation advances.
+        let mut submitted = installed.draft();
+        let crate::task::WorkflowSnapshot::Execute { execution } = &mut submitted.workflow else {
+            unreachable!()
+        };
+        execution.record.generation = 3;
+        execution.record.pending_revision_reason = Some("Clarify ownership".into());
+        execution.record.resume_after_review = true;
+        controller
+            .change(
+                &mut store,
+                Some(&installed.revision),
+                TaskChange::Update(Box::new(Task::try_from(submitted).unwrap())),
+                3,
+            )
+            .unwrap();
+        context
+            .task_authority_progress
+            .as_ref()
+            .unwrap()
+            .await_execution_review("execution", 3)
+            .unwrap();
+        let mut runtime = ControlToolRuntime::new(context);
+        let invoke = |name: &str, arguments: serde_json::Value| ControlToolInvocation {
+            call_id: None,
+            task_permit: None,
+            name: name.into(),
+            arguments,
+        };
+        runtime
+            .invoke(invoke(
+                "plan_read",
+                json!({"plan_id":"plan","path":"Foo.rs"}),
+            ))
+            .await
+            .unwrap();
+        let refused = runtime
+            .invoke(invoke(
+                "plan_edit",
+                json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: Foo.rs\n@@\n-pub struct Foo;\n+pub struct Revised;\n*** End Patch"}),
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("awaits the user's review"), "{refused}");
+        assert!(!refused.contains("task changed"), "{refused}");
     }
 
     fn planning_context() -> ControlTurnContext {

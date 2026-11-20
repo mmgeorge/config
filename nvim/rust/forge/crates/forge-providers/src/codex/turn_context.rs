@@ -7,6 +7,10 @@
 //! note, as one `<forge>` block, and the adapter appends it as a developer message with
 //! `thread/inject_items` before the turn starts. Harness owns which sections are pending; this
 //! adapter owns only the native mechanics.
+//!
+//! The same channel carries the reason for a declined approval during a turn: Codex queues an
+//! item injected into an active turn as that turn's pending input, and the decline reply itself
+//! has no field for a reason.
 
 use super::rpc::{MethodReply, NativeRpc};
 use forge_provider_api::{ProviderError, ProviderSessionId, error::ProviderOperation};

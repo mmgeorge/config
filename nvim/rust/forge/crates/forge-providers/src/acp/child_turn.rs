@@ -79,7 +79,7 @@ impl AcpChildTurn {
     pub(super) async fn observe(&self, observed_at_ms: i64) -> Result<(), ProviderError> {
         if self.runner.is_finished() && !self.observed.load(Ordering::Acquire) {
             return Err(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
+                forge_provider_api::ObservationFailure::ownership_conflict(),
             ));
         }
         let mut relationship = self.relationship.subscribe();
@@ -127,7 +127,7 @@ impl AcpChildTurn {
         let mut terminal = self.driver.terminal.lock().await;
         if terminal.is_some() {
             return Err(ProviderError::Observation(
-                forge_provider_api::ObservationFailure::OwnershipConflict,
+                forge_provider_api::ObservationFailure::ownership_conflict(),
             ));
         }
         *terminal = Some(result);

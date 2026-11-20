@@ -180,6 +180,13 @@ impl HarnessBroker {
                 self.store
                     .require_settled_exchange_tree(&self.session.id, &exchanges)
                     .map_err(|_| RollbackFailure::PreparationFailed)?;
+                // Applying rewinds the conversation after restoring files, so a rewind known to be
+                // impossible refuses the preview before the user confirms any restore.
+                crate::exchange::rollback::rewind_target(
+                    &history,
+                    position,
+                    &self.rewind_provider(),
+                )?;
                 let expected_id = history
                     .iter()
                     .rev()

@@ -321,6 +321,11 @@ struct CallbackRouter {
     /// that names only the native call can identify the tool it gates.
     native_call_items: RwLock<HashMap<String, forge_provider_api::ItemId>>,
     observed_agents: RwLock<HashMap<forge_provider_api::InvocationScope, InvocationCallbacks>>,
+    /// Child turn each native agent ID names, so a pre-tool hook can find its actor's authority.
+    ///
+    /// Copilot's pre-tool hook names its actor, never its call. A finished agent stays retired,
+    /// so its late hooks are refused instead of waiting for a lifecycle that will not come.
+    observed_native_agents: RwLock<HashMap<String, ObservedNativeAgent>>,
     child_resources:
         RwLock<HashMap<forge_provider_api::InvocationScope, super::child_turn::ChildResources>>,
     mcp_tools: RwLock<HashMap<String, HashSet<String>>>,
@@ -332,6 +337,12 @@ struct CallbackRouter {
     foreground_callbacks: AtomicU64,
     callbacks_changed: tokio::sync::Notify,
     provider_closed: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Track whether a native agent ID still names a live observed child.
+enum ObservedNativeAgent {
+    Live(TurnAddress),
+    Retired,
 }
 
 #[derive(Default)]
@@ -442,6 +453,11 @@ impl CallbackRouter {
             }
             changed.await;
         }
+        self.begin_child_callback()
+    }
+
+    /// Admit a callback under a known child's authority, which outlives foreground retirement.
+    fn begin_child_callback(&self) -> Result<NativeCallbackGuard<'_>, ProviderError> {
         let admission = self
             .revoked
             .lock()
@@ -643,6 +659,7 @@ impl CallbackRouter {
         self.observed_call_owners.write().await.clear();
         self.native_call_items.write().await.clear();
         self.observed_agents.write().await.clear();
+        self.observed_native_agents.write().await.clear();
         self.child_resources.write().await.clear();
         Ok(())
     }
@@ -737,6 +754,91 @@ impl CallbackRouter {
         callback.retain_as_child();
         callback.child = Some(retained);
         Ok(resources)
+    }
+
+    /// Wait until the native agent a pre-tool hook names is registered as an observed child.
+    ///
+    /// The hook can arrive before the event stream has delivered the agent's start, so the wait
+    /// ends only when the agent registers, has finished, or nothing could still register it.
+    async fn observed_native_agent(
+        &self,
+        native_agent: &str,
+    ) -> Result<TurnAddress, ProviderError> {
+        loop {
+            let changed = self.callbacks_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.observed_native_agents.read().await.get(native_agent) {
+                Some(ObservedNativeAgent::Live(child)) => return Ok(child.clone()),
+                Some(ObservedNativeAgent::Retired) => {
+                    return Err(failure(
+                        ProviderOperation::TurnStart,
+                        ProviderFailureKind::Rejected,
+                    ));
+                }
+                None => {}
+            }
+            let closed = matches!(
+                *self
+                    .revoked
+                    .lock()
+                    .expect("callback admission lock is not poisoned"),
+                CallbackAdmission::Closed
+            ) || self
+                .provider_closed
+                .as_ref()
+                .is_some_and(|closed| closed.load(Ordering::Acquire));
+            let foreground = self
+                .active
+                .read()
+                .await
+                .values()
+                .any(|registration| matches!(registration.phase, CallbackPhase::Foreground));
+            if closed || (!foreground && self.observed_agents.read().await.is_empty()) {
+                return Err(failure(
+                    ProviderOperation::TurnStart,
+                    ProviderFailureKind::Rejected,
+                ));
+            }
+            changed.await;
+        }
+    }
+
+    /// Hold a pre-tool hook on the barrier of the native subagent its actor names.
+    async fn before_child_hook(&self, native_agent: &str) -> Result<(), ProviderError> {
+        let child = self.observed_native_agent(native_agent).await?;
+        let mut callback = self.begin_child_callback()?;
+        let callbacks = self
+            .observed_agents
+            .read()
+            .await
+            .get(&child.scope)
+            .cloned()
+            .ok_or(ProviderError::Cancelled)?;
+        let resources = self.retain_child_callback(&mut callback, &child).await?;
+        tokio::select! {
+            result = callbacks.permissions.before_observed_child(&callbacks.scope, &child) => result?,
+            _ = resources.revoked.cancelled() => return Err(ProviderError::Cancelled),
+        }
+        if matches!(
+            *self
+                .revoked
+                .lock()
+                .expect("callback admission lock is not poisoned"),
+            CallbackAdmission::Closed
+        ) {
+            return Err(ProviderError::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// Retire every native agent ID that names the finished child.
+    async fn retire_native_agent(&self, child: &forge_provider_api::InvocationScope) {
+        for registration in self.observed_native_agents.write().await.values_mut() {
+            if matches!(registration, ObservedNativeAgent::Live(live) if &live.scope == child) {
+                *registration = ObservedNativeAgent::Retired;
+            }
+        }
     }
 
     async fn prune_settled_scope(
@@ -1024,7 +1126,7 @@ impl NativeCallbackRouter for CallbackRouter {
         &self,
         call_id: &str,
         mut call: ToolCall,
-    ) -> Result<String, ProviderError> {
+    ) -> Result<forge_provider_api::control::ToolReply, ProviderError> {
         let mut callback = self.begin_native_callback(Some(call_id)).await?;
         call.id = forge_provider_api::control::ToolCallId::new(call_id)
             .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
@@ -1034,7 +1136,7 @@ impl NativeCallbackRouter for CallbackRouter {
             let _resources = self.retain_child_callback(&mut callback, &child).await?;
             return callbacks
                 .tools
-                .call_observed_child(&callbacks.scope, &child, call)
+                .call_observed_child_reply(&callbacks.scope, &child, call)
                 .await;
         }
         callbacks.authorize_tool(&call)?;
@@ -1045,7 +1147,7 @@ impl NativeCallbackRouter for CallbackRouter {
                 ProviderFailureKind::BindingClosed,
             ));
         }
-        callbacks.tools.call(&callbacks.scope, call).await
+        callbacks.tools.call_reply(&callbacks.scope, call).await
     }
 
     async fn authorize_native(
@@ -1106,8 +1208,16 @@ impl NativeCallbackRouter for CallbackRouter {
         }
     }
 
-    async fn before_tool_native(&self, call_id: Option<&str>) -> Result<(), ProviderError> {
-        // The SDK hook omits call identity. A live child makes its authority ambiguous.
+    async fn before_tool_native(&self, tool: NativeToolIdentity<'_>) -> Result<(), ProviderError> {
+        let call_id = match tool {
+            NativeToolIdentity::ChildHook(native_agent) => {
+                return self.before_child_hook(native_agent).await;
+            }
+            NativeToolIdentity::Call(call_id) => Some(call_id),
+            NativeToolIdentity::RootHook => None,
+        };
+        // A hook that names no subagent names no call either, so a live child makes its
+        // authority ambiguous.
         if call_id.is_none() && !self.observed_agents.read().await.is_empty() {
             return Err(failure(
                 ProviderOperation::TurnStart,
@@ -1180,10 +1290,12 @@ impl NativeCallbackRouter for CallbackRouter {
     async fn observe_native_child(
         &self,
         parent: &forge_provider_api::InvocationScope,
+        native_agents: &[String],
         child: TurnAddress,
         finished: bool,
     ) -> Result<(), ProviderError> {
         if finished {
+            self.retire_native_agent(&child.scope).await;
             let resources = self.child_resources.write().await.remove(&child.scope);
             if let Some(resources) = resources {
                 resources.collect().await;
@@ -1200,6 +1312,14 @@ impl NativeCallbackRouter for CallbackRouter {
                 .await
                 .entry(child.scope.clone())
                 .or_insert_with(super::child_turn::ChildResources::new);
+            {
+                let mut registrations = self.observed_native_agents.write().await;
+                for native_agent in native_agents {
+                    registrations
+                        .entry(native_agent.clone())
+                        .or_insert_with(|| ObservedNativeAgent::Live(child.clone()));
+                }
+            }
             self.observed_agents
                 .write()
                 .await
@@ -1223,6 +1343,7 @@ impl NativeCallbackRouter for CallbackRouter {
     }
 
     async fn collect_native_child(&self, child: &TurnAddress) -> Result<(), ProviderError> {
+        self.retire_native_agent(&child.scope).await;
         let resources = self.child_resources.read().await.get(&child.scope).cloned();
         if let Some(resources) = resources {
             resources.collect().await;
@@ -1625,28 +1746,39 @@ pub(super) trait NativeCallbackRouter: Send + Sync {
     }
     /// Revalidate the exact invocation immediately before a shell operation.
     async fn before_shell_native(&self, call_id: &str) -> Result<(), ProviderError> {
-        self.before_tool_native(Some(call_id)).await
+        self.before_tool_native(NativeToolIdentity::Call(call_id))
+            .await
     }
-    async fn call_native(&self, call_id: &str, call: ToolCall) -> Result<String, ProviderError>;
+    /// Run a host tool for a native call and report whether the host refused it.
+    async fn call_native(
+        &self,
+        call_id: &str,
+        call: ToolCall,
+    ) -> Result<forge_provider_api::control::ToolReply, ProviderError>;
     async fn authorize_native(
         &self,
         call_id: &str,
         request: PermissionRequest,
     ) -> PermissionResponse;
-    async fn before_tool_native(&self, call_id: Option<&str>) -> Result<(), ProviderError>;
+    /// Wait for the host's pre-execution barrier of the invocation that owns this native tool.
+    async fn before_tool_native(&self, tool: NativeToolIdentity<'_>) -> Result<(), ProviderError>;
     async fn bind_native_call(
         &self,
         call_id: &str,
         scope: &forge_provider_api::InvocationScope,
     ) -> Result<(), ProviderError>;
     /// Retain or release the original authority for a positively published child lifetime.
+    ///
+    /// `native_agents` lists every native ID Copilot uses for the child, so a pre-tool hook
+    /// whose actor names one of them waits on the child's own barrier.
     async fn observe_native_child(
         &self,
         parent: &forge_provider_api::InvocationScope,
+        native_agents: &[String],
         child: TurnAddress,
         finished: bool,
     ) -> Result<(), ProviderError> {
-        let _ = (parent, child, finished);
+        let _ = (parent, native_agents, child, finished);
         Ok(())
     }
     /// Get the independently registered original child callback collection group.
@@ -1691,11 +1823,26 @@ pub(super) trait NativeCallbackRouter: Send + Sync {
     }
 }
 
+/// Name the native call or actor whose tool waits on the host's pre-execution barrier.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum NativeToolIdentity<'native> {
+    /// A permission or helper callback that names its exact native call.
+    Call(&'native str),
+    /// A pre-tool hook that names no subagent, from the root agent or an older runtime.
+    RootHook,
+    /// A pre-tool hook from the native subagent with this native agent ID.
+    ChildHook(&'native str),
+}
+
 pub(super) struct NoopNativeCallbacks;
 
 #[async_trait]
 impl NativeCallbackRouter for NoopNativeCallbacks {
-    async fn call_native(&self, _: &str, _: ToolCall) -> Result<String, ProviderError> {
+    async fn call_native(
+        &self,
+        _: &str,
+        _: ToolCall,
+    ) -> Result<forge_provider_api::control::ToolReply, ProviderError> {
         Err(failure(
             ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
@@ -1704,7 +1851,7 @@ impl NativeCallbackRouter for NoopNativeCallbacks {
     async fn authorize_native(&self, _: &str, _: PermissionRequest) -> PermissionResponse {
         PermissionResponse::Cancelled
     }
-    async fn before_tool_native(&self, _: Option<&str>) -> Result<(), ProviderError> {
+    async fn before_tool_native(&self, _: NativeToolIdentity<'_>) -> Result<(), ProviderError> {
         Err(failure(
             ProviderOperation::TurnStart,
             ProviderFailureKind::Rejected,
@@ -5052,14 +5199,19 @@ mod callback_tests {
             turn_id: child_scope.turn_id().unwrap(),
             scope: child_scope,
         };
-        let pending = router.before_tool_native(Some("child-call"));
+        let pending = router.before_tool_native(NativeToolIdentity::Call("child-call"));
         tokio::pin!(pending);
         assert!(futures_util::poll!(pending.as_mut()).is_pending());
         router
-            .observe_native_child(&parent, child.clone(), false)
+            .observe_native_child(&parent, &[], child.clone(), false)
             .await
             .unwrap();
-        assert!(router.before_tool_native(None).await.is_err());
+        assert!(
+            router
+                .before_tool_native(NativeToolIdentity::RootHook)
+                .await
+                .is_err()
+        );
         router
             .bind_observed_native_call("child-call", &parent, child.clone())
             .await
@@ -5094,7 +5246,7 @@ mod callback_tests {
         router.release_native_call("child-call").await;
         assert!(router.callbacks(&parent).await.is_ok());
         router.revoke();
-        let later = router.before_tool_native(Some("later-child-call"));
+        let later = router.before_tool_native(NativeToolIdentity::Call("later-child-call"));
         tokio::pin!(later);
         assert!(futures_util::poll!(later.as_mut()).is_pending());
         router
@@ -5108,20 +5260,159 @@ mod callback_tests {
         ));
         router.release_native_call("later-child-call").await;
         router
-            .observe_native_child(&parent, child, true)
+            .observe_native_child(&parent, &[], child, true)
             .await
             .unwrap();
         assert!(router.callbacks(&parent).await.is_err());
     }
 
+    /// Open the host barrier for an observed child as well as for its parent.
+    struct ObservedChildAuthority;
+
+    #[async_trait]
+    impl ProviderPermissions for ObservedChildAuthority {
+        async fn authorize(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            PermissionResponse::Allow
+        }
+        async fn before_observed_child(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: &TurnAddress,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// Build the pre-tool hook Copilot sends for one tool of the named actor.
+    ///
+    /// A subagent's hook names the subagent in its actor metadata and reports the subagent's
+    /// own session ID, while the hook context keeps the root session.
+    fn pre_tool_hook(
+        actor: Option<&str>,
+    ) -> (
+        github_copilot_sdk::hooks::HookEvent,
+        github_copilot_sdk::hooks::HookActor,
+    ) {
+        let session = actor.unwrap_or("root-session");
+        let input = serde_json::from_value(json!({
+            "sessionId": session, "timestamp": 0.0, "cwd": ".",
+            "toolName": "grep_search", "toolArgs": {"query": "InvoiceError"},
+        }))
+        .unwrap();
+        let actor = serde_json::from_value(match actor {
+            Some(agent) => json!({"agentId": agent, "agentType": "search-subagent"}),
+            None => json!({}),
+        })
+        .unwrap();
+        (
+            github_copilot_sdk::hooks::HookEvent::PreToolUse {
+                input,
+                ctx: github_copilot_sdk::hooks::HookContext {
+                    session_id: github_copilot_sdk::SessionId::new("root-session"),
+                },
+            },
+            actor,
+        )
+    }
+
+    /// A live subagent's read-only tool passes that subagent's own host barrier.
+    ///
+    /// Copilot's pre-tool hook carries no call ID, so the router once treated every hook as
+    /// ambiguous while a child was live and denied each of the child's tools before it ran.
+    /// The hook's actor names the child, which identifies the authority to wait on.
+    #[tokio::test]
+    async fn native_child_pre_tool_hook_uses_the_child_barrier() {
+        let router = Arc::new(CallbackRouter::default());
+        let parent = forge_provider_api::InvocationScope::new(
+            forge_provider_api::testing::root_thread("child-hook"),
+            "parent",
+        );
+        install_with(&router, &parent, Arc::new(ObservedChildAuthority)).await;
+        let child_scope = forge_provider_api::InvocationScope::new(
+            parent
+                .thread_id
+                .child(&forge_provider_api::agent::AgentId::new("observed-child").unwrap())
+                .unwrap(),
+            parent.exchange_id.clone(),
+        );
+        let child = TurnAddress {
+            thread_id: child_scope.thread_id.clone(),
+            turn_id: child_scope.turn_id().unwrap(),
+            scope: child_scope,
+        };
+        let hooks = super::super::permission::checkpoint_hooks(router.clone());
+        let pending = {
+            let hooks = hooks.clone();
+            tokio::spawn(async move {
+                let (event, actor) = pre_tool_hook(Some("call_search"));
+                hooks.on_hook_with_actor(event, actor).await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !pending.is_finished(),
+            "a hook that precedes the child's lifecycle must wait for it"
+        );
+        router
+            .observe_native_child(&parent, &["call_search".into()], child.clone(), false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                pending.await.unwrap(),
+                github_copilot_sdk::hooks::HookOutput::None
+            ),
+            "the child's tool was denied before it ran"
+        );
+        let (event, actor) = pre_tool_hook(None);
+        assert!(
+            matches!(
+                hooks.on_hook_with_actor(event, actor).await,
+                github_copilot_sdk::hooks::HookOutput::PreToolUse(_)
+            ),
+            "a hook without an actor stays ambiguous while a child is live"
+        );
+        router
+            .observe_native_child(&parent, &["call_search".into()], child, true)
+            .await
+            .unwrap();
+        let (event, actor) = pre_tool_hook(Some("call_search"));
+        assert!(
+            matches!(
+                hooks.on_hook_with_actor(event, actor).await,
+                github_copilot_sdk::hooks::HookOutput::PreToolUse(_)
+            ),
+            "a finished child can run no further tools"
+        );
+    }
+
     /// Install authority shared by successive native tool callbacks.
     async fn install(router: &CallbackRouter, scope: &forge_provider_api::InvocationScope) -> u64 {
+        install_with(router, scope, Arc::new(Authority)).await
+    }
+
+    /// Install the given permission authority with the default tools and turn control.
+    async fn install_with(
+        router: &CallbackRouter,
+        scope: &forge_provider_api::InvocationScope,
+        permissions: Arc<dyn ProviderPermissions>,
+    ) -> u64 {
         let authority = Arc::new(Authority);
         router
             .install(InvocationCallbacks {
                 scope: scope.clone(),
                 generation: 0,
-                permissions: authority.clone(),
+                permissions,
                 tools: authority.clone(),
                 control: authority.clone(),
                 allowed_tools: HashSet::from(["fixture_tool".into()]),

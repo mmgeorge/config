@@ -28,9 +28,10 @@ pub struct ExchangeMetrics {
     pub reported_output_tokens: Option<u64>,
     /// Native measured duration, unavailable when contributing turn timing is unknown.
     pub reported_response_ms: Option<u64>,
-    /// Resume intent belongs to the live permission coordinator and cannot survive a host restart.
+    /// Whether the clock resumes when the last user wait ends. Resume intent belongs to the live
+    /// owner and cannot survive a host restart.
     #[serde(skip)]
-    pub(crate) approval_resume: bool,
+    pub(crate) user_wait_resume: bool,
     tool: BTreeSet<String>,
     blocker: BTreeSet<String>,
     reports: Vec<UsageSample>,
@@ -113,7 +114,7 @@ impl TryFrom<StoredExchangeMetrics> for ExchangeMetrics {
             tool_started_ms,
             reported_output_tokens: None,
             reported_response_ms: None,
-            approval_resume: false,
+            user_wait_resume: false,
             tool,
             blocker,
             reports: Vec::new(),
@@ -197,10 +198,62 @@ struct TurnTimingTotal {
     duration_ms: Option<u64>,
 }
 
+/// Name the user waits that suspend the exchange clock, by the blocker identity prefix each uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserWait {
+    /// A permission request awaiting the user's decision.
+    Approval,
+    /// A question a running tool waits on for the user's answer.
+    Answer,
+}
+
+impl UserWait {
+    /// Return the blocker identity prefix that marks this kind of wait.
+    pub(crate) const fn prefix(self) -> &'static str {
+        match self {
+            Self::Approval => "approval:",
+            Self::Answer => "question:",
+        }
+    }
+
+    /// Classify a blocker identity as a user wait, if it is one.
+    pub(crate) fn of(blocker: &str) -> Option<Self> {
+        [Self::Approval, Self::Answer]
+            .into_iter()
+            .find(|wait| blocker.starts_with(wait.prefix()))
+    }
+
+    /// Build the blocker identity for one wait of this kind.
+    pub(crate) fn blocker(self, id: &str) -> String {
+        format!("{}{id}", self.prefix())
+    }
+}
+
 impl ExchangeMetrics {
     /// Reports whether any permission request still suspends this exchange.
     pub(crate) fn awaiting_approval(&self) -> bool {
-        self.blocker.iter().any(|id| id.starts_with("approval:"))
+        self.blocker
+            .iter()
+            .any(|id| id.starts_with(UserWait::Approval.prefix()))
+    }
+
+    /// Reports whether a running tool still waits for the user's answer to a question.
+    pub(crate) fn awaiting_answer(&self) -> bool {
+        self.blocker
+            .iter()
+            .any(|id| id.starts_with(UserWait::Answer.prefix()))
+    }
+
+    /// Reports whether any wait for the user, an approval or an answer, suspends this exchange.
+    pub(crate) fn awaiting_user(&self) -> bool {
+        self.awaiting_approval() || self.awaiting_answer()
+    }
+
+    /// Identify the questions whose answers this exchange currently waits for.
+    pub(crate) fn awaited_questions(&self) -> impl Iterator<Item = &str> {
+        self.blocker
+            .iter()
+            .filter_map(|id| id.strip_prefix(UserWait::Answer.prefix()))
     }
 
     /// Reports a recorded parent wait for delegated execution.
@@ -241,7 +294,7 @@ impl ExchangeMetrics {
         self.blocker.clear();
         self.close_tools(elapsed_ms);
         self.tool.clear();
-        self.approval_resume = false;
+        self.user_wait_resume = false;
     }
 
     /// Returns tool occupancy including currently running calls, when timing is complete.
@@ -461,7 +514,7 @@ impl Default for ExchangeMetrics {
             tool_started_ms: None,
             reported_output_tokens: None,
             reported_response_ms: None,
-            approval_resume: false,
+            user_wait_resume: false,
             tool: BTreeSet::new(),
             blocker: BTreeSet::new(),
             reports: Vec::new(),

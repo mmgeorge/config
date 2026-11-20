@@ -309,7 +309,10 @@ fn tool_group_elapsed(
     let calls: Vec<_> = calls
         .iter()
         .copied()
-        .filter(|tool| tool.started_active_ms.is_some() || tool.started_at_ms.is_some())
+        .filter(|tool| {
+            tool.state() != crate::turn::ToolState::Denied
+                && (tool.started_active_ms.is_some() || tool.started_at_ms.is_some())
+        })
         .collect();
     if calls.is_empty() {
         return None;
@@ -466,14 +469,17 @@ pub(super) fn timing_blocks(
                                         .map_or(0, |layout| layout.indent.saturating_sub(2)),
                                 )
                                 .max(1);
-                            blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
-                                previous,
-                                crate::buffer::transcript::ToolHeading::of(
-                                    tool,
-                                    exchange.tool_instant(now_ms),
-                                    false,
-                                ),
-                            )?);
+                            let mut heading = crate::buffer::transcript::ToolHeading::of(
+                                tool,
+                                exchange.tool_instant(now_ms),
+                                false,
+                            );
+                            heading.state =
+                                super::tool_outcome::heading_state(exchange, turn, tool);
+                            blocks.push(
+                                TranscriptRenderer::new(&profile)?
+                                    .refresh_tool_heading(previous, heading)?,
+                            );
                         }
                     } else {
                         groups.entry(&output.group).or_default().push((turn, tool));
@@ -514,14 +520,15 @@ pub(super) fn timing_blocks(
                             .map_or(0, |layout| layout.indent.saturating_sub(2)),
                     )
                     .max(1);
-                blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
-                    previous,
-                    crate::buffer::transcript::ToolHeading::of(
-                        tool,
-                        exchange.tool_instant(now_ms),
-                        expanded.get(&format!("{call_id}:tool")) == Some(&true),
-                    ),
-                )?);
+                let mut heading = crate::buffer::transcript::ToolHeading::of(
+                    tool,
+                    exchange.tool_instant(now_ms),
+                    expanded.get(&format!("{call_id}:tool")) == Some(&true),
+                );
+                heading.state = super::tool_outcome::heading_state(exchange, turn, tool);
+                blocks.push(
+                    TranscriptRenderer::new(&profile)?.refresh_tool_heading(previous, heading)?,
+                );
             }
             let Some(previous) = document.block(&BlockId(id.into())) else {
                 continue;
@@ -985,6 +992,8 @@ impl TimelineRenderer<'_> {
                     PlanLifecycleKind::ChangesRequested => "Plan revision requested",
                     PlanLifecycleKind::Accepted => "Plan accepted",
                     PlanLifecycleKind::Cancelled => "Plan rejected",
+                    PlanLifecycleKind::RevisionStopped => "Plan revision stopped",
+                    PlanLifecycleKind::DraftWithdrawn => "Plan draft changed after submission",
                 };
                 let question = matches!(
                     lifecycle.kind,
@@ -1010,6 +1019,11 @@ impl TimelineRenderer<'_> {
                     }
                 } else if question {
                     format!("▸ {label}")
+                } else if lifecycle.kind == PlanLifecycleKind::DraftWithdrawn {
+                    format!(
+                        "▸ {label} · revision {} withdrawn",
+                        lifecycle.model_revision
+                    )
                 } else {
                     format!("▸ {label}: {title} · revision {}", lifecycle.model_revision)
                 };
@@ -1147,7 +1161,7 @@ impl TimelineRenderer<'_> {
             ObservedAgentState::Active(AgentActiveState::Waiting) => "waiting",
             ObservedAgentState::Finished(AgentOutcome::Completed) => "completed",
             ObservedAgentState::Finished(AgentOutcome::Failed(_)) => "failed",
-            ObservedAgentState::Finished(AgentOutcome::Interrupted) => "interrupted",
+            ObservedAgentState::Finished(AgentOutcome::Interrupted) => "cancelled",
             ObservedAgentState::Finished(AgentOutcome::Closed) => "closed",
         };
         let unavailable =
@@ -1547,11 +1561,16 @@ impl TimelineRenderer<'_> {
         TranscriptRenderer::heading_marker(&mut heading, &capture);
         self.push(heading)?;
         let section = self.begin_section(2);
+        // The first turn's check runs are drawn once, as the exchange's results beneath the
+        // Thought, so the commentary that owns them inside the Thought does not draw them too.
+        // Later turns' commentary draws its own runs where they happened.
+        let mut activity = interaction.content(&layout.activity, true)?;
+        let activity_checks = activity.take_checks();
         self.content(
             interaction,
             agents,
             depth,
-            interaction.content(&layout.activity, true)?,
+            activity,
             Some(&layout.questions),
             MarkdownRole::Response,
         )?;
@@ -1572,20 +1591,12 @@ impl TimelineRenderer<'_> {
         self.provider_checklist(interaction)?;
         self.host_file_changes(interaction)?;
         self.agent_results(interaction, agents)?;
-        self.interaction_results(interaction)?;
+        self.interaction_results(interaction, activity_checks)?;
         self.content(
             interaction,
             agents,
             depth,
             interaction.content(&layout.results, false)?,
-            Some(&layout.questions),
-            MarkdownRole::Response,
-        )?;
-        self.content(
-            interaction,
-            agents,
-            depth,
-            interaction.content(&layout.conclusion, false)?,
             Some(&layout.questions),
             MarkdownRole::Response,
         )?;
@@ -1614,14 +1625,19 @@ impl TimelineRenderer<'_> {
             self.offset_layout(start, indent / 2);
             continuation = remaining;
         }
+        // An execution's completion or failure concludes the exchange, so it follows the response.
+        self.content(
+            interaction,
+            agents,
+            depth,
+            interaction.content(&layout.conclusion, false)?,
+            Some(&layout.questions),
+            MarkdownRole::Response,
+        )?;
         for (index, record) in interaction.tool_timeout.iter().enumerate() {
             self.literal(
                 &format!("{}:tool-timeout:{index}", interaction.id),
-                &format!(
-                    "Stopped: `{}` exceeded its {} tool timeout.",
-                    record.title,
-                    record.timeout_label()
-                ),
+                &super::tool_outcome::timeout_notice(interaction, record),
                 None,
             )?;
         }
@@ -1663,11 +1679,15 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    /// Project stable interaction summaries while retaining each thought's original activity.
-    fn interaction_results(&mut self, interaction: &Exchange) -> Result<()> {
+    /// Project the exchange's file changes and the check runs of its first turn.
+    fn interaction_results(
+        &mut self,
+        interaction: &Exchange,
+        checks: Vec<&crate::checks::CheckRun>,
+    ) -> Result<()> {
         let identity = format!("{}:results", interaction.id);
         self.workspace_changes(&format!("{identity}:changes"), interaction)?;
-        self.check_group(&identity, interaction.checks())
+        self.check_group(&identity, checks.into_iter())
     }
 
     /// Combines attempts under a stable owner while preserving each command's output source.
@@ -1687,17 +1707,21 @@ impl TimelineRenderer<'_> {
         let Some(latest) = runs.last() else {
             return Ok(());
         };
+        // The latest run carries the completion title and its selected skips, which explain a
+        // run that started no check; earlier runs contribute only commands that executed.
         let mut combined = (**latest).clone();
         combined.id = identity.to_owned();
-        combined.completed_plan = None;
         combined.commands = runs
             .iter()
-            .flat_map(|run| run.commands.iter())
-            .filter(|command| {
-                !matches!(
-                    command.state,
-                    crate::checks::CheckState::Pending | crate::checks::CheckState::Skipped
-                )
+            .flat_map(|run| {
+                let latest = std::ptr::eq(*run, *latest);
+                run.commands
+                    .iter()
+                    .filter(move |command| match command.state {
+                        crate::checks::CheckState::Pending => false,
+                        crate::checks::CheckState::Skipped => latest && command.selected,
+                        _ => true,
+                    })
             })
             .map(|command| {
                 let mut command = command.clone();
@@ -2860,7 +2884,7 @@ Action",
     fn workspace_changes(&mut self, identity: &str, exchange: &Exchange) -> Result<()> {
         use crate::exchange::ExchangeChangeResult;
         match exchange.change_result() {
-            ExchangeChangeResult::NotStarted => Ok(()),
+            ExchangeChangeResult::NotStarted | ExchangeChangeResult::Delegated => Ok(()),
             ExchangeChangeResult::Captured(comparison) => {
                 self.workspace_comparison(identity, comparison, "")
             }
@@ -3198,6 +3222,13 @@ Action",
             ToolOutputView::new(call_id, &tool.output)
         };
         output.heading(tool, exchange.tool_instant(self.now_ms));
+        // A denial already shows its reason as the body; any other unsuccessful end keeps its
+        // output and states how the call ended beneath it. The provider reports a call its
+        // deadline stopped as interrupted; Harness knows it failed.
+        output.conclude(
+            outcome.filter(|_| tool.state() != crate::turn::ToolState::Denied),
+            timed_out.then_some(crate::turn::ToolState::Failed),
+        );
         output.group = group.to_owned();
         let id = format!("{call_id}:tool");
         let target = TargetId(id.clone());
@@ -3210,9 +3241,8 @@ Action",
             exchange.tool_instant(self.now_ms),
             expanded,
         );
-        // The provider reports a call its deadline stopped as interrupted; Harness knows it failed.
-        if timed_out {
-            heading.state = crate::turn::ToolState::Failed;
+        if let Some(state) = output.heading_state() {
+            heading.state = state;
         }
         let block = renderer.tool_header(BlockId(id), target.clone(), heading)?;
         self.action
@@ -3239,13 +3269,6 @@ Action",
                     .insert(target.id.clone(), TranscriptAction::Tool { call_id });
             }
             self.push(hidden)?;
-            // A denial already shows its reason as the body; any other unsuccessful end keeps
-            // its output and states how the call ended beneath it.
-            if tool.state() != crate::turn::ToolState::Denied
-                && let Some(outcome) = &outcome
-            {
-                self.literal(&format!("{call_id}:outcome"), outcome, None)?;
-            }
         } else {
             for suffix in ["preview", "hidden"] {
                 self.push(BufferBlock {
@@ -4181,6 +4204,30 @@ pub(crate) mod tests {
             }));
         }
         Ok(())
+    }
+
+    /// A call that never executed shows no duration on its row or in its group, on every
+    /// provider.
+    ///
+    /// Codex announces a command as running before it asks to run it, so a denied Codex call
+    /// carried an interval (`0.1s`) while the same denial on Claude Code, which never starts the
+    /// call, showed `—`.
+    #[test]
+    fn denied_calls_have_no_duration() {
+        use crate::turn::{ToolCall, ToolInstant, ToolState};
+        let denied = ToolCall::projection(
+            "denied".into(),
+            "command".into(),
+            "sleep 4sec".into(),
+            ToolState::Denied,
+            Some(0),
+            Some(92),
+        );
+        assert_eq!(denied.elapsed_ms(ToolInstant::wall(1_000)), None);
+        assert_eq!(
+            super::tool_group_label([&denied], ToolInstant::wall(1_000)),
+            "▸ Tools · 0/1 · (1 denied)",
+        );
     }
 
     /// Count concurrent and sequential tool intervals without charging overlaps or idle gaps.

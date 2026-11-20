@@ -94,12 +94,39 @@ pub struct CheckApplicability {
     pub matched_files: Vec<String>,
 }
 
+/// State how much of a run's change set is known when its checks are admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChangeInventory {
+    /// No task tracks changes, so automatic path triggers require an explicit selection.
+    Untracked,
+    /// A task baseline exists, but the scan that lists its changed paths has not finished.
+    Pending,
+    /// A task requires its change set, but it has no baseline that could produce one.
+    Unavailable,
+    /// Paths changed since the task baseline.
+    Known(Vec<String>),
+}
+
+impl ChangeInventory {
+    /// Get the known changed paths, empty until a scan produces them.
+    pub(crate) fn files(&self) -> &[String] {
+        match self {
+            Self::Known(files) => files,
+            Self::Untracked | Self::Pending | Self::Unavailable => &[],
+        }
+    }
+
+    /// Report whether a task owns this change set, even before its paths are known.
+    pub(crate) fn tracked(&self) -> bool {
+        !matches!(self, Self::Untracked)
+    }
+}
+
 /// Resolves overlapping path triggers and includes prerequisites of selected checks.
 pub(super) fn resolve(
     request: &RunRequest,
     config: &CheckConfig,
-    files: Option<&[String]>,
-    has_scope: bool,
+    inventory: &ChangeInventory,
 ) -> Result<Vec<CheckApplicability>> {
     let known: BTreeSet<_> = config
         .definitions
@@ -133,8 +160,8 @@ pub(super) fn resolve(
         .definitions
         .iter()
         .map(|check| {
-            let matched_files: Vec<_> = files
-                .unwrap_or_default()
+            let matched_files: Vec<_> = inventory
+                .files()
                 .iter()
                 .filter(|path| check.trigger.matches_path(path))
                 .cloned()
@@ -153,12 +180,14 @@ pub(super) fn resolve(
                 (false, "Automatic execution disabled".into())
             } else if matches!(check.trigger, CheckTrigger::Manual) {
                 (false, "Explicit runs only".into())
-            } else if !has_scope {
+            } else if *inventory == ChangeInventory::Untracked {
                 (
                     false,
                     "No task change context. Select checks explicitly.".into(),
                 )
-            } else if files.is_none() {
+            } else if *inventory == ChangeInventory::Pending {
+                (true, "Waiting for the task change scan".into())
+            } else if *inventory == ChangeInventory::Unavailable {
                 (
                     true,
                     "Task changes unavailable. Automatic trigger requires verification.".into(),

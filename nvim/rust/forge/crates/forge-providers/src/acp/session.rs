@@ -918,7 +918,7 @@ impl AcpSessionState {
                     })
             {
                 return Err(ProviderError::Observation(
-                    forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                    forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
                 )
                 .into());
             }
@@ -1337,7 +1337,7 @@ impl AcpSessionState {
                 };
                 let turn = self.address(session_id).await.ok_or_else(|| {
                     ProviderError::Observation(
-                        forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                        forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
                     )
                 })?;
                 {
@@ -1347,7 +1347,7 @@ impl AcpSessionState {
                         .or_insert_with(|| turn.clone());
                     if owner != &turn {
                         return Err(ProviderError::Observation(
-                            forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                            forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
                         )
                         .into());
                     }
@@ -1371,7 +1371,7 @@ impl AcpSessionState {
                         })
                 {
                     return Err(ProviderError::Observation(
-                        forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                        forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
                     )
                     .into());
                 }
@@ -1407,7 +1407,7 @@ impl AcpSessionState {
                     match items.entry(native_key.clone()) {
                         std::collections::hash_map::Entry::Occupied(entry) => {
                             if entry.get().kind != kind {
-                                return Err(ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict).into());
+                                return Err(ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::ownership_conflict()).into());
                             }
                             (entry.get().item_id.clone(), false)
                         }
@@ -1993,7 +1993,7 @@ fn merge_tool_snapshot(snapshot: &mut Value, update: &Value) -> Result<bool, Pro
         && normalized_tool_kind(previous) != normalized_tool_kind(next)
     {
         return Err(ProviderError::Observation(
-            forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+            forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
         ));
     }
     let invocation_changed = ["title", "kind", "rawInput"].into_iter().any(|field| {

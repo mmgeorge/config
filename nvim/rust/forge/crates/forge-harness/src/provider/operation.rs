@@ -48,7 +48,7 @@ impl OperationRegistry {
             .map_err(|_| operation_ownership_failure())?;
         let original = records
             .get_mut(id)
-            .ok_or_else(operation_ownership_failure)?;
+            .ok_or_else(|| operation_ownership_failure())?;
         if original
             .binding
             .as_ref()
@@ -71,7 +71,9 @@ impl OperationRegistry {
             .records
             .lock()
             .map_err(|_| operation_warning_conflict())?;
-        let original = records.get(id).ok_or_else(operation_warning_conflict)?;
+        let original = records
+            .get(id)
+            .ok_or_else(|| operation_warning_conflict())?;
         if original.binding.as_ref() != Some(binding) || original.scope.owner() != *owner {
             return Err(operation_warning_conflict());
         }
@@ -464,12 +466,14 @@ pub(super) fn primary_failure(error: &ProviderError) -> Option<ProviderFailure> 
 }
 
 /// Reject operation identity reassignment before dispatch.
+#[track_caller]
 fn operation_ownership_failure() -> ProviderError {
-    ProviderError::Observation(forge_provider_api::ObservationFailure::OwnershipConflict)
+    ProviderError::Observation(forge_provider_api::ObservationFailure::ownership_conflict())
 }
 /// Reject an unregistered, foreign, or retired-generation operation warning.
+#[track_caller]
 fn operation_warning_conflict() -> forge_provider_api::events::EventDeliveryError {
     forge_provider_api::events::EventDeliveryError::Observation(
-        forge_provider_api::ObservationFailure::OwnershipConflict,
+        forge_provider_api::ObservationFailure::ownership_conflict(),
     )
 }

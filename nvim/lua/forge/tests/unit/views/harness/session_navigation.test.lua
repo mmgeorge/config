@@ -251,4 +251,39 @@ T["resume_reopens_only_an_unavailable_current_session"] = function()
   assert(activations[1].options.state == current, "the reopened session left its own view")
 end
 
+
+-- Choosing a session from Insert mode returns its composer in Insert mode. The chosen composer's
+-- entry guard ran `stopinsert` when focus reached it, and a `startinsert` issued while Insert mode
+-- is still active, as in a reply that arrives after the picker restored it, is ignored, so the
+-- deliberate focus must not trigger the guard at all.
+T["insert_focus_does_not_trigger_the_composer_entry_guard"] = function()
+  local session = require("forge.session")
+  local layout = require("forge.views.harness.layout")
+  local navigation = require("forge.views.harness.session_navigation")
+  local function view(name, open_mode)
+    local state = session.new_harness_state()
+    state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
+      layout.open(name, open_mode)
+    session.register_harness(name, state)
+    return state
+  end
+  local chosen = view("chosen", "tab")
+  local current = view("current", "tab")
+  session.select_harness(current)
+  vim.api.nvim_set_current_win(current.composer_win)
+  local stop_count = 0
+  local original_cmd = vim.cmd
+  vim.cmd = setmetatable({}, { __index = original_cmd, __call = function(_, command)
+    if command == "stopinsert" then stop_count = stop_count + 1 end
+    return original_cmd(command)
+  end })
+  MiniTest.finally(function() vim.cmd = original_cmd end)
+  vim.keymap.set("i", "<F2>", function()
+    navigation.resume("chosen", { open_mode = "tab", insert = true })
+  end, { buffer = current.composer_buf })
+  vim.api.nvim_feedkeys(vim.keycode("i<F2>"), "xt", false)
+  vim.cmd = original_cmd
+  eq({ vim.api.nvim_get_current_win(), stop_count }, { chosen.composer_win, 0 })
+end
+
 return T

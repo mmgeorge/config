@@ -3,6 +3,10 @@ pub(super) fn tool_duration(milliseconds: Option<u64>) -> String {
     let Some(milliseconds) = milliseconds else {
         return "    —".into();
     };
+    // Sub-second times read in milliseconds, as `duration_label` shows them in headings.
+    if milliseconds < 1000 {
+        return format!("{:>5}", format!("{milliseconds}ms"));
+    }
     for (unit, divisor) in [("s", 100), ("m", 6000), ("h", 360_000), ("d", 8_640_000)] {
         let tenths = milliseconds / divisor + u64::from(milliseconds % divisor >= divisor / 2);
         if tenths < 1000 {
@@ -70,5 +74,26 @@ impl LabelDue {
 
     fn at(&mut self, due_ms: i64) {
         self.due_ms = Some(self.due_ms.map_or(due_ms, |current| current.min(due_ms)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Rows show sub-second durations in milliseconds, as the Thought and Tools headings do.
+    ///
+    /// The row column rounded to tenths of a second, so one call read `0.1s` on its row and
+    /// `92ms` in both headings above it. Every label still fits the five-cell column.
+    #[test]
+    fn tool_rows_show_sub_second_durations_in_milliseconds() {
+        for (milliseconds, row) in [
+            (0, "  0ms"),
+            (92, " 92ms"),
+            (999, "999ms"),
+            (1_000, "   1s"),
+            (14_300, "14.3s"),
+        ] {
+            assert_eq!(super::tool_duration(Some(milliseconds)), row);
+        }
+        assert_eq!(super::tool_duration(None), "    —");
     }
 }

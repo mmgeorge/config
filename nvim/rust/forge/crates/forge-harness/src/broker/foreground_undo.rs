@@ -50,38 +50,33 @@ impl ConversationRewind {
 }
 
 impl HarnessBroker {
+    /// Describe this session's provider for the shared conversation rewind rule.
+    pub(super) fn rewind_provider(&self) -> crate::exchange::rollback::RewindProvider<'_> {
+        crate::exchange::rollback::RewindProvider {
+            label: &self.session.provider_label,
+            capability: &self.capability,
+            native_history: self.session.provider_session_id.is_some(),
+        }
+    }
+
     /// Select the checkpoint that ends the retained native conversation.
     ///
     /// Retained exchanges without provider turns never reached native history and are skipped.
-    /// A retained exchange with provider turns but no recorded checkpoint has no safe boundary,
+    /// A retained exchange with provider turns but no reported checkpoint has no safe boundary,
     /// so rollback rejects it rather than discarding that exchange's native turns.
     pub(super) fn native_rewind(
         &self,
         exchanges: &[Exchange],
         first_removed: usize,
     ) -> Result<Option<NativeRewind>> {
-        anyhow::ensure!(
-            self.capability.native_conversation_rewind,
-            "Conversation rollback is unsupported: {} cannot rewind its conversation",
-            self.session.provider_label
-        );
-        if self.session.provider_session_id.is_none() {
+        let Some(after) = crate::exchange::rollback::rewind_target(
+            exchanges,
+            first_removed,
+            &self.rewind_provider(),
+        )?
+        else {
             return Ok(None);
-        }
-        let mut after = None;
-        for exchange in exchanges[..first_removed].iter().rev().filter(|exchange| {
-            exchange.disposition() == crate::exchange::HistoryDisposition::Current
-        }) {
-            if let Some(checkpoint) = &exchange.provider_checkpoint_id {
-                after = Some(checkpoint.clone());
-                break;
-            }
-            anyhow::ensure!(
-                exchange.turn.is_empty(),
-                "Conversation rollback is unsupported here: interaction {} has no recorded provider checkpoint",
-                exchange.ordinal
-            );
-        }
+        };
         Ok(Some(NativeRewind {
             request: self.provider_request(ProviderInput::from_user_text(""), PromptMode::Chat)?,
             after,
@@ -176,16 +171,24 @@ impl HarnessBroker {
         self.store
             .require_settled_exchange_tree(&self.session.id, &rewind.exchanges)
             .context("rollback requires settled child work")?;
+        let keeps_task = rewind.expected_task.as_ref().is_some_and(|task| {
+            crate::exchange::rollback::rollback_keeps_task(
+                &exchanges,
+                &rewind.exchanges,
+                task.created_at_ms,
+            )
+        });
         let mut session = self.session.clone();
-        session.active_task = None;
         self.apply_rewound_conversation(&mut session, rewind.native.as_ref())?;
-        self.task_controller.clear_for_rollback(
+        self.task_controller.commit_rollback(
             &mut self.store,
             rewind.expected_task.as_ref().map(|task| &task.revision),
             &session,
             &rewind.exchanges,
+            keeps_task,
             self.clock.now_ms(),
         )?;
+        session.active_task = self.task_controller.current()?;
         self.session = session;
         self.context_usage_fresh = false;
         self.rolled_back_events(&rewind.exchanges[0])

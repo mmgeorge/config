@@ -20,6 +20,9 @@ impl<'exchange> CheckpointComparison<'exchange> {
 pub(crate) enum ExchangeChangeResult<'exchange> {
     /// The exchange ended before its initial workspace checkpoint was captured.
     NotStarted,
+    /// A provider-native child's edits belong to the checkpoints of the exchange that
+    /// delegated to it, so the child's own exchange records none.
+    Delegated,
     Pending {
         previous: Option<CheckpointComparison<'exchange>>,
     },
@@ -33,6 +36,9 @@ pub(crate) enum ExchangeChangeResult<'exchange> {
 impl Exchange {
     /// Select saved evidence, retaining earlier captures while work is unsettled or failed.
     pub(crate) fn change_result(&self) -> ExchangeChangeResult<'_> {
+        if self.opening == super::ExchangeOpening::NativeAgent {
+            return ExchangeChangeResult::Delegated;
+        }
         let previous = match (
             &self.checkpoint_before,
             &self.checkpoint_after,

@@ -52,7 +52,17 @@ end
 local function label_for(tab)
   local state = displayed_state(tab)
   if state then return session_label(state) end
-  local buffer = vim.api.nvim_win_get_buf(vim.api.nvim_tabpage_get_win(tab))
+  -- A focused popup holds a scratch buffer; the tab is named after the window it floats over.
+  local window = vim.api.nvim_tabpage_get_win(tab)
+  if vim.api.nvim_win_get_config(window).relative ~= "" then
+    local tab_number = vim.api.nvim_tabpage_get_number(tab)
+    local previous = vim.fn.win_getid(vim.fn.tabpagewinnr(tab_number, "#"), tab_number)
+    window = previous ~= 0 and vim.api.nvim_win_get_config(previous).relative == "" and previous
+      or vim.iter(vim.api.nvim_tabpage_list_wins(tab)):find(function(candidate)
+        return vim.api.nvim_win_get_config(candidate).relative == ""
+      end) or window
+  end
+  local buffer = vim.api.nvim_win_get_buf(window)
   local name = vim.api.nvim_buf_get_name(buffer)
   return name == "" and "[No Name]" or vim.fn.fnamemodify(name, ":t")
 end

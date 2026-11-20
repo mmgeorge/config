@@ -117,13 +117,18 @@ impl<'profile> TranscriptRenderer<'profile> {
     }
 
     /// Retain the empty end anchor used to replace an individual tool's output chunks.
+    /// Close an expanded tool body with how the call ended, when it did not succeed.
     pub(super) fn tool_hidden(
         &self,
         call_id: &super::identity::DisplayId,
-        _output: &ToolOutputView,
-        _expanded: bool,
+        output: &ToolOutputView,
+        expanded: bool,
     ) -> Result<BufferBlock> {
-        self.output_block(BlockId(format!("{call_id}:hidden")), Vec::new())
+        let rows = match output.outcome().filter(|_| expanded) {
+            Some(outcome) => tool_body_rows(self.profile, outcome, false)?,
+            None => Vec::new(),
+        };
+        self.output_block(BlockId(format!("{call_id}:hidden")), rows)
     }
 
     fn output_block(&self, id: BlockId, rows: Vec<String>) -> Result<BufferBlock> {
@@ -227,11 +232,8 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn response(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
         let source = markdown_math::normalize(source);
-        let mut rendered = MarkdownRenderer::file_link_labels(
-            id,
-            source.trim_end_matches(['\r', '\n']),
-            self.profile,
-        )?;
+        let mut rendered =
+            MarkdownRenderer::link_labels(id, source.trim_end_matches(['\r', '\n']), self.profile)?;
         rendered.block.metadata.markdown = true;
         rendered.block.metadata.layout = Some(ContentLayout {
             indent: 2,
@@ -246,11 +248,8 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn commentary(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
         let source = markdown_math::normalize(source);
-        let mut rendered = MarkdownRenderer::file_link_labels(
-            id,
-            source.trim_end_matches(['\r', '\n']),
-            self.profile,
-        )?;
+        let mut rendered =
+            MarkdownRenderer::link_labels(id, source.trim_end_matches(['\r', '\n']), self.profile)?;
         let block = &mut rendered.block;
         block.metadata.markdown = true;
         block.metadata.decoration.clear();
@@ -526,14 +525,9 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
         .collect())
 }
 
-/// Formats a bounded display title without changing the retained provider call.
-fn tool_heading(
-    profile: &WidthProfile,
-    kind: &str,
-    title: &str,
-    duration: &str,
-    shell: Option<&str>,
-) -> Result<String> {
+/// Name a call as its row does: a command by its summary or unwrapped source, without the
+/// provider's shell wrapper, and any other call by its title, on one line.
+pub(super) fn tool_display_title(kind: &str, title: &str, shell: Option<&str>) -> String {
     let display = matches!(kind, "command" | "check").then(|| {
         crate::permissions::command::display_command(
             title,
@@ -552,7 +546,18 @@ fn tool_heading(
             .as_ref()
             .map_or(title, |display| display.source.as_str())
     });
-    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Formats a bounded display title without changing the retained provider call.
+fn tool_heading(
+    profile: &WidthProfile,
+    kind: &str,
+    title: &str,
+    duration: &str,
+    shell: Option<&str>,
+) -> Result<String> {
+    let normalized = tool_display_title(kind, title, shell);
     let full = if kind == "check" {
         format!("▸ {normalized} · {}", duration.trim())
     } else {

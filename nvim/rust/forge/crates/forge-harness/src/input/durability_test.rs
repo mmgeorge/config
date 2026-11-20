@@ -247,7 +247,7 @@ fn check_inbox_restart_case(boundary: DispatchCut) -> Result<()> {
 fn accepted_queue_reopens_suspended_with_order_and_idempotency() -> Result<()> {
     let root = tempfile::tempdir()?;
     let submissions = submission_store(root.path())?;
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
     queue.apply(queued_operation("first"))?;
     queue.apply(queued_operation("second"))?;
     queue.apply(InputOperation {
@@ -262,7 +262,7 @@ fn accepted_queue_reopens_suspended_with_order_and_idempotency() -> Result<()> {
     })?;
     let before = queue.snapshot()?;
     drop(queue);
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
     let restored = queue.snapshot()?;
     assert!(restored.suspended);
     assert_eq!(restored.messages[0].text, before.messages[0].text);
@@ -339,7 +339,7 @@ fn claim_with_submission(
 fn failed_prompt_survives_restart_and_blocks_follow_ups() -> Result<()> {
     let root = tempfile::tempdir()?;
     let submissions = submission_store(root.path())?;
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
     let submission = claim_with_submission(&queue, &submissions)?;
     submission.cancel()?;
     queue.delivery(
@@ -350,7 +350,7 @@ fn failed_prompt_survives_restart_and_blocks_follow_ups() -> Result<()> {
     )?;
     queue.apply(queued_operation("follow-up"))?;
     drop(queue);
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
     let restored = queue.snapshot()?;
     assert_eq!(restored.messages[0].id, "message");
     assert_eq!(restored.messages[0].delivery(), InputDelivery::Failed);
@@ -374,12 +374,95 @@ fn failed_prompt_survives_restart_and_blocks_follow_ups() -> Result<()> {
     Ok(())
 }
 
+/// A prompt interrupted before dispatch whose exchange the transcript already shows settles
+/// there at restore: it leaves the queue, cannot be retried, and does not pause later input.
+#[test]
+fn interrupted_prompt_with_exchange_settles_at_restore() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
+    let submission = claim_with_submission(&queue, &submissions)?;
+    drop(queue);
+    let exchanged = std::collections::HashSet::from(["message".to_owned()]);
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &exchanged)?;
+    let restored = queue.snapshot()?;
+    assert!(restored.messages.is_empty(), "{:?}", restored.messages);
+    assert!(!restored.suspended, "a settled prompt paused the queue");
+    assert!(matches!(
+        submission.record()?.delivery,
+        crate::provider::submission::SubmissionState::Cancelled
+    ));
+    Ok(())
+}
+
+/// A prompt interrupted before dispatch without an exchange stays as the failed entry the user
+/// retries explicitly, and the queue reopens paused behind it.
+#[test]
+fn interrupted_prompt_without_exchange_stays_failed_and_paused() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
+    claim_with_submission(&queue, &submissions)?;
+    drop(queue);
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
+    let restored = queue.snapshot()?;
+    assert_eq!(restored.messages.len(), 1);
+    assert_eq!(restored.messages[0].delivery(), InputDelivery::Failed);
+    assert!(restored.suspended);
+    Ok(())
+}
+
+/// Retrying the failed entry of a paused queue keeps each prompt the queue held as its own
+/// turn, so none of them steers into the retried turn out of submission order.
+#[test]
+fn retrying_a_paused_queue_keeps_held_prompts_as_turns() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
+    claim_with_submission(&queue, &submissions)?;
+    drop(queue);
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
+    let mut held = queued_operation("held");
+    let InputAction::Submit { message } = &mut held.action else {
+        unreachable!("queued operations submit")
+    };
+    message.intent = InputIntent::Auto;
+    // The stale control revision submits behind the pause without resuming it.
+    queue.apply(held)?;
+    let paused = queue.snapshot()?;
+    assert!(paused.suspended);
+    let retried = queue.apply(InputOperation {
+        id: "retry".into(),
+        control_revision: paused.control_revision,
+        after_control: None,
+        action: InputAction::Retry {
+            id: "message".into(),
+            revision: paused
+                .messages
+                .iter()
+                .find(|message| message.id == "message")
+                .context("failed prompt missing")?
+                .revision,
+        },
+    })?;
+    assert!(retried.error.is_none(), "{:?}", retried.error);
+    let resumed = queue.snapshot()?;
+    assert!(!resumed.suspended);
+    let held = resumed
+        .messages
+        .iter()
+        .find(|message| message.id == "held")
+        .context("held prompt missing")?;
+    assert_eq!(held.intent, InputIntent::Queue);
+    Ok(())
+}
+
 /// Removing uncertain input discards its record without replay and unblocks the queue.
 #[test]
 fn removing_uncertain_input_discards_its_record_without_replay() -> Result<()> {
     let root = tempfile::tempdir()?;
     let submissions = submission_store(root.path())?;
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
     let submission = claim_with_submission(&queue, &submissions)?;
     submission.sending(Some(forge_provider_api::RecoveryToken::new(
         b"fixture-sending".to_vec(),
@@ -434,7 +517,7 @@ fn removing_uncertain_input_discards_its_record_without_replay() -> Result<()> {
             .is_some()
     );
     drop(queue);
-    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
     assert!(
         queue
             .snapshot()?
@@ -460,7 +543,8 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
         DispatchCut::Cancelled,
     ] {
         let session = format!("session-{boundary:?}");
-        let queue = SessionInputQueue::open(root.path(), &session, &submissions)?;
+        let queue =
+            SessionInputQueue::open(root.path(), &session, &submissions, &Default::default())?;
         queue.apply(queued_operation("message"))?;
         queue
             .claim("message", 1, InputRoute::Turn)?
@@ -509,7 +593,8 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
             )?;
         }
         drop(queue);
-        let queue = SessionInputQueue::open(root.path(), &session, &submissions)?;
+        let queue =
+            SessionInputQueue::open(root.path(), &session, &submissions, &Default::default())?;
         let restored = queue.snapshot()?;
         assert_eq!(
             restored.suspended,

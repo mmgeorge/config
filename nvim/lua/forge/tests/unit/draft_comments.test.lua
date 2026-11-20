@@ -98,4 +98,30 @@ T["draft_comment_threads"] = function()
   assert(not vim.bo[buffer].modifiable and followup.focused and change.focused, "merged compact answer lost readonly thread focus")
 end
 
+T["saved_comment_collapses_at_once"] = function()
+  local comments = require("forge.draft_comments")
+  local buffer = buffer_support.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, buffer)
+  local state = comments.attach(buffer, window, { "pub struct Boundary;", "Next source row" },
+    { { id = 1, source_line = 1, end_source_line = 1, body = "Keep this API." } }, { guard_source = true })
+  assert(comments.focus(buffer, 1))
+  local function compact()
+    return vim.iter(state.range_list):all(function(range) return range.compact end)
+  end
+  assert(not compact(), "focusing did not expand the comment")
+  comments.saved(buffer, comments.capture(buffer))
+  -- The save is the visible acknowledgement: the comment collapses as if the cursor had left it.
+  assert(compact(), "a saved comment stayed expanded until the cursor moved")
+  assert(not vim.bo[buffer].modified, "the saved comment left the buffer modified")
+  -- A comment typed into after its save was sent keeps its editor open.
+  assert(comments.focus(buffer, 1))
+  local captured = comments.capture(buffer)
+  local row = vim.api.nvim_win_get_cursor(window)[1] - 1
+  vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Keep this API stable." })
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
+  comments.saved(buffer, captured)
+  assert(not compact(), "a save of older text collapsed a comment that is still being edited")
+end
+
 return T

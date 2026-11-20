@@ -102,8 +102,20 @@ function M.proposed(review, selection, captured, commit)
     preview(value)
     perf.event("harness", "ui.plan.rename_preview", { phase = "confirmed", document = review.owner.document,
       revision = selection.expected_version, count = #selection.preview, duration_ms = perf.elapsed_ms(started) })
-    local submitted, failure = pcall(commit, value, finish)
-    if not submitted then finish() notifications.error(tostring(failure), "ForgePlanReview") end
+    -- The preview stays on screen while the reviewer confirms, so a name typed and entered in
+    -- one motion is still shown in every span it rewrites before anything changes.
+    local count = #selection.preview
+    require("forge.infra.confirm").open({
+      ("Rename %s to %s in %d place%s?"):format(selection.name, value, count, count == 1 and "" or "s"),
+      "Each highlighted span in the review changes.",
+    }, function()
+      if not review.owner.is_current(captured) then
+        finish()
+        notifications.error("Plan changed while the rename was awaiting confirmation", "ForgePlanReview") return
+      end
+      local submitted, failure = pcall(commit, value, finish)
+      if not submitted then finish() notifications.error(tostring(failure), "ForgePlanReview") end
+    end, finish, { title = "Rename symbol" })
   end)
 end
 

@@ -20,14 +20,17 @@ pub(super) fn definition() -> ControlToolDefinition {
                 `## Background`, `## Decisions`, `## Design`, and `## Manual checks`; Objective, Background, \
                 and Design are required. List sections use `- item` with two-space continuation lines, \
                 decisions use `- **Decision.** Rationale.`, and Manual checks lists what the agent must \
-                observe in Verify because automated checks cannot establish it. plan:flows.md has one \
+                observe in Verify because automated checks cannot establish it; every item is a Verify \
+                action, so omit the section rather than listing \"None\". plan:flows.md has one \
                 `## Title` per independently triggered flow, then a one-to-two-line description that names \
                 its trigger, then one ```mermaid block: sequenceDiagram for a flow that crosses ownership \
                 boundaries, flowchart for branching control flow inside one owner, or stateDiagram-v2 for a \
                 lifecycle whose transitions come from several triggers. plan:tests.md has one \
-                `## path/to/file` per file and items such as - new `exact_test_name` [target: runner]: \
+                `## path/to/file` per file and items such as - new `exact_test_name`: \
                 scenario and expected result, where the change is new, modified, removed, or reused and the \
-                target is optional. plan:checks.md lists one check ID per line, each a saved check from \
+                name is the test's declared title, optionally preceded by its group titles. Add \
+                [target: check] after the name only when the name matches cases in several test checks; \
+                the target is a test check's ID or label from check_definition_list. plan:checks.md lists one check ID per line, each a saved check from \
                 check_definition_list to run in addition to the automatic ones; a line's presence alone \
                 selects its check, and Harness adds prerequisites itself. Add File on an \
                 artifact replaces its whole text, and Delete File clears it. Operations on one artifact \

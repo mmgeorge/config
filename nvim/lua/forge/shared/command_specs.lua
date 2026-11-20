@@ -171,6 +171,8 @@ M.view_specs = {
     { id = "references", label = "references", desc = "Find symbol usages in this plan snapshot", modes = "n", pinned = false },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
     { id = "jump_entity", label = "definition", desc = "Jump to the selected declaration, call, or property definition", modes = "n", pinned = false },
+    { id = "entity_info", label = "info", desc = "Show the selected entity's captured definition", modes = "n", pinned = false },
+    { id = "schema", label = "schema", desc = "Show the canonical plan document as JSON", modes = "n", pinned = false },
     { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = false },
     { id = "toggle", label = "fold", desc = "Toggle the current declaration diff file or hunk", modes = "n", pinned = false },
     { id = "open", label = "open", desc = "Jump to the selected definition or open the source file", modes = "n", pinned = false },
