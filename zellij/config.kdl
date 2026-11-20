@@ -1,4 +1,21 @@
 keybinds clear-defaults=true {
+    normal {
+        // Reserve ordinary application keys. Zellij-specific modes start with Ctrl+N.
+        bind "Ctrl n" { SwitchToMode "tmux"; }
+        bind "Ctrl Shift t" { NewTab; }
+        bind "Ctrl Tab" "Ctrl PageDown" { GoToNextTab; }
+        bind "Ctrl Shift Tab" "Ctrl PageUp" { GoToPreviousTab; }
+        bind "Ctrl Shift PageDown" { MoveTab "right"; }
+        bind "Ctrl Shift PageUp" { MoveTab "left"; }
+        bind "Ctrl Shift x" { SwitchToMode "scroll"; }
+        bind "Shift PageUp" { PageScrollUp; }
+        bind "Shift PageDown" { PageScrollDown; }
+        bind "Alt Shift s" { Resize "Increase up"; }
+        bind "Alt Shift t" { Resize "Increase down"; }
+        // Preserve the CSI-u sequences WezTerm sends to applications.
+        bind "Ctrl ." { WriteChars "\u{1b}[46;5u"; }
+        bind "Ctrl ," { WriteChars "\u{1b}[44;5u"; }
+    }
     locked {
         bind "Ctrl g" { SwitchToMode "normal"; }
     }
@@ -85,110 +102,33 @@ keybinds clear-defaults=true {
         bind "tab" { MovePane; }
     }
     scroll {
-        bind "e" { EditScrollback; SwitchToMode "normal"; }
-        bind "s" { SwitchToMode "entersearch"; SearchInput 0; }
+        bind "E" { EditScrollback; SwitchToMode "normal"; }
+        bind "up" { ScrollUp; }
+        bind "down" { ScrollDown; }
+        bind "o" { PageScrollDown; }
     }
     search {
         bind "c" { SearchToggleOption "CaseSensitivity"; }
-        bind "n" { Search "down"; }
+        bind "n" "Ctrl n" "down" { Search "down"; }
         bind "o" { SearchToggleOption "WholeWord"; }
-        bind "p" { Search "up"; }
+        bind "p" "Ctrl p" "up" { Search "up"; }
         bind "w" { SearchToggleOption "Wrap"; }
     }
     session {
-        bind "a" {
-            LaunchOrFocusPlugin "zellij:about" {
-                floating true
-                move_to_focused_tab true
-            }
-            SwitchToMode "normal"
-        }
-        bind "c" {
-            LaunchOrFocusPlugin "configuration" {
-                floating true
-                move_to_focused_tab true
-            }
-            SwitchToMode "normal"
-        }
-        bind "l" {
-            LaunchOrFocusPlugin "zellij:layout-manager" {
-                floating true
-                move_to_focused_tab true
-            }
-            SwitchToMode "normal"
-        }
         bind "Ctrl o" { SwitchToMode "normal"; }
-        bind "p" {
-            LaunchOrFocusPlugin "plugin-manager" {
-                floating true
-                move_to_focused_tab true
-            }
-            SwitchToMode "normal"
-        }
-        bind "s" {
-            LaunchOrFocusPlugin "zellij:share" {
-                floating true
-                move_to_focused_tab true
-            }
-            SwitchToMode "normal"
-        }
-        bind "w" {
-            LaunchOrFocusPlugin "session-manager" {
-                floating true
-                move_to_focused_tab true
-                skip_plugin_cache true
-            }
-            SwitchToMode "normal"
-        }
+        bind "r" { SwitchToMode "renamesession"; SessionNameInput 0; }
+        bind "tab" { SwitchToMode "normal"; ToggleSession; }
     }
-    shared_except "locked" {
-        bind "Alt left" { MoveFocusOrTab "left"; }
-        bind "Alt down" { MoveFocus "down"; }
-        bind "Alt up" { MoveFocus "up"; }
-        bind "Alt right" { MoveFocusOrTab "right"; }
-        bind "Alt +" { Resize "Increase"; }
-        bind "Alt -" { Resize "Decrease"; }
-        bind "Alt =" { Resize "Increase"; }
-        bind "Alt [" { PreviousSwapLayout; }
-        bind "Alt ]" { NextSwapLayout; }
-        bind "Alt f" { ToggleFloatingPanes; }
-        bind "Ctrl g" { SwitchToMode "locked"; }
-        bind "Alt h" { MoveFocusOrTab "left"; }
-        bind "Alt i" { MoveTab "left"; }
-        bind "Alt j" { MoveFocus "down"; }
-        bind "Alt k" { MoveFocus "up"; }
-        bind "Alt l" { MoveFocusOrTab "right"; }
-        bind "Alt n" { NewPane; }
-        bind "Alt o" { MoveTab "right"; }
-        bind "Alt p" { TogglePaneInGroup; }
-        bind "Alt Shift p" { ToggleGroupMarking; }
-        bind "Ctrl q" { Quit; }
+    renamesession {
+        bind "esc" "Ctrl c" { UndoRenameSession; SwitchToMode "normal"; }
     }
-    shared_except "locked" "move" {
-        bind "Ctrl h" { SwitchToMode "move"; }
-    }
-    shared_except "locked" "session" {
-        bind "Ctrl o" { SwitchToMode "session"; }
-    }
-    shared_except "locked" "scroll" "search" "tmux" {
-        bind "Ctrl n" { SwitchToMode "tmux"; }
-    }
-    shared_except "locked" "scroll" "search" {
-        bind "Ctrl s" { SwitchToMode "scroll"; }
-    }
-    shared_except "locked" "tab" {
-        bind "Ctrl t" { SwitchToMode "tab"; }
-    }
-    shared_except "locked" "pane" {
-        bind "Ctrl p" { SwitchToMode "pane"; }
-    }
-    shared_except "locked" "resize" {
-        bind "Ctrl b" { SwitchToMode "resize"; }
+    shared_among "normal" "scroll" {
+        bind "Ctrl Shift f" { SwitchToMode "entersearch"; SearchInput 0; }
     }
     shared_except "normal" "locked" "entersearch" {
         bind "enter" { SwitchToMode "normal"; }
     }
-    shared_except "normal" "locked" "entersearch" "renametab" "renamepane" {
+    shared_except "normal" "locked" "entersearch" "renametab" "renamepane" "renamesession" {
         bind "esc" { SwitchToMode "normal"; }
     }
     shared_among "pane" "tmux" {
@@ -197,24 +137,17 @@ keybinds clear-defaults=true {
     shared_among "scroll" "search" {
         bind "PageDown" { PageScrollDown; }
         bind "PageUp" { PageScrollUp; }
-        bind "left" { PageScrollUp; }
-        bind "down" { ScrollDown; }
-        bind "up" { ScrollUp; }
-        bind "right" { PageScrollDown; }
         bind "Ctrl c" { ScrollToBottom; SwitchToMode "normal"; }
-        bind "Ctrl s" { SwitchToMode "normal"; }
-        // WezTerm copy mode navigation (s/t = up/down)
+        // WezTerm copy-mode keys scroll the viewport in Zellij.
         bind "s" { ScrollUp; }
         bind "t" { ScrollDown; }
-        bind "e" { HalfPageScrollUp; }
-        bind "a" { HalfPageScrollDown; }
+        bind "e" { ScrollUp; ScrollUp; ScrollUp; ScrollUp; }
+        bind "a" { ScrollDown; ScrollDown; ScrollDown; ScrollDown; }
         bind "u" { PageScrollUp; }
-        bind "o" { PageScrollDown; }
-        // Vim-style fallback
-        bind "j" { ScrollDown; }
-        bind "k" { ScrollUp; }
-        bind "d" { HalfPageScrollDown; }
-        bind "Ctrl f" { PageScrollDown; }
+        bind "k" { ScrollToTop; }
+        bind "K" { ScrollToBottom; }
+        bind "l" { Copy; }
+        bind "q" { SwitchToMode "normal"; }
     }
     entersearch {
         bind "Ctrl c" { SwitchToMode "scroll"; }
@@ -234,6 +167,12 @@ keybinds clear-defaults=true {
         bind "d" { Detach; }
     }
     tmux {
+        // Zellij's additional modes remain available after the leader.
+        bind "Ctrl b" { SwitchToMode "resize"; }
+        bind "Ctrl g" { SwitchToMode "locked"; }
+        bind "Ctrl o" { SwitchToMode "session"; }
+        bind "Ctrl p" { SwitchToMode "pane"; }
+        bind "Ctrl t" { SwitchToMode "tab"; }
         // Pane navigation (WezTerm: LEADER + n/a/e/i)
         bind "n" { MoveFocus "left"; SwitchToMode "normal"; }
         bind "a" { MoveFocus "down"; SwitchToMode "normal"; }
@@ -243,7 +182,8 @@ keybinds clear-defaults=true {
         bind "down" { MoveFocus "down"; SwitchToMode "normal"; }
         bind "up" { MoveFocus "up"; SwitchToMode "normal"; }
         bind "right" { MoveFocus "right"; SwitchToMode "normal"; }
-        bind "o" { FocusNextPane; }
+        bind "o" { FocusNextPane; SwitchToMode "normal"; }
+        bind "O" { SwitchToMode "move"; }
         // Pane management
         bind "'" { NewPane "down"; SwitchToMode "normal"; }
         bind "\"" { NewPane "right"; SwitchToMode "normal"; }
@@ -252,68 +192,63 @@ keybinds clear-defaults=true {
         bind "c" { NewTab; SwitchToMode "normal"; }
         bind "y" { GoToPreviousTab; SwitchToMode "normal"; }
         bind "z" { GoToNextTab; SwitchToMode "normal"; }
-        // Session manager (WezTerm: LEADER + s)
+        // Session picker (WezTerm: LEADER + s)
         bind "s" {
-            LaunchOrFocusPlugin "session-manager" {
+            SwitchToMode "normal"
+            LaunchOrFocusPlugin "zellij:session-manager" {
                 floating true
                 move_to_focused_tab true
-                skip_plugin_cache true
             }
-            SwitchToMode "normal"
         }
-        // Quick session switch (Shift+S) - launches session manager for fast switching
-        bind "S" {
-            LaunchOrFocusPlugin "session-manager" {
-                floating true
-                move_to_focused_tab true
-                skip_plugin_cache true
-            }
-            SwitchToMode "normal"
-        }
-        // Rename session (WezTerm: LEADER + u)
-        bind "u" {
-            LaunchOrFocusPlugin "file:D:/config/zellij/sessions/target/wasm32-wasip1/release/sessions.wasm" {
-                floating true
-                move_to_focused_tab true
-                skip_plugin_cache true
-                rename_session true
-            }
-            SwitchToMode "normal"
-        }
+        bind "S" { SwitchToMode "normal"; ToggleSession; }
+        bind "u" { SwitchToMode "renamesession"; SessionNameInput 0; }
+        bind "j" { SwitchToMode "normal"; Quit; }
+        bind ";" { SwitchToMode "normal"; OpenContextMenu; }
         // Enter scroll/copy mode (WezTerm: LEADER + .)
         bind "." { SwitchToMode "scroll"; }
         bind "[" { SwitchToMode "scroll"; }
         // Layout
-        bind "space" { NextSwapLayout; }
+        bind "space" { NextSwapLayout; SwitchToMode "normal"; }
         // Send literal Ctrl-N to terminal
         bind "Ctrl n" { Write 14; SwitchToMode "normal"; }
     }
 }
 
-// Plugin aliases - can be used to change the implementation of Zellij
-// changing these requires a restart to take effect
-plugins {
-    about location="zellij:about"
-    compact-bar location="zellij:compact-bar"
-    configuration location="zellij:configuration"
-    filepicker location="zellij:strider" {
-        cwd "/"
+// Desktop settings follow wezterm/wezterm.lua.
+terminal {
+    font "Cascadia Code NF"
+    font_size 12
+    line_height 1.0
+    padding_left 4
+    padding_right 4
+    padding_top 2
+    padding_bottom 0
+    cursor_style "block"
+    cursor_blink false
+    startup_mode "windowed"
+    initial_columns 80
+    initial_rows 24
+    paste_keys "Ctrl y" "Ctrl Shift v" "Shift Insert" "Super v"
+    fullscreen_keys "Alt Enter" "F11"
+    theme {
+        cursor "#ffffff"
+        black "#000000"
+        red "#cc5555"
+        green "#55cc55"
+        yellow "#cdcd55"
+        blue "#5455cb"
+        magenta "#cc55cc"
+        cyan "#7acaca"
+        white "#cccccc"
+        bright_black "#555555"
+        bright_red "#ff5555"
+        bright_green "#55ff55"
+        bright_yellow "#ffff55"
+        bright_blue "#5555ff"
+        bright_magenta "#ff55ff"
+        bright_cyan "#55ffff"
+        bright_white "#ffffff"
     }
-    plugin-manager location="zellij:plugin-manager"
-    session-manager location="file:D:/config/zellij/sessions/target/wasm32-wasip1/release/sessions.wasm"
-    status-bar location="zellij:status-bar"
-    strider location="zellij:strider"
-    tab-bar location="zellij:tab-bar"
-    welcome-screen location="zellij:session-manager" {
-        welcome_screen true
-    }
-}
-
-// Plugins to load in the background when a new session starts
-// eg. "file:/path/to/my-plugin.wasm"
-// eg. "https://example.com/my-plugin.wasm"
-load_plugins {
-    zellij:link
 }
 web_client {
     font "monospace"
@@ -333,10 +268,43 @@ web_client {
 //
 // osc8_hyperlinks true
 
-// Choose the theme that is specified in the themes section.
-// Default: default
-//
-// theme "dracula"
+theme "wezterm"
+themes {
+    wezterm {
+        text_unselected {
+            base "#b2b2b2"
+            background "#000000"
+            emphasis_0 "#ffffff"
+            emphasis_1 "#b2b2b2"
+            emphasis_2 "#7acaca"
+            emphasis_3 "#ff5555"
+        }
+        ribbon_selected {
+            base "#ffffff"
+            background "#000000"
+            emphasis_0 "#ffffff"
+            emphasis_1 "#b2b2b2"
+            emphasis_2 "#7acaca"
+            emphasis_3 "#ff5555"
+        }
+        ribbon_unselected {
+            base "#808080"
+            background "#000000"
+            emphasis_0 "#ffffff"
+            emphasis_1 "#b2b2b2"
+            emphasis_2 "#7acaca"
+            emphasis_3 "#ff5555"
+        }
+        ribbon_hover {
+            base "#ffffff"
+            background "#000000"
+            emphasis_0 "#ffffff"
+            emphasis_1 "#b2b2b2"
+            emphasis_2 "#7acaca"
+            emphasis_3 "#ff5555"
+        }
+    }
+}
 
 // Choose the base input mode of zellij.
 // Default: normal
@@ -355,7 +323,16 @@ default_shell "nu"
 // The name of the default layout to load on startup
 // Default: "default"
 //
-default_layout "compact"
+default_layout "default"
+bars_hidden_on_start "status-bar"
+hidden_bars_notification false
+session_indicator false
+
+ui {
+    pane_frames {
+        hide_session_name true
+    }
+}
 
 // The folder in which Zellij will look for layouts
 // (Requires restart)
@@ -407,7 +384,9 @@ pane_frames false
 // Valid values: positive integers
 // Default value: 10000
 //
-// scroll_buffer_size 10000
+scroll_buffer_size 3000
+// Enter scroll mode only through a shortcut, even when the viewport has scrolled back.
+scroll_mode_sync false
 
 // Provide a command to execute when copying text. The text will be piped to
 // the stdin of the program to perform the copy. This can be used with
@@ -562,7 +541,7 @@ show_startup_tips false
 // Whether to show release notes on first version run
 // Default: true
 //
-// show_release_notes false
+show_release_notes false
 
 // Whether to enable mouse hover effects and pane grouping functionality
 // default is true
