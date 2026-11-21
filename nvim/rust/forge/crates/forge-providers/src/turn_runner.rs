@@ -191,7 +191,9 @@ fn invalidates_binding(error: &ProviderError) -> bool {
         ProviderError::Combined { primary, secondary } => {
             invalidates_binding(primary) || secondary.iter().any(invalidates_binding)
         }
-        ProviderError::PreparationFailed(cause) => invalidates_binding(cause),
+        ProviderError::PreparationFailed(cause) | ProviderError::Explained { cause, .. } => {
+            invalidates_binding(cause)
+        }
         ProviderError::PreparationCleanup { cause, cleanup } => {
             invalidates_binding(cause) || invalidates_binding(cleanup)
         }
@@ -212,7 +214,8 @@ fn normalized_failure(error: &ProviderError, phase: ProviderPhase) -> ProviderFa
         ProviderError::Failure(failure) => *failure,
         ProviderError::Combined { primary, .. } => normalized_failure(primary, phase),
         ProviderError::PreparationFailed(cause) => normalized_failure(cause, phase),
-        ProviderError::PreparationCleanup { cause, .. } => normalized_failure(cause, phase),
+        ProviderError::PreparationCleanup { cause, .. }
+        | ProviderError::Explained { cause, .. } => normalized_failure(cause, phase),
         ProviderError::Delivery(_)
         | ProviderError::Contract(_)
         | ProviderError::Observation(_)

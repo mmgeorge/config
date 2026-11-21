@@ -536,12 +536,20 @@ async fn launch_conversation(
         launch(launcher, state, options, start, cleanup).await,
         restart,
     ) {
-        (Err(ProviderError::Failure(failure)), Some(restart))
-            if failure.kind() == ProviderFailureKind::Initialization =>
-        {
+        (Err(error), Some(restart)) if failed_initialization(&error) => {
             launch(launcher, state, options, restart, cleanup).await
         }
         (launched, _) => launched,
+    }
+}
+
+/// Report whether a launch ended before the CLI completed its initialize handshake, whether or
+/// not the CLI stated why.
+fn failed_initialization(error: &ProviderError) -> bool {
+    match error {
+        ProviderError::Failure(failure) => failure.kind() == ProviderFailureKind::Initialization,
+        ProviderError::Explained { cause, .. } => failed_initialization(cause),
+        _ => false,
     }
 }
 
@@ -578,12 +586,23 @@ async fn launch(
         Err(error) => {
             let _ = transport.shutdown().await;
             // The reader delivers every frame before it reports the closed output, so a reason
-            // the CLI printed before it exited is already recorded.
-            if let Some(reason) = frames.startup_refusal() {
-                tracing::error!(target: "forge::provider", event_name = "provider.startup.refused",
-                    provider = "claude", reason = %reason);
-            }
-            return Err(initialization_failure(error));
+            // the CLI printed before it exited is already recorded. The host log keeps an event's
+            // `error` text, and the explanation carries it to the user.
+            let cause = initialization_failure(error);
+            let refusal = frames
+                .startup_refusal()
+                .and_then(|reason| forge_provider_api::SanitizedMessage::new(reason).ok());
+            return Err(match refusal {
+                Some(explanation) => {
+                    tracing::error!(target: "forge::provider", event_name = "provider.startup.refused",
+                        provider = "claude", error = %explanation);
+                    ProviderError::Explained {
+                        cause: Box::new(cause),
+                        explanation,
+                    }
+                }
+                None => cause,
+            });
         }
     };
     let initialized: InitializeResponse = serde_json::from_value(initialized).map_err(|_| {

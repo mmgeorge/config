@@ -98,7 +98,8 @@ pub(crate) fn trace_failure_kind(error: &ProviderError) -> ProviderFailureKind {
         ProviderError::Combined { primary, .. } | ProviderError::PreparationFailed(primary) => {
             trace_failure_kind(primary)
         }
-        ProviderError::PreparationCleanup { cause, .. } => trace_failure_kind(cause),
+        ProviderError::PreparationCleanup { cause, .. }
+        | ProviderError::Explained { cause, .. } => trace_failure_kind(cause),
         ProviderError::Contract(_)
         | ProviderError::Cleanup(_)
         | ProviderError::Unsupported(_)

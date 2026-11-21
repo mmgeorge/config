@@ -1371,6 +1371,7 @@ impl ClaudeProvider {
                 });
             }
         };
+        commit_truncation(&session, ProviderOperation::ThreadRewind).await?;
         match kept {
             Some(kept) => {
                 ledger.truncate(kept + 1);
@@ -1866,6 +1867,47 @@ async fn persist_rewind(session: &ClaudeBinding) -> Result<String, ProviderError
     .await
 }
 
+/// Make a truncating restart the branch every later CLI process loads.
+///
+/// A CLI process that exits records its newest entry as the transcript's leaf checkpoint, and a
+/// later resume or fork loads the chain of the newest checkpoint unless the transcript's newest
+/// entry follows it. The process that a truncating restart replaces records the discarded branch
+/// as it exits, and the restarted process records nothing until it exits in turn, so until then
+/// the CLI loads the discarded branch: a fork at an answer given after the truncation is refused
+/// because that answer is not in the loaded chain, and a plain resume brings the discarded
+/// entries back. Ending the restarted process right after its note records the note, which every
+/// later entry follows.
+///
+/// The caller holds the binding's operation lock while the CLI is idle. A failed restart leaves
+/// the binding without a process, so it invalidates the binding.
+async fn commit_truncation(
+    session: &ClaudeBinding,
+    operation: ProviderOperation,
+) -> Result<(), ProviderError> {
+    let restarted = session
+        .conversation
+        .restart(
+            SessionStart::Resume {
+                session_id: session.conversation.id().to_owned(),
+                resume_at: None,
+                drops_turn: None,
+            },
+            &session.cleanup,
+        )
+        .await;
+    if let Err(error) = restarted {
+        let cause = operation_failure(
+            operation,
+            &error,
+            ProviderPhase::Observation,
+            FailureDisposition::Invalidated,
+        );
+        session.invalidate(cause.clone()).await;
+        return Err(cause);
+    }
+    Ok(())
+}
+
 /// Append a transcript entry that starts no model request, and return its chain entry uuid.
 async fn append_note(
     session: &ClaudeBinding,
@@ -1969,6 +2011,7 @@ async fn withdraw_unanswered_request(
         };
         match noted {
             Ok(note) => {
+                commit_truncation(session, operation).await?;
                 ledger.truncate(kept + 1);
                 ledger[kept].rewind_note = Some(note);
                 ledger[kept].unanswered = false;
@@ -3428,6 +3471,14 @@ fn operation_failure(
     let kind = match error {
         ProviderError::Failure(failure) => failure.kind(),
         ProviderError::Cancelled => ProviderFailureKind::Cancelled,
+        // The CLI's own statement of a refusal is what the user acts on, so it survives the
+        // reclassification.
+        ProviderError::Explained { cause, explanation } => {
+            return ProviderError::Explained {
+                cause: Box::new(operation_failure(operation, cause, phase, disposition)),
+                explanation: explanation.clone(),
+            };
+        }
         _ => ProviderFailureKind::Unknown,
     };
     ProviderError::Failure(ProviderFailure::new(operation, kind).at_phase(phase, disposition))
@@ -3440,6 +3491,10 @@ fn with_operation(operation: ProviderOperation, error: ProviderError) -> Provide
             ProviderFailure::new(operation, failure.kind())
                 .at_phase(failure.phase(), failure.disposition()),
         ),
+        ProviderError::Explained { cause, explanation } => ProviderError::Explained {
+            cause: Box::new(with_operation(operation, *cause)),
+            explanation,
+        },
         error => error,
     }
 }

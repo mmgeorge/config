@@ -1143,7 +1143,8 @@ impl EventFixtureProvider {
                         | ProviderError::DeliveryUncertain
                         | ProviderError::Retryable(_)
                         | ProviderError::Combined { .. }
-                        | ProviderError::PreparationCleanup { .. },
+                        | ProviderError::PreparationCleanup { .. }
+                        | ProviderError::Explained { .. },
                     ) => false,
                 };
             if result.is_ok() || unconsumed {

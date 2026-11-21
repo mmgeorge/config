@@ -5585,8 +5585,17 @@ impl HarnessBroker {
         let reported_usage = self
             .context_usage_fresh
             .then(|| self.session.context_usage.clone());
+        // Retraction rolls the turn back inside the live native conversation, which later turns
+        // keep using. What that binding reported about itself, its conversation identity and its
+        // negotiated fork and compaction support, outlives the retraction: the prompt that opened
+        // the conversation is often the one retracted, and no later turn reports them again.
+        let native_identity = self.session.provider_session_id.take();
+        let (native_fork, native_compact) = (self.session.native_fork, self.session.native_compact);
         self.session = snapshot.session;
         self.session.active_task = current;
+        self.session.provider_session_id = native_identity;
+        self.session.native_fork = native_fork;
+        self.session.native_compact = native_compact;
         if let Some(reported_usage) = reported_usage {
             self.session.context_usage = reported_usage;
             self.context_usage_fresh = false;

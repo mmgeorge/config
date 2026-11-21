@@ -346,7 +346,9 @@ impl ConfigurationReconcileJob {
             ProviderError::Combined { primary, secondary } => {
                 Self::unchanged_failure(primary) && secondary.iter().all(Self::unchanged_failure)
             }
-            ProviderError::PreparationFailed(cause) => Self::unchanged_failure(cause),
+            ProviderError::PreparationFailed(cause) | ProviderError::Explained { cause, .. } => {
+                Self::unchanged_failure(cause)
+            }
             ProviderError::Unsupported(_) => true,
             ProviderError::Contract(_)
             | ProviderError::Cleanup(_)

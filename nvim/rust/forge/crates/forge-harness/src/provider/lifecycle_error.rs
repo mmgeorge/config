@@ -47,7 +47,8 @@ pub(crate) fn diagnostic(
             ProviderError::Failure(failure) => return failure,
             ProviderError::Combined { primary: cause, .. }
             | ProviderError::PreparationFailed(cause)
-            | ProviderError::PreparationCleanup { cause, .. } => return primary(operation, *cause),
+            | ProviderError::PreparationCleanup { cause, .. }
+            | ProviderError::Explained { cause, .. } => return primary(operation, *cause),
             ProviderError::Contract(_) => ProviderFailureKind::Protocol,
             ProviderError::Cleanup(_)
             | ProviderError::Observation(_)
@@ -67,7 +68,8 @@ pub(crate) fn diagnostic(
     primary(operation, classify_source(operation, source))
 }
 
-/// Convert only recognized typed causes; native text and source chains never cross this boundary.
+/// Convert only recognized typed causes; source chains never cross this boundary, and native text
+/// crosses only as the sanitized explanation of `ProviderError::Explained`.
 pub(crate) fn classify_source(
     operation: ProviderOperation,
     source: &(dyn std::error::Error + 'static),

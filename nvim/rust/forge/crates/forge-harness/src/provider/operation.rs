@@ -449,7 +449,8 @@ pub(super) fn primary_failure(error: &ProviderError) -> Option<ProviderFailure> 
         ProviderError::Combined { primary, .. } | ProviderError::PreparationFailed(primary) => {
             primary_failure(primary)
         }
-        ProviderError::PreparationCleanup { cause, .. } => primary_failure(cause),
+        ProviderError::PreparationCleanup { cause, .. }
+        | ProviderError::Explained { cause, .. } => primary_failure(cause),
         ProviderError::Cleanup(report) => report.origin().and_then(primary_failure),
         ProviderError::Contract(_)
         | ProviderError::Unsupported(_)

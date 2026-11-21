@@ -16,6 +16,9 @@ enum CollectionBoundary {
     /// Hold native execution after the provider reports context usage and then echoes the
     /// submitted user message, as Codex does.
     ActiveAfterUserEcho,
+    /// Hold the first native open until it is interrupted, as a provider still starting does,
+    /// then let the next open succeed and hold its turn as `ActiveAfterUserEcho` does.
+    OpenInterruptedThenEcho,
     /// Hold native execution inside a started shell tool until its deadline stops the turn.
     ActiveInTool,
     /// Accept the input without starting its turn, hold it until it is interrupted, then lose the
@@ -41,6 +44,8 @@ struct SlowCollectionFixture {
     events: Arc<std::sync::Mutex<Vec<(tokio::time::Instant, serde_json::Value)>>>,
     events_changed: Arc<tokio::sync::Notify>,
     collection_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Completes the native open `OpenInterruptedThenEcho` holds.
+    open_release: Arc<tokio::sync::Notify>,
     // Declared last: fields drop in order, and Windows cannot delete files still open.
     root: tempfile::TempDir,
 }
@@ -74,14 +79,19 @@ async fn slow_collection_fixture(
                 boundary,
                 CollectionBoundary::Active
                     | CollectionBoundary::ActiveAfterUserEcho
+                    | CollectionBoundary::OpenInterruptedThenEcho
                     | CollectionBoundary::ActiveInTool
                     | CollectionBoundary::ActiveLosesObservation
                     | CollectionBoundary::ActiveFailsInterrupt
             ) && executions.fetch_add(1, Ordering::AcqRel) == 0;
             let lose_observation =
                 held_active && boundary == CollectionBoundary::ActiveLosesObservation;
-            let echo_user_message =
-                held_active && boundary == CollectionBoundary::ActiveAfterUserEcho;
+            let echo_user_message = held_active
+                && matches!(
+                    boundary,
+                    CollectionBoundary::ActiveAfterUserEcho
+                        | CollectionBoundary::OpenInterruptedThenEcho
+                );
             let run_tool = held_active && boundary == CollectionBoundary::ActiveInTool;
             async move {
                 // A binding that is still starting accepts the input without starting its turn.
@@ -242,6 +252,26 @@ async fn slow_collection_fixture(
             Ok(())
         }
     });
+    let open_release = Arc::new(tokio::sync::Notify::new());
+    if boundary == CollectionBoundary::OpenInterruptedThenEcho {
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = held_started.clone();
+        let release = open_release.clone();
+        native.with_session_open(move |_| {
+            let first = opens.fetch_add(1, Ordering::AcqRel) == 0;
+            let held = held.clone();
+            let release = release.clone();
+            async move {
+                if first {
+                    let _ = held.send(());
+                    // A stop detaches from a starting open rather than ending it, so the open
+                    // completes only when the scenario releases it.
+                    release.notified().await;
+                }
+                Ok(())
+            }
+        });
+    }
     if boundary == CollectionBoundary::HeldBeforeDispatch {
         let held_prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let held = held_started.clone();
@@ -418,6 +448,7 @@ async fn slow_collection_fixture(
         events,
         events_changed,
         collection_count,
+        open_release,
     })
 }
 
@@ -432,7 +463,6 @@ impl SlowCollectionFixture {
     ///
     /// Returns the provisional exchange the echo created.
     async fn retract_echoed_prompt(&self) -> Result<String> {
-        use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
         // The echo precedes the fixture's start signal, so wait until the broker applied it.
         let exchange_id = loop {
             let changed = self.events_changed.notified();
@@ -453,6 +483,26 @@ impl SlowCollectionFixture {
             }
             changed.await;
         };
+        self.cancel_restoring_prompt().await?;
+        Ok(exchange_id)
+    }
+
+    /// Count the inputs the owner has published as retracted.
+    fn retracted_input_count(&self) -> usize {
+        self.events
+            .lock()
+            .expect("fixture events poisoned")
+            .iter()
+            .filter(|(_, event)| {
+                event["event"] == "input_changed" && event["payload"]["retracted"].is_string()
+            })
+            .count()
+    }
+
+    /// Cancel the running prompt as the editor's `Ctrl+C` does and wait for its retraction.
+    async fn cancel_restoring_prompt(&self) -> Result<()> {
+        use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
+        let retracted_before = self.retracted_input_count();
         self.controller
             .exchange_owner
             .execute_command(Command::CancelExchange(CancelExchangeRequest {
@@ -463,20 +513,73 @@ impl SlowCollectionFixture {
         // Input settlement publishes after the cancellation command commits its outcome.
         loop {
             let changed = self.events_changed.notified();
-            let retracted = self
-                .events
-                .lock()
-                .expect("fixture events poisoned")
-                .iter()
-                .any(|(_, event)| {
-                    event["event"] == "input_changed" && event["payload"]["retracted"].is_string()
-                });
-            if retracted {
-                break;
+            if self.retracted_input_count() > retracted_before {
+                return Ok(());
             }
             changed.await;
         }
-        Ok(exchange_id)
+    }
+
+    /// Submit one prompt and wait until the fixture provider runs it to completion.
+    async fn run_prompt(&mut self, request_id: u64, text: &str) -> Result<()> {
+        prompt::apply(
+            &self.controller,
+            Request {
+                id: request_id,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":format!("prompt-{request_id}"),"text":text}),
+            },
+            &self.sink,
+        )
+        .await?;
+        loop {
+            match self.dispatches.recv().await {
+                Some(forge_provider_api::input::PromptInput::Text(dispatched))
+                    if dispatched == text =>
+                {
+                    break;
+                }
+                Some(_) => {}
+                None => anyhow::bail!("fixture dispatch channel closed"),
+            }
+        }
+        let session = self.controller.observer.session_id().to_owned();
+        loop {
+            let changed = self.events_changed.notified();
+            let finished = SqliteStore::read_only(&self.controller.data_root)?
+                .list_exchange(&session)?
+                .iter()
+                .all(crate::exchange::Exchange::is_finished);
+            if finished && self.controller.coordinator.execution.available_permits() == 1 {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+
+    /// Require the session to name its native conversation and to admit a `/compact`.
+    async fn ensure_conversation_retained(&self) -> Result<()> {
+        let broker = self.controller.broker.lock().await;
+        ensure!(
+            broker.snapshot()?.session.provider_session_id.is_some(),
+            "the session ran a turn but never recorded its provider conversation"
+        );
+        ensure!(
+            broker.owner_compaction_available().is_ok(),
+            "the session refused compaction: {:?}",
+            broker.owner_compaction_available()
+        );
+        drop(broker);
+        let saved = crate::session::SessionStore::load_session(
+            &SqliteStore::read_only(&self.controller.data_root)?,
+            self.controller.observer.session_id(),
+        )?
+        .context("fixture session is missing")?;
+        ensure!(
+            saved.provider_session_id.is_some(),
+            "the saved session lost its provider conversation, so a restart starts a new one"
+        );
+        Ok(())
     }
 
     /// Stop owner work and provider collection after a scenario, preserving the scenario result.
@@ -584,6 +687,59 @@ async fn owner_cancel_after_user_message_echo_retracts_output_free_prompt() -> R
         }
         .await?;
         Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    fixture.finish(scenario).await
+}
+
+/// A session keeps its provider conversation after its first prompt was stopped while the
+/// provider was still starting.
+///
+/// The first `Ctrl+C` lands while the native open is still running, so that prompt returns to the
+/// composer. The next prompt opens the conversation and is itself stopped and retracted, as a
+/// second early `Ctrl+C` does; the conversation it opened stays live and every later turn runs in
+/// it. Retraction restored the session as it stood before that prompt, which had no conversation
+/// yet, and no later turn reported the identity again: `/compact` was refused for want of a
+/// conversation, and a restart resumed none.
+#[tokio::test]
+async fn first_prompt_stopped_while_the_provider_starts_keeps_the_later_conversation() -> Result<()>
+{
+    let mut fixture =
+        slow_collection_fixture(Duration::ZERO, CollectionBoundary::OpenInterruptedThenEcho)
+            .await?;
+    let scenario = async {
+        fixture.cancel_restoring_prompt().await?;
+        fixture.open_release.notify_one();
+        prompt::apply(
+            &fixture.controller,
+            Request {
+                id: 801,
+                method: "session.prompt.submit".into(),
+                params: json!({"operation_id":"opens-conversation","text":"Second prompt"}),
+            },
+            &fixture.sink,
+        )
+        .await?;
+        fixture.retract_echoed_prompt().await?;
+        fixture.run_prompt(802, "Answered prompt").await?;
+        fixture.ensure_conversation_retained().await
+    }
+    .await;
+    fixture.finish(scenario).await
+}
+
+/// A session keeps the provider conversation its retracted first prompt opened.
+///
+/// The open succeeds and the stop lands in the turn itself, so no stop during provider startup is
+/// involved: a retraction of whichever prompt opened the conversation used to discard it.
+#[tokio::test]
+async fn retracted_first_prompt_keeps_the_conversation_it_opened() -> Result<()> {
+    let mut fixture =
+        slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveAfterUserEcho).await?;
+    let scenario = async {
+        fixture.retract_echoed_prompt().await?;
+        fixture.run_prompt(802, "Answered prompt").await?;
+        fixture.ensure_conversation_retained().await
     }
     .await;
     fixture.finish(scenario).await

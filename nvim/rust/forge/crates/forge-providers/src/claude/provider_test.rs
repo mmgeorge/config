@@ -1666,6 +1666,9 @@ async fn unsupported_options_reject_before_launch() {
 
 /// Rewinding restarts the process; the deliberate exit of the old process must not invalidate the
 /// binding, so the next prompt runs on the resumed process.
+///
+/// The rewind truncates in one process and then resumes plainly in another, so that the
+/// truncating process's exit records the kept branch as the transcript's leaf.
 #[tokio::test]
 async fn prompts_run_after_a_rewind_restart() {
     let directory = tempfile::tempdir().unwrap();
@@ -1731,12 +1734,16 @@ async fn prompts_run_after_a_rewind_restart() {
     until_completed(&mut opened.events).await;
 
     let launches = launcher.record.lock().unwrap().launches.clone();
-    assert_eq!(launches.len(), 2);
-    assert!(
-        launches[1]
-            .iter()
-            .any(|argument| argument.starts_with("--resume-session-at="))
+    assert_eq!(launches.len(), 3);
+    assert_eq!(
+        argument_value(&launches[1], "--resume-session-at"),
+        Some(checkpoints[0].as_str())
     );
+    assert_eq!(
+        argument_value(&launches[2], "--resume"),
+        argument_value(&launches[1], "--resume")
+    );
+    assert_eq!(argument_value(&launches[2], "--resume-session-at"), None);
     provider.shutdown(operation_context()).await.unwrap();
 }
 
@@ -2148,6 +2155,274 @@ async fn forks_after_a_rewind_copy_the_kept_history() {
         argument_value(target_open, "--resume-session-at"),
         Some(checkpoints[0].as_str()),
         "the target resumes before the note that materialized it"
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// One modelled CLI session transcript: every entry under the entry it follows, and the leaf
+/// checkpoints the CLI's processes recorded when they exited.
+#[derive(Clone, Default)]
+struct SessionTranscript {
+    parent_of: std::collections::HashMap<String, Option<String>>,
+    entries: Vec<String>,
+    checkpoints: Vec<String>,
+}
+
+impl SessionTranscript {
+    fn append(&mut self, entry: String, parent: Option<String>) {
+        self.parent_of.insert(entry.clone(), parent);
+        self.entries.push(entry);
+    }
+
+    /// Report whether `entry` is `ancestor` or follows it.
+    fn descends(&self, entry: &str, ancestor: &str) -> bool {
+        let mut current = Some(entry.to_owned());
+        while let Some(visited) = current {
+            if visited == ancestor {
+                return true;
+            }
+            current = self.parent_of.get(&visited).cloned().flatten();
+        }
+        false
+    }
+
+    /// Get the chain a resume loads, oldest entry first.
+    ///
+    /// The CLI loads the chain of its newest entry when that entry follows the newest recorded
+    /// checkpoint, and otherwise the chain of the checkpoint, which it takes for the branch the
+    /// user kept.
+    fn loaded_chain(&self) -> Vec<String> {
+        let leaf = match (self.checkpoints.last(), self.entries.last()) {
+            (Some(checkpoint), Some(newest)) if !self.descends(newest, checkpoint) => checkpoint,
+            (_, Some(newest)) => newest,
+            (Some(checkpoint), None) => checkpoint,
+            (None, None) => return Vec::new(),
+        };
+        let mut chain = Vec::new();
+        let mut current = Some(leaf.clone());
+        while let Some(entry) = current {
+            current = self.parent_of.get(&entry).cloned().flatten();
+            chain.push(entry);
+        }
+        chain.reverse();
+        chain
+    }
+}
+
+/// The modelled transcripts of every session one CLI installation wrote.
+type SessionTranscripts = Arc<Mutex<std::collections::HashMap<String, SessionTranscript>>>;
+
+/// The session and newest entry of one modelled CLI process.
+struct ModelledProcess {
+    transcripts: SessionTranscripts,
+    session: Option<String>,
+    tip: Option<String>,
+}
+
+impl ModelledProcess {
+    fn append(&mut self, entry: String) {
+        if let Some(session) = &self.session {
+            self.transcripts
+                .lock()
+                .unwrap()
+                .entry(session.clone())
+                .or_default()
+                .append(entry.clone(), self.tip.clone());
+        }
+        self.tip = Some(entry);
+    }
+}
+
+impl Drop for ModelledProcess {
+    /// Record the process's newest entry as the session's leaf checkpoint, as the CLI does when
+    /// its input closes and it exits.
+    fn drop(&mut self) {
+        if let (Some(session), Some(tip)) = (&self.session, &self.tip) {
+            self.transcripts
+                .lock()
+                .unwrap()
+                .entry(session.clone())
+                .or_default()
+                .checkpoints
+                .push(tip.clone());
+        }
+    }
+}
+
+/// Model a CLI whose transcripts branch where a resume truncates them, which answers every prompt
+/// except the one at `unanswered_request` and records an interrupt as a user entry.
+///
+/// A resume or fork names `--resume-session-at` only within the chain it loaded, and otherwise
+/// prints the CLI's "No message found" refusal and exits.
+fn branching_transcript_peer(unanswered_request: usize) -> (Arc<PeerLauncher>, SessionTranscripts) {
+    let transcripts: SessionTranscripts = Arc::default();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer_transcripts = transcripts.clone();
+    let launcher = PeerLauncher::with_refusals(move |arguments| {
+        let resume_at = argument_value(arguments, "--resume-session-at");
+        let named_session = argument_value(arguments, "--session-id").map(str::to_owned);
+        let (session, tip) = match argument_value(arguments, "--resume") {
+            Some(resumed) => {
+                let mut sessions = peer_transcripts.lock().unwrap();
+                let mut chain = sessions
+                    .get(resumed)
+                    .cloned()
+                    .unwrap_or_default()
+                    .loaded_chain();
+                if let Some(resume_at) = resume_at {
+                    let kept = chain
+                        .iter()
+                        .position(|entry| entry == resume_at)
+                        .ok_or_else(|| {
+                            format!("No message found with message.uuid of: {resume_at}")
+                        })?;
+                    chain.truncate(kept + 1);
+                }
+                let session = if arguments
+                    .iter()
+                    .any(|argument| argument == "--fork-session")
+                {
+                    let target = named_session
+                        .clone()
+                        .expect("a fork names its target session");
+                    let copy = sessions.entry(target.clone()).or_default();
+                    let mut parent = None;
+                    for entry in &chain {
+                        copy.append(entry.clone(), parent.replace(entry.clone()));
+                    }
+                    target
+                } else {
+                    resumed.to_owned()
+                };
+                (Some(session), chain.last().cloned())
+            }
+            None => (named_session, None),
+        };
+        let mut process = ModelledProcess {
+            transcripts: peer_transcripts.clone(),
+            session,
+            tip,
+        };
+        let requests = requests.clone();
+        let handler: PeerHandler = Box::new(move |frame: &Value| {
+            if frame["request"]["subtype"] == "interrupt" {
+                process.append(uuid::Uuid::new_v4().to_string());
+                return Some(vec![
+                    success(frame["request_id"].clone(), json!({})),
+                    result_interrupted(),
+                ]);
+            }
+            let uuid = user_uuid(frame)?;
+            process.append(uuid.as_str().unwrap().to_owned());
+            if frame["shouldQuery"] == false {
+                return Some(vec![
+                    lifecycle(&uuid, "queued"),
+                    lifecycle(&uuid, "completed"),
+                ]);
+            }
+            let request = requests.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let message_id = format!("msg-{request}");
+            let mut frames = vec![lifecycle(&uuid, "queued"), lifecycle(&uuid, "started")];
+            let answer = text_message(&message_id, &["ok"]);
+            if request == unanswered_request {
+                // `message_start`, `content_block_start`, and the first delta only.
+                frames.extend(answer.into_iter().take(3));
+                return Some(frames);
+            }
+            let answer_uuid = answer
+                .iter()
+                .find(|frame| frame["type"] == "assistant")
+                .and_then(|frame| frame["uuid"].as_str())
+                .unwrap()
+                .to_owned();
+            process.append(answer_uuid);
+            frames.extend(answer);
+            frames.push(lifecycle(&uuid, "completed"));
+            frames.push(result_success());
+            Some(frames)
+        });
+        Ok(handler)
+    });
+    (launcher, transcripts)
+}
+
+/// Fork the conversation at a checkpoint into a separately owned target, as a session fork does.
+async fn fork_checkpoint(
+    provider: &ClaudeProvider,
+    provider_session_id: forge_provider_api::ProviderSessionId,
+    checkpoint: forge_provider_api::CheckpointId,
+    workspace: &std::path::Path,
+) -> Result<forge_provider_api::ProviderSessionId, ProviderError> {
+    let source = session_request(workspace);
+    provider
+        .thread_fork(
+            operation_context(),
+            forge_provider_api::session::SessionForkRequest {
+                source: forge_provider_api::ForkSource::Checkpoint {
+                    provider_session_id,
+                    checkpoint,
+                },
+                target: forge_provider_api::ForkTarget {
+                    thread_id: forge_provider_api::testing::root_thread("claude-fork-owner"),
+                    workspace: source.workspace,
+                    configuration: source.configuration,
+                    system_instructions: source.system_instructions,
+                },
+            },
+        )
+        .await
+        .map(|forked| forked.provider_session_id)
+}
+
+/// A session whose stopped request was withdrawn forks at its last answered turn.
+///
+/// The withdrawal restarts the CLI at the answer before the request. The process it replaces
+/// records the request's interrupt marker as the transcript's leaf checkpoint when it exits, and
+/// the CLI keeps loading that abandoned branch while every later entry follows another one, so a
+/// fork at a later answer was refused: "No message found with message.uuid of" that answer.
+#[tokio::test]
+async fn a_session_with_a_withdrawn_request_forks_at_its_last_answer() {
+    let directory = tempfile::tempdir().unwrap();
+    let (launcher, transcripts) = branching_transcript_peer(1);
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let source = opened.binding.provider_session_id.clone().unwrap();
+    let first = run_turn(&provider, &mut opened, "answered", false).await;
+    run_turn(&provider, &mut opened, "stopped", true).await;
+    let last = run_turn(&provider, &mut opened, "after the stop", false).await;
+    let last_answer = last.result().checkpoint_id().cloned().unwrap();
+
+    let forked = fork_checkpoint(&provider, source, last_answer.clone(), directory.path()).await;
+
+    let target = forked.expect("the fork at the last answered turn was refused");
+    let copied = transcripts.lock().unwrap()[target.as_str()].entries.clone();
+    for answer in [first.result().checkpoint_id().unwrap(), &last_answer] {
+        assert!(
+            copied.iter().any(|entry| entry == answer.as_str()),
+            "the fork lacks the answer {answer:?}: {copied:?}"
+        );
+    }
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// A fork the CLI refuses reports the CLI's own reason, not only the failed initialization.
+#[tokio::test]
+async fn a_refused_fork_reports_the_cli_reason() {
+    let directory = tempfile::tempdir().unwrap();
+    let (launcher, _) = branching_transcript_peer(usize::MAX);
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let source = opened.binding.provider_session_id.clone().unwrap();
+    run_turn(&provider, &mut opened, "answered", false).await;
+    let missing = forge_provider_api::CheckpointId::new("entry-the-cli-never-wrote").unwrap();
+
+    let refused = fork_checkpoint(&provider, source, missing, directory.path())
+        .await
+        .expect_err("the CLI refuses a fork at an entry it never wrote");
+
+    assert!(
+        refused
+            .to_string()
+            .contains("No message found with message.uuid of: entry-the-cli-never-wrote"),
+        "the fork failure omits the CLI's reason: {refused}"
     );
     provider.shutdown(operation_context()).await.unwrap();
 }
@@ -3761,8 +4036,9 @@ async fn a_refused_rewind_logs_the_cli_reason() {
 
     assert!(rewound.is_err());
     let recorded = captured.lock().unwrap().join("\n");
+    // The host's log keeps `error` among an event's free-text fields and drops other names.
     assert!(
-        recorded.contains(super::test_peer::LAUNCH_REFUSAL),
+        recorded.contains(&format!("error={}", super::test_peer::LAUNCH_REFUSAL)),
         "the CLI's reason is missing from the diagnostics: {recorded}"
     );
     provider.shutdown(operation_context()).await.unwrap();

@@ -4028,7 +4028,8 @@ fn configuration_failure(
         ProviderError::Combined { primary, .. } | ProviderError::PreparationFailed(primary) => {
             return configuration_failure(primary, fallback_phase);
         }
-        ProviderError::PreparationCleanup { cause, .. } => {
+        ProviderError::PreparationCleanup { cause, .. }
+        | ProviderError::Explained { cause, .. } => {
             return configuration_failure(cause, fallback_phase);
         }
         ProviderError::Cleanup(report) => {

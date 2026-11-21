@@ -472,6 +472,17 @@ pub enum ProviderError {
     Retryable(Box<retry::RetryableFailure>),
     /// Normalized event delivery failed and its typed transport/observation cause is retained.
     Delivery(events::EventDeliveryError),
+    /// The native runtime refused the operation and stated why in its own words.
+    ///
+    /// The cause keeps every normalized classification; the explanation is the runtime's
+    /// sanitized diagnostic, which the user needs to act on a refusal the classification cannot
+    /// describe, such as a resume point the runtime cannot find.
+    Explained {
+        /// Normalized cause, classified as if no explanation existed.
+        cause: Box<ProviderError>,
+        /// The runtime's own statement of the refusal.
+        explanation: crate::diagnostic::SanitizedMessage,
+    },
 }
 
 impl ProviderError {
@@ -490,6 +501,10 @@ impl ProviderError {
             Self::PreparationCleanup { cause, cleanup } => Self::PreparationCleanup {
                 cause: Box::new(cause.for_operation(operation)),
                 cleanup,
+            },
+            Self::Explained { cause, explanation } => Self::Explained {
+                cause: Box::new(cause.for_operation(operation)),
+                explanation,
             },
             unchanged @ (Self::Contract(_)
             | Self::Cleanup(_)
@@ -510,7 +525,9 @@ impl ProviderError {
     pub fn is_clean_cancellation(&self) -> bool {
         match self {
             Self::Cancelled => true,
-            Self::PreparationFailed(cause) => cause.is_clean_cancellation(),
+            Self::PreparationFailed(cause) | Self::Explained { cause, .. } => {
+                cause.is_clean_cancellation()
+            }
             Self::Combined { primary, secondary } => {
                 primary.is_clean_cancellation() && secondary.iter().all(Self::is_clean_cancellation)
             }
@@ -569,6 +586,7 @@ impl std::fmt::Display for ProviderError {
             Self::Interrupted => formatter.write_str("provider execution interrupted"),
             Self::Retryable(error) => std::fmt::Display::fmt(error, formatter),
             Self::Delivery(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Explained { cause, explanation } => write!(formatter, "{cause}: {explanation}"),
         }
     }
 }
@@ -585,7 +603,9 @@ impl std::error::Error for ProviderError {
             Self::RuntimeVersion(error) => Some(error),
             Self::RuntimeLaunch { failure, .. } => Some(failure),
             Self::PreparationFailed(error) => Some(error.as_ref()),
-            Self::PreparationCleanup { cause, .. } => Some(cause.as_ref()),
+            Self::PreparationCleanup { cause, .. } | Self::Explained { cause, .. } => {
+                Some(cause.as_ref())
+            }
             Self::Retryable(error) => Some(error.as_ref()),
             Self::Delivery(error) => Some(error),
             Self::NotConsumed | Self::DeliveryUncertain | Self::Cancelled | Self::Interrupted => {

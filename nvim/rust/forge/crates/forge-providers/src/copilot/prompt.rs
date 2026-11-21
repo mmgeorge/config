@@ -269,7 +269,8 @@ pub async fn run(
                         | ProviderError::Cancelled
                         | ProviderError::Interrupted
                         | ProviderError::Retryable(_)
-                        | ProviderError::Delivery(_) => None,
+                        | ProviderError::Delivery(_)
+                        | ProviderError::Explained { .. } => None,
                     })
                     .unwrap_or(ProviderError::DeliveryUncertain)
             };

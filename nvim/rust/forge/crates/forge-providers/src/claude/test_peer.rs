@@ -4,9 +4,9 @@
 //! launch builds a fresh `PeerHandler` that receives every frame Forge writes and returns the
 //! frames the CLI would print. Control requests the handler declines receive the generic
 //! success the CLI gives for configuration controls. A launch whose arguments the CLI would
-//! refuse builds no handler, and the peer then prints the CLI's error `result` naming
-//! `LAUNCH_REFUSAL` and closes its output before the initialize answer, as the CLI does when it
-//! exits at startup.
+//! refuse builds no handler, and the peer then prints the CLI's error `result` naming the reason,
+//! `LAUNCH_REFUSAL` unless the test supplies the CLI's own words, and closes its output before the
+//! initialize answer, as the CLI does when it exits at startup.
 
 use super::process::{ClaudeLauncher, LaunchSpec};
 use super::transport::ProcessIo;
@@ -27,8 +27,9 @@ pub(super) struct PeerRecord {
     pub frames: Vec<Value>,
 }
 
-/// Build the handler of one launch from its CLI arguments, or `None` when the CLI would exit.
-type LaunchHandlerFactory = Box<dyn Fn(&[String]) -> Option<PeerHandler> + Send + Sync>;
+/// Build the handler of one launch from its CLI arguments, or the reason the CLI would print
+/// before it exits.
+type LaunchHandlerFactory = Box<dyn Fn(&[String]) -> Result<PeerHandler, String> + Send + Sync>;
 
 /// Launch in-memory peers in place of `claude`.
 pub(super) struct PeerLauncher {
@@ -46,6 +47,15 @@ impl PeerLauncher {
     /// Launch peers whose behavior depends on the command line, such as a resume point.
     pub(super) fn with_arguments(
         handler_factory: impl Fn(&[String]) -> Option<PeerHandler> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::with_refusals(move |arguments| {
+            handler_factory(arguments).ok_or_else(|| LAUNCH_REFUSAL.to_owned())
+        })
+    }
+
+    /// Launch peers that refuse some command lines with the reason the CLI prints for them.
+    pub(super) fn with_refusals(
+        handler_factory: impl Fn(&[String]) -> Result<PeerHandler, String> + Send + Sync + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
             handler_factory: Box::new(handler_factory),
@@ -91,13 +101,16 @@ impl ClaudeLauncher for PeerLauncher {
         let (mut peer_stdout, client_stdout) = tokio::io::duplex(1 << 20);
         let record = self.record.clone();
         tokio::spawn(async move {
-            let Some(mut handler) = handler else {
-                let mut line = serde_json::to_vec(&launch_refusal()).unwrap();
-                line.push(b'\n');
-                let _ = peer_stdout.write_all(&line).await;
-                drop(peer_stdout);
-                drop(peer_stdin);
-                return;
+            let mut handler = match handler {
+                Ok(handler) => handler,
+                Err(reason) => {
+                    let mut line = serde_json::to_vec(&launch_refusal(&reason)).unwrap();
+                    line.push(b'\n');
+                    let _ = peer_stdout.write_all(&line).await;
+                    drop(peer_stdout);
+                    drop(peer_stdin);
+                    return;
+                }
             };
             let mut lines = BufReader::new(peer_stdin).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -126,9 +139,9 @@ pub(super) const LAUNCH_REFUSAL: &str =
     "Error: resuming would discard entries not attributable to the declared turn";
 
 /// Build the error `result` the CLI prints in stream-json mode before it exits at startup.
-fn launch_refusal() -> Value {
+fn launch_refusal(reason: &str) -> Value {
     json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
-        "duration_ms": 0, "num_turns": 0, "errors": [LAUNCH_REFUSAL],
+        "duration_ms": 0, "num_turns": 0, "errors": [reason],
         "uuid": uuid::Uuid::new_v4().to_string()})
 }
 
