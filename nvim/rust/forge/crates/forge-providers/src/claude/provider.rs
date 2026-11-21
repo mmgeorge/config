@@ -3,6 +3,7 @@
 use super::conversation::{ClaudeConversation, ConversationOptions, failure, wait_command};
 use super::process::{ClaudeLauncher, ProcessLauncher, SessionStart};
 use super::session::{ClaudeSessionState, timestamp};
+use super::wire::control::{OutboundControl, RewindRefusal, RewindResponse};
 use super::wire::stdin::UserInput;
 use super::wire::stdout::CommandState;
 use crate::pending_input::{PendingInput, PendingInputs};
@@ -34,11 +35,19 @@ const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// which restarts the provider, rather than as a stop that never ends.
 const INTERRUPT_SETTLEMENT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Report whether the live CLI could apply the requested cut.
+enum LiveRewind {
+    Applied,
+    ResumeRequired,
+}
+
 /// One completed root turn in the binding's native history.
 #[derive(Clone, Debug)]
 struct LedgerTurn {
     /// The client-stamped uuid of the turn's first input.
     prompt: String,
+    /// The client-stamped uuid of the last input the turn consumed.
+    last_input: String,
     /// The turn's last transcript chain entry.
     checkpoint: Option<String>,
     /// The rewind note the adapter appended after the checkpoint, the newest chain entry while
@@ -1262,7 +1271,7 @@ impl ClaudeProvider {
         })
     }
 
-    /// Truncate native history after a checkpoint by restarting the idle process at it.
+    /// Truncate native history after a checkpoint and retain the idle process when possible.
     async fn rewind_session(
         &self,
         context: OperationContext,
@@ -1299,83 +1308,36 @@ impl ClaudeProvider {
         {
             return Ok(());
         }
-        // The CLI refuses a guarded resume whose discarded range holds anything but the declared
-        // turn's own prompt and output, so only a range of exactly one turn with no rewind note
-        // after it and no absorbed steering is guarded; any other range runs unguarded.
-        let drops_turn = kept
-            .filter(|kept| {
-                kept + 2 == ledger.len()
-                    && ledger[kept + 1].rewind_note.is_none()
-                    && !ledger[kept + 1].absorbed_steering
-            })
-            .map(|kept| ledger[kept + 1].prompt.clone());
         let resume_at = kept
             .and_then(|kept| ledger[kept].resume_point())
-            .unwrap_or(after.as_str())
-            .to_owned();
-        let session_id = session.conversation.id().to_owned();
-        tracing::info!(target: "forge::provider", event_name = "provider.rewind.requested",
-            provider = "claude", session_id = %session_id, resume_at = %resume_at,
-            drops_turn = ?drops_turn, ledger_turns = ledger.len(), kept_turn = ?kept);
-        let rewound = session
-            .conversation
-            .restart(
-                SessionStart::Resume {
-                    session_id: session_id.clone(),
-                    resume_at: Some(resume_at),
-                    drops_turn,
-                },
-                &session.cleanup,
-            )
-            .await;
-        let persisted = match rewound {
-            Ok(()) => persist_rewind(&session).await,
-            Err(error) => Err(error),
+            .unwrap_or(after.as_str());
+        let first_discarded = kept.and_then(|kept| ledger.get(kept + 1));
+        // The control removes its target, while the launch flag keeps its target. Only use the
+        // control when the first discarded prompt is known to follow the retained entry.
+        let native = match (first_discarded, ledger.last()) {
+            (Some(first), Some(last)) if first.follows.as_deref() == Some(resume_at) => {
+                let last_seen = last.rewind_note.as_deref().unwrap_or(&last.last_input);
+                rewind_live(&session, &first.prompt, last_seen).await?
+            }
+            _ => LiveRewind::ResumeRequired,
         };
-        let rewind_note = match persisted {
-            Ok(rewind_note) => rewind_note,
-            Err(error) => {
-                // A refused or unpersisted rewind leaves the transcript unchanged; resume it plainly.
-                let restored = session
-                    .conversation
-                    .restart(
-                        SessionStart::Resume {
-                            session_id,
-                            resume_at: None,
-                            drops_turn: None,
-                        },
-                        &session.cleanup,
-                    )
-                    .await;
-                return Err(match restored {
-                    Ok(()) => ProviderError::Failure(
-                        ProviderFailure::new(
-                            ProviderOperation::ThreadRewind,
-                            ProviderFailureKind::Rejected,
-                        )
-                        .at_phase(ProviderPhase::Observation, FailureDisposition::Unchanged),
-                    ),
-                    Err(restore) => {
-                        let cause = with_cleanup(
-                            operation_failure(
-                                ProviderOperation::ThreadRewind,
-                                &error,
-                                ProviderPhase::Observation,
-                                FailureDisposition::Invalidated,
-                            ),
-                            vec![restore],
-                        );
-                        session.invalidate(cause.clone()).await;
-                        cause
-                    }
-                });
+        let rewind_note = match native {
+            LiveRewind::Applied => None,
+            LiveRewind::ResumeRequired => {
+                // The launch guard checks that a single discarded turn owns its whole suffix.
+                let guarded_turn = first_discarded
+                    .filter(|turn| turn.rewind_note.is_none() && !turn.absorbed_steering)
+                    .filter(|_| kept.is_some_and(|kept| kept + 2 == ledger.len()))
+                    .map(|turn| turn.prompt.clone());
+                Some(rewind_by_resume(&session, resume_at.to_owned(), guarded_turn).await?)
             }
         };
-        commit_truncation(&session, ProviderOperation::ThreadRewind).await?;
         match kept {
             Some(kept) => {
                 ledger.truncate(kept + 1);
-                ledger[kept].rewind_note = Some(rewind_note);
+                if let Some(rewind_note) = rewind_note {
+                    ledger[kept].rewind_note = Some(rewind_note);
+                }
             }
             None => ledger.clear(),
         }
@@ -1856,15 +1818,153 @@ impl ClaudeProvider {
     }
 }
 
-/// Make a rewind durable by appending a note, because the CLI persists a truncation only when
-/// the next entry is appended, and return the note's chain entry uuid.
-async fn persist_rewind(session: &ClaudeBinding) -> Result<String, ProviderError> {
-    append_note(
-        session,
-        "[Forge: the user rolled the conversation back to this point; later turns were discarded]",
-        ProviderOperation::ThreadRewind,
-    )
-    .await
+/// Apply an exclusive cut on the live CLI and require it to confirm the requested target.
+async fn rewind_live(
+    session: &ClaudeBinding,
+    first_discarded: &str,
+    last_seen: &str,
+) -> Result<LiveRewind, ProviderError> {
+    const OPERATION: ProviderOperation = ProviderOperation::ThreadRewind;
+    let confirmed = session
+        .conversation
+        .request(
+            OPERATION,
+            OutboundControl::RewindConversation {
+                target_message_uuid: first_discarded.to_owned(),
+                last_seen_user_message_uuid: last_seen.to_owned(),
+            },
+        )
+        .await;
+    let response = confirmed.and_then(|response| {
+        serde_json::from_value::<RewindResponse>(response).map_err(|_| {
+            ProviderFailure::new(OPERATION, ProviderFailureKind::Protocol)
+                .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
+                .into()
+        })
+    });
+    let cause = match response {
+        Ok(response) if response.rewound => {
+            if response.target_message_uuid.as_deref() == Some(first_discarded) {
+                return Ok(LiveRewind::Applied);
+            }
+            ProviderFailure::new(OPERATION, ProviderFailureKind::Protocol)
+                .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
+                .into()
+        }
+        Ok(response) if matches!(response.reason, Some(RewindRefusal::TargetNotFound)) => {
+            return Ok(LiveRewind::ResumeRequired);
+        }
+        Ok(response) => {
+            let disposition = match response.reason {
+                Some(RewindRefusal::PersistFailed | RewindRefusal::StateChanged) => {
+                    FailureDisposition::Invalidated
+                }
+                _ => FailureDisposition::Unchanged,
+            };
+            let cause = ProviderError::Failure(
+                ProviderFailure::new(OPERATION, ProviderFailureKind::Rejected)
+                    .at_phase(ProviderPhase::Observation, disposition),
+            );
+            let cause = match response
+                .error
+                .and_then(|reason| forge_provider_api::SanitizedMessage::new(reason).ok())
+            {
+                Some(explanation) => ProviderError::Explained {
+                    cause: Box::new(cause),
+                    explanation,
+                },
+                None => cause,
+            };
+            if disposition == FailureDisposition::Invalidated {
+                session.invalidate(cause.clone()).await;
+            }
+            return Err(cause);
+        }
+        Err(error) => error,
+    };
+    if matches!(&cause, ProviderError::Failure(failure) if failure.disposition() == FailureDisposition::Unchanged)
+    {
+        return Err(cause);
+    }
+    let cause = operation_failure(
+        OPERATION,
+        &cause,
+        ProviderPhase::Observation,
+        FailureDisposition::Invalidated,
+    );
+    session.invalidate(cause.clone()).await;
+    Err(cause)
+}
+
+/// Keep a named transcript entry by resuming at it, then persist and select the new branch.
+async fn rewind_by_resume(
+    session: &ClaudeBinding,
+    resume_at: String,
+    drops_turn: Option<String>,
+) -> Result<String, ProviderError> {
+    const OPERATION: ProviderOperation = ProviderOperation::ThreadRewind;
+    let session_id = session.conversation.id().to_owned();
+    tracing::info!(target: "forge::provider", event_name = "provider.rewind.requested",
+        provider = "claude", session_id = %session_id, resume_at = %resume_at,
+        drops_turn = ?drops_turn);
+    let rewound = session
+        .conversation
+        .restart(
+            SessionStart::Resume {
+                session_id: session_id.clone(),
+                resume_at: Some(resume_at),
+                drops_turn,
+            },
+            &session.cleanup,
+        )
+        .await;
+    let persisted = match rewound {
+        Ok(()) => append_note(
+            session,
+            "[Forge: the user rolled the conversation back to this point; later turns were discarded]",
+            OPERATION,
+        )
+        .await,
+        Err(error) => Err(error),
+    };
+    let note = match persisted {
+        Ok(note) => note,
+        Err(error) => {
+            // A refused or unpersisted rewind leaves the transcript unchanged; resume it plainly.
+            let restored = session
+                .conversation
+                .restart(
+                    SessionStart::Resume {
+                        session_id,
+                        resume_at: None,
+                        drops_turn: None,
+                    },
+                    &session.cleanup,
+                )
+                .await;
+            return Err(match restored {
+                Ok(()) => ProviderError::Failure(
+                    ProviderFailure::new(OPERATION, ProviderFailureKind::Rejected)
+                        .at_phase(ProviderPhase::Observation, FailureDisposition::Unchanged),
+                ),
+                Err(restore) => {
+                    let cause = with_cleanup(
+                        operation_failure(
+                            OPERATION,
+                            &error,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Invalidated,
+                        ),
+                        vec![restore],
+                    );
+                    session.invalidate(cause.clone()).await;
+                    cause
+                }
+            });
+        }
+    };
+    commit_truncation(session, OPERATION).await?;
+    Ok(note)
 }
 
 /// Make a truncating restart the branch every later CLI process loads.
@@ -3125,11 +3225,12 @@ async fn record_ledger_turn(
     follows: Option<String>,
     unanswered: bool,
 ) {
-    let Some(prompt) = end.commands.first() else {
+    let Some((prompt, last_input)) = end.commands.first().zip(end.commands.last()) else {
         return;
     };
     session.ledger.lock().await.push(LedgerTurn {
         prompt: prompt.clone(),
+        last_input: last_input.clone(),
         checkpoint: end.checkpoint.clone(),
         rewind_note: None,
         absorbed_steering: end.commands.len() > 1,

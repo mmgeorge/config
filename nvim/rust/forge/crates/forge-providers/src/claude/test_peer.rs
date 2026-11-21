@@ -3,8 +3,8 @@
 //! `PeerLauncher` implements the production `ClaudeLauncher` boundary with duplex streams. Each
 //! launch builds a fresh `PeerHandler` that receives every frame Forge writes and returns the
 //! frames the CLI would print. Control requests the handler declines receive the generic
-//! success the CLI gives for configuration controls. A launch whose arguments the CLI would
-//! refuse builds no handler, and the peer then prints the CLI's error `result` naming the reason,
+//! success the CLI gives for configuration controls or a missing-target rewind refusal. A launch
+//! whose arguments the CLI would refuse builds no handler. The peer prints an error `result`,
 //! `LAUNCH_REFUSAL` unless the test supplies the CLI's own words, and closes its output before the
 //! initialize answer, as the CLI does when it exits at startup.
 
@@ -161,6 +161,11 @@ pub(super) fn default_reply(frame: &Value) -> Vec<Value> {
             "claude_code_version": "2.1.317",
         }),
         Some("get_context_usage") => json!({"totalTokens": 1200, "maxTokens": 200000}),
+        Some("rewind_conversation") => json!({
+            "rewound": false,
+            "reason": "target_not_found",
+            "error": "target not found",
+        }),
         _ => json!({}),
     };
     vec![success(request_id, response)]

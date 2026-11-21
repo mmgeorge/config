@@ -1664,6 +1664,120 @@ async fn unsupported_options_reject_before_launch() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// Cut at the first discarded prompt and continue through the same binding.
+#[tokio::test]
+async fn rewind_keeps_the_live_cli_when_the_cut_is_known() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        let mut answer = answering_peer(&["ok"]);
+        Box::new(move |frame| {
+            if frame["request"]["subtype"] == "rewind_conversation" {
+                return Some(vec![success(
+                    frame["request_id"].clone(),
+                    json!({
+                        "rewound": true,
+                        "targetMessageUuid": frame["request"]["target_message_uuid"],
+                    }),
+                )]);
+            }
+            answer(frame)
+        })
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let kept = run_turn(&provider, &mut opened, "keep", false)
+        .await
+        .result()
+        .checkpoint_id()
+        .cloned()
+        .unwrap();
+    run_turn(&provider, &mut opened, "discard", false).await;
+    run_turn(&provider, &mut opened, "discard later", false).await;
+    let prompts = launcher.frames("user");
+
+    provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest {
+                after: Some(kept.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest { after: Some(kept) },
+        )
+        .await
+        .unwrap();
+    run_turn(&provider, &mut opened, "after rewind", false).await;
+
+    assert_eq!(launcher.record.lock().unwrap().launches.len(), 1);
+    let rewinds: Vec<_> = launcher
+        .frames("control_request")
+        .into_iter()
+        .filter(|frame| frame["request"]["subtype"] == "rewind_conversation")
+        .collect();
+    assert_eq!(rewinds.len(), 1);
+    assert_eq!(
+        rewinds[0]["request"]["target_message_uuid"],
+        prompts[1]["uuid"]
+    );
+    assert_eq!(
+        rewinds[0]["request"]["last_seen_user_message_uuid"],
+        prompts[2]["uuid"]
+    );
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Preserve the binding and report the native reason when the CLI detects an unseen turn.
+#[tokio::test]
+async fn rewind_refusal_does_not_bypass_the_live_history_guard() {
+    let directory = tempfile::tempdir().unwrap();
+    let launcher = PeerLauncher::new(|| {
+        let mut answer = answering_peer(&["ok"]);
+        Box::new(move |frame| {
+            if frame["request"]["subtype"] == "rewind_conversation" {
+                return Some(vec![success(
+                    frame["request_id"].clone(),
+                    json!({
+                        "rewound": false,
+                        "reason": "unseen_later_turn",
+                        "error": "unseen later turn",
+                    }),
+                )]);
+            }
+            answer(frame)
+        })
+    });
+    let (provider, mut opened) = open(launcher.clone(), directory.path()).await;
+    let binding = opened.binding.id.clone();
+    let kept = run_turn(&provider, &mut opened, "keep", false)
+        .await
+        .result()
+        .checkpoint_id()
+        .cloned()
+        .unwrap();
+    run_turn(&provider, &mut opened, "discard", false).await;
+
+    let error = provider
+        .thread_rewind(
+            operation_context(),
+            &binding,
+            forge_provider_api::ThreadRewindRequest { after: Some(kept) },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("unseen later turn"), "{error}");
+    run_turn(&provider, &mut opened, "after refusal", false).await;
+    assert_eq!(launcher.record.lock().unwrap().launches.len(), 1);
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// Rewinding restarts the process; the deliberate exit of the old process must not invalidate the
 /// binding, so the next prompt runs on the resumed process.
 ///

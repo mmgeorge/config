@@ -161,6 +161,11 @@ pub(crate) enum OutboundControl {
         #[serde(skip_serializing_if = "Option::is_none")]
         cancel_queued: Option<bool>,
     },
+    /// Remove the target user message and the suffix that follows it.
+    RewindConversation {
+        target_message_uuid: String,
+        last_seen_user_message_uuid: String,
+    },
     SetPermissionMode {
         mode: String,
     },
@@ -183,6 +188,7 @@ impl OutboundControl {
         match self {
             Self::Initialize(_) => "initialize",
             Self::Interrupt { .. } => "interrupt",
+            Self::RewindConversation { .. } => "rewind_conversation",
             Self::SetPermissionMode { .. } => "set_permission_mode",
             Self::SetModel { .. } => "set_model",
             Self::ApplyFlagSettings { .. } => "apply_flag_settings",
@@ -190,6 +196,27 @@ impl OutboundControl {
             Self::GetContextUsage {} => "get_context_usage",
         }
     }
+}
+
+/// Decode the CLI's application-level result inside a successful control response.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RewindResponse {
+    pub rewound: bool,
+    pub target_message_uuid: Option<String>,
+    pub reason: Option<RewindRefusal>,
+    pub error: Option<String>,
+}
+
+/// Distinguish a missing target from refusals that protect the live history.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RewindRefusal {
+    TargetNotFound,
+    PersistFailed,
+    StateChanged,
+    #[serde(other)]
+    Other,
 }
 
 /// The first request of every session, which configures the CLI for this client.
