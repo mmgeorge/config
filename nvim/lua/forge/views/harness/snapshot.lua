@@ -38,6 +38,13 @@ function HarnessSnapshot.apply(state, result)
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
   local session_changed = state.session and result.session and state.session.id ~= result.session.id
   local runtime_changed = state.runtime_epoch ~= result.runtime_epoch
+  if state.session and (session_changed or runtime_changed) then
+    state.model_catalog_bound = nil
+    require("forge.views.harness.provider_catalog").invalidate_models(state)
+  elseif state.session and state.model_catalog_bound and (state.session.model ~= result.session.model
+    or state.session.effort ~= result.session.effort) then
+    require("forge.views.harness.provider_catalog").invalidate_models(state)
+  end
   if session_changed or state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
     state.questions = nil
     state.publication_cursor, state.publication_received, state.publication_more = nil, nil, nil

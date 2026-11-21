@@ -85,6 +85,15 @@ impl ContextCompactionRun {
         }
     }
 
+    /// Check whether the next fact would start collection or reserve a new native request.
+    pub(super) fn can_abandon_before_dispatch(&self, event: &CompactionEvent) -> bool {
+        matches!(event, CompactionEvent::Ready)
+            && matches!(
+                self.stage,
+                CompactionStage::Inspect | CompactionStage::Prepare
+            )
+    }
+
     /// Commit native facts and select the next compaction stage in the exchange owner.
     ///
     /// `interrupted` is the exchange this command's collection stopped, which records the

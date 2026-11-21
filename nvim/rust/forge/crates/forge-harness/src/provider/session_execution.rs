@@ -112,7 +112,8 @@ impl OwnerObservation {
     }
 }
 /// How accepted typed input reached its provider, which decides what proves it was read.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AcceptedInputDelivery {
     /// The input joined a running native turn, which reports when the model reads it.
     Steering,

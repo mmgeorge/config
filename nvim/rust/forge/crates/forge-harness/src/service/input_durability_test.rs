@@ -1092,6 +1092,236 @@ async fn owner_recovers_stored_acceptance_without_dispatching_input() -> Result<
     Ok(())
 }
 
+/// Recover the original text when native acceptance outlives its transcript append.
+#[tokio::test]
+async fn accepted_steering_reopens_in_its_exchange_without_replay() -> Result<()> {
+    use crate::input::{InputDelivery, InputRoute};
+    let root = tempfile::tempdir()?;
+    let controller = receipt_test_controller(root.path()).await?;
+    let session = controller.broker.lock().await.snapshot()?.session;
+    let mut exchange = crate::storage::test::running_exchange("steering-owner");
+    exchange.session_id = session.id.clone();
+    exchange.agent_id = session.primary_agent_id;
+    let scope = crate::provider::InvocationScope::new(
+        crate::provider::ThreadOwner::root(&session.id),
+        exchange.id.clone(),
+    );
+    exchange.finish(crate::exchange::ExchangeOutcome::Complete, 100)?;
+    SqliteStore::open(&controller.data_root)?.save_exchange(&exchange)?;
+
+    let (input, submission) = registered_receipt_on_route(
+        &controller,
+        "accepted-steer",
+        crate::input::InputPurpose::User,
+        InputRoute::Steering,
+    )
+    .await?;
+    submission.bind_steering_scope(submission.record()?.attempt_id, scope)?;
+    submission.sending(None)?;
+    submission.accepted(None)?;
+    let receipt = submission.receipt_id().clone();
+    controller
+        .exchange_owner
+        .observe_input_receipt(
+            crate::exchange::InputReceiptFact::Settled {
+                submission: receipt.clone(),
+                result: crate::exchange::InputExecutionResult::Completed,
+                activity: crate::exchange::InputDispatchActivity::Active,
+            },
+            None,
+        )
+        .await?;
+    assert_eq!(
+        controller.coordinator.submissions.snapshot()?.messages[0].delivery(),
+        InputDelivery::Accepted,
+        "settlement dropped the only copy before the transcript append"
+    );
+    controller.finish_exchange_owner().await?;
+    drop(submission);
+    drop(controller);
+
+    for _ in 0..2 {
+        let reopened = receipt_test_controller_with_session(root.path(), &session.id).await?;
+        let history = SqliteStore::read_only(&reopened.data_root)?.list_exchange(&session.id)?;
+        assert_eq!(
+            history.len(),
+            1,
+            "acceptance was replayed as a new exchange"
+        );
+        let prompts: Vec<_> = history[0]
+            .node_list
+            .iter()
+            .filter_map(|node| match node {
+                crate::exchange::ExchangeNode::ExchangeInput { prompt }
+                    if prompt.submission_id.as_ref() == Some(&receipt) =>
+                {
+                    Some(prompt)
+                }
+                _ => None,
+            })
+            .collect();
+        let [prompt] = prompts.as_slice() else {
+            anyhow::bail!("the original exchange must show the accepted steer once");
+        };
+        assert_eq!(prompt.id, input.id.as_str());
+        assert_eq!(prompt.text, "Owned receipt");
+        assert_eq!(
+            prompt.consumption,
+            crate::exchange::InputConsumption::Unconfirmed
+        );
+        assert!(
+            reopened
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .is_empty()
+        );
+        reopened.finish_exchange_owner().await?;
+    }
+    Ok(())
+}
+
+/// Close the exchange owner while it waits for catalog evidence for an unapplied queued choice.
+#[tokio::test]
+async fn closing_owner_keeps_queued_settings_after_catalog_returns() -> Result<()> {
+    use crate::input::InputDelivery;
+    let root = tempfile::tempdir()?;
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().context("fixture provider missing")?,
+    )
+    .context("fixture descriptor missing")?;
+    let queried = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |_request, _sink, _start, _cancelled| async {
+            Err(crate::provider::ProviderError::Cancelled)
+        },
+    )
+    .with_models(vec![serde_json::from_value(json!({
+        "id":"fixture-model", "reasoning":["low","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?])
+    .with_model_list_answer({
+        let queried = queried.clone();
+        let release = release.clone();
+        move || {
+            let queried = queried.clone();
+            let release = release.clone();
+            async move {
+                queried.notify_one();
+                release.notified().await;
+                Ok(())
+            }
+        }
+    });
+    let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"closing-settings",
+        "provider":{"kind":"mock","command":[]},
+    }))?)?;
+    broker.set_provider_for_test(provider.provider_handle());
+    let initial_model = broker.snapshot()?.session.model;
+    let controller = SessionController::new(broker).await?;
+    let (sink, _output) = forge_protocol::outbound::channel();
+    let input = queued_offer_input(
+        &controller,
+        "queued-settings",
+        "",
+        Some(json!({
+            "model":"fixture-model", "effort":"high",
+        })),
+    )?;
+    controller.attach_input(&sink).await?;
+    queried.notified().await;
+    controller.input_stopping.store(true, Ordering::Release);
+    controller.coordinator.submissions.changed.notify_one();
+    controller.exchange_owner.close().await;
+    while controller
+        .exchange_owner
+        .input_ready(sink.clone())
+        .await
+        .is_ok()
+    {}
+    release.notify_one();
+    controller.finish_exchange_owner().await?;
+
+    let snapshot = controller.coordinator.submissions.snapshot()?;
+    let [message] = snapshot.messages.as_slice() else {
+        anyhow::bail!("shutdown consumed queued settings");
+    };
+    assert_eq!(message.id, input.id.as_str());
+    assert_eq!(message.delivery(), InputDelivery::Queued);
+    assert!(snapshot.suspended);
+    assert_eq!(
+        controller.broker.lock().await.snapshot()?.session.model,
+        initial_model
+    );
+    provider.provider_handle().shutdown().await?;
+    Ok(())
+}
+
+/// Retire a staged steer while its captured foreground receiver is still open.
+#[tokio::test]
+async fn stopped_staged_steering_returns_to_the_paused_queue() -> Result<()> {
+    use crate::input::InputDelivery;
+    let root = tempfile::tempdir()?;
+    let controller = receipt_test_controller(root.path()).await?;
+    let input = queued_offer_input(&controller, "staged-steer", "Preserve this text", None)?;
+    let execution = controller.coordinator.execution.acquire().await?;
+    let mut active = controller.parent_input.activate(None)?;
+    let (sink, _output) = forge_protocol::outbound::channel();
+    assert!(
+        controller
+            .exchange_owner
+            .offer_steering(
+                crate::exchange::SteeringDeliveryOffer {
+                    input: input.clone(),
+                    control: controller
+                        .coordinator
+                        .control
+                        .clone()
+                        .acquire_owned()
+                        .await?,
+                    order: Arc::new(tokio::sync::Semaphore::new(1))
+                        .acquire_owned()
+                        .await?,
+                },
+                sink,
+            )
+            .await?
+    );
+    let command = active
+        .receive()
+        .await
+        .context("steering was never staged")?;
+    let queue = &controller.coordinator.submissions;
+    queue.suspend(true, None)?;
+    // The foreground effect gate drops this command before running it and waits for the
+    // provider's separate collection to close the lane.
+    drop(command);
+    loop {
+        let changed = queue.changed.notified();
+        let snapshot = queue.snapshot()?;
+        let [message] = snapshot.messages.as_slice() else {
+            anyhow::bail!("stopping removed the unsent steer");
+        };
+        if message.delivery() != InputDelivery::Delivering {
+            assert_eq!(message.id, input.id.as_str());
+            assert_eq!(message.text, "Preserve this text");
+            assert_eq!(message.delivery(), InputDelivery::Queued);
+            assert!(snapshot.suspended);
+            break;
+        }
+        changed.await;
+    }
+    drop(active);
+    drop(execution);
+    controller.finish_exchange_owner().await?;
+    Ok(())
+}
+
 /// Accept a draft into the actual queue without starting its legacy readiness listener.
 fn queued_offer_input(
     controller: &SessionController,
@@ -1134,7 +1364,20 @@ async fn registered_receipt(
     crate::exchange::command::InputRevision,
     Arc<crate::provider::submission::Submission>,
 )> {
-    use crate::input::{InputAction, InputIntent, InputMessage, InputOperation, InputRoute};
+    registered_receipt_on_route(controller, id, purpose, crate::input::InputRoute::Turn).await
+}
+
+/// Register one real receipt on the route whose recovery authority the test exercises.
+async fn registered_receipt_on_route(
+    controller: &SessionController,
+    id: &str,
+    purpose: crate::input::InputPurpose,
+    route: crate::input::InputRoute,
+) -> Result<(
+    crate::exchange::command::InputRevision,
+    Arc<crate::provider::submission::Submission>,
+)> {
+    use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
     controller.coordinator.submissions.apply(InputOperation {
         id: format!("submit-{id}"),
         control_revision: 0,
@@ -1153,7 +1396,7 @@ async fn registered_receipt(
     let message = controller
         .coordinator
         .submissions
-        .claim(id, 1, InputRoute::Turn)?
+        .claim(id, 1, route)?
         .unwrap();
     let catalog = controller.catalog_request.read().await.clone();
     let provider = controller.provider_handle().descriptor().kind;

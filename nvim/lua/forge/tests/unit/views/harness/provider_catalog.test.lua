@@ -215,4 +215,40 @@ T["a_view_switched_to_a_provider_labels_its_model_from_that_provider_catalog_at_
   eq({ #requests, delivered[1].label }, { 2, "Beta Model (session)" })
 end
 
+T["live_catalog_discards_workspace_responses"] = function()
+  local equal = MiniTest.expect.equality
+  local session = require("forge.session")
+  local catalog = require("forge.views.harness.provider_catalog")
+  local requests = mock_client.record()
+  local state = session.harness
+  state.session = { id = "lazy-binding", provider = "antigravity", workspace = vim.fn.getcwd() }
+  local prebind_result, bound_result
+  catalog.models(false, function(models) prebind_result = models end)
+  catalog.invalidate_models(state)
+  catalog.models(false, function(models) bound_result = models end)
+  equal(#requests, 2)
+
+  requests[1].callback({ { id = "workspace-model" } })
+  equal(prebind_result, nil)
+  equal(#requests, 2)
+  requests[2].callback({ { id = "bound-model", reasoning = { "high" } } })
+  equal(prebind_result, bound_result)
+  equal(state.model_list, bound_result)
+  equal(bound_result[1].id, "bound-model")
+end
+
+T["empty_catalog_has_no_model_to_confirm"] = function()
+  local model_picker = require("forge.views.harness.model_picker")
+  local picker = require("forge.views.picker")
+  local window = vim.api.nvim_get_current_win()
+  local confirmed = false
+  model_picker.open({ host = { window_list = { window }, control_win = window }, provider = "antigravity",
+    model_list = {}, on_confirm = function() confirmed = true end })
+  local view = assert(picker._state_for_test())
+  MiniTest.expect.equality(view.spec.page_list[1].empty_text, "The provider advertised no models.")
+  MiniTest.expect.equality(assert(view.spec.on_confirm)({}), false)
+  MiniTest.expect.equality(confirmed, false)
+  picker.close(false)
+end
+
 return T

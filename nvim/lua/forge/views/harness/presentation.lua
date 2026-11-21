@@ -403,11 +403,13 @@ function M.open(options, callback)
     local staged = { queue = {}, steering = {}, paused = paused }
     for _, entry in ipairs(queue or {}) do
       staged.queue[#staged.queue + 1] = type(entry) == "table" and entry.id
-        and { id = entry.id, text = entry.text, failed = entry.failed == true, content = entry.content } or type(entry) == "table" and entry.text or entry
+        and { id = entry.id, text = entry.text, failed = entry.failed == true, failure_notice = entry.failure_notice,
+          content = entry.content } or type(entry) == "table" and entry.text or entry
     end
     for _, entry in ipairs(steering or {}) do
       staged.steering[#staged.steering + 1] = entry.id
-        and { id = entry.id, text = entry.text, failed = entry.failed == true, content = entry.content } or entry.text or ""
+        and { id = entry.id, text = entry.text, failed = entry.failed == true, failure_notice = entry.failure_notice,
+          content = entry.content } or entry.text or ""
     end
     -- Staged steering publishes at once: the host keeps an acknowledged message in the same status
     -- section until its provider reports consumption, so the message has one visible place

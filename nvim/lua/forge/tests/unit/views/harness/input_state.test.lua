@@ -141,7 +141,7 @@ T["retracted_input"] = function()
   state.composer_buf = buffer.scratch()
   local context = { document = "draft", buffer = state.composer_buf, is_current = function() return true end }
   local scenarios = { { newer = false }, { newer = true }, { newer = false, late = true }, { newer = true, late = true },
-    { newer = false, claimed = true } }
+    { newer = false, claimed = true }, { newer = false, newer_during_removal = true } }
   for index, scenario in ipairs(scenarios) do
     local newer_draft = scenario.newer
     buffer.set(state.composer_buf, { "Cancel this prompt" })
@@ -177,8 +177,10 @@ T["retracted_input"] = function()
       assert(state.input.revision == revision + 2 and state.input.control_revision == 9,
         "late retraction regressed the authoritative input projection")
     end
+    if scenario.newer_during_removal then buffer.set(state.composer_buf, { "Typed during removal" }) end
     assert(buffer.line(state.composer_buf, 1)
-      == (newer_draft and "Newer unsent draft" or "Cancel this prompt"), "cancellation overwrote or lost the draft")
+      == (newer_draft and "Newer unsent draft" or scenario.newer_during_removal and "Typed during removal" or ""),
+      "cancellation overwrote the draft before removal was confirmed")
     eq(#vim.tbl_filter(function(entry) return entry.local_only end, state.queue), 0)
     local function held()
       return vim.tbl_filter(function(entry) return entry.id == unsent.id end, state.queue)
@@ -191,13 +193,19 @@ T["retracted_input"] = function()
       eq(held()[1].delivery, "failed")
       input.receive(state, { revision = state.input.revision + 1, suspended = true, upsert = {}, removed = { unsent.id } })
     else
-      -- The composer holds the text again, so the editor removes the host's copy exactly once.
+      -- The editor removes the host's copy exactly once before restoring the text.
       eq(#requests, count + 1)
       local removal = requests[#requests]
       eq(removal.spec.method, "session.input.apply")
       eq(removal.spec.params.action, { kind = "remove", id = unsent.id, revision = unsent.revision })
       removal.callback({ operation_id = removal.spec.params.id, revision = state.input.revision + 1,
         suspended = true, upsert = {}, removed = { unsent.id } })
+      eq(buffer.line(state.composer_buf, 1), scenario.newer_during_removal and "Typed during removal" or "Cancel this prompt")
+      if scenario.newer_during_removal then
+        local draft = state.queue[1]
+        eq({ draft.text, draft.local_only }, { "Cancel this prompt", true })
+        input.discard_rejected(state, draft.id)
+      end
     end
     eq(#held(), 0)
   end
@@ -229,6 +237,34 @@ T["retraction_into_queue_edit"] = function()
   -- The host's unsent entry is the only copy; the editor neither removes nor duplicates it.
   eq(#requests, count)
   eq(vim.tbl_map(function(entry) return { entry.id, entry.local_only } end, state.queue), { { unsent.id } })
+end
+
+T["retraction_keeps_the_host_copy_when_removal_fails"] = function()
+  local input = require("forge.views.harness.input_state")
+  local submission = require("forge.views.harness.prompt_submission")
+  local requests = mock_client.record()
+  notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local state = { session = { id = "retraction-removal" }, queue = {}, composer_buf = buffer.scratch() }
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 0, suspended = false, messages = {} })
+  local context = { document = "draft", buffer = state.composer_buf, is_current = function() return true end }
+  buffer.set(state.composer_buf, { "Retract me" })
+  submission.start(state, { context = context }, function() end)
+  local request = requests[#requests]
+  local message = vim.deepcopy(request.spec.params.action.message)
+  message.revision = 1
+  request.callback({ operation_id = request.spec.params.id, revision = 1, suspended = false, upsert = { message }, removed = {} })
+  local unsent = { id = "retracted:removal-failed", revision = 1, text = "Retract me", attachments = {},
+    purpose = { kind = "user" }, intent = "queue", delivery = "failed", error = "Interrupted before the model replied." }
+  input.receive(state, { revision = 2, suspended = true, upsert = { unsent }, removed = { message.id }, retracted = message.id })
+  requests[#requests].callback(nil, "Host stopped", { code = "outcome_unknown" })
+  eq(buffer.line(state.composer_buf, 1), "")
+  eq(vim.tbl_map(function(entry) return entry.id end, state.queue), { unsent.id })
+  -- If the owner really did commit removal but the reply was lost, reconciliation
+  -- still keeps one editor-held copy without authorizing it to be sent.
+  input.receive(state, { revision = 3, snapshot = { revision = 3, suspended = true, messages = {} } })
+  eq(vim.tbl_map(function(entry) return { entry.text, entry.draft_state } end, state.queue),
+    { { unsent.text, "unknown" } })
 end
 
 T["perform_settles_after_ownership_change"] = function()
@@ -545,8 +581,8 @@ T["withdrawn_entries_leave_the_queue_before_the_host_answers"] = function()
   state.input.changed = function()
     for _, entry in ipairs(state.queue) do if entry.id == "retracted:taken" then shown = true end end
   end
-  input.submit(state, "Take me back", {}, "auto", nil, nil, function()
-    buffer.set(state.composer_buf, { "Take me back" })
+  input.submit(state, "Take me back", {}, "auto", nil, nil, function(check_only)
+    if not check_only then buffer.set(state.composer_buf, { "Take me back" }) end
     return true
   end)
   local message = fixture.commit()
@@ -597,6 +633,35 @@ T["failed_submission_returns_to_the_composer_or_its_row"] = function()
   third.callback(nil, "Provider restart failed")
   eq(vim.tbl_map(function(entry) return { entry.text, entry.draft_state } end, state.queue),
     { { "Lost in the restart", "rejected" } })
+end
+
+T["unknown_submission_stays_out_of_an_empty_composer"] = function()
+  local input = require("forge.views.harness.input_state")
+  local submission = require("forge.views.harness.prompt_submission")
+  local requests = mock_client.record()
+  notify.capture({ min_level = vim.log.levels.ERROR, notifications = true })
+  local state = { session = { id = "unknown-submission" }, queue = {}, composer_buf = buffer.scratch() }
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 0, suspended = false, messages = {} })
+  local context = { document = "composer", buffer = state.composer_buf, is_current = function() return true end }
+  buffer.set(state.composer_buf, { "The host may have accepted this" })
+  submission.start(state, { context = context }, function() end)
+  requests[#requests].callback(nil, "outcome unconfirmed", { code = "outcome_unknown" })
+  eq(buffer.line(state.composer_buf, 1), "")
+  eq(vim.tbl_map(function(entry) return entry.draft_state end, state.queue), { "unknown" })
+end
+
+T["input_during_idle_compaction_waits_as_a_follow_up"] = function()
+  local deferred = dofile("nvim/lua/forge/tests/support/deferred.lua")
+  local fixture = placement_fixture("compaction-placement", "working")
+  local state, input = fixture.state, fixture.input
+  local timers = deferred.install({ input.submission_notice_delay_ms })
+  state.status = { kind = "compacting", turn_waiting = false }
+  input.submit(state, "After compaction", {}, "auto")
+  fixture.commit()
+  eq(timers.fire(input.submission_notice_delay_ms), 1)
+  eq(#state.pending_steer, 0)
+  eq(vim.tbl_map(function(entry) return entry.text end, state.queue), { "After compaction" })
 end
 
 return T

@@ -3,9 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use forge_provider_api::{
-    BindingId, InvocationScope, ProviderError,
+    BindingId, InvocationScope, ProviderError, ProviderId,
     control::{ProviderTools, ToolCall, ToolReply},
     error::{ProviderFailure, ProviderFailureKind, ProviderOperation},
+    permissions::{
+        PermissionRequest, PermissionResponse, PermissionSubject, PermissionTarget,
+        ProviderPermissions,
+    },
     session::{HostEffectFailure, ProviderHostEffects},
     turn_control::{HostTurnStatus, TurnControl},
 };
@@ -19,6 +23,7 @@ use super::{CompletionSlot, ProviderCompletion};
 /// Retain host callback authority and effects for exactly one normalized invocation.
 pub(crate) struct HostInvocation {
     provider_closed: Arc<std::sync::atomic::AtomicBool>,
+    provider_id: ProviderId,
     binding: BindingId,
     scope: InvocationScope,
     request: super::ProviderRequest,
@@ -34,9 +39,8 @@ pub(crate) struct HostInvocation {
     checkpoint: Option<crate::checkpoint::ToolGate>,
     completion: Arc<CompletionSlot>,
     endpoint: Arc<crate::tools::control_session::ControlSession>,
-    endpoint_lease: Arc<super::bridge::EndpointLease>,
+    binding_control: Option<Arc<crate::tools::control_session::BindingControl>>,
     endpoint_collected: tokio::sync::OnceCell<Result<(), HostEffectFailure>>,
-    endpoint_closed: tokio::sync::OnceCell<()>,
     relay: tokio::sync::Mutex<HostEventRelay>,
     skills: Mutex<Option<crate::skill::SkillExecution>>,
     skill_observer: Option<Arc<dyn super::events::EventObserver>>,
@@ -61,12 +65,13 @@ impl ObservedTools {
         let (record, fresh) = {
             let mut calls = self.calls.lock().map_err(|_| rejected())?;
             if let Some(record) = calls.get(&call.id) {
-                if record.name != call.name || record.arguments != call.arguments {
+                if !record.matches(&call, HostCallTransport::Direct) {
                     return Err(rejected());
                 }
                 (record.clone(), false)
             } else {
                 let record = Arc::new(HostCall {
+                    transport: HostCallTransport::Direct,
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     state: Mutex::new(HostCallState::Running),
@@ -139,10 +144,25 @@ fn refused_before_execution(
 }
 
 struct HostCall {
+    transport: HostCallTransport,
     name: String,
     arguments: serde_json::Value,
     state: Mutex<HostCallState>,
     changed: Notify,
+}
+
+impl HostCall {
+    /// Bind a replay to the same transport, tool name, and arguments.
+    fn matches(&self, call: &ToolCall, transport: HostCallTransport) -> bool {
+        self.transport == transport && self.name == call.name && self.arguments == call.arguments
+    }
+}
+
+/// Distinguish native callbacks from HTTP calls that require host authorization.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostCallTransport {
+    Direct,
+    Http,
 }
 
 #[derive(Clone)]
@@ -180,10 +200,11 @@ impl Drop for RunningHostCall {
 pub(crate) struct HostInvocationResources {
     pub(crate) observed_authority: Arc<super::bridge::ObservedPermissionAuthority>,
     pub(crate) provider_closed: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) provider_id: ProviderId,
     pub(crate) permissions: Arc<crate::permissions::provider::ProviderPermissionContext>,
     pub(crate) directories: Option<super::approval::DirectoryExecution>,
     pub(crate) endpoint: Arc<crate::tools::control_session::ControlSession>,
-    pub(crate) endpoint_lease: Arc<super::bridge::EndpointLease>,
+    pub(crate) binding_control: Option<Arc<crate::tools::control_session::BindingControl>>,
     pub(crate) relay: HostEventRelay,
     pub(crate) skills: Option<crate::skill::SkillExecution>,
 }
@@ -311,10 +332,11 @@ impl HostInvocation {
         let HostInvocationResources {
             observed_authority,
             provider_closed,
+            provider_id,
             permissions,
             directories,
             endpoint,
-            endpoint_lease,
+            binding_control,
             relay,
             skills,
         } = resources;
@@ -326,6 +348,7 @@ impl HostInvocation {
         let checkpoint = context.checkpoint.clone();
         Self {
             provider_closed,
+            provider_id,
             binding,
             scope,
             request: request.invocation_snapshot(),
@@ -339,9 +362,8 @@ impl HostInvocation {
             checkpoint,
             completion,
             endpoint,
-            endpoint_lease,
+            binding_control,
             endpoint_collected: tokio::sync::OnceCell::new(),
-            endpoint_closed: tokio::sync::OnceCell::new(),
             relay: tokio::sync::Mutex::new(relay),
             skills: Mutex::new(skills),
             skill_observer,
@@ -442,6 +464,9 @@ impl HostInvocation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.endpoint.cancel_admission();
+        if let Some(control) = &self.binding_control {
+            control.unbind(&self.endpoint);
+        }
         self.skills
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -510,6 +535,13 @@ impl HostInvocation {
         self.settle(&self.scope).await
     }
 
+    /// Route future HTTP requests only after native input is admitted.
+    pub(super) fn bind_control_endpoint(&self) {
+        if let Some(control) = &self.binding_control {
+            control.bind(&self.endpoint);
+        }
+    }
+
     /// Admit a callback only while its immutable invocation retains authority.
     fn admit(&self, scope: &InvocationScope) -> Result<AdmittedEffect<'_>, ProviderError> {
         if scope != &self.scope {
@@ -554,6 +586,9 @@ impl HostInvocation {
                 state.admission = Admission::Finishing;
             }
         }
+        if let Some(control) = &self.binding_control {
+            control.unbind(&self.endpoint);
+        }
         let endpoint_result = *self
             .endpoint_collected
             .get_or_init(|| async {
@@ -564,12 +599,6 @@ impl HostInvocation {
                     .map_err(|_| HostEffectFailure::Uncertain)
             })
             .await;
-        // Cache only successful server collection: a timed-out close retains its handle for retry.
-        let endpoint_close = self
-            .endpoint_closed
-            .get_or_try_init(|| self.endpoint_lease.close())
-            .await
-            .map(|_| ());
         self.executor.finish().await;
         loop {
             let changed = self.changed.notified();
@@ -595,7 +624,6 @@ impl HostInvocation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         endpoint_result?;
-        endpoint_close?;
         relay_result?;
         if self.executor.mutation_failed() || self.endpoint.mutation_failed() {
             return Err(HostEffectFailure::Uncertain);
@@ -811,6 +839,29 @@ impl ProviderTools for HostInvocation {
         scope: &InvocationScope,
         call: ToolCall,
     ) -> Result<ToolReply, ProviderError> {
+        self.dispatch_tool(scope, call, HostCallTransport::Direct)
+            .await
+    }
+
+    /// Gate the actual HTTP call under the invocation selected by the binding endpoint.
+    async fn call_http_reply(
+        &self,
+        scope: &InvocationScope,
+        call: ToolCall,
+    ) -> Result<ToolReply, ProviderError> {
+        self.dispatch_tool(scope, call, HostCallTransport::Http)
+            .await
+    }
+}
+
+impl HostInvocation {
+    /// Execute one admitted call, sharing its decision and result with duplicate deliveries.
+    async fn dispatch_tool(
+        &self,
+        scope: &InvocationScope,
+        call: ToolCall,
+        transport: HostCallTransport,
+    ) -> Result<ToolReply, ProviderError> {
         if scope != &self.scope || !self.tools.contains(&call.name) {
             return Err(rejected());
         }
@@ -820,7 +871,7 @@ impl ProviderTools for HostInvocation {
             calls
                 .get(&call.id)
                 .map(|record| {
-                    if record.name != call.name || record.arguments != call.arguments {
+                    if !record.matches(&call, transport) {
                         return Err(rejected());
                     }
                     Ok(record.state.lock().map_err(|_| rejected())?.clone())
@@ -833,15 +884,18 @@ impl ProviderTools for HostInvocation {
             Some(HostCallState::Running) | None => {}
         }
         let mut admitted = self.admit(scope)?;
+        // Replay, permission waits, and refusals cannot leave an unpublished effect.
+        admitted.published = true;
         let (record, fresh) = {
             let mut calls = self.calls.lock().map_err(|_| rejected())?;
             if let Some(record) = calls.get(&call.id) {
-                if record.name != call.name || record.arguments != call.arguments {
+                if !record.matches(&call, transport) {
                     return Err(rejected());
                 }
                 (record.clone(), false)
             } else {
                 let record = Arc::new(HostCall {
+                    transport,
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     state: Mutex::new(HostCallState::Running),
@@ -853,12 +907,20 @@ impl ProviderTools for HostInvocation {
         };
         if fresh {
             let _running = RunningHostCall(record.clone());
-            let result = self.execute_call(call, &record, &mut admitted).await;
+            let result = async {
+                if transport == HostCallTransport::Http
+                    && let Some(denial) = self.authorize_http_tool(scope, &call).await?
+                {
+                    return Ok(denial);
+                }
+                admitted.published = false;
+                self.execute_call(call, &record, &mut admitted).await
+            }
+            .await;
             *record.state.lock().map_err(|_| rejected())? = HostCallState::Complete(result.clone());
             record.changed.notify_waiters();
             return result;
         }
-        admitted.published = true;
         loop {
             let changed = record.changed.notified();
             tokio::pin!(changed);
@@ -875,6 +937,40 @@ impl ProviderTools for HostInvocation {
                 }
                 HostCallState::Complete(result) => return result,
             }
+        }
+    }
+
+    /// Apply the current policy to the actual HTTP tool and retain any refusal as its reply.
+    async fn authorize_http_tool(
+        &self,
+        scope: &InvocationScope,
+        call: &ToolCall,
+    ) -> Result<Option<ToolReply>, ProviderError> {
+        self.permissions.before_tool(scope).await?;
+        let response = self
+            .permissions
+            .authorize(
+                scope,
+                PermissionRequest {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    provider: self.provider_id.clone(),
+                    // HTTP MCP uses a transport request ID independent of ACP's tool item ID.
+                    subject: PermissionSubject::Unattached,
+                    reason: None,
+                    target_list: vec![PermissionTarget::HostTool {
+                        name: call.name.clone(),
+                    }],
+                },
+            )
+            .await;
+        match response {
+            PermissionResponse::Allow => Ok(None),
+            PermissionResponse::Deny { reason } => {
+                Ok(Some(ToolReply::failed(reason.unwrap_or_else(|| {
+                    "Harness denied the host tool call.".into()
+                }))))
+            }
+            PermissionResponse::Cancelled => Err(ProviderError::Cancelled),
         }
     }
 }

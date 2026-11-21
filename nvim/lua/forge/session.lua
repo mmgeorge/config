@@ -90,6 +90,8 @@ M.empty_diff_rows = {}
 ---@field model_list table[]?
 ---@field model_provider string?
 ---@field model_list_provisional? boolean `model_list` is the provider's latest catalog from another session, held until this session's own arrives.
+---@field model_catalog_bound? boolean The current runtime has reported an open provider binding.
+---@field model_catalog_revision? integer Invalidate catalog results after a binding or model change.
 ---@field render_rows table<integer, table>
 ---@field fold_installed table<string, boolean>
 ---@field activity_expanded table<string, boolean>

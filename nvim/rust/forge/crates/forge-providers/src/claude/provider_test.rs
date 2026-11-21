@@ -325,6 +325,7 @@ fn steering_request(
     text: &str,
 ) -> forge_provider_api::session::SteeringRequest {
     forge_provider_api::session::SteeringRequest {
+        dispatch: None,
         scope,
         input: forge_provider_api::forge::TurnInput::user(
             forge_provider_api::input::PromptInput::Text(text.into()),
@@ -3601,6 +3602,7 @@ fn journaled_steering(
     id: &str,
 ) -> forge_provider_api::session::SteeringRequest {
     forge_provider_api::session::SteeringRequest {
+        dispatch: None,
         delivery: forge_provider_api::session::SteeringDelivery::Journaled {
             receipt: receipt(id),
         },

@@ -10,6 +10,8 @@ This reference explains what counts as acceptance for each provider, and how to 
 
 Owner-targeted steering is registered with the shared session execution engine before dispatch. The adapter returns direct `InputAcceptance` from `turn_start` or typed steering acceptance from `turn_steer`, independently of the later canonical `Turn.Completed` event. Its 30-second acknowledgment deadline produces an uncertain-delivery error; it never silently queues another copy. Cancelling the owning turn still interrupts delivery.
 
+The foreground owner admits user steers in queue order. It releases the next input after tracked transport handoff or after the current delivery settles. Antigravity reports handoff when its local ACP writer takes ownership, so the next send can proceed while the first still awaits its native reply. An unsent steer releases the slot only after the owner has handled its disposition.
+
 An explicit `NotConsumed` result proves that the addressed delivery did not consume input; it carries no native continuation authority. The host may retain that input for a later explicitly owned admission after the previous invocation settles. That admission uses ordinary `turn_start`, a fresh invocation scope, and a fresh delivery attempt for the original journal entry. An accepted result, disconnect, or unknown outcome never permits replay. Native terminal coverage, native resource settlement, and host commit all precede the completed host result.
 
 | State | Meaning |
@@ -59,9 +61,11 @@ Steering writes another user frame into the running process. The CLI either fold
 
 ### ACP
 
-Antigravity uses [ACP v1 prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn). The `session/prompt` response ends the turn, so it is not an early acceptance receipt, and v1 has no mandatory client-assigned ID to prove delivery. Forge commits the session ID and method as `Sending` immediately before the transport call. Startup and attachment failures leave input `Prepared`. Antigravity does not advertise steering.
+Antigravity uses [ACP v1 prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn). The `session/prompt` response ends the turn, so it is not an early acceptance receipt, and v1 has no mandatory client-assigned ID to prove delivery. Forge commits the session ID and method as `Sending` immediately before the transport call. Startup and attachment failures leave input `Prepared`. Bundled Antigravity steers by sending another prompt on the same session. The first reply can arrive before the second prompt finishes, so all admitted requests settle under the same Forge invocation. Each journaled steer requires its own valid response for acceptance.
 
 The [ACP v2 draft](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) makes `session/prompt` return when the message enters the conversation. Forge negotiates v1, and must not apply v2 semantics to a v1 connection.
+
+During steering, Antigravity can keep streaming prose from the original prompt after its RPC reply. Forge records terminal reply order at transport ingress and commits each request's receipt separately. If a steer needs a continuation, the continuation sends the typed input from its receipt, including any check results or attachments. Native message IDs mark prose boundaries when ACP sends them. Forge can also split an anonymous reply using exact native transcript evidence at settlement. During interruption, the recorded waiting input and separator can preserve a completed reply before a partial one.
 
 ## Acceptance and consumption
 
@@ -73,9 +77,11 @@ Acceptance proves that the provider owns an input, so the journal never replays 
 | Copilot | Root `user.message` with the accepted `messageId`, published by `EventDecoder::consumed_input`. |
 | Claude Code stream-json | `command_lifecycle started` for the steering frame `uuid`, published by `ClaudeSessionState::command_lifecycle`. |
 | Mock | One user item per journaled steer when the held response begins. |
-| Antigravity ACP v1 | Not applicable; ACP steering is unsupported. |
+| Antigravity ACP v1 | The wire does not correlate a live user-message observation to the steering attempt. Accepted steering uses the unconfirmed-read presentation. |
 
 A covered input in a terminal result is not a consumption report, because coverage lists accepted attempts and a terminal result can describe interruption or failure. An exchange that settles without a report, and recovery that detaches the invocation, settle the input as `Unconfirmed`: its transcript row keeps the user's text with the label `Steering (not confirmed read)`, and its `Accepted` journal entry is never resent.
+
+Before native steering dispatch, Forge records the receipt's attempt and host invocation. A continuation that sends the steer as its prompt records the successor invocation in that receipt. The queue retains accepted steering until the exchange owner commits its transcript append. If the host stops first, recovery restores the text to the named exchange before removing the queue copy. Repeating recovery matches the same submission in history and leaves one row. When shutdown returns an unsent receipt to the queue, the receipt records that intent in the retirement transaction. A restart recognizes the intent even if the queue write did not commit.
 
 ## Recovery before the next prompt
 
@@ -97,6 +103,12 @@ Test the write-before-acknowledge crash, acknowledgment commit failure, expired 
 
 Verify the journal and generic lifecycle fixtures in `forge-harness` and native classifiers and wire fixtures in `forge-providers`. Start with the affected compiler checks, then select the exact regression names from the changed module. ACP simulated peers run in memory and need no provider credentials.
 
-After rebuilding, run `nvim/lua/forge/tests/integration/views/harness/harness.test.lua` in fresh headless Neovim processes, with `vim.g.forge_acp_fixture_lost_ack` set to `false` and `true`; the fixture drives Antigravity through a simulated ACP peer. It asserts that uncertain delivery blocks the next native send and keeps the original error.
+Run the Antigravity [submission fixture](../../lua/forge/tests/integration/views/harness/submission.test.lua) with the `lua-host-test` check inside Harness. Outside Harness, [build the development executable](building-and-testing.md#build) and run the selected cases from the repository root.
+
+```nu
+nu .forge/checks/lua-tests.nu nvim/lua/forge/tests/integration/views/harness/submission.test.lua
+```
+
+The fixture drives a simulated ACP peer in two cases. `submission` verifies that Forge sends the next input without replaying an accepted prompt. `unconfirmed delivery keeps the next input queued` verifies that losing the ACP reply preserves the unconfirmed-delivery error and blocks the next native send.
 
 With tracing enabled, `provider.submission` log entries record delivery transitions, input IDs, attempt IDs, and owners. Native correlation tokens and receipt bytes remain private and are not logged.

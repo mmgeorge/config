@@ -13,7 +13,7 @@ use forge_provider_api::{
 use tokio::sync::{Mutex, OnceCell, mpsc};
 
 use crate::tools::control_server::ControlServer;
-use crate::tools::control_session::ControlSession;
+use crate::tools::control_session::{BindingControl, ControlSession};
 
 use super::{ProviderRequest, approval::PermissionCoordinator, operation::OperationControl};
 
@@ -50,6 +50,7 @@ pub struct ProviderBridge {
     >,
     binding_collection: Arc<BindingCollection>,
     admission: tokio::sync::RwLock<()>,
+    resource_admission: tokio::sync::RwLock<()>,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -113,6 +114,7 @@ impl BindingCollection {
 struct HostSession {
     provider_closed: Arc<std::sync::atomic::AtomicBool>,
     initialized: OnceCell<BoundSession>,
+    endpoint: OnceCell<BindingEndpoint>,
     observed_authorities: std::sync::Mutex<
         HashMap<forge_provider_api::InvocationId, Arc<ObservedPermissionAuthority>>,
     >,
@@ -139,6 +141,23 @@ struct HostSession {
 }
 
 impl HostSession {
+    /// Reject a settings operation when the owner has started retiring its current binding.
+    fn ensure_resource_admission(&self) -> Result<(), ProviderError> {
+        use std::sync::atomic::Ordering;
+        if self.closing.load(Ordering::Acquire)
+            || self
+                .initialized
+                .get()
+                .is_some_and(|bound| bound.retiring.load(Ordering::Acquire))
+        {
+            return Err(failure(
+                ProviderOperation::Inspect,
+                ProviderFailureKind::BindingClosed,
+            ));
+        }
+        Ok(())
+    }
+
     /// Forget delivered context after a history change that may have removed it.
     fn clear_context(&self) {
         self.context_delivery
@@ -150,6 +169,7 @@ impl HostSession {
 
 struct BoundSession {
     binding: SessionBinding,
+    resources: Option<Arc<crate::settings::SessionResources>>,
     rejected_events: Option<Mutex<Option<ProviderEventStream>>>,
     registrations: forge_provider_api::TurnRegistrationReader,
     relay: Mutex<Option<tokio::task::JoinHandle<Result<(), ProviderError>>>>,
@@ -187,18 +207,9 @@ impl Drop for HostObservation {
     }
 }
 
-pub(super) struct EndpointLease {
-    _server: ControlServer,
-}
-
-impl EndpointLease {
-    /// Stop the exact invocation endpoint and collect all accepted HTTP calls.
-    pub(super) async fn close(&self) -> Result<(), forge_provider_api::HostEffectFailure> {
-        self._server
-            .close()
-            .await
-            .map_err(|_| forge_provider_api::HostEffectFailure::Uncertain)
-    }
+struct BindingEndpoint {
+    server: ControlServer,
+    control: Arc<BindingControl>,
 }
 
 struct PreparedOperation {
@@ -228,6 +239,7 @@ impl PreparedOperation {
         })?;
         let operation = OperationControl::fresh(ProviderOperation::TurnStart).map_err(prepare)?;
         self.effects.request_native_input()?;
+        self.effects.bind_control_endpoint();
         Ok(NativeOperation {
             binding: self.binding,
             request: self.request,
@@ -252,6 +264,14 @@ pub(crate) enum ConfigureReceipt {
     Deferred,
     /// Native configuration and its ordered identity observation completed for this exact binding.
     Applied(ConfiguredBindingReceipt),
+}
+
+/// Identify which resource selection belongs to a settings application.
+pub(crate) enum ConfigurationResources {
+    /// The native open retained this exact selection and cannot change it.
+    Immutable(Arc<crate::settings::SessionResources>),
+    /// A mutable or unopened provider uses the requested configuration.
+    Desired(Option<Arc<crate::settings::SessionResources>>),
 }
 
 /// Prove ordered configuration without retaining native resources or extending a binding's lifetime.
@@ -416,8 +436,6 @@ enum BindingMetadata {
     Identity(forge_provider_api::ProviderSessionId),
 }
 
-impl ResourceLease for EndpointLease {}
-
 struct RepositoryProcessLease(Arc<dyn forge_shell::process::ProcessOwner>);
 
 impl ResourceLease for RepositoryProcessLease {
@@ -476,6 +494,7 @@ impl ProviderBridge {
             ownership: Default::default(),
             retired_bindings: Default::default(),
             admission: tokio::sync::RwLock::new(()),
+            resource_admission: tokio::sync::RwLock::new(()),
             closed,
         }
     }
@@ -530,6 +549,12 @@ impl ProviderBridge {
                 ProviderFailureKind::BindingClosed,
             ));
         }
+        // Keep the selection and its published binding on one side of a settings commit.
+        let _resource_open = if session.initialized.get().is_none() {
+            Some(self.resource_admission.read().await)
+        } else {
+            None
+        };
         let initialized = session
             .initialized
             .get_or_try_init(|| async {
@@ -550,28 +575,43 @@ impl ProviderBridge {
                 };
                 // Background generation is tool-free, so it selects no skills or MCP servers; an
                 // empty selection excludes inherited resources rather than restoring defaults.
-                let resources = match descriptor.capability.integration.resource_target.as_deref() {
-                    Some(_) if request.mode == super::PromptMode::Background => Default::default(),
-                    Some(target) => crate::settings::SessionResources::load(
-                        &self.root,
-                        &catalog,
-                        descriptor.kind.as_str(),
-                        target,
-                    )
-                    .map_err(|_| {
-                        ProviderError::Failure(ProviderFailure::new(
-                            ProviderOperation::ThreadOpen,
-                            ProviderFailureKind::Rejected,
-                        ))
-                    })?
-                    .selection(),
-                    None => Default::default(),
+                let resources = match session.open_operation.pending_resources() {
+                    Some(resources) => resources,
+                    None if request.mode == super::PromptMode::Background => Arc::default(),
+                    None => self
+                        .desired_resources(&catalog)
+                        .map_err(|_| {
+                            failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Rejected)
+                        })?
+                        .unwrap_or_default(),
                 };
                 let tools = crate::tools::ControlToolRegistry
                     .registration_definitions(&owner, request.mode);
+                let tool_endpoint = if descriptor.capability.integration.host_tool_endpoint
+                    && request.mode != super::PromptMode::Background
+                {
+                    let endpoint = session.endpoint.get_or_try_init(|| async {
+                        let control = Arc::new(BindingControl::new(tools.clone()));
+                        let server = ControlServer::start(control.clone()).await.map_err(|error| {
+                            ProviderError::Explained {
+                                cause: Box::new(failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Runtime)),
+                                explanation: forge_provider_api::diagnostic::SanitizedMessage::new(
+                                    format!("Could not open the local Forge tool endpoint. {error}"),
+                                ).expect("the endpoint diagnostic has a fixed nonempty prefix"),
+                            }
+                        })?;
+                        Ok::<_, ProviderError>(BindingEndpoint { server, control })
+                    }).await?;
+                    Some(HostToolEndpoint {
+                        url: endpoint.server.url.clone(),
+                        headers: Default::default(),
+                    })
+                } else {
+                    None
+                };
                 // Adapters retain open-time instructions for every later turn, so they hold only
                 // static text. Each turn's purpose, task contract, and settings travel as tracked
-                // context sections that the binding's delivery record sends once per change.
+                // context sections that the binding selects for each prompt.
                 let system_instructions =
                     request.open_instructions(descriptor.capability.integration.context_channel);
                 let opening_request = SessionRequest {
@@ -591,7 +631,7 @@ impl ProviderBridge {
                         model: model_selection(request),
                         access: request.access.clone(),
                         approval: request.approval_mode,
-                        resources,
+                        resources: resources.selection(),
                     },
                     resource_lease: request
                         .control_context
@@ -601,21 +641,23 @@ impl ProviderBridge {
                             Arc::new(RepositoryProcessLease(owner)) as Arc<dyn ResourceLease>
                         }),
                     tools,
-                    tool_endpoint: None,
+                    tool_endpoint,
                     system_instructions,
                     trace: self.trace.clone(),
                 };
-                let opened = session
+                let (opened, resources) = session
                     .open_operation
                     .open(
                         self.native.as_ref(),
                         self.trace.clone(),
                         &self.core_events,
                         opening_request,
+                        resources,
                         self.binding_collection.clone(),
                     )
                     .await?;
-                Ok::<_, ProviderError>(self.install_session(&owner, &session, opened))
+                let resources = self.retains_resource_snapshot().then_some(resources);
+                Ok::<_, ProviderError>(self.install_session(&owner, &session, opened, resources))
             })
             .await?;
         if self.binding_collection.ambiguous(&initialized.binding.id) {
@@ -661,6 +703,7 @@ impl ProviderBridge {
         owner: &ThreadOwner,
         session: &Arc<HostSession>,
         opened: forge_provider_api::OpenedSession,
+        resources: Option<Arc<crate::settings::SessionResources>>,
     ) -> BoundSession {
         let forge_provider_api::OpenedSession {
             binding,
@@ -699,6 +742,7 @@ impl ProviderBridge {
             )));
             return BoundSession {
                 binding,
+                resources: None,
                 registrations,
                 rejected_events: Some(Mutex::new(Some(events))),
                 relay: Mutex::new(None),
@@ -750,6 +794,7 @@ impl ProviderBridge {
         ));
         BoundSession {
             binding,
+            resources,
             rejected_events: None,
             registrations,
             relay: Mutex::new(Some(relay)),
@@ -889,7 +934,7 @@ impl ProviderBridge {
         }
         let binding = self.binding_under_admission(&request).await?;
         let host = self.session(owner.clone()).await;
-        host.initialized.get().ok_or_else(|| {
+        let bound = host.initialized.get().ok_or_else(|| {
             ProviderError::Failure(ProviderFailure::new(
                 ProviderOperation::ThreadOpen,
                 ProviderFailureKind::SessionMissing,
@@ -926,22 +971,38 @@ impl ProviderBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .prepare(scope.clone())?;
         let (sink, events) = super::events::channel(scope.clone());
-        let skills = if self
-            .descriptor()
+        let skills = match self
+            .descriptor
             .capability
             .integration
             .resource_target
-            .is_some()
+            .as_deref()
         {
-            Some(
-                self.permissions
-                    .skills(Some(&self.root), &request, &self.descriptor)
-                    .map_err(|_| {
-                        failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected)
-                    })?,
-            )
-        } else {
-            None
+            Some(target) => {
+                let resource_error =
+                    |_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Rejected);
+                let resources = if let Some(resources) = &bound.resources {
+                    resources.clone()
+                } else if request.mode == super::PromptMode::Background {
+                    Arc::new(crate::settings::SessionResources::default())
+                } else {
+                    Arc::new(
+                        crate::settings::SessionResources::load(
+                            &self.root,
+                            &catalog_request(&request),
+                            self.descriptor.kind.as_str(),
+                            target,
+                        )
+                        .map_err(resource_error)?,
+                    )
+                };
+                Some(
+                    self.permissions
+                        .skills(&request, &resources.selected_skill)
+                        .map_err(resource_error)?,
+                )
+            }
+            None => None,
         };
         let mut context = request
             .control_context
@@ -980,11 +1041,19 @@ impl ProviderBridge {
         }
         let tools = crate::tools::ControlToolRegistry
             .definition_list_for_context(Some(&context), scope.owner().is_root());
-        let turn_context = host
-            .context_delivery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending(request.standing_sections());
+        let turn_context = {
+            let sections = request.standing_sections();
+            let delivery = host
+                .context_delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Bundled Antigravity can compact without notifying the client.
+            if self.descriptor.kind.as_str() == "antigravity" {
+                delivery.all(sections)
+            } else {
+                delivery.pending(sections)
+            }
+        };
         let permissions = Arc::new(
             crate::permissions::provider::ProviderPermissionContext::new(self.permissions.clone()),
         );
@@ -1037,14 +1106,7 @@ impl ProviderBridge {
         context.file_permissions = Some(permissions.clone());
         let endpoint = Arc::new(ControlSession::new(tools.clone()));
         endpoint.begin(context.clone(), sink).await;
-        let server = ControlServer::start(endpoint.clone())
-            .await
-            .map_err(|_| failure(ProviderOperation::TurnStart, ProviderFailureKind::Runtime))?;
-        let tool_endpoint = HostToolEndpoint {
-            url: server.url.clone(),
-            headers: Default::default(),
-        };
-        let lease = Arc::new(EndpointLease { _server: server });
+        let binding_control = host.endpoint.get().map(|binding| binding.control.clone());
         let relay = super::host_invocation::HostEventRelay::start(
             binding.id.clone(),
             events,
@@ -1059,10 +1121,11 @@ impl ProviderBridge {
             super::host_invocation::HostInvocationResources {
                 observed_authority: authority,
                 provider_closed: self.closed.clone(),
+                provider_id: self.descriptor.kind.clone(),
                 permissions: permissions.clone(),
                 directories: Some(directories),
                 endpoint: endpoint.clone(),
-                endpoint_lease: lease.clone(),
+                binding_control,
                 relay,
                 skills,
             },
@@ -1093,8 +1156,8 @@ impl ProviderBridge {
             request: Box::new(forge_provider_api::PromptRequest {
                 configuration,
                 tools,
-                tool_endpoint: Some(tool_endpoint),
-                resource_lease: Some(lease),
+                tool_endpoint: None,
+                resource_lease: None,
                 thread_id: (scope).owner().thread_id(),
                 turn_id: (scope)
                     .turn_id()
@@ -1142,9 +1205,10 @@ impl ProviderBridge {
         owner: &ThreadOwner,
         scope: forge_provider_api::InvocationScope,
         input: super::SteeringInput,
+        publication: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<(), ProviderError> {
         let _admission = self.admission.read().await;
-        let (binding, request) =
+        let (binding, mut request) =
             self.prepare_steering(owner, scope, input)
                 .await
                 .map_err(|error| {
@@ -1152,10 +1216,24 @@ impl ProviderBridge {
                         error.for_operation(ProviderOperation::TurnSteer),
                     ))
                 })?;
+        let dispatch = if let (Some(publication), Some(receipt)) =
+            (publication, request.delivery.receipt())
+        {
+            let (reporter, observer) = forge_provider_api::submission::DispatchReporter::channel(
+                binding.clone(),
+                request.scope.clone(),
+                receipt.id().clone(),
+                receipt.attempt_id()?,
+            );
+            request.dispatch = Some(reporter);
+            Some((publication, observer))
+        } else {
+            None
+        };
         let expected = request.delivery.submission_id().cloned();
         let operation = OperationControl::fresh(ProviderOperation::TurnSteer)?;
         let context = operation.context();
-        let accepted = super::operation::observe(
+        let work = super::operation::observe(
             self.trace.clone(),
             &self.core_events,
             ProviderOperation::TurnSteer,
@@ -1163,8 +1241,22 @@ impl ProviderBridge {
             request.scope.clone().into(),
             Some(binding.clone()),
             self.native.turn_steer(context.clone(), &binding, request),
-        )
-        .await
+        );
+        let accepted = if let Some((publication, mut observer)) = dispatch {
+            tokio::pin!(work);
+            tokio::select! {
+                biased;
+                handoff = observer.wait() => {
+                    if handoff.is_ok() {
+                        publication.notify_one();
+                    }
+                    work.await
+                }
+                accepted = &mut work => accepted,
+            }
+        } else {
+            work.await
+        }
         .map_err(|error| input_rejection(ProviderOperation::TurnSteer, error))?;
         let actual = match accepted {
             forge_provider_api::SteeringAcceptance::Journaled { submission_id } => {
@@ -1263,6 +1355,7 @@ impl ProviderBridge {
             forge_provider_api::SteeringRequest {
                 scope,
                 delivery,
+                dispatch: None,
                 input: {
                     let mut normalized = neutralized_input(normalized);
                     crate::exchange::TaskStart::announce(input.task_start(), &mut normalized);
@@ -1324,6 +1417,20 @@ impl ProviderBridge {
         &self,
         request: &super::ProviderCatalogRequest,
     ) -> Result<forge_provider_api::QueryContext, ProviderError> {
+        Ok(self.catalog_binding(request).await?.0)
+    }
+
+    /// Sample the binding identity and its resource snapshot at the same boundary.
+    async fn catalog_binding(
+        &self,
+        request: &super::ProviderCatalogRequest,
+    ) -> Result<
+        (
+            forge_provider_api::QueryContext,
+            Option<Arc<crate::settings::SessionResources>>,
+        ),
+        ProviderError,
+    > {
         self.ensure_admission(ProviderOperation::Inspect)?;
         let owner = request
             .owner()
@@ -1331,22 +1438,153 @@ impl ProviderBridge {
         let sessions = self.sessions.lock().await;
         Ok(
             match sessions.get(&owner).and_then(|host| host.initialized.get()) {
-                Some(bound) if !bound.retiring.load(std::sync::atomic::Ordering::Acquire) => {
-                    forge_provider_api::QueryContext::Binding(bound.binding.id.clone())
-                }
+                Some(bound) if !bound.retiring.load(std::sync::atomic::Ordering::Acquire) => (
+                    forge_provider_api::QueryContext::Binding(bound.binding.id.clone()),
+                    bound.resources.clone(),
+                ),
                 Some(_) => {
                     return Err(failure(
                         ProviderOperation::Inspect,
                         ProviderFailureKind::BindingClosed,
                     ));
                 }
-                None => forge_provider_api::QueryContext::Workspace(
-                    forge_provider_api::WorkspaceContext {
-                        workspace: request.workspace.clone(),
-                    },
+                None => (
+                    forge_provider_api::QueryContext::Workspace(
+                        forge_provider_api::WorkspaceContext {
+                            workspace: request.workspace.clone(),
+                        },
+                    ),
+                    None,
                 ),
             },
         )
+    }
+
+    /// Get the resource catalog applied to this binding or the selection for its next open.
+    pub(crate) async fn configured_resources(
+        &self,
+        request: &super::ProviderCatalogRequest,
+    ) -> anyhow::Result<(
+        forge_provider_api::QueryContext,
+        Option<Arc<crate::settings::SessionResources>>,
+    )> {
+        let (context, bound_resources) = self.catalog_binding(request).await?;
+        let resources = match bound_resources {
+            Some(resources) => Some(resources),
+            None => self.desired_resources(request)?,
+        };
+        Ok((context, resources))
+    }
+
+    /// Capture applied resources for settings confirmation and notice publication.
+    pub(crate) async fn configuration_resources(
+        &self,
+        request: &super::ProviderCatalogRequest,
+    ) -> anyhow::Result<ConfigurationResources> {
+        // Exclude publication while a retained open transfers its resource snapshot.
+        let immutable_admission = if self.retains_resource_snapshot() {
+            Some(self.resource_admission.write().await)
+        } else {
+            None
+        };
+        self.ensure_admission(ProviderOperation::Inspect)?;
+        let owner = request
+            .owner()
+            .map_err(|_| failure(ProviderOperation::Inspect, ProviderFailureKind::Rejected))?;
+        if immutable_admission.is_some()
+            && let Some(host) = self.sessions.lock().await.get(&owner)
+        {
+            host.ensure_resource_admission()?;
+            let resources = host
+                .initialized
+                .get()
+                .and_then(|bound| bound.resources.clone())
+                .or_else(|| host.open_operation.pending_resources());
+            if let Some(resources) = resources {
+                return Ok(ConfigurationResources::Immutable(resources));
+            }
+        }
+        Ok(ConfigurationResources::Desired(
+            self.desired_resources(request)?,
+        ))
+    }
+
+    /// Resolve a provider's requested resources without starting native work.
+    fn desired_resources(
+        &self,
+        request: &super::ProviderCatalogRequest,
+    ) -> anyhow::Result<Option<Arc<crate::settings::SessionResources>>> {
+        self.descriptor
+            .capability
+            .integration
+            .resource_target
+            .as_deref()
+            .map(|target| {
+                crate::settings::SessionResources::load(
+                    &self.root,
+                    request,
+                    self.descriptor.kind.as_str(),
+                    target,
+                )
+                .map(Arc::new)
+            })
+            .transpose()
+    }
+
+    /// Commit a resource setting against the same binding admission that samples it on open.
+    pub(crate) async fn commit_resource_settings<T>(
+        &self,
+        request: super::ProviderCatalogRequest,
+        changes: &[forge_provider_api::capability::CapabilityId],
+        commit: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        use forge_provider_api::capability::{ProviderFeature, UnsupportedCapability};
+        let _resource_edit = self.resource_admission.write().await;
+        self.ensure_admission(ProviderOperation::Inspect)?;
+        let owner = request
+            .owner()
+            .map_err(|_| failure(ProviderOperation::Inspect, ProviderFailureKind::Rejected))?;
+        let host = self.sessions.lock().await.get(&owner).cloned();
+        if let Some(host) = host {
+            host.ensure_resource_admission()?;
+            let capabilities = if host.initialized.get().is_some() {
+                host.observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .capabilities
+                    .clone()
+            } else if host.open_operation.pending_resources().is_some() {
+                // A native open outlives its waiter and retains the original settings.
+                Some(forge_provider_api::CapabilityManifest::from_descriptor(
+                    self.descriptor(),
+                ))
+            } else {
+                None
+            };
+            anyhow::ensure!(
+                capabilities.is_none_or(|capabilities| {
+                    changes
+                        .iter()
+                        .all(|capability| capabilities.supports(*capability))
+                }),
+                UnsupportedCapability(ProviderFeature::ResourceSelection)
+            );
+        }
+        commit()
+    }
+
+    /// Keep opening selections when the native binding has no live resource mutation.
+    fn retains_resource_snapshot(&self) -> bool {
+        use forge_provider_api::capability::CapabilityId;
+        let manifest = forge_provider_api::CapabilityManifest::from_descriptor(self.descriptor());
+        self.descriptor
+            .capability
+            .integration
+            .resource_target
+            .is_some()
+            && [CapabilityId::SkillMutation, CapabilityId::McpMutation]
+                .into_iter()
+                .all(|id| !manifest.supports(id))
     }
 
     /// Apply host-selected resources through the normalized configuration boundary.
@@ -1417,8 +1655,12 @@ impl ProviderBridge {
                 .or_else(|| bound.binding.provider_session_id.clone())
         };
         let descriptor = self.descriptor();
-        let resources = match descriptor.capability.integration.resource_target.as_deref() {
-            Some(target) => crate::settings::SessionResources::load_with_selection(
+        let resources = match (
+            bound.resources.as_ref(),
+            descriptor.capability.integration.resource_target.as_deref(),
+        ) {
+            (Some(resources), _) => resources.selection(),
+            (None, Some(target)) => crate::settings::SessionResources::load_with_selection(
                 &self.root,
                 &request,
                 descriptor.kind.as_str(),
@@ -1432,7 +1674,7 @@ impl ProviderBridge {
                 )
             })?
             .selection(),
-            None => Default::default(),
+            (None, None) => Default::default(),
         };
         let configuration = forge_provider_api::SessionConfiguration {
             model: model_selection(&desired),
@@ -2503,7 +2745,7 @@ impl ProviderBridge {
                 )
                 .await?
         {
-            let bound = self.install_session(owner, &session, opened);
+            let bound = self.install_session(owner, &session, opened, None);
             session.initialized.set(bound).map_err(|_| {
                 failure(
                     ProviderOperation::ThreadClose,
@@ -2609,6 +2851,11 @@ impl ProviderBridge {
         }
         // Failed native collection still owns its producer and reader for the next close attempt.
         combined(errors)?;
+        if let Some(endpoint) = session.endpoint.get() {
+            endpoint.server.close().await.map_err(|_| {
+                failure(ProviderOperation::ThreadClose, ProviderFailureKind::Runtime)
+            })?;
+        }
         // An owner takes the host stream under shared admission, which every caller of this close
         // holds exclusively. A stream still parked here, as when the binding was opened only as a
         // fork source, can therefore never be consumed. Dropping it ends the wait below as
@@ -3096,6 +3343,7 @@ impl ProviderBridge {
                 Arc::new(HostSession {
                     provider_closed: self.closed.clone(),
                     initialized: OnceCell::new(),
+                    endpoint: OnceCell::new(),
                     observed_contexts: Default::default(),
                     observed_authorities: Default::default(),
                     open_operation: Default::default(),

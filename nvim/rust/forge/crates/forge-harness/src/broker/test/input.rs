@@ -1,5 +1,5 @@
 use super::super::{
-    ExchangeAdmission, ForegroundAction, ForegroundCollection, ForegroundSignal,
+    ExchangeAdmission, ForegroundAction, ForegroundCollection, ForegroundJob, ForegroundSignal,
     NativeForegroundSignal, PromptMode, ProviderAttempt, ProviderCompletion, ProviderError,
     ProviderEvent, ProviderInput, Request, TurnTransaction, publication,
 };
@@ -9,6 +9,56 @@ use anyhow::Result;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// Keep the next user steer queued while the first still owns native publication.
+#[tokio::test]
+async fn foreground_steers_wait_for_prior_publication() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    broker.checkpoint = None;
+    broker.turn_cancellation.arm();
+    let mut staged = broker.stage_foreground_interaction(
+        "initial",
+        PromptMode::Chat,
+        Some(&ExchangeAdmission::chat("initial".into())),
+        ProviderInput::from_user_text("initial"),
+    )?;
+    broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+    let engine = broker
+        .execution_registry()
+        .owner(crate::provider::ThreadOwner::root(&broker.session.id))
+        .await?;
+    let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
+    transaction.scan_enabled = false;
+    transaction.question_enabled = false;
+    transaction.agent_command_active = true;
+    transaction.execution_open = false;
+    let first = broker.parent_input.steer("first".into());
+    let next = broker.parent_input.steer("next".into());
+    tokio::pin!(first, next);
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    assert!(futures_util::poll!(next.as_mut()).is_pending());
+
+    let ForegroundSignal::UserInput(input) = transaction.next().await? else {
+        anyhow::bail!("the owner did not admit the first steer");
+    };
+    assert_eq!(input.text, "first");
+    let ForegroundAction::Effect(ForegroundJob::UserSteering { flight, .. }) =
+        broker.prepare_foreground_input(&mut transaction, input)
+    else {
+        anyhow::bail!("the provider did not schedule native steering");
+    };
+    assert!(futures_util::poll!(Box::pin(transaction.next()).as_mut()).is_pending());
+    flight.publication.as_ref().unwrap().notify_one();
+    let ForegroundSignal::UserInput(input) = transaction.next().await? else {
+        anyhow::bail!("the owner did not release the next steer");
+    };
+    assert_eq!(input.text, "next");
+    assert!(!transaction.steering.pending_deliveries.is_empty());
+    drop(flight);
+    Ok(())
+}
 
 /// Reject new steering as soon as the owner reads native completion, before checkpoint settlement.
 #[tokio::test]
@@ -176,7 +226,7 @@ impl BoundarySteeringProvider {
 
                     let text = crate::provider::test_support::input_text(&request.input);
                     input.lock().unwrap().push(text.clone());
-                    let continuation = text == "boundary correction";
+                    let continuation = request.input.label() != "initial request";
                     let address = crate::provider::TurnAddress {
                         thread_id: (request.scope.clone()).owner().thread_id(),
                         turn_id: (request.scope.clone()).turn_id().unwrap(),
@@ -254,7 +304,7 @@ impl BoundarySteeringProvider {
             let continuation_started = continuation_started.clone();
             let continuation_accept = continuation_accept.clone();
             async move {
-                if matches!(request.input.user_input(), Some(forge_provider_api::PromptInput::Text(text)) if text == "boundary correction") {
+                if request.input.label() != "initial request" {
                     continuation_started.add_permits(1);
                     crate::provider::test_support::wait_gate(&continuation_accept).await?;
                 }
@@ -273,7 +323,23 @@ impl BoundarySteeringProvider {
 }
 #[tokio::test]
 async fn deferred_steering_acknowledges_only_after_provider_acceptance() -> Result<()> {
-    assert_deferred_steering_delivery(false).await
+    assert_deferred_steering_delivery(ProviderInput::from_user_text("boundary correction")).await
+}
+
+/// A deferred check remains a structured result when the next native turn receives it.
+#[tokio::test]
+async fn deferred_check_steering_preserves_its_typed_input() -> Result<()> {
+    use forge_provider_api::forge::{CheckResult, CheckResultState, TurnKind};
+    assert_deferred_steering_delivery(ProviderInput::kind(TurnKind::CheckResult {
+        result: CheckResult {
+            run_id: "boundary-check".into(),
+            exchange_id: "fixture-owner".into(),
+            state: CheckResultState::Failed,
+            complete: true,
+            checks: Vec::new(),
+        },
+    }))
+    .await
 }
 
 /// Retaining a cancelled foreground must release unsent commands and their durable attempts.
@@ -335,13 +401,12 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     Ok(())
 }
 
-async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
+async fn assert_deferred_steering_delivery(input: ProviderInput) -> Result<()> {
     async {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let provider = Arc::new(BoundarySteeringProvider::new());
-        provider.fail_response.store(fail_response, std::sync::atomic::Ordering::Release);
         let session = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
         broker.provider = session.provider_handle();
         let provider_id = broker.provider.descriptor().kind;
@@ -360,10 +425,11 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
                 anyhow::bail!("boundary foreground ended before initial native start: {result:?}");
             }
         }
-        let submission = journal.prepare_input(&catalog,
-            ProviderInput::from_user_text("boundary correction"), provider_id, Some("boundary-message".into()))?;
+        let label = input.text();
+        let wire_input = crate::provider::test_support::input_text(input.turn());
+        let submission = journal.prepare_input(&catalog, input, provider_id, Some("boundary-message".into()))?;
         let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
-            text: "boundary correction".into(), attachments: Vec::new(), submission: Some(submission.clone()),
+            text: label.clone(), attachments: Vec::new(), submission: Some(submission.clone()),
         }));
         assert!(futures_util::poll!(steering.as_mut()).is_pending());
         await_boundary_barrier(&provider.steering_deferred).await?;
@@ -384,12 +450,12 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         assert!(!running.is_finished(), "steering acknowledgement waited for the full provider response");
         provider.continuation_release.add_permits(1);
         let (broker, result) = running.await?;
-        if fail_response { assert!(result.is_err()); } else { result?; }
+        result?;
         let exchange = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchange.len(), 1, "steering created a second exchange");
         assert_eq!(exchange[0].node_list.iter().filter(|node| matches!(node,
-            crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.text == "boundary correction" && prompt.id == "boundary-message")).count(), 1);
-        assert_eq!(*provider.input.lock().unwrap(), ["initial request", "boundary correction"]);
+            crate::exchange::ExchangeNode::ExchangeInput { prompt } if prompt.text == label && prompt.id == "boundary-message")).count(), 1);
+        assert_eq!(*provider.input.lock().unwrap(), ["initial request".to_owned(), wire_input.clone()]);
         // The deferred steer became the continuation's own prompt, which the model reads when
         // that turn starts, so its row is consumed at the turn boundary, before the output that
         // answers it, rather than settled as steering nobody reported reading.
@@ -399,16 +465,15 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
             unreachable!("position matched an input node");
         };
         assert_eq!(prompt.consumption, crate::exchange::InputConsumption::Consumed);
-        if !fail_response {
-            let answer_position = exchange[0].node_list.iter().position(|node| {
-                let crate::exchange::ExchangeNode::TurnContent { turn_id, item: crate::turn::TurnItem::Message { id }, .. } = node else {
-                    return false;
-                };
-                exchange[0].turn.iter().filter(|turn| turn.id() == turn_id).flat_map(|turn| turn.messages())
-                    .any(|message| message.id() == id && message.text() == "handled boundary correction")
-            }).expect("the continuation answered the steer");
-            assert!(input_position < answer_position, "the steer's row follows the answer to it");
-        }
+        let answer = format!("handled {wire_input}");
+        let answer_position = exchange[0].node_list.iter().position(|node| {
+            let crate::exchange::ExchangeNode::TurnContent { turn_id, item: crate::turn::TurnItem::Message { id }, .. } = node else {
+                return false;
+            };
+            exchange[0].turn.iter().filter(|turn| turn.id() == turn_id).flat_map(|turn| turn.messages())
+                .any(|message| message.id() == id && message.text() == answer)
+        }).expect("the continuation answered the steer");
+        assert!(input_position < answer_position, "the steer's row follows the answer to it");
         Ok::<(), anyhow::Error>(())
     }.await
 }

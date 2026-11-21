@@ -252,7 +252,7 @@ impl HarnessBroker {
             attempted_results: std::collections::HashSet::new(),
             pending_agent_launch: std::collections::VecDeque::new(),
             pending_agent_reply: None,
-            user_delivery: tokio::task::JoinSet::new(),
+            user_publication: None,
             session_events,
             delivery_sink: self.event_sink.clone(),
             scan_interval,

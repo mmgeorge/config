@@ -1665,6 +1665,32 @@ async fn reasoning_change_while_the_parent_waits_for_children_restarts_the_turn(
     fixture.finish().await
 }
 
+/// Keep a queued prompt when shutdown wins before preparation can publish a foreground.
+#[tokio::test]
+async fn exit_during_input_preparation_keeps_the_unsent_prompt_queued() -> Result<()> {
+    let fixture = MockOwnerFixture::start("exit-preparation").await?;
+    let generation = fixture.controller.provider_lane.write().await;
+    fixture.submit("Keep this unsent prompt")?;
+    let queue = &fixture.controller.coordinator.submissions;
+    while !queue.snapshot()?.messages.iter().any(|message| {
+        message.delivery() == crate::input::InputDelivery::Delivering
+    }) {
+        tokio::task::yield_now().await;
+    }
+    fixture.controller.exchange_owner.close().await;
+    while fixture.controller.exchange_owner.input_ready(fixture.sink.clone()).await.is_ok() {}
+    drop(generation);
+    tokio::time::timeout(Duration::from_secs(1), fixture.controller.finish_exchange_owner())
+        .await
+        .context("the closed owner waited on a new foreground handoff")??;
+
+    let snapshot = queue.snapshot()?;
+    assert_eq!(snapshot.messages.len(), 1);
+    assert_eq!(snapshot.messages[0].delivery(), crate::input::InputDelivery::Queued);
+    assert!(fixture.exchanges()?.is_empty());
+    fixture.finish().await
+}
+
 /// Exiting the editor during a running turn leaves the reopened exchange cancelled.
 #[tokio::test]
 async fn editor_exit_during_a_running_turn_reopens_cancelled() -> Result<()> {

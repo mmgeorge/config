@@ -1119,6 +1119,7 @@ enum Command {
         scope: InvocationScope,
         input: crate::provider::SteeringInput,
         submission: Option<SubmissionId>,
+        publication: Option<Arc<tokio::sync::Notify>>,
         authority: Option<crate::tools::TaskAuthority>,
         reply: oneshot::Sender<Result<(), ProviderError>>,
     },
@@ -2031,6 +2032,7 @@ impl SessionExecution {
         &self,
         scope: InvocationScope,
         input: crate::provider::SteeringInput,
+        publication: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<(), ProviderError> {
         if scope.owner() != self.owner {
             return Err(protocol("steering belongs to another execution owner"));
@@ -2046,6 +2048,7 @@ impl SessionExecution {
                 scope,
                 input,
                 submission,
+                publication,
                 authority: None,
                 reply,
             })
@@ -3031,6 +3034,7 @@ impl Driver {
                     scope,
                     input,
                     submission,
+                    publication: None,
                     authority,
                     reply,
                 });
@@ -3039,6 +3043,7 @@ impl Driver {
                 scope,
                 input,
                 submission,
+                publication,
                 authority,
                 reply,
             } => {
@@ -3076,49 +3081,58 @@ impl Driver {
                         .pending_controls
                         .checked_add(1)
                         .ok_or_else(|| protocol("pending control count exhausted"))?;
-                    if let Some(id) = &submission {
-                        let attempt = input
-                            .submission()
-                            .ok_or_else(|| protocol("steering has no journal attempt"))?
+                    let receipt = input.submission();
+                    let target = if let Some(id) = &submission {
+                        let receipt = receipt
+                            .as_ref()
+                            .ok_or_else(|| protocol("steering has no journal attempt"))?;
+                        let attempt = receipt
                             .record()
                             .map_err(crate::provider::submission::journal_failure)?
                             .attempt_id;
-                        self.state.admit(scope.clone(), id.clone(), attempt)?;
-                    }
+                        self.state.admit(scope.clone(), id.clone(), attempt.clone())?;
+                        Some((receipt.clone(), attempt, scope.clone()))
+                    } else {
+                        None
+                    };
                     invocation.pending_controls = pending;
                     invocation.revision = revision;
                     let provider = self.provider.clone();
                     let reply = reply
                         .take()
                         .expect("control reply is present before dispatch");
-                    let receipt = input.submission();
                     self.submissions.spawn(async move {
-                        let result = match dispatch_authority
-                            .as_ref()
-                            .map(|authority| authority.validate_scope())
-                            .transpose()
-                        {
-                            Err(error) => Err(ProviderError::PreparationFailed(Box::new(
-                                crate::provider::lifecycle_error::classify(
-                                    forge_provider_api::ProviderOperation::TurnStart,
-                                    error,
-                                ),
-                            ))),
-                            Ok(_) => {
-                                let result = provider
-                                    .turn_steer(&scope.owner(), scope.clone(), input)
-                                    .await;
-                                if dispatch_authority
-                                    .as_ref()
-                                    .is_some_and(|authority| authority.validate_scope().is_err())
-                                    && !matches!(&result, Err(ProviderError::NotConsumed))
-                                {
-                                    Err(ProviderError::DeliveryUncertain)
-                                } else {
-                                    result
-                                }
+                        let result = async {
+                            if let Some((receipt, attempt, scope)) = target {
+                                receipt
+                                    .persist(move |receipt| receipt.bind_steering_scope(attempt, scope))
+                                    .await
+                                    .map_err(crate::provider::submission::journal_failure)
+                                    .map_err(|error| ProviderError::PreparationFailed(Box::new(error)))?;
                             }
-                        };
+                            if let Some(authority) = &dispatch_authority {
+                                authority.validate_scope().map_err(|error| {
+                                    ProviderError::PreparationFailed(Box::new(
+                                        crate::provider::lifecycle_error::classify(
+                                            forge_provider_api::ProviderOperation::TurnStart,
+                                            error,
+                                        ),
+                                    ))
+                                })?;
+                            }
+                            let result = provider
+                                .turn_steer(&scope.owner(), scope.clone(), input, publication)
+                                .await;
+                            if dispatch_authority
+                                .as_ref()
+                                .is_some_and(|authority| authority.validate_scope().is_err())
+                                && !matches!(&result, Err(ProviderError::NotConsumed))
+                            {
+                                return Err(ProviderError::DeliveryUncertain);
+                            }
+                            result
+                        }
+                        .await;
                         SubmissionOutcome {
                             scope,
                             submission,
@@ -3307,6 +3321,7 @@ impl Driver {
                     let _ = reply.send(Err(ProviderError::Cancelled));
                     return;
                 }
+                let is_continuation = continuation.is_some();
                 if let Some((previous_scope, revision, effects_revision, nonce)) = continuation {
                     if scope.owner() != previous_scope.owner()
                         || scope.exchange_id != previous_scope.exchange_id
@@ -3443,8 +3458,22 @@ impl Driver {
                 let attempt_dispatch = request.dispatch.observer();
                 let (finished, finish_observer) = tokio::sync::watch::channel(false);
                 let receipt = attempt_submission.clone();
+                let fallback_attempt = attempt_id.clone();
                 let task = self.submissions.spawn(async move {
-                    let mut result = provider.turn_start(request, scope.clone()).await;
+                    let mut result = async {
+                        if is_continuation
+                            && let Some(receipt) = &receipt
+                            && receipt.record().map_err(crate::provider::submission::journal_failure)?.has_steering_target()
+                        {
+                            let fallback_scope = scope.clone();
+                            receipt
+                                .persist(move |receipt| receipt.bind_steering_fallback(fallback_attempt, fallback_scope))
+                                .await
+                                .map_err(crate::provider::submission::journal_failure)
+                                .map_err(|error| ProviderError::PreparationFailed(Box::new(error)))?;
+                        }
+                        provider.turn_start(request, scope.clone()).await
+                    }.await;
                     let accepted = receipt
                         .as_ref()
                         .map(|receipt| receipt.record())

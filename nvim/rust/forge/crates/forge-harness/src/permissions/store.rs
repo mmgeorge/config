@@ -100,9 +100,6 @@ impl PermissionStore {
         if !disk_matches {
             atomic_write(&self.path, &source)?;
         }
-        if source == self.source {
-            return Ok(());
-        }
         let extends_enforced = disk.as_ref() == Some(&self.compiled.document);
         let epoch = match edit {
             PermissionEdit::ApprovedAllow if extends_enforced => self.revocation_epoch.clone(),
@@ -110,57 +107,89 @@ impl PermissionStore {
                 PermissionRevocationEpoch(Arc::new(()))
             }
         };
+        self.install(document, source, epoch);
+        Ok(())
+    }
+
+    /// Commit an approval only while its original policy still admits the decision.
+    pub(crate) fn commit_approval(
+        &mut self,
+        expected: &PermissionRevocationEpoch,
+        rules: &[(String, String, PermissionDecision)],
+        save_directory_grants: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.revocation_epoch == *expected,
+            "permission policy changed after approval was requested"
+        );
+        let _writer = permission_writer_lock(&self.path)?;
+        let disk = read_disk_document(&self.path)?.context("permission policy was removed")?;
+        if !preserves_approval_policy(&self.compiled.document, &disk) {
+            let source = serialize_permission_document(&disk)?;
+            self.install(disk, source, PermissionRevocationEpoch(Arc::new(())));
+            anyhow::bail!("permission policy changed after approval was requested");
+        }
+        save_directory_grants()?;
+        if rules.is_empty() {
+            return Ok(());
+        }
+        let edit = if rules
+            .iter()
+            .all(|(_, _, decision)| *decision == PermissionDecision::Allow)
+        {
+            PermissionEdit::ApprovedAllow
+        } else {
+            PermissionEdit::Replacement
+        };
+        self.commit_rules(rules, edit, Some(disk))
+    }
+
+    /// Apply the selected rule edits to the document read under the writer lock.
+    fn commit_rules(
+        &mut self,
+        rules: &[(String, String, PermissionDecision)],
+        edit: PermissionEdit,
+        disk: Option<PermissionDocument>,
+    ) -> Result<()> {
+        let mut document = disk
+            .clone()
+            .unwrap_or_else(|| self.compiled.document.clone());
+        for (category, pattern, decision) in rules {
+            set_permission_rule(&mut document, category, pattern, *decision)?;
+        }
+        self.commit(document, disk, edit)
+    }
+
+    /// Update the in-memory policy without rewriting the document read from disk.
+    fn install(
+        &mut self,
+        document: PermissionDocument,
+        source: String,
+        epoch: PermissionRevocationEpoch,
+    ) {
+        if source == self.source {
+            return;
+        }
         self.compiled = Arc::new(CompiledPermissionDocument::compile(
             document,
             &self.workspace,
         ));
         self.source = source;
         self.revocation_epoch = epoch;
-        Ok(())
-    }
-
-    /// Apply exact rules to the document currently on disk, so rules saved by another editor
-    /// sharing the file survive, and install the merged result.
-    fn merge_rules(
-        &mut self,
-        rule_list: &[(String, String, PermissionDecision)],
-        edit: PermissionEdit,
-    ) -> Result<()> {
-        let _writer = permission_writer_lock(&self.path)?;
-        let disk = read_disk_document(&self.path)?;
-        let mut document = disk
-            .clone()
-            .unwrap_or_else(|| self.compiled.document.clone());
-        for (category, pattern, decision) in rule_list {
-            set_permission_rule(&mut document, category, pattern, *decision)?;
-        }
-        self.commit(document, disk, edit)
-    }
-
-    /// Commit allow-only rules from a validated approval without revoking stricter captured policies.
-    pub(crate) fn grant_approved(
-        &mut self,
-        rules: &[(String, String, PermissionDecision)],
-    ) -> Result<()> {
-        anyhow::ensure!(
-            !rules.is_empty()
-                && rules
-                    .iter()
-                    .all(|(_, _, decision)| *decision == PermissionDecision::Allow),
-            "approved permission grant must contain only allow decisions"
-        );
-        self.merge_rules(rules, PermissionEdit::ApprovedAllow)
     }
 
     pub(crate) fn revocation_epoch(&self) -> PermissionRevocationEpoch {
         self.revocation_epoch.clone()
     }
 
+    /// Apply explicit rule edits to the current document without replacing other rules.
     pub fn set_rule_list(
         &mut self,
         rule_list: &[(String, String, PermissionDecision)],
     ) -> Result<()> {
-        self.merge_rules(rule_list, PermissionEdit::Replacement)
+        let _writer = permission_writer_lock(&self.path)?;
+        let disk = read_disk_document(&self.path)?;
+        self.commit_rules(rule_list, PermissionEdit::Replacement, disk)
     }
 
     pub fn compiled(&self) -> Arc<CompiledPermissionDocument> {
@@ -200,6 +229,29 @@ impl PermissionStore {
                 })
             })
     }
+}
+
+/// Verify that another writer only added allows or replaced asks with allows.
+fn preserves_approval_policy(previous: &PermissionDocument, current: &PermissionDocument) -> bool {
+    previous.permission.iter().all(|(category, rules)| {
+        rules.iter().all(|(pattern, decision)| {
+            let observed = current
+                .permission
+                .get(category)
+                .and_then(|rules| rules.get(pattern));
+            observed == Some(decision)
+                || (*decision == PermissionDecision::Ask
+                    && observed == Some(&PermissionDecision::Allow))
+        })
+    }) && current.permission.iter().all(|(category, rules)| {
+        rules.iter().all(|(pattern, decision)| {
+            *decision == PermissionDecision::Allow
+                || previous
+                    .permission
+                    .get(category)
+                    .is_some_and(|rules| rules.contains_key(pattern))
+        })
+    })
 }
 
 /// Serialize read-merge-write cycles across every host that shares the permission document.
@@ -260,7 +312,7 @@ fn atomic_write(path: &Path, source: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::document::{CATEGORY_BASH, CATEGORY_TOOL};
+    use crate::permissions::document::{CATEGORY_MCP, CATEGORY_TOOL};
 
     fn rule(
         category: &str,
@@ -288,8 +340,16 @@ mod tests {
         let mut first_host = PermissionStore::load(&path, directory.path())?;
         let mut second_host = PermissionStore::load(&path, directory.path())?;
 
-        first_host.grant_approved(&[rule(CATEGORY_TOOL, "first", PermissionDecision::Allow)])?;
-        second_host.grant_approved(&[rule(CATEGORY_TOOL, "second", PermissionDecision::Allow)])?;
+        first_host.commit_approval(
+            &first_host.revocation_epoch(),
+            &[rule(CATEGORY_TOOL, "first", PermissionDecision::Allow)],
+            || Ok(()),
+        )?;
+        second_host.commit_approval(
+            &second_host.revocation_epoch(),
+            &[rule(CATEGORY_TOOL, "second", PermissionDecision::Allow)],
+            || Ok(()),
+        )?;
 
         assert_eq!(
             disk_rule(&path, CATEGORY_TOOL, "first"),
@@ -306,28 +366,38 @@ mod tests {
         Ok(())
     }
 
-    /// A rule tightened to deny by one host is not resurrected by another host's later grant, and
-    /// the grant revokes captured authority because the enforced policy became stricter.
+    /// A host learns another host's denial before applying a stale approval or directory grant.
     #[test]
     fn a_denial_saved_by_another_host_survives_a_later_grant() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("permissions.json");
         let mut first_host = PermissionStore::load(&path, directory.path())?;
         let mut second_host = PermissionStore::load(&path, directory.path())?;
-        first_host.set_rule_list(&[rule(CATEGORY_BASH, "git push", PermissionDecision::Allow)])?;
-        second_host.set_rule_list(&[rule(CATEGORY_BASH, "cargo", PermissionDecision::Allow)])?;
-        first_host.set_rule_list(&[rule(CATEGORY_BASH, "git push", PermissionDecision::Deny)])?;
+        first_host.set_rule_list(&[rule(
+            CATEGORY_MCP,
+            "fixture/ping",
+            PermissionDecision::Deny,
+        )])?;
         let epoch_before_grant = second_host.revocation_epoch();
 
-        second_host.grant_approved(&[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)])?;
+        let result = second_host.commit_approval(
+            &epoch_before_grant,
+            &[rule(
+                CATEGORY_MCP,
+                "fixture/ping",
+                PermissionDecision::Allow,
+            )],
+            || panic!("stale approval cannot grant a directory"),
+        );
 
+        assert!(result.unwrap_err().to_string().contains("policy changed"));
         assert_eq!(
-            disk_rule(&path, CATEGORY_BASH, "git push"),
+            disk_rule(&path, CATEGORY_MCP, "fixture/ping"),
             Some(PermissionDecision::Deny)
         );
         assert_eq!(
-            disk_rule(&path, CATEGORY_BASH, "cargo"),
-            Some(PermissionDecision::Allow)
+            second_host.compiled().document.permission[CATEGORY_MCP].get("fixture/ping"),
+            Some(&PermissionDecision::Deny)
         );
         assert!(second_host.revocation_epoch() != epoch_before_grant);
         Ok(())
@@ -341,7 +411,11 @@ mod tests {
         let mut store = PermissionStore::load(&path, directory.path())?;
         let epoch_before_grant = store.revocation_epoch();
 
-        store.grant_approved(&[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)])?;
+        store.commit_approval(
+            &epoch_before_grant,
+            &[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)],
+            || Ok(()),
+        )?;
 
         assert!(store.revocation_epoch() == epoch_before_grant);
         Ok(())
@@ -356,7 +430,11 @@ mod tests {
         fs::write(&path, "{ not json")?;
 
         let failure = store
-            .grant_approved(&[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)])
+            .commit_approval(
+                &store.revocation_epoch(),
+                &[rule(CATEGORY_TOOL, "probe", PermissionDecision::Allow)],
+                || Ok(()),
+            )
             .unwrap_err();
 
         assert!(format!("{failure:#}").contains("validate permission document"));

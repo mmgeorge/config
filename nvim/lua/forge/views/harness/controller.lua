@@ -278,7 +278,8 @@ local function status_text()
   local selected = selected_settings(state)
   if selected.model ~= configured_model then model = model_options.label(model_catalog, selected.model) end
   -- The thinking field names the level the provider uses, the name the model picker gives it.
-  local effort = model_options.thinking(model_options.find(model_catalog, selected.model), selected.effort)
+  local thinking_model = selected.model == "default" and configured_model == "default" and confirmed_model or selected.model
+  local effort = model_options.thinking(model_options.find(model_catalog, thinking_model), selected.effort)
   local tier = selected.service_tier
   local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
   -- Selected values that differ from the applied ones and wait for existing work carry the marker;
@@ -848,12 +849,18 @@ local function on_event(event, payload)
     elseif payload.kind == "runtime_resolved" then
       local runtime = payload.data or {}
       if not state.session or runtime.session_id ~= state.session.id then return end
+      local provider_catalog = require("forge.views.harness.provider_catalog")
+      local resolved_model = type(runtime.model) == "string" and runtime.model or nil
+      if not state.model_catalog_bound or state.session.resolved_model ~= resolved_model then
+        state.model_catalog_bound = true
+        provider_catalog.invalidate_models(state)
+      end
       state.session.provider_label = runtime.provider
-      state.session.resolved_model = type(runtime.model) == "string" and runtime.model or nil
+      state.session.resolved_model = resolved_model
       M.refresh_winbar()
       -- A resolved runtime has a live provider session, so its catalog can now name the model.
       -- A catalog failure leaves the id in the status line; the model picker reports such failures.
-      require("forge.views.harness.provider_catalog").models(false, function(model_list)
+      provider_catalog.models(false, function(model_list)
         if model_list then M.refresh_winbar() end
       end)
     elseif payload.kind == "context_usage" then
@@ -935,6 +942,9 @@ local function on_event(event, payload)
   elseif event == "session_configured" or event == "session_changed" then
     if snapshot.apply(state, payload.snapshot) then
       if state.input and state.input.runtime_epoch ~= state.runtime_epoch then input_state.refresh(state) end
+      if state.model_catalog_bound and state.model_list_provisional then
+        require("forge.views.harness.provider_catalog").models(false, function() end)
+      end
       M.refresh_winbar()
       schedule_render()
     end
@@ -2043,29 +2053,15 @@ end
 
 ---Explain how an edit ended when its message left the queue before the edit took hold.
 ---@param recovered ("sent"|"edited")?
-function M.report_recovered_edit(recovered)
+---@param saved_draft? ForgePromptDraft
+function M.report_recovered_edit(recovered, saved_draft)
   if recovered == "sent" then
     notifications.info("The queued message was sent before the edit took hold. The composer shows your earlier draft again.", "ForgeHarness")
   elseif recovered == "edited" then
-    notifications.warn("The queued message was sent before the edit took hold. Your changed text is now a normal draft; submit it to send it as a new message.", "ForgeHarness")
+    local message = "The queued message was sent before the edit took hold. Your changed text is now a normal draft."
+    if saved_draft then message = message .. " Press Up to recall your earlier draft." end
+    notifications.warn(message, "ForgeHarness")
   end
-end
-
----End an edit whose message the host delivered before the edit's reservation took hold.
----
----Unchanged text was already sent, so the composer returns to the draft it held before editing;
----changed text stays as an ordinary draft. Waiting for the next key instead left an edit that no
----save could apply.
----@param state table
-function M.settle_delivered_edit(state)
-  if not queue_editor.delivered(state) then return end
-  local original, _, attachments, recovered = queue_editor.finish(state, composer_text(state.composer_buf))
-  set_composer_text(state.composer_buf, original, attachments)
-  if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
-    layout.resize_composer(state.composer_buf, state.composer_win)
-  end
-  M.refresh_winbar()
-  M.report_recovered_edit(recovered)
 end
 
 local function finish_queue_edit(state, text, unqueue)
@@ -2091,10 +2087,13 @@ local function finish_queue_edit(state, text, unqueue)
     end
   end
   local selected_attachments = edit.attachments[edit.entry]
-  local original, failure, attachments, recovered = queue_editor.finish(state, unqueue and "" or text)
+  local original, failure, attachments, recovered = queue_editor.finish(state, text, unqueue)
   if failure then notifications.warn(failure, "ForgeHarness") return end
   local saved_draft
-  if unqueue then
+  if recovered == "edited" and edit.original_draft:find("%S") then
+    saved_draft = { text = edit.original_draft, attachments = edit.original_attachments }
+    prompt_history.record(saved_draft)
+  elseif unqueue and not recovered then
     -- The composer takes the unqueued message, so the draft it held before editing moves into prompt
     -- history, where Up recalls it.
     if original and original:find("%S") then
@@ -2109,11 +2108,17 @@ local function finish_queue_edit(state, text, unqueue)
     if unqueue then vim.api.nvim_set_current_win(state.composer_win) end
   end
   M.refresh_winbar()
-  M.report_recovered_edit(recovered)
-  if saved_draft then
+  M.report_recovered_edit(recovered, saved_draft)
+  if saved_draft and not recovered then
     notifications.info("Your earlier draft was saved to prompt history; press Up to recall it.", "ForgeHarness")
   end
-  if state.presentation then state.presentation.follow_tail() end
+  if state.presentation and not recovered then state.presentation.follow_tail() end
+end
+
+---Recover an edit after delivery won its reservation, keeping edits on other messages.
+---@param state table
+function M.settle_delivered_edit(state)
+  if queue_editor.delivered(state) then finish_queue_edit(state, composer_text(state.composer_buf), false) end
 end
 
 ---Explain why no session is attached: a recorded startup failure, or startup still running.
@@ -2574,6 +2579,7 @@ end
 function M.edit_queued(direction)
   local state = harness_state()
   if not attachments_ready(state.composer_buf) then return end
+  if queue_editor.delivered(state) then M.settle_delivered_edit(state) return end
   local draft = composer_text(state.composer_buf)
   local text, failure, attachments, recovered = queue_editor.move(state, draft, direction)
   if failure then notifications.warn(failure, "ForgeHarness") return end
@@ -2617,6 +2623,7 @@ function M.change_effort(direction)
     if failure then notifications.error(failure, "Harness effort") return end
     if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
     local model_id = selected_setting(state, "model")
+    if model_id == "default" then model_id = state.session.resolved_model or model_id end
     for _, model in ipairs(model_list or {}) do
       if model.id == model_id or (model_id == "default" and model.is_default) then
         local model_options = require("forge.views.harness.model_options")
@@ -2664,9 +2671,13 @@ function M.select_effort()
     if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
     if loading and not picker.is_open(loading_owner) then return end
     local model_id = selected_setting(state, "model")
+    if model_id == "default" then model_id = state.session.resolved_model or model_id end
     local choice = {}
     for _, model in ipairs(model_list or {}) do
-      if model.id == model_id or (model_id == "default" and model.is_default) then choice = model.reasoning or {} break end
+      if model.id == model_id or (model_id == "default" and model.is_default) then
+        choice = require("forge.views.harness.model_options").reasoning_choices(model)
+        break
+      end
     end
     local options = vim.tbl_map(function(effort)
       return { label = effort, detail = detail_list[effort] or "Provider-advertised reasoning choice", value = effort }
@@ -2742,26 +2753,6 @@ function M.select_model(on_confirm)
   local function open_model_picker(model_list)
     if not is_current() then return end
     loading = false
-    if type(model_list) ~= "table" or #model_list == 0 then
-      local current = harness_state().session and harness_state().session.model or config.options.harness.model
-      picker.open({
-        host = picker_host(harness_state()),
-        initial_input_kind = "other",
-        page_list = {
-          {
-            id = "custom-model",
-            title = "Enter Model",
-            column_headers = { "Model", "Details" },
-            option_list = { { label = "Model", value = current, input_kind = "other" } },
-            allow_input = true,
-            input_height = 3,
-            footer = "C-s apply  go options  q close",
-          },
-        },
-        on_confirm = function(result) on_confirm({ model = result.text }) end,
-      })
-      return
-    end
     local state = harness_state()
     model_picker.open({
       host = picker_host(state),
@@ -2792,15 +2783,26 @@ function M.select_model(on_confirm)
   end)
 end
 
+---Use future defaults when the provider declares that it cannot edit an open binding.
+local function resource_defaults_only(state, capability)
+  local integration = state.capability.integration or {}
+  return vim.iter(integration.limitations or {}):any(function(limitation)
+    return limitation.id == capability and limitation.support == "unsupported"
+  end)
+end
+
 function M.open_skill_picker()
   local state = harness_state()
+  local session_id = state.session and state.session.id
   if not (state.capability.catalog and state.capability.catalog.skill) then
     notifications.warn("The current provider does not advertise provider skills", "Harness skills")
     return
   end
   provider_picker.open_skills({
     host = picker_host(state),
-    is_current = function() return harness_state() == state end,
+    is_current = function() return harness_state() == state and (state.session and state.session.id) == session_id end,
+    future_defaults = resource_defaults_only(state, "skill_mutation"),
+    workspace = state.session and state.session.workspace,
     on_insert = function(text) set_composer_text(harness_state().composer_buf, text) end,
   })
 end
@@ -2819,7 +2821,8 @@ function M.open_mcp_picker()
   provider_picker.open_mcp({
     host = picker_host(state),
     is_current = owns_session,
-
+    future_defaults = resource_defaults_only(state, "mcp_mutation"),
+    workspace = state.session and state.session.workspace,
   })
 end
 
@@ -2876,10 +2879,7 @@ function M.select_provider()
 end
 
 function M.resolve_runtime_model()
-  -- This warms the model cache on attach; `provider_catalog.models` stores the catalog and
-  -- redraws the winbar. ACP providers such as Antigravity list models only from an open binding,
-  -- so an unavailable catalog here is expected; pickers fetch again on demand and report their
-  -- own failures.
+  -- Warm the catalog on attach; the first runtime observation replaces workspace discovery.
   require("forge.views.harness.provider_catalog").models(true, function() end)
 end
 
@@ -3010,6 +3010,29 @@ function M.activate_snapshot(result, options)
   if not options or options.present_questions ~= false then M.present_held_prompts() end
 end
 
+---Let a user retire a message whose delivery the host cannot confirm.
+local function recover_unknown_input(state, entry)
+  local owner, id, revision = state.input, entry.id, entry.revision
+  local choices = {}
+  if not entry.local_only then
+    choices[#choices + 1] = { label = "Reconcile delivery",
+      detail = "Retry only when delivery evidence confirms the provider did not receive the message", value = "reconcile" }
+  end
+  choices[#choices + 1] = { label = "Discard queue entry", detail = "Release the queue without sending this text again", value = "discard" }
+  open_choice_picker(state, "Unconfirmed input", entry.error, choices, function(choice)
+    if not choice then return end
+    local current = owner and owner.entry_by_id[id]
+    if state.input ~= owner or not current or current.revision ~= revision
+      or (current.draft_state ~= "unknown" and current.delivery ~= "unknown") then
+      notifications.warn("Input delivery changed. Check the current queue.", "Harness message")
+      return
+    end
+    if choice == "reconcile" then input_state.retry(state, current)
+    elseif current.local_only then input_state.discard_rejected(state, id)
+    else input_state.perform(state, { kind = "remove", id = id, revision = revision }) end
+  end, "No recovery choices")
+end
+
 ---Open the question or approval the selected session's snapshot holds, once its view is on screen.
 function M.present_held_prompts()
   local state = harness_state()
@@ -3036,9 +3059,19 @@ function M.command_set()
   local function after_paste(action)
     return require("forge.views.harness.composer_draft").after_pending_paste(function()
       return harness_state().composer_buf
-    end, function(fence)
-      input_state.under_fence(harness_state(), fence, action)
-    end, function() return input_state.control_fence(harness_state()) end)
+    end, function(origin)
+      local state = harness_state()
+      if state ~= origin.state or state.composer_buf ~= origin.buffer
+        or (state.session and state.session.id) ~= origin.session_id or state.runtime_epoch ~= origin.runtime_epoch then
+        notifications.warn("The Harness composer changed before the action ran. The draft was kept.", "ForgeHarness")
+        return
+      end
+      input_state.under_fence(state, origin.fence, action)
+    end, function()
+      local state = harness_state()
+      return { state = state, buffer = state.composer_buf, session_id = state.session and state.session.id,
+        runtime_epoch = state.runtime_epoch, fence = input_state.control_fence(state) }
+    end)
   end
   command_set.register(set, "edit_queued", after_paste(function() M.edit_queued(-1) end))
   command_set.register(set, "next_queued", after_paste(function() M.edit_queued(1) end))
@@ -3053,7 +3086,8 @@ function M.command_set()
     end
     for _, entry in ipairs(state.queue or {}) do
       if M.retries(entry) then
-        input_state.retry(state, entry)
+        if entry.draft_state == "unknown" or entry.delivery == "unknown" then recover_unknown_input(state, entry)
+        else input_state.retry(state, entry) end
         return
       end
     end

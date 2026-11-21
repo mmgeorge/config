@@ -18,10 +18,7 @@ pub(super) fn mcp_launches(
                 forge_provider_api::ProviderFailureKind::Rejected,
             )));
         }
-        if launch.timeout.is_some()
-            || launch.working_directory.is_some()
-            || matches!(launch.tools, Some(forge_provider_api::session::McpToolSelection::Only(_)))
-        {
+        if mcp_launch_incompatibility(launch).is_some() {
             return Err(UnsupportedCapability(forge_provider_api::capability::ProviderFeature::McpLaunchRequirements).into());
         }
         let environment = |values: &std::collections::BTreeMap<String, String>| {
@@ -35,9 +32,50 @@ pub(super) fn mcp_launches(
             McpTransport::Http { url, headers } => json!({
                 "type": "http", "name": launch.name, "url": url, "headers": environment(headers),
             }),
-            McpTransport::Sse { url, headers } => json!({
-                "type": "sse", "name": launch.name, "url": url, "headers": environment(headers),
-            }),
+            McpTransport::Sse { .. } => unreachable!("launch compatibility excludes SSE"),
         })
     }).collect()
+}
+
+/// Describe the first launch option an Antigravity session cannot honor.
+pub(crate) fn mcp_launch_incompatibility(launch: &McpLaunch) -> Option<&'static str> {
+    if matches!(launch.transport, McpTransport::Sse { .. }) {
+        Some("Antigravity requires stdio or Streamable HTTP. Replace legacy SSE in the MCP definition")
+    } else if launch.timeout.is_some() {
+        Some("Antigravity does not support a per-server timeout. Remove the timeout from the MCP definition")
+    } else if launch.working_directory.is_some() {
+        Some("Antigravity uses the workspace for stdio servers. Remove the working directory from the MCP definition")
+    } else if matches!(launch.tools, Some(forge_provider_api::session::McpToolSelection::Only(_))) {
+        Some("Antigravity cannot restrict a server to selected tools")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_provider_api::{ProviderOperation, capability::ProviderFeature};
+
+    /// Reject legacy SSE before sending a native open that only supports Streamable HTTP.
+    #[test]
+    fn rejects_legacy_sse_transport() {
+        let launch = McpLaunch {
+            name: "fixture".into(),
+            transport: McpTransport::Sse {
+                url: "http://localhost/sse".into(),
+                headers: Default::default(),
+            },
+            timeout: None,
+            working_directory: None,
+            tools: None,
+        };
+        let result = mcp_launches(ProviderOperation::ThreadOpen, &[launch]);
+        assert!(matches!(
+            result,
+            Err(ProviderError::Unsupported(UnsupportedCapability(
+                ProviderFeature::McpLaunchRequirements,
+            )))
+        ));
+    }
 }

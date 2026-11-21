@@ -20,6 +20,7 @@ pub(super) type PeerHandlerFactory = Box<dyn Fn() -> PeerHandler + Send + Sync>;
 
 struct PeerDefinition {
     requests: Arc<Mutex<Vec<Value>>>,
+    request_received: tokio::sync::Notify,
     handler_factory: PeerHandlerFactory,
 }
 
@@ -50,6 +51,7 @@ impl InMemoryPeer {
         }
         let definition = Arc::new(PeerDefinition {
             requests: Arc::default(),
+            request_received: tokio::sync::Notify::new(),
             handler_factory,
         });
         REGISTRY
@@ -75,6 +77,24 @@ impl InMemoryPeer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Wait until the wire peer receives a named method without polling the clock.
+    pub(super) async fn wait_for_request(&self, method: &str) {
+        loop {
+            let received = self.definition.request_received.notified();
+            if self
+                .definition
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|request| request["method"] == method)
+            {
+                return;
+            }
+            received.await;
+        }
     }
 }
 
@@ -123,6 +143,7 @@ pub(super) fn attach(program: &str) -> Option<AttachedPeer> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(request.clone());
+            definition.request_received.notify_waiters();
             for mut message in handler(&request) {
                 message["jsonrpc"] = json!("2.0");
                 let mut encoded = serde_json::to_vec(&message).expect("peer message serializes");

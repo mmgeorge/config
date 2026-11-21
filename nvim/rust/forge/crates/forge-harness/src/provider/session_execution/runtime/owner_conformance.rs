@@ -432,7 +432,7 @@ async fn completion_racing_steering_preserves_proven_rejection_and_delivery_unce
             let receipt = input.submission().unwrap();
             let running = engine.clone();
             let selected = scope.clone();
-            let steer = tokio::spawn(async move { running.steer(selected, input).await });
+            let steer = tokio::spawn(async move { running.steer(selected, input, None).await });
             let pending = fixture.steering.recv().await.context("steer missing")?;
             call.finish(normal())?;
             boundary(&mut events, true).await?;

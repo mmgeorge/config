@@ -31,6 +31,8 @@ pub(crate) use input_readiness::{
 };
 #[cfg(test)]
 pub(crate) use input_receipts::InputReceiptFact;
+#[cfg(test)]
+pub(crate) use input_receipts::{InputDispatchActivity, InputExecutionResult};
 mod services;
 mod task_command;
 mod task_input;

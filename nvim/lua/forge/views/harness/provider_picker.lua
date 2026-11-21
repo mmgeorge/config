@@ -87,6 +87,33 @@ local function mcp_detail_lines(definition)
   return result
 end
 
+---Offer explicit future defaults without changing the observed live selection.
+local function resource_actions(options, kind, toggle, details, on_saved)
+  if not options.future_defaults then return { toggle, details } end
+  local action_list = { details }
+  for _, enabled in ipairs({ true, false }) do
+    local verb = enabled and "Enable" or "Disable"
+    action_list[#action_list + 1] = {
+      id = enabled and "enable-future-default" or "disable-future-default",
+      key = enabled and "e" or "d",
+      desc = verb .. " for future sessions",
+      callback = function(context)
+        local resource = context.option and context.option.value
+        if not resource or (options.is_current and not options.is_current()) then return end
+        if not resource.resource_id or (resource.scope ~= "global" and resource.scope ~= "workspace") then
+          notifications.error("This resource has no editable global or workspace default", "Harness resources")
+          return
+        end
+        provider_catalog.set_resource_default(kind, options.workspace, resource, enabled, function(_, failure)
+          if failure then notifications.error(failure, "Harness resources") return end
+          on_saved(verb .. "d " .. resource.name .. " for future sessions")
+        end)
+      end,
+    }
+  end
+  return action_list
+end
+
 ---@param options table
 function M.open_skills(options)
   skills_generation = skills_generation + 1
@@ -104,6 +131,7 @@ function M.open_skills(options)
     local pending_by_id = {}
     local current_skill_list = skill_list or {}
     local expanded_by_id = {}
+    local default_notice
     local function spec()
       local option_list = {}
       for _, skill in ipairs(current_skill_list) do
@@ -125,15 +153,15 @@ function M.open_skills(options)
           {
             id = "provider-skills",
             title = "Manage Skills",
-            subtitle = next(pending_by_id) and "Changes pending" or nil,
+            subtitle = next(pending_by_id) and "Changes pending" or default_notice,
             column_headers = { "Skill", "Source", "Description" },
             option_list = option_list,
             empty_text = "The provider advertised no user-invocable skills.",
-            footer = "↑↓ select  Enter insert  Space enable/disable  Tab source  q close",
+            footer = options.future_defaults and "Enter insert  e/d enable/disable for future sessions  Tab source  q close"
+              or "↑↓ select  Enter insert  Space enable/disable  Tab source  q close",
           },
         },
-        action_list = {
-          {
+        action_list = resource_actions(options, "skill", {
             id = "toggle-skill",
             key = "<Space>",
             desc = "Enable or disable provider skill",
@@ -166,8 +194,7 @@ function M.open_skills(options)
                 end)
               end, skill.resource_id, skill.scope)
             end,
-          },
-          {
+          }, {
             id = "toggle-source",
             key = "<Tab>",
             desc = "Fold skill source path",
@@ -178,8 +205,11 @@ function M.open_skills(options)
               expanded_by_id[id] = not expanded_by_id[id]
               picker.update(spec())
             end,
-          },
-        },
+          }, function(message)
+            if not picker.is_open(owner) or (options.is_current and not options.is_current()) then return end
+            default_notice = message
+            picker.update(spec())
+          end),
         on_confirm = function(result)
           local skill = result.option and result.option.value
           if not skill then return false end
@@ -232,6 +262,7 @@ function M.open_mcp(options)
     local closed = false
     local refreshing = false
     local refresh_ticks = 0
+    local default_notice
     local build_spec
     local start_animation
 
@@ -317,15 +348,15 @@ function M.open_mcp(options)
           {
             id = "provider-mcp",
             title = "Manage MCP Servers",
-            subtitle = next(pending_by_id) and "Changes pending" or nil,
+            subtitle = next(pending_by_id) and "Changes pending" or default_notice,
             column_headers = { "Server", "Source", "Transport", "Tokens", "Status" },
             option_list = option_list,
             empty_text = "The provider advertised no MCP servers.",
-            footer = "↑↓ select  Space enable/disable  Tab details  q close",
+            footer = options.future_defaults and "e/d enable/disable for future sessions  Tab details  q close"
+              or "↑↓ select  Space enable/disable  Tab details  q close",
           },
         },
-        action_list = {
-          {
+        action_list = resource_actions(options, "mcp", {
             id = "toggle-mcp",
             key = "<Space>",
             desc = "Enable or disable MCP server",
@@ -355,8 +386,7 @@ function M.open_mcp(options)
                 refresh()
               end, definition.resource_id, definition.scope)
             end,
-          },
-          {
+          }, {
             id = "toggle-tools",
             key = "<Tab>",
             desc = "Fold MCP source and tools",
@@ -367,8 +397,11 @@ function M.open_mcp(options)
               expanded_by_id[id] = not expanded_by_id[id]
               picker.update(build_spec())
             end,
-          },
-        },
+          }, function(message)
+            if not picker.is_open(owner) or (options.is_current and not options.is_current()) then return end
+            default_notice = message
+            picker.update(build_spec())
+          end),
         on_confirm = function() return false end,
         on_close = function()
           closed = true

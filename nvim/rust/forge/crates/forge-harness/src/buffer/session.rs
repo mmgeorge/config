@@ -83,6 +83,7 @@ struct PresentedInput {
     id: Option<String>,
     text: String,
     failed: bool,
+    failure_notice: Option<String>,
     content: crate::input::UserInputContent,
 }
 
@@ -94,11 +95,13 @@ impl PresentedInput {
                 content: crate::input::UserInputContent::UserText { text: text.clone() },
                 text,
                 failed: false,
+                failure_notice: None,
             }),
             StagedInput::Message {
                 id,
                 text,
                 failed,
+                failure_notice,
                 content,
             } => {
                 let content = match content {
@@ -119,6 +122,7 @@ impl PresentedInput {
                     id: Some(id),
                     text,
                     failed,
+                    failure_notice,
                     content,
                 })
             }
@@ -146,6 +150,7 @@ pub enum StagedInput {
         content: StagedContent,
         #[serde(default)]
         failed: bool,
+        failure_notice: Option<String>,
     },
 }
 
@@ -1400,12 +1405,20 @@ impl SessionPresentation {
         if open.failure.is_some() {
             return;
         }
-        for operation in &patch.operation {
-            if let TimelineOperation::Insert { entry, .. }
-            | TimelineOperation::Replace { entry, .. } = operation
-            {
-                open.history_input_id
-                    .extend(history_input_ids(std::slice::from_ref(entry)));
+        if patch
+            .operation
+            .iter()
+            .any(|operation| matches!(operation, TimelineOperation::Remove { .. }))
+        {
+            open.history_input_id = history_input_ids(self.timeline.entry_list());
+        } else {
+            for operation in &patch.operation {
+                if let TimelineOperation::Insert { entry, .. }
+                | TimelineOperation::Replace { entry, .. } = operation
+                {
+                    open.history_input_id
+                        .extend(history_input_ids(std::slice::from_ref(entry)));
+                }
             }
         }
         open.awaiting_steering = awaiting_steering(self.timeline.entry_list());
@@ -2386,6 +2399,7 @@ fn awaiting_steering(entries: &[TimelineEntry]) -> Vec<PresentedInput> {
             id: Some(prompt.id.clone()),
             text: prompt.text.clone(),
             failed: false,
+            failure_notice: None,
         })
         .collect()
 }
@@ -2401,13 +2415,24 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     let staged = |values: &[PresentedInput]| {
         values
             .iter()
-            .filter(|value| {
-                value
+            .filter_map(|value| {
+                let in_history = value
                     .id
                     .as_ref()
-                    .is_none_or(|id| !open.history_input_id.contains(id))
+                    .is_some_and(|id| open.history_input_id.contains(id));
+                if !in_history {
+                    return Some(value.clone());
+                }
+                // The transcript owns the prompt, but its delivery can still hold the queue.
+                value.failed.then(|| {
+                    let mut notice = value.clone();
+                    notice.text = value.failure_notice.as_deref().map_or_else(
+                        || "Input needs recovery".to_owned(),
+                        |reason| format!("Input needs recovery · {reason}"),
+                    );
+                    notice
+                })
             })
-            .cloned()
             .collect::<Vec<_>>()
     };
     let (mut staged_steering, mut staged_queue) = open
@@ -3712,6 +3737,50 @@ mod tests {
         Ok(())
     }
 
+    /// Keep a failed queue entry actionable after the transcript adopts its text.
+    #[test]
+    fn unresolved_input_keeps_a_status_notice_without_repeating_its_text() -> Result<()> {
+        let prompt = "Prompt awaiting delivery evidence";
+        let exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id": "exchange", "session_id": "session", "agent_id": "primary", "ordinal": 1,
+            "prompt": prompt, "state": "failed", "created_at_ms": 0, "input_message_id": "failed",
+            "attributed_matches_checkpoint": false, "node_list": []
+        }))?;
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            agent_by_id: HashMap::new(),
+            exchange: exchange.into(),
+        }])?;
+        let document = DocumentId("timeline:unresolved-input".into());
+        owner.open(
+            document.clone(),
+            ViewId("timeline:unresolved-input:view".into()),
+            WidthProfile::default(),
+        )?;
+        owner.set_staging(
+            &document,
+            1,
+            vec![StagedInput::Message {
+                id: "failed".into(),
+                content: StagedContent::Message,
+                text: prompt.into(),
+                failed: true,
+                failure_notice: None,
+            }],
+            Vec::new(),
+            None,
+            &Default::default(),
+        )?;
+        let status =
+            serde_json::to_string(&owner.open.as_ref().context("open")?.status.snapshot())?;
+        assert!(status.contains("Queued follow-up inputs"), "{status}");
+        assert!(status.contains("Input needs recovery"), "{status}");
+        assert!(!status.contains(prompt), "{status}");
+        Ok(())
+    }
+
     /// The status section shows each steering message once, from staging through acknowledgement,
     /// without Lua staging, until consumption moves it into the transcript.
     #[test]
@@ -3760,6 +3829,7 @@ mod tests {
                 content: StagedContent::Message,
                 text: steer.into(),
                 failed: false,
+                failure_notice: None,
             }]
         };
 

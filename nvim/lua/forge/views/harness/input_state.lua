@@ -14,7 +14,7 @@ M.submission_notice_delay_ms = 500
 ---@field confirmed table[] Committed host input; never optimistically edited.
 ---@field drafts table[] Unacknowledged or rejected editor drafts, never eligible for host delivery.
 ---@field entry_by_id table<string, table> Stable display objects for queue editing.
----@field retraction table<string, fun(): boolean>
+---@field retraction table<string, fun(check_only?: boolean): boolean>
 ---@field awaiting_claim table<string, true> Automatic submissions from this view that the host has
 ---  yet to claim, which no list draws until the notice delay passes.
 ---@field follow_up table<string, true> Messages the status split has shown waiting. Membership
@@ -96,7 +96,8 @@ local function awaits_steering(state, input, entry)
   local status = state.status
   if input.suspended or entry.error ~= nil or entry.reservation ~= nil or entry.intent == "queue" then return false end
   if host_produced(entry) or type(status) ~= "table" or holding_phase[status.kind] then return false end
-  return require("forge.views.harness.activity").turn_running(state)
+  local activity = require("forge.views.harness.activity")
+  return activity.turn_running(state) and activity.turn_awaited(state)
 end
 
 -- Get whether an unclaimed message belongs in the queued follow-up list.
@@ -249,7 +250,8 @@ local function project(state, input, update)
     for _, id in ipairs(update.removed or {}) do
       local index = index_of(input.confirmed, id)
       if index then table.remove(input.confirmed, index) end
-      discard_draft(input, id)
+      local draft = input.drafts[index_of(input.drafts, id) or 0]
+      if not (draft and draft.pickup_unconfirmed) then discard_draft(input, id) end
     end
     for _, message in ipairs(update.upsert or {}) do
       local index = index_of(input.confirmed, message.id)
@@ -275,8 +277,9 @@ end
 ---
 ---The host keeps a retracted prompt as an unsent queue entry, because the editor can exit before
 ---it restores the text. Once the composer holds the text, that entry would duplicate the draft, so
----the editor removes it. A composer holding newer work leaves the entry in the queue, where the
----user retries or edits it.
+---the editor claims it by removing the host's copy first. A composer holding newer work leaves
+---the entry in the queue. If the composer fills during the claim, the editor retains the removed
+---text as an unsent draft.
 ---@param state table
 ---@param update table
 function M.receive(state, update)
@@ -287,14 +290,30 @@ function M.receive(state, update)
   local unsent
   if restore then
     input.retraction[update.retracted] = nil
-    if restore() then unsent = (update.upsert or {})[1] end
+    local candidate = (update.upsert or {})[1]
+    local current = candidate and input.confirmed[index_of(input.confirmed, candidate.id) or 0]
+    if candidate and (update.revision >= input.revision or current and current.revision == candidate.revision)
+      and restore(true) then unsent = candidate end
   end
-  -- The composer already shows the text, so the host's copy is withdrawn before it is ever drawn.
+  -- Do not flash the host's copy while the editor is claiming it for the composer.
   if unsent then input.removing[unsent.id] = (input.removing[unsent.id] or 0) + 1 end
   project(state, input, update)
-  if unsent then
+  if unsent and restore then
     if state.input == input then
-      M.perform(state, { kind = "remove", id = unsent.id, revision = unsent.revision })
+      M.perform(state, { kind = "remove", id = unsent.id, revision = unsent.revision }, function(failure, detail)
+        local uncertain = detail and detail.code == "outcome_unknown"
+        if failure and not uncertain or not failure and restore() then return end
+        local owner = state.input
+        if not owner or owner.session_id ~= input.session_id then return end
+        local draft = vim.deepcopy(unsent)
+        draft.id = uncertain and unsent.id or command.identity()
+        draft.local_only, draft.draft_state = true, uncertain and "unknown" or "rejected"
+        draft.pickup_unconfirmed = uncertain
+        if uncertain then draft.error = failure end
+        -- If the host still owns the unsent entry, its row covers this recovery copy.
+        owner.drafts[#owner.drafts + 1] = draft
+        render(state)
+      end)
     end
     M.release_removal(state, input, unsent.id)
   end
@@ -384,9 +403,9 @@ end
 ---Submit one immutable command; shared command transport owns all observation and recovery.
 ---@param state table
 ---@param action table
----@param callback? fun(failure: string?)
+---@param callback? fun(failure: string?, detail: table?)
 ---@param target? table
----@param restore? fun(): boolean Returns a rejected submission's text to the composer when it is free.
+---@param restore? fun(check_only?: boolean): boolean Returns a rejected submission's text to the composer when it is free.
 function M.perform(state, action, callback, target, restore)
   local input = state.input
   local id = command.identity()
@@ -440,13 +459,14 @@ function M.perform(state, action, callback, target, restore)
     -- A rejected submission returns to the composer while it is free, and otherwise stays as a
     -- failed row carrying the host's reason, so its text is never left only in a pending row.
     local function reject(owner, reason)
-      if restore and restore() then
+      local uncertain = detail and detail.code == "outcome_unknown"
+      if not uncertain and restore and restore() then
         discard_draft(owner, draft.id)
         if state.input and state.input ~= owner then discard_draft(state.input, draft.id) end
         return
       end
       discard_draft(owner, draft.id)
-      draft.draft_state = detail and detail.code == "outcome_unknown" and "unknown" or "rejected"
+      draft.draft_state = uncertain and "unknown" or "rejected"
       draft.error = reason
       owner.drafts[#owner.drafts + 1] = draft
     end
@@ -459,7 +479,7 @@ function M.perform(state, action, callback, target, restore)
         render(state)
       end
       if failure then notifications.error(failure, "Harness message") end
-      if callback then callback(failure or "Harness input changed before the host answered") end
+      if callback then callback(failure or "Harness input changed before the host answered", detail) end
       settle_commits()
       return
     end
@@ -479,7 +499,7 @@ function M.perform(state, action, callback, target, restore)
         entry_id = action.id, operation_id = id, session_id = input.session_id,
         code = result and result.error_code or (detail and detail.code) })
     end
-    if callback then callback(failure) end
+    if callback then callback(failure, detail) end
     settle_commits()
   end)
 end
@@ -584,7 +604,7 @@ end
 ---
 ---`restore` puts the text back into the composer when the composer is still free. It answers both a
 ---retraction and a rejected submission.
----@param restore? fun(): boolean
+---@param restore? fun(check_only?: boolean): boolean
 function M.submit(state, text, attachments, intent, config, callback, restore, target)
   local message = { id = command.identity(), text = text, attachments = attachments,
     purpose = { kind = "user" }, config = config, intent = intent }

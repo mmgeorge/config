@@ -11,7 +11,7 @@ impl ExchangeDriver {
         state: &mut DriverState,
         step: u64,
         foreground_status: &TurnStatus,
-        _closed: &mut bool,
+        closed: &mut bool,
         wake: (InputDeliveryTarget, InputDeliveryEvent),
     ) -> WakeEnd {
         let DriverEnv {
@@ -51,7 +51,10 @@ impl ExchangeDriver {
             &mut *broker.lock().await,
             services,
             &mut self.input_receipts,
-            !self.commands.storage_unavailable(),
+            crate::exchange::input_delivery::InputEffectAdmission {
+                owner_closed: *closed || self.receiver.is_closed(),
+                can_commit: !self.commands.storage_unavailable(),
+            },
         );
         match progress {
             Ok(InputDeliveryProgress::Waiting {

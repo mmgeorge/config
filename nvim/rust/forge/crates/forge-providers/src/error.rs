@@ -1,6 +1,6 @@
 use crate::acp::{AcpConnectionError, AcpRemoteFailure};
 use crate::codex::CodexConnectionError;
-use forge_provider_api::ProviderError;
+use forge_provider_api::{ProviderError, SanitizedMessage};
 use forge_provider_api::error::{ProviderFailureKind, ProviderOperation};
 
 /// Render a native cause chain only at the diagnostic boundary, without debug payloads.
@@ -52,8 +52,28 @@ pub(crate) fn codex(error: CodexConnectionError, operation: ProviderOperation) -
 
 /// Normalize an ACP transport failure without retaining native diagnostics or inventing delivery proof.
 pub(crate) fn acp(error: AcpConnectionError, operation: ProviderOperation) -> ProviderError {
+    let (summary, remote_failure, os_error) = match &error {
+        AcpConnectionError::Configuration(message) | AcpConnectionError::Startup { message, .. } =>
+            (*message, None, None),
+        AcpConnectionError::Process { operation, source } =>
+            (*operation, None, source.raw_os_error()),
+        AcpConnectionError::StartupExit { .. } => ("ACP process exited during initialization", None, None),
+        AcpConnectionError::Protocol { .. } => ("could not encode ACP request", None, None),
+        AcpConnectionError::Remote { failure, .. } => ("ACP request failed", *failure, None),
+        AcpConnectionError::Collection { .. } => ("ACP collection failed", None, None),
+        AcpConnectionError::Callback(_) => ("ACP callback failed", None, None),
+    };
+    let explanation = match &error {
+        AcpConnectionError::Remote {
+            failure: Some(AcpRemoteFailure::AuthenticationRequired),
+            ..
+        } => Some(SanitizedMessage::new("Antigravity is not signed in. Run `agy acp --login` and retry.")),
+        AcpConnectionError::StartupExit { reason } => Some(SanitizedMessage::new(reason.to_string())),
+        _ => None,
+    }.map(|explanation| explanation.expect("normalized ACP explanation is nonempty"));
     tracing::error!(target: "forge::provider", event_name = "provider.failure",
-        provider = "antigravity", operation = ?operation, error = %Diagnostic(&error));
+        provider = "antigravity", operation = ?operation, summary, remote_failure = ?remote_failure,
+        os_error, explanation = explanation.as_ref().map(SanitizedMessage::as_str));
     let (kind, phase, disposition) = match error {
         AcpConnectionError::Protocol { .. } => (
             ProviderFailureKind::Protocol,
@@ -88,7 +108,9 @@ pub(crate) fn acp(error: AcpConnectionError, operation: ProviderOperation) -> Pr
             forge_provider_api::ProviderPhase::Admission,
             forge_provider_api::FailureDisposition::Unchanged,
         ),
-        AcpConnectionError::Process { .. } | AcpConnectionError::Startup { .. } => (
+        AcpConnectionError::Process { .. }
+        | AcpConnectionError::Startup { .. }
+        | AcpConnectionError::StartupExit { .. } => (
             ProviderFailureKind::Runtime,
             forge_provider_api::ProviderPhase::Preparation,
             forge_provider_api::FailureDisposition::Unchanged,
@@ -117,7 +139,14 @@ pub(crate) fn acp(error: AcpConnectionError, operation: ProviderOperation) -> Pr
             };
         }
     };
-    ProviderError::Failure(
+    let cause = ProviderError::Failure(
         forge_provider_api::ProviderFailure::new(operation, kind).at_phase(phase, disposition),
-    )
+    );
+    match explanation {
+        Some(explanation) => ProviderError::Explained {
+            cause: Box::new(cause),
+            explanation,
+        },
+        None => cause,
+    }
 }

@@ -14,15 +14,30 @@ pub(crate) enum PromptOutcome {
 pub(super) struct NativePromptEnd {
     outcome: PromptOutcome,
     completed_at_ms: i64,
+    observed_order: u64,
 }
 
 impl NativePromptEnd {
     /// Decode exactly one native stop reason at its response boundary.
-    pub(super) fn parse(value: &Value, completed_at_ms: i64) -> Result<Self, serde_json::Error> {
+    pub(super) fn parse(
+        value: &Value,
+        completed_at_ms: i64,
+        observed_order: u64,
+    ) -> Result<Self, serde_json::Error> {
         Ok(Self {
             outcome: prompt_outcome(value)?,
             completed_at_ms,
+            observed_order,
         })
+    }
+
+    /// Select the later observed response on the same connection.
+    pub(super) fn latest(self, other: Self) -> Self {
+        if other.observed_order > self.observed_order {
+            other
+        } else {
+            self
+        }
     }
     /// Get the once-parsed native terminal outcome.
     pub(super) fn outcome(self) -> PromptOutcome {

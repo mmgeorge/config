@@ -166,6 +166,7 @@ enum SteeringDeliveryIdentity {
 pub struct SteeringRequestIdentity {
     scope: InvocationScope,
     delivery: SteeringDeliveryIdentity,
+    dispatch: Option<crate::submission::DispatchIdentity>,
     input: crate::forge::TurnInput,
     attachments: Vec<FileAttachment>,
 }
@@ -175,6 +176,7 @@ impl From<&SteeringRequest> for SteeringRequestIdentity {
         let SteeringRequest {
             scope,
             delivery,
+            dispatch,
             input,
             attachments,
         } = request;
@@ -188,6 +190,7 @@ impl From<&SteeringRequest> for SteeringRequestIdentity {
         Self {
             scope: scope.clone(),
             delivery,
+            dispatch: dispatch.as_ref().map(crate::submission::DispatchReporter::identity),
             input: input.clone(),
             attachments: attachments.clone(),
         }

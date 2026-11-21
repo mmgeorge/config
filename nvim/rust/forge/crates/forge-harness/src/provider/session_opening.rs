@@ -34,9 +34,24 @@ enum OpenState {
 struct PendingOpen {
     operation: OperationControl,
     request: SessionRequest,
+    resources: Arc<crate::settings::SessionResources>,
 }
 
 impl SessionOpening {
+    /// Get the original resource selection while its native open can still be observed.
+    pub(super) fn pending_resources(&self) -> Option<Arc<crate::settings::SessionResources>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            OpenState::Pending(pending) | OpenState::Closed(Some(pending)) => {
+                Some(pending.resources.clone())
+            }
+            OpenState::Idle | OpenState::Closed(None) => None,
+        }
+    }
+
     /// Get the exact rejected receipt still owned before installation can proceed.
     #[cfg(test)]
     pub(super) fn quarantined_binding(&self) -> Option<forge_provider_api::BindingId> {
@@ -143,9 +158,10 @@ impl SessionOpening {
         trace: Arc<crate::trace::TraceStore>,
         core: &crate::exchange::core_log::CoreEventLog,
         request: SessionRequest,
+        resources: Arc<crate::settings::SessionResources>,
         collection: Arc<super::bridge::BindingCollection>,
-    ) -> Result<OpenedSession, ProviderError> {
-        let (operation, request, purpose) = self.begin(request)?;
+    ) -> Result<(OpenedSession, Arc<crate::settings::SessionResources>), ProviderError> {
+        let (operation, request, resources, purpose) = self.begin(request, resources)?;
         let owner = request.owner().clone();
         let result = super::operation::observe_owned(
             trace,
@@ -166,7 +182,7 @@ impl SessionOpening {
             .resolve_observation(provider, core, &operation, result, &collection)
             .await;
         self.complete(&operation, result.as_ref().err());
-        result
+        result.map(|opened| (opened, resources))
     }
 
     /// Collect a successful owned open before exposing its failed completion-evidence result.
@@ -336,10 +352,12 @@ impl SessionOpening {
     fn begin(
         &self,
         request: SessionRequest,
+        resources: Arc<crate::settings::SessionResources>,
     ) -> Result<
         (
             OperationContext,
             SessionRequest,
+            Arc<crate::settings::SessionResources>,
             super::operation::ObservationPurpose,
         ),
         ProviderError,
@@ -352,6 +370,7 @@ impl SessionOpening {
             *state = OpenState::Pending(PendingOpen {
                 operation: OperationControl::fresh(ProviderOperation::ThreadOpen)?,
                 request,
+                resources,
             });
             super::operation::ObservationPurpose::Admission
         } else {
@@ -361,6 +380,7 @@ impl SessionOpening {
             OpenState::Pending(pending) => Ok((
                 pending.operation.context(),
                 pending.request.clone(),
+                pending.resources.clone(),
                 purpose,
             )),
             OpenState::Closed(_) => Err(ProviderFailure::new(

@@ -2,6 +2,12 @@ use tokio::process::Command;
 
 use std::path::{Path, PathBuf};
 
+/// Choose whether an unqualified executable may be found outside PATH.
+enum ExecutableSearch {
+    PlatformDefault,
+    PathOnly,
+}
+
 /// Admit native process creation while retaining the caller's repository ownership.
 pub trait ProcessOwner: Send + Sync {
     /// Spawn only while the original operation still permits execution.
@@ -38,27 +44,53 @@ pub fn executable(program: &str) -> Option<PathBuf> {
     )
 }
 
+/// Resolve a bare executable through absolute PATH directories.
+pub fn executable_on_path(program: &str) -> Option<PathBuf> {
+    resolve_executable(
+        program,
+        &std::env::current_dir().ok()?,
+        &std::env::var_os("PATH")?,
+        ExecutableSearch::PathOnly,
+    )
+}
+
 /// Resolve a command against its launch directory and effective PATH without running it.
 pub fn executable_at(
     program: &str,
     working_directory: &Path,
     search_path: &std::ffi::OsStr,
 ) -> Option<PathBuf> {
+    resolve_executable(
+        program,
+        working_directory,
+        search_path,
+        ExecutableSearch::PlatformDefault,
+    )
+}
+
+/// Apply the search policy before checking platform extensions and file permissions.
+fn resolve_executable(
+    program: &str,
+    working_directory: &Path,
+    search_path: &std::ffi::OsStr,
+    search: ExecutableSearch,
+) -> Option<PathBuf> {
     if program.is_empty() {
         return None;
     }
     let requested = Path::new(program);
     let qualified = requested.is_absolute() || requested.components().count() > 1;
-    let directory: Vec<PathBuf> = if qualified {
-        vec![working_directory.to_path_buf()]
-    } else {
-        let directory =
-            std::env::split_paths(search_path).map(|directory| working_directory.join(directory));
-        #[cfg(windows)]
-        let directory = std::iter::once(working_directory.to_path_buf()).chain(directory);
-        directory.collect()
-    };
-    for directory in directory {
+    let platform_default = matches!(search, ExecutableSearch::PlatformDefault);
+    if qualified && !platform_default {
+        return None;
+    }
+    let launch_directory = (qualified || (cfg!(windows) && platform_default))
+        .then(|| working_directory.to_path_buf());
+    // Relative PATH entries can resolve inside the checkout that started this process.
+    let path_directory = std::env::split_paths(search_path)
+        .filter(|directory| !qualified && (platform_default || directory.is_absolute()))
+        .map(|directory| working_directory.join(directory));
+    for directory in launch_directory.into_iter().chain(path_directory) {
         #[cfg(windows)]
         let extensions: &[&str] = if requested
             .extension()
@@ -187,7 +219,48 @@ impl process_wrap::tokio::CommandWrapper for ParentJob {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::job_attribute_refused;
+    use super::{ExecutableSearch, executable_at, job_attribute_refused, resolve_executable};
+    use std::path::Path;
+
+    /// Keep checkout executables outside implicit search even with relative PATH entries.
+    #[test]
+    fn path_only_lookup_skips_windows_checkout_relative_entries() -> std::io::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().join("workspace");
+        let workspace_bin = workspace.join("bin");
+        let installation = fixture.path().join("installation");
+        std::fs::create_dir_all(&workspace_bin)?;
+        std::fs::create_dir(&installation)?;
+        let local_executable = workspace.join("agy.exe");
+        let installed_executable = installation.join("agy.exe");
+        std::fs::write(&local_executable, [])?;
+        std::fs::write(workspace_bin.join("agy.exe"), [])?;
+        std::fs::write(&installed_executable, [])?;
+        let relative_entries = [Path::new(""), Path::new("."), Path::new("bin")];
+        let checkout_path = std::env::join_paths(relative_entries).map_err(std::io::Error::other)?;
+        let search_path =
+            std::env::join_paths(relative_entries.into_iter().chain([installation.as_path()]))
+                .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            executable_at("agy", &workspace, &search_path),
+            Some(local_executable)
+        );
+        assert_eq!(
+            resolve_executable("agy", &workspace, &search_path, ExecutableSearch::PathOnly),
+            Some(installed_executable)
+        );
+        assert_eq!(
+            resolve_executable(
+                "agy",
+                &workspace,
+                &checkout_path,
+                ExecutableSearch::PathOnly
+            ),
+            None
+        );
+        Ok(())
+    }
 
     /// Only an access-denied refusal repeats the launch suspended; other failures stand.
     #[test]

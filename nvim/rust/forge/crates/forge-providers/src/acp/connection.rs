@@ -4,9 +4,125 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use tokio::sync::{Mutex, oneshot};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::{Mutex, oneshot, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+/// Order native prompt publication, replies, and cancellation for one invocation.
+#[derive(Clone, Default)]
+pub(super) struct PromptCancellation {
+    pub(super) token: tokio_util::sync::CancellationToken,
+    replies_drained: tokio_util::sync::CancellationToken,
+    state: Arc<std::sync::Mutex<PromptPublication>>,
+}
+
+#[derive(Default)]
+struct PromptPublication {
+    pending_count: usize,
+    sealed: bool,
+    notified: bool,
+}
+
+impl PromptCancellation {
+    /// Fence future sends while leaving admitted requests alive until their replies arrive.
+    pub(super) fn seal(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sealed = true;
+        if state.pending_count == 0 {
+            self.replies_drained.cancel();
+        }
+    }
+
+    /// Prevent any further native prompt publication for this invocation.
+    pub(super) fn stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sealed = true;
+        self.token.cancel();
+        if state.pending_count == 0 {
+            self.replies_drained.cancel();
+        }
+    }
+
+    /// Wait for the last native reply to close prompt publication.
+    pub(super) async fn wait_for_replies(&self) {
+        self.replies_drained.cancelled().await;
+    }
+
+    /// Send the native notification once even when multiple requests are awaiting replies.
+    pub(super) fn notify(
+        &self,
+        connection: &AcpConnection,
+        session_id: &str,
+    ) -> Result<(), AcpConnectionError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sealed = true;
+        self.token.cancel();
+        if state.pending_count == 0 {
+            self.replies_drained.cancel();
+            return Ok(());
+        }
+        if state.notified {
+            return Ok(());
+        }
+        connection.cancel(session_id)?;
+        state.notified = true;
+        Ok(())
+    }
+
+    /// Publish while the invocation still owns native work, or when publishing its first prompt.
+    fn publish(
+        &self,
+        send: impl FnOnce() -> Result<(), agent_client_protocol::Error>,
+    ) -> Result<bool, agent_client_protocol::Error> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.sealed {
+            return Ok(false);
+        }
+        // Hold the gate through SDK publication so the ordered callback and cancel
+        // cannot observe a request that was enqueued but has yet to be counted.
+        send()?;
+        state.pending_count += 1;
+        Ok(true)
+    }
+
+    /// Enqueue a native setter only while the invocation remains open to publication.
+    fn publish_configuration<Sent>(&self, send: impl FnOnce() -> Sent) -> Option<Sent> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!state.sealed).then(send)
+    }
+
+    /// Retire one published request as its ordered reply arrives or its response channel closes.
+    fn reply_finished(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending_count = state
+            .pending_count
+            .checked_sub(1)
+            .expect("a reply retires its published request once");
+        if state.pending_count == 0 {
+            state.sealed = true;
+            self.replies_drained.cancel();
+        }
+    }
+}
 
 type SourceError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -30,8 +146,11 @@ pub enum AcpConnectionError {
         #[source]
         source: SourceError,
     },
+    /// The provider exited during initialization with a sanitized startup diagnosis.
+    #[error("{reason}")]
+    StartupExit { reason: AcpStartupFailure },
     /// A native message could not be encoded.
-    #[error("encode ACP {method}: {source}")]
+    #[error("ACP {method} protocol error: {source}")]
     Protocol {
         method: String,
         #[source]
@@ -64,6 +183,15 @@ pub enum AcpRemoteFailure {
     ResourceNotFound,
     Rejected,
     Protocol,
+}
+
+/// Classify launch output with fixed text that excludes provider paths and arguments.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub enum AcpStartupFailure {
+    #[error("Antigravity rejected a launch option. Check the configured command and run agy acp --help.")]
+    UnsupportedOption,
+    #[error("Antigravity exited before completing ACP initialization.")]
+    ExitedBeforeInitialize,
 }
 
 fn remote_failure(source: &(dyn std::error::Error + 'static)) -> Option<AcpRemoteFailure> {
@@ -124,6 +252,7 @@ struct AcpTransportResources {
 struct TransportState {
     process: Box<dyn process_wrap::tokio::ChildWrapper>,
     driver: DriverState,
+    stderr: Option<tokio::task::JoinHandle<()>>,
     process_collected: bool,
 }
 
@@ -170,6 +299,11 @@ impl AcpTransportResources {
             }
             DriverState::Collected => None,
         };
+        if let Some(stderr) = state.stderr.as_mut() {
+            stderr.abort();
+            let _ = stderr.await;
+            state.stderr = None;
+        }
         if process_failure.is_some() || reader_failure.is_some() {
             return Err(AcpConnectionError::Collection {
                 process: process_failure,
@@ -186,6 +320,9 @@ impl Drop for AcpTransportResources {
         if let DriverState::Running(driver) = &mut self.state.get_mut().driver {
             driver.abort();
         }
+        if let Some(stderr) = &self.state.get_mut().stderr {
+            stderr.abort();
+        }
     }
 }
 
@@ -196,16 +333,29 @@ fn spawn_provider_process(
     launch: &AcpLaunch<'_>,
     program: &str,
 ) -> Result<Box<dyn process_wrap::tokio::ChildWrapper>, AcpConnectionError> {
-    let mut command = forge_shell::process::command(program, &launch.command[1..]);
+    let arguments = &launch.command[1..];
+    let separator = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(arguments.len());
+    let (options, trailing) = arguments.split_at(separator);
+    let mut command = forge_shell::process::command(program, options);
     command.envs(launch.environment);
     if let Some(profile) = launch.profile {
-        command.env("GEMINI_HOME", profile);
+        command
+            .arg("--gemini-dir")
+            .arg(profile)
+            .arg("--cli_dir_name")
+            .arg(super::profile::cli_data_argument())
+            .arg("--agent")
+            .arg(super::profile::agent_name(profile));
     }
     command
+        .args(trailing)
         .current_dir(launch.workspace)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     match &launch.process_owner {
         Some(owner) => owner.spawn(command),
         None => forge_shell::process::spawn_owned(command),
@@ -214,6 +364,37 @@ fn spawn_provider_process(
         operation: "launch ACP provider",
         source,
     })
+}
+
+/// Drain stderr without retaining native text past a diagnostic's fixed prefix.
+async fn read_startup_diagnostics(
+    mut stderr: impl AsyncRead + Unpin,
+    diagnostics: watch::Sender<Option<AcpStartupFailure>>,
+) {
+    const OPTION_ERRORS: [&[u8]; 2] = [
+        b"Error: flags provided but not defined:",
+        b"Error: unexpected arguments:",
+    ];
+    let mut buffer = [0; 1024];
+    let mut prefix = Vec::new();
+    let mut prefix_complete = false;
+    while let Ok(length) = stderr.read(&mut buffer).await {
+        if length == 0 {
+            break;
+        }
+        for byte in &buffer[..length] {
+            if *byte == b'\n' {
+                prefix.clear();
+                prefix_complete = false;
+            } else if !prefix_complete {
+                prefix.push(*byte);
+                if OPTION_ERRORS.contains(&prefix.as_slice()) {
+                    diagnostics.send_replace(Some(AcpStartupFailure::UnsupportedOption));
+                }
+                prefix_complete = !OPTION_ERRORS.iter().any(|error| error.starts_with(&prefix));
+            }
+        }
+    }
 }
 
 /// Run the native driver over one byte transport until it closes or is aborted.
@@ -248,12 +429,22 @@ where
                 async move |request: UntypedMessage, responder, context| {
                     let handler = Arc::clone(&handler);
                     context.spawn(async move {
-                        let response = handler
-                            .request(request.method(), request.params().clone())
-                            .await
-                            .map_err(|error| {
-                                agent_client_protocol::util::internal_error(format!("{error:#}"))
-                            });
+                        let work = handler.request(request.method(), request.params().clone());
+                        let response = if request.method() == "session/request_permission" {
+                            let cancellation = responder.cancellation();
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => Ok(serde_json::json!({
+                                    "outcome": {"outcome": "cancelled"}
+                                })),
+                                result = work => result,
+                            }
+                        } else {
+                            work.await
+                        }
+                        .map_err(|error| {
+                            agent_client_protocol::util::internal_error(format!("{error:#}"))
+                        });
                         match response {
                             Ok(value) => responder.respond(value),
                             Err(error) => responder.respond_with_error(error),
@@ -276,6 +467,8 @@ where
 pub struct AcpConnection {
     connection: ConnectionTo<UntypedRole>,
     resources: Arc<AcpTransportResources>,
+    startup_diagnostics: watch::Receiver<Option<AcpStartupFailure>>,
+    prompt_end_count: Arc<AtomicU64>,
     prompt_ends: std::sync::Mutex<
         std::collections::HashMap<
             (
@@ -322,10 +515,12 @@ impl AcpConnection {
         };
         #[cfg(not(test))]
         let process = spawn_provider_process(&launch, program)?;
+        let (diagnostics, startup_diagnostics) = watch::channel(None);
         let resources = Arc::new(AcpTransportResources {
             state: Mutex::new(TransportState {
                 process,
                 driver: DriverState::Starting,
+                stderr: None,
                 process_collected: false,
             }),
             first_failure: Mutex::new(None),
@@ -340,6 +535,11 @@ impl AcpConnection {
                 "ACP startup was collected",
             ));
         }
+        retained.stderr = retained
+            .process
+            .stderr()
+            .take()
+            .map(|stderr| tokio::spawn(read_startup_diagnostics(stderr, diagnostics)));
         #[cfg(test)]
         let attached_driver = peer_streams.map(|streams| {
             start_driver(
@@ -385,6 +585,8 @@ impl AcpConnection {
         Ok(Self {
             connection,
             resources,
+            startup_diagnostics,
+            prompt_end_count: Arc::default(),
             prompt_ends: Default::default(),
         })
     }
@@ -444,72 +646,141 @@ impl AcpConnection {
         method: &str,
         parameter: Value,
     ) -> Result<Value, AcpConnectionError> {
-        self.request_tracked(method, parameter, None, None).await
+        let message = request_message(method, parameter)?;
+        response_value(method, self.connection.send_request(message).block_task().await)
     }
 
-    /// Hand a tracked request to the native driver before waiting for its response.
-    /// Prompt callers have already installed immutable configuration and collection
-    /// ownership. The SDK retains response/cancellation routing at publication.
-    pub(super) async fn request_tracked(
+    /// Preserve the safe launch diagnosis when the native process closes the protocol at startup.
+    pub(super) async fn request_initialization(
+        &self,
+        parameter: Value,
+    ) -> Result<Value, AcpConnectionError> {
+        match self.request("initialize", parameter).await {
+            Err(AcpConnectionError::Remote {
+                failure,
+                ref source,
+                ..
+            }) if source
+                .downcast_ref::<agent_client_protocol::Error>()
+                .is_some_and(agent_client_protocol::is_incoming_transport_closed)
+                || (failure.is_none() && self.connection.is_incoming_closed()) =>
+            {
+                let mut diagnostics = self.startup_diagnostics.clone();
+                let reason = diagnostics
+                    .wait_for(Option::is_some)
+                    .await
+                    .ok()
+                    .and_then(|reason| *reason)
+                    .unwrap_or(AcpStartupFailure::ExitedBeforeInitialize);
+                Err(AcpConnectionError::StartupExit { reason })
+            }
+            result => result,
+        }
+    }
+
+    /// Publish a setter only while preparation is admitted and retain every published reply.
+    pub(super) async fn request_configuration(
         &self,
         method: &str,
         parameter: Value,
-        dispatch: Option<&forge_provider_api::submission::DispatchReporter>,
-        cancellation: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<Value, AcpConnectionError> {
-        let session_id = parameter["sessionId"].as_str().map(str::to_owned);
-        let message = UntypedMessage::new(method, parameter).map_err(|source| {
-            AcpConnectionError::Protocol {
-                method: method.into(),
-                source: Box::new(source),
-            }
-        })?;
-        let request = self.connection.send_request(message).block_task();
-        tokio::pin!(request);
-        // Drain synchronous publication errors before confirming the tracked handoff.
-        // Pending means the SDK owns the request and response/cancellation routing;
-        // it does not prove remote delivery or receipt acceptance.
-        let response = if let std::task::Poll::Ready(response) = futures_util::poll!(&mut request) {
-            if response.is_ok()
-                && let Some(dispatch) = dispatch
-            {
-                dispatch.confirm();
-            }
-            response
-        } else {
-            if let Some(dispatch) = dispatch {
-                dispatch.confirm();
-            }
-            if method == "session/prompt" {
-                if let (Some(cancellation), Some(session_id)) = (cancellation, session_id) {
-                    tokio::select! {
-                        biased;
-                        result = &mut request => result,
-                        _ = cancellation.cancelled() => {
-                            self.cancel(&session_id)?;
-                            request.await
-                        }
-                    }
-                } else {
-                    request.await
-                }
-            } else {
-                // A native subrequest must not reset or shorten its retained operation's budget.
-                request.await
-            }
+        cancellation: Option<&PromptCancellation>,
+    ) -> Result<Option<Value>, AcpConnectionError> {
+        let message = request_message(method, parameter)?;
+        let send = || self.connection.send_request(message);
+        let request = match cancellation {
+            Some(cancellation) => match cancellation.publish_configuration(send) {
+                Some(request) => request,
+                None => return Ok(None),
+            },
+            None => send(),
         };
-        response.map_err(|source| {
-            let failure = remote_failure(&source);
-            AcpConnectionError::Remote {
-                method: method.into(),
-                failure,
-                source: Box::new(source),
+        response_value(method, request.block_task().await).map(Some)
+    }
+
+    /// Hand a prompt to the native driver and stamp its reply before later replies can pass it.
+    /// A missing response means prompt admission closed before the request published.
+    pub(super) async fn request_prompt(
+        &self,
+        method: &str,
+        parameter: Value,
+        session_id: &str,
+        dispatch: Option<&forge_provider_api::submission::DispatchReporter>,
+        cancellation: Option<&PromptCancellation>,
+    ) -> Result<Option<super::response::NativePromptEnd>, AcpConnectionError> {
+        let message = request_message(method, parameter)?;
+        let prepared = self.connection.prepare_request(message);
+        let response_method = method.to_owned();
+        let order = self.prompt_end_count.clone();
+        let publication = cancellation.cloned();
+        let (sender, mut receiver) = oneshot::channel();
+        // The SDK acknowledges an ordered callback before dispatching the next message.
+        // Keep journal work outside the callback so it cannot delay other inbound traffic.
+        let send = || {
+            prepared.on_receiving_result(move |response| async move {
+                let result = response_value(&response_method, response).and_then(|response| {
+                    super::response::NativePromptEnd::parse(
+                        &response,
+                        super::children::timestamp(),
+                        order.fetch_add(1, Ordering::Relaxed),
+                    )
+                    .map_err(|source| AcpConnectionError::Protocol {
+                        method: response_method,
+                        source: Box::new(source),
+                    })
+                });
+                if let Some(publication) = publication {
+                    publication.reply_finished();
+                }
+                let _ = sender.send(result);
+                Ok(())
+            })
+        };
+        let published = if let Some(cancellation) = cancellation {
+            cancellation.publish(send)
+        } else {
+            send().map(|()| true)
+        }
+        .map_err(|source| AcpConnectionError::Remote {
+            method: method.into(),
+            failure: remote_failure(&source),
+            source: Box::new(source),
+        })?;
+        if !published {
+            return Ok(None);
+        }
+        if let Some(dispatch) = dispatch {
+            dispatch.confirm();
+        }
+        let mut cancel_error = None;
+        let result = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                result = &mut receiver => result,
+                _ = cancellation.token.cancelled() => {
+                    cancel_error = cancellation.notify(self, session_id).err();
+                    receiver.await
+                }
             }
-        })
+        } else {
+            receiver.await
+        };
+        match result {
+            Ok(result) => result.map(Some),
+            Err(source) => {
+                if let Some(cancellation) = cancellation {
+                    cancellation.reply_finished();
+                }
+                Err(cancel_error.unwrap_or_else(|| AcpConnectionError::Remote {
+                    method: method.into(),
+                    failure: None,
+                    source: Box::new(source),
+                }))
+            }
+        }
     }
 
     /// Send the session's native interruption without closing its response reader.
-    pub fn cancel(&self, session_id: &str) -> Result<(), AcpConnectionError> {
+    fn cancel(&self, session_id: &str) -> Result<(), AcpConnectionError> {
         let method = "session/cancel";
         let notification = UntypedMessage::new(method, serde_json::json!({"sessionId":session_id}))
             .map_err(|source| AcpConnectionError::Protocol {
@@ -528,5 +799,45 @@ impl AcpConnection {
     /// Collect the process tree and stop the native driver.
     pub async fn shutdown(&self) -> Result<(), AcpConnectionError> {
         self.resources.collect().await
+    }
+}
+
+/// Encode the request before taking the invocation's publication gate.
+fn request_message(method: &str, parameter: Value) -> Result<UntypedMessage, AcpConnectionError> {
+    UntypedMessage::new(method, parameter).map_err(|source| AcpConnectionError::Protocol {
+        method: method.into(),
+        source: Box::new(source),
+    })
+}
+
+/// Preserve the SDK's typed remote failure at the ACP boundary.
+fn response_value(
+    method: &str,
+    response: Result<Value, agent_client_protocol::Error>,
+) -> Result<Value, AcpConnectionError> {
+    response.map_err(|source| {
+        let failure = remote_failure(&source);
+        AcpConnectionError::Remote {
+            method: method.into(),
+            failure,
+            source: Box::new(source),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Classify only the fixed native diagnostic prefix, even when stderr contains private text.
+    #[tokio::test]
+    async fn startup_diagnostics_keep_only_a_fixed_explanation() {
+        let (sender, diagnostics) = watch::channel(None);
+        let stderr = b"private local path\r\nError: flags provided but not defined: private-option\r\n";
+        read_startup_diagnostics(&stderr[..], sender).await;
+        assert!(matches!(
+            *diagnostics.borrow(),
+            Some(AcpStartupFailure::UnsupportedOption),
+        ));
     }
 }

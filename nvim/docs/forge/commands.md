@@ -46,7 +46,15 @@ to start a new session. Breaking state versions select a new directory automatic
 so old editors do not prevent new hosts from starting. The one-time old-layout
 cleanup described below also belongs to this command.
 
-The first startup after the storage-layout change reports an incompatible layout and requires `:ForgeHistoryClear`; startup does not delete old content. That explicit command discards the old Harness root, including old preferences, and restores defaults. The next Harness start reports the reset once, in one editor. It refuses the reset while an old host or unresolved repository process owns the data. Later `:ForgeHistoryClear` runs preserve the new `settings.db`, provider selection, model pins, logging preferences, and external permission rules. An unknown layout or corrupt new settings database reports an error and never triggers another reset.
+Antigravity uses the bundled ACP server in Antigravity CLI 1.5.13 or newer. Install the CLI on your search path and sign in with `agy acp --login`. The first start with the bundled adapter opens a fresh history for all providers and loads existing persistent preferences. Older hosts can finish with their original history version.
+
+Remove any `harness.providers.antigravity.command` override that launches `agy_acp_server` to use the bundled default. If Neovim cannot find `agy` on its search path, set that override to the absolute path to `agy` followed by `acp` and `--process-per-session`, as separate command entries.
+
+After steering an Antigravity response, separate replies may first stream together. When the turn settles, Forge separates them if the CLI's saved transcript confirms the boundary. If you stop the later reply, a confirmed earlier reply stays visible.
+
+Antigravity's `/skills` and `/mcp` show the current resource selection. Press `e` or `d` to enable or disable the selected resource for future conversations in its global or workspace scope. Forge applies those defaults the next time it opens a native binding.
+
+The first startup of a recognized retired layout asks you to run `:ForgeHistoryClear`. The command clears retired history after its owners release it. It keeps a compatible `settings.db`, permission rules, and subagent profiles in place. It moves incompatible settings databases and older provider selection and logging files to `retired-settings/` inside the Harness data directory for manual recovery. If the current settings database needs to be created, Forge starts with defaults for the archived choices. The next Harness start reports the cutover once, in one editor. Later clears preserve `retired-settings/` along with active settings. An unknown layout or corrupt canonical database reports an error.
 
 `harness_session_log` reads newest-first and returns up to 1,000 complete entries
 per page by default. Its optional positive integer `limit` selects another page
@@ -359,10 +367,11 @@ popup by default. Saved tool rules still apply. File access, write mode, and
 protected-path checks remain enforced. External MCP and provider tools keep their
 normal approval behavior.
 
-Harness sessions suppress provider-native question, agent, plan, and task tools
-that compete with Harness workflows. File, shell, and web tools remain available.
-Codex's separate `send_message_to_user_async` tool may still appear when its model
-catalog enables it; the native feature flag does not fully suppress that tool.
+Forge suppresses competing native question, agent, plan, and task tools where the
+provider supports suppression. File, shell, and web tools remain available.
+Antigravity retains its native task, question, messaging, and subagent tools. Its
+Forge profile excludes the CLI scheduler. Codex's separate `send_message_to_user_async`
+tool may still appear when its model catalog enables it.
 
 File-write permission popups offer **Always allow writes in this workspace** for
 paths inside the current workspace. The choice persists a workspace-specific rule,
@@ -477,7 +486,8 @@ file scan.
 `/fork [name]` opens a child timeline with a snapshot of the source's visible history
 above its fork marker. New child messages append below that marker. Source updates do
 not change the copied history, and pending questions, tasks, and agents do not resume
-in the child. Inherited question and plan controls are inactive.
+in the child. Inherited question and plan controls are inactive. `/fork` and `/btw`
+require native fork support, which Antigravity lacks.
 
 `/fork` works while the source is running a turn. The child then stops at the source's
 last finished exchange, and its fork marker reads "Forked before the unfinished
@@ -678,7 +688,8 @@ list `ot` shows.
 Thought headers show successful/total tools and append changed-file counts when
 nonzero. Repeated successful edits to one file count once. Individual tool errors
 and compaction details remain available in the expanded timeline.
-`/compact` asks the provider to compact the conversation's context and adds one
+`/compact` requires manual compaction support, which Antigravity lacks. It asks the
+provider to compact the conversation's context and adds one
 `Context compacted` row with the context size before and after the compaction, as the
 provider reports them; a provider that reports no counts gets no figures. Both figures measure
 the whole context, so on a short conversation they can rise: a summary longer than the few
@@ -859,11 +870,12 @@ host restart. With no failed message, `Alt-R` resumes a paused queue. A failed
 message pauses the queue, and a prompt you send after it runs as the next exchange
 while the failed message stays, unsent, for `Alt-R`. Follow-ups queued behind a failed
 message wait for it, and the heading then reads
-`Queued follow-up inputs · paused · <M-r> retry`. For uncertain
-delivery, the same shortcut checks provider acceptance before permitting a resend; an
-entry whose delivery is uncertain after a host restart requires manual delivery
-confirmation and is not resent by this shortcut. Explicitly queued messages do not
-interrupt the active response or checks.
+`Queued follow-up inputs · paused · <M-r> retry`. For uncertain delivery, `Alt-R`
+opens **Unconfirmed input**. Choose **Reconcile delivery** to check receipt and retry
+only if the provider confirms it never received the message. Choose **Discard queue
+entry** to let later prompts proceed. An unconfirmed editor
+submission stays in the queue until the host confirms it or you discard it.
+Explicitly queued messages do not interrupt the active response or checks.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
@@ -947,7 +959,8 @@ Submit, queue, steer, and queue-editing keys first let any paste that preceded t
 the terminal input land, so a path pasted and submitted in one burst waits for its
 import. If the draft changes in any other way before the key takes effect, such as by
 keys typed right after it in the same burst, Harness sends nothing, keeps the draft,
-and shows a notice.
+and shows a notice. Switching to another Harness composer before the action runs
+also leaves the drafts in place.
 
 `/config` includes an **LSP** toggle under **Tools**. It enables the
 [LSP tools](lsp-tools.md) for code exploration and permission-checked symbol,

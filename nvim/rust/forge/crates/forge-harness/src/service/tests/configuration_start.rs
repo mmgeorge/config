@@ -10,6 +10,81 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// Report the normalized catalog failure and allow another configuration before the first prompt.
+#[tokio::test]
+async fn model_catalog_failure_does_not_fence_session_configuration() -> Result<()> {
+    use crate::exchange::command::{CommandFailure, ConfigurationRejection, ExecuteCommandError};
+    use forge_provider_api::{ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation};
+
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let provider_id = forge_providers::registry::nonselectable_id().context("no fixture provider")?;
+    let descriptor = forge_providers::registry::descriptor(&provider_id)?;
+    let fail_catalog = Arc::new(AtomicBool::new(true));
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |_, _, _, _| async { panic!("model configuration must not dispatch a native prompt") },
+    );
+    native.with_models(vec![serde_json::from_value(json!({
+        "id":"fixture-model", "reasoning":["low","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?]);
+    native.with_model_list_answer({
+        let fail_catalog = fail_catalog.clone();
+        move || {
+            let fail = fail_catalog.load(Ordering::Acquire);
+            async move {
+                if fail {
+                    Err(ProviderError::Failure(ProviderFailure::new(
+                        ProviderOperation::ModelList,
+                        ProviderFailureKind::Timeout,
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    });
+    let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
+    broker.set_provider_for_test(provider.provider_handle());
+    let controller = SessionController::new(broker).await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.start_provider(&sink).await;
+    controller.attach_input(&sink).await?;
+
+    let request = Request {
+        id: 1,
+        method: "session.configure".into(),
+        params: json!({"model":"fixture-model","effort":"high","session_policy":true}),
+    };
+    let result = controller
+        .execute_command(super::super::native_settings::decode_command(&request)?, &sink)
+        .await;
+    ensure!(matches!(
+        result,
+        Err(ExecuteCommandError::Failed(CommandFailure::ConfigurationRejected(
+            ConfigurationRejection::Provider(ProviderFailureKind::Timeout)
+        )))
+    ));
+    fail_catalog.store(false, Ordering::Release);
+    controller
+        .execute_command(super::super::native_settings::decode_command(&request)?, &sink)
+        .await?;
+    ensure!(controller.broker.lock().await.snapshot()?.session.effort == "high");
+    controller.input_stopping.store(true, Ordering::Release);
+    controller.coordinator.submissions.changed.notify_one();
+    controller.finish_exchange_owner().await?;
+    provider.provider_handle().shutdown().await?;
+    controller.finish_session_events().await?;
+    reader.abort();
+    Ok(())
+}
+
 /// A configuration change sent after the provider took a turn's input, but before the provider
 /// reported that turn's native start, waits for the start and then restarts the turn.
 ///

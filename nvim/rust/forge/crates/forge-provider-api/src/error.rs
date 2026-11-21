@@ -586,7 +586,12 @@ impl std::fmt::Display for ProviderError {
             Self::Interrupted => formatter.write_str("provider execution interrupted"),
             Self::Retryable(error) => std::fmt::Display::fmt(error, formatter),
             Self::Delivery(error) => std::fmt::Display::fmt(error, formatter),
-            Self::Explained { cause, explanation } => write!(formatter, "{cause}: {explanation}"),
+            Self::Explained { cause, explanation } => match cause.as_ref() {
+                Self::Failure(failure) if failure.kind() == ProviderFailureKind::Authentication => {
+                    write!(formatter, "provider {:?} failed: {explanation}", failure.operation())
+                }
+                _ => write!(formatter, "{cause}: {explanation}"),
+            },
         }
     }
 }

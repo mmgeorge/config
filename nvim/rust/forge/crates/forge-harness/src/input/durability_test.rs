@@ -621,3 +621,25 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
     }
     Ok(())
 }
+
+/// Reopen after shutdown committed receipt retirement but lost the queue write.
+#[test]
+fn shutdown_retirement_restores_the_unsent_draft() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
+    let submission = claim_with_submission(&queue, &submissions)?;
+    submission.retire_prepared_for_queue()?;
+    drop(queue);
+
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions, &Default::default())?;
+    let snapshot = queue.snapshot()?;
+    let [message] = snapshot.messages.as_slice() else {
+        anyhow::bail!("recovery dropped the unsent draft");
+    };
+    assert_eq!(message.id, "message");
+    assert_eq!(message.delivery(), InputDelivery::Queued);
+    assert!(message.submission_id().is_none());
+    assert!(snapshot.suspended);
+    Ok(())
+}

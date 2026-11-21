@@ -650,7 +650,8 @@ function M.open(state, host, resume_state, defaults)
         and (not defaults or defaults.current())
     end
     local function model_descriptor()
-      return require("forge.views.harness.model_options").find(main_catalog.model_list, active.model)
+      local model = active.model == "default" and active.resolved_model or active.model
+      return require("forge.views.harness.model_options").find(main_catalog.model_list, model)
     end
     local function change_main(id, direction)
       if id == "main-model" then
@@ -666,8 +667,8 @@ function M.open(state, host, resume_state, defaults)
           end
         end
       elseif id == "main-thinking" then
-        local model = model_descriptor()
-        configure({ effort = cycle(model and model.reasoning or {}, active.effort, direction) })
+        local choices = require("forge.views.harness.model_options").reasoning_choices(model_descriptor())
+        configure({ effort = cycle(choices, active.effort, direction) })
       elseif id == "main-speed" then
         local values = require("forge.views.harness.model_options").speeds(model_descriptor(), state.capability or {})
         configure({ service_tier = cycle(values, active.service_tier or "default", direction) })
@@ -741,6 +742,7 @@ function M.open(state, host, resume_state, defaults)
       local background_fields = { background.provider, background.model, background.thinking }
       if background.speed then background_fields[#background_fields + 1] = background.speed end
       local capability = state.capability or {}
+      local model_options = require("forge.views.harness.model_options")
       ---@param id string
       ---@param kind 'choice'|'toggle'|'input'|'action'
       ---@param value string|boolean
@@ -754,17 +756,23 @@ function M.open(state, host, resume_state, defaults)
           disabled_reason = disabled, muted = muted,
           input = kind == "input" and { kind = "choice", values = duration.choices(), initial = duration.selection(active[id]) } or nil }
       end
-      local catalog_disabled = not main_catalog.model_list and (main_catalog.failure or "Loading models") or nil
+      local catalog_disabled = not main_catalog.model_list and (main_catalog.failure or "Loading models")
+        or #main_catalog.model_list == 0 and "The provider advertised no models." or nil
+      local function thinking_disabled(model)
+        if catalog_disabled then return catalog_disabled end
+        if not capability.effort_selection then return "Reasoning effort selection is unavailable for this provider" end
+        if not model or #(model.reasoning or {}) == 0 then return "This model advertises no reasoning choices." end
+      end
       local ask_disabled = not ask.model and "Enable Override to change Ask settings." or catalog_disabled
+      local model_id = active.model == "default" and active.resolved_model or active.model
       local main = {
         field("main-provider", "action", cli or "Unknown", "Provider"),
-        field("main-model", "choice", active.model
-          and require("forge.views.harness.model_options").label(main_catalog.model_list, active.model) or "Default", nil,
+        field("main-model", "choice", model_id and model_options.label(main_catalog.model_list, model_id) or "Default", nil,
           not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
         field("main-thinking", "choice", active.effort or "Default", "Thinking",
-          not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or catalog_disabled),
+          thinking_disabled(model_descriptor())),
       }
-      local speeds = require("forge.views.harness.model_options").speeds(model_descriptor(), capability)
+      local speeds = model_options.speeds(model_descriptor(), capability)
       main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed",
         catalog_disabled or (#speeds == 1 and (active.service_tier or "default") == "default"
           and "This model only supports default speed" or nil))
@@ -809,11 +817,11 @@ function M.open(state, host, resume_state, defaults)
             }),
             row("models", "ask-model", "Ask model", "Model", {
               field("ask-model", "choice", (ask.model or active.resolved_model or active.model)
-                and require("forge.views.harness.model_options").label(main_catalog.model_list,
+                 and model_options.label(main_catalog.model_list,
                   ask.model or active.resolved_model or active.model) or "Default", nil,
                 ask_disabled or not capability.model_selection and "Model selection is unavailable for this provider" or nil),
               field("ask-thinking", "choice", ask.model and (ask.effort or "Default") or (active.effort or "Default"), "Thinking",
-                ask_disabled or not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or nil),
+                ask_disabled or thinking_disabled(model_options.find(main_catalog.model_list, ask.model))),
               field("ask-speed", "choice", ask.model and (ask.service_tier or "default") or (active.service_tier or "default"), "Speed",
                 ask_disabled),
             }),

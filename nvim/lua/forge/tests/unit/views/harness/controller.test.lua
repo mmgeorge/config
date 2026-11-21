@@ -1142,9 +1142,10 @@ T["unavailable_queue_edit_submit"] = function()
   local controller = require("forge.views.harness.controller")
   local input = require("forge.views.harness.input_state")
   local requests = mock_client.record()
-  local warnings = {}
+  local warnings, saved = {}, {}
   controller.refresh_winbar = function() end
-  require("forge.views.harness.prompt_history").record = function() end
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  stub(require("forge.views.harness.prompt_history"), "record", function(draft) saved[#saved + 1] = draft end)
   require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
   state.session = { id = "missing-edit", provider = "mock" }
   state.composer_buf = buffer.scratch()
@@ -1159,12 +1160,14 @@ T["unavailable_queue_edit_submit"] = function()
   requests[1].callback({ revision = 1, messages = {
     { id = "queued", revision = 1, text = "original", delivery = "queued", attachments = {} },
   }, suspended = false })
+  buffer.set(state.composer_buf, "earlier draft")
   controller.edit_queued(-1)
   input.receive(state, { revision = 2, removed = { "queued" }, upsert = {} })
   buffer.set(state.composer_buf, "new prompt")
   controller.submit()
   eq(state.queue_edit, nil)
   eq(buffer.text(state.composer_buf), "new prompt")
+  eq(saved, { { text = "earlier draft", attachments = {} } })
   eq(#warnings, 1)
   eq(requests[#requests].spec.params.action.kind, "release")
   controller.submit()
@@ -1197,6 +1200,50 @@ T["retry_input_resumes_a_paused_queue"] = function()
   } })
   retry({})
   eq({ requests[#requests].spec.params.action.kind, requests[#requests].spec.params.action.id }, { "retry", "failed" })
+end
+
+T["unknown_input_can_be_discarded_without_retrying"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local input = require("forge.views.harness.input_state")
+  local requests = mock_client.record()
+  local picker = require("forge.views.picker")
+  local opened
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  stub(picker, "open", function(options) opened = options end)
+  state.session = { id = "unconfirmed-queue", provider = "mock" }
+  state.composer_buf = buffer.scratch()
+  input.attach(state, function() end)
+  requests[1].callback({ revision = 1, suspended = true, messages = {
+    { id = "unknown", revision = 3, text = "Delivery unconfirmed", delivery = "unknown", intent = "auto", attachments = {} },
+  } })
+  local retry = require("forge.shared.view_command_set").action(controller.command_set(), "retry_input").run
+  retry({})
+  eq(opened ~= nil, true)
+  eq(#requests, 1)
+  local discard = opened.page_list[1].option_list[2]
+  opened.on_confirm({ option = discard })
+  eq(requests[#requests].spec.params.action, { kind = "remove", id = "unknown", revision = 3 })
+end
+
+T["deferred_submit_keeps_the_originating_composer"] = function()
+  local session = require("forge.session")
+  local controller = require("forge.views.harness.controller")
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local origin, destination = session.harness, session.new_harness_state()
+  origin.composer_buf, destination.composer_buf = buffer.scratch(), buffer.scratch()
+  buffer.set(origin.composer_buf, { "Origin draft" })
+  buffer.set(destination.composer_buf, { "Other draft" })
+  local scheduled, submitted
+  stub(vim, "schedule", function(callback) scheduled = callback end)
+  stub(controller, "submit", function() submitted = session.harness end)
+  notify.capture({ min_level = vim.log.levels.WARN, notifications = true })
+  local submit = require("forge.shared.view_command_set").action(controller.command_set(), "submit").run
+  submit({})
+  session.select_harness(destination)
+  scheduled()
+  eq(submitted == destination, false)
+  eq(buffer.text(destination.composer_buf), "Other draft")
 end
 
 -- A composer send runs one main-loop turn after its key, while an interrupt runs at once, so the

@@ -471,8 +471,8 @@ impl std::fmt::Debug for McpTransport {
 
 /// Own one journaled delivery attempt and its immutable invocation authority.
 /// The host issues scope, submission, and attempt IDs. The adapter validates them together
-/// with the dispatch reporter and receipt before sending. All callbacks use this request's
-/// endpoints and authority; none may fall back to a previous invocation. Release strong
+/// with the dispatch reporter and receipt before sending. Each callback uses the authority of
+/// the invocation that admits it. Release strong
 /// callback/resource copies when their native scope is collected, keeping only weak replay identity.
 #[derive(Clone)]
 pub struct PromptRequest {
@@ -490,8 +490,8 @@ pub struct PromptRequest {
     /// Providers with mutable catalogs advertise this subset; immutable catalogs may retain the
     /// session's registration superset but must reject every call absent from this list.
     pub tools: Vec<crate::control::ControlToolDefinition>,
-    /// Bind MCP tool calls to this invocation's immutable host endpoint before dispatch.
-    /// An adapter must not reuse a previous invocation's endpoint for new input.
+    /// Optional host endpoint for invocation-specific transport. Adapters with a binding-owned
+    /// endpoint receive it in `SessionRequest` and route calls through the active authority.
     pub tool_endpoint: Option<HostToolEndpoint>,
     /// Keep invocation-specific transport resources alive until callbacks are collected.
     pub resource_lease: Option<std::sync::Arc<dyn ResourceLease>>,
@@ -616,6 +616,8 @@ pub struct SteeringRequest {
     pub scope: InvocationScope,
     /// Distinguish durable user input from a host-generated contextual notification.
     pub delivery: SteeringDelivery,
+    /// Report local transport handoff for a tracked journaled steer when supported.
+    pub dispatch: Option<crate::submission::DispatchReporter>,
     /// Carry the steered input: the user's words, or a typed Harness input such as a question
     /// response, rendered with [`crate::forge::input_block`] and no standing context.
     pub input: crate::forge::TurnInput,
@@ -635,6 +637,7 @@ impl PartialEq for SteeringRequest {
     fn eq(&self, other: &Self) -> bool {
         self.scope == other.scope
             && self.delivery == other.delivery
+            && self.dispatch == other.dispatch
             && self.input == other.input
             && self.attachments == other.attachments
     }

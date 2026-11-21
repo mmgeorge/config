@@ -1,6 +1,6 @@
 //! Stage settings I/O as facts while the exchange owner retains every commit decision.
 
-use super::command::{CommandId, SessionConfigurationPatch};
+use super::command::{CommandId, ConfigurationRejection, SessionConfigurationPatch};
 use super::failure::OperationFailure;
 use super::transition::ChildCollectionPolicy;
 use crate::broker::publication::SessionUpdate;
@@ -9,14 +9,14 @@ use crate::broker::{
     ConfigurationPreparation, ConfigurationReconcileJob, ConfigurationReconcileResult,
     HarnessBroker,
 };
-use crate::provider::ProviderModel;
+use crate::provider::{ConfigurationResources, ProviderModel};
 
 /// Retain validation, provider work, and host commit for one immutable settings patch.
 pub(super) struct SettingsRun {
     patch: SessionConfigurationPatch,
     owner: SettingsOwner,
     stage: SettingsStage,
-    resource_notices: ResourceNoticePolicy,
+    resources: Option<ConfigurationResources>,
     deadline: Option<tokio::time::Instant>,
 }
 
@@ -31,7 +31,7 @@ impl SettingsRun {
             patch,
             owner: SettingsOwner::Command(command),
             stage: SettingsStage::Preparing(PreparationPurpose::Inspect),
-            resource_notices: ResourceNoticePolicy::Preserve,
+            resources: None,
             deadline: Some(admitted_at + std::time::Duration::from_secs(30)),
         }
     }
@@ -44,7 +44,7 @@ impl SettingsRun {
             patch: SessionConfigurationPatch::queued_model(settings)?,
             owner: SettingsOwner::Input,
             stage: SettingsStage::Preparing(PreparationPurpose::Inspect),
-            resource_notices: ResourceNoticePolicy::Preserve,
+            resources: None,
             deadline: None,
         })
     }
@@ -53,6 +53,16 @@ impl SettingsRun {
     pub(super) fn collected(&mut self) {
         assert!(matches!(self.stage, SettingsStage::AwaitingCollection));
         self.stage = SettingsStage::Preparing(PreparationPurpose::Apply);
+    }
+
+    /// Check whether the next fact can be dropped before configuration changes any state.
+    pub(super) fn can_abandon_before_apply(&self, event: &SettingsEvent) -> bool {
+        matches!(
+            (&self.stage, event),
+            (SettingsStage::Preparing(_), SettingsEvent::Ready)
+                | (SettingsStage::Catalog { .. }, SettingsEvent::Catalog(_))
+                | (SettingsStage::Resources { .. }, SettingsEvent::Resources(_))
+        )
     }
 
     /// Start internal settings timing only once it has acquired its enclosing execution admission.
@@ -69,6 +79,11 @@ impl SettingsRun {
             SettingsStage::Catalog { task, .. } => tokio::select! {
                 biased;
                 result = task => SettingsEvent::Catalog(result.unwrap_or_else(|error| Err(OperationFailure::JobObservationLost(error)))),
+                _ = tokio::time::sleep_until(deadline) => SettingsEvent::Deadline,
+            },
+            SettingsStage::Resources { task, .. } => tokio::select! {
+                biased;
+                result = task => SettingsEvent::Resources(result.unwrap_or_else(|error| Err(OperationFailure::JobObservationLost(error)))),
                 _ = tokio::time::sleep_until(deadline) => SettingsEvent::Deadline,
             },
             SettingsStage::Reconcile { task, .. } => tokio::select! {
@@ -148,7 +163,15 @@ impl SettingsRun {
                             purpose,
                             preparation,
                             task: tokio::spawn(async move {
-                                job.run().await.map_err(OperationFailure::Domain)
+                                job.run().await.map_err(|error| {
+                                    let failure = crate::provider::lifecycle_error::diagnostic(
+                                        forge_provider_api::ProviderOperation::ModelList,
+                                        error.as_ref(),
+                                    );
+                                    let rejection =
+                                        ConfigurationRejection::Provider(failure.kind());
+                                    OperationFailure::Validation(error.context(rejection))
+                                })
                             }),
                         };
                         return Ok(SettingsProgress::Waiting);
@@ -165,17 +188,30 @@ impl SettingsRun {
                     Ok(SettingsProgress::Waiting)
                 }
                 SettingsStage::Finalizing => {
+                    let immutable_resources = match &self.resources {
+                        Some(ConfigurationResources::Immutable(resources)) => {
+                            Some(resources.as_ref())
+                        }
+                        _ => None,
+                    };
                     if let SettingsOwner::Command(command) = &self.owner {
                         let action = serde_json::json!({"operation_id":command.as_str(),"config":self.patch.encode_legacy().map_err(|error| OperationFailure::Domain(error.into()))?});
                         broker
-                            .confirm_configuration_application(&action)
+                            .confirm_configuration_application(&action, immutable_resources)
                             .map_err(OperationFailure::Domain)?;
                     }
-                    let updates = match self.resource_notices {
-                        ResourceNoticePolicy::Preserve => Vec::new(),
-                        ResourceNoticePolicy::Refresh => {
+                    let resources = match &self.resources {
+                        Some(ConfigurationResources::Immutable(resources)) => {
+                            Some(resources.as_ref())
+                        }
+                        Some(ConfigurationResources::Desired(resources)) => resources.as_deref(),
+                        None => None,
+                    };
+                    let updates = match resources {
+                        None => Vec::new(),
+                        Some(resources) => {
                             let mut notices = broker
-                                .prepare_configuration_mcp_notices()
+                                .prepare_configuration_mcp_notices(resources)
                                 .map_err(OperationFailure::Domain)?;
                             let updates = std::mem::take(&mut notices.deliveries)
                                 .into_iter()
@@ -190,6 +226,7 @@ impl SettingsRun {
                     Ok(SettingsProgress::Committed { updates })
                 }
                 SettingsStage::Catalog { .. }
+                | SettingsStage::Resources { .. }
                 | SettingsStage::AwaitingCollection
                 | SettingsStage::Reconcile { .. }
                 | SettingsStage::Consumed => {
@@ -209,6 +246,13 @@ impl SettingsRun {
                     .commit_configuration_catalog(result?)
                     .map_err(OperationFailure::Domain)?;
                 self.validate(broker, purpose, preparation, &models)
+            }
+            SettingsEvent::Resources(result) => {
+                let SettingsStage::Resources { candidate, .. } = stage else {
+                    unreachable!("resource facts belong to the retained candidate task")
+                };
+                self.resources = Some(result?);
+                self.reconcile(broker, candidate)
             }
             SettingsEvent::Reconciled(result) => {
                 let SettingsStage::Reconcile {
@@ -243,6 +287,10 @@ impl SettingsRun {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(_)) | Err(_) => Err(crate::provider::ProviderError::DeliveryUncertain),
                 }
+            })),
+            SettingsStage::Resources { task, .. } => Some(tokio::spawn(async move {
+                let _ = task.await;
+                Ok(())
             })),
             SettingsStage::Reconcile {
                 task, candidate, ..
@@ -288,6 +336,31 @@ impl SettingsRun {
                 return Ok(SettingsProgress::Collect(children));
             }
         }
+        if candidate.has_resource_selection() {
+            let request = broker
+                .provider_catalog_request()
+                .map_err(OperationFailure::Domain)?;
+            let provider = broker.provider_handle();
+            self.stage = SettingsStage::Resources {
+                candidate,
+                task: tokio::spawn(async move {
+                    provider
+                        .configuration_resources(&request)
+                        .await
+                        .map_err(OperationFailure::Validation)
+                }),
+            };
+            return Ok(SettingsProgress::Waiting);
+        }
+        self.reconcile(broker, candidate)
+    }
+
+    /// Reconcile the candidate after capturing any resource settings it will confirm.
+    fn reconcile(
+        &mut self,
+        broker: &HarnessBroker,
+        candidate: Box<ConfigurationCandidate>,
+    ) -> Result<SettingsProgress, OperationFailure> {
         if let Some(revision) = self.patch.application_revision() {
             let SettingsOwner::Command(command) = &self.owner else {
                 unreachable!(
@@ -298,11 +371,6 @@ impl SettingsRun {
                 .owner_begin_configuration_application(command, revision)
                 .map_err(OperationFailure::Domain)?;
         }
-        self.resource_notices = if candidate.has_resource_selection() {
-            ResourceNoticePolicy::Refresh
-        } else {
-            ResourceNoticePolicy::Preserve
-        };
         self.stage = match broker
             .prepare_candidate_reconcile(&candidate)
             .map_err(OperationFailure::Domain)?
@@ -339,6 +407,7 @@ enum SettingsOwner {
 pub(super) enum SettingsEvent {
     Ready,
     Catalog(Result<ConfigurationCatalogResult, OperationFailure>),
+    Resources(Result<ConfigurationResources, OperationFailure>),
     Reconciled(Result<ConfigurationReconcileResult, OperationFailure>),
     Deadline,
 }
@@ -349,6 +418,7 @@ impl SettingsEvent {
         match self {
             Self::Ready => "settings_ready",
             Self::Catalog(_) => "settings_catalog_completed",
+            Self::Resources(_) => "settings_resources_captured",
             Self::Reconciled(_) => "settings_reconcile_completed",
             Self::Deadline => "settings_deadline",
         }
@@ -368,18 +438,16 @@ enum PreparationPurpose {
     Apply,
 }
 
-#[derive(Clone, Copy)]
-enum ResourceNoticePolicy {
-    Preserve,
-    Refresh,
-}
-
 enum SettingsStage {
     Preparing(PreparationPurpose),
     Catalog {
         purpose: PreparationPurpose,
         preparation: Box<ConfigurationPreparation>,
         task: tokio::task::JoinHandle<Result<ConfigurationCatalogResult, OperationFailure>>,
+    },
+    Resources {
+        candidate: Box<ConfigurationCandidate>,
+        task: tokio::task::JoinHandle<Result<ConfigurationResources, OperationFailure>>,
     },
     AwaitingCollection,
     Reconcile {

@@ -1026,6 +1026,7 @@ local goal_request = {}
 local status_thought_request = {}
 local configuration_request = {}
 local timeline_source = { "Native transcript" }
+local model_source = {}
 local staged_response, staged_request
 local hold_staging, staging_reply, staging_count, fail_selection = false, nil, 0, false
 local submitted_callback, cancellation_callback
@@ -1069,7 +1070,7 @@ client.request = function(request_specification, callback)
   if method == "session.health.get" then callback({ responsive = true }) return end
   if method == "session.state.get" then callback({ session = state.session }) return end
   if method == "session.prompt.history.record" then vim.schedule(function() callback({}) end) return end
-  if method == "session.provider.model.list" then callback({}) return end
+  if method == "session.provider.model.list" then callback(model_source) return end
   assert(method == "session.document")
   if params.operation == "open" then
     initial[#initial + 1] = params
@@ -1450,14 +1451,15 @@ do
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar, { use_winbar = true, maxwidth = 200 }).str
   assert(title:find("Saved Alias 5", 1, true) and not title:find("saved-alias", 1, true),
     "a session without a loaded catalog did not display its saved model label")
-  state.session.model, state.session.model_label = "default", nil
+  state.session.model, state.session.model_label, state.session.effort = "default", nil, "default"
+  model_source = { { id = "resolved-model", label = "Live Model", is_default = true,
+    reasoning = { "high" }, default_reasoning = "high" } }
   receive("provider_event", { kind = "runtime_resolved", data = {
     session_id = "native-controller", provider = "Mock CLI", model = "resolved-model",
   } }, "native-controller")
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
-  assert(title:find("resolved-model", 1, true) and not title:find("resolving model", 1, true),
-    "running session did not publish the resolved model immediately")
+  MiniTest.expect.equality(title:find("Live Model high", 1, true) ~= nil, true, { fail_reason = title })
   receive("provider_event", { kind = "runtime_resolved", data = {
     session_id = "other-session", model = "wrong-model",
   } }, "native-controller")
@@ -2616,13 +2618,15 @@ T["cancellation_restores_prompt_and_clears_status"] = function()
     local operation = state.cleanup_request_id
     controller.cancel_turn()
     eq(state.cleanup_request_id, operation)
-    -- The host keeps the retracted prompt as an unsent entry. The editor removes that entry once
-    -- its composer holds the text again, and leaves it queued when the composer holds newer text.
+    -- The host keeps the retracted prompt as an unsent entry. The editor restores the composer
+    -- after the removal receipt and leaves the entry queued when the composer holds newer text.
     -- The submitted prompt can still be queued in this view when the wait starts, so the newer-text
     -- scenario waits for the unsent entry itself instead of for a count the prompt also satisfies.
     wait_until(function()
       if not (state.cancellation and state.cancellation.phase == "settled") then return false end
-      if not scenario.newer then return #state.input.confirmed == 0 end
+      if not scenario.newer then
+        return #state.input.confirmed == 0 and buffer.text(state.composer_buf) == scenario.prompt
+      end
       return #state.input.confirmed == 1 and state.input.confirmed[1].delivery == "failed"
     end, "Cancellation did not settle its input")
     eq(buffer.text(state.composer_buf), scenario.newer or scenario.prompt)
@@ -2816,8 +2820,10 @@ submission.start(state, { text = "retract before output", context = state.presen
 host.flush()
 local retracted = assert(retained_message("retract before output"))
 host.retract(retracted.id)
-assert(composer_text() == "retract before output", "retraction did not restore the unchanged composer")
+eq(composer_text(), "")
+eq(host.requests[#host.requests].parameters.action.kind, "remove")
 host.flush()
+assert(composer_text() == "retract before output", "confirmed retraction did not restore the unchanged composer")
 assert(not retained_message("retract before output"), "the restored prompt also stayed in the queue")
 compose("retract while typing")
 submission.start(state, { text = "retract while typing", context = state.presentation.capture_prompt() }, function() end)

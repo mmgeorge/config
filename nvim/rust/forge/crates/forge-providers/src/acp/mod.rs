@@ -3,6 +3,7 @@ mod child_turn;
 mod connection;
 mod kind;
 mod resources;
+pub(crate) use resources::mcp_launch_incompatibility;
 pub(crate) use kind::AcpKind;
 mod profile;
 mod response;
@@ -29,3 +30,4 @@ mod session_fixture_test;
 mod wire_fixture_test;
 
 mod tool_semantics;
+mod transcript;

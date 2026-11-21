@@ -67,6 +67,23 @@ impl ContextDelivery {
         }
     }
 
+    /// Select every section when the provider can discard history without reporting it.
+    pub(super) fn all(&self, sections: StandingSections) -> TurnContext {
+        let StandingSections {
+            permissions,
+            aside,
+            agent,
+            task,
+        } = sections;
+        TurnContext {
+            record: self.record.clone(),
+            permissions,
+            aside,
+            agent,
+            task,
+        }
+    }
+
     /// Record the sections of a submission the provider accepted.
     ///
     /// Context another record selected, such as one that existed before a rebind, is ignored.
@@ -88,12 +105,9 @@ impl ContextDelivery {
         }
     }
 
-    /// Forget every delivered section after an event that may have removed it from history.
+    /// Replace the record after a history change so acceptance from before it stays stale.
     pub(super) fn clear(&mut self) {
-        self.permissions = None;
-        self.aside = None;
-        self.agent = None;
-        self.task = None;
+        *self = Self::new();
     }
 }
 
@@ -168,6 +182,18 @@ mod tests {
             names(&delivery.pending(sections("ship", ApprovalMode::Ask))),
             (true, true)
         );
+    }
+
+    /// Acceptance of a prompt prepared before compaction cannot restore its delivery record.
+    #[test]
+    fn clearing_rejects_receipts_from_before_compaction() {
+        let mut delivery = ContextDelivery::new();
+        let original = delivery.pending(sections("ship", ApprovalMode::Ask));
+        delivery.clear();
+        delivery.commit(&original);
+        let current = delivery.pending(sections("ship", ApprovalMode::Ask));
+        assert_ne!(current.record, original.record);
+        assert_eq!(names(&current), (true, true));
     }
 
     /// Deliver an aside's origin once, and again after history may have lost it.

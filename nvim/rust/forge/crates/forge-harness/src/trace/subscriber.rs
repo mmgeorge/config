@@ -95,7 +95,7 @@ where
         id: &tracing::Id,
         context: Context<'_, RegistryType>,
     ) {
-        let mut fields = DiagnosticFields::default();
+        let mut fields = DiagnosticFields::for_target(attributes.metadata().target());
         attributes.record(&mut fields);
         if let Some(span) = context.span(id) {
             span.extensions_mut().insert(fields);
@@ -121,10 +121,7 @@ where
         let Some(writer) = self.writer() else {
             return;
         };
-        let mut fields = DiagnosticFields::default();
-        if event.metadata().target() == "forge::record" {
-            fields.source = FieldSource::Metadata;
-        }
+        let mut fields = DiagnosticFields::for_target(event.metadata().target());
         event.record(&mut fields);
         let mut span_path = Vec::new();
         let mut inherited = Map::new();
@@ -193,18 +190,41 @@ where
     }
 }
 
-#[derive(Default)]
 enum FieldSource {
-    #[default]
+    Dependency,
     Native,
     Metadata,
 }
 
-#[derive(Default)]
 struct DiagnosticFields {
     values: Map<String, Value>,
     payload: Option<String>,
     source: FieldSource,
+}
+
+impl DiagnosticFields {
+    /// Keep dependency events structural because their diagnostic text can contain wire messages.
+    fn for_target(target: &str) -> Self {
+        let source = if target == "forge::record" {
+            FieldSource::Metadata
+        } else if target.starts_with("forge") {
+            FieldSource::Native
+        } else {
+            FieldSource::Dependency
+        };
+        Self {
+            values: Map::new(),
+            payload: None,
+            source,
+        }
+    }
+
+    /// Include free-form diagnostics authored by Forge and allowlisted metadata from every source.
+    fn accepts(&self, key: &str) -> bool {
+        diagnostic_field(key)
+            || (!matches!(self.source, FieldSource::Dependency)
+                && matches!(key, "message" | "error" | "event_name"))
+    }
 }
 
 impl Visit for DiagnosticFields {
@@ -212,9 +232,7 @@ impl Visit for DiagnosticFields {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "payload" && matches!(self.source, FieldSource::Metadata) {
             self.payload = Some(value.into());
-        } else if diagnostic_field(field.name())
-            || matches!(field.name(), "message" | "error" | "event_name")
-        {
+        } else if self.accepts(field.name()) {
             self.values.insert(field.name().into(), value.into());
         }
     }
@@ -252,8 +270,7 @@ impl Visit for DiagnosticFields {
 
     /// Format only allowlisted display fields, not arbitrary provider arguments.
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if diagnostic_field(field.name())
-            || matches!(field.name(), "message" | "error" | "event_name")
+        if self.accepts(field.name())
             || field.name() == "payload" && matches!(self.source, FieldSource::Metadata)
         {
             self.record_str(field, &format!("{value:?}"));

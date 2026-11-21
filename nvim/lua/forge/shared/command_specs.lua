@@ -122,7 +122,7 @@ M.view_specs = {
         queue_edit = function(state) if state.queue_edit then return "unqueue" end end } },
     { id = "steer", label = "steer", desc = "Send the composer into the active provider turn", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if require("forge.views.harness.activity").busy(state) and state.capability and state.capability.native_steer then return "steer" end end } },
-    { id = "retry_input", label = "retry input", desc = "Retry the first failed input, resume a paused queue, or reconcile unconfirmed delivery", modes = { "n", "i" }, pinned = false,
+    { id = "retry_input", label = "retry input", desc = "Retry failed input, resume a paused queue, or recover unconfirmed input", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state)
         for _, entry in ipairs(state.queue or {}) do if entry.error then return "retry input" end end
         if state.input and state.input.suspended and #(state.queue or {}) > 0 then return "resume queue" end

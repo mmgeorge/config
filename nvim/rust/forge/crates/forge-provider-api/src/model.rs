@@ -191,6 +191,9 @@ pub struct ProviderModel {
 /// Declares optional operations and implementation-specific explanations.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderIntegration {
+    /// Register a private, binding-owned HTTP endpoint for Harness tools.
+    #[serde(skip)]
+    pub host_tool_endpoint: bool,
     pub background_generation: bool,
     /// Generate text in fresh history separate from the main conversation.
     pub isolated_generation: bool,

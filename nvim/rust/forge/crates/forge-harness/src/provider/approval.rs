@@ -11,7 +11,7 @@ use crate::permissions::matcher::{
     PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
 };
 use crate::permissions::shell;
-use crate::permissions::store::PermissionStore;
+use crate::permissions::store::{PermissionRevocationEpoch, PermissionStore};
 use crate::provider::ScopeOwner;
 use crate::provider::events::{HarnessEventSink, HostEvent};
 use crate::provider::host_event::*;
@@ -34,15 +34,14 @@ struct ApprovalExecution<'scope> {
     directory_policy: Option<Arc<DirectoryPolicy>>,
     authority: Option<Arc<ApprovalAuthority>>,
     kind: ApprovalExecutionKind,
-    /// Whether the approval mode decides this request, as it does for every reported tool
-    /// operation that saved rules leave to the user, but not for a proposal review.
-    mode_governed: bool,
+    /// The policy that first left this tool request to the user. Proposal reviews have no epoch.
+    policy_epoch: Option<PermissionRevocationEpoch>,
 }
 
 struct PendingApproval {
     token: Uuid,
     view: ApprovalRequestView,
-    mode_governed: bool,
+    policy_epoch: Option<PermissionRevocationEpoch>,
     presentation: PermissionApprovalRequest,
     execution_kind: ApprovalExecutionKind,
     response: oneshot::Sender<ApprovalResolution>,
@@ -262,10 +261,8 @@ impl PermissionCoordinator {
 
     /// Apply a new approval mode to an owner's running callbacks and its pending requests.
     ///
-    /// The mode is Harness policy, so changing it needs no provider restart. A pending request
-    /// already passed saved rules and access checks with an Ask result, so Allow approves it and
-    /// Deny rejects it exactly as a new request under that mode would be decided; Ask leaves it
-    /// waiting for the user. Proposal reviews are not mode-governed and keep waiting.
+    /// Allow settles pending tool requests whose saved policy still admits the decision. Deny
+    /// rejects them, and Ask leaves them waiting for the user. Proposal reviews keep waiting.
     pub(crate) fn apply_approval_mode(
         &self,
         owner: &crate::provider::ThreadOwner,
@@ -277,32 +274,72 @@ impl PermissionCoordinator {
             ApprovalMode::Deny => ApprovalResolution::DenyMode,
             ApprovalMode::Ask => return Ok(()),
         };
-        let decided = {
+        // Snapshot identities before taking authority. Registration, expiry, and manual
+        // resolution acquire authority before entering the pending registry.
+        let candidates = {
+            let pending_map = self
+                .pending_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+            pending_map
+                .iter()
+                .filter(|(_, pending)| {
+                    pending.policy_epoch.is_some()
+                        && pending.view.execution_owner.as_ref() == Some(owner)
+                })
+                .map(|(id, pending)| (id.clone(), pending.token, pending.authority.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut decided = Vec::new();
+        for (id, token, authority) in candidates {
+            let Ok(generation) = authority
+                .as_ref()
+                .map(|authority| authority.0.lock())
+                .transpose()
+            else {
+                continue;
+            };
+            if generation.as_ref().is_some_and(|retired| **retired) {
+                continue;
+            }
+            let mode_by_owner = self
+                .approval_mode_by_owner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval mode lock poisoned"))?;
+            if mode_by_owner.get(owner) != Some(&mode) {
+                break;
+            }
             let mut pending_map = self
                 .pending_map
                 .lock()
                 .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-            let id_list: Vec<_> = pending_map
-                .iter()
-                .filter(|(_, pending)| {
-                    pending.mode_governed
-                        && pending.view.execution_owner.as_ref() == Some(owner)
-                        && !pending.authority.as_ref().is_some_and(|authority| {
-                            authority.0.lock().map(|retired| *retired).unwrap_or(true)
-                        })
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            id_list
-                .into_iter()
-                .filter_map(|id| pending_map.remove(&id))
-                .collect::<Vec<_>>()
-        };
+            if let std::collections::btree_map::Entry::Occupied(entry) = pending_map.entry(id)
+                && entry.get().token == token
+                && !entry
+                    .get()
+                    .view
+                    .deadline
+                    .as_ref()
+                    .is_some_and(|deadline| deadline.expired(0))
+            {
+                decided.push(entry.remove());
+            }
+        }
         if decided.is_empty() {
             return Ok(());
         }
+        let store = self.store.clone();
         tokio::spawn(async move {
             for pending in decided {
+                let resolution = if resolution == ApprovalResolution::AllowOnce
+                    && let Some(policy_epoch) = &pending.policy_epoch
+                    && store.write().map_or(true, |mut store| {
+                        store.commit_approval(policy_epoch, &[], || Ok(())).is_err()
+                    }) {
+                    ApprovalResolution::DenyPolicy
+                } else {
+                    resolution
+                };
                 // The waiter answers the provider; the resolution event only records why.
                 let _ = Self::emit_mode_resolution(&pending, resolution).await;
                 let _ = pending.response.send(resolution);
@@ -311,7 +348,7 @@ impl PermissionCoordinator {
         Ok(())
     }
 
-    /// Publish a pending request's decision by the approval mode on its own stream.
+    /// Publish a pending request's automatic decision on its own stream.
     async fn emit_mode_resolution(
         pending: &PendingApproval,
         resolution: ApprovalResolution,
@@ -320,11 +357,16 @@ impl PermissionCoordinator {
             return Ok(());
         };
         let choice = ApprovalChoice {
-            id: "approval_mode".into(),
-            label: "Decided by the approval mode".into(),
+            id: "automatic".into(),
+            label: "Decided by Harness".into(),
             resolution,
             rule_list: Vec::new(),
             directory: None,
+        };
+        let source = if resolution == ApprovalResolution::DenyPolicy {
+            ApprovalDecisionSource::SavedPolicy
+        } else {
+            ApprovalDecisionSource::ApprovalMode
         };
         let targets = pending
             .presentation
@@ -334,7 +376,7 @@ impl PermissionCoordinator {
                 Ok(ResolvedPermissionTarget {
                     target_id: target.target_id.clone(),
                     decision: automatic_decision(&choice)?,
-                    source: ApprovalDecisionSource::ApprovalMode,
+                    source,
                     rules: Vec::new(),
                     directory_grants: Vec::new(),
                 })
@@ -388,40 +430,12 @@ impl PermissionCoordinator {
     /// Bind selected bundle access to one provider execution and revoke it when the guard drops.
     pub(crate) fn skills(
         self: &Arc<Self>,
-        root: Option<&Path>,
         request: &crate::provider::ProviderRequest,
-        descriptor: &crate::provider::ProviderDescriptor,
+        selected: &[crate::settings::SkillResource],
     ) -> Result<crate::skill::SkillExecution> {
-        let target = descriptor
-            .capability
-            .integration
-            .resource_target
-            .as_deref()
-            .context("provider has no managed resource target")?;
-        let provider = descriptor.kind.as_str();
-        let selected = if request.mode == crate::provider::PromptMode::Background {
-            Vec::new()
-        } else if let Some(root) = root {
-            crate::settings::SessionResources::load(
-                root,
-                &crate::provider::ProviderCatalogRequest {
-                    execution_owner: request.execution_owner.clone(),
-                    harness_session_id: request.harness_session_id.clone(),
-                    workspace: request.workspace.clone(),
-                    access: request.access.clone(),
-                    approval_mode: request.approval_mode,
-                    provider_session_id: request.provider_session_id.clone(),
-                },
-                provider,
-                target,
-            )?
-            .selected_skill
-        } else {
-            Vec::new()
-        };
         let access = Arc::new(crate::skill::SkillAccess::new(
             &request.workspace,
-            &selected,
+            selected,
         )?);
         let owner = request.owner()?;
         let mut scope = self
@@ -663,8 +677,8 @@ impl PermissionCoordinator {
             })
             .transpose()?
             .flatten();
-        let (mut evaluation, precheck_notice) = (async {
-            let (workspace, evaluation) = {
+        let (mut evaluation, precheck_notice, policy_epoch) = (async {
+            let (workspace, evaluation, policy_epoch) = {
                 let store = self
                     .store
                     .read()
@@ -683,7 +697,7 @@ impl PermissionCoordinator {
                     }
                     evaluation
                 };
-                (workspace, evaluation)
+                (workspace, evaluation, store.revocation_epoch())
             };
             // Only an approval the user will answer runs the preflight; Allow and Deny modes
             // decide Ask without it.
@@ -701,7 +715,7 @@ impl PermissionCoordinator {
                     }
                 }
             }
-            Ok::<_, anyhow::Error>((evaluation, precheck_notice))
+            Ok::<_, anyhow::Error>((evaluation, precheck_notice, policy_epoch))
         })
         .await?;
         if evaluation.decision != PermissionDecision::Deny {
@@ -931,7 +945,7 @@ impl PermissionCoordinator {
                 directory_policy,
                 authority,
                 kind: execution_kind,
-                mode_governed: true,
+                policy_epoch: Some(policy_epoch),
             },
         )
         .await
@@ -996,7 +1010,7 @@ impl PermissionCoordinator {
                 directory_policy: None,
                 authority: None,
                 kind: ApprovalExecutionKind::Managed,
-                mode_governed: false,
+                policy_epoch: None,
             },
         )
         .await
@@ -1016,7 +1030,7 @@ impl PermissionCoordinator {
             directory_policy,
             authority,
             kind: execution_kind,
-            mode_governed,
+            policy_epoch,
         } = execution;
         if let Some(sink) = event_sink {
             view.exchange_id = sink
@@ -1079,7 +1093,7 @@ impl PermissionCoordinator {
                 PendingApproval {
                     token,
                     view: view.clone(),
-                    mode_governed,
+                    policy_epoch,
                     presentation: presentation.clone(),
                     execution_kind,
                     response: sender,
@@ -1283,27 +1297,22 @@ impl PermissionCoordinator {
                 (pending, resolution, rule_list, directory_list, selected)
             };
             let persisted = (|| -> Result<()> {
-                if !directory_list.is_empty() {
-                    pending
-                        .directory_policy
-                        .as_ref()
-                        .context("directory policy is no longer available")?
-                        .save(&directory_list)?;
-                }
-                if !rule_list.is_empty() {
-                    let mut store = self
-                        .store
+                if let Some(policy_epoch) = &pending.policy_epoch
+                    && (resolution == ApprovalResolution::AllowOnce || !rule_list.is_empty())
+                {
+                    self.store
                         .write()
-                        .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
-                    if resolution == ApprovalResolution::AllowOnce
-                        && rule_list
-                            .iter()
-                            .all(|(_, _, decision)| *decision == PermissionDecision::Allow)
-                    {
-                        store.grant_approved(&rule_list)?;
-                    } else {
-                        store.set_rule_list(&rule_list)?;
-                    }
+                        .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+                        .commit_approval(policy_epoch, &rule_list, || {
+                            if !directory_list.is_empty() {
+                                pending
+                                    .directory_policy
+                                    .as_ref()
+                                    .context("directory policy is no longer available")?
+                                    .save(&directory_list)?;
+                            }
+                            Ok(())
+                        })?;
                 }
                 Ok(())
             })();
@@ -2797,6 +2806,104 @@ mod test {
                 .collect::<Vec<_>>(),
             vec!["allow_once", "deny_once", "cancel"]
         );
+    }
+
+    /// Saving an explicit denial before answering prevents the old picker from restoring access.
+    #[tokio::test]
+    async fn saved_denial_survives_a_stale_mcp_approval_answer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let coordinator = PermissionCoordinator::load(
+            directory.path().join("permissions.json"),
+            directory.path(),
+        )?;
+        let (sink, mut stream) = crate::provider::events::channel(scope());
+        let waiting = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            async move {
+                coordinator
+                    .authorize_scoped(
+                        ApprovalMode::Ask,
+                        mcp_approval_request(),
+                        None,
+                        Some(&sink),
+                        Some(Arc::new(ApprovalAuthority::default())),
+                        ApprovalExecutionKind::Managed,
+                    )
+                    .await
+            }
+        });
+        let view = approval(stream.recv().await?.context("approval stream closed")?);
+        let denial = r#"{"permission":{"mcp":{"fixture/ping":"deny"}}}"#;
+        coordinator.store().write().unwrap().save(denial)?;
+
+        let answer = coordinator
+            .resolve(
+                &view.id,
+                &[ApprovalAnswer {
+                    item_id: view.item_list[0].id.clone(),
+                    choice_id: "allow_exact".into(),
+                }],
+                None,
+            )
+            .await;
+
+        assert!(answer.unwrap_err().to_string().contains("policy changed"));
+        assert!(waiting.await?.is_err());
+        assert!(coordinator.pending_list()?.is_empty());
+        assert_eq!(
+            coordinator
+                .store()
+                .read()
+                .unwrap()
+                .compiled()
+                .document
+                .permission[CATEGORY_MCP]
+                .get("fixture/ping"),
+            Some(&PermissionDecision::Deny)
+        );
+        Ok(())
+    }
+
+    /// An Allow mode change leaves an expired request to its timeout owner.
+    #[tokio::test(start_paused = true)]
+    async fn approval_mode_cannot_allow_an_expired_request() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let coordinator = PermissionCoordinator::load(
+            directory.path().join("permissions.json"),
+            directory.path(),
+        )?;
+        let (sink, mut stream) = crate::provider::events::channel(scope());
+        let waiting = coordinator.authorize_scoped(
+            ApprovalMode::Ask,
+            mcp_approval_request(),
+            None,
+            Some(&sink),
+            Some(Arc::new(ApprovalAuthority::default())),
+            ApprovalExecutionKind::Managed,
+        );
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        approval(stream.recv().await?.context("approval stream closed")?);
+        tokio::time::advance(InputTimeout::default().duration()).await;
+
+        coordinator.apply_approval_mode(&scope().owner(), ApprovalMode::Allow)?;
+
+        assert_eq!(waiting.await?, ApprovalResolution::TimedOut);
+        assert!(coordinator.pending_list()?.is_empty());
+        Ok(())
+    }
+
+    /// Create a permission request for a harmless external tool with no saved rule.
+    fn mcp_approval_request() -> PermissionRequest {
+        PermissionRequest {
+            id: "mcp-approval".into(),
+            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+            subject: PermissionSubject::Unattached,
+            reason: None,
+            target_list: vec![PermissionTarget::Mcp {
+                target: "fixture/ping".into(),
+            }],
+        }
     }
 
     #[tokio::test]

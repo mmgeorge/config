@@ -431,7 +431,10 @@ impl SteeringDeliveries {
     /// Retain one effect and its eventual owner-applied result.
     fn retain(self: &Arc<Self>) -> SteeringDeliveryGuard {
         self.count.fetch_add(1, Ordering::AcqRel);
-        SteeringDeliveryGuard(self.clone())
+        SteeringDeliveryGuard {
+            owner: self.clone(),
+            publication: None,
+        }
     }
 
     /// Check whether every retained effect has been applied or abandoned.
@@ -441,12 +444,18 @@ impl SteeringDeliveries {
 }
 
 /// Release steering ownership on every result, task-failure, and unlaunched-effect path.
-pub(crate) struct SteeringDeliveryGuard(Arc<SteeringDeliveries>);
+pub(crate) struct SteeringDeliveryGuard {
+    owner: Arc<SteeringDeliveries>,
+    publication: Option<Arc<tokio::sync::Notify>>,
+}
 
 impl Drop for SteeringDeliveryGuard {
     fn drop(&mut self) {
-        self.0.count.fetch_sub(1, Ordering::AcqRel);
-        self.0.changed.notify_one();
+        if let Some(publication) = &self.publication {
+            publication.notify_one();
+        }
+        self.owner.count.fetch_sub(1, Ordering::AcqRel);
+        self.owner.changed.notify_one();
     }
 }
 
@@ -640,7 +649,7 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) attempted_results: std::collections::HashSet<String>,
     pub(crate) pending_agent_launch: std::collections::VecDeque<PendingAgentLaunch>,
     pub(crate) pending_agent_reply: Option<(tokio::sync::oneshot::Sender<Result<Value>>, Value)>,
-    pub(crate) user_delivery: tokio::task::JoinSet<(crate::provider::SteerCommand, Result<()>)>,
+    user_publication: Option<Arc<tokio::sync::Notify>>,
     pub(crate) session_events: Arc<crate::provider::session_execution::SessionObservationInbox>,
     pub(crate) delivery_sink: Option<publication::SessionUpdateSink>,
     pub(crate) scan_interval: tokio::time::Interval,
@@ -712,7 +721,6 @@ pub(crate) enum ForegroundSignal {
     QuestionStopped(Box<Result<ProviderCompletion>>),
     Checkpoint(Result<crate::checkpoint::CheckpointRecord>),
     UserInput(crate::provider::SteerCommand),
-    UserDelivery((crate::provider::SteerCommand, Result<()>)),
     AgentChanged,
     AgentDelivery(Box<(crate::agent::AgentTask, Result<()>)>),
     AgentResultDelivered {
@@ -833,7 +841,7 @@ pub(crate) enum ForegroundSignal {
     PriorFinalCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
     UserDeliverySettled(
         Option<crate::provider::SteerCommand>,
-        Option<SteeringDeliveryGuard>,
+        SteeringDeliveryGuard,
     ),
 }
 
@@ -862,7 +870,6 @@ impl ForegroundSignal {
             Self::QuestionStopped(..) => "QuestionStopped",
             Self::Checkpoint(..) => "Checkpoint",
             Self::UserInput(..) => "UserInput",
-            Self::UserDelivery(..) => "UserDelivery",
             Self::AgentChanged => "AgentChanged",
             Self::AgentDelivery(..) => "AgentDelivery",
             Self::AgentResultDelivered { .. } => "AgentResultDelivered",
@@ -1142,10 +1149,6 @@ pub(crate) enum ForegroundJob {
         scope: crate::provider::InvocationScope,
         input: crate::provider::SteerCommand,
     },
-    SettleUserDelivery {
-        input: crate::provider::SteerCommand,
-        result: Result<()>,
-    },
 }
 
 impl ForegroundJob {
@@ -1201,7 +1204,6 @@ impl ForegroundJob {
             Self::SettlementRefresh { .. } => "SettlementRefresh",
             Self::SettlementCommit { .. } => "SettlementCommit",
             Self::UserSteering { .. } => "UserSteering",
-            Self::SettleUserDelivery { .. } => "SettleUserDelivery",
         }
     }
 
@@ -1222,7 +1224,6 @@ impl ForegroundJob {
             | Self::AgentInterrupt { .. }
             | Self::SettlementRefresh { .. }
             | Self::SettlementCommit { .. }
-            | Self::SettleUserDelivery { .. }
             | Self::GoalProgress(_)
             | Self::ExecutionProgress(_)
             | Self::PlanSubmission(_)
@@ -1517,7 +1518,11 @@ impl ForegroundJob {
                 message,
             } => {
                 let result = engine
-                    .steer(scope, crate::provider::SteeringInput::AgentResult(message))
+                    .steer(
+                        scope,
+                        crate::provider::SteeringInput::AgentResult(message),
+                        None,
+                    )
                     .await
                     .map_err(anyhow::Error::from);
                 Ok(ForegroundSignal::AgentResultDelivered {
@@ -1682,19 +1687,13 @@ impl ForegroundJob {
             } => {
                 let result = match input.deliver_to(&scope) {
                     Ok(()) => engine
-                        .steer(scope, input.input())
+                        .steer(scope, input.input(), flight.publication.clone())
                         .await
                         .map_err(anyhow::Error::from),
                     Err(error) => Err(error),
                 };
                 Ok(match input.settle_delivery(result).await {
-                    Ok(input) => ForegroundSignal::UserDeliverySettled(input, Some(flight)),
-                    Err(error) => ForegroundSignal::EffectFailed(error),
-                })
-            }
-            Self::SettleUserDelivery { input, result } => {
-                Ok(match input.settle_delivery(result).await {
-                    Ok(input) => ForegroundSignal::UserDeliverySettled(input, None),
+                    Ok(input) => ForegroundSignal::UserDeliverySettled(input, flight),
                     Err(error) => ForegroundSignal::EffectFailed(error),
                 })
             }
@@ -1799,7 +1798,15 @@ impl ForegroundTransaction {
                         None => std::future::pending().await,
                     }
                 } => return Ok(ForegroundSignal::Checkpoint(checkpoint)),
-                input = self.steering.active.receive(), if self.user_delivery.is_empty() && self.steering.deferred.is_empty() && (self.pending_native_ready.is_none() || self.native_ready_parked) => {
+                () = async {
+                    if let Some(publication) = &self.user_publication {
+                        publication.notified().await;
+                    }
+                }, if self.user_publication.is_some() => {
+                    self.user_publication = None;
+                    continue;
+                }
+                input = self.steering.active.receive(), if self.user_publication.is_none() && self.steering.deferred.is_empty() && (self.pending_native_ready.is_none() || self.native_ready_parked) => {
                     let input = input.context("parent input receiver closed")?;
                     if self.native_ready_parked {
                         // New user input resumes a parent that waits for its children.
@@ -1808,9 +1815,6 @@ impl ForegroundTransaction {
                         continue;
                     }
                     return Ok(ForegroundSignal::UserInput(input));
-                }
-                delivery = self.user_delivery.join_next(), if !self.user_delivery.is_empty() => {
-                    return Ok(ForegroundSignal::UserDelivery(delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?));
                 }
                 changed = self.agent_revision.changed(), if !self.agent_command_active => {
                     changed.context("agent coordinator closed during root execution")?;
@@ -7148,8 +7152,12 @@ impl HarnessBroker {
         input: crate::provider::SteerCommand,
     ) -> ForegroundAction {
         if self.capability.native_steer {
+            let publication = Arc::new(tokio::sync::Notify::new());
+            transaction.user_publication = Some(publication.clone());
+            let mut flight = transaction.steering.pending_deliveries.retain();
+            flight.publication = Some(publication);
             ForegroundAction::Effect(ForegroundJob::UserSteering {
-                flight: transaction.steering.pending_deliveries.retain(),
+                flight,
                 engine: transaction.engine.clone(),
                 scope: transaction.state.scope.clone(),
                 input,
@@ -9100,6 +9108,7 @@ impl HarnessBroker {
                 runtime.retraction_eligibility.consume();
                 if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
                                 matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
+                                receipt.mark_input_presented();
                                 return Ok(AppliedProviderEvent::Effects(effects));
                             }
                 // The wait ends when the input reaches the provider, before the model reads it.
@@ -9115,6 +9124,7 @@ impl HarnessBroker {
                     now_ms,
                 )?;
                 self.store.save_exchange(interaction)?;
+                receipt.mark_input_presented();
                 // Consumption remains independent of presentation: typed answers are visible on
                 // acceptance, while this notification still reports only consumed prompts.
                 let prompt = prompt.consumption.is_consumed().then_some(prompt);
@@ -9196,7 +9206,9 @@ impl HarnessBroker {
             }
         }
         interaction.observe_blocker("agent_wait".into(), false, now_ms);
-        self.store.save_exchange(interaction)
+        self.store.save_exchange(interaction)?;
+        receipt.mark_input_presented();
+        Ok(())
     }
 
     /// Apply ordinary content and retain ordered publication effects.

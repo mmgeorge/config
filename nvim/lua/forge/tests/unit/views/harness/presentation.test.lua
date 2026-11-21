@@ -323,17 +323,23 @@ T["presentation"] = function()
   local submission = host.requests[#host.requests]
   eq(submission.parameters.action.message.text, "first typed prompt")
   local function retract(id)
+    if not id then
+      host.retract(submission.parameters.action.message.id)
+      return
+    end
     host.revision = host.revision + 1
     input_state.receive(session_state, { revision = host.revision, suspended = true, upsert = {}, removed = {},
-      retracted = id or submission.parameters.action.message.id })
+      retracted = id })
   end
   eq(buffer.line(composer, 1), "")
   host.complete(submission)
   retract("stale-message")
   assert(buffer.line(composer, 1) == "", "stale retraction restored a draft")
   retract()
-  eq(buffer.line(composer, 1), "first typed prompt")
+  eq(buffer.line(composer, 1), "")
+  eq(host.requests[#host.requests].parameters.action.kind, "remove")
   host.flush()
+  eq(buffer.line(composer, 1), "first typed prompt")
 
   submit(function() end)
   submission = host.requests[#host.requests]

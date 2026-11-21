@@ -72,31 +72,10 @@ impl ResourceProfile {
         directory: &str,
     ) -> Result<(), ProfileError> {
         std::fs::create_dir_all(self.path().join(directory))?;
-        let mut names = std::collections::HashSet::new();
-        for skill in skills.iter().filter(|skill| skill.enabled) {
-            if skill.name.is_empty()
-                || skill.name == "."
-                || skill.name == ".."
-                || skill.name.ends_with('.')
-                || !skill
-                    .name
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-            {
-                return Err(ProfileError::InvalidSkillName);
-            }
-            if !names.insert(&skill.name) {
-                return Err(ProfileError::DuplicateSkillName);
-            }
-            let source = Path::new(
-                skill
-                    .path
-                    .as_deref()
-                    .ok_or(ProfileError::MissingSkillSource)?,
-            )
-            .parent()
-            .ok_or(ProfileError::MissingSkillDirectory)?;
-            self.bind(source, &format!("{directory}/{}", skill.name))?;
+        for selection in selected_skill_paths(skills) {
+            let (name, path) = selection?;
+            let source = path.parent().ok_or(ProfileError::MissingSkillDirectory)?;
+            self.bind(source, &format!("{directory}/{name}"))?;
         }
         Ok(())
     }
@@ -164,6 +143,31 @@ impl Drop for ResourceProfile {
             let _ = directory.keep();
         }
     }
+}
+
+/// Validate enabled skill identities before a provider projects their source files.
+pub(crate) fn selected_skill_paths(
+    skills: &[SkillDefinition],
+) -> impl Iterator<Item = Result<(&str, &Path), ProfileError>> {
+    let mut names = std::collections::HashSet::new();
+    skills.iter().filter(|skill| skill.enabled).map(move |skill| {
+        let name = skill.name.as_str();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.ends_with('.')
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+        {
+            return Err(ProfileError::InvalidSkillName);
+        }
+        if !names.insert(name) {
+            return Err(ProfileError::DuplicateSkillName);
+        }
+        let path = skill.path.as_deref().ok_or(ProfileError::MissingSkillSource)?;
+        Ok((name, Path::new(path)))
+    })
 }
 
 #[cfg(test)]

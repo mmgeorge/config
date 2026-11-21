@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 /// Resolves one provider's shared catalog while retaining credentials only in launch payloads.
+#[derive(Default)]
 pub(crate) struct SessionResources {
     /// Contains every applicable skill with its requested enabled state.
     pub(crate) skill: Vec<SkillDefinition>,
@@ -99,13 +100,22 @@ impl SessionResources {
                             "MCP server {} collides with another selected definition or Harness control",
                             definition.name
                         );
-                        if let Some(command) =
-                            unavailable_command(&payload, Path::new(&request.workspace))
-                        {
-                            let message = format!(
-                                "MCP server {} was not started: executable '{command}' was not found or is not executable. Install it and retry in /mcp.",
-                                definition.name
-                            );
+                        let skipped = forge_providers::registry::mcp_launch_incompatibility(provider, &payload)
+                            .map(|reason| format!("MCP server {} was not started. {reason}.", definition.name))
+                            .or_else(|| {
+                                unavailable_command(&payload, Path::new(&request.workspace)).map(|command| {
+                                    let retry = if provider == "antigravity" {
+                                        "Install it and open a new binding."
+                                    } else {
+                                        "Install it and retry in /mcp."
+                                    };
+                                    format!(
+                                        "MCP server {} was not started: executable '{command}' was not found or is not executable. {retry}",
+                                        definition.name
+                                    )
+                                })
+                            });
+                        if let Some(message) = skipped {
                             launch_notice.insert(definition.id.clone(), message.clone());
                             (McpStatus::Unavailable, Some(message))
                         } else {
@@ -194,6 +204,51 @@ fn unavailable_command(payload: &McpLaunch, workspace: &Path) -> Option<String> 
 mod test {
     use super::*;
     use crate::session::{AccessPolicy, ApprovalMode};
+
+    /// Keep incompatible servers visible without preventing compatible Antigravity launches.
+    #[test]
+    fn antigravity_resource_incompatibility_isolated_per_server() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::storage::layout::prepare(root.path())?;
+        let workspace = root.path().join("workspace");
+        let rulesync = workspace.join(".rulesync");
+        std::fs::create_dir_all(&rulesync)?;
+        std::fs::write(
+            rulesync.join("mcp.json"),
+            r#"{"mcpServers":{
+                "legacy":{"type":"sse","url":"http://localhost/events"},
+                "supported":{"type":"http","url":"http://localhost/mcp"}
+            }}"#,
+        )?;
+        let request = ProviderCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: workspace.to_string_lossy().into_owned(),
+            access: AccessPolicy::default(),
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: None,
+        };
+        let resources = SessionResources::load(
+            root.path(),
+            &request,
+            "antigravity",
+            "antigravity-cli",
+        )?;
+        let legacy = resources
+            .mcp
+            .iter()
+            .find(|row| row.name == "legacy")
+            .expect("incompatible server remains visible");
+        assert!(legacy.enabled);
+        assert_eq!(legacy.status, McpStatus::Unavailable);
+        assert!(legacy
+            .status_detail
+            .as_ref()
+            .is_some_and(|reason| reason.as_str().contains("legacy SSE")));
+        assert_eq!(resources.launch.len(), 1);
+        assert_eq!(resources.launch[0].name, "supported");
+        Ok(())
+    }
 
     #[test]
     fn shared_resources_apply_selection_without_exposing_launch_credentials() {

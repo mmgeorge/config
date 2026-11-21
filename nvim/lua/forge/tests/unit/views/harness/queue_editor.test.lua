@@ -176,6 +176,29 @@ T["delivered_unchanged_edit_restores_earlier_draft"] = function()
   eq(requests[#requests].spec.params.action.kind, "release")
 end
 
+T["delivery_race_preserves_edits_on_other_reserved_messages"] = function()
+  local input = require("forge.views.harness.input_state")
+  local editor = require("forge.views.harness.queue_editor")
+  local requests = mock_client.record()
+  local state = { session = { id = "delivery-race-with-edits" }, queue = {}, composer_buf = buffer.scratch() }
+  input.attach(state, function() end)
+  local first = { id = "first", revision = 1, text = "first", delivery = "queued", attachments = {} }
+  local second = { id = "second", revision = 1, text = "second", delivery = "queued", attachments = {} }
+  requests[1].callback({ revision = 1, messages = { first, second }, suspended = false })
+  eq(editor.move(state, "earlier draft", -1), "second")
+  local reserve = requests[#requests]
+  second.revision, second.reservation = 2, reserve.spec.params.action.reservation
+  reserve.callback({ revision = 2, upsert = { second }, removed = {}, suspended = false })
+  eq(editor.move(state, "edited second", -1), "first")
+  local contested = requests[#requests]
+  input.receive(state, { revision = 3, upsert = {}, removed = { first.id }, suspended = false })
+  eq(editor.finish(state, "first"), "earlier draft")
+  contested.callback({ revision = 4, upsert = {}, removed = {}, suspended = false, error = "Input already claimed" })
+  local action = requests[#requests].spec.params.action
+  eq(action.kind, "commit")
+  eq(vim.tbl_map(function(edit) return { edit.id, edit.text } end, action.edits), { { second.id, "edited second" } })
+end
+
 T["navigation_releases_unchanged_entries"] = function()
   -- Navigation reserves each message it visits. A message left unchanged is released alone, so
   -- an earlier message the user only looked at can still run while a later one is edited.

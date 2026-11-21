@@ -355,4 +355,44 @@ T["provider_catalog"] = function()
   picker.close(false)
 end
 
+T["future_resource_default_preserves_live_selection"] = function()
+  require("forge").setup()
+  local equal = MiniTest.expect.equality
+  local controller = require("forge.views.harness.controller")
+  local picker = require("forge.views.picker")
+  local state = require("forge.session").harness
+  local workspace = vim.fn.getcwd()
+  state.session = { id = "open-antigravity", provider = "antigravity", workspace = workspace }
+  state.transcript_win = vim.api.nvim_get_current_win()
+  state.capability = { catalog = { skill = true, mcp = true }, integration = { limitations = {
+    { id = "skill_mutation", support = "unsupported" }, { id = "mcp_mutation", support = "unsupported" },
+  } } }
+  local requests = mock_client.respond({
+    ["session.provider.skill.list"] = { { name = "guide", enabled = true, resource_id = "skill:guide", scope = "workspace" } },
+    ["session.provider.mcp.list"] = { { name = "tool", enabled = true, status = "connected", resource_id = "mcp:tool", scope = "global" } },
+    ["settings.skill.set_enabled"] = { state = "saved" },
+    ["settings.mcp.set_enabled"] = { state = "saved" },
+  })
+
+  for _, source in ipairs({
+    { open = controller.open_skill_picker, kind = "skill", name = "guide", scope = "workspace" },
+    { open = controller.open_mcp_picker, kind = "mcp", name = "tool", scope = "global" },
+  }) do
+    source.open()
+    local view = assert(picker._state_for_test())
+    local page = view.spec.page_list[1]
+    local actions = assert(view.spec.action_list)
+    equal(vim.iter(actions):any(function(action) return action.key == "<Space>" end), false)
+    local disable = assert(vim.iter(actions):find(function(action) return action.key == "d" end))
+    disable.callback({ option = page.option_list[1] })
+    local request = requests[#requests].spec
+    equal(request.method, "settings." .. source.kind .. ".set_enabled")
+    equal(request.session_id, nil)
+    equal(request.params, { name = source.name, resource_id = source.kind .. ":" .. source.name,
+      workspace = workspace, scope = source.scope, enabled = false })
+    equal(picker._state_for_test().spec.page_list[1].option_list[1].value.enabled, true)
+    picker.close(false)
+  end
+end
+
 return T

@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -101,6 +101,10 @@ pub struct SubmissionRecord {
     /// Exact task observation authority captured before this input can dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) task_receipt: Option<crate::task::TaskReceiptPermit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    steering: Option<SteeringReceiptTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement: Option<RetirementIntent>,
     /// Host-generated UUID, also used for native input correlation.
     pub id: String,
     /// Original request, including typed input and durable attachment references.
@@ -118,6 +122,44 @@ impl SubmissionRecord {
     pub(crate) fn is_user_input(&self) -> bool {
         matches!(self.origin, JournalOrigin::User)
     }
+
+    /// Get the exchange invocation that received this delivery attempt.
+    pub(crate) fn steering_target(
+        &self,
+    ) -> Option<(
+        &forge_provider_api::InvocationScope,
+        super::session_execution::AcceptedInputDelivery,
+    )> {
+        self.steering
+            .as_ref()
+            .filter(|target| target.attempt == self.attempt_id)
+            .map(|target| (&target.scope, target.delivery))
+    }
+
+    /// Get whether the receipt originated in the steering lane before its current attempt.
+    pub(crate) fn has_steering_target(&self) -> bool {
+        self.steering.is_some()
+    }
+
+    /// Check whether retirement committed an instruction to retain the unsent draft.
+    pub(crate) fn returns_to_queue(&self) -> bool {
+        self.retirement == Some(RetirementIntent::ReturnToQueue)
+    }
+}
+
+/// Explain what the queue must do if the process exits before updating its own journal.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RetirementIntent {
+    ReturnToQueue,
+}
+
+/// Bind steering evidence to the invocation and attempt whose transcript can record it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SteeringReceiptTarget {
+    attempt: DeliveryAttemptId,
+    scope: forge_provider_api::InvocationScope,
+    delivery: super::session_execution::AcceptedInputDelivery,
 }
 
 /// Preserve the author of a logical input independently of its native delivery attempt.
@@ -147,6 +189,10 @@ impl<'de> Deserialize<'de> for SubmissionRecord {
             input_message_id: Option<String>,
             #[serde(default)]
             task_receipt: Option<crate::task::TaskReceiptPermit>,
+            #[serde(default)]
+            steering: Option<SteeringReceiptTarget>,
+            #[serde(default)]
+            retirement: Option<RetirementIntent>,
             id: String,
             request: serde_json::Value,
             revision: Option<u64>,
@@ -176,6 +222,8 @@ impl<'de> Deserialize<'de> for SubmissionRecord {
                 .ok_or_else(|| serde::de::Error::custom("missing input origin"))?,
             input_message_id: stored.input_message_id,
             task_receipt: stored.task_receipt,
+            steering: stored.steering,
+            retirement: stored.retirement,
             id: stored.id,
             request: serde_json::from_value(stored.request).map_err(serde::de::Error::custom)?,
             delivery,
@@ -255,6 +303,7 @@ impl SubmissionStore {
             receipt_id: SubmissionId::try_from(id.to_owned())?,
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(accepted).0,
+            input_presented: tokio::sync::watch::channel(false).0,
             steering_queued: tokio::sync::watch::channel(false).0,
             dispatch_observer: Mutex::new(None),
             dispatch: Mutex::new(None),
@@ -384,6 +433,8 @@ impl SubmissionStore {
             origin: JournalOrigin::User,
             input_message_id,
             task_receipt: None,
+            steering: None,
+            retirement: None,
             id: uuid::Uuid::new_v4().to_string(),
             request: request.invocation_snapshot(),
             delivery: SubmissionState::Prepared,
@@ -438,6 +489,10 @@ impl SubmissionStore {
                     if existing.delivery == SubmissionState::Cancelled {
                         existing.delivery = SubmissionState::Prepared;
                         existing.error = None;
+                        existing.retirement = None;
+                        if existing.steering.take().is_some() {
+                            existing.attempt_id = record.attempt_id.clone();
+                        }
                         transaction.execute(
                             "UPDATE submission SET payload=?2 WHERE id=?1",
                             params![id, serde_json::to_string(&existing)?],
@@ -472,6 +527,7 @@ impl SubmissionStore {
             receipt_id: SubmissionId::try_from(record.id.clone())?,
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(false).0,
+            input_presented: tokio::sync::watch::channel(false).0,
             steering_queued: tokio::sync::watch::channel(false).0,
             dispatch_observer: Mutex::new(None),
             dispatch: Mutex::new(None),
@@ -771,6 +827,7 @@ pub struct Submission {
     receipt_id: SubmissionId,
     record: Mutex<SubmissionRecord>,
     acceptance: tokio::sync::watch::Sender<bool>,
+    input_presented: tokio::sync::watch::Sender<bool>,
     steering_queued: tokio::sync::watch::Sender<bool>,
     dispatch_observer: Mutex<Option<forge_provider_api::submission::DispatchObserver>>,
     dispatch: Mutex<Option<SubmissionDispatch>>,
@@ -1022,6 +1079,16 @@ impl Submission {
     pub(crate) fn acceptance(&self) -> tokio::sync::watch::Receiver<bool> {
         self.acceptance.subscribe()
     }
+
+    /// Publish the original exchange owner's durable input append.
+    pub(crate) fn mark_input_presented(&self) {
+        self.input_presented.send_replace(true);
+    }
+
+    /// Observe whether the live exchange already owns the accepted text.
+    pub(crate) fn input_presentation(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.input_presented.subscribe()
+    }
     /// Observe delivery without changing eligibility or publishing acceptance from a worker.
     pub(crate) async fn observe_reconciliation(
         self: &Arc<Self>,
@@ -1160,6 +1227,67 @@ impl Submission {
     ) -> Result<()> {
         let submission = self.clone();
         self.store.persist(move |_| operation(&submission)).await
+    }
+
+    /// Commit recovery authority before the adapter can record acceptance.
+    pub(crate) fn bind_steering_scope(
+        &self,
+        attempt: DeliveryAttemptId,
+        scope: forge_provider_api::InvocationScope,
+    ) -> Result<()> {
+        self.update(|record| {
+            record.delivery.require_prepared()?;
+            ensure!(
+                record.attempt_id == attempt,
+                "steering receipt attempt changed"
+            );
+            ensure!(
+                record.steering_target().is_none_or(|(previous, delivery)| {
+                    previous == &scope
+                        && matches!(
+                            delivery,
+                            super::session_execution::AcceptedInputDelivery::Steering
+                        )
+                }),
+                "steering receipt invocation changed"
+            );
+            record.steering = Some(SteeringReceiptTarget {
+                attempt,
+                scope,
+                delivery: super::session_execution::AcceptedInputDelivery::Steering,
+            });
+            Ok(())
+        })
+    }
+
+    /// Retarget a refused steer to the successor invocation that will send it as a prompt.
+    pub(crate) fn bind_steering_fallback(
+        &self,
+        attempt: DeliveryAttemptId,
+        scope: forge_provider_api::InvocationScope,
+    ) -> Result<()> {
+        self.update(|record| {
+            record.delivery.require_prepared()?;
+            ensure!(
+                record.attempt_id == attempt,
+                "steering fallback attempt changed"
+            );
+            let previous = record
+                .steering
+                .as_ref()
+                .context("steering fallback has no original target")?;
+            ensure!(
+                previous.scope.thread_id == scope.thread_id
+                    && previous.scope.exchange_id == scope.exchange_id,
+                "steering fallback belongs to another exchange"
+            );
+            record.steering = Some(SteeringReceiptTarget {
+                attempt,
+                scope,
+                delivery: super::session_execution::AcceptedInputDelivery::TurnPrompt,
+            });
+            Ok(())
+        })
     }
 
     /// Persists the uncertain state before polling the external send future.
@@ -1354,7 +1482,14 @@ impl Submission {
     pub(crate) fn retire_prepared(
         &self,
     ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
-        self.retire_attempt(None)
+        self.retire_attempt(None, None)
+    }
+
+    /// Retire an unsent receipt while preserving its draft through a forced exit.
+    pub(crate) fn retire_prepared_for_queue(
+        &self,
+    ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
+        self.retire_attempt(None, Some(RetirementIntent::ReturnToQueue))
     }
 
     /// Prevent only the exact registered delivery attempt without cancelling a successor attempt.
@@ -1362,13 +1497,14 @@ impl Submission {
         &self,
         attempt: &DeliveryAttemptId,
     ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
-        self.retire_attempt(Some(attempt))
+        self.retire_attempt(Some(attempt), None)
     }
 
     /// Validate attempt authority and commit prepared retirement in one journal transaction.
     fn retire_attempt(
         &self,
         attempt: Option<&DeliveryAttemptId>,
+        intent: Option<RetirementIntent>,
     ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
         self.update(|record| {
             ensure!(
@@ -1379,11 +1515,11 @@ impl Submission {
                 ))
             );
             Ok(match record.delivery {
-                SubmissionState::Prepared => {
+                SubmissionState::Prepared | SubmissionState::Cancelled => {
                     record.delivery = SubmissionState::Cancelled;
+                    record.retirement = intent.or(record.retirement);
                     SubmissionRetirement::Cancelled
                 }
-                SubmissionState::Cancelled => SubmissionRetirement::Cancelled,
                 // A discarded record keeps its uncertainty; retirement never authorizes replay.
                 SubmissionState::Sending { .. } | SubmissionState::Discarded => {
                     SubmissionRetirement::Sending

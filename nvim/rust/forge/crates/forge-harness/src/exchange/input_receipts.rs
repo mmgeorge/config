@@ -52,6 +52,8 @@ pub(crate) enum InputAbandonment {
     Retracted,
     /// Configuration collection stopped admission before native dispatch.
     Reconfigured,
+    /// The owner closed while this input still had preparation left.
+    Shutdown,
 }
 
 /// Carry native facts to the owner without allowing the producer to select queue state.
@@ -259,8 +261,16 @@ impl InputReceipts {
             let id = id.clone();
             // A cancelled select or a ready sibling must not consume the owner's watch version.
             let mut acceptance = tracked.acceptance.clone();
+            let transcript = matches!(tracked.work, ReceiptWork::AwaitingTranscript)
+                .then(|| tracked.submission.input_presentation());
             waiting.push(async move {
-                match acceptance.changed().await {
+                let evidence = match transcript {
+                    Some(mut transcript) => {
+                        transcript.wait_for(|recorded| *recorded).await.map(drop)
+                    }
+                    None => acceptance.changed().await,
+                };
+                match evidence {
                     Ok(()) => InputReceiptWake::Evidence(id),
                     Err(_) => InputReceiptWake::Unavailable(id),
                 }
@@ -328,14 +338,18 @@ impl InputReceipts {
                 if !tracked.accepted {
                     return Err(InputReceiptError::AcceptanceUnconfirmed);
                 }
-                let unconfirmed = matches!(tracked.work, ReceiptWork::DeliveryUncertain);
-                let delivery = if unconfirmed {
+                let settled = !matches!(tracked.work, ReceiptWork::Running);
+                let remove = settled && !tracked.awaiting_transcript()?;
+                if settled && !remove {
+                    tracked.work = ReceiptWork::AwaitingTranscript;
+                }
+                let delivery = if remove {
                     None
                 } else {
                     Some(InputDelivery::Accepted)
                 };
                 let update = tracked.commit_delivery(services, delivery, None);
-                if unconfirmed
+                if remove
                     && (update.is_ok() || matches!(&update, Err(InputReceiptError::StaleInput)))
                 {
                     self.pending.remove(&submission);
@@ -372,6 +386,15 @@ impl InputReceipts {
                     .map_err(|error| InputReceiptError::Receipt(error.into()))?;
                 if retirement == SubmissionRetirement::Accepted {
                     tracked.observe_acceptance(services)?;
+                    if tracked.awaiting_transcript()? {
+                        let update = tracked.commit_delivery(
+                            services,
+                            Some(InputDelivery::Accepted),
+                            None,
+                        )?;
+                        tracked.work = ReceiptWork::AwaitingTranscript;
+                        return Ok(Some(update));
+                    }
                 }
                 let delivery = match retirement {
                     SubmissionRetirement::Accepted => None,
@@ -436,10 +459,15 @@ impl InputReceipts {
                     .pending
                     .get_mut(&submission)
                     .ok_or(InputReceiptError::Unknown)?;
-                let retirement = tracked
-                    .submission
-                    .retire_prepared()
-                    .map_err(|error| InputReceiptError::Receipt(error.into()))?;
+                let retirement = match reason {
+                    InputAbandonment::Paused
+                    | InputAbandonment::Reconfigured
+                    | InputAbandonment::Shutdown => tracked.submission.retire_prepared_for_queue(),
+                    InputAbandonment::Cancelled
+                    | InputAbandonment::Superseded
+                    | InputAbandonment::Retracted => tracked.submission.retire_prepared(),
+                }
+                .map_err(|error| InputReceiptError::Receipt(error.into()))?;
                 if retirement == SubmissionRetirement::Accepted {
                     tracked.observe_acceptance(services)?;
                 }
@@ -450,9 +478,9 @@ impl InputReceipts {
                         InputAbandonment::Cancelled
                         | InputAbandonment::Superseded
                         | InputAbandonment::Retracted => None,
-                        InputAbandonment::Paused | InputAbandonment::Reconfigured => {
-                            Some(InputDelivery::Queued)
-                        }
+                        InputAbandonment::Paused
+                        | InputAbandonment::Reconfigured
+                        | InputAbandonment::Shutdown => Some(InputDelivery::Queued),
                     },
                 };
                 // Confirmed native history retraction removes an accepted prompt as completely as
@@ -465,8 +493,18 @@ impl InputReceipts {
                     ),
                     InputAbandonment::Paused
                     | InputAbandonment::Reconfigured
+                    | InputAbandonment::Shutdown
                     | InputAbandonment::Superseded => false,
                 };
+                if retirement == SubmissionRetirement::Accepted
+                    && !retracted
+                    && tracked.awaiting_transcript()?
+                {
+                    let update =
+                        tracked.commit_delivery(services, Some(InputDelivery::Accepted), None)?;
+                    tracked.work = ReceiptWork::AwaitingTranscript;
+                    return Ok(Some(update));
+                }
                 let update = if retracted {
                     tracked.commit_retraction(services)?
                 } else {
@@ -665,6 +703,7 @@ struct TrackedInput {
 enum ReceiptWork {
     Running,
     DeliveryUncertain,
+    AwaitingTranscript,
 }
 
 /// Keep failed observation owned without a permanently-ready retry loop.
@@ -680,6 +719,18 @@ enum ReceiptBinding {
 }
 
 impl TrackedInput {
+    /// Keep the queue copy until the exchange owns the accepted user's text.
+    fn awaiting_transcript(&self) -> Result<bool, InputReceiptError> {
+        if self.route != InputRoute::Steering || !matches!(self.purpose, InputPurpose::User) {
+            return Ok(false);
+        }
+        let record = self
+            .submission
+            .record()
+            .map_err(InputReceiptError::Receipt)?;
+        Ok(record.steering_target().is_some() && !*self.submission.input_presentation().borrow())
+    }
+
     /// Atomically reject a stale worker before it can overwrite a newer input attempt.
     fn commit_delivery(
         &mut self,

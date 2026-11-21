@@ -108,6 +108,27 @@ fn detailed_logs_exclude_bodies_isolate_sessions_and_redact_credentials() {
     );
 }
 
+/// Dependency messages can contain raw protocol frames even when a field looks diagnostic.
+#[test]
+fn dependency_trace_retains_metadata_without_free_text() {
+    let directory = tempdir().unwrap();
+    let trace = TraceStore::open(directory.path()).unwrap();
+    trace.configure(LogLevel::Trace).unwrap();
+    tracing::dispatcher::with_default(&trace.dispatch(), || {
+        let native = tracing::info_span!(target: "agent_client_protocol::jsonrpc", "native", error = "private native span");
+        let _entered = native.enter();
+        tracing::trace!(target: "agent_client_protocol::jsonrpc",
+            session_id = "session", method = "session/new", message = "private native payload");
+        tracing::warn!(target: "forge::test", session_id = "session", error = "Forge normalized diagnostic");
+    });
+    trace.flush().unwrap();
+    let contents = std::fs::read_to_string(trace.session_status("session").path).unwrap();
+    assert!(contents.contains("agent_client_protocol::jsonrpc"));
+    assert!(contents.contains("session/new"));
+    assert!(contents.contains("Forge normalized diagnostic"));
+    assert!(!contents.contains("private native"));
+}
+
 /// Filter the same callsites dynamically while retaining error correlation below Info.
 #[test]
 fn logging_levels_filter_events_and_preserve_redacted_span_context() {

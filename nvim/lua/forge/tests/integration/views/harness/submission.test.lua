@@ -1,9 +1,8 @@
-local function verify_submission()
+local function verify_submission(lost)
   local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
   local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
   local kind = "antigravity"
-  local lost = vim.g.forge_acp_fixture_lost_ack == true
-  local runtime_version = "1.4.5"
+  local runtime_version = "1.5.13"
   local root, workspace, data = vim.fn.getcwd(), vim.fn.tempname(), vim.fn.tempname()
   vim.fn.mkdir(workspace, "p")
   vim.fn.mkdir(data, "p")
@@ -22,9 +21,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   const request = JSON.parse(line);
   if (request.id === undefined) return;
   let result = {};
-  if (request.method === 'initialize') result = {protocolVersion:1,agentCapabilities:{loadSession:true},
+  if (request.method === 'initialize') result = {protocolVersion:1,agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},mcpCapabilities:{http:true}},
     agentInfo:{name:'fixture',version:process.argv[5]}};
-  if (request.method === 'session/new' || request.method === 'session/load') result = {sessionId:'native'};
+  if (request.method === 'session/new' || request.method === 'session/resume') result = {sessionId:'native'};
   if (request.method === 'session/prompt') {
     const prompt = ++promptCount;
     fs.appendFileSync(process.argv[2], JSON.stringify(request.params) + '\n');
@@ -98,16 +97,31 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     request("session.prompt.submit", { text = "FIRST_SUBMISSION_MARKER" }, lost)
     local first = settle(1)
     assert(first.state == (lost and "failed" or "complete"), vim.inspect(first))
-    local _, second_error = request("session.prompt.submit", { text = "SECOND_SUBMISSION_MARKER" }, lost)
-    local second = settle(2)
-    assert(second.state == (lost and "failed" or "complete"), vim.inspect(second))
-    local native = vim.fn.readfile(sent)
-    assert(#native == (lost and 1 or 2), "unexpected native dispatch count: " .. #native)
+    request("session.prompt.submit", { text = "SECOND_SUBMISSION_MARKER" })
     if lost then
-      local failure_text = tostring(second_error) .. table.concat(errors, " | ")
-      assert(failure_text:find("uncertain delivery", 1, true), failure_text)
+      local snapshot
+      wait_until(function()
+        local current = assert(request("session.input.get"))
+        snapshot = current
+        local first_input, second_input = unpack(current.messages)
+        return first_input and first_input.delivery == "unknown"
+          and second_input and second_input.delivery == "queued"
+      end, "uncertain delivery did not block the next input", { context = function() return vim.inspect(snapshot) end })
+      assert(#request("session.exchange.list") == 1, "a queued input opened another exchange")
+      assert(#vim.fn.readfile(sent) == 1, "the provider received another prompt after losing the reply")
+      local failure_text = snapshot.messages[1].error or ""
+      assert(failure_text:find("Delivery unconfirmed", 1, true), failure_text)
       assert(not failure_text:find("session/prompt", 1, true), "native protocol detail escaped normalization: " .. failure_text)
+      local status = state.presentation.status_view.buffer
+      wait_until(function()
+        return buffer.text(status):find("Input needs recovery", 1, true) ~= nil
+      end, "status hid the unconfirmed input blocking delivery", { context = function() return buffer.text(status) end })
+      assert(not buffer.text(status):find("FIRST_SUBMISSION_MARKER", 1, true), "status repeated the transcript prompt")
     else
+      local second = settle(2)
+      assert(second.state == "complete", vim.inspect(second))
+      local native = vim.fn.readfile(sent)
+      assert(#native == 2, "unexpected native dispatch count: " .. #native)
       assert(not native[2]:find("FIRST_SUBMISSION_MARKER", 1, true), "accepted input was replayed as missing context")
       assert(native[2]:find("SECOND_SUBMISSION_MARKER", 1, true), "follow-up input was lost")
       local transcript = state.presentation.transcript
@@ -144,6 +158,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         end, "activity expansion did not settle", { timeout_ms = 1000 })
       end
       set_activity(true)
+      local read_label = "Read .rulesync/skills/fixture/SKILL.md"
       local expanded = {}
       local function assert_activity()
         for index = 0, transcript.sequence:count() - 1 do
@@ -156,7 +171,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         end
         local found = {}
         for row, text in ipairs(buffer.lines(state.transcript_buf)) do
-          for _, label in ipairs({ "Read fixture", "Edits" }) do
+          for _, label in ipairs({ read_label, "Edits" }) do
             if text:find(label, 1, true) and not text:find("Edits unavailable", 1, true) then
               local location = require("forge.buffer").locate(transcript, row - 1, 0)
               local entry = transcript.sequence.node[location.block].entry
@@ -166,17 +181,17 @@ readline.createInterface({input:process.stdin}).on('line', line => {
           end
         end
         -- The failed edit's outcome reaches the group summary in a later publication than its rows.
-        return found["Read fixture"] and found["Edits"]
+        return found[read_label] and found["Edits"]
           and buffer.text(state.transcript_buf):find("1 unsuccessful", 1, true) ~= nil
       end
       wait_until(assert_activity, "activity events did not render", { timeout_ms = 1000,
         context = function() return buffer.text(state.transcript_buf) .. "\n" .. table.concat(errors, "\n") end })
       local visible = buffer.text(state.transcript_buf)
-      assert(visible:find("Read fixture", 1, true) and visible:find("Edits", 1, true))
+      assert(visible:find(read_label, 1, true) and visible:find("Edits", 1, true))
       assert(visible:find("1 unsuccessful", 1, true), "failed ACP edit lost its outcome")
       vim.api.nvim_set_current_win(state.transcript_win)
       for row, text in ipairs(buffer.lines(state.transcript_buf)) do
-        if text:find("Read fixture", 1, true) or text:find("Edits", 1, true) then
+        if text:find(read_label, 1, true) or text:find("Edits", 1, true) then
           vim.api.nvim_win_set_cursor(state.transcript_win, { row, 0 })
           vim.cmd("normal! zz")
           assert(vim.api.nvim_get_current_line() == text, "activity navigation selected another row")
@@ -185,7 +200,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       set_activity(false)
       wait_until(function()
         visible = buffer.text(state.transcript_buf)
-        return not visible:find("Read fixture", 1, true) and not visible:find("▸ Edits", 1, true)
+        return not visible:find(read_label, 1, true) and not visible:find("▸ Edits", 1, true)
       end, "collapsed activity left its events outside the fold", { timeout_ms = 4000 })
       assert(visible:find("ACP_SUBMISSION_ACCEPTED", 1, true), "activity collapse hid the final response")
     end
@@ -207,7 +222,12 @@ local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 -- requires-forge-host
 T["submission"] = function()
-  verify_submission()
+  verify_submission(false)
+end
+
+-- requires-forge-host
+T["unconfirmed delivery keeps the next input queued"] = function()
+  verify_submission(true)
 end
 
 return T

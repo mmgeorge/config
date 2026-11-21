@@ -29,13 +29,14 @@ end
 ---@param source string[] draft lines to restore
 ---@param attachments table[] draft attachments to restore
 ---@param is_current fun(): boolean whether the composer still belongs to the submitting view
----@return fun(): boolean restore
+---@return fun(check_only?: boolean): boolean restore
 function M.take(buffer, source, attachments, is_current)
   vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "" })
   attachment.restore(buffer, {})
   local composer_free = M.observe(buffer)
-  return function()
+  return function(check_only)
     if not (is_current() and composer_free()) then return false end
+    if check_only then return true end
     vim.api.nvim_buf_set_lines(buffer, 0, -1, false, source)
     attachment.restore(buffer, attachments)
     return true

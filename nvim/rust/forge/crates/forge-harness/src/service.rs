@@ -3574,20 +3574,12 @@ async fn route_control_request(
         }
         RuntimeMethod::SessionProviderSkillList => {
             let provider = controller.provider_handle();
-            let descriptor = provider.descriptor();
-            let skills = match descriptor.capability.integration.resource_target.as_deref() {
-                Some(target) => {
-                    crate::settings::SessionResources::load(
-                        &controller.data_root,
-                        &catalog_request,
-                        descriptor.kind.as_str(),
-                        target,
-                    )?
-                    .skill
-                }
+            let (context, configured) = provider.configured_resources(&catalog_request).await?;
+            let skills = match configured {
+                Some(resources) => resources.skill.clone(),
                 None => tokio::time::timeout(
                     Duration::from_secs(30),
-                    provider.skill_list(provider.query_context(&catalog_request).await?),
+                    provider.skill_list(context),
                 )
                 .await
                 .context("skill discovery exceeded 30 seconds")??,
@@ -3609,28 +3601,13 @@ async fn route_control_request(
                 *discovery = (revision, Default::default());
             }
             let provider = controller.provider_handle();
-            let descriptor = provider.descriptor();
-            let configured = descriptor
-                .capability
-                .integration
-                .resource_target
-                .as_deref()
-                .map(|target| {
-                    crate::settings::SessionResources::load(
-                        &controller.data_root,
-                        &catalog_request,
-                        descriptor.kind.as_str(),
-                        target,
-                    )
-                    .map(|resources| resources.mcp)
-                })
-                .transpose()?;
+            let (context, configured) = provider.configured_resources(&catalog_request).await?;
             let server_list = discovery
                 .1
                 .snapshot(
                     provider.clone(),
-                    provider.query_context(&catalog_request).await?,
-                    configured,
+                    context,
+                    configured.map(|resources| resources.mcp.clone()),
                 )
                 .await?;
             Some(Response::success(request.id, server_list)?)

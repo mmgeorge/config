@@ -7,7 +7,25 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 const MARKER: &str = "{\"layout\":\"harness-settings-and-versioned-state\"}\n";
-const RESET_NOTICE: &str = "Forge reset the old Harness storage layout. Previous sessions, settings, and preferences were discarded; defaults now apply.";
+const RESET_NOTICE: &str = "Forge cleared the retired Harness history.";
+const RETAINED_RESET_NOTICE: &str = "Forge cleared the retired Harness history. Older settings formats were retained in retired-settings under the Harness data directory. Review those files to restore their choices.";
+const RETIRED_SETTINGS_DIRECTORY: &str = "retired-settings";
+const CURRENT_SETTING_FILES: &[&str] = &["permissions.json", "subagents.json"];
+const SETTINGS_DATABASE_FILES: &[&str] = &[
+    "settings.db",
+    "settings.db-wal",
+    "settings.db-shm",
+    "settings.db-journal",
+];
+const RETIRED_SETTING_FILES: &[&str] = &[
+    "provider.json",
+    "backend.json",
+    "harness-trace-config.json",
+    "preferences.sqlite3",
+    "preferences.sqlite3-wal",
+    "preferences.sqlite3-shm",
+    "preferences.sqlite3-journal",
+];
 /// Holds the reset notice at the Harness root until one session start takes it.
 const RESET_NOTICE_FILE: &str = "reset-notice.txt";
 
@@ -118,25 +136,46 @@ fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
     let resetting = resetting || !entries.is_empty();
     ensure!(
         !resetting || operation == Initialization::HistoryClear,
-        "An incompatible Harness storage layout was detected at {}. Run :ForgeHistoryClear before starting Harness. This one-time cleanup discards old sessions, settings, and preferences.",
+        "An incompatible Harness storage layout was detected at {}. Run :ForgeHistoryClear to discard retired sessions and retain previous settings before starting Harness.",
         root.display()
     );
     let mut owners = CleanupOwnership::default();
     if resetting {
         // Resolve every ownership boundary before deleting the first dependent file.
+        let retained = root.join(RETIRED_SETTINGS_DIRECTORY);
+        check_retained_directory(&retained)?;
+        for name in CURRENT_SETTING_FILES.iter().chain(SETTINGS_DATABASE_FILES) {
+            plain_settings_file(&root.join(name))?;
+        }
         let retired = crate::repository_access::reset_preflight()?;
-        owners.inspect(root)?;
+        owners.inspect_excluding(root, Some(RETIRED_SETTINGS_DIRECTORY))?;
+        let keep_database = owners.settings_are_compatible(root);
         fs::write(pending, root.to_string_lossy().as_bytes())?;
         fs::OpenOptions::new()
             .write(true)
             .open(pending)?
             .sync_all()?;
+        // Put settings outside the deletion set before discarding retired state.
+        owners.close_databases();
+        retain_retired_settings(root, &retained, keep_database)?;
         for journal in retired {
             crate::repository_access::clear_retired(&journal)?;
         }
-        owners.close_databases();
         for entry in fs::read_dir(root)? {
             let entry = entry?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|name| {
+                file_name_matches(name, RETIRED_SETTINGS_DIRECTORY)
+                    || CURRENT_SETTING_FILES
+                        .iter()
+                        .any(|file| file_name_matches(name, file))
+                    || (keep_database
+                        && SETTINGS_DATABASE_FILES
+                            .iter()
+                            .any(|file| file_name_matches(name, file)))
+            }) {
+                continue;
+            }
             if entry.file_type()?.is_dir() {
                 fs::remove_dir_all(entry.path())
                     .with_context(|| format!("reset {}", entry.path().display()))?;
@@ -151,8 +190,13 @@ fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
     // Publish settings before disposable storage opens, so logging can diagnose history failures.
     super::preferences::initialize(root)?;
     if resetting {
-        fs::write(root.join(RESET_NOTICE_FILE), RESET_NOTICE)?;
-        eprintln!("{RESET_NOTICE}");
+        let notice = if root.join(RETIRED_SETTINGS_DIRECTORY).try_exists()? {
+            RETAINED_RESET_NOTICE
+        } else {
+            RESET_NOTICE
+        };
+        fs::write(root.join(RESET_NOTICE_FILE), notice)?;
+        eprintln!("{notice}");
     }
     fs::write(&marker, MARKER)?;
     fs::OpenOptions::new()
@@ -163,6 +207,82 @@ fn initialize(root: &Path, operation: Initialization) -> Result<bool> {
         fs::remove_file(pending)?;
     }
     Ok(resetting)
+}
+
+/// Reject an archive alias before any legacy file moves into it.
+fn check_retained_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            metadata.is_dir() && !is_link(path)?,
+            "retired settings location {} is not a plain directory",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    Ok(())
+}
+
+/// Match reserved paths using their ordinary platform case convention.
+fn file_name_matches(name: &str, expected: &str) -> bool {
+    name == expected || (cfg!(windows) && name.eq_ignore_ascii_case(expected))
+}
+
+/// Check that an existing settings file can be preserved without following an alias.
+fn plain_settings_file(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file() && !is_link(path)?,
+                "settings path {} is not a plain file",
+                path.display()
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+/// Move incompatible settings and SQLite sidecars together under the interrupted-reset record.
+fn retain_retired_settings(root: &Path, retained: &Path, keep_database: bool) -> Result<()> {
+    let names = RETIRED_SETTING_FILES
+        .iter()
+        .chain(SETTINGS_DATABASE_FILES.iter().filter(|_| !keep_database));
+    let mut moves = Vec::new();
+    for name in names {
+        let source = root.join(name);
+        if plain_settings_file(&source)? {
+            let target = retained.join(name);
+            ensure!(
+                !plain_settings_file(&target)?,
+                "retired settings already exist at {}; current files remain at {}",
+                target.display(),
+                root.display()
+            );
+            moves.push((source, target));
+        }
+    }
+    if moves.is_empty() {
+        return Ok(());
+    }
+    match fs::create_dir(retained) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            check_retained_directory(retained)?;
+        }
+        Err(error) => return Err(error).with_context(|| format!("create {}", retained.display())),
+    }
+    for (source, target) in moves {
+        fs::rename(&source, &target).with_context(|| {
+            format!(
+                "retain settings from {} at {}",
+                source.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Resolve the exact reset boundary and reject roots, aliases, and broad configuration directories.
@@ -232,7 +352,7 @@ fn legacy(root: &Path) -> Result<bool> {
         }
     }
     let settings = root.join("settings.db");
-    if settings.try_exists()? {
+    if plain_settings_file(&settings)? {
         #[expect(
             clippy::disallowed_methods,
             reason = "layout detection reads the retired settings header without modifying it"
@@ -252,12 +372,17 @@ fn legacy(root: &Path) -> Result<bool> {
 #[derive(Default)]
 pub(super) struct CleanupOwnership {
     leases: Vec<File>,
-    databases: Vec<rusqlite::Connection>,
+    databases: Vec<(PathBuf, rusqlite::Connection)>,
 }
 
 impl CleanupOwnership {
     /// Inspect a complete tree without following links or deleting dependent files.
     pub(super) fn inspect(&mut self, root: &Path) -> Result<()> {
+        self.inspect_excluding(root, None)
+    }
+
+    /// Inspect ownership without entering a directory kept outside the deletion set.
+    fn inspect_excluding(&mut self, root: &Path, retained: Option<&str>) -> Result<()> {
         ensure!(
             !is_link(root)?,
             "cleanup refuses symlink or junction {}",
@@ -265,6 +390,13 @@ impl CleanupOwnership {
         );
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
+            if retained.is_some_and(|name| {
+                path.file_name()
+                    .and_then(|entry| entry.to_str())
+                    .is_some_and(|entry| file_name_matches(entry, name))
+            }) {
+                continue;
+            }
             // Generated provider resources link outside state; their targets are not owned here.
             if is_link(&path)? {
                 continue;
@@ -286,7 +418,10 @@ impl CleanupOwnership {
                 self.leases.push(owner);
             } else if path
                 .extension()
-                .is_some_and(|extension| extension == "db" || extension == "sqlite3")
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    file_name_matches(extension, "db") || file_name_matches(extension, "sqlite3")
+                })
             {
                 #[expect(
                     clippy::disallowed_methods,
@@ -303,10 +438,22 @@ impl CleanupOwnership {
                     .with_context(|| {
                         format!("database owner blocks cleanup: {}", path.display())
                     })?;
-                self.databases.push(connection);
+                self.databases.push((path, connection));
             }
         }
         Ok(())
+    }
+
+    /// Validate current settings under the same exclusive connection used for cleanup preflight.
+    fn settings_are_compatible(&self, root: &Path) -> bool {
+        self.databases.iter().any(|(path, connection)| {
+            path.parent() == Some(root)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| file_name_matches(name, "settings.db"))
+                && super::preferences::validate(connection).is_ok()
+        })
     }
 
     /// Close database handles before unlinking while retaining independent ownership leases.
@@ -382,11 +529,24 @@ mod tests {
             fs::read_to_string(root.path().join("unknown"))?,
             "old content"
         );
+        assert_eq!(
+            fs::read_to_string(root.path().join("provider.json"))?,
+            "old choice"
+        );
+        assert!(!root.path().join(RETIRED_SETTINGS_DIRECTORY).exists());
         drop(lease);
         assert!(prepare(root.path()).is_err());
         clear_legacy(root.path())?;
         assert!(!root.path().join("unknown").exists());
         assert!(!root.path().join("provider.json").exists());
+        assert_eq!(
+            fs::read_to_string(
+                root.path()
+                    .join(RETIRED_SETTINGS_DIRECTORY)
+                    .join("provider.json"),
+            )?,
+            "old choice"
+        );
         assert!(root.path().join("reset-notice.txt").exists());
         Ok(())
     }
@@ -402,13 +562,85 @@ mod tests {
         assert!(clear_legacy(retired_root.path())?);
         assert_eq!(
             take_reset_notice(retired_root.path())?.as_deref(),
-            Some(RESET_NOTICE)
+            Some(RETAINED_RESET_NOTICE)
         );
         assert!(!retired_root.path().join(RESET_NOTICE_FILE).exists());
         assert_eq!(take_reset_notice(retired_root.path())?, None);
         // Taking the notice leaves a canonical layout that needs no further reset.
         prepare(retired_root.path())?;
         assert!(!clear_legacy(retired_root.path())?);
+        Ok(())
+    }
+
+    /// Retain unsupported settings while clearing retired history and initializing fresh state.
+    #[test]
+    fn retired_layout_retains_incompatible_settings() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let settings = root.path().join("settings.db");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "build a retired settings database without opening current state"
+        )]
+        let previous = rusqlite::Connection::open(&settings)?;
+        previous.pragma_update(None, "journal_mode", "WAL")?;
+        previous.execute_batch(
+            "PRAGMA user_version = 1;
+             CREATE TABLE setting_layer (scope TEXT, payload TEXT);
+             INSERT INTO setting_layer VALUES ('global', 'saved preference');",
+        )?;
+        drop(previous);
+        let permissions = root.path().join("permissions.json");
+        fs::write(&permissions, r#"{"rules":["fixture"]}"#)?;
+        let history = root.path().join("objects");
+        fs::create_dir(&history)?;
+        fs::write(history.join("retired-object"), "discard")?;
+
+        assert!(prepare(root.path()).is_err());
+        assert!(clear_legacy(root.path())?);
+        assert!(!history.exists());
+        assert_eq!(fs::read_to_string(permissions)?, r#"{"rules":["fixture"]}"#);
+        let retained = root
+            .path()
+            .join(RETIRED_SETTINGS_DIRECTORY)
+            .join("settings.db");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "read the retained retired database without normalizing it"
+        )]
+        let previous = rusqlite::Connection::open_with_flags(
+            &retained,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let payload: String = previous.query_row(
+            "SELECT payload FROM setting_layer WHERE scope='global'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(payload, "saved preference");
+        drop(previous);
+        super::super::preferences::open(root.path())?;
+        assert!(!super::super::state::directory(root.path()).exists());
+        assert!(!clear_legacy(root.path())?);
+        assert!(retained.is_file());
+        Ok(())
+    }
+
+    /// Keep a canonical settings database when disposable files still use the retired layout.
+    #[test]
+    fn retired_layout_preserves_compatible_settings_in_place() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        prepare(root.path())?;
+        super::super::preferences::host_set(root.path(), "provider", &"antigravity")?;
+        fs::remove_file(root.path().join("layout.json"))?;
+        fs::create_dir(root.path().join("state-locks"))?;
+
+        assert!(clear_legacy(root.path())?);
+        assert_eq!(
+            super::super::preferences::host_get::<String>(root.path(), "provider")?.as_deref(),
+            Some("antigravity")
+        );
+        assert!(!root.path().join(RETIRED_SETTINGS_DIRECTORY).exists());
+        assert_eq!(take_reset_notice(root.path())?.as_deref(), Some(RESET_NOTICE));
         Ok(())
     }
 
@@ -447,6 +679,10 @@ mod tests {
             canonical.to_string_lossy().as_bytes(),
         )?;
         fs::write(root.join("partially-deleted"), "discard")?;
+        let retained = root.join(RETIRED_SETTINGS_DIRECTORY);
+        fs::create_dir(&retained)?;
+        fs::write(retained.join("provider.json"), "saved provider")?;
+        fs::write(root.join("harness-trace-config.json"), "saved trace config")?;
         assert!(
             prepare(&root)
                 .unwrap_err()
@@ -457,6 +693,14 @@ mod tests {
         clear_legacy(&root)?;
         assert!(!root.join("partially-deleted").exists());
         assert!(root.join("layout.json").exists());
+        assert_eq!(
+            fs::read_to_string(retained.join("provider.json"))?,
+            "saved provider"
+        );
+        assert_eq!(
+            fs::read_to_string(retained.join("harness-trace-config.json"))?,
+            "saved trace config"
+        );
         Ok(())
     }
 

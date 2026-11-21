@@ -4,7 +4,7 @@ use super::{
 };
 use crate::provider::{HarnessEventSink, HostEvent, ProviderCompletion};
 use async_trait::async_trait;
-use forge_provider_api::control::ToolCall;
+use forge_provider_api::control::{ToolCall, ToolOutcome};
 use serde::Serialize;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -16,9 +16,72 @@ pub(crate) trait ControlEndpoint: Send + Sync {
     async fn call(&self, call: ToolCall) -> ToolResult<ControlReply>;
 }
 
-#[derive(Debug, Serialize)]
+/// Route one binding's stable HTTP endpoint to the invocation active at admission.
+pub(crate) struct BindingControl {
+    definitions: Vec<ControlToolDefinition>,
+    active: StdMutex<Option<std::sync::Weak<ControlSession>>>,
+}
+
+impl BindingControl {
+    /// Create an idle endpoint with the binding's stable tool catalog.
+    pub(crate) fn new(definitions: Vec<ControlToolDefinition>) -> Self {
+        Self {
+            definitions,
+            active: StdMutex::new(None),
+        }
+    }
+
+    /// Install the fully prepared invocation before its native prompt is sent.
+    pub(crate) fn bind(&self, invocation: &Arc<ControlSession>) {
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(invocation));
+    }
+
+    /// Revoke the exact target, including when a retry has reused the invocation scope.
+    pub(crate) fn unbind(&self, invocation: &Arc<ControlSession>) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .as_ref()
+            .is_some_and(|target| target.ptr_eq(&Arc::downgrade(invocation)))
+        {
+            *active = None;
+        }
+    }
+}
+
+#[async_trait]
+impl ControlEndpoint for BindingControl {
+    async fn definitions(&self) -> Vec<ControlToolDefinition> {
+        self.definitions.clone()
+    }
+
+    async fn call(&self, call: ToolCall) -> ToolResult<ControlReply> {
+        let invocation = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                ToolError::MissingState("No Forge invocation accepts tool calls".into())
+            })?;
+        invocation.call(call).await
+    }
+}
+
+/// Retain the host tool outcome alongside the existing MCP text payload.
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct ControlReply {
+    /// Carry the tool's model-visible message.
     pub(crate) message: String,
+    /// Carry the outcome for the native MCP error field.
+    #[serde(skip)]
+    pub(crate) outcome: ToolOutcome,
 }
 
 struct ActiveControl {
@@ -247,11 +310,14 @@ impl ControlEndpoint for ControlSession {
                 .tools
                 .upgrade()
                 .ok_or_else(|| ToolError::MissingState("Host invocation has retired".into()))?;
-            let message = tools
-                .call(&host.scope, call)
+            let reply = tools
+                .call_http_reply(&host.scope, call)
                 .await
                 .map_err(|error| ToolError::Operation(Box::new(error)))?;
-            return Ok(ControlReply { message });
+            return Ok(ControlReply {
+                message: reply.text,
+                outcome: reply.outcome,
+            });
         }
         let (active, _pending) = self.admit_call(&call.name)?;
         let executor = active.executor.clone();
@@ -292,6 +358,69 @@ impl ControlEndpoint for ControlSession {
         }
         Ok(ControlReply {
             message: result.message,
+            outcome: ToolOutcome::Succeeded,
         })
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use forge_provider_api::control::{ProviderTools, ToolCallId, ToolReply};
+
+    struct FixedDispatch(ToolReply);
+
+    #[async_trait]
+    impl ProviderTools for FixedDispatch {
+        async fn call(
+            &self,
+            _: &crate::provider::InvocationScope,
+            _: ToolCall,
+        ) -> Result<String, forge_provider_api::ProviderError> {
+            Ok(self.0.text.clone())
+        }
+
+        async fn call_reply(
+            &self,
+            _: &crate::provider::InvocationScope,
+            _: ToolCall,
+        ) -> Result<ToolReply, forge_provider_api::ProviderError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Keep one URL while the bound tool authority changes and retires.
+    #[tokio::test]
+    async fn binding_routes_only_to_the_installed_invocation() {
+        let endpoint = BindingControl::new(Vec::new());
+        let call = || ToolCall {
+            id: ToolCallId::new("fixture-call").unwrap(),
+            name: "fixture".into(),
+            arguments: serde_json::json!({}),
+        };
+        assert!(endpoint.call(call()).await.is_err());
+
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::testing::root_thread("binding-owner"),
+            "fixture-turn",
+        );
+        let original = Arc::new(ControlSession::new(Vec::new()));
+        let original_tools: Arc<dyn ProviderTools> =
+            Arc::new(FixedDispatch(ToolReply::succeeded("original")));
+        original.bind_host(scope.clone(), Arc::downgrade(&original_tools));
+        endpoint.bind(&original);
+        assert_eq!(endpoint.call(call()).await.unwrap().message, "original");
+
+        let successor = Arc::new(ControlSession::new(Vec::new()));
+        let successor_tools: Arc<dyn ProviderTools> =
+            Arc::new(FixedDispatch(ToolReply::failed("successor")));
+        successor.bind_host(scope, Arc::downgrade(&successor_tools));
+        endpoint.bind(&successor);
+        endpoint.unbind(&original);
+        let successor_reply = endpoint.call(call()).await.unwrap();
+        assert_eq!(successor_reply.message, "successor");
+        assert_eq!(successor_reply.outcome, ToolOutcome::Failed);
+        endpoint.unbind(&successor);
+        assert!(endpoint.call(call()).await.is_err());
     }
 }

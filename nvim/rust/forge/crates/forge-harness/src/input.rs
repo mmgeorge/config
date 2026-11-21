@@ -301,13 +301,29 @@ impl SessionInputQueue {
                         .context("input message revision exhausted")?;
                 }
                 if let Some(id) = message.submission_id() {
-                    let record = submissions.submission(id)?.record()?;
+                    let submission = submissions.submission(id)?;
+                    let record = submission.record()?;
                     ensure!(
                         record.request.harness_session_id == session_id,
                         "input submission belongs to another session"
                     );
                     match record.delivery {
                         crate::provider::submission::SubmissionState::Accepted { .. } => {
+                            if message.route() == Some(InputRoute::Steering)
+                                && matches!(message.purpose, InputPurpose::User)
+                                && let Some((scope, delivery)) = record.steering_target()
+                            {
+                                ensure!(
+                                    record.input_message_id.as_deref() == Some(message.id.as_str()),
+                                    "steering receipt belongs to another input"
+                                );
+                                journal.restore_accepted_steering(
+                                    message,
+                                    &submission,
+                                    scope,
+                                    delivery,
+                                )?;
+                            }
                             message.set_delivery(InputDelivery::Accepted, None, None)?;
                         }
                         crate::provider::submission::SubmissionState::Sending { .. } => {
@@ -319,12 +335,12 @@ impl SessionInputQueue {
                         }
                         crate::provider::submission::SubmissionState::Prepared => {
                             if channel == InputChannel::CheckResults {
-                                submissions.submission(id)?.retire_prepared()?;
+                                submission.retire_prepared()?;
                                 message.queue();
                             } else if exchanged_inputs.contains(&message.id) {
                                 // The transcript already shows this prompt as an interrupted
                                 // exchange, so it settles there and never runs again.
-                                submissions.submission(id)?.retire_prepared()?;
+                                submission.retire_prepared()?;
                                 cancelled.insert(message.id.clone());
                             } else {
                                 message.set_delivery(
@@ -337,12 +353,11 @@ impl SessionInputQueue {
                                 )?;
                             }
                         }
-                        // Settlement retires every unsent failure to Cancelled while the queue
-                        // keeps the entry Failed, so the entry stays visible and keeps blocking
-                        // later follow-ups. A user retraction removes the entry instead, so only
-                        // an entry interrupted mid-settlement reaches here in another phase.
+                        // Retirement can commit before the queue sees it. Preserve explicit
+                        // return intent without treating ordinary cancellation as queued work.
                         crate::provider::submission::SubmissionState::Cancelled
-                            if channel == InputChannel::CheckResults
+                            if (channel == InputChannel::CheckResults
+                                || record.returns_to_queue())
                                 && message.delivery() != InputDelivery::Failed =>
                         {
                             message.queue();

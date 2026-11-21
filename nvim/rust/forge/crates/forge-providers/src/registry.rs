@@ -204,10 +204,10 @@ const REGISTRATIONS: &[RegistryEntry] = &[
     RegistryEntry {
         id: "antigravity",
         label: "Antigravity",
-        detail: "Standalone Antigravity ACP server",
+        detail: "Bundled Antigravity CLI ACP server",
         selectable: true,
         aliases: &["agy"],
-        command: &["agy_acp_server"],
+        command: &["agy", "acp", "--process-per-session"],
         background_generation: None,
     },
     RegistryEntry {
@@ -293,6 +293,17 @@ pub fn descriptor(id: &ProviderId) -> Result<ProviderDescriptor, ProviderResolut
         label: registration.label.to_owned(),
         capability: registration.capability,
     })
+}
+
+/// Describe the provider constraint that prevents a particular MCP server launch.
+pub fn mcp_launch_incompatibility(
+    provider: &str,
+    launch: &forge_provider_api::session::McpLaunch,
+) -> Option<&'static str> {
+    match provider {
+        "antigravity" => crate::acp::mcp_launch_incompatibility(launch),
+        _ => None,
+    }
 }
 
 fn capability(id: &str) -> ProviderCapability {
@@ -423,6 +434,7 @@ fn capability(id: &str) -> ProviderCapability {
         },
         "antigravity" => ProviderCapability {
             integration: ProviderIntegration {
+                host_tool_endpoint: true,
                 isolated_generation: true,
                 tracked_submission: true,
                 resource_target: Some("antigravity-cli".into()),
@@ -456,7 +468,9 @@ fn capability(id: &str) -> ProviderCapability {
                 ],
                 ..Default::default()
             },
+            native_steer: true,
             model_selection: true,
+            effort_selection: true,
             permission_control: true,
             catalog,
             approval_mode_list: approvals,

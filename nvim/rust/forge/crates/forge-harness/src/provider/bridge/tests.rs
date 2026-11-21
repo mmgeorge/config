@@ -926,11 +926,62 @@ async fn accepted_turns_deliver_each_context_section_once_per_change() -> anyhow
     Ok(())
 }
 
+/// Redeliver unchanged context when Antigravity may compact without reporting a history change.
+#[tokio::test]
+async fn antigravity_primary_prompts_always_carry_standing_context() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    native.accept_input.store(true, Ordering::Release);
+    let mut bridge = bridge(root.path(), native.clone()).await?;
+    bridge.descriptor.kind = forge_provider_api::ProviderId::new("antigravity")?;
+    let store = super::super::submission::SubmissionStore::open(
+        root.path(),
+        Arc::new(crate::trace::TraceStore::open(root.path())?),
+    )?;
+    for exchange in ["first", "unchanged"] {
+        let mut request = provider_request(root.path());
+        request.submission = Some(store.prepare(&request, bridge.descriptor.kind.clone())?);
+        let scope = forge_provider_api::InvocationScope::new(request.owner()?, exchange);
+        bridge.turn_start(request, scope).await?;
+    }
+    {
+        let accepted_context = native.accepted_context.lock().unwrap();
+        assert_eq!(accepted_context.len(), 2);
+        assert!(
+            accepted_context
+                .iter()
+                .all(|context| { context.permissions.is_some() && context.task.is_some() })
+        );
+    }
+    bridge.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> anyhow::Result<()> {
+    use crate::permissions::document::{CATEGORY_TOOL, PermissionDecision};
+    use crate::provider::approval_view::ApprovalAnswer;
+
     let root = tempfile::tempdir()?;
     let native = BridgeFixtureProvider::new(false);
     let bridge = bridge(root.path(), native.clone()).await?;
+    bridge
+        .permissions
+        .store()
+        .write()
+        .unwrap()
+        .set_rule_list(&[
+            (
+                CATEGORY_TOOL.into(),
+                "goal_complete".into(),
+                PermissionDecision::Ask,
+            ),
+            (
+                CATEGORY_TOOL.into(),
+                "harness_config".into(),
+                PermissionDecision::Deny,
+            ),
+        ])?;
     let request = provider_request(root.path());
     let owner = request.owner()?;
     bridge.thread_open(request).await?;
@@ -958,8 +1009,6 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     )?;
     endpoint.begin(context.clone(), sink).await;
     let (_event_sink, event_stream) = crate::provider::events::channel(scope.clone());
-    let server = ControlServer::start(endpoint.clone()).await?;
-    let endpoint_lease = Arc::new(EndpointLease { _server: server });
     let relay = crate::provider::host_invocation::HostEventRelay::start(
         bound.binding.id.clone(),
         event_stream,
@@ -980,16 +1029,36 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
                 crate::provider::events::channel(scope.clone()).0,
             )),
             provider_closed: bridge.closed.clone(),
+            provider_id: bridge.descriptor.kind.clone(),
             permissions: permissions.clone(),
             directories: None,
             endpoint: endpoint.clone(),
-            endpoint_lease,
+            binding_control: None,
             relay,
             skills: None,
         },
     ));
     let delegated: Arc<dyn forge_provider_api::control::ProviderTools> = invocation.clone();
     endpoint.bind_host(scope.clone(), Arc::downgrade(&delegated));
+    let refused = crate::tools::control_session::ControlEndpoint::call(
+        endpoint.as_ref(),
+        forge_provider_api::control::ToolCall {
+            id: forge_provider_api::control::ToolCallId::new("mcp-denied")?,
+            name: "harness_config".into(),
+            arguments: serde_json::json!({}),
+        },
+    )
+    .await?;
+    assert_eq!(
+        refused.outcome,
+        forge_provider_api::control::ToolOutcome::Failed
+    );
+    assert!(
+        refused.message.contains("saved permission rule"),
+        "{}",
+        refused.message
+    );
+    assert!(bridge.permissions.pending_list()?.is_empty());
     let call = forge_provider_api::control::ToolCall {
         id: forge_provider_api::control::ToolCallId::new("mcp-live-goal")?,
         name: "goal_complete".into(),
@@ -1000,6 +1069,33 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
         call.clone(),
     ));
     assert!(futures_util::poll!(pending.as_mut()).is_pending());
+    let mut concurrent = Box::pin(crate::tools::control_session::ControlEndpoint::call(
+        endpoint.as_ref(),
+        call.clone(),
+    ));
+    assert!(futures_util::poll!(concurrent.as_mut()).is_pending());
+    let pending_approvals = bridge.permissions.pending_list()?;
+    assert_eq!(
+        pending_approvals.len(),
+        1,
+        "duplicate HTTP delivery must share one approval"
+    );
+    assert!(
+        live_receiver.try_recv().is_err(),
+        "mutation ran before approval"
+    );
+    let approval = &pending_approvals[0];
+    bridge
+        .permissions
+        .resolve(
+            &approval.id,
+            &[ApprovalAnswer {
+                item_id: approval.item_list[0].id.clone(),
+                choice_id: "allow_once".into(),
+            }],
+            None,
+        )
+        .await?;
     let effect = tokio::select! {
         effect = live_receiver.recv() => effect.expect("mutation requests owner commit"),
         result = pending.as_mut() => panic!("mutation replied before owner commit: {result:?}"),
@@ -1007,10 +1103,6 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     assert_eq!(effect.call_id, call.id);
     assert!(effect.batch.completion.goal_control.is_some());
     assert!(futures_util::poll!(pending.as_mut()).is_pending());
-    let mut concurrent = Box::pin(crate::tools::control_session::ControlEndpoint::call(
-        endpoint.as_ref(),
-        call.clone(),
-    ));
     assert!(futures_util::poll!(concurrent.as_mut()).is_pending());
     assert!(
         live_receiver.try_recv().is_err(),

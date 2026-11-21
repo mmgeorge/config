@@ -9,8 +9,12 @@ enum InputAppend {
     User,
     /// The provider acknowledged receipt under this invocation.
     Acknowledged(forge_provider_api::InvocationScope),
+    /// The receipt survived its invocation and no further consumption evidence can arrive.
+    RecoveredSteering(forge_provider_api::InvocationScope),
     /// The provider accepted the input as the prompt of this invocation.
     Dispatched(forge_provider_api::InvocationScope),
+    /// The provider accepted the fallback prompt before the owner wrote its history row.
+    RecoveredPrompt(forge_provider_api::InvocationScope),
 }
 
 /// What one recorded turn message is, as far as the transcript is concerned.
@@ -1725,12 +1729,38 @@ impl Exchange {
         )
     }
 
+    /// Restore an accepted user steer whose transcript append did not survive owner shutdown.
+    pub(crate) fn restore_accepted_steering(
+        &mut self,
+        invocation: &forge_provider_api::InvocationScope,
+        id: String,
+        submission: forge_provider_api::SubmissionId,
+        text: String,
+        delivery: crate::provider::session_execution::AcceptedInputDelivery,
+        now_ms: i64,
+    ) -> anyhow::Result<ExchangeInput> {
+        use crate::provider::session_execution::AcceptedInputDelivery;
+        let admission = match delivery {
+            AcceptedInputDelivery::Steering => InputAppend::RecoveredSteering(invocation.clone()),
+            AcceptedInputDelivery::TurnPrompt => InputAppend::RecoveredPrompt(invocation.clone()),
+        };
+        self.record_input(
+            admission,
+            Some(id),
+            Some(submission),
+            InputIntent::user_text(text.clone()),
+            text,
+            None,
+            now_ms,
+        )
+    }
+
     /// Record accepted input that the provider received as the prompt of `invocation`.
     ///
     /// A steer the provider refused before dispatch is resent as the next invocation's prompt.
-    /// The model reads a turn's prompt when that turn starts, and providers echo only steering,
-    /// so the input is consumed on acceptance: its row closes the running message and precedes
-    /// the output of the turn it starts, or replaces an echo that arrived first.
+    /// The model reads that prompt when its turn starts. Mark it consumed on acceptance and
+    /// place it before the turn's content, even when the acknowledgement follows streaming
+    /// output. An echo that arrived first supplies its own row position.
     pub(crate) fn append_dispatched_input(
         &mut self,
         invocation: &forge_provider_api::InvocationScope,
@@ -1768,6 +1798,7 @@ impl Exchange {
                 self.state(),
                 ExchangeState::Running | ExchangeState::Finalizing
             ),
+            InputAppend::RecoveredSteering(_) | InputAppend::RecoveredPrompt(_) => true,
         };
         if let Some(prompt) = self.node_list.iter().find_map(|node| match node {
             ExchangeNode::ExchangeInput { prompt }
@@ -1790,35 +1821,50 @@ impl Exchange {
         // Only journaled provider steering can report consumption; other input is part of the
         // exchange as soon as Harness records it.
         let steering = match (&admission, &submission_id) {
-            (InputAppend::Acknowledged(invocation), Some(submission))
+            (InputAppend::Acknowledged(invocation) | InputAppend::RecoveredSteering(invocation), Some(submission))
                 if matches!(intent, InputIntent::User { .. }) =>
             {
                 Some((invocation, submission))
             }
             _ => None,
         };
-        let dispatched = match (&admission, &submission_id) {
-            (InputAppend::Dispatched(invocation), Some(submission)) => {
-                Some((invocation, submission))
-            }
-            _ => None,
+        let dispatched_invocation = match &admission {
+            InputAppend::Dispatched(invocation) | InputAppend::RecoveredPrompt(invocation) => Some(invocation),
+            InputAppend::User | InputAppend::Acknowledged(_) | InputAppend::RecoveredSteering(_) => None,
         };
         let anchor = steering
-            .or(dispatched)
+            .or(dispatched_invocation.zip(submission_id.as_ref()))
             .and_then(|(invocation, submission)| self.consumption_anchor(invocation, submission));
         let consumption = match steering {
             None => InputConsumption::Consumed,
             Some(_) if anchor.is_some() => InputConsumption::Consumed,
-            Some((invocation, _)) if self.closed_input_consumption.contains(invocation) => {
+            Some((invocation, _))
+                if matches!(admission, InputAppend::RecoveredSteering(_))
+                    || self.closed_input_consumption.contains(invocation) => {
                 InputConsumption::Unconfirmed
             }
             Some((invocation, _)) => InputConsumption::AwaitingConsumption {
                 invocation: invocation.clone(),
             },
         };
-        // Steering joins the provider's message stream only at its consumption boundary, so
-        // acknowledgement leaves the current message open.
-        if steering.is_none() {
+        let dispatched_turn = dispatched_invocation.and_then(|invocation| {
+            self.turn
+                .iter()
+                .find(|turn| &turn.provider().scope == invocation)
+        });
+        let dispatched_position = dispatched_turn.and_then(|turn| {
+            self.node_list.iter().position(|node| {
+                matches!(
+                    node,
+                    ExchangeNode::TurnContent { turn_id, .. }
+                        | ExchangeNode::SkillRead { turn_id, .. }
+                        | ExchangeNode::InstructionRead { turn_id, .. } if turn_id == turn.id()
+                )
+            })
+        });
+        // A steering acknowledgement has no consumption boundary. A late prompt receipt
+        // belongs to the start of its turn and must leave that turn's message open.
+        if steering.is_none() && dispatched_turn.is_none() {
             self.close_running_messages();
         }
 
@@ -1842,7 +1888,9 @@ impl Exchange {
         };
         match anchor {
             Some(position) => self.node_list[position] = node,
-            None => self.node_list.push(node),
+            None => self
+                .node_list
+                .insert(dispatched_position.unwrap_or(self.node_list.len()), node),
         }
         self.reconcile_entries()?;
         Ok(prompt)
@@ -2598,6 +2646,66 @@ mod test {
                 _ => None,
             })
             .expect("input node")
+    }
+
+    /// Keep a deferred steer's prompt ahead of the continuation's already published output.
+    #[test]
+    fn dispatched_steer_precedes_output_that_arrived_before_acknowledgement() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let original = running_turn(&mut exchange, "original", 1);
+        let original_response = crate::turn::test_support::message(
+            &original,
+            "original-response",
+            Some(AgentMessageRole::Response),
+            "Original response",
+        );
+        assert!(exchange.observe_event(&original_response, 2).unwrap());
+        let original_response_completed = crate::turn::test_support::message_completed(
+            &original,
+            "original-response",
+            "Original response",
+        );
+        assert!(
+            exchange
+                .observe_event(&original_response_completed, 2)
+                .unwrap()
+        );
+        let original_row = displayed(&exchange)[0].clone();
+        let original_finished = crate::turn::test_support::completed_event(
+            &original,
+            crate::turn::TurnOutcome::Completed {
+                stop_reason: forge_provider_api::turn::TurnCompletionReason::Normal,
+            },
+            3,
+        );
+        assert!(exchange.observe_event(&original_finished, 3).unwrap());
+
+        let continuation = running_turn(&mut exchange, "continuation", 4);
+        let continuation_response = crate::turn::test_support::message(
+            &continuation,
+            "continuation-response",
+            Some(AgentMessageRole::Response),
+            "Continuation response",
+        );
+        assert!(exchange.observe_event(&continuation_response, 5).unwrap());
+        let continuation_row = displayed(&exchange)[1].clone();
+        let prompt = exchange
+            .append_dispatched_input(
+                &continuation.scope,
+                Some("deferred-steer".into()),
+                Some(submission("deferred-steer")),
+                InputIntent::user_text("Prefer the short form".into()),
+                "Prefer the short form".into(),
+                6,
+            )
+            .unwrap();
+
+        assert_eq!(prompt.consumption, InputConsumption::Consumed);
+        assert_eq!(
+            displayed(&exchange),
+            [original_row, prompt.id, continuation_row]
+        );
     }
 
     /// Acknowledgement waits for consumption, and the echo places the row where it arrived.

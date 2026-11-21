@@ -309,7 +309,7 @@ pub(crate) struct ConfigurationCommit {
 pub(crate) struct ConfigurationMcpNotices {
     pub(crate) deliveries: Vec<PendingProviderDelivery>,
     authority: Box<ConfigurationAuthority>,
-    notices: Option<std::collections::HashMap<String, String>>,
+    notices: std::collections::HashMap<String, String>,
 }
 
 impl ConfigurationCatalogJob {
@@ -671,7 +671,11 @@ impl HarnessBroker {
     }
 
     /// Confirm only the settings revision that this operation actually applied.
-    pub(crate) fn confirm_configuration_application(&mut self, action: &Value) -> Result<()> {
+    pub(crate) fn confirm_configuration_application(
+        &mut self,
+        action: &Value,
+        immutable_resources: Option<&crate::settings::SessionResources>,
+    ) -> Result<()> {
         let Some(revision) = action
             .pointer("/config/settings_revision")
             .and_then(Value::as_u64)
@@ -697,6 +701,18 @@ impl HarnessBroker {
             "settings changed before application confirmation"
         );
         let mut effective = snapshot.desired;
+        if let Some(resources) = immutable_resources {
+            effective.skill = resources
+                .skill
+                .iter()
+                .filter_map(|entry| Some((entry.resource_id.clone()?, entry.enabled)))
+                .collect();
+            effective.mcp = resources
+                .mcp
+                .iter()
+                .filter_map(|entry| Some((entry.resource_id.clone()?, entry.enabled)))
+                .collect();
+        }
         effective.access = Some(self.session.access.clone());
         effective.shell = Some(self.session.shell);
         effective.plan_compact = Some(self.session.plan_compact);
@@ -726,27 +742,10 @@ impl HarnessBroker {
     }
 
     /// Stage diagnostics for unavailable MCP resources in their original order.
-    pub(crate) fn prepare_configuration_mcp_notices(&mut self) -> Result<ConfigurationMcpNotices> {
-        let request = self.provider_catalog_request()?;
-        let declaration = self.provider.descriptor();
-        let Some(target) = declaration
-            .capability
-            .integration
-            .resource_target
-            .as_deref()
-        else {
-            return Ok(ConfigurationMcpNotices {
-                deliveries: Vec::new(),
-                authority: self.capture_configuration_authority()?,
-                notices: None,
-            });
-        };
-        let resources = crate::settings::SessionResources::load(
-            &self.data_root,
-            &request,
-            &self.session.provider,
-            target,
-        )?;
+    pub(crate) fn prepare_configuration_mcp_notices(
+        &mut self,
+        resources: &crate::settings::SessionResources,
+    ) -> Result<ConfigurationMcpNotices> {
         let mut deliveries = Vec::new();
         for (id, message) in &resources.launch_notice {
             if self.mcp_notice.get(id) == Some(message) {
@@ -779,7 +778,7 @@ impl HarnessBroker {
         Ok(ConfigurationMcpNotices {
             deliveries,
             authority: self.capture_configuration_authority()?,
-            notices: Some(resources.launch_notice),
+            notices: resources.launch_notice.clone(),
         })
     }
 
@@ -788,9 +787,7 @@ impl HarnessBroker {
         notices: ConfigurationMcpNotices,
     ) -> Result<()> {
         self.validate_configuration_authority(&notices.authority)?;
-        if let Some(notices) = notices.notices {
-            self.mcp_notice = notices;
-        }
+        self.mcp_notice = notices.notices;
         Ok(())
     }
 
@@ -923,7 +920,8 @@ impl HarnessBroker {
             ConfigurationRejection::ModelUnavailable,
         );
         anyhow::ensure!(
-            !requested_effort.is_some_and(|effort| effort != self.session.effort)
+            !requested_effort
+                .is_some_and(|effort| effort != "default" && effort != self.session.effort)
                 || self.capability.effort_selection,
             ConfigurationRejection::EffortUnavailable,
         );
@@ -2035,6 +2033,45 @@ impl HarnessBroker {
 #[cfg(test)]
 mod owned_tests {
     use super::*;
+
+    /// Apply workspace-advertised Antigravity thinking without opening a provider binding.
+    #[tokio::test]
+    async fn antigravity_effort_uses_workspace_catalog_before_first_prompt() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let provider = forge_providers::registry::select("antigravity")?;
+        broker.capability = forge_providers::registry::descriptor(&provider)?.capability;
+        let models = [crate::provider::ProviderModel {
+            id: broker.session.model.clone(),
+            label: None,
+            service_tiers: vec![crate::provider::ServiceTier::Standard],
+            reasoning: vec!["low".into(), "high".into()],
+            default_reasoning: Some("low".into()),
+            selected_reasoning: None,
+            context_window: Vec::new(),
+            default_context_window: None,
+            selected_context_window: None,
+            vision: false,
+            description: None,
+            is_default: true,
+        }];
+        let preparation = broker.prepare_configuration(json!({"effort": "high"}))?;
+        assert!(preparation.needs_catalog(&broker));
+        let candidate = broker.build_configuration_candidate(preparation, &models)?;
+        assert_eq!(candidate.configured.effort, "high");
+
+        let preparation = broker.prepare_configuration(json!({"effort": "xhigh"}))?;
+        assert!(broker.build_configuration_candidate(preparation, &models).is_err());
+
+        broker.capability.effort_selection = false;
+        broker.session.effort = "high".into();
+        let preparation = broker.prepare_configuration(json!({"effort": "default"}))?;
+        let candidate = broker.build_configuration_candidate(preparation, &models)?;
+        assert_eq!(candidate.configured.effort, "default");
+        Ok(())
+    }
 
     /// Preserve authoritative rejection without weakening the fence for uncertain writes.
     #[tokio::test]

@@ -41,6 +41,7 @@ local input_state = require("forge.views.harness.input_state")
 ---@field id string
 ---@field text string
 ---@field failed boolean
+---@field failure_notice? string Recovery detail that does not repeat the prompt.
 ---@field content ForgeStagedContent
 
 ---@class ForgeQueuedPrompt
@@ -62,6 +63,9 @@ local input_state = require("forge.views.harness.input_state")
 ---  with the reservation to send once it lands when navigation returned to the message meanwhile.
 ---@field release_after? table<string, true> Messages left unchanged while their reservation was
 ---  still in flight, released once the host acknowledges it.
+---@field delivered_entry? ForgeQueuedPrompt Entry that settled while its draft was open.
+---@field failure? string Reservation failure awaiting recovery.
+---@field failure_entry? ForgeQueuedPrompt Entry whose reservation failed.
 
 ---@param queue (string|ForgeQueuedPrompt)[]
 ---@param entry ForgeQueuedPrompt
@@ -109,7 +113,9 @@ local function reserve(state, edit, entry)
       if edit.release_after and edit.release_after[entry.id] then
         edit.release_after[entry.id] = nil
         if not failure then M.release(state, edit, entry) end
-      elseif failure then edit.failure = failure end
+      elseif failure and edit.delivered_entry ~= entry then
+        edit.failure, edit.failure_entry = failure, entry
+      end
       if edit.commit and not next(edit.reserving) then
         local commit = edit.commit
         edit.commit = nil
@@ -191,7 +197,7 @@ function M.move(state, draft, direction)
   if entry.local_only and entry.draft_state == "pending" then
     return nil, "This message is still being submitted. Wait for acknowledgement before editing."
   end
-  if entry.delivery == "delivering" or entry.delivery == "unknown" then
+  if entry.delivery == "delivering" or entry.delivery == "unknown" or entry.draft_state == "unknown" then
     return nil, "Delivery has started. The original message cannot be edited."
   end
   if edit then
@@ -234,40 +240,49 @@ end
 ---Commit edited entries in place and remove cleared entries, preserving all remaining identities.
 ---@param state table
 ---@param draft string
+---@param unqueue? boolean
 ---@return string? original_draft
 ---@return string? failure
 ---@return ForgeAttachmentSelection[]? attachments
 ---@return ("sent"|"edited")? recovered Why an edit whose message left the queue ended: its
 ---  unchanged text gave way to the earlier draft, or its changed text became an ordinary draft.
-function M.finish(state, draft)
+function M.finish(state, draft, unqueue)
   local edit = state.queue_edit
   if not edit then
     return nil, "The queued message being edited is no longer available"
   end
+  local restored, restored_attachments = edit.original_draft, edit.original_attachments
+  local recovered
   if not position(state.queue, edit.entry) then
     require("forge.infra.perf").diagnostic("ui.queue.recovered", { reason = "entry_missing",
       entry_id = edit.entry.id, reservation_id = edit.reservation, session_id = state.input and state.input.session_id })
-    -- Delivery can win the race with reservation. End editor ownership instead of
-    -- trapping every subsequent submit behind an entry that cannot be edited.
+    -- Delivery can win the race with this reservation while earlier edits still hold theirs.
+    -- Retire the missing entry and commit the surviving reservations below.
     local attachments = attachment.capture(state.composer_buf).attachments
-    state.queue_edit = nil
-    input_state.perform(state, { kind = "release", reservation = edit.reservation })
-    if draft == "" then return edit.original_draft, nil, edit.original_attachments end
-    -- Text the host already sent would only be sent twice, so it gives way to the earlier draft.
-    -- Text the user changed is new work and stays as an ordinary draft.
-    if unchanged(edit.entry, draft, attachments) then
-      return edit.original_draft, nil, edit.original_attachments, "sent"
+    recovered = "sent"
+    if draft ~= "" and not unchanged(edit.entry, draft, attachments) then
+      restored, restored_attachments, recovered = draft, attachments, "edited"
     end
-    return draft, nil, attachments, "edited"
+    edit.delivered_entry = edit.entry
+    if edit.reserving then edit.reserving[edit.entry.id] = nil end
+    if edit.failure_entry == edit.entry then edit.failure, edit.failure_entry = nil, nil end
+    edit.drafts[edit.entry], edit.attachments[edit.entry] = nil, nil
+  else
+    if not unqueue and edit.failure and draft ~= "" then
+      return nil, edit.failure .. ". Unqueue to retain this draft separately."
+    end
+    edit.drafts[edit.entry] = unqueue and "" or draft
+    edit.attachments[edit.entry] = attachment.capture(state.composer_buf).attachments
   end
-  if edit.failure and draft ~= "" then return nil, edit.failure .. ". Unqueue to retain this draft separately." end
-  edit.drafts[edit.entry] = draft
-  edit.attachments[edit.entry] = attachment.capture(state.composer_buf).attachments
   local entries = {}
   for _, entry in ipairs(state.queue) do
     if edit.drafts[entry] ~= nil then entries[#entries + 1] = entry end
   end
   state.queue_edit = nil
+  if recovered and #entries == 0 then
+    input_state.perform(state, { kind = "release", reservation = edit.reservation })
+    return restored, nil, restored_attachments, recovered
+  end
   -- The host answers the commit later, and later still when it waits for a reservation, so each
   -- saved row shows its saved text from this frame instead of the host's old copy.
   for _, entry in ipairs(entries) do
@@ -316,7 +331,7 @@ function M.finish(state, draft)
     input_state.perform(state, { kind = "commit", reservation = edit.reservation, edits = edits }, failed)
   end
   if edit.reserving and next(edit.reserving) then edit.commit = commit else commit() end
-  return edit.original_draft, nil, edit.original_attachments
+  return restored, nil, restored_attachments, recovered
 end
 
 ---Mark the reserved entry in the status split without changing queued payloads.
@@ -328,6 +343,7 @@ function M.staging(state, draft, entries)
   local staged = {}
   for _, entry in ipairs(entries or state.queue) do
     local text = edit and edit.drafts[entry] or queued_text(entry)
+    local failure_notice
     if edit and entry == edit.entry then text = "[editing] " .. (draft or edit.drafts[entry] or queued_text(entry))
     elseif entry.local_only and entry.draft_state == "pending" then
       text = "[submitting] " .. text
@@ -336,6 +352,7 @@ function M.staging(state, draft, entries)
     elseif entry.error then
       local keys = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")
       local retry = keys[1] and (" " .. keys[1] .. " retry") or ""
+      failure_notice = keys[1] and (keys[1] .. " retry · " .. entry.error) or entry.error
       text = "[" .. (entry.draft_state or entry.delivery) .. "]" .. retry .. " " .. text .. " — " .. entry.error
     end
     ---@type ForgeStagedContent
@@ -345,7 +362,8 @@ function M.staging(state, draft, entries)
       vim.list_extend(responses, entry.purpose.additional_replies or {})
       content = { kind = "question_response", responses = responses }
     end
-    staged[#staged + 1] = { id = entry.id, text = text, failed = entry.error ~= nil, content = content }
+    staged[#staged + 1] = { id = entry.id, text = text, failed = entry.error ~= nil, failure_notice = failure_notice,
+      content = content }
   end
   return staged
 end

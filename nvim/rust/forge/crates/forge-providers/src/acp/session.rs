@@ -8,7 +8,7 @@ use forge_provider_api::*;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{Mutex, RwLock};
@@ -34,13 +34,13 @@ pub struct AcpSessionState {
     permission: Option<Arc<dyn ScopedPermissions>>,
     active: RwLock<Option<ActiveTurn>>,
     retained: RwLock<Option<ActiveTurn>>,
-    history_replay: AtomicBool,
     callback_work: Arc<RwLock<()>>,
     child_permissions: Mutex<HashMap<String, ChildPermissionAuthority>>,
     child_turns: Mutex<HashMap<TurnAddress, Arc<super::child_turn::AcpChildTurn>>>,
     operation: RwLock<Option<ActiveOperation>>,
     output: Mutex<forge_provider_api::completion::ProviderCompletion>,
     catalog: RwLock<Value>,
+    mcp_server_names: OnceLock<Vec<String>>,
     capabilities: RwLock<
         Option<(
             String,
@@ -50,12 +50,11 @@ pub struct AcpSessionState {
     >,
     tool: Mutex<HashMap<(String, String), Value>>,
     tool_owner: Mutex<HashMap<(String, String), TurnAddress>>,
+    /// Retain terminal native identities across turns so a replay cannot start another item.
     finished_tool: Mutex<HashSet<(String, String)>>,
     admitted_tool: Mutex<HashMap<(String, String), AcpToolItem>>,
     started_tool: Mutex<HashSet<(String, String)>>,
     compaction: Mutex<HashMap<String, Compaction>>,
-    /// Count of history changes, such as completed compactions, that may remove earlier prompts.
-    history_epoch: std::sync::atomic::AtomicU64,
     children: Mutex<super::children::AcpChildren>,
     message: Mutex<HashMap<TurnAddress, Vec<AcpMessage>>>,
     usage_owner: Mutex<HashMap<UsageReportId, TurnAddress>>,
@@ -90,10 +89,19 @@ struct ActiveOperation {
     sink: ProviderEventSink,
 }
 
-/// Retain the immutable normalized item kind after native metadata becomes sufficient.
+/// Retain the immutable normalized item kind selected at first observation.
 struct AcpToolItem {
     item_id: ItemId,
     kind: ToolKind,
+}
+
+/// Describe which visible fields a native tool patch changed.
+struct AcpToolPatch {
+    descriptor_changed: bool,
+    output_changed: bool,
+    previous_output: Option<String>,
+    changes_changed: bool,
+    had_diff: bool,
 }
 
 struct AcpMessage {
@@ -106,14 +114,23 @@ struct AcpMessage {
     closed: bool,
 }
 
-/// Temporarily suppress observations caused only by ACP replaying saved history.
-pub(super) struct HistoryReplayGuard<'state> {
-    active: &'state AtomicBool,
-}
-
-impl Drop for HistoryReplayGuard<'_> {
-    fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
+impl AcpMessage {
+    fn complete(self, outcome: MessageOutcome) -> AdapterActivity {
+        let completion = MessageCompletion {
+            text: self.text,
+            outcome,
+        };
+        let completion = if self.role == Some(AcpMessageRole::Reasoning) {
+            ItemCompletion::Reasoning(completion)
+        } else {
+            ItemCompletion::AgentMessage(completion)
+        };
+        AdapterActivity::Item {
+            thread_id: self.address.thread_id,
+            turn_id: self.address.turn_id,
+            item_id: self.item_id,
+            event: ItemEvent::Completed(completion),
+        }
     }
 }
 
@@ -150,13 +167,13 @@ impl AcpSessionState {
             permission,
             active: RwLock::new(None),
             retained: RwLock::new(None),
-            history_replay: AtomicBool::new(false),
             callback_work: Arc::new(RwLock::new(())),
             child_permissions: Mutex::new(HashMap::new()),
             child_turns: Mutex::new(HashMap::new()),
             operation: RwLock::new(None),
             output: Mutex::new(forge_provider_api::completion::ProviderCompletion::default()),
             catalog: RwLock::new(json!({})),
+            mcp_server_names: OnceLock::new(),
             capabilities: RwLock::new(None),
             tool: Mutex::new(HashMap::new()),
             tool_owner: Mutex::new(HashMap::new()),
@@ -164,7 +181,6 @@ impl AcpSessionState {
             admitted_tool: Mutex::new(HashMap::new()),
             started_tool: Mutex::new(HashSet::new()),
             compaction: Mutex::new(HashMap::new()),
-            history_epoch: std::sync::atomic::AtomicU64::new(0),
             children: Mutex::new(super::children::AcpChildren::default()),
             message: Mutex::new(HashMap::new()),
             usage_owner: Mutex::new(HashMap::new()),
@@ -194,10 +210,6 @@ impl AcpSessionState {
             .lock()
             .await
             .retain(|(session, _), _| session != session_id);
-        self.finished_tool
-            .lock()
-            .await
-            .retain(|(session, _)| session != session_id);
         self.admitted_tool
             .lock()
             .await
@@ -236,16 +248,6 @@ impl AcpSessionState {
             active.permissions = Some(permissions);
         }
         Ok(())
-    }
-
-    /// Suppress late history replay while a retained ACP conversation is loaded again.
-    pub(super) fn suppress_history_replay(&self) -> Result<HistoryReplayGuard<'_>, ProviderError> {
-        self.history_replay
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| provider_failure(ProviderFailureKind::Rejected))?;
-        Ok(HistoryReplayGuard {
-            active: &self.history_replay,
-        })
     }
 
     /// Install the shared runner's positive-start authority before prompt dispatch.
@@ -564,18 +566,6 @@ impl AcpSessionState {
         *self.operation.write().await = None;
     }
 
-    /// Get the count of history changes that may have removed earlier prompt content.
-    pub fn history_epoch(&self) -> u64 {
-        self.history_epoch
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Record a history change that may have removed earlier prompt content.
-    pub fn advance_history_epoch(&self) {
-        self.history_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
     pub async fn has_active_work(&self) -> bool {
         self.active.read().await.is_some()
             || self.operation.read().await.is_some()
@@ -723,6 +713,15 @@ impl AcpSessionState {
         &self,
         outcome: forge_provider_api::turn::TurnOutcome,
     ) -> Result<(), ProviderError> {
+        self.finish_with_transcript(outcome, None).await
+    }
+
+    /// Settle the root turn, using proven native boundaries for its final anonymous ACP item.
+    pub(super) async fn finish_with_transcript(
+        &self,
+        outcome: forge_provider_api::turn::TurnOutcome,
+        transcript: Option<super::transcript::TranscriptCursor>,
+    ) -> Result<(), ProviderError> {
         if self.active.read().await.is_none() {
             self.finish_compaction().await;
             return Ok(());
@@ -730,7 +729,15 @@ impl AcpSessionState {
         let result: Result<(), ProviderError> = async {
             let root = self.children.lock().await.root_address();
             if let Some(address) = root {
-                self.finish_messages(&address, outcome)
+                let replies = match transcript {
+                    Some(cursor) if self.is_admitting() => tokio::select! {
+                        biased;
+                        _ = self.admission_revocation.cancelled() => None,
+                        replies = cursor.replies() => replies,
+                    },
+                    _ => None,
+                };
+                self.finish_messages(&address, outcome, replies)
                     .await
                     .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
                 self.finish_tools(&address).await?;
@@ -742,10 +749,12 @@ impl AcpSessionState {
         result
     }
 
+    /// Complete each wire message and reconcile the final anonymous response when the log proves it.
     async fn finish_messages(
         &self,
         address: &TurnAddress,
         outcome: forge_provider_api::turn::TurnOutcome,
+        replies: Option<super::transcript::TranscriptReplies>,
     ) -> Result<(), ProviderError> {
         // The end of the turn settles every pending role, whatever the outcome. Harness hides an
         // interrupted response and keeps other prose, so a reply left unclassified at an
@@ -753,40 +762,86 @@ impl AcpSessionState {
         self.classify_messages(address, AcpMessageRole::Response)
             .await
             .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
-        let updates = {
-            let mut messages = self.message.lock().await;
-            messages
-                .remove(address)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|message| {
-                    let completion = MessageCompletion {
-                        text: message.text,
-                        outcome: if matches!(
-                            outcome,
-                            forge_provider_api::turn::TurnOutcome::Completed { .. }
-                        ) {
-                            MessageOutcome::Completed
-                        } else {
-                            MessageOutcome::Interrupted
-                        },
-                    };
-                    let completion = if message.role == Some(AcpMessageRole::Reasoning) {
-                        ItemCompletion::Reasoning(completion)
-                    } else {
-                        ItemCompletion::AgentMessage(completion)
-                    };
-                    AdapterActivity::Item {
-                        thread_id: message.address.thread_id,
-                        turn_id: message.address.turn_id,
-                        item_id: message.item_id,
-                        event: ItemEvent::Completed(completion),
-                    }
-                })
-                .collect::<Vec<_>>()
+        let outcome = if matches!(
+            outcome,
+            forge_provider_api::turn::TurnOutcome::Completed { .. }
+        ) {
+            MessageOutcome::Completed
+        } else {
+            MessageOutcome::Interrupted
         };
-        for update in updates {
-            self.emit(update).await?;
+        let messages = self
+            .message
+            .lock()
+            .await
+            .remove(address)
+            .unwrap_or_default();
+        // A steer can begin reasoning without emitting prose. Its thought must not hide the
+        // earlier completed reply on interruption.
+        let mut split = replies.and_then(|replies| {
+            let index = messages
+                .iter()
+                .rposition(|message| message.role == Some(AcpMessageRole::Response))?;
+            let response = &messages[index];
+            if response.native_message_id.is_some() {
+                return None;
+            }
+            replies
+                .split(&response.text, outcome == MessageOutcome::Interrupted)
+                .map(|split| (index, split))
+        });
+        for (index, message) in messages.into_iter().enumerate() {
+            if let Some((_, split)) = split.take_if(|(response, _)| *response == index) {
+                self.finish_split_message(address, message, split).await?;
+            } else {
+                self.emit(message.complete(outcome)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reuse the original item for the first reply and give each following reply its own item.
+    async fn finish_split_message(
+        &self,
+        address: &TurnAddress,
+        mut response: AcpMessage,
+        split: super::transcript::TranscriptSplit,
+    ) -> Result<(), ProviderError> {
+        response.text = split.first;
+        self.emit(response.complete(MessageOutcome::Completed))
+            .await?;
+        let following_count = split.following.len();
+        for (index, text) in split.following.into_iter().enumerate() {
+            let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())
+                .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
+            let role = Some(AcpMessageRole::Response);
+            self.emit(AdapterActivity::Item {
+                thread_id: address.thread_id.clone(),
+                turn_id: address.turn_id.clone(),
+                item_id: item_id.clone(),
+                event: ItemEvent::Started(ItemStart::AgentMessage(AgentMessageStart {
+                    text: text.clone(),
+                    classification: message_classification(role),
+                })),
+            })
+            .await?;
+            let outcome = if index + 1 == following_count && !split.last_completed {
+                MessageOutcome::Interrupted
+            } else {
+                MessageOutcome::Completed
+            };
+            self.emit(
+                AcpMessage {
+                    address: address.clone(),
+                    item_id,
+                    native_message_id: None,
+                    role,
+                    text,
+                    closed: true,
+                }
+                .complete(outcome),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -812,27 +867,8 @@ impl AcpSessionState {
                 .get(&key)
                 .cloned()
                 .ok_or_else(|| provider_failure(ProviderFailureKind::Protocol))?;
-            let (kind, descriptor) = normalize_tool_descriptor(&snapshot, &self.workspace);
-            let (item_id, admitted) = {
-                let mut items = self.admitted_tool.lock().await;
-                if let Some(item) = items.get(&key) {
-                    if item.kind != kind {
-                        return Err(provider_failure(ProviderFailureKind::Protocol));
-                    }
-                    (item.item_id.clone(), false)
-                } else {
-                    let id = ItemId::new(uuid::Uuid::new_v4().to_string())
-                        .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
-                    items.insert(
-                        key,
-                        AcpToolItem {
-                            item_id: id.clone(),
-                            kind,
-                        },
-                    );
-                    (id, true)
-                }
-            };
+            let (initial_kind, descriptor) = normalize_descriptor(&snapshot, &self.workspace);
+            let (item_id, kind, admitted) = self.admit_tool(&key, initial_kind).await?;
             if admitted {
                 let start = match kind {
                     ToolKind::Command => ItemStart::CommandExecution(descriptor.clone()),
@@ -863,12 +899,35 @@ impl AcpSessionState {
         Ok(())
     }
 
+    /// Bind a native permission decision to its original request and invocation.
     async fn authorize(&self, parameter: Value) -> Result<Value> {
         if !self.is_admitting() {
             return Ok(json!({"outcome":{"outcome":"cancelled"}}));
         }
-        let session_id = parameter["sessionId"].as_str().unwrap_or_default();
+        let Some(options) = super::permission::OncePermissionOptions::parse(&parameter["options"])
+        else {
+            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+        };
+        let supplied = &parameter["toolCall"];
+        let Some(item_id) = supplied["toolCallId"].as_str().filter(|id| !id.is_empty()) else {
+            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+        };
+        let Some(session_id) = parameter["sessionId"].as_str().filter(|id| !id.is_empty()) else {
+            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+        };
+        let tool_key = (session_id.to_owned(), item_id.to_owned());
         let child_authority = self.child_permissions.lock().await.get(session_id).cloned();
+        if !self.is_root(session_id).await
+            && (child_authority.is_none()
+                || self
+                    .children
+                    .lock()
+                    .await
+                    .child_address(session_id, false)
+                    .is_none())
+        {
+            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+        }
         let active = self.active.read().await.clone();
         let (parent_scope, permissions, revocation, callback_work, generation) =
             if let Some(child) = &child_authority {
@@ -880,10 +939,6 @@ impl AcpSessionState {
                     child.generation.clone(),
                 )
             } else {
-                ensure!(
-                    self.is_root(session_id).await,
-                    "ACP child has no registered permission authority"
-                );
                 let active = active
                     .as_ref()
                     .context("ACP permission request has no active root turn")?;
@@ -897,25 +952,19 @@ impl AcpSessionState {
             };
         let _callback = callback_work.read().await;
         let authorizing = async {
-            let session_id = parameter["sessionId"].as_str().unwrap_or_default();
-            let address = if let Some(id) = parameter["toolCall"]["toolCallId"].as_str() {
-                self.tool_owner
-                    .lock()
-                    .await
-                    .get(&(session_id.to_owned(), id.to_owned()))
-                    .cloned()
-            } else {
-                None
-            };
+            let address = self.tool_owner.lock().await.get(&tool_key).cloned();
             if address.is_none()
-                && parameter["toolCall"]["toolCallId"].is_string()
-                && !["title", "kind", "rawInput", "locations", "content"]
-                    .iter()
-                    .any(|field| {
-                        parameter["toolCall"]
-                            .get(*field)
-                            .is_some_and(|value| !value.is_null())
-                    })
+                && ![
+                    "name",
+                    "title",
+                    "kind",
+                    "rawInput",
+                    "locations",
+                    "content",
+                    "_meta",
+                ]
+                .iter()
+                .any(|field| supplied.get(*field).is_some_and(|value| !value.is_null()))
             {
                 return Err(ProviderError::Observation(
                     forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
@@ -958,18 +1007,8 @@ impl AcpSessionState {
             } else if child {
                 return Ok(json!({"outcome":{"outcome":"cancelled"}}));
             }
-            let supplied = &parameter["toolCall"];
-            let item_id = supplied["toolCallId"].as_str();
-            let session_id = parameter["sessionId"].as_str().unwrap_or_default();
-            let observed_tool = if let Some(item_id) = item_id {
-                self.tool
-                    .lock()
-                    .await
-                    .get(&(session_id.to_owned(), item_id.to_owned()))
-                    .cloned()
-            } else {
-                None
-            };
+            // Combine the sparse request with the original tool observation before consulting policy.
+            let observed_tool = self.tool.lock().await.get(&tool_key).cloned();
             let mut tool = observed_tool.clone().unwrap_or_else(|| json!({}));
             if let Some(fields) = supplied.as_object() {
                 for (field, value) in fields {
@@ -980,41 +1019,41 @@ impl AcpSessionState {
             }
             // The agent reports a tool call before asking to run it, which admits its host item;
             // a request for a call that was never admitted gates no host item.
-            let subject = match item_id {
-                Some(item_id) => self
-                    .admitted_tool
-                    .lock()
-                    .await
-                    .get(&(session_id.to_owned(), item_id.to_owned()))
-                    .map_or(
-                        forge_provider_api::permissions::PermissionSubject::Unattached,
-                        |admitted| {
-                            forge_provider_api::permissions::PermissionSubject::Tool(
-                                admitted.item_id.clone(),
-                            )
-                        },
-                    ),
-                None => forge_provider_api::permissions::PermissionSubject::Unattached,
+            let subject = self.admitted_tool.lock().await.get(&tool_key).map_or(
+                forge_provider_api::permissions::PermissionSubject::Unattached,
+                |admitted| {
+                    forge_provider_api::permissions::PermissionSubject::Tool(
+                        admitted.item_id.clone(),
+                    )
+                },
+            );
+            let mcp_server_names = self.mcp_server_names.get().map_or(&[][..], Vec::as_slice);
+            let Ok(request) =
+                super::permission::permission_request(self.kind, &tool, subject, mcp_server_names)
+            else {
+                return Ok(json!({"outcome":{"outcome":"cancelled"}}));
             };
-            let request = super::permission::permission_request(self.kind, &tool, subject)?;
-            let resolution = if let Some(permissions) = &permissions {
-                let decision = if child {
+            let mounted_host_tool = mcp_server_names
+                .iter()
+                .any(|name| name == super::permission::HOST_TOOL_SERVER)
+                && !request.target_list.is_empty()
+                && request.target_list.iter().all(|target| {
+                    matches!(
+                        target,
+                        forge_provider_api::permissions::PermissionTarget::HostTool { .. }
+                    )
+                });
+            let resolution = if mounted_host_tool {
+                // The native response permits delivery to Forge's mounted endpoint or inspection
+                // of its schemas. The endpoint authorizes the actual operation at HTTP dispatch.
+                PermissionResponse::Allow
+            } else if let Some(permissions) = &permissions {
+                if child {
                     permissions
                         .authorize_observed_child(&parent_scope, &address, request)
                         .await
                 } else {
                     permissions.authorize(&address.scope, request).await
-                };
-                match decision {
-                    forge_provider_api::permissions::PermissionResponse::Allow => {
-                        PermissionResponse::Allow
-                    }
-                    forge_provider_api::permissions::PermissionResponse::Deny { reason } => {
-                        PermissionResponse::Deny { reason }
-                    }
-                    forge_provider_api::permissions::PermissionResponse::Cancelled => {
-                        PermissionResponse::Cancelled
-                    }
                 }
             } else if let Some(permission) = &self.permission {
                 permission.authorize(address, request).await?
@@ -1046,33 +1085,40 @@ impl AcpSessionState {
                 return Ok(json!({"outcome":{"outcome":"cancelled"}}));
             }
             if matches!(resolution, PermissionResponse::Allow)
-                && let (Some(item_id), Some(observed)) = (item_id, &observed_tool)
+                && let Some(observed) = &observed_tool
             {
                 let current = self.tool.lock().await;
-                ensure!(
-                    current
-                        .get(&(session_id.to_owned(), item_id.to_owned()))
-                        .is_some_and(|current| current == observed),
-                    "ACP tool changed while approval was pending"
-                );
+                if current.get(&tool_key) != Some(observed) {
+                    return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+                }
             }
-            if matches!(resolution, PermissionResponse::Cancelled) {
-                return Ok(json!({"outcome":{"outcome":"cancelled"}}));
-            }
-            let allow = matches!(resolution, PermissionResponse::Allow);
-            let kind = if allow { "allow_once" } else { "reject_once" };
-            let option = parameter["options"]
-                .as_array()
-                .and_then(|options| options.iter().find(|option| option["kind"] == kind))
-                .context("ACP agent did not advertise the required once-only permission choice")?;
-            Ok(json!({"outcome":{"outcome":"selected","optionId":option["optionId"]}}))
+            let option_id = match resolution {
+                PermissionResponse::Allow => options.allow,
+                PermissionResponse::Deny { .. } => options.reject,
+                PermissionResponse::Cancelled => {
+                    return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+                }
+            };
+            Ok(json!({"outcome":{"outcome":"selected","optionId":option_id}}))
         };
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = self.admission_revocation.cancelled() => Ok(json!({"outcome":{"outcome":"cancelled"}})),
             _ = revocation.cancelled() => Ok(json!({"outcome":{"outcome":"cancelled"}})),
             result = authorizing => result,
+        };
+        // The child can finish while this request waits for its original callback authority.
+        if child_authority.is_some()
+            && self
+                .children
+                .lock()
+                .await
+                .child_address(session_id, false)
+                .is_none()
+        {
+            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
         }
+        result
     }
 }
 
@@ -1082,14 +1128,6 @@ impl AcpSessionState {
             return Ok(());
         }
         let update = &parameter["update"];
-        if self.history_replay.load(Ordering::Acquire)
-            && !matches!(
-                update["sessionUpdate"].as_str(),
-                Some("available_commands_update" | "config_option_update" | "current_mode_update")
-            )
-        {
-            return Ok(());
-        }
         let session_id = parameter["sessionId"].as_str().unwrap_or_default();
         if !self.has_observation_context().await
             && !matches!(
@@ -1104,21 +1142,25 @@ impl AcpSessionState {
         {
             return Ok(());
         }
-        let idle_root = self.active.read().await.is_none() && self.is_root(session_id).await;
-        let starts_unowned_work = idle_root
-            && match update["sessionUpdate"].as_str() {
-                Some("agent_message_chunk" | "agent_thought_chunk" | "plan") => true,
-                Some("subagent_spawned") => true,
-                Some("tool_call" | "tool_call_update") => match update["toolCallId"].as_str() {
-                    Some(id) => !self
-                        .tool
-                        .lock()
-                        .await
-                        .contains_key(&(session_id.to_owned(), id.to_owned())),
-                    None => true,
-                },
-                _ => false,
-            };
+        let root = self.is_root(session_id).await;
+        let kind = update["sessionUpdate"].as_str().unwrap_or_default();
+        // A retired child can still report the state of a descendant it registered while active.
+        if !root
+            && self
+                .children
+                .lock()
+                .await
+                .child_address(session_id, kind == "subagent_state_update")
+                .is_none()
+        {
+            return Ok(());
+        }
+        let starts_unowned_work = root
+            && self.active.read().await.is_none()
+            && matches!(
+                kind,
+                "agent_message_chunk" | "agent_thought_chunk" | "plan" | "subagent_spawned"
+            );
         if starts_unowned_work {
             return Err(ProviderError::Observation(
                 forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
@@ -1225,7 +1267,8 @@ impl AcpSessionState {
                     child_turn.observe(completed_at_ms).await?;
                 }
                 self.child_permissions.lock().await.remove(child_id);
-                self.finish_messages(&observation.address, outcome).await?;
+                self.finish_messages(&observation.address, outcome, None)
+                    .await?;
                 self.finish_tools(&observation.address).await?;
             }
             let starts_child = matches!(
@@ -1246,7 +1289,7 @@ impl AcpSessionState {
             }
             return Ok(());
         }
-        match update["sessionUpdate"].as_str().unwrap_or_default() {
+        match kind {
             "available_commands_update" => {
                 if !self.is_root(session_id).await {
                     return Ok(());
@@ -1332,200 +1375,7 @@ impl AcpSessionState {
                 .await?;
             }
             "tool_call" | "tool_call_update" => {
-                let Some(id) = update["toolCallId"].as_str().filter(|id| !id.is_empty()) else {
-                    return Ok(());
-                };
-                let turn = self.address(session_id).await.ok_or_else(|| {
-                    ProviderError::Observation(
-                        forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
-                    )
-                })?;
-                {
-                    let mut owners = self.tool_owner.lock().await;
-                    let owner = owners
-                        .entry((session_id.to_owned(), id.to_owned()))
-                        .or_insert_with(|| turn.clone());
-                    if owner != &turn {
-                        return Err(ProviderError::Observation(
-                            forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
-                        )
-                        .into());
-                    }
-                }
-                let mut tool_map = self.tool.lock().await;
-                let tool_key = (session_id.to_owned(), id.to_owned());
-                let invocation_started = !tool_map.contains_key(&tool_key);
-                let snapshot = tool_map.entry(tool_key).or_insert_with(|| json!({}));
-                let finished = self
-                    .finished_tool
-                    .lock()
-                    .await
-                    .contains(&(session_id.to_owned(), id.to_owned()));
-                if finished
-                    && ["title", "kind", "rawInput", "status"]
-                        .into_iter()
-                        .any(|field| {
-                            update.get(field).is_some_and(|value| {
-                                !value.is_null() && snapshot.get(field) != Some(value)
-                            })
-                        })
-                {
-                    return Err(ProviderError::Observation(
-                        forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
-                    )
-                    .into());
-                }
-                let invocation_changed = merge_tool_snapshot(snapshot, update)?;
-                let snapshot = snapshot.clone();
-                drop(tool_map);
-                let update = &snapshot;
-                // Only a newly started invocation shows the agent kept working after its prose.
-                // Claude can report a terminal status for an earlier, abandoned tool after the
-                // final answer, and that update must leave the answer for turn completion.
-                if invocation_started {
-                    self.classify_messages(&turn, AcpMessageRole::Commentary)
-                        .await?;
-                }
-                let native_key = (session_id.to_owned(), id.to_owned());
-                let status = update["status"].as_str().unwrap_or("in_progress");
-                let status = match status {
-                    "pending" | "in_progress" => ToolStatus::Running,
-                    "completed" => ToolStatus::Succeeded,
-                    "failed" => ToolStatus::Failed,
-                    "denied" => ToolStatus::Denied,
-                    "cancelled" => ToolStatus::Cancelled,
-                    "interrupted" => ToolStatus::Interrupted,
-                    _ => return Err(provider_failure(ProviderFailureKind::Protocol).into()),
-                };
-                // Delay immutable type admission until native metadata establishes its category.
-                if update.get("kind").is_none_or(Value::is_null) && status == ToolStatus::Running {
-                    return Ok(());
-                }
-                let (kind, descriptor) = normalize_tool_descriptor(update, &self.workspace);
-                let (item_id, admitted) = {
-                    let mut items = self.admitted_tool.lock().await;
-                    match items.entry(native_key.clone()) {
-                        std::collections::hash_map::Entry::Occupied(entry) => {
-                            if entry.get().kind != kind {
-                                return Err(ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::ownership_conflict()).into());
-                            }
-                            (entry.get().item_id.clone(), false)
-                        }
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            let id = ItemId::new(uuid::Uuid::new_v4().to_string())?;
-                            entry.insert(AcpToolItem {
-                                item_id: id.clone(),
-                                kind,
-                            });
-                            (id, true)
-                        }
-                    }
-                };
-                if admitted {
-                    let start = match kind {
-                        ToolKind::Command => ItemStart::CommandExecution(descriptor.clone()),
-                        ToolKind::FileChange => ItemStart::FileChange(descriptor.clone()),
-                        ToolKind::ToolCall => ItemStart::ToolCall(descriptor.clone()),
-                    };
-                    self.emit(item_activity(&turn, &item_id, ItemEvent::Started(start)))
-                        .await?;
-                } else if invocation_changed {
-                    self.emit(item_activity(
-                        &turn,
-                        &item_id,
-                        ItemEvent::Tool {
-                            event: ToolItemEvent::DescriptorUpdated(descriptor.clone()),
-                        },
-                    ))
-                    .await?;
-                }
-                // A tool that succeeded or failed executed even when it skipped `in_progress`
-                // (Claude reports its own tools as `pending` then `completed`); without a start,
-                // Harness cannot measure it. Denied and cancelled tools never ran.
-                let executed = update["status"] == "in_progress"
-                    || matches!(status, ToolStatus::Succeeded | ToolStatus::Failed);
-                if executed && self.started_tool.lock().await.insert(native_key.clone()) {
-                    self.emit(item_activity(
-                        &turn,
-                        &item_id,
-                        ItemEvent::Tool {
-                            event: ToolItemEvent::ExecutionStarted,
-                        },
-                    ))
-                    .await?;
-                    self.output.lock().await.evidence.tool_called = true;
-                }
-                let output = tool_output(update)?;
-                if let Some(output) = &output {
-                    self.emit(item_activity(
-                        &turn,
-                        &item_id,
-                        ItemEvent::Tool {
-                            event: ToolItemEvent::Output(TextUpdate::Replace(output.clone())),
-                        },
-                    ))
-                    .await?;
-                }
-                let changes = file_changes(update);
-                if !changes.is_empty() {
-                    if status == ToolStatus::Succeeded {
-                        self.output.lock().await.evidence.workspace_changed = true;
-                    }
-                    self.emit(item_activity(
-                        &turn,
-                        &item_id,
-                        ItemEvent::Tool {
-                            event: ToolItemEvent::Changes(changes.clone()),
-                        },
-                    ))
-                    .await?;
-                }
-                let outcome = match status {
-                    ToolStatus::Running => None,
-                    ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
-                    ToolStatus::Failed => Some(ToolOutcome::Failed {
-                        diagnostic: ToolDiagnostic {
-                            kind: forge_provider_api::ProviderFailureKind::Unknown,
-                            message: forge_provider_api::diagnostic::SanitizedMessage::new(
-                                "Provider tool execution failed",
-                            )
-                            .expect("static diagnostic is valid"),
-                        },
-                    }),
-                    ToolStatus::Denied => Some(ToolOutcome::Denied {
-                        reason: forge_provider_api::diagnostic::SanitizedMessage::new(
-                            "Tool execution was denied by the provider",
-                        )
-                        .expect("static denial is nonempty"),
-                    }),
-                    ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
-                    ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
-                };
-                if let Some(outcome) = outcome
-                    && self
-                        .finished_tool
-                        .lock()
-                        .await
-                        .insert((session_id.to_owned(), id.to_owned()))
-                {
-                    let completion = ToolCompletion {
-                        outcome,
-                        descriptor: Some(descriptor),
-                        output,
-                        changes,
-                    };
-                    let completion = match kind {
-                        ToolKind::Command => ItemCompletion::CommandExecution(completion),
-                        ToolKind::FileChange => ItemCompletion::FileChange(completion),
-                        ToolKind::ToolCall => ItemCompletion::ToolCall(completion),
-                    };
-                    self.emit(item_activity(
-                        &turn,
-                        &item_id,
-                        ItemEvent::Completed(completion),
-                    ))
-                    .await?;
-                }
+                self.observe_tool(session_id, update).await?;
             }
             "compaction_update" => {
                 if !self.is_root(session_id).await {
@@ -1544,13 +1394,6 @@ impl AcpSessionState {
                     }
                     compaction_map.insert(compaction.id.clone(), compaction.clone());
                     drop(compaction_map);
-                    if matches!(
-                        compaction.state,
-                        forge_provider_api::CompactionState::Completed
-                            | forge_provider_api::CompactionState::Unconfirmed
-                    ) {
-                        self.advance_history_epoch();
-                    }
                     self.emit(AdapterActivity::Thread {
                         thread_id: self.event_scope().await?.thread_id().clone(),
                         event: ThreadEvent::CompactionUpdated(Box::new(compaction)),
@@ -1625,7 +1468,11 @@ impl AcpSessionState {
             // Mode and session-title metadata have no normalized event. Outside history replay,
             // Harness already retains the accepted user input, so an echoed user chunk must not
             // create a second native user item.
-            "current_mode_update" | "session_info_update" | "user_message_chunk" => {}
+            "current_mode_update"
+            | "session_info_update"
+            | "user_message_chunk"
+            | "subagent_spawned"
+            | "subagent_state_update" => {}
             // Advertising `session.notices` makes agents send status such as MCP startup
             // failures as notices instead of bold text inside the assistant's answer.
             "notice" => self.notice(session_id, update).await?,
@@ -1702,13 +1549,201 @@ impl AcpSessionState {
         Ok(())
     }
 
-    async fn handle_request(&self, method: &str, parameter: Value) -> Result<Value> {
-        if self.history_replay.load(Ordering::Acquire) {
-            return match method {
-                "session/request_permission" => Ok(json!({"outcome":{"outcome":"cancelled"}})),
-                _ => bail!("unsupported ACP client request during history reload"),
+    /// Merge one native tool patch and publish changes under the original item identity.
+    async fn observe_tool(&self, session_id: &str, update: &Value) -> Result<()> {
+        let id = update["toolCallId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| provider_failure(ProviderFailureKind::Protocol))?;
+        let key = (session_id.to_owned(), id.to_owned());
+        let finished = self.finished_tool.lock().await.contains(&key);
+        if self.active.read().await.is_none() && self.is_root(session_id).await {
+            return if finished {
+                Ok(())
+            } else {
+                Err(ProviderError::Observation(
+                    forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+                )
+                .into())
             };
         }
+        let Some(turn) = self.address(session_id).await else {
+            return if finished {
+                Ok(())
+            } else {
+                Err(ProviderError::Observation(
+                    forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
+                )
+                .into())
+            };
+        };
+
+        // Root turn admission rotates the snapshots while terminal native identities survive.
+        let mut tool_map = self.tool.lock().await;
+        let invocation_started = !tool_map.contains_key(&key);
+        if finished && invocation_started {
+            return Ok(());
+        }
+        let snapshot = tool_map.entry(key.clone()).or_insert_with(|| json!({}));
+        let wire_status = update
+            .get("status")
+            .filter(|status| !status.is_null())
+            .or_else(|| snapshot.get("status"));
+        if finished && wire_status != snapshot.get("status") {
+            return Err(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
+            )
+            .into());
+        }
+        let starts_execution = wire_status.is_some_and(|status| status == "in_progress")
+            && wire_status != snapshot.get("status");
+        let status = tool_status(wire_status)?;
+        let patch = merge_tool_snapshot(snapshot, update)?;
+        let completing = status != ToolStatus::Running && !finished;
+        if !invocation_started
+            && !patch.descriptor_changed
+            && !patch.output_changed
+            && !patch.changes_changed
+            && !starts_execution
+            && !completing
+        {
+            return Ok(());
+        }
+        let snapshot = snapshot.clone();
+        drop(tool_map);
+        {
+            let mut owners = self.tool_owner.lock().await;
+            let owner = owners.entry(key.clone()).or_insert_with(|| turn.clone());
+            if owner != &turn {
+                return Err(ProviderError::Observation(
+                    forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
+                )
+                .into());
+            }
+        }
+        // Only a first observation makes pending prose commentary; result updates carry no new work.
+        if invocation_started {
+            self.classify_messages(&turn, AcpMessageRole::Commentary)
+                .await?;
+        }
+        let (initial_kind, descriptor) = normalize_descriptor(&snapshot, &self.workspace);
+        let (item_id, kind, admitted) = self.admit_tool(&key, initial_kind).await?;
+        if admitted {
+            let start = match kind {
+                ToolKind::Command => ItemStart::CommandExecution(descriptor.clone()),
+                ToolKind::FileChange => ItemStart::FileChange(descriptor.clone()),
+                ToolKind::ToolCall => ItemStart::ToolCall(descriptor.clone()),
+            };
+            self.emit(item_activity(&turn, &item_id, ItemEvent::Started(start)))
+                .await?;
+        } else if patch.descriptor_changed {
+            self.emit(item_activity(
+                &turn,
+                &item_id,
+                ItemEvent::Tool {
+                    event: ToolItemEvent::DescriptorUpdated(descriptor.clone()),
+                },
+            ))
+            .await?;
+        }
+
+        // Only a positive running observation establishes timing.
+        if starts_execution && self.started_tool.lock().await.insert(key.clone()) {
+            self.emit(item_activity(
+                &turn,
+                &item_id,
+                ItemEvent::Tool {
+                    event: ToolItemEvent::ExecutionStarted,
+                },
+            ))
+            .await?;
+        }
+        if starts_execution || matches!(status, ToolStatus::Succeeded | ToolStatus::Failed) {
+            self.output.lock().await.evidence.tool_called = true;
+        }
+        let output = if patch.output_changed || completing {
+            tool_output(&snapshot)?
+        } else {
+            None
+        };
+        if patch.output_changed && patch.previous_output != output {
+            self.emit(item_activity(
+                &turn,
+                &item_id,
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Output(TextUpdate::Replace(
+                        output.clone().unwrap_or_default(),
+                    )),
+                },
+            ))
+            .await?;
+        }
+        let changes = if patch.changes_changed || completing {
+            file_changes(&snapshot)
+        } else {
+            ProviderChangeSet::default()
+        };
+        if status == ToolStatus::Succeeded && !changes.is_empty() {
+            self.output.lock().await.evidence.workspace_changed = true;
+        }
+        if patch.changes_changed && (patch.had_diff || !changes.is_empty()) {
+            self.emit(item_activity(
+                &turn,
+                &item_id,
+                ItemEvent::Tool {
+                    event: ToolItemEvent::Changes(changes.clone()),
+                },
+            ))
+            .await?;
+        }
+        if completing
+            && let Some(outcome) = tool_outcome(status)
+            && self.finished_tool.lock().await.insert(key)
+        {
+            let completion = ToolCompletion {
+                outcome,
+                descriptor: Some(descriptor),
+                output,
+                changes,
+            };
+            let completion = match kind {
+                ToolKind::Command => ItemCompletion::CommandExecution(completion),
+                ToolKind::FileChange => ItemCompletion::FileChange(completion),
+                ToolKind::ToolCall => ItemCompletion::ToolCall(completion),
+            };
+            self.emit(item_activity(
+                &turn,
+                &item_id,
+                ItemEvent::Completed(completion),
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Preserve the first admitted item category as native presentation metadata evolves.
+    async fn admit_tool(
+        &self,
+        key: &(String, String),
+        initial_kind: ToolKind,
+    ) -> Result<(ItemId, ToolKind, bool), ProviderError> {
+        let mut items = self.admitted_tool.lock().await;
+        if let Some(item) = items.get(key) {
+            return Ok((item.item_id.clone(), item.kind, false));
+        }
+        let item_id = ItemId::new(uuid::Uuid::new_v4().to_string())
+            .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
+        items.insert(
+            key.clone(),
+            AcpToolItem {
+                item_id: item_id.clone(),
+                kind: initial_kind,
+            },
+        );
+        Ok((item_id, initial_kind, true))
+    }
+
+    async fn handle_request(&self, method: &str, parameter: Value) -> Result<Value> {
         match method {
             "session/request_permission" => self.authorize(parameter).await,
             _ => bail!("unsupported ACP client request: {method}"),
@@ -1728,6 +1763,7 @@ fn tool_output(update: &Value) -> Result<Option<String>> {
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|block| block["type"] == "content" && block["content"]["type"] == "text")
         .filter_map(|block| block.pointer("/content/text").and_then(Value::as_str))
         .collect::<Vec<_>>();
     if !text.is_empty() {
@@ -1761,9 +1797,9 @@ fn file_changes(update: &Value) -> ProviderChangeSet {
             }
             let path = content["path"].as_str().filter(|path| !path.is_empty())?;
             let after = content["newText"].as_str()?;
-            let before = match content.get("oldText")? {
-                Value::Null => None,
-                Value::String(text) => Some(text.as_str()),
+            let before = match content.get("oldText") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) => Some(text.as_str()),
                 _ => return None,
             };
             let kind = if before.is_none() {
@@ -1919,14 +1955,7 @@ impl AcpSessionState {
             return;
         }
         let catalog = self.catalog.read().await;
-        let effort = catalog["configOptions"].as_array().is_some_and(|options| {
-            options.iter().any(|option| {
-                matches!(
-                    option["category"].as_str(),
-                    Some("thought_level" | "effort")
-                ) || matches!(option["id"].as_str(), Some("thought_level" | "effort"))
-            })
-        });
+        let effort = super::conversation::supports_effort(&catalog);
         drop(catalog);
         let publication = {
             let mut capabilities = self.capabilities.write().await;
@@ -1969,6 +1998,13 @@ impl AcpSessionState {
         }
     }
 
+    /// Retain the server names sent at native open separately from display catalog updates.
+    pub(super) fn set_mcp_server_names(&self, names: Vec<String>) -> Result<()> {
+        self.mcp_server_names
+            .set(names)
+            .map_err(|_| anyhow::anyhow!("ACP MCP launch names were already installed"))
+    }
+
     pub async fn catalog(&self) -> Value {
         self.catalog.read().await.clone()
     }
@@ -1986,54 +2022,74 @@ impl AcpSessionState {
     }
 }
 
-/// Merge a native descriptor only after checking every immutable category constraint.
-fn merge_tool_snapshot(snapshot: &mut Value, update: &Value) -> Result<bool, ProviderError> {
-    let present = |value: &Value| !value.is_null();
-    if let Some(previous) = snapshot.get("kind").filter(|kind| present(kind))
-        && let Some(next) = update.get("kind").filter(|kind| present(kind))
-        && normalized_tool_kind(previous) != normalized_tool_kind(next)
-    {
-        return Err(ProviderError::Observation(
-            forge_provider_api::lifecycle::ObservationFailure::ownership_conflict(),
-        ));
-    }
-    let invocation_changed = ["title", "kind", "rawInput"].into_iter().any(|field| {
+/// Merge present tool fields and distinguish replaced output from omitted result fields.
+fn merge_tool_snapshot(snapshot: &mut Value, update: &Value) -> Result<AcpToolPatch> {
+    let changed = |field| {
         update
             .get(field)
-            .is_some_and(|value| present(value) && snapshot.get(field) != Some(value))
-    });
+            .is_some_and(|value| !value.is_null() && snapshot.get(field) != Some(value))
+    };
+    let content_changed = changed("content");
+    let output_changed = content_changed || changed("rawOutput");
+    let changes_changed = content_changed || changed("kind");
+    let patch = AcpToolPatch {
+        descriptor_changed: ["title", "name", "kind", "locations", "rawInput"]
+            .into_iter()
+            .any(changed),
+        output_changed,
+        previous_output: if output_changed {
+            tool_output(snapshot)?
+        } else {
+            None
+        },
+        changes_changed,
+        had_diff: changes_changed
+            && snapshot["content"]
+                .as_array()
+                .is_some_and(|content| content.iter().any(|block| block["type"] == "diff")),
+    };
     if let Some(fields) = update.as_object() {
         for (field, value) in fields {
-            if present(value) {
+            if !value.is_null() {
                 snapshot[field] = value.clone();
             }
         }
     }
-    Ok(invocation_changed)
+    Ok(patch)
 }
 
-/// Normalize one complete native snapshot before publishing its immutable item type and descriptor.
-fn normalize_tool_descriptor(snapshot: &Value, workspace: &str) -> (ToolKind, ToolDescriptor) {
-    normalize_descriptor(
-        normalized_tool_kind(&snapshot["kind"]),
-        ToolDescriptor {
-            semantics: Default::default(),
-            name: snapshot["title"].as_str().unwrap_or("Tool").into(),
-            title: snapshot["title"].as_str().unwrap_or("Tool").into(),
-            arguments: InspectableArguments::new(
-                snapshot.get("rawInput").cloned().unwrap_or(Value::Null),
-            ),
-        },
-        workspace,
-    )
+/// Interpret a missing ACP status as pending and reject an unknown explicit status.
+fn tool_status(status: Option<&Value>) -> Result<ToolStatus, ProviderError> {
+    match status.and_then(Value::as_str) {
+        None if status.is_none() => Ok(ToolStatus::Running),
+        Some("pending" | "in_progress") => Ok(ToolStatus::Running),
+        Some("completed") => Ok(ToolStatus::Succeeded),
+        Some("failed") => Ok(ToolStatus::Failed),
+        Some("denied") => Ok(ToolStatus::Denied),
+        Some("cancelled") => Ok(ToolStatus::Cancelled),
+        Some("interrupted") => Ok(ToolStatus::Interrupted),
+        _ => Err(provider_failure(ProviderFailureKind::Protocol)),
+    }
 }
 
-/// Preserve the normalized item category across native descriptor revisions.
-fn normalized_tool_kind(kind: &Value) -> ToolKind {
-    match kind.as_str() {
-        Some("edit" | "delete" | "move") => ToolKind::FileChange,
-        Some("execute") => ToolKind::Command,
-        Some(_) | None => ToolKind::ToolCall,
+/// Translate terminal ACP statuses into sanitized provider outcomes.
+fn tool_outcome(status: ToolStatus) -> Option<ToolOutcome> {
+    match status {
+        ToolStatus::Running => None,
+        ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
+        ToolStatus::Failed => Some(ToolOutcome::Failed {
+            diagnostic: ToolDiagnostic {
+                kind: ProviderFailureKind::Unknown,
+                message: diagnostic::SanitizedMessage::new("Provider tool execution failed")
+                    .expect("static diagnostic is valid"),
+            },
+        }),
+        ToolStatus::Denied => Some(ToolOutcome::Denied {
+            reason: diagnostic::SanitizedMessage::new("Tool execution was denied by the provider")
+                .expect("static denial is nonempty"),
+        }),
+        ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
+        ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
     }
 }
 

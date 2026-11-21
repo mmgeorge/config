@@ -157,7 +157,7 @@ function ModelPicker.open(options)
   if not find_model(model_list, selected_model_id) then
     local default_model
     for _, model in ipairs(model_list) do if model.is_default then default_model = model break end end
-    selected_model_id = (default_model or model_list[1]).id
+    selected_model_id = (default_model or model_list[1] or {}).id
   end
   local layout = column_layout(model_list)
   local active_field_by_model = {}
@@ -210,8 +210,9 @@ function ModelPicker.open(options)
           title = "Select Model",
           column_headers = column_headers,
           option_list = option_list,
+          empty_text = "The provider advertised no models.",
           selected_index = selected_index,
-          footer = "↑↓ model  ←→ value  Tab field  p pin/unpin  Enter confirm  q close",
+          footer = #option_list == 0 and "q close" or "↑↓ model  ←→ value  Tab field  p pin/unpin  Enter confirm  q close",
         },
       },
       on_change = function(context)
@@ -223,7 +224,7 @@ function ModelPicker.open(options)
         end
       end,
       on_confirm = function(result)
-        if not is_current() then return end
+        if not is_current() or not result.option then return false end
         local model = result.option.value
         options.on_confirm({
           model = model.id,

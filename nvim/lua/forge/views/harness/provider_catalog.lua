@@ -18,9 +18,10 @@ local model_cache = {}
 ---@type table<string, table[]>
 local latest_model_list_by_provider = {}
 
+---@param harness? table
 ---@return string
-local function cache_key()
-  local harness = session.harness
+local function cache_key(harness)
+  harness = harness or session.harness
   local provider_session = harness.session or {}
   return table.concat({
     provider_session.provider or "active",
@@ -74,6 +75,7 @@ end
 function M.models(force, callback)
   local state = session.harness
   local provider = state.session and state.session.provider
+  local revision = state.model_catalog_revision
   local function deliver(value, failure)
     if failure then callback(nil, failure) return end
     local models = vim.deepcopy(value or {})
@@ -115,7 +117,11 @@ function M.models(force, callback)
   end
   local key = cache_key()
   request_catalog(model_cache, "session.provider.model.list", force, function(value, failure)
-    if key ~= cache_key() then return end
+    if state ~= session.harness or key ~= cache_key() then return end
+    if revision ~= state.model_catalog_revision then
+      M.models(false, callback)
+      return
+    end
     if not failure then
       if provider then latest_model_list_by_provider[provider] = vim.deepcopy(value or {}) end
       state.model_provider, state.model_list, state.model_list_provisional = provider, vim.deepcopy(value or {}), nil
@@ -125,6 +131,14 @@ function M.models(force, callback)
     end
     deliver(value, failure)
   end)
+end
+
+---Keep the last labels visible while the next request samples the new native catalog.
+---@param state table
+function M.invalidate_models(state)
+  model_cache[cache_key(state)] = nil
+  state.model_catalog_revision = (state.model_catalog_revision or 0) + 1
+  state.model_list_provisional = true
 end
 
 local function mutate(method, cache, name, enabled, callback, resource_id, scope)
@@ -153,6 +167,19 @@ end
 ---@param scope ForgeResourceScope?
 function M.set_mcp_enabled(name, enabled, callback, resource_id, scope)
   mutate("settings.mcp.set_enabled", mcp_cache, name, enabled, callback, resource_id, scope)
+end
+
+---Edit the next binding's settings without addressing the current provider session.
+---@param kind "skill"|"mcp"
+---@param workspace string
+---@param resource table
+---@param enabled boolean
+---@param callback fun(result: table?, error: string?)
+function M.set_resource_default(kind, workspace, resource, enabled, callback)
+  client.request({ method = "settings." .. kind .. ".set_enabled", params = {
+    workspace = workspace, name = resource.name, enabled = enabled, resource_id = resource.resource_id,
+    scope = resource.scope,
+  } }, callback)
 end
 
 function M.clear()

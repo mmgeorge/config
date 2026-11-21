@@ -65,7 +65,7 @@ pub(super) async fn catalog(
         registry.runtime.trace(),
         PathBuf::from(&registry.initialize.data_root),
     )?;
-    let capability = adapter.descriptor().capability;
+    let mut capability = adapter.descriptor().capability;
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         adapter.model_list(forge_provider_api::QueryContext::Workspace(
@@ -81,5 +81,6 @@ pub(super) async fn catalog(
         .context("defaults model catalog cleanup exceeded 30 seconds");
     let models = result??;
     cleanup??;
+    capability.effort_selection &= models.iter().any(|model| !model.reasoning.is_empty());
     Ok(json!({"models":models,"capability":capability}))
 }

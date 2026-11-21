@@ -3,6 +3,7 @@ use super::{
     conversation::{AcpConversation, ConversationOptions},
     runtime::AcpRuntime,
     session::AcpSessionState,
+    submission::reject_before_dispatch,
 };
 use crate::pending_input::{PendingInput, PendingInputs};
 use async_trait::async_trait;
@@ -24,6 +25,9 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, RwLock};
 
+/// Leave time within the host drain for process, reader, and profile collection.
+const NATIVE_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 struct AcpBinding {
     binding: SessionBinding,
     owner: ThreadId,
@@ -31,10 +35,8 @@ struct AcpBinding {
     state: Arc<AcpSessionState>,
     sink: ProviderEventSink,
     cleanup: crate::resource_cleanup::ResourceCleanup,
-    profiles: Mutex<Vec<Arc<crate::resource_cleanup::RetainedProfile>>>,
     selection: Mutex<forge_provider_api::session::ResourceSelection>,
     native_model: Mutex<forge_provider_api::ModelSelection>,
-    initial_model: forge_provider_api::ModelSelection,
     operation: Mutex<()>,
     steering: RwLock<()>,
     covered_inputs: std::sync::Mutex<
@@ -68,6 +70,19 @@ impl AcpBinding {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
+    }
+
+    /// Fence prompt publication and prevent any successor from acquiring this binding.
+    fn close_prompt_admission(&self) {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active) = active.as_ref() {
+            active.cancellation.stop();
+        }
+        // Root admission takes this same lock before installing the next publication gate.
+        self.state.close_admission();
     }
 
     /// Derive current binding support from the native handshake and retained catalog.
@@ -121,8 +136,15 @@ impl AcpBinding {
         &self,
         scope: &forge_provider_api::InvocationScope,
     ) -> Result<forge_provider_api::CompletedTurn, ProviderError> {
-        let record = self
-            .settlements
+        self.settlement_record(scope)?.wait().await
+    }
+
+    /// Get the retained collector for exactly one admitted invocation.
+    fn settlement_record(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+    ) -> Result<Arc<OperationRecord<forge_provider_api::CompletedTurn>>, ProviderError> {
+        self.settlements
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(scope)
@@ -132,8 +154,7 @@ impl AcpBinding {
                     ProviderOperation::TurnInterrupt,
                     ProviderFailureKind::WrongInvocation,
                 )
-            })?;
-        record.wait().await
+            })
     }
 }
 
@@ -182,6 +203,7 @@ struct AcpOperations {
         forge_provider_api::CompactionResult,
     >,
     close: Store<BindingId, ()>,
+    terminate_binding: Store<BindingId, ()>,
     cancel: Store<
         (BindingId, forge_provider_api::CancelRequest),
         forge_provider_api::TurnInterruptResult,
@@ -222,6 +244,7 @@ impl AcpOperations {
             fork: Store::registered(identities.clone()),
             compact: Store::registered(identities.clone()),
             close: Store::registered(identities.clone()),
+            terminate_binding: Store::registered(identities.clone()),
             cancel: Store::registered(identities.clone()),
             submit: Store::registered(identities.clone()),
             steer: Store::registered(identities.clone()),
@@ -258,6 +281,9 @@ impl AcpOperations {
             failures.push(error);
         }
         if let Err(error) = self.close.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.terminate_binding.join_all_except(id).await {
             failures.push(error);
         }
         if let Err(error) = self.cancel.join_all_except(id).await {
@@ -336,14 +362,13 @@ impl crate::turn_runner::NativeTurnDriver for AcpTurnDriver {
 
     /// Interrupt only this retained native prompt when its original scope is still active.
     async fn interrupt(&self) -> Result<(), ProviderError> {
-        let mut active = self
+        let active = self
             .session
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(active) = active.as_mut().filter(|active| active.scope == self.scope) {
-            active.cancelled = true;
-            active.cancellation.cancel();
+        if let Some(active) = active.as_ref().filter(|active| active.scope == self.scope) {
+            active.cancellation.stop();
         }
         Ok(())
     }
@@ -372,8 +397,8 @@ struct PromptInvocation {
 
 struct ActiveExecution {
     scope: forge_provider_api::InvocationScope,
-    cancelled: bool,
-    cancellation: tokio_util::sync::CancellationToken,
+    steering_end: Option<super::response::NativePromptEnd>,
+    cancellation: Arc<super::connection::PromptCancellation>,
     task: Option<Arc<crate::turn_runner::RetainedTurn>>,
 }
 
@@ -419,7 +444,7 @@ impl AcpProvider {
             ));
         }
         Ok(Self::from_runtime(
-            AcpRuntime::new(kind, command, &runtime_root),
+            AcpRuntime::new(kind, command),
             runtime_root,
         ))
     }
@@ -456,7 +481,7 @@ impl AcpProvider {
         let observation = interruption.failure(operation, phase, FailureDisposition::Invalidated);
         let cause = observation.clone();
         if let Ok(session) = self.binding(&binding, operation) {
-            session.state.close_admission();
+            session.close_prompt_admission();
         }
         Interruption::new(observation, async move {
             let session = provider.binding(&binding, operation)?;
@@ -491,7 +516,7 @@ impl AcpProvider {
         if let Some(binding) = &binding
             && let Ok(session) = self.binding(binding, ProviderOperation::ThreadFork)
         {
-            session.state.close_admission();
+            session.close_prompt_admission();
         }
         Interruption::new(observation, async move {
             if let Some(binding) = binding {
@@ -637,6 +662,7 @@ impl AcpProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.check_admission(ProviderOperation::TurnStart)?;
             context.check_admission(ProviderOperation::TurnStart)?;
+            session.state.ensure_admission(ProviderOperation::TurnStart)?;
             if active.is_some() {
                 return Err(failure(
                     ProviderOperation::TurnStart,
@@ -663,8 +689,8 @@ impl AcpProvider {
                 .insert(request.scope.clone(), request.input_coverage());
             *active = Some(ActiveExecution {
                 scope: request.scope.clone(),
-                cancelled: false,
-                cancellation: tokio_util::sync::CancellationToken::new(),
+                steering_end: None,
+                cancellation: Arc::default(),
                 task: None,
             });
             let (started, start) = tokio::sync::oneshot::channel();
@@ -736,7 +762,7 @@ impl AcpProvider {
         let runtime = self
             .runtime
             .resolve()
-            .map_err(|_| failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Runtime))?;
+            .map_err(|error| runtime_unavailable(ProviderOperation::ThreadOpen, error))?;
         context.check_admission(ProviderOperation::ThreadOpen)?;
         let _history_admission = self.history_admission.lock().await;
         context.check_admission(ProviderOperation::ThreadOpen)?;
@@ -787,7 +813,21 @@ impl AcpProvider {
         let _preparation = preparation.lock().await;
         let existing = self.owners.lock().await.get(&request.thread_id).cloned();
         if let Some(existing) = existing {
-            self.close_session(&existing).await?;
+            let previous = self.binding(&existing, ProviderOperation::ThreadOpen)?;
+            if let Err(error) = self.close_session(&existing).await {
+                // Only release of this exact binding permits the replacement to write history.
+                if !previous.history_released.load(Ordering::Acquire) {
+                    return Err(error);
+                }
+                let failure = match &error {
+                    ProviderError::Failure(failure) => Some(*failure),
+                    _ => None,
+                };
+                tracing::warn!(target: "forge::provider", event_name = "provider.acp.replaced_after_close_failure",
+                    provider = "antigravity", operation = ?ProviderOperation::ThreadClose,
+                    kind = ?failure.map(ProviderFailure::kind), phase = ?failure.map(ProviderFailure::phase),
+                    disposition = ?failure.map(ProviderFailure::disposition), error = %error);
+            }
         }
         if let Some(resume) = request.history.resume_id() {
             let reservations = self
@@ -824,6 +864,7 @@ impl AcpProvider {
             self.kind,
             &self.runtime_root,
             &request.configuration.resources.skills,
+            &request.history,
         )?);
         let process_owner = request
             .resource_lease
@@ -836,7 +877,7 @@ impl AcpProvider {
             self.admission.clone(),
             request.workspace.clone(),
         ));
-        let conversation = AcpConversation::open(
+        let conversation = match AcpConversation::open(
             super::AcpLaunch {
                 process_owner,
                 command: &runtime.command,
@@ -851,12 +892,24 @@ impl AcpProvider {
                 session_id: request.history.resume_id().map(ToString::to_string),
                 control_endpoint: request.tool_endpoint.clone(),
                 mcp_servers,
-                resources: mcp_definitions(&selection),
                 system_instructions: request.system_instructions.clone(),
             },
             &cleanup,
         )
-        .await?;
+        .await
+        {
+            Ok(conversation) => conversation,
+            Err(cause) => {
+                // A failed open has no public binding whose close can release its profile and lease.
+                return Err(match cleanup.shutdown().await {
+                    Ok(()) => cause,
+                    Err(cleanup) => ProviderError::PreparationCleanup {
+                        cause: Box::new(cause),
+                        cleanup: Box::new(cleanup),
+                    },
+                });
+            }
+        };
         let session_id: forge_provider_api::ProviderSessionId =
             conversation.id().to_owned().try_into().map_err(|_| {
                 failure(ProviderOperation::ThreadOpen, ProviderFailureKind::Protocol)
@@ -898,7 +951,6 @@ impl AcpProvider {
             id: binding_id.clone(),
             provider_session_id: Some(session_id),
         };
-        let initial_model = conversation.initial_model().await;
         let requested_model = request.configuration.model.clone();
         let retained = Arc::new(AcpBinding {
             binding: binding.clone(),
@@ -907,10 +959,8 @@ impl AcpProvider {
             state,
             sink,
             cleanup: cleanup.clone(),
-            profiles: Mutex::new(vec![profile]),
             selection: Mutex::new(selection),
             native_model: Mutex::new(forge_provider_api::ModelSelection::default()),
-            initial_model,
             operation: Mutex::new(()),
             steering: RwLock::new(()),
             covered_inputs: std::sync::Mutex::new(HashMap::new()),
@@ -936,6 +986,7 @@ impl AcpProvider {
                     &requested_model,
                     &forge_provider_api::ModelSelection::default(),
                     forge_provider_api::ExecutionMode::Default,
+                    None,
                 )
                 .await
             }
@@ -1021,35 +1072,21 @@ impl AcpProvider {
             ));
         }
         validate_configuration(&configuration.model, &configuration.access)?;
-        let servers = super::resources::mcp_launches(
-            ProviderOperation::ThreadConfigure,
-            &configuration.resources.mcp,
-        )?;
         let resources_changed =
             !same_resources(&*session.selection.lock().await, &configuration.resources);
-        if resources_changed && self.kind == AcpKind::Antigravity {
+        if resources_changed {
             return Err(forge_provider_api::capability::UnsupportedCapability(
                 forge_provider_api::capability::ProviderFeature::ResourceSelection,
             )
             .into());
         }
-        let prepared_resources = if resources_changed {
-            let profile = session.cleanup.retain_profile(super::profile::create(
-                self.kind,
-                &self.runtime_root,
-                &configuration.resources.skills,
-            )?);
-            session.profiles.lock().await.push(profile.clone());
-            Some((profile, servers))
-        } else {
-            None
-        };
         let stored_model = session.native_model.lock().await.clone();
         if let Err(error) = configure_model(
             &session,
             &configuration.model,
             &stored_model,
             forge_provider_api::ExecutionMode::Default,
+            None,
         )
         .await
         {
@@ -1066,34 +1103,6 @@ impl AcpProvider {
             );
             session.invalidate(error.clone()).await;
             return Err(error);
-        }
-        if let Some((profile, servers)) = prepared_resources {
-            if let Err(error) = session.conversation.configure_resources(servers).await {
-                let error = operation_failure(
-                    ProviderOperation::ThreadConfigure,
-                    &error,
-                    forge_provider_api::ProviderPhase::Preparation,
-                    forge_provider_api::FailureDisposition::Invalidated,
-                );
-                session.invalidate(error.clone()).await;
-                return Err(error);
-            }
-            let profiles = session.profiles.lock().await.clone();
-            for previous in profiles {
-                if !Arc::ptr_eq(&previous, &profile)
-                    && let Err(error) = previous.close(ProviderOperation::ThreadConfigure).await
-                {
-                    let cause = operation_failure(
-                        ProviderOperation::ThreadConfigure,
-                        &error,
-                        ProviderPhase::Collection,
-                        FailureDisposition::Invalidated,
-                    );
-                    session.invalidate(cause.clone()).await;
-                    return Err(cause);
-                }
-            }
-            *session.selection.lock().await = configuration.resources.clone();
         }
         *session.native_model.lock().await = configuration.model.clone();
         if let Err(cause) =
@@ -1163,22 +1172,101 @@ impl AcpProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
-        if session
+        if !session.state.execution_started().await {
+            return Err(ProviderError::NotConsumed);
+        }
+        let cancellation = session
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .is_none_or(|active| active.scope != request.scope)
+            .filter(|active| active.scope == request.scope)
+            .map(|active| active.cancellation.clone())
+            .ok_or(ProviderError::NotConsumed)?;
+        let mut rendered = forge_provider_api::forge::input_block(&request.input);
+        rendered.push_str(&user_text(&request.input));
+        let receipt = request.delivery.receipt().cloned();
+        let prompt = match super::attachments::input(
+            rendered,
+            &request.attachments,
+            session.conversation.supports_images(),
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                let error = error.for_operation(ProviderOperation::TurnSteer);
+                return Err(match &receipt {
+                    Some(receipt) => reject_before_dispatch(receipt, error).await,
+                    None => ProviderError::PreparationFailed(Box::new(error)),
+                });
+            }
+        };
+        let covered = receipt
+            .as_ref()
+            .map(|receipt| {
+                Ok::<_, ProviderError>(forge_provider_api::CoveredInput::new(
+                    receipt.id().clone(),
+                    receipt.attempt_id()?,
+                ))
+            })
+            .transpose()?;
+        if let Some(dispatch) = &request.dispatch
+            && !covered.as_ref().is_some_and(|covered| {
+                dispatch.matches(
+                    binding,
+                    &request.scope,
+                    covered.submission_id(),
+                    covered.attempt_id(),
+                )
+            })
         {
-            return Err(failure(
-                ProviderOperation::TurnSteer,
-                ProviderFailureKind::WrongInvocation,
-            ));
+            return Err(failure(ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation));
         }
-        Err(forge_provider_api::capability::UnsupportedCapability(
-            forge_provider_api::capability::ProviderFeature::NativeSteer,
-        )
-        .into())
+        let response = session
+            .conversation
+            .submit(
+                super::submission::AcpSubmission::Steer,
+                serde_json::json!({"sessionId":session.conversation.id(),"prompt":prompt}),
+                receipt,
+                request.dispatch.as_ref(),
+                Some(&cancellation),
+            )
+            .await;
+        let native_end = match response {
+            Ok(native_end) => native_end,
+            Err(error) => {
+                if !matches!(error, ProviderError::NotConsumed) {
+                    cancellation.seal();
+                    session.state.retain_failure(error.clone()).await;
+                }
+                return Err(error);
+            }
+        };
+        let mut active = session
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = active
+            .as_mut()
+            .filter(|active| active.scope == request.scope)
+            .ok_or_else(|| failure(ProviderOperation::TurnSteer, ProviderFailureKind::WrongInvocation))?;
+        active.steering_end = Some(
+            active
+                .steering_end
+                .map_or(native_end, |end| end.latest(native_end)),
+        );
+        if let Some(covered) = covered {
+            let submission_id = covered.submission_id().clone();
+            session
+                .covered_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&request.scope)
+                .ok_or_else(|| failure(ProviderOperation::TurnSteer, ProviderFailureKind::Protocol))?
+                .push(covered);
+            Ok(forge_provider_api::SteeringAcceptance::Journaled { submission_id })
+        } else {
+            Ok(forge_provider_api::SteeringAcceptance::Context)
+        }
     }
 
     /// Close every producer before joining retained native operations and pending opens.
@@ -1231,17 +1319,15 @@ impl AcpProvider {
 
     async fn close_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
         let session = self.binding(binding, ProviderOperation::ThreadClose)?;
-        session.state.close_admission();
+        session.close_prompt_admission();
         let pending = self.pending_inputs.fence_binding(binding);
         session.state.revoke_authority().await;
         pending.await;
         let mut retained = session.close_task.lock().await;
-        if retained.as_ref().is_some_and(|task| task.is_finished()) {
-            if let Some(task) = retained.as_ref()
-                && task.join().await.is_ok()
-            {
-                return Ok(());
-            }
+        if let Some(task) = retained.as_ref()
+            && task.is_finished()
+            && task.join().await.is_err()
+        {
             retained.take();
         }
         let task = retained
@@ -1255,7 +1341,7 @@ impl AcpProvider {
             .clone();
         drop(retained);
         let result = task.join().await;
-        if result.is_ok() {
+        if session.history_released.load(Ordering::Acquire) {
             let mut owners = self.owners.lock().await;
             if owners.get(&session.owner) == Some(binding) {
                 owners.remove(&session.owner);
@@ -1355,8 +1441,6 @@ impl AcpProvider {
         session
             .state
             .ensure_admission(ProviderOperation::InputRetract)?;
-        // The retracted prompt may have carried the instruction prelude.
-        session.state.advance_history_epoch();
         if session.has_active_prompt() {
             return Err(failure(
                 ProviderOperation::InputRetract,
@@ -1453,13 +1537,14 @@ impl AcpProvider {
         Ok(skills)
     }
 
+    /// Read the launch definitions for the exact binding without claiming live readiness.
     async fn list_mcp(
         &self,
         query: forge_provider_api::catalog::McpQuery,
     ) -> Result<Vec<forge_provider_api::catalog::McpDefinition>, ProviderError> {
-        let (request, observed) = match query {
-            forge_provider_api::catalog::McpQuery::Configured(context) => (context, false),
-            forge_provider_api::catalog::McpQuery::Observed(context) => (context, true),
+        let request = match query {
+            forge_provider_api::catalog::McpQuery::Configured(context)
+            | forge_provider_api::catalog::McpQuery::Observed(context) => context,
         };
         let binding = match request {
             forge_provider_api::catalog::QueryContext::Binding(binding) => binding,
@@ -1472,34 +1557,7 @@ impl AcpProvider {
         };
         let session = self.binding(&binding, ProviderOperation::McpList)?;
         session.state.ensure_admission(ProviderOperation::McpList)?;
-        let mut definitions = mcp_definitions(&*session.selection.lock().await);
-        if !observed {
-            return Ok(definitions);
-        }
-        let catalog = session.state.catalog().await;
-        if let Some(resources) = catalog["mcpResources"].as_array() {
-            for definition in &mut definitions {
-                if let Some(native) = resources
-                    .iter()
-                    .find(|resource| resource["name"] == definition.name)
-                {
-                    match native["state"].as_str() {
-                        Some("requested") => {
-                            definition.status = forge_provider_api::catalog::McpStatus::Loading
-                        }
-                        Some("disabled") => {
-                            definition.status = forge_provider_api::catalog::McpStatus::Disabled
-                        }
-                        Some("unavailable") => {
-                            definition.status = forge_provider_api::catalog::McpStatus::Unavailable;
-                            definition.status_detail =
-                                Some(normalized_mcp_reason(native["reason"].as_str()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+        let definitions = mcp_definitions(&*session.selection.lock().await);
         Ok(definitions)
     }
 
@@ -1529,23 +1587,18 @@ impl AcpProvider {
 
     /// Read the model catalog for a workspace that has no live binding.
     ///
-    /// ACP publishes models only in a session response, so discovery opens a disposable session
-    /// with no tools, MCP servers, or instructions, and always collects its process. Claude's
-    /// session is not persisted, so discovery leaves no transcript in the user's history.
+    /// ACP publishes models only in a session response. Discovery opens a disposable session
+    /// without configuring MCP servers or supplying instructions, and collects its private profile.
     async fn workspace_models(
         &self,
         workspace: &str,
         cleanup: &crate::resource_cleanup::ResourceCleanup,
     ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
-        let runtime = self.runtime.status();
-        if !runtime.available {
-            return Err(failure(
-                ProviderOperation::ModelList,
-                ProviderFailureKind::Runtime,
-            ));
-        }
+        let runtime = self.runtime.resolve()
+            .map_err(|error| runtime_unavailable(ProviderOperation::ModelList, error))?;
         let profile =
-            cleanup.retain_profile(super::profile::create(self.kind, &self.runtime_root, &[])?);
+            cleanup.retain_profile(super::profile::discovery(&self.runtime_root)?);
+        let requirement = super::conversation::runtime_requirement(self.kind, &runtime.command);
         let connection = super::AcpConnection::launch_retained(
             super::AcpLaunch {
                 process_owner: None,
@@ -1562,27 +1615,20 @@ impl AcpProvider {
             cleanup,
         )
         .await
-        .map_err(|_| failure(ProviderOperation::ModelList, ProviderFailureKind::Transport))?;
-        let requirement = super::conversation::runtime_requirement(
-            self.kind,
-            runtime
-                .command
-                .first()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "ACP".into()),
-        )?;
-        let protocol = || failure(ProviderOperation::ModelList, ProviderFailureKind::Protocol);
+        .map_err(|error| {
+            super::conversation::launch_failure(&requirement, ProviderOperation::ModelList, error)
+        })?;
         let result = async {
-            let initialized = connection
-                .request("initialize", initialize_params())
-                .await
-                .map_err(|_| protocol())?;
-            super::conversation::validate_initialization(&requirement, &initialized)?;
+            let initialized = super::conversation::initialize(
+                &connection,
+                &requirement,
+                ProviderOperation::ModelList,
+            ).await?;
             let parameter = serde_json::json!({"cwd":workspace,"mcpServers":[]});
             let session = connection
                 .request("session/new", parameter)
                 .await
-                .map_err(|_| protocol())?;
+                .map_err(|error| crate::error::acp(error, ProviderOperation::ModelList))?;
             let vision = initialized
                 .pointer("/agentCapabilities/promptCapabilities/image")
                 .and_then(serde_json::Value::as_bool)
@@ -1759,6 +1805,51 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                         ProviderOperation::ThreadClose,
                         interruption,
                         ProviderPhase::Close,
+                    )
+                },
+            )
+            .await
+    }
+
+    /// Reap the binding's dedicated process tree without waiting for a protocol reply.
+    async fn thread_terminate(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<(), ProviderError> {
+        let provider = self.clone();
+        let binding = binding.clone();
+        let worker_context = context.clone();
+        self.operations
+            .terminate_binding
+            .observe(
+                context,
+                ProviderOperation::ThreadClose,
+                binding.clone(),
+                async move {
+                    worker_context.check_admission(ProviderOperation::ThreadClose)?;
+                    let Ok(session) = provider.binding(&binding, ProviderOperation::ThreadClose) else {
+                        return Ok(());
+                    };
+                    session.close_prompt_admission();
+                    drop(provider.pending_inputs.fence_binding(&binding));
+                    session.cleanup.terminate().await?;
+                    session.state.mark_collected();
+                    session.history_released.store(true, Ordering::Release);
+                    let mut owners = provider.owners.lock().await;
+                    if owners.get(&session.owner) == Some(&binding) {
+                        owners.remove(&session.owner);
+                    }
+                    Ok(())
+                },
+                |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::ThreadClose,
+                            ProviderPhase::Close,
+                            FailureDisposition::Uncertain,
+                        ),
+                        async { Ok(()) },
                     )
                 },
             )
@@ -2138,15 +2229,6 @@ impl forge_provider_api::provider::Provider for AcpProvider {
     }
 }
 
-/// Advertise only the ACP features implemented by this native adapter.
-fn initialize_params() -> serde_json::Value {
-    serde_json::json!({
-        "protocolVersion":1,
-        "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-        "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}},"notices":{}},"subagents":{}}
-    })
-}
-
 /// Get all journaled input identities accepted under the exact retained invocation.
 fn covered_inputs(
     session: &AcpBinding,
@@ -2197,20 +2279,37 @@ async fn close_binding(session: Arc<AcpBinding>) -> Result<(), ProviderError> {
     let mut errors = Vec::new();
     session.state.revoke_callbacks().await;
     let scope = {
-        let mut active = session
+        let active = session
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.as_mut().map(|active| {
-            active.cancelled = true;
-            active.cancellation.cancel();
-            active.scope.clone()
-        })
+        active
+            .as_ref()
+            .map(|active| (active.scope.clone(), active.cancellation.clone()))
     };
-    if scope.is_some()
-        && let Err(error) = session.conversation.cancel()
+    if let Some((_, cancellation)) = &scope
+        && let Err(error) = session.conversation.cancel(cancellation)
     {
         errors.push(error);
+    }
+    if scope.is_none()
+        && !session.cleanup.is_collected()
+        && session.state.binding_failure().await.is_none()
+    {
+        // Configuration can hold the operation lock until transport cleanup unblocks its RPC.
+        // Bound the entire graceful attempt so this close always reaches that cleanup.
+        let graceful = tokio::time::timeout(NATIVE_CLOSE_GRACE, async {
+            let _operation = session.operation.lock().await;
+            if session.state.binding_failure().await.is_none() && !session.cleanup.is_collected() {
+                session.conversation.close_native().await?;
+            }
+            Ok(())
+        });
+        match graceful.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(_) => errors.push(failure(ProviderOperation::ThreadClose, ProviderFailureKind::Timeout)),
+        }
     }
     // Explicit binding close owns the entire transport, including unresponsive prompts.
     // Collect it before joining settlement instead of adding a second cancellation timer.
@@ -2221,10 +2320,18 @@ async fn close_binding(session: Arc<AcpBinding>) -> Result<(), ProviderError> {
             false
         }
     };
-    if let Some(scope) = scope {
-        let result = session.settlement(&scope).await;
-        if let Err(error) = result {
-            errors.push(error);
+    let mut settled = true;
+    if let Some((scope, _)) = scope {
+        match session.settlement_record(&scope) {
+            Ok(record) => {
+                // The retained outcome still reports delivery uncertainty to invocation callers.
+                // Force collection can cause that outcome while proving the writer was reaped.
+                let _ = record.wait().await;
+            }
+            Err(error) => {
+                settled = false;
+                errors.push(error.for_operation(ProviderOperation::ThreadClose));
+            }
         }
     }
     let _operation = session.operation.lock().await;
@@ -2232,10 +2339,13 @@ async fn close_binding(session: Arc<AcpBinding>) -> Result<(), ProviderError> {
     if collected && let Err(error) = session.cleanup.shutdown().await {
         errors.push(with_operation(ProviderOperation::ThreadClose, error));
     }
-    if errors.is_empty() && session.cleanup.is_collected() {
+    if settled && session.cleanup.is_collected() {
+        // Collection proves the previous writer stopped even when native close reported a failure.
         session.state.mark_collected();
         session.history_released.store(true, Ordering::Release);
-        return Ok(());
+        if errors.is_empty() {
+            return Ok(());
+        }
     }
     if errors.is_empty() {
         errors.push(failure(
@@ -2259,30 +2369,19 @@ async fn run_prompt(
         let cancellation = session.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().filter(|active| active.scope == request.scope).map(|active| active.cancellation.clone()).ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::WrongInvocation))?;
         let preparation = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err(ProviderError::Cancelled),
+            _ = cancellation.token.cancelled() => Err(ProviderError::Cancelled),
             result = request.turn_control.before_send(&request.scope) => result,
         };
         if let Err(error) = preparation {
             session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
             return Err(reject_before_dispatch(&request.receipt, error).await);
         }
-        if !session.state.is_admitting() || session.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|active| active.cancelled) {
+        if !session.state.is_admitting() || cancellation.token.is_cancelled() {
             session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
             return Err(reject_before_dispatch(&request.receipt, ProviderError::Cancelled).await);
         }
         let _operation = session.operation.lock().await;
         session.sink.check()?;
-        if let Err(error) = session
-            .conversation
-            .bind_tool_endpoint(request.tool_endpoint.as_ref())
-            .await
-        {
-            let error = with_operation(ProviderOperation::TurnStart, error);
-            if matches!(&error, ProviderError::Failure(failure) if matches!(failure.disposition(), FailureDisposition::Uncertain | FailureDisposition::Invalidated)) {
-                session.invalidate(error.clone()).await;
-            }
-            return Err(reject_before_dispatch(&request.receipt, error).await);
-        }
         let event_sink = session.sink.invocation_sink(&request.scope)?;
         if let Err(error) = session
             .state
@@ -2293,7 +2392,7 @@ async fn run_prompt(
             )
             .await
         {
-            let error = if cancellation.is_cancelled() { ProviderError::Cancelled } else { error };
+            let error = if cancellation.token.is_cancelled() { ProviderError::Cancelled } else { error };
             if error.is_clean_cancellation() { session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone())); }
             return Err(reject_before_dispatch(&request.receipt, error).await);
         }
@@ -2304,9 +2403,7 @@ async fn run_prompt(
             .await
             .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
         let current_model = session.native_model.lock().await.clone();
-        let history_epoch = session.state.history_epoch();
-        let prelude = session.conversation.prompt_instructions(history_epoch);
-        let carries_prelude = prelude.is_some();
+        let prelude = session.conversation.prompt_instructions();
         let prompt = match prompt_content(&request, session.conversation.supports_images(), prelude) {
             Ok(prompt) => prompt,
             Err(error) => return Err(reject_before_dispatch(&request.receipt, error).await),
@@ -2316,16 +2413,21 @@ async fn run_prompt(
             &request.configuration.model,
             &current_model,
             request.execution,
+            Some(&cancellation),
         )
         .await
         {
             let error = with_operation(ProviderOperation::TurnStart, error);
+            if error.is_clean_cancellation() {
+                session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
+            }
             if matches!(&error, ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Invalidated) { session.invalidate(error.clone()).await; }
             return Err(reject_before_dispatch(&request.receipt, error).await);
         }
         *session.native_model.lock().await = request.configuration.model.clone();
+        let transcript = session.conversation.transcript_cursor().await;
         let cancellation = session.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().filter(|active| active.scope == request.scope).map(|active| active.cancellation.clone()).ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::WrongInvocation))?;
-        if cancellation.is_cancelled() || !session.state.is_admitting() {
+        if cancellation.token.is_cancelled() || !session.state.is_admitting() {
             session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
             return Err(reject_before_dispatch(&request.receipt, ProviderError::Cancelled).await);
         }
@@ -2336,13 +2438,22 @@ async fn run_prompt(
                 super::submission::AcpSubmission::Prompt,
                 serde_json::json!({"sessionId":session.conversation.id(),"prompt":prompt}),
                 Some(request.receipt.clone()),
-                &request.dispatch,
-                &cancellation,
+                Some(&request.dispatch),
+                Some(&cancellation),
             )
             .await;
         let _response = match response {
             Ok(response) => response,
+            Err(error) if error.is_clean_cancellation()
+                || matches!(&error, ProviderError::PreparationCleanup { cause, .. } if cause.is_clean_cancellation()) =>
+            {
+                session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
+                return Err(error);
+            }
             Err(error) => {
+                cancellation.seal();
+                cancellation.wait_for_replies().await;
+                let _steering = session.steering.write().await;
                 let started = session.state.execution_started().await;
                 let proven_unconsumed = match &error {
                     ProviderError::NotConsumed => true,
@@ -2375,19 +2486,26 @@ async fn run_prompt(
                 return Err(with_cleanup(error, cleanup));
             }
         };
-        if carries_prelude {
-            session.conversation.prelude_accepted(history_epoch);
-        }
         let native_end = session.conversation.prompt_end(&forge_provider_api::CoveredInput::new(
             request.submission_id.clone(), request.attempt_id.clone()))
             .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::Protocol))?;
-        let completed_at_ms = native_end.completed_at_ms();
         if let Some(sender) = accepted.take() {
             let _ = sender.send(Ok(InputAcceptance {
                 submission_id: request.submission_id.clone(),
             }));
         }
+        cancellation.wait_for_replies().await;
         let _steering_boundary = session.steering.write().await;
+        if let Some(error) = session.state.binding_failure().await {
+            session.invalidate(error.clone()).await;
+            return Err(error);
+        }
+        let steering_end = session.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref().filter(|active| active.scope == request.scope)
+            .map(|active| active.steering_end)
+            .ok_or_else(|| failure(ProviderOperation::TurnStart, ProviderFailureKind::WrongInvocation))?;
+        let native_end = steering_end.map_or(native_end, |end| native_end.latest(end));
+        let completed_at_ms = native_end.completed_at_ms();
         let native_outcome = match native_end.outcome() {
             super::PromptOutcome::Completed(reason) => forge_provider_api::turn::TurnOutcome::Completed { stop_reason: reason },
             super::PromptOutcome::Cancelled => forge_provider_api::turn::TurnOutcome::Interrupted,
@@ -2399,8 +2517,9 @@ async fn run_prompt(
         }
         session.state.observe_native_start(completed_at_ms).await?;
         let outcome = native_outcome;
+        let transcript = transcript.filter(|_| steering_end.is_some());
         let mut terminal_errors = Vec::new();
-        if let Err(error) = session.state.finish(outcome).await {
+        if let Err(error) = session.state.finish_with_transcript(outcome, transcript).await {
             terminal_errors.push(error);
         }
         let completion = session.state.take_completion().await;
@@ -2419,7 +2538,7 @@ async fn run_prompt(
         Ok(result) => Ok(result),
         Err(error) => {
             let mut error = error;
-            if accepted.is_some() && session.state.has_active_work().await {
+            if session.state.has_active_work().await {
                 session.state.revoke_callbacks().await;
                 if let Err(cleanup) = session
                     .state
@@ -2450,29 +2569,39 @@ async fn run_prompt(
 
 /// Resolve provider-default resets from the native snapshot captured before task overrides.
 fn resolve_native_model(
-    session: &AcpBinding,
+    initial: &forge_provider_api::ModelSelection,
     requested: &forge_provider_api::ModelSelection,
     retained: &forge_provider_api::ModelSelection,
+    models: &[forge_provider_api::ProviderModel],
 ) -> Result<forge_provider_api::ModelSelection, ProviderError> {
+    use forge_provider_api::capability::{ProviderFeature, UnsupportedCapability};
     use forge_provider_api::generation::ReasoningSelection;
     let mut resolved = requested.clone();
-    if requested.model.is_none() && retained.model.is_some() {
-        resolved.model = Some(session.initial_model.model.clone().ok_or(
-            forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ModelDefaultReset,
-            ),
-        )?);
+    let resetting_effort = requested.reasoning == ReasoningSelection::Default
+        && retained.reasoning != ReasoningSelection::Default;
+    if requested.model.is_none() && (retained.model.is_some() || resetting_effort) {
+        let feature = if retained.model.is_some() {
+            ProviderFeature::ModelDefaultReset
+        } else {
+            ProviderFeature::ReasoningDefaultReset
+        };
+        resolved.model = Some(initial.model.clone().ok_or(UnsupportedCapability(feature))?);
     }
-    if requested.reasoning == ReasoningSelection::Default
-        && retained.reasoning != ReasoningSelection::Default
+    if resetting_effort
+        && let Some(model) = models
+            .iter()
+            .find(|model| resolved.model.as_deref() == Some(model.id.as_str()))
+        && model.default_reasoning.is_none()
+        && !model.reasoning.is_empty()
     {
-        if session.initial_model.reasoning == ReasoningSelection::Default {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ReasoningDefaultReset,
-            )
-            .into());
+        // For older peers with a separate effort control, the opening effort belongs to
+        // the opening model. Concrete variants already restore their own effort on selection.
+        if initial.model.as_deref() != Some(model.id.as_str())
+            || !matches!(&initial.reasoning, ReasoningSelection::Level(level) if model.reasoning.contains(level))
+        {
+            return Err(UnsupportedCapability(ProviderFeature::ReasoningDefaultReset).into());
         }
-        resolved.reasoning = session.initial_model.reasoning.clone();
+        resolved.reasoning = initial.reasoning.clone();
     }
     Ok(resolved)
 }
@@ -2518,20 +2647,24 @@ async fn configure_model(
     requested: &forge_provider_api::session::ModelSelection,
     retained: &forge_provider_api::session::ModelSelection,
     mode: forge_provider_api::ExecutionMode,
+    cancellation: Option<&super::connection::PromptCancellation>,
 ) -> Result<(), ProviderError> {
     use forge_provider_api::generation::ReasoningSelection;
 
     validate_model_selection(requested)?;
-    let resolved = resolve_native_model(session, requested, retained)?;
-    let requested = &resolved;
-
     let models = session.conversation.models().await.map_err(|_| {
         failure(
             ProviderOperation::ThreadConfigure,
             ProviderFailureKind::Protocol,
         )
     })?;
-    let selected_model = match requested.model.as_deref() {
+    let resolved = resolve_native_model(
+        session.conversation.initial_model(),
+        requested,
+        retained,
+        &models,
+    )?;
+    let selected_model = match resolved.model.as_deref() {
         Some(model) => {
             if !models.iter().any(|candidate| candidate.id == model) {
                 return Err(failure(
@@ -2546,7 +2679,7 @@ async fn configure_model(
             .find(|model| model.is_default)
             .map(|model| model.id.as_str()),
     };
-    if let ReasoningSelection::Level(level) = &requested.reasoning
+    if let ReasoningSelection::Level(level) = &resolved.reasoning
         && !selected_model
             .and_then(|id| models.iter().find(|model| model.id == id))
             .is_some_and(|model| model.reasoning.contains(level))
@@ -2556,9 +2689,9 @@ async fn configure_model(
         )
         .into());
     }
-    let effort = match &requested.reasoning {
-        ReasoningSelection::Default => "default",
-        ReasoningSelection::Level(level) => level.as_str(),
+    let effort = match &resolved.reasoning {
+        ReasoningSelection::Default => None,
+        ReasoningSelection::Level(level) => Some(level.as_str()),
         ReasoningSelection::Lowest => {
             let reasoning = selected_model
                 .and_then(|id| models.iter().find(|model| model.id == id))
@@ -2568,16 +2701,12 @@ async fn configure_model(
                         forge_provider_api::capability::ProviderFeature::EffortSelection,
                     )
                 })?;
-            reasoning.as_str()
+            Some(reasoning.as_str())
         }
     };
-    session
+    let outcome = session
         .conversation
-        .configure(
-            requested.model.as_deref().unwrap_or("default"),
-            effort,
-            mode,
-        )
+        .configure(resolved.model.as_deref(), effort, mode, cancellation)
         .await
         .map_err(|_| {
             ProviderError::Failure(
@@ -2590,7 +2719,16 @@ async fn configure_model(
                     forge_provider_api::FailureDisposition::Invalidated,
                 ),
             )
-        })
+        })?;
+    match outcome {
+        super::conversation::ConfigurationOutcome::Configured => Ok(()),
+        super::conversation::ConfigurationOutcome::Cancelled => Err(ProviderError::Cancelled),
+        super::conversation::ConfigurationOutcome::ModelOnly => {
+            // Record the confirmed model so a successor can restore its own defaults.
+            session.native_model.lock().await.model = requested.model.clone();
+            Err(ProviderError::Cancelled)
+        }
+    }
 }
 
 /// Preserve independent cleanup failures without recursively nesting combined reports.
@@ -2627,20 +2765,6 @@ fn flatten_failures(error: ProviderError, failures: &mut Vec<ProviderError>) {
             }
         }
         error => failures.push(error),
-    }
-}
-
-/// Record positive local no-send evidence while retaining an independent journal failure.
-async fn reject_before_dispatch(
-    receipt: &Arc<dyn forge_provider_api::submission::InputReceipt>,
-    cause: ProviderError,
-) -> ProviderError {
-    match receipt.clone().record_rejected(cause.clone()).await {
-        Ok(()) => ProviderError::PreparationFailed(Box::new(cause)),
-        Err(cleanup) => ProviderError::PreparationCleanup {
-            cause: Box::new(cause),
-            cleanup: Box::new(cleanup),
-        },
     }
 }
 
@@ -2697,22 +2821,13 @@ fn parse_checkpoint(
     })
 }
 
-pub(super) fn normalized_mcp_reason(
-    reason: Option<&str>,
-) -> forge_provider_api::diagnostic::SanitizedMessage {
-    let message = match reason {
-        Some("authentication_required") | Some("authenticationRequired") => {
-            "MCP resource requires authentication."
-        }
-        Some("permission_denied") | Some("permissionDenied") => "MCP resource access was denied.",
-        Some("connection_failed") | Some("connectionFailed") => "MCP resource connection failed.",
-        Some("initialization_failed") | Some("initializationFailed") => {
-            "MCP resource could not initialize."
-        }
-        _ => "MCP resource is unavailable.",
-    };
-    forge_provider_api::diagnostic::SanitizedMessage::new(message)
-        .expect("static normalized MCP messages are nonempty")
+/// Explain how to resolve an unavailable runtime without exposing launch arguments.
+fn runtime_unavailable(operation: ProviderOperation, error: anyhow::Error) -> ProviderError {
+    let cause = failure(operation, ProviderFailureKind::Runtime);
+    match forge_provider_api::diagnostic::SanitizedMessage::new(error.to_string()) {
+        Ok(explanation) => ProviderError::Explained { cause: Box::new(cause), explanation },
+        Err(_) => cause,
+    }
 }
 
 fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
@@ -2781,6 +2896,7 @@ fn prompt_content(
     Ok(content)
 }
 
+/// Describe the resources sent on open without implying that the native agent connected.
 fn mcp_definitions(
     selection: &forge_provider_api::session::ResourceSelection,
 ) -> Vec<forge_provider_api::catalog::McpDefinition> {
@@ -2804,7 +2920,7 @@ fn mcp_definitions(
                 }
             },
             enabled: true,
-            status: forge_provider_api::catalog::McpStatus::Loading,
+            status: forge_provider_api::catalog::McpStatus::Unavailable,
             status_detail: None,
             token_count: None,
             token_estimated: false,
@@ -2905,6 +3021,80 @@ mod tests {
     use super::*;
     use forge_provider_api::provider::Provider;
 
+    /// Describe submitted MCP launches without reporting a readiness observation.
+    #[test]
+    fn acp_mcp_launch_catalog_has_no_readiness_observation() {
+        use forge_provider_api::{
+            catalog::{McpStatus, McpTransportKind},
+            session::{McpLaunch, McpTransport, ResourceSelection},
+        };
+
+        let selection = ResourceSelection {
+            skills: Vec::new(),
+            mcp: vec![McpLaunch {
+                name: "selected".into(),
+                transport: McpTransport::Http {
+                    url: "http://localhost/mcp".into(),
+                    headers: Default::default(),
+                },
+                timeout: None,
+                working_directory: None,
+                tools: None,
+            }],
+        };
+        let rows = mcp_definitions(&selection);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "selected");
+        assert_eq!(rows[0].transport, McpTransportKind::Http);
+        assert!(rows[0].enabled);
+        assert_eq!(rows[0].status, McpStatus::Unavailable);
+        assert!(rows[0].tools.is_empty());
+    }
+
+    /// Restore the native default without transferring effort from another model.
+    #[test]
+    fn bundled_effort_default_uses_the_selected_variant() {
+        use forge_provider_api::{ModelSelection, generation::ReasoningSelection};
+        use serde_json::json;
+
+        let initial = ModelSelection {
+            model: Some("neon-xhigh".to_owned()),
+            reasoning: ReasoningSelection::Level("xhigh".to_owned()),
+            ..Default::default()
+        };
+        let models = super::super::conversation::decode_model_catalog(
+            &json!({
+                "models": {"availableModels": [
+                    {"modelId": "neon-xhigh"}, {"modelId": "flash-low"},
+                    {"modelId": "flash-high"}, {"modelId": "orchestrator"}
+                ]},
+                "configOptions": [
+                    {"id": "model", "currentValue": "neon", "options": [
+                        {"value": "neon"}, {"value": "flash"}, {"value": "orchestrator"}
+                    ]},
+                    {"id": "thought_level", "currentValue": "xhigh", "options": [
+                        {"value": "xhigh"}
+                    ]}
+                ]
+            }),
+            false,
+        );
+        for model in ["flash-low", "orchestrator"] {
+            let requested = ModelSelection {
+                model: Some(model.to_owned()),
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve_native_model(&initial, &requested, &initial, &models).unwrap(),
+                requested
+            );
+        }
+        let reset = resolve_native_model(&initial, &ModelSelection::default(), &initial, &models)
+            .unwrap();
+        assert_eq!(reset.model, initial.model);
+        assert_eq!(reset.reasoning, ReasoningSelection::Default);
+    }
+
     /// Create a fresh bounded host operation whose dropped cancellation source stays inert.
     fn operation_context() -> forge_provider_api::OperationContext {
         let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
@@ -2946,6 +3136,53 @@ mod tests {
             token: Some(token),
             accepted_receipts: Vec::new(),
         }
+    }
+
+    /// Fence a published invocation's next send before close waits for queued preparation.
+    #[tokio::test]
+    async fn close_stops_active_prompt_publication_before_waiting_for_queued_preparation() {
+        let (_fixture, provider, opened) =
+            super::super::wire_fixture_test::provider_fixture("ok", "").await;
+        let binding_id = &opened.binding.id;
+        let binding = provider
+            .binding(binding_id, ProviderOperation::ThreadClose)
+            .unwrap();
+        let scope = forge_provider_api::InvocationScope::new(binding.owner.clone(), "active");
+        let cancellation = Arc::new(super::super::connection::PromptCancellation::default());
+        let settlement = Arc::new(OperationRecord::new());
+        binding
+            .settlements
+            .lock()
+            .unwrap()
+            .insert(scope.clone(), settlement.clone());
+        *binding.active.lock().unwrap() = Some(ActiveExecution {
+            scope: scope.clone(),
+            steering_end: None,
+            cancellation: cancellation.clone(),
+            task: None,
+        });
+        let queued_scope = forge_provider_api::InvocationScope::new(binding.owner.clone(), "queued");
+        let pending = provider.pending_inputs.register(
+            binding_id,
+            &queued_scope,
+            operation_context().id(),
+        );
+
+        let mut close = Box::pin(provider.close_session(binding_id));
+        assert!(futures_util::poll!(&mut close).is_pending());
+        assert!(pending.is_cancelled());
+        assert!(cancellation.token.is_cancelled());
+        assert!(!binding.state.is_admitting());
+
+        // A force-collected transport can still leave the active prompt's delivery uncertain.
+        settlement.complete(Err(ProviderError::DeliveryUncertain)).await;
+        drop(pending);
+        close.await.unwrap();
+        assert!(binding.history_released.load(Ordering::Acquire));
+        assert!(matches!(
+            binding.settlement(&scope).await,
+            Err(ProviderError::DeliveryUncertain)
+        ));
     }
 
     /// An inconclusive read cannot authorize replay after a delayed native acceptance.

@@ -256,6 +256,11 @@ impl AcpChildren {
         if self.is_root(session) {
             return self.root_turn.clone();
         }
+        self.child_address(session, allow_closed)
+    }
+
+    /// Resolve a registered native child without accepting the root as a fallback.
+    pub(super) fn child_address(&self, session: &str, allow_closed: bool) -> Option<TurnAddress> {
         let child = self.child.get(session)?;
         (child.outcome.is_none() || allow_closed).then(|| child.address.clone())
     }

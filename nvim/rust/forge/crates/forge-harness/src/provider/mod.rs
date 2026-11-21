@@ -13,7 +13,9 @@ pub type ProviderCompactionRequest =
 mod bridge;
 mod context_delivery;
 mod session_opening;
-pub(crate) use bridge::{ConfigureReceipt, ConfiguredBindingReceipt, NativeBindingStatus};
+pub(crate) use bridge::{
+    ConfigurationResources, ConfigureReceipt, ConfiguredBindingReceipt, NativeBindingStatus,
+};
 mod completion;
 mod live_host_effect;
 pub(crate) use live_host_effect::{LiveHostCommit, LiveHostEffect, LiveHostEffectSender};

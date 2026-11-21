@@ -310,10 +310,7 @@ impl HarnessBroker {
             ForegroundSignal::UserInput(input) => {
                 Ok(self.prepare_foreground_input(transaction, input))
             }
-            ForegroundSignal::UserDelivery((input, result)) => Ok(ForegroundAction::Effect(
-                ForegroundJob::SettleUserDelivery { input, result },
-            )),
-            ForegroundSignal::UserDeliverySettled(input, _flight) => {
+            ForegroundSignal::UserDeliverySettled(input, flight) => {
                 if let Some(input) = input {
                     transaction.steering.deferred.push_back(input);
                 } else {
@@ -321,6 +318,7 @@ impl HarnessBroker {
                     // A staged effect cancelled before delivery leaves no later readiness to collect.
                     transaction.steering.refresh_readiness = true;
                 }
+                drop(flight);
                 Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::AgentChanged => self.poll_foreground_agents(transaction),

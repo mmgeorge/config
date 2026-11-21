@@ -141,6 +141,18 @@ pub trait ProviderTools: Send + Sync {
         self.call(scope, call).await.map(ToolReply::succeeded)
     }
 
+    /// Admit a call received through the host's HTTP MCP endpoint.
+    ///
+    /// The endpoint has no native permission receipt, so the host can enforce policy at this
+    /// boundary. Implementations without a distinct HTTP transport reuse the normal reply path.
+    async fn call_http_reply(
+        &self,
+        scope: &crate::InvocationScope,
+        call: ToolCall,
+    ) -> Result<ToolReply, ProviderError> {
+        self.call_reply(scope, call).await
+    }
+
     /// Execute for an independently registered native child using its original parent authority.
     /// Hosts must explicitly support this boundary; root execution is never a fallback.
     async fn call_observed_child(

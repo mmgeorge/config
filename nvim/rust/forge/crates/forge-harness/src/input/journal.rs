@@ -53,6 +53,42 @@ impl InputJournal {
         })
     }
 
+    /// Commit the accepted steer to its original exchange before recovery drops the queue copy.
+    pub(super) fn restore_accepted_steering(
+        &self,
+        message: &super::InputMessage,
+        submission: &crate::provider::submission::Submission,
+        scope: &forge_provider_api::InvocationScope,
+        delivery: crate::provider::session_execution::AcceptedInputDelivery,
+    ) -> Result<()> {
+        let owner = crate::provider::ThreadOwner::root(&self.session_id);
+        anyhow::ensure!(
+            scope.thread_id == owner.into(),
+            "steering receipt belongs to another owner"
+        );
+        self.writer.exclusive(|store| {
+            let mut exchange = store
+                .load_exchange(scope.exchange_id.as_str())?
+                .ok_or_else(|| anyhow::anyhow!("the accepted steer's exchange is missing"))?;
+            anyhow::ensure!(
+                exchange.session_id == self.session_id
+                    && exchange.agent_id
+                        == crate::session::HarnessSession::primary_agent_id(&self.session_id),
+                "steering receipt belongs to another exchange"
+            );
+            let now_ms = crate::broker::Clock::now_ms(&crate::broker::SystemClock);
+            exchange.restore_accepted_steering(
+                scope,
+                message.id.clone(),
+                submission.receipt_id().clone(),
+                message.text.clone(),
+                delivery,
+                now_ms,
+            )?;
+            store.save_exchange(&exchange)
+        })?
+    }
+
     /// Get a table belonging only to this channel; names never contain caller input.
     fn table(&self, suffix: &str) -> String {
         let prefix = match self.channel {

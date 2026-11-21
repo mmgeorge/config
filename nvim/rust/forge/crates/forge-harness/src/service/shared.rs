@@ -1,4 +1,5 @@
 use super::*;
+use forge_provider_api::capability::CapabilityId;
 
 /// Describe saved history together with its live ownership in this host.
 #[derive(serde::Serialize)]
@@ -267,18 +268,30 @@ async fn settings(
             .await?;
             settings = restored;
             let resource = preview.select(fingerprint, &selected)?;
-            settings.import_operation(
-                revision,
-                crate::settings::SettingTarget {
-                    scope,
-                    workspace: &workspace,
-                    session: session_key,
-                },
-                &resource,
-                &operation_id,
-                &receipt,
-            )?
+            commit_resource_settings(
+                controller.as_deref(),
+                resource
+                    .iter()
+                    .map(|resource| match resource {
+                        crate::settings::ImportedResource::Skill { .. } => CapabilityId::SkillMutation,
+                        crate::settings::ImportedResource::Mcp { .. } => CapabilityId::McpMutation,
+                    })
+                    .collect(),
+                || settings.import_operation(
+                    revision,
+                    crate::settings::SettingTarget {
+                        scope,
+                        workspace: &workspace,
+                        session: session_key,
+                    },
+                    &resource,
+                    &operation_id,
+                    &receipt,
+                ),
+            )
+            .await?
         } else {
+            let previous = settings.layer_settings(scope, &workspace, session_key)?;
             let desired = if resource_mutation {
                 let name = request.params["name"]
                     .as_str()
@@ -312,7 +325,7 @@ async fn settings(
                     );
                 };
                 let id = id.clone();
-                let mut desired = settings.layer_settings(scope, &workspace, session_key)?;
+                let mut desired = previous.clone();
                 if method == RuntimeMethod::SettingsSkillSetEnabled {
                     desired.skill.insert(id, enabled);
                 } else {
@@ -322,17 +335,28 @@ async fn settings(
             } else {
                 serde_json::from_value(request.params["desired"].clone())?
             };
-            settings.update_operation(
-                revision,
-                crate::settings::SettingTarget {
-                    scope,
-                    workspace: &workspace,
-                    session: session_key,
-                },
-                &desired,
-                &operation_id,
-                &receipt,
-            )?
+            commit_resource_settings(
+                controller.as_deref(),
+                [
+                    (previous.skill != desired.skill).then_some(CapabilityId::SkillMutation),
+                    (previous.mcp != desired.mcp).then_some(CapabilityId::McpMutation),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+                || settings.update_operation(
+                    revision,
+                    crate::settings::SettingTarget {
+                        scope,
+                        workspace: &workspace,
+                        session: session_key,
+                    },
+                    &desired,
+                    &operation_id,
+                    &receipt,
+                ),
+            )
+            .await?
         }
     };
     drop(settings);
@@ -347,6 +371,19 @@ async fn settings(
     }
     message_sink.send_response(Response::success(request.id, json!({"id":operation_id,"state":"saved","revision":mutation.revision,"restart_required":false}))?).await?;
     Ok(())
+}
+
+/// Protect a session edit before saving. Detached requests save defaults for future opens.
+async fn commit_resource_settings<T>(
+    controller: Option<&SessionController>,
+    changes: Vec<CapabilityId>,
+    commit: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(controller) = controller.filter(|_| !changes.is_empty()) {
+        let request = controller.catalog_request.read().await.clone();
+        return controller.provider_handle().commit_resource_settings(request, &changes, commit).await;
+    }
+    commit()
 }
 
 async fn profiles(

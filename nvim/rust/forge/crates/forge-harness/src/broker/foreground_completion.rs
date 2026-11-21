@@ -517,11 +517,15 @@ impl HarnessBroker {
                     transaction.continuation_count += 1;
                 }
                 let command = transaction.steering.deferred.pop_front();
-                // A deferred user message carries the reports beside its text; otherwise the
-                // reports continue the parent's request on their own.
+                // The deferred input keeps the typed request its receipt owns. Child results join
+                // that request or continue the parent's work on their own.
                 let (input, submission) = if let Some(command) = &command {
-                    let mut input = ProviderInput::from_user_text(command.text.clone())
-                        .with_attachments(command.attachments.clone());
+                    let mut input = if let Some(submission) = &command.submission {
+                        submission.record()?.request.input
+                    } else {
+                        ProviderInput::from_user_text(command.text.clone())
+                            .with_attachments(command.attachments.clone())
+                    };
                     input.push_child_results(reports);
                     (input, command.submission.clone())
                 } else {

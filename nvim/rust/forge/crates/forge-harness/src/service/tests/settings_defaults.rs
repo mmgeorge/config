@@ -126,6 +126,206 @@ async fn global_defaults_do_not_create_or_modify_sessions() -> Result<()> {
     Ok(())
 }
 
+/// Reject unsupported live resource changes before advancing the persisted settings revision.
+#[tokio::test]
+async fn unsupported_live_resource_edits_preserve_settings() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let rulesync = fixture.path().join(".rulesync");
+    std::fs::create_dir(&rulesync)?;
+    std::fs::write(
+        rulesync.join("mcp.json"),
+        r#"{"mcpServers":{"fixture-server":{"type":"http","url":"http://localhost/mcp"}}}"#,
+    )?;
+    let service = service();
+    let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+    let session_id = opened.result().context("session result missing")?["session"]["id"]
+        .as_str()
+        .context("session id missing")?
+        .to_owned();
+    let registry = service.registry().await?;
+    let controller = registry.resolve(&session_id).await?;
+    let provider_id = forge_providers::registry::select("antigravity")?;
+    let descriptor = forge_providers::registry::descriptor(&provider_id)?;
+    let opening = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let finish_open = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |_request, _sink, _start, _cancelled| async {
+            Err(crate::provider::ProviderError::Cancelled)
+        },
+    ).with_session_open({
+        let opening = opening.clone();
+        let finish_open = finish_open.clone();
+        move |request| {
+            let opening = opening.clone();
+            let finish_open = finish_open.clone();
+            async move {
+                assert_eq!(request.configuration.resources.mcp[0].name, "fixture-server");
+                opening.add_permits(1);
+                finish_open.acquire().await.unwrap().forget();
+                Ok(())
+            }
+        }
+    }).with_session_configure(|_, configuration| async move {
+        assert_eq!(configuration.resources.mcp[0].name, "fixture-server");
+        Ok(())
+    });
+    let provider = std::sync::Arc::new(crate::provider::Provider::new(
+        native.registration(),
+        controller.permission.clone(),
+        controller.trace.clone(),
+        controller.data_root.clone(),
+    ));
+    let previous_provider = controller.provider_handle();
+    *controller.provider.write().unwrap() = provider.clone();
+
+    let workspace = controller.catalog_request.read().await.workspace.clone();
+    let settings = crate::settings::SettingsStore::open(&controller.data_root)?;
+    let revision = settings.get(&workspace, &session_id, "mock")?.revision;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 2,
+                method: "settings.update".into(),
+                params: json!({"scope":"session","expected_revision":revision,
+                    "desired":{"skill":{"fixture-skill":false}}}),
+            },
+            &sink,
+        )
+        .await?;
+    response_for(&mut output, 2).await?;
+    let opened_settings = settings.get(&workspace, &session_id, "mock")?;
+    assert_eq!(opened_settings.revision, revision + 1);
+    assert_eq!(opened_settings.desired.skill.get("fixture-skill"), Some(&false));
+
+    let request = controller.broker.lock().await.provider_request(
+        crate::provider::ProviderInput::from_user_text(""),
+        crate::provider::PromptMode::Chat,
+    )?;
+    let mut open = Box::pin(provider.thread_open(request.clone()));
+    tokio::select! {
+        started = opening.acquire() => started?.forget(),
+        result = &mut open => anyhow::bail!("binding opened before its resource snapshot barrier: {result:?}"),
+    }
+    let mut concurrent_edit = Box::pin(service.dispatch(
+        Some(session_id.clone()),
+        Request {
+            id: 9,
+            method: "settings.mcp.set_enabled".into(),
+            params: json!({"name":"fixture-server","enabled":false}),
+        },
+        &sink,
+    ));
+    assert!(futures_util::poll!(concurrent_edit.as_mut()).is_pending());
+    assert_eq!(settings.get(&workspace, &session_id, "mock")?.revision, opened_settings.revision);
+    // Stopping a prepared prompt drops this waiter while the adapter's exact open remains owned.
+    drop(open);
+    assert_eq!(concurrent_edit.await.unwrap_err().to_string(), "unsupported provider capability: ResourceSelection");
+
+    for (id, method, params) in [
+        (
+            3,
+            "settings.mcp.set_enabled",
+            json!({"name":"fixture-server","enabled":false}),
+        ),
+        (
+            4,
+            "settings.update",
+            json!({"scope":"session","expected_revision":opened_settings.revision,
+                "desired":{"skill":{"fixture-skill":true}}}),
+        ),
+    ] {
+        let error = service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id,
+                    method: method.into(),
+                    params,
+                },
+                &sink,
+            )
+            .await
+            .expect_err("unsupported mutation reached settings application");
+        assert_eq!(
+            error.to_string(),
+            "unsupported provider capability: ResourceSelection"
+        );
+        assert_eq!(
+            settings.get(&workspace, &session_id, "mock")?.revision,
+            opened_settings.revision
+        );
+    }
+    service
+        .dispatch(
+            None,
+            Request {
+                id: 5,
+                method: "settings.mcp.set_enabled".into(),
+                params: json!({"scope":"workspace","workspace":workspace,"name":"fixture-server","enabled":false}),
+            },
+            &sink,
+        )
+        .await?;
+    assert_eq!(response_for(&mut output, 5).await?["result"]["state"], "saved");
+    let saved = settings.get(&workspace, &session_id, "mock")?;
+    assert_eq!(saved.revision, opened_settings.revision + 1);
+    assert_eq!(saved.desired.mcp.values().copied().collect::<Vec<_>>(), [false]);
+    finish_open.add_permits(1);
+    assert!(provider.thread_open(request.clone()).await?.is_some());
+    let live_edit = service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 8,
+                method: "settings.mcp.set_enabled".into(),
+                params: json!({"scope":"session","name":"fixture-server","enabled":false}),
+            },
+            &sink,
+        )
+        .await
+        .expect_err("the live binding accepted a resource edit");
+    assert_eq!(live_edit.to_string(), "unsupported provider capability: ResourceSelection");
+    assert_eq!(settings.get(&workspace, &session_id, "mock")?.revision, saved.revision);
+    service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 6,
+                method: "session.provider.mcp.list".into(),
+                params: json!({}),
+            },
+            &sink,
+        )
+        .await?;
+    let catalog = response_for(&mut output, 6).await?;
+    assert_eq!(catalog["result"][0]["name"], "fixture-server");
+    assert_eq!(catalog["result"][0]["enabled"], true);
+    provider.thread_configure(request, &saved.desired, None).await?;
+    let catalog_request = controller.catalog_request.read().await.clone();
+    let crate::provider::ConfigurationResources::Immutable(resources) =
+        provider.configuration_resources(&catalog_request).await?
+    else {
+        anyhow::bail!("configuration lost the binding's initial resource selection");
+    };
+    settings.begin_application(&session_id, "fixture-settings-confirm", saved.revision)?;
+    controller.broker.lock().await.confirm_configuration_application(
+        &json!({"operation_id":"fixture-settings-confirm","config":{"settings_revision":saved.revision}}),
+        Some(&resources),
+    )?;
+    let effective = settings
+        .application(&session_id)?
+        .effective
+        .context("settings confirmation has no effective selection")?;
+    assert_eq!(effective.mcp.values().copied().collect::<Vec<_>>(), [true]);
+    *controller.provider.write().unwrap() = previous_provider;
+    provider.shutdown().await?;
+    service.shutdown(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
 /// Start a controller over a provider whose turns complete at once.
 async fn permissions_fixture(
     root: &tempfile::TempDir,

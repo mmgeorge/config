@@ -11,6 +11,7 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcpSubmission {
     Prompt,
+    Steer,
 }
 
 impl AcpSubmission {
@@ -18,26 +19,27 @@ impl AcpSubmission {
     fn operation(self) -> ProviderOperation {
         match self {
             Self::Prompt => ProviderOperation::TurnStart,
+            Self::Steer => ProviderOperation::TurnSteer,
         }
     }
 
     fn method(self) -> &'static str {
         match self {
-            Self::Prompt => "session/prompt",
+            Self::Prompt | Self::Steer => "session/prompt",
         }
     }
 }
 
 impl AcpConnection {
     /// Commit ACP's provider-owned delivery evidence around one native send.
-    pub async fn submit(
+    pub(super) async fn submit(
         &self,
         kind: AcpSubmission,
         parameter: Value,
         receipt: Option<Arc<dyn InputReceipt>>,
         dispatch: Option<&forge_provider_api::submission::DispatchReporter>,
-        cancellation: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<Value, ProviderError> {
+        cancellation: Option<&super::connection::PromptCancellation>,
+    ) -> Result<super::response::NativePromptEnd, ProviderError> {
         let method = kind.method();
         let operation = kind.operation();
         let session_id = parameter["sessionId"]
@@ -59,62 +61,37 @@ impl AcpConnection {
                 .await
                 .map_err(|error| error.for_operation(operation))?;
         }
-        let mut rejected_without_consumption = false;
-        let result = async {
-            let response = self
-                .request_tracked(method, parameter, dispatch, cancellation)
-                .await
-                .map_err(|error| crate::error::acp(error, operation))?;
-            if kind == AcpSubmission::Prompt {
-                // ACP v1 acknowledges a prompt only after the native turn has ended.
-                let native_end = super::response::NativePromptEnd::parse(
-                    &response,
-                    super::children::timestamp(),
-                )
-                .map_err(|_| {
-                    ProviderFailure::new(operation, ProviderFailureKind::Protocol)
-                        .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
-                })?;
-                if let Some(receipt) = &receipt {
-                    self.retain_prompt_end(
-                        &forge_provider_api::CoveredInput::new(
-                            receipt.id().clone(),
-                            receipt.attempt_id()?,
-                        ),
-                        native_end,
-                    )?;
-                }
-            } else {
-                match response["outcome"].as_str() {
-                    Some("injected" | "startedNewTurn") => {}
-                    Some("promptRequired")
-                        if response["reason"].as_str() == Some("noRunningTurn") =>
-                    {
-                        rejected_without_consumption = true;
-                        let cause = ProviderError::PreparationFailed(Box::new(
-                            ProviderFailure::new(operation, ProviderFailureKind::Rejected)
-                                .at_phase(ProviderPhase::Observation, FailureDisposition::Unchanged)
-                                .into(),
-                        ));
-                        if let Some(receipt) = &receipt
-                            && let Err(record_error) =
-                                receipt.clone().record_rejected(cause.clone()).await
-                        {
-                            return Err(ProviderError::Combined {
-                                primary: Box::new(cause),
-                                secondary: vec![record_error],
-                            });
+        let response = match self
+            .request_prompt(method, parameter, &session_id, dispatch, cancellation)
+            .await
+        {
+            Ok(Some(native_end)) => Ok(native_end),
+            Ok(None) => {
+                if kind == AcpSubmission::Prompt {
+                    return Err(match receipt {
+                        Some(receipt) => {
+                            reject_before_dispatch(&receipt, ProviderError::Cancelled).await
                         }
-                        return Err(cause);
-                    }
-                    _ => {
-                        return Err(
-                            ProviderFailure::new(operation, ProviderFailureKind::Protocol)
-                                .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain)
-                                .into(),
-                        );
-                    }
+                        None => ProviderError::Cancelled,
+                    });
                 }
+                if let Some(receipt) = receipt {
+                    receipt.record_rejected(ProviderError::NotConsumed).await?;
+                }
+                return Err(ProviderError::NotConsumed);
+            }
+            Err(error) => Err(crate::error::acp(error, operation)),
+        };
+        let result: Result<super::response::NativePromptEnd, ProviderError> = async {
+            let native_end = response?;
+            if let Some(receipt) = &receipt {
+                self.retain_prompt_end(
+                    &forge_provider_api::CoveredInput::new(
+                        receipt.id().clone(),
+                        receipt.attempt_id()?,
+                    ),
+                    native_end,
+                )?;
             }
             if let Some(receipt) = &receipt {
                 receipt
@@ -141,12 +118,10 @@ impl AcpConnection {
                         },
                     })?;
             }
-            Ok(response)
+            Ok(native_end)
         }
         .await;
-        if let (Err(error), Some(receipt)) = (&result, receipt)
-            && !rejected_without_consumption
-        {
+        if let (Err(error), Some(receipt)) = (&result, receipt) {
             let record_result = receipt
                 .record_failure(error.clone().for_operation(operation))
                 .await;
@@ -158,6 +133,20 @@ impl AcpConnection {
             }
         }
         result
+    }
+}
+
+/// Record positive local no-send evidence while retaining an independent journal failure.
+pub(super) async fn reject_before_dispatch(
+    receipt: &Arc<dyn InputReceipt>,
+    cause: ProviderError,
+) -> ProviderError {
+    match receipt.clone().record_rejected(cause.clone()).await {
+        Ok(()) => ProviderError::PreparationFailed(Box::new(cause)),
+        Err(cleanup) => ProviderError::PreparationCleanup {
+            cause: Box::new(cause),
+            cleanup: Box::new(cleanup),
+        },
     }
 }
 

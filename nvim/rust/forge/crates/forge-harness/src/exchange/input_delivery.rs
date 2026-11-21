@@ -356,7 +356,9 @@ impl InputDeliveryRun {
                 }
                 InputDeliveryEvent::Foreground(response.await)
             }
-            DeliveryStage::Local | DeliveryStage::Rejected(_) => InputDeliveryEvent::Ready,
+            DeliveryStage::Local | DeliveryStage::Closing | DeliveryStage::Rejected(_) => {
+                InputDeliveryEvent::Ready
+            }
             DeliveryStage::Consumed => std::future::pending().await,
         }
     }
@@ -383,8 +385,9 @@ impl InputDeliveryRun {
         broker: &mut HarnessBroker,
         services: &OwnerServices,
         receipts: &mut InputReceipts,
-        can_commit: bool,
+        admission: InputEffectAdmission,
     ) -> Result<InputDeliveryProgress, OperationFailure> {
+        let can_commit = admission.can_commit;
         self.observation = InputObservation::Waiting;
         match event {
             InputDeliveryEvent::Observation(result) => {
@@ -396,7 +399,7 @@ impl InputDeliveryRun {
                 if let Some(reason) = self.steering_block_reason(services)? {
                     return self.finish_unprepared_steering(reason, services);
                 }
-                if let Some(reason) = self.interruption(services)? {
+                if let Some(reason) = self.interruption(services, admission.owner_closed)? {
                     return self.finish_interrupted(reason, None, receipts, services);
                 }
                 self.stage = DeliveryStage::Work;
@@ -409,6 +412,14 @@ impl InputDeliveryRun {
                 let PreparationWork::Settings(run) = &mut self.work else {
                     unreachable!("settings fact belongs to input settings preparation")
                 };
+                if admission.owner_closed && can_commit && run.can_abandon_before_apply(&event) {
+                    return self.finish_interrupted(
+                        InputAbandonment::Shutdown,
+                        None,
+                        receipts,
+                        services,
+                    );
+                }
                 match run.update(event, broker, can_commit)? {
                     SettingsProgress::Waiting => Ok(InputDeliveryProgress::waiting()),
                     SettingsProgress::Collect(children) => {
@@ -421,7 +432,16 @@ impl InputDeliveryRun {
                             .map_err(OperationFailure::Domain)?;
                         updates.extend(configured.delivery.into_updates());
                         self.work = PreparationWork::None;
-                        self.after_settings(services);
+                        if admission.owner_closed {
+                            self.stage = match self.kind {
+                                DeliveryKind::ConfigurationOnly => DeliveryStage::Local,
+                                DeliveryKind::Prompt | DeliveryKind::Compact => {
+                                    DeliveryStage::Closing
+                                }
+                            };
+                        } else {
+                            self.after_settings(services);
+                        }
                         Ok(InputDeliveryProgress::Waiting {
                             events: Vec::new(),
                             updates,
@@ -434,6 +454,14 @@ impl InputDeliveryRun {
                 let PreparationWork::Compaction(run) = &mut self.work else {
                     unreachable!("compaction fact belongs to queued compaction")
                 };
+                if admission.owner_closed && can_commit && run.can_abandon_before_dispatch(&event) {
+                    return self.finish_interrupted(
+                        InputAbandonment::Shutdown,
+                        None,
+                        receipts,
+                        services,
+                    );
+                }
                 match run.update(event, broker, can_commit, self.selected.as_ref())? {
                     CompactionProgress::Collect(children) => {
                         self.collect(children, services);
@@ -453,7 +481,9 @@ impl InputDeliveryRun {
                             .owner_finish_configuration(None, self.selected.as_ref(), None)
                             .map_err(OperationFailure::Domain)?;
                         updates.extend(completed.delivery.into_updates());
-                        if let Some(prompt) = completed.resume {
+                        if !admission.owner_closed
+                            && let Some(prompt) = completed.resume
+                        {
                             let (publication, stream) = crate::broker::publication::channel();
                             if let Some(transaction) = broker
                                 .begin_selected_continuation_dispatch(
@@ -522,13 +552,17 @@ impl InputDeliveryRun {
                     } => {
                         self.selected = exchange.or_else(|| self.selected.take());
                         self.collected = true;
-                        match &mut self.work {
-                            PreparationWork::Settings(run) => run.collected(),
-                            PreparationWork::Compaction(run) => run.collected(),
-                            PreparationWork::None => self.after_settings(services),
-                        }
-                        if !matches!(self.work, PreparationWork::None) {
-                            self.stage = DeliveryStage::Work;
+                        if admission.owner_closed {
+                            self.stage = DeliveryStage::Closing;
+                        } else {
+                            match &mut self.work {
+                                PreparationWork::Settings(run) => run.collected(),
+                                PreparationWork::Compaction(run) => run.collected(),
+                                PreparationWork::None => self.after_settings(services),
+                            }
+                            if !matches!(self.work, PreparationWork::None) {
+                                self.stage = DeliveryStage::Work;
+                            }
                         }
                         Ok(InputDeliveryProgress::Waiting {
                             events,
@@ -544,6 +578,14 @@ impl InputDeliveryRun {
             }
             InputDeliveryEvent::Attachments(result) => {
                 self.stage = DeliveryStage::Consumed;
+                if admission.owner_closed && can_commit {
+                    return self.finish_interrupted(
+                        InputAbandonment::Shutdown,
+                        None,
+                        receipts,
+                        services,
+                    );
+                }
                 let attachments = result
                     .map_err(OperationFailure::JobObservationLost)?
                     .map_err(|error| {
@@ -557,7 +599,7 @@ impl InputDeliveryRun {
                 if let Some(reason) = self.steering_block_reason(services)? {
                     return self.finish_unprepared_steering(reason, services);
                 }
-                if let Some(reason) = self.interruption(services)? {
+                if let Some(reason) = self.interruption(services, admission.owner_closed)? {
                     return self.finish_interrupted(reason, None, receipts, services);
                 }
                 let provider = self
@@ -620,16 +662,48 @@ impl InputDeliveryRun {
                 else {
                     unreachable!("receipt result belongs to its attachment preparation")
                 };
-                let submission = result
-                    .map_err(OperationFailure::JobObservationLost)?
-                    .map_err(|error| {
-                        OperationFailure::Validation(
+                let result = result.map_err(OperationFailure::JobObservationLost)?;
+                let submission = match result {
+                    Ok(submission) => submission,
+                    Err(_) if admission.owner_closed && can_commit => {
+                        return self.finish_interrupted(
+                            InputAbandonment::Shutdown,
+                            None,
+                            receipts,
+                            services,
+                        );
+                    }
+                    Err(error) => {
+                        return Err(OperationFailure::Validation(
                             anyhow::Error::new(error)
                                 .context(super::command::CommandFailure::PrerequisiteFailed),
-                        )
-                    })?;
+                        ));
+                    }
+                };
                 if !can_commit {
                     return Err(OperationFailure::StorageUncommitted);
+                }
+                if admission.owner_closed
+                    && !*services.cancellation.subscribe().borrow()
+                    && matches!(
+                        submission
+                            .record()
+                            .map_err(OperationFailure::Domain)?
+                            .delivery,
+                        SubmissionState::Prepared | SubmissionState::Cancelled
+                    )
+                    && submission
+                        .retire_prepared_for_queue()
+                        .map_err(|error| OperationFailure::InputReconciliation(error))?
+                        == crate::provider::submission::SubmissionRetirement::Cancelled
+                {
+                    // Capture no new queue binding before retiring an attempt the adapter never saw.
+                    return self.finish_interrupted(
+                        InputAbandonment::Shutdown,
+                        None,
+                        receipts,
+                        services,
+                    );
                 }
                 let input = receipts
                     .apply(
@@ -681,7 +755,7 @@ impl InputDeliveryRun {
                         completion: None,
                     });
                 }
-                if let Some(reason) = self.interruption(services)? {
+                if let Some(reason) = self.interruption(services, admission.owner_closed)? {
                     return self.finish_interrupted(reason, Some(&submission), receipts, services);
                 }
                 let message = receipts
@@ -883,12 +957,18 @@ impl InputDeliveryRun {
                     .delivery;
                 let retired_parent = !flight.target.parent.is_open();
                 let user_cancelled = *services.cancellation.subscribe().borrow();
-                // A turn that ends on a question, plan submission, or collection retires its
-                // lane and settlement cancels the steering it never dispatched. Without a user
-                // cancel that retirement is not a retraction: the message returns to the queue.
+                // Collection can retire a staged steer before the native stop closes its lane.
+                // The suspended queue preserves the text while that stop finishes.
+                let collecting = !user_cancelled
+                    && (admission.owner_closed
+                        || services
+                            .input
+                            .snapshot()
+                            .map_err(OperationFailure::Domain)?
+                            .suspended);
                 let undispatched = match delivery {
-                    SubmissionState::Prepared => retired_parent || user_cancelled,
-                    SubmissionState::Cancelled => retired_parent && !user_cancelled,
+                    SubmissionState::Prepared => collecting || retired_parent || user_cancelled,
+                    SubmissionState::Cancelled => collecting || retired_parent && !user_cancelled,
                     SubmissionState::Sending { .. }
                     | SubmissionState::Accepted { .. }
                     | SubmissionState::Discarded => false,
@@ -898,7 +978,11 @@ impl InputDeliveryRun {
                         .apply(
                             InputReceiptFact::Abandoned {
                                 submission: submission.receipt_id().clone(),
-                                reason: InputAbandonment::Paused,
+                                reason: if admission.owner_closed {
+                                    InputAbandonment::Shutdown
+                                } else {
+                                    InputAbandonment::Paused
+                                },
                             },
                             services,
                         )
@@ -992,6 +1076,12 @@ impl InputDeliveryRun {
                     return Err(OperationFailure::StorageUncommitted);
                 }
                 match &mut self.stage {
+                    DeliveryStage::Closing => self.finish_interrupted(
+                        InputAbandonment::Shutdown,
+                        None,
+                        receipts,
+                        services,
+                    ),
                     DeliveryStage::Rejected(error) => Err(error
                         .take()
                         .expect("input preflight rejection is consumed once")),
@@ -1024,6 +1114,7 @@ impl InputDeliveryRun {
                                 | DeliveryStage::Foreground { .. }
                                 | DeliveryStage::Steering { .. }
                                 | DeliveryStage::Reconcile { .. }
+                                | DeliveryStage::Closing
                                 | DeliveryStage::Rejected(_)
                                 | DeliveryStage::Consumed => unreachable!(
                                     "only local or confirmed replacement input completes here"
@@ -1036,6 +1127,14 @@ impl InputDeliveryRun {
                         })
                     }
                     DeliveryStage::Work => {
+                        if admission.owner_closed {
+                            return self.finish_interrupted(
+                                InputAbandonment::Shutdown,
+                                None,
+                                receipts,
+                                services,
+                            );
+                        }
                         self.after_settings(services);
                         Ok(InputDeliveryProgress::waiting())
                     }
@@ -1130,6 +1229,7 @@ impl InputDeliveryRun {
             | DeliveryStage::Collecting
             | DeliveryStage::Foreground { .. }
             | DeliveryStage::Local
+            | DeliveryStage::Closing
             | DeliveryStage::Rejected(_)
             | DeliveryStage::Consumed => {}
             DeliveryStage::Replacement { work, response, .. } => {
@@ -1214,7 +1314,8 @@ impl InputDeliveryRun {
         let delivery = match reason {
             InputAbandonment::Paused
             | InputAbandonment::Retracted
-            | InputAbandonment::Reconfigured => Some(InputDelivery::Queued),
+            | InputAbandonment::Reconfigured
+            | InputAbandonment::Shutdown => Some(InputDelivery::Queued),
             InputAbandonment::Cancelled | InputAbandonment::Superseded => None,
         };
         let input = services
@@ -1263,14 +1364,15 @@ impl InputDeliveryRun {
                 InputAbandonment::Cancelled | InputAbandonment::Retracted => {
                     store.retract(self.input.id.as_str(), guard)
                 }
-                InputAbandonment::Paused | InputAbandonment::Reconfigured => store
-                    .delivery_if_current(
-                        self.input.id.as_str(),
-                        guard,
-                        Some(InputDelivery::Queued),
-                        None,
-                        None,
-                    ),
+                InputAbandonment::Paused
+                | InputAbandonment::Reconfigured
+                | InputAbandonment::Shutdown => store.delivery_if_current(
+                    self.input.id.as_str(),
+                    guard,
+                    Some(InputDelivery::Queued),
+                    None,
+                    None,
+                ),
                 InputAbandonment::Superseded => {
                     store.delivery_if_current(self.input.id.as_str(), guard, None, None, None)
                 }
@@ -1290,6 +1392,7 @@ impl InputDeliveryRun {
     fn interruption(
         &self,
         services: &OwnerServices,
+        owner_closed: bool,
     ) -> Result<Option<InputAbandonment>, OperationFailure> {
         let snapshot = services
             .input_store(self.input.id.as_str())
@@ -1305,6 +1408,9 @@ impl InputDeliveryRun {
         }
         if *services.cancellation.subscribe().borrow() {
             return Ok(Some(InputAbandonment::Cancelled));
+        }
+        if owner_closed {
+            return Ok(Some(InputAbandonment::Shutdown));
         }
         if snapshot.suspended
             && !matches!(
@@ -1504,6 +1610,12 @@ impl InputDeliveryProgress {
     }
 }
 
+/// Capture the owner fences before applying one input effect's result.
+pub(super) struct InputEffectAdmission {
+    pub(super) owner_closed: bool,
+    pub(super) can_commit: bool,
+}
+
 /// Correlate a retained input job or preparation stage with its unique delivery owner.
 pub(super) enum InputDeliveryEvent {
     Observation(Result<ProviderGenerationPermit, tokio::task::JoinError>),
@@ -1614,6 +1726,8 @@ enum DeliveryStage {
         confirmed: bool,
     },
     Local,
+    /// Publish retained preparation facts before returning the unsent input to the queue.
+    Closing,
     Rejected(Option<OperationFailure>),
     Consumed,
 }
