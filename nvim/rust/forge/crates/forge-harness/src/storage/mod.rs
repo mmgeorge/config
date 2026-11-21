@@ -1030,6 +1030,15 @@ impl SqliteStore {
         self.publish_admission(&execution.session_id)
     }
 
+    /// Remove a provisional execution owned by the selected session.
+    pub(crate) fn delete_plan_execution(&mut self, session: &str, execution: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM plan_execution_record WHERE session_id=?1 AND id=?2",
+            params![session, execution],
+        )?;
+        self.publish_admission(session)
+    }
+
     /// Load one accepted-plan execution by stable identifier.
     pub fn load_plan_execution(&self, execution_id: &str) -> Result<Option<PlanExecutionRecord>> {
         if let Some(execution) = self.active_execution_view(execution_id)? {

@@ -1417,6 +1417,8 @@ impl NativeCallbackRouter for CallbackRouter {
     }
 }
 
+type CancelledInvocation = Result<Option<forge_provider_api::CoveredInput>, ProviderError>;
+
 struct BindingState {
     binding: SessionBinding,
     open_operation: forge_provider_api::OperationId,
@@ -1438,7 +1440,7 @@ struct BindingState {
             Result<forge_provider_api::CompletedTurn, ProviderError>,
         >,
     >,
-    cancellations: Mutex<HashMap<forge_provider_api::InvocationScope, Result<(), ProviderError>>>,
+    cancellations: Mutex<HashMap<forge_provider_api::InvocationScope, CancelledInvocation>>,
     retained_resources: Mutex<Option<Arc<RetainedResources>>>,
     retired_resources: Mutex<Vec<Arc<RetainedResources>>>,
     settled: tokio::sync::Notify,
@@ -1662,6 +1664,15 @@ impl BindingState {
 
     /// Fence native handoff and stop this already selected execution without consuming settlement.
     async fn interrupt(&self) -> Result<(), ProviderError> {
+        self.interrupt_with_policy(forge_provider_api::operations::InterruptInput::Retain)
+            .await
+    }
+
+    /// Use atomic withdrawal before the native-start wait when the caller can restore the draft.
+    async fn interrupt_with_policy(
+        &self,
+        input: forge_provider_api::operations::InterruptInput,
+    ) -> Result<(), ProviderError> {
         /// Bound how long a stop waits for Copilot to start a turn it accepted.
         ///
         /// Copilot usually starts an accepted message within a few hundred milliseconds; a start
@@ -1683,6 +1694,28 @@ impl BindingState {
         // Stop and writer admission share one state lock; every admitted frame
         // precedes abort, while handoffs attempted after stop are rejected.
         let interrupt = async {
+            if input == forge_provider_api::operations::InterruptInput::WithdrawUnanswered
+                && let Some((message, prompt, attempt)) =
+                    self.turn.withdrawal_candidate().map_err(|_| {
+                        failure(
+                            ProviderOperation::TurnInterrupt,
+                            ProviderFailureKind::Runtime,
+                        )
+                    })?
+            {
+                match session.withdraw_unanswered(message, prompt).await? {
+                    super::handle::Withdrawal::Removed => {
+                        self.turn.confirm_withdrawal(attempt);
+                        self.turn.wait_inactive().await;
+                        return Ok(());
+                    }
+                    super::handle::Withdrawal::Interrupted => {
+                        self.turn.wait_inactive().await;
+                        return Ok(());
+                    }
+                    super::handle::Withdrawal::Refused => {}
+                }
+            }
             // An abort before Copilot starts the accepted input's turn does not prevent that turn,
             // so the abort waits for the start. A turn that has not started within the grace is
             // aborted anyway, as Copilot then discards input it still queues.
@@ -2545,9 +2578,15 @@ impl CopilotProvider {
                     false
                 };
                 if targeted {
-                    self.interrupt_invocation(&binding, CancelRequest { scope })
-                        .await
-                        .map(|_| ())
+                    self.interrupt_invocation(
+                        &binding,
+                        CancelRequest {
+                            scope,
+                            input: forge_provider_api::operations::InterruptInput::Retain,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
                 } else {
                     Ok(())
                 }
@@ -4005,8 +4044,9 @@ impl CopilotProvider {
                 ProviderFailureKind::OperationConflict,
             )
         })?;
-        let receipt = || -> Result<TurnInterruptResult, ProviderError> {
+        let receipt = |withdrawn| -> Result<TurnInterruptResult, ProviderError> {
             Ok(TurnInterruptResult {
+                withdrawn,
                 operation_id: operation.context.id().clone(),
                 thread_id: request.scope.thread_id.clone(),
                 turn_id: request.scope.turn_id().map_err(|_| {
@@ -4025,12 +4065,11 @@ impl CopilotProvider {
             .get(&request.scope)
             .cloned()
         {
-            result?;
-            return receipt();
+            return receipt(result?);
         }
         if let Some(completed) = state.settlements.lock().await.get(&request.scope).cloned() {
             completed?;
-            return receipt();
+            return receipt(None);
         }
         if !state
             .active
@@ -4047,7 +4086,7 @@ impl CopilotProvider {
         let _admission = state.admission.lock().await;
         if let Some(completed) = state.settlements.lock().await.get(&request.scope).cloned() {
             completed?;
-            return receipt();
+            return receipt(None);
         }
         // Revalidate under admission; an old interruption cannot select a successor.
         if !state
@@ -4063,7 +4102,7 @@ impl CopilotProvider {
             ));
         }
         super::operation::dispatch_for(ProviderOperation::TurnInterrupt)?;
-        let stop = state.interrupt().await;
+        let stop = state.interrupt_with_policy(request.input).await;
         let collected = match state.collect_execution().await {
             Ok(None | Some(Ok(()))) => Ok(()),
             Ok(Some(Err(error))) | Err(error) => Err(error),
@@ -4075,13 +4114,13 @@ impl CopilotProvider {
                 secondary: vec![secondary],
             }),
         };
+        let result = result.map(|()| state.turn.withdrawal());
         state
             .cancellations
             .lock()
             .await
             .insert(request.scope.clone(), result.clone());
-        result?;
-        receipt()
+        receipt(result?)
     }
 
     async fn fork_history(
@@ -5646,6 +5685,7 @@ mod retained_recovery_tests {
                     &binding,
                     CancelRequest {
                         scope: scope.clone(),
+                        input: forge_provider_api::operations::InterruptInput::Retain,
                     },
                 )
                 .await
@@ -5954,7 +5994,14 @@ mod retained_recovery_tests {
         );
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(11),
-            provider.turn_interrupt(operation, &binding, CancelRequest { scope }),
+            provider.turn_interrupt(
+                operation,
+                &binding,
+                CancelRequest {
+                    scope,
+                    input: forge_provider_api::operations::InterruptInput::Retain,
+                },
+            ),
         )
         .await
         .expect("acknowledged abort left native collection waiting indefinitely");
@@ -6140,6 +6187,7 @@ mod retained_recovery_tests {
             &binding,
             CancelRequest {
                 scope: scope.clone(),
+                input: forge_provider_api::operations::InterruptInput::Retain,
             },
         );
         tokio::pin!(interrupting);
@@ -6214,6 +6262,81 @@ mod retained_recovery_tests {
             .unwrap();
     }
 
+    /// Remove an accepted queued message without waiting for a native start or abort event.
+    #[tokio::test(start_paused = true)]
+    async fn restoring_stop_withdraws_accepted_queued_input() {
+        let (provider, opened, _root, peer) = opened_helper_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+            HelperBehavior::DeferredStart(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        )
+        .await;
+        let binding = opened.binding.id;
+        let state = provider
+            .binding(&binding, ProviderOperation::TurnStart)
+            .await
+            .unwrap();
+        let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "withdraw-root");
+        let receipt = Arc::new(AcceptedReceipt {
+            id: "withdraw-input".try_into().unwrap(),
+            attempt: forge_provider_api::DeliveryAttemptId::new("withdraw-attempt").unwrap(),
+            accepted: AtomicU64::new(0),
+        });
+        let request = queued_request(
+            &binding,
+            scope.clone(),
+            state.request.lock().await.configuration.clone(),
+            receipt.clone(),
+        );
+        let starting = provider.turn_start(context("withdraw-submit"), &binding, request);
+        tokio::pin!(starting);
+        while state.turn.withdrawal_candidate().unwrap().is_none() {
+            let _ = futures_util::poll!(starting.as_mut());
+            tokio::task::yield_now().await;
+        }
+        let stopped = provider
+            .turn_interrupt(
+                context("withdraw-stop"),
+                &binding,
+                CancelRequest {
+                    scope,
+                    input: forge_provider_api::operations::InterruptInput::WithdrawUnanswered,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.withdrawn.unwrap().submission_id(), &receipt.id);
+        let requests = peer.requests();
+        let withdrawn = requests
+            .iter()
+            .find(|request| request["method"] == "session.queue.withdrawMessage")
+            .unwrap();
+        let sent = requests
+            .iter()
+            .find(|request| request["method"] == "session.send")
+            .unwrap();
+        assert_eq!(withdrawn["params"]["messageId"], "accepted-input");
+        assert_eq!(
+            withdrawn["params"]["expectedPrompt"],
+            sent["params"]["prompt"]
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request["method"] == "session.abort")
+        );
+        provider
+            .thread_close(context("withdraw-close"), &binding)
+            .await
+            .unwrap();
+        provider
+            .shutdown(context("withdraw-shutdown"))
+            .await
+            .unwrap();
+    }
+
     /// Select whether auxiliary queue admission succeeds while preserving the main lifecycle fixture.
     async fn opened_helper_fixture(
         shells: Arc<std::sync::atomic::AtomicBool>,
@@ -6265,6 +6388,11 @@ mod retained_recovery_tests {
                             .insert(request["params"]["sessionId"].as_str().unwrap().to_owned());
                     }
                     json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
+                }
+                "session.queue.withdrawMessage"
+                    if matches!(helper_behavior, HelperBehavior::DeferredStart(_)) =>
+                {
+                    json!({"removed":true,"interrupted":false})
                 }
                 "session.send" if matches!(helper_behavior, HelperBehavior::DeferredStart(_)) => {
                     json!({"messageId":"accepted-input"})

@@ -21,6 +21,17 @@ use std::time::Duration;
 #[tokio::test(start_paused = true)]
 async fn configuration_before_the_native_start_waits_for_the_start_then_restarts_the_turn()
 -> Result<()> {
+    configuration_before_native_start(false).await
+}
+
+/// Interrupt accepted work while a configuration change is waiting for native start.
+#[tokio::test(start_paused = true)]
+async fn stop_overtakes_configuration_waiting_for_native_start() -> Result<()> {
+    configuration_before_native_start(true).await
+}
+
+/// Drive the same deferred configuration with and without an explicit stop.
+async fn configuration_before_native_start(stop: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let execution_count = Arc::new(AtomicUsize::new(0));
@@ -141,6 +152,24 @@ async fn configuration_before_the_native_start_waits_for_the_start_then_restarts
             !interrupted_before_start.load(Ordering::Acquire),
             "the configuration change interrupted the turn before the provider started it"
         );
+        if stop {
+            let request = Request {
+                id: 3,
+                method: "session.turn.cancel".into(),
+                params: json!({"operation_id":"held-start-stop","restore_prompt_if_no_output":true}),
+            };
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                super::super::cancellation::apply(&controller, &request, &sink),
+            )
+            .await
+            .context("stop remained blocked by deferred configuration")??;
+            ensure!(interrupted_before_start.load(Ordering::Acquire), "provider never received stop");
+            configuring.await??;
+            ensure!(controller.broker.lock().await.snapshot()?.session.effort == "high");
+            ensure!(execution_count.load(Ordering::Acquire) == 1);
+            return Ok(());
+        }
         start_release.notify_one();
         tokio::time::timeout(Duration::from_secs(120), configuring)
             .await

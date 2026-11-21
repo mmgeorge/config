@@ -87,8 +87,10 @@ pub(super) struct AdmissionFacts {
 }
 
 /// Record what the driver may start under one snapshot of owner facts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Admission {
+    /// The exact stop selected past a blocked queue head.
+    pub(super) bypass_stop: Option<CommandId>,
     /// The next queued command may start.
     pub(super) start_command: bool,
     /// The next queued turn may start.
@@ -187,6 +189,7 @@ impl Admission {
             && !facts.storage_failed
             && ready;
         Self {
+            bypass_stop: None,
             start_command,
             start_turn: facts.turn.is_none()
                 && facts.turn_queued
@@ -273,6 +276,29 @@ impl ExchangeDriver {
                 command.closes_tool_admission() && !command.authorizes_foreground(turn.id)
             }),
         });
+        let head = self.commands.next_command().map(|next| match next {
+            Command::CancelExchange(_) => NextCommand::Cancel,
+            Command::Input(crate::exchange::command::InputCommand::Submit(_)) => {
+                NextCommand::Submission
+            }
+            _ => NextCommand::Other,
+        });
+        let bypass_stop = if head == Some(NextCommand::Other)
+            && self.execution_state != ExecutionState::Failed
+            && turn.is_some_and(|facts| {
+                matches!(
+                    facts.dispatch,
+                    DispatchStage::Unsent | DispatchStage::InFlight
+                ) && !facts.dispatch_lost
+            }) {
+            state
+                .foreground
+                .as_ref()
+                .and_then(|turn| self.commands.stop_for(turn.id))
+                .cloned()
+        } else {
+            None
+        };
         let facts = AdmissionFacts {
             execution: self.execution_state,
             owner_closed: closed,
@@ -282,13 +308,7 @@ impl ExchangeDriver {
             observation_closed: services.observer.session_events().is_closed(),
             command_active: command.is_some(),
             command_closes_tools: command.is_some_and(ActiveCommand::closes_tool_admission),
-            next_command: self.commands.next_command().map(|next| match next {
-                Command::CancelExchange(_) => NextCommand::Cancel,
-                Command::Input(crate::exchange::command::InputCommand::Submit(_)) => {
-                    NextCommand::Submission
-                }
-                _ => NextCommand::Other,
-            }),
+            next_command: bypass_stop.as_ref().map(|_| NextCommand::Cancel).or(head),
             delivery_preparing: self
                 .input_delivery
                 .as_ref()
@@ -316,6 +336,7 @@ impl ExchangeDriver {
                 || !self.question_tools.is_empty(),
         };
         let mut admission = Admission::evaluate(&facts);
+        admission.bypass_stop = bypass_stop;
         if self.pending_plan_acceptance.is_some() {
             admission.start_turn = false;
             admission.run_automatic_checks = false;

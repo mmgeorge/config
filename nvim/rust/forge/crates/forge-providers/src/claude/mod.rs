@@ -9,6 +9,7 @@ mod host_tools;
 mod process;
 mod profile;
 mod provider;
+mod recovery;
 mod session;
 mod tool_targets;
 mod transport;

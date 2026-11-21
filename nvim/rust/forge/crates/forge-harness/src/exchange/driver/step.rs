@@ -220,6 +220,7 @@ impl ExchangeDriver {
                             let (reply, _response) = oneshot::channel();
                             self.commands.admit(
                                 CommandAdmission {
+                                    stop_target: None,
                                     request: CommandRequest {
                                         id: CommandId::new(uuid::Uuid::new_v4().to_string())
                                             .expect("generated retry command identity is nonempty"),
@@ -507,7 +508,7 @@ impl ExchangeDriver {
                 }
             }
         }
-        let start_command = self.admission(services, state, closed).start_command;
+        let admission = self.admission(services, state, closed);
         let DriverState {
             foreground,
             command,
@@ -520,8 +521,10 @@ impl ExchangeDriver {
         } = state;
         // Start only one command per update step, including immediate rejection.
         if !command_at_entry
-            && start_command
-            && let Some(queued) = self.commands.start(trace, session_id, step)
+            && admission.start_command
+            && let Some(queued) =
+                self.commands
+                    .start(admission.bypass_stop.as_ref(), trace, session_id, step)
         {
             if let Some(pending) = &self.pending_plan_acceptance
                 && pending
@@ -569,6 +572,26 @@ impl ExchangeDriver {
                                 .session_events()
                                 .configuration_availability(),
                         });
+                    }
+                    if let Some(target) = queued.stop_target.as_ref()
+                        && foreground.as_ref().is_none_or(|turn| {
+                            turn.id != target.foreground
+                                || target.invocation.as_ref().is_some_and(|scope| {
+                                    turn.transaction.invocation_scope().ok().flatten().as_ref()
+                                        != Some(scope)
+                                })
+                        })
+                    {
+                        self.commands.finish(
+                            queued,
+                            Ok(CommandOutcome::Cancelled(
+                                crate::exchange::command::CancellationOutcome::NoWork,
+                            )),
+                            trace,
+                            session_id,
+                            step,
+                        );
+                        return;
                     }
                     let mut active = ActiveCommand::start(queued, services);
                     let pin = active
@@ -1032,6 +1055,12 @@ impl ExchangeDriver {
                         pending,
                         OwnerIntake {
                             active: command.as_mut(),
+                            foreground_target: foreground.as_ref().map(|turn| {
+                                crate::exchange::queue::StopTarget {
+                                    foreground: turn.id,
+                                    invocation: turn.transaction.invocation_scope().ok().flatten(),
+                                }
+                            }),
                             steering: SteeringAdmission::from(foreground.as_ref()),
                         },
                         command_messages,

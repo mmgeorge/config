@@ -711,6 +711,18 @@ impl CopilotTurnEvent {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+        if event.agent_id.is_some()
+            || matches!(
+                event.event_type.as_str(),
+                "assistant.message"
+                    | "assistant.message_delta"
+                    | "assistant.reasoning"
+                    | "assistant.reasoning_delta"
+                    | "tool.execution_start"
+            )
+        {
+            state.produced_output = true;
+        }
         let envelope_root = event.agent_id.is_none()
             && event
                 .data
@@ -871,6 +883,74 @@ impl CopilotTurnEvent {
         Ok(())
     }
 
+    /// Get the sole accepted foreground submission under the native send fence.
+    pub(super) fn withdrawal_candidate(
+        &self,
+    ) -> Result<Option<(String, String, forge_provider_api::CoveredInput)>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+        if state.produced_output
+            || state.pending_sends != 0
+            || state.uncertain_send
+            || state.accepted_inputs.len() != 1
+            || state.input_attempts.len() != 1
+        {
+            return Ok(None);
+        }
+        let NativeSubmission::Sent {
+            message_id: Some(message),
+            prompt,
+            ..
+        } = &state.submission
+        else {
+            return Ok(None);
+        };
+        let Some(submission) = state.accepted_submissions.get(message) else {
+            return Ok(None);
+        };
+        let Some(attempt) = state.input_attempts.get(submission) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            message.clone(),
+            prompt.clone(),
+            forge_provider_api::CoveredInput::new(submission.clone(), attempt.clone()),
+        )))
+    }
+
+    /// Publish native withdrawal proof and wake the invocation awaiting a terminal event.
+    pub(super) fn confirm_withdrawal(&self, input: forge_provider_api::CoveredInput) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .withdrawal = Some(input);
+        self.sends_changed.notify_waiters();
+    }
+
+    /// Get exact withdrawal proof retained through native collection.
+    pub(super) fn withdrawal(&self) -> Option<forge_provider_api::CoveredInput> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .withdrawal
+            .clone()
+    }
+
+    /// Wait for a confirmed atomic removal even when queued input has no native terminal event.
+    pub(super) async fn wait_withdrawal(&self) {
+        loop {
+            let changed = self.sends_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.withdrawal().is_some() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Match retraction only to the cancelled invocation's sole accepted input and exact boundary.
     pub fn checked_retraction(
         &self,
@@ -892,6 +972,7 @@ impl CopilotTurnEvent {
             cursor,
             user_event_id: Some(event_id),
             message_id: Some(message_id),
+            ..
         } = &state.submission
         else {
             return Ok(None);
@@ -925,6 +1006,8 @@ impl CopilotTurnEvent {
 struct CopilotTurnState {
     delivery: TurnDelivery,
     submission: NativeSubmission,
+    withdrawal: Option<forge_provider_api::CoveredInput>,
+    produced_output: bool,
     cancelled: bool,
     pending_sends: usize,
     accepted_inputs: HashSet<String>,
@@ -1010,6 +1093,7 @@ enum NativeSubmission {
     Unsent,
     Sent {
         cursor: String,
+        prompt: String,
         user_event_id: Option<String>,
         message_id: Option<String>,
     },
@@ -1034,13 +1118,15 @@ impl CopilotTurnEventGuard<'_> {
         submission: Option<forge_provider_api::SubmissionId>,
         send: impl std::future::Future<Output = Result<String>>,
     ) -> Result<()> {
-        self.send_native(cursor, submission, |_| send).await
+        self.send_native(cursor, String::new(), submission, |_| send)
+            .await
     }
 
     /// Preserve initial send ownership until native acceptance or failure settles.
     pub async fn send_native<'a, F, Fut>(
         &'a self,
         cursor: String,
+        prompt: String,
         submission: Option<forge_provider_api::lifecycle::SubmissionId>,
         send: F,
     ) -> Result<()>
@@ -1057,6 +1143,7 @@ impl CopilotTurnEventGuard<'_> {
                 .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
             state.submission = NativeSubmission::Sent {
                 cursor,
+                prompt,
                 user_event_id: None,
                 message_id: None,
             };

@@ -179,6 +179,7 @@ pub async fn run(
     let sending = turn_event_guard
         .send_native(
             cursor.clone(),
+            message.prompt.clone(),
             options.submission_id.clone(),
             |authority| async {
                 owned_session.ensure_healthy()?;
@@ -300,6 +301,7 @@ pub async fn run(
     let processing: std::result::Result<super::turn::IdleOutcome, ProviderError> = async {
         loop {
             tokio::select! {
+                () = turn_event.wait_withdrawal() => return Ok(super::turn::IdleOutcome::Aborted),
                 settled = turn_event.idle_settled() => {
                     normalize_internal(settled, ProviderOperation::TurnStart, ProviderFailureKind::Protocol)?;
                     return normalize_internal(turn_event.terminal_outcome(), ProviderOperation::TurnStart, ProviderFailureKind::Protocol);
@@ -387,7 +389,24 @@ pub async fn run(
     if native_cancelled && decoder.root_address().is_none() {
         return Err(ProviderError::Cancelled);
     }
-    let native = normalized_result(turn_event, output)?;
+    let native = if turn_event.withdrawal().is_some() {
+        forge_provider_api::TurnResult::new(
+            forge_provider_api::turn::TurnOutcome::Interrupted,
+            super::decode::timestamp_ms(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .map_err(|_| {
+            native_failure(
+                ProviderOperation::TurnInterrupt,
+                ProviderFailureKind::Protocol,
+            )
+        })?
+    } else {
+        normalized_result(turn_event, output)?
+    };
     decoder.finish_native(native.outcome(), sink).await?;
     drop(active_context);
     Ok(native)

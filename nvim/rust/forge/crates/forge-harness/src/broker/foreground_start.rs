@@ -264,6 +264,7 @@ impl HarnessBroker {
             native_ready_parked: false,
             native_ready_awaits_children: false,
             retraction_boundary: None,
+            withdrawn_input: None,
             scan_enabled: execution.is_some(),
             execution_open: true,
             _agent_lease: agent_lease,

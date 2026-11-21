@@ -1535,6 +1535,7 @@ impl MockProvider {
                 binding,
                 CancelRequest {
                     scope: scope.clone(),
+                    input: forge_provider_api::operations::InterruptInput::Retain,
                 },
             )
             .await
@@ -1701,6 +1702,7 @@ impl MockProvider {
             .binding(binding, ProviderOperation::TurnInterrupt)
             .await?;
         Ok(TurnInterruptResult {
+            withdrawn: None,
             operation_id: operation.context.id().clone(),
             thread_id: scope.thread_id.clone(),
             turn_id: scope.turn_id().map_err(|_| {

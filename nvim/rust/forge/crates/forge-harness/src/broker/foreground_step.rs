@@ -115,7 +115,7 @@ impl HarnessBroker {
                     admission.begin_owner_collection(*disposition)?;
                     return Ok(ForegroundAction::Wait);
                 }
-                ForegroundSignal::CollectionCompleted(disposition) => {
+                ForegroundSignal::CollectionCompleted(disposition, _) => {
                     admission.complete_owner_collection(*disposition)?;
                     self.fail_foreground_dispatch(dispatch, TurnCancelled.into())?;
                     return Ok(ForegroundAction::WaitForPublicationDrain);
@@ -414,7 +414,8 @@ impl HarnessBroker {
                     crate::exchange::ExchangeCollection::TimedOut,
                 )
             }
-            ForegroundSignal::CollectionCompleted(disposition) => {
+            ForegroundSignal::CollectionCompleted(disposition, withdrawn) => {
+                transaction.withdrawn_input = withdrawn;
                 admission.complete_owner_collection(disposition)?;
                 transaction.collection = Some(disposition);
                 if let Some(finalization) = transaction.finalization.as_mut() {

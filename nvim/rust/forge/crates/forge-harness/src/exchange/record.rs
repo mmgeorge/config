@@ -1852,9 +1852,8 @@ impl Exchange {
     ///
     /// A native user message that echoes a Forge submission repeats the prompt the broker already
     /// rendered for that admitted action, so it stays turn evidence without a transcript node.
-    /// An echo that lost its submission is still the user's steer when it repeats the text of
-    /// steering Harness sent to this exchange, so it reports that submission instead of drawing
-    /// the message a second time. Harness-authored input such as child results, notices, and task
+    /// An unattributed user item cannot confirm a submission. Harness-authored input such as
+    /// child results, notices, and task
     /// starts carries no submission: its echo opens with a `<forge>` block, or repeats the prompt
     /// of an exchange that Harness opened, whose notice row stands in for that text. Other native
     /// input, such as text from another client, keeps its row. A provider can start the item
@@ -1874,17 +1873,6 @@ impl Exchange {
         let text = message.text().trim();
         if text.is_empty() {
             return NativeInput::Unread;
-        }
-        if let Some(submission) = self.node_list.iter().find_map(|node| match node {
-            ExchangeNode::ExchangeInput { prompt }
-                if matches!(prompt.intent, InputIntent::User { .. })
-                    && prompt.text.trim() == text =>
-            {
-                prompt.submission_id.clone()
-            }
-            _ => None,
-        }) {
-            return NativeInput::Submission(submission);
         }
         let task_prompt = matches!(
             self.opening,
@@ -3037,11 +3025,62 @@ mod test {
         assert_eq!(shown, vec![Some("typed in another client".to_owned())]);
     }
 
-    /// A provider that echoes a steer without its submission still consumes it: the echo repeats
-    /// the text of input Harness sent to that invocation, so the input moves into the transcript
-    /// once and the echo draws no second row, whether its text arrives at once or after its start.
+    /// Distinguish identical steering messages by their provider-reported identity.
     #[test]
-    fn steering_echoed_without_its_submission_is_consumed_once() {
+    fn identical_steers_require_distinct_submission_evidence() {
+        for identified in [true, false] {
+            let mut exchange = interaction();
+            exchange.resume(1).unwrap();
+            let address = running_turn(&mut exchange, "invocation", 1);
+            let first_id = submission("first");
+            let first = acknowledge(&mut exchange, &address, &first_id, 2);
+            observe(&mut exchange, &echo(&address, "echo-one", &first_id), 2);
+            assert_eq!(
+                consumption(&exchange, &first.id),
+                InputConsumption::Consumed
+            );
+
+            let second_id = submission("second");
+            let second = acknowledge(&mut exchange, &address, &second_id, 3);
+            if identified {
+                observe(&mut exchange, &echo(&address, "echo-two", &second_id), 4);
+            } else {
+                streamed_native_input(&mut exchange, &address, "echo-two", "prefer the short form");
+            }
+            exchange.settle_input_consumption();
+            let expected = if identified {
+                InputConsumption::Consumed
+            } else {
+                InputConsumption::Unconfirmed
+            };
+            assert_eq!(consumption(&exchange, &second.id), expected);
+        }
+    }
+
+    /// Keep an unattributed input from confirming an unrelated local submission.
+    #[test]
+    fn matching_foreign_text_cannot_confirm_a_local_steer() {
+        let mut exchange = interaction();
+        exchange.resume(1).unwrap();
+        let address = running_turn(&mut exchange, "first", 1);
+        let pending = acknowledge(&mut exchange, &address, &submission("mine"), 2);
+        streamed_native_input(
+            &mut exchange,
+            &address,
+            "different-client-item",
+            "prefer the short form",
+        );
+        assert!(
+            matches!(
+                consumption(&exchange, &pending.id),
+                InputConsumption::AwaitingConsumption { .. }
+            ),
+            "an unattributed matching item confirmed my input"
+        );
+    }
+
+    #[test]
+    fn unattributed_steering_echo_remains_visible() {
         for streamed in [false, true] {
             let mut exchange = interaction();
             exchange.resume(1).unwrap();
@@ -3067,14 +3106,20 @@ mod test {
             }
             assert_eq!(
                 consumption(&exchange, &prompt.id),
-                InputConsumption::Consumed,
+                InputConsumption::AwaitingConsumption {
+                    invocation: address.scope.clone()
+                },
                 "streamed={streamed}"
             );
+            let visible = displayed(&exchange);
+            assert_eq!(visible.len(), 1, "streamed={streamed}");
+            assert_ne!(visible[0], prompt.id, "the visible item is the native echo");
+            exchange.settle_input_consumption();
             assert_eq!(
-                displayed(&exchange),
-                vec![prompt.id.clone()],
-                "streamed={streamed}"
+                consumption(&exchange, &prompt.id),
+                InputConsumption::Unconfirmed
             );
+            assert_eq!(displayed(&exchange).len(), 2, "streamed={streamed}");
         }
     }
 }

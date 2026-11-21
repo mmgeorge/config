@@ -1085,6 +1085,7 @@ enum Command {
     },
     CancelExchange {
         scope: InvocationScope,
+        input: forge_provider_api::operations::InterruptInput,
         reply: oneshot::Sender<Result<ExchangeCollection, ProviderError>>,
     },
     ReconcileInput {
@@ -1099,12 +1100,13 @@ enum Command {
     },
     Cancel {
         scope: InvocationScope,
+        input: forge_provider_api::operations::InterruptInput,
         reply: CancellationReply,
     },
     CancellationFinished {
         scope: InvocationScope,
         outcome: CancellationKind,
-        result: Result<(), ProviderError>,
+        result: Result<Option<forge_provider_api::CoveredInput>, ProviderError>,
         reply: CancellationReply,
     },
     SteerCurrent {
@@ -1231,6 +1233,7 @@ enum ReservationOrigin {
 pub(crate) struct ExchangeCollection {
     scope: InvocationScope,
     fence_id: forge_provider_api::OperationId,
+    pub(crate) withdrawn: Option<forge_provider_api::CoveredInput>,
     commands: mpsc::Sender<Command>,
 }
 
@@ -1247,13 +1250,27 @@ enum CancellationReply {
 impl CancellationReply {
     /// Publish collection proof only after the owner establishes successful cancellation collection.
     fn complete(self, result: Result<(), ProviderError>) {
+        self.complete_with_withdrawal(result.map(|()| None));
+    }
+
+    /// Attach native withdrawal to positive collection, after validation by the owner.
+    fn complete_with_withdrawal(
+        self,
+        result: Result<Option<forge_provider_api::CoveredInput>, ProviderError>,
+    ) {
         match self {
             #[cfg(test)]
             Self::Invocation(reply) => {
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(drop));
             }
-            Self::Exchange { collection, reply } => {
-                let _ = reply.send(result.map(|_| collection));
+            Self::Exchange {
+                mut collection,
+                reply,
+            } => {
+                let _ = reply.send(result.map(|withdrawn| {
+                    collection.withdrawn = withdrawn;
+                    collection
+                }));
             }
         }
     }
@@ -1425,20 +1442,30 @@ impl SessionExecution {
         &self,
         scope: InvocationScope,
     ) -> Result<(), ProviderError> {
-        self.collect_exchange(scope).await.map(drop)
+        self.collect_exchange(
+            scope,
+            forge_provider_api::operations::InterruptInput::Retain,
+        )
+        .await
+        .map(drop)
     }
 
     /// Collect the actual latest scheduled attempt and retain its exact cancellation generation proof.
     pub(crate) async fn collect_exchange(
         &self,
         scope: InvocationScope,
+        input: forge_provider_api::operations::InterruptInput,
     ) -> Result<ExchangeCollection, ProviderError> {
         if scope.owner() != self.owner {
             return Err(protocol("exchange cancellation belongs to another owner"));
         }
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::CancelExchange { scope, reply })
+            .send(Command::CancelExchange {
+                scope,
+                input,
+                reply,
+            })
             .await
             .map_err(|_| protocol("execution owner closed before exchange cancellation"))?;
         response
@@ -1494,6 +1521,7 @@ impl SessionExecution {
         self.commands
             .send(Command::Cancel {
                 scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
                 reply: CancellationReply::Invocation(reply),
             })
             .await
@@ -1816,7 +1844,7 @@ impl SessionExecution {
             receive.close();
             while let Ok(command) = receive.try_recv() {
                 if let Command::CancellationFinished { result, reply, .. } = command {
-                    reply.complete(result);
+                    reply.complete_with_withdrawal(result);
                 }
             }
             driver.idle.close(
@@ -2732,7 +2760,11 @@ impl Driver {
                 self.cancelled_exchanges.remove(&scope.exchange_id);
                 let _ = reply.send(Ok(()));
             }
-            Command::CancelExchange { scope, reply } => {
+            Command::CancelExchange {
+                scope,
+                input,
+                reply,
+            } => {
                 let registered = self
                     .admitted
                     .lock()
@@ -2747,6 +2779,7 @@ impl Driver {
                 };
                 let collection = ExchangeCollection {
                     scope: fence.clone(),
+                    withdrawn: None,
                     fence_id: forge_provider_api::OperationId::new(
                         uuid::Uuid::new_v4().to_string(),
                     )
@@ -2765,6 +2798,7 @@ impl Driver {
                     .unwrap_or(fence);
                 self.command(Command::Cancel {
                     scope: target,
+                    input,
                     reply: CancellationReply::Exchange { collection, reply },
                 });
             }
@@ -2811,7 +2845,11 @@ impl Driver {
                 };
                 let _ = reply.send(result);
             }
-            Command::Cancel { scope, reply } => {
+            Command::Cancel {
+                scope,
+                input,
+                reply,
+            } => {
                 if self.failed || scope.owner() != self.owner {
                     reply.complete(Err(protocol("cancellation has no live owner")));
                     return;
@@ -2895,20 +2933,20 @@ impl Driver {
                         CancellationKind::Prevented(_) => {
                             let stopped = finished.wait_for(|finished| *finished).await.map(drop);
                             match stopped {
-                                Ok(()) => {
-                                    provider
-                                        .cancel_prepared_invocation(&scope, retirement)
-                                        .await
-                                }
+                                Ok(()) => provider
+                                    .cancel_prepared_invocation(&scope, retirement)
+                                    .await
+                                    .map(|()| None),
                                 Err(_) => Err(protocol(
                                     "prevented submission lost task collection evidence",
                                 )),
                             }
                         }
                         CancellationKind::Native => match dispatch.wait().await {
-                            Ok(confirmation) if confirmation.scope() == &scope => {
-                                provider.collect_invocation(scope.clone()).await.map(|_| ())
-                            }
+                            Ok(confirmation) if confirmation.scope() == &scope => provider
+                                .collect_invocation_with_input(scope.clone(), input)
+                                .await
+                                .map(|receipt| receipt.withdrawn),
                             Ok(_) => Err(protocol("cancellation dispatch identity changed")),
                             Err(_) => Err(ProviderError::DeliveryUncertain),
                         },
@@ -2977,7 +3015,7 @@ impl Driver {
                     self.begin_host_collection(&scope);
                     self.settle(&scope.invocation_id);
                 }
-                reply.complete(result);
+                reply.complete_with_withdrawal(result);
             }
             Command::SteerCurrent {
                 input,

@@ -137,14 +137,25 @@ impl ActiveCommand {
             } => {
                 let mut broker = broker.lock().await;
                 let broker = &mut *broker;
+                let Command::CancelExchange(request) = &command.record.request.command else {
+                    unreachable!("the active cancellation retains its cancellation request")
+                };
+                let input = if request.input
+                    == super::command::CancelledInputPolicy::RestoreIfUnconsumed
+                    && dispatch
+                        .as_deref()
+                        .is_some_and(crate::broker::TurnTransaction::output_free)
+                {
+                    forge_provider_api::operations::InterruptInput::WithdrawUnanswered
+                } else {
+                    forge_provider_api::operations::InterruptInput::Retain
+                };
                 transition.pin_cancellation_target(
                     foreground,
                     broker,
                     services.observer.session_id(),
+                    input,
                 )?;
-                let Command::CancelExchange(request) = &command.record.request.command else {
-                    unreachable!("the active cancellation retains its cancellation request")
-                };
                 let foreground_absent = matches!(
                     dispatch.as_deref(),
                     None | Some(crate::broker::TurnTransaction::Done(_))

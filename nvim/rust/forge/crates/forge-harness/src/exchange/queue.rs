@@ -11,9 +11,17 @@ use super::journal::{CommandJournal, CommandJournalError, CommandRecord};
 /// Resolve one observer independently of the command's lifetime and retained result.
 pub(super) type CommandReply = oneshot::Sender<Result<CommandResult, ExecuteCommandError>>;
 
+/// Bind a stop to the driver foreground and the native invocation known at admission.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct StopTarget {
+    pub(super) foreground: uuid::Uuid,
+    pub(super) invocation: Option<forge_provider_api::InvocationScope>,
+}
+
 /// Transfer one identified command and its admitted completion/capacity ownership together.
 pub(super) struct CommandAdmission {
     pub(super) request: CommandRequest,
+    pub(super) stop_target: Option<StopTarget>,
     pub(super) reply: CommandReply,
     pub(super) task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -174,6 +182,7 @@ impl CommandQueue {
             request,
             reply,
             task_admission,
+            stop_target,
         } = admission;
         let response_log = CommandResponseLog {
             id: &request.id,
@@ -262,7 +271,9 @@ impl CommandQueue {
             return;
         }
         let shared = active.filter(|active| {
-            self.order.is_empty() && equivalent_cancellation(&active.record.request, &request)
+            self.order.is_empty()
+                && active.stop_target == stop_target
+                && equivalent_cancellation(&active.record.request, &request)
         });
         let operation = shared.as_ref().map(|active| &active.record.request.id);
         let admitted = match operation {
@@ -276,6 +287,7 @@ impl CommandQueue {
                 }));
                 let command = QueuedCommand {
                     record,
+                    stop_target,
                     waiters: vec![reply],
                     admitted_at: tokio::time::Instant::now(),
                     task_admission,
@@ -319,9 +331,22 @@ impl CommandQueue {
             .map(|command| &command.record.request.command)
     }
 
+    /// Find the earliest queued stop targeting a dispatch that is blocking the head.
+    pub(super) fn stop_for(&self, foreground_id: uuid::Uuid) -> Option<&CommandId> {
+        self.order.iter().find(|id| {
+            self.pending.get(*id).is_some_and(|queued| {
+                queued
+                    .stop_target
+                    .as_ref()
+                    .is_some_and(|target| target.foreground == foreground_id)
+            })
+        })
+    }
+
     /// Start at most one queued command when the driver's update-step contract permits it.
     pub(super) fn start(
         &mut self,
+        selected_stop: Option<&CommandId>,
         trace: &crate::trace::TraceStore,
         session: &str,
         step: u64,
@@ -329,7 +354,13 @@ impl CommandQueue {
         if self.storage_unavailable() || !matches!(self.availability, QueueAvailability::Open) {
             return None;
         }
-        let id = self.order.pop_front()?;
+        let id = match selected_stop {
+            Some(selected) => {
+                let position = self.order.iter().position(|id| id == selected)?;
+                self.order.remove(position)?
+            }
+            None => self.order.pop_front()?,
+        };
         let mut command = self
             .pending
             .remove(&id)
@@ -409,6 +440,7 @@ impl CommandQueue {
         let observers = QueuedCommand {
             record: command.record.clone(),
             admitted_at: command.admitted_at,
+            stop_target: command.stop_target.clone(),
             task_admission: None,
             waiters: std::mem::take(&mut command.waiters),
         };
@@ -593,6 +625,8 @@ pub(super) struct QueuedCommand {
     pub(super) record: CommandRecord,
     /// Monotonic active-command admission; FIFO waiting does not consume its response budget.
     pub(super) admitted_at: tokio::time::Instant,
+    /// Foreground invocation selected when the stop entered the owner.
+    pub(super) stop_target: Option<StopTarget>,
     /// Reserved child-task capacity acquired before this command entered its parent's FIFO.
     pub(super) task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     waiters: Vec<CommandReply>,
@@ -775,6 +809,7 @@ mod tests {
         let (first_reply, first_response) = oneshot::channel();
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: request("first"),
                 reply: first_reply,
                 task_admission: None,
@@ -784,10 +819,11 @@ mod tests {
             "session",
             1,
         );
-        let mut active = queue.start(&trace, "session", 2).unwrap();
+        let mut active = queue.start(None, &trace, "session", 2).unwrap();
         let (second_reply, second_response) = oneshot::channel();
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: request("second"),
                 reply: second_reply,
                 task_admission: None,
@@ -817,6 +853,7 @@ mod tests {
         let (late_reply, late_response) = oneshot::channel();
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: request("late"),
                 reply: late_reply,
                 task_admission: None,
@@ -848,6 +885,7 @@ mod tests {
         let (reply, _) = oneshot::channel();
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: request("first"),
                 reply,
                 task_admission: None,
@@ -857,12 +895,13 @@ mod tests {
             "session",
             1,
         );
-        let mut active = queue.start(&trace, "session", 2).unwrap();
+        let mut active = queue.start(None, &trace, "session", 2).unwrap();
         let mut responses = Vec::new();
         for _ in 0..2 {
             let (reply, response) = oneshot::channel();
             queue.admit(
                 CommandAdmission {
+                    stop_target: None,
                     request: request("joined"),
                     reply,
                     task_admission: None,
@@ -881,6 +920,7 @@ mod tests {
         let (reply, _) = oneshot::channel();
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: different,
                 reply,
                 task_admission: None,
@@ -893,6 +933,7 @@ mod tests {
         let (reply, _) = oneshot::channel();
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: request("after-boundary"),
                 reply,
                 task_admission: None,
@@ -968,6 +1009,7 @@ mod tests {
         let active_request = request("active");
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: active_request.clone(),
                 reply: active_reply,
                 task_admission: None,
@@ -977,10 +1019,11 @@ mod tests {
             "session",
             1,
         );
-        let active = queue.start(&trace, "session", 2).unwrap();
+        let active = queue.start(None, &trace, "session", 2).unwrap();
         let (pending_reply, pending_response) = oneshot::channel();
         queue.admit(
             CommandAdmission {
+                stop_target: None,
                 request: request("pending"),
                 reply: pending_reply,
                 task_admission: None,

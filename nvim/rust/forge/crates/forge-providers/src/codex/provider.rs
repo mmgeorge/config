@@ -2970,6 +2970,7 @@ impl Provider for CodexProvider {
                         )
                         .await
                         .map(|collected| forge_provider_api::TurnInterruptResult {
+                            withdrawn: None,
                             operation_id,
                             thread_id: collected.address.thread_id,
                             turn_id: collected.address.turn_id,
@@ -6818,7 +6819,7 @@ mod continuation_tests {
             let interrupting_provider = provider.clone();
             let interrupting_binding = binding.clone();
             let interrupting_scope = scope.clone();
-            let interrupting = tokio::spawn(async move { interrupting_provider.turn_interrupt(context(), &interrupting_binding, forge_provider_api::CancelRequest { scope: interrupting_scope }).await });
+            let interrupting = tokio::spawn(async move { interrupting_provider.turn_interrupt(context(), &interrupting_binding, forge_provider_api::CancelRequest { scope: interrupting_scope , input: forge_provider_api::operations::InterruptInput::Retain,}).await });
             // Release the acknowledgment only after the cancellation is recorded on the admission.
             loop {
                 let requested = session.admitting.lock().await.as_ref().is_some_and(|admitting| admitting.scope == scope && admitting.cancel.load(Ordering::Acquire));
@@ -6896,6 +6897,7 @@ mod continuation_tests {
                 &binding,
                 forge_provider_api::CancelRequest {
                     scope: scope.clone(),
+                    input: forge_provider_api::operations::InterruptInput::Retain,
                 },
             ),
         )
@@ -6980,7 +6982,7 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             let worker = Arc::new(crate::retained_task::RetainedTask::new(ProviderOperation::TurnStart, tokio::spawn(async move { released.await.unwrap(); Ok(completed) })));
         let worker = fixture_worker(&session, &successor_scope, worker);
             *session.active.lock().await = Some(ActiveExecution { scope: successor_scope.clone(), native_turn_id: "successor-turn".into(), turn_updates: watch::channel(Some("successor-turn".into())).0, submissions: Arc::new(Mutex::new(Vec::new())), request: successor, cancel, task: Some(worker.clone()) });
-            let settled = provider.turn_interrupt(context(), &session.binding.id, forge_provider_api::CancelRequest { scope: scope.clone() }).await.unwrap();
+            let settled = provider.turn_interrupt(context(), &session.binding.id, forge_provider_api::CancelRequest { scope: scope.clone() , input: forge_provider_api::operations::InterruptInput::Retain,}).await.unwrap();
             assert_eq!(settled.watermark, retained.watermark);
             assert_eq!(settled.thread_id, session.owner.clone());
             assert!(cancelled.try_recv().is_err());

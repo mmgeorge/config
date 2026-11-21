@@ -521,7 +521,13 @@ impl AcpProvider {
             // The active invocation and its collection lock fence reuse until actual settlement.
             // An expired observer does not authorize collecting independently owned terminals.
             match self
-                .cancel_invocation(&binding, forge_provider_api::CancelRequest { scope })
+                .cancel_invocation(
+                    &binding,
+                    forge_provider_api::CancelRequest {
+                        scope,
+                        input: forge_provider_api::operations::InterruptInput::Retain,
+                    },
+                )
                 .await
             {
                 Ok(_) => Ok(()),
@@ -544,7 +550,13 @@ impl AcpProvider {
         // Collection remains attached to this exact invocation after its observer expires.
         // A shorter timer must not tear down independently owned terminal resources.
         match self
-            .cancel_invocation(binding, forge_provider_api::CancelRequest { scope })
+            .cancel_invocation(
+                binding,
+                forge_provider_api::CancelRequest {
+                    scope,
+                    input: forge_provider_api::operations::InterruptInput::Retain,
+                },
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -1778,6 +1790,7 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                         .await?;
                     let session = provider.binding(&binding, ProviderOperation::TurnInterrupt)?;
                     Ok(forge_provider_api::TurnInterruptResult {
+                        withdrawn: None,
                         operation_id,
                         thread_id: request.scope.thread_id.clone(),
                         turn_id: request.scope.turn_id().map_err(|_| {

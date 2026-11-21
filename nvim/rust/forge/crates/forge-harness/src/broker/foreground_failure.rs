@@ -76,6 +76,10 @@ enum FailureBaselinePolicy {
         submission: Arc<crate::provider::submission::Submission>,
         attempt: forge_provider_api::DeliveryAttemptId,
     },
+    Withdrawn {
+        submission: Arc<crate::provider::submission::Submission>,
+        attempt: forge_provider_api::DeliveryAttemptId,
+    },
     Retract {
         context: forge_provider_api::OperationContext,
         request: forge_provider_api::InputRetractRequest,
@@ -171,6 +175,24 @@ impl FailureBaselineJob {
                         if record.attempt_id == attempt
                             && record.delivery
                                 == crate::provider::submission::SubmissionState::Cancelled
+                        {
+                            BaselineDisposition::Retracted
+                        } else {
+                            BaselineDisposition::Retained
+                        },
+                    )
+                }
+                FailureBaselinePolicy::Withdrawn {
+                    submission,
+                    attempt,
+                } => {
+                    let record = submission.record()?;
+                    Ok(
+                        if record.attempt_id == attempt
+                            && matches!(
+                                record.delivery,
+                                crate::provider::submission::SubmissionState::Accepted { .. }
+                            )
                         {
                             BaselineDisposition::Retracted
                         } else {
@@ -1102,7 +1124,18 @@ impl HarnessBroker {
         // that failed proves nothing about what the provider consumed, so the exchange stays.
         let restores_prompt =
             Self::cancellation_restores_prompt(transaction) && !admission.owner_collection_failed();
-        let native_retraction = if restores_prompt && self.capability.native_turn_rollback {
+        let native_retraction = if !restores_prompt {
+            None
+        } else if let Some(withdrawn) = &transaction.withdrawn_input
+            && let Some(submission) = &transaction.request.submission
+            && withdrawn.submission_id() == submission.receipt_id()
+            && withdrawn.attempt_id() == &submission.record()?.attempt_id
+        {
+            Some(FailureBaselinePolicy::Withdrawn {
+                submission: submission.clone(),
+                attempt: withdrawn.attempt_id().clone(),
+            })
+        } else if self.capability.native_turn_rollback {
             Self::output_free_retraction(transaction)?
         } else {
             None

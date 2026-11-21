@@ -41,6 +41,13 @@ pub(crate) enum SubmissionReconciliation {
     ContentMismatch,
 }
 
+/// Distinguish a removed input from an ordinary stop that kept the original history.
+pub(super) enum Withdrawal {
+    Removed,
+    Interrupted,
+    Refused,
+}
+
 impl CopilotClient {
     /// Bind a native transport to its single shared health generation.
     pub(crate) fn new(inner: github_copilot_sdk::Client) -> Self {
@@ -268,6 +275,49 @@ impl CopilotSession {
         }
     }
     /// Interrupt foreground generation while preserving independently owned shell tasks.
+    /// Withdraw the identified accepted message if it is safe for the runtime to remove.
+    pub(super) async fn withdraw_unanswered(
+        &self,
+        message: String,
+        prompt: String,
+    ) -> Result<Withdrawal, ProviderError> {
+        #[derive(serde::Deserialize)]
+        struct ResultFrame {
+            removed: bool,
+            interrupted: bool,
+        }
+        let response = self
+            .inner
+            .client()
+            .call(
+                "session.queue.withdrawMessage",
+                Some(serde_json::json!({
+                    "sessionId": self.inner.id(), "messageId": message, "expectedPrompt": prompt,
+                })),
+            )
+            .await;
+        match response {
+            Ok(response) => {
+                let response: ResultFrame = serde_json::from_value(response).map_err(|_| {
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::TurnInterrupt,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
+                })?;
+                Ok(match (response.removed, response.interrupted) {
+                    (true, _) => Withdrawal::Removed,
+                    (false, true) => Withdrawal::Interrupted,
+                    (false, false) => Withdrawal::Refused,
+                })
+            }
+            Err(error) if error.rpc_code() == Some(-32601) => Ok(Withdrawal::Refused),
+            Err(error) => Err(transport_failure(
+                forge_provider_api::ProviderOperation::TurnInterrupt,
+                &error,
+            )),
+        }
+    }
+
     pub async fn abort(&self) -> Result<(), ProviderError> {
         self.ensure_healthy()?;
         let result = self

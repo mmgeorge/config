@@ -655,6 +655,7 @@ pub(crate) struct ForegroundTransaction {
     /// Holds a deferred root result while a cancellation collects this exchange's children.
     /// Only child activity re-exposes it, because the collection itself is already under way.
     pub(crate) native_ready_awaits_children: bool,
+    pub(crate) withdrawn_input: Option<forge_provider_api::CoveredInput>,
     pub(crate) retraction_boundary: Option<(
         crate::provider::InvocationScope,
         forge_provider_api::CheckpointId,
@@ -691,7 +692,10 @@ pub(crate) enum ForegroundSignal {
     CollectionStarted(ForegroundCollection),
     /// The command response timed out; native cleanup retains ownership.
     CollectionTimedOut,
-    CollectionCompleted(ForegroundCollection),
+    CollectionCompleted(
+        ForegroundCollection,
+        Option<forge_provider_api::CoveredInput>,
+    ),
     /// The owner's native collection ended without proving the provider idle, so no
     /// `CollectionCompleted` follows and the owner restarts the provider.
     CollectionFailed,
@@ -2401,10 +2405,62 @@ struct ExchangeAdmission {
     agent_run_id: Option<String>,
 }
 
+/// Retain only admission-owned effects and the model selection they ran under.
 struct PromptControlSnapshot {
-    session: HarnessSession,
-    execution: Vec<PlanExecutionRecord>,
-    plan: Vec<PlanRecord>,
+    model: String,
+    effort: String,
+    context_window: Option<String>,
+    service_tier: crate::provider::ServiceTier,
+    resolved_model: Option<String>,
+    active_task: Option<crate::task::Task>,
+    plan: Vec<PromptArtifactChange<PlanRecord>>,
+    execution: Vec<PromptArtifactChange<PlanExecutionRecord>>,
+}
+
+/// Reverse a provisional write only if its exact resulting content still exists.
+struct PromptArtifactChange<Record> {
+    id: String,
+    before: Option<Record>,
+    written: Value,
+}
+
+impl<Record: serde::Serialize> PromptArtifactChange<Record> {
+    /// Capture changed or created records across a synchronous admission step.
+    fn capture(
+        before: Vec<Record>,
+        after: Vec<Record>,
+        id: impl Fn(&Record) -> &str,
+    ) -> Result<Vec<Self>> {
+        let mut original = before
+            .into_iter()
+            .map(|record| (id(&record).to_owned(), record))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut changes = Vec::new();
+        for record in after {
+            let id = id(&record).to_owned();
+            let before = original.remove(&id);
+            let written = serde_json::to_value(record)?;
+            if before
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?
+                .as_ref()
+                != Some(&written)
+            {
+                changes.push(Self {
+                    id,
+                    before,
+                    written,
+                });
+            }
+        }
+        Ok(changes)
+    }
+
+    /// Check the recorded write against the current owner's value.
+    fn still_owns(&self, current: &Record) -> Result<bool> {
+        Ok(serde_json::to_value(current)? == self.written)
+    }
 }
 
 /// Retain submission admission and rollback state across independently awaited work.
@@ -5512,9 +5568,14 @@ impl HarnessBroker {
     /// Capture prompt admission and rollback ownership before executing its workflow.
     pub(crate) fn begin_prompt_submission(&mut self, params: &Value) -> Result<PromptSubmission> {
         let snapshot = PromptControlSnapshot {
-            session: self.session_view()?,
-            execution: self.store.list_plan_execution(&self.session.id)?,
-            plan: self.store.list_plan(&self.session.id)?,
+            model: self.session.model.clone(),
+            effort: self.session.effort.clone(),
+            context_window: self.session.context_window.clone(),
+            service_tier: self.session.service_tier,
+            resolved_model: self.session.resolved_model.clone(),
+            active_task: self.task_controller.current()?,
+            execution: Vec::new(),
+            plan: Vec::new(),
         };
         self.prompt_admission = params
             .get("_prompt_admission")
@@ -5553,53 +5614,51 @@ impl HarnessBroker {
         snapshot: PromptControlSnapshot,
         current: Option<crate::task::Task>,
     ) -> Result<()> {
-        let unchanged = match (&current, &snapshot.session.active_task) {
+        let same_task = match (&current, &snapshot.active_task) {
             (Some(current), Some(original)) => {
                 current.revision == original.revision && current.same_contract(original)
             }
             (None, None) => true,
             _ => false,
         };
-        if unchanged {
-            for execution in &snapshot.execution {
-                self.store.save_plan_execution(execution)?;
-            }
-            let restored_plan_id = snapshot
-                .plan
-                .iter()
-                .map(|plan| plan.id.as_str())
-                .collect::<HashSet<_>>();
-            for plan in self.store.list_plan(&self.session.id)? {
-                if !restored_plan_id.contains(plan.id.as_str()) {
-                    self.store.delete_plan(&plan.id)?;
-                    self.plan_file.delete_plan(&self.session.id, &plan.id)?;
+        if same_task {
+            for change in snapshot.execution {
+                if let Some(current) = self.store.load_plan_execution(&change.id)?
+                    && change.still_owns(&current)?
+                {
+                    if let Some(before) = change.before {
+                        self.store.save_plan_execution(&before)?;
+                    } else {
+                        self.store
+                            .delete_plan_execution(&self.session.id, &change.id)?;
+                    }
                 }
             }
-            for plan in &snapshot.plan {
-                self.store.save_plan(plan)?;
+            for change in snapshot.plan {
+                if let Some(current) = self.store.load_plan(&change.id)?
+                    && change.still_owns(&current)?
+                {
+                    if let Some(before) = change.before {
+                        self.store.save_plan(&before)?;
+                    } else {
+                        self.plan_file.delete_plan(&self.session.id, &change.id)?;
+                        self.store.delete_plan(&change.id)?;
+                    }
+                }
             }
         }
-        // A usage report measures the native context rather than the retracted prompt, so one
-        // received during this turn supersedes the figure saved before the prompt. It predates
-        // the history truncation, so it cannot authorize maintenance until a later report.
-        let reported_usage = self
-            .context_usage_fresh
-            .then(|| self.session.context_usage.clone());
-        // Retraction rolls the turn back inside the live native conversation, which later turns
-        // keep using. What that binding reported about itself, its conversation identity and its
-        // negotiated fork and compaction support, outlives the retraction: the prompt that opened
-        // the conversation is often the one retracted, and no later turn reports them again.
-        let native_identity = self.session.provider_session_id.take();
-        let (native_fork, native_compact) = (self.session.native_fork, self.session.native_compact);
-        self.session = snapshot.session;
-        self.session.active_task = current;
-        self.session.provider_session_id = native_identity;
-        self.session.native_fork = native_fork;
-        self.session.native_compact = native_compact;
-        if let Some(reported_usage) = reported_usage {
-            self.session.context_usage = reported_usage;
-            self.context_usage_fresh = false;
+        // A model observed during provisional execution belongs to the retracted prompt unless
+        // a later configuration selected a different execution contract.
+        if self.session.model == snapshot.model
+            && self.session.effort == snapshot.effort
+            && self.session.context_window == snapshot.context_window
+            && self.session.service_tier == snapshot.service_tier
+        {
+            self.session.resolved_model = snapshot.resolved_model;
         }
+        self.session.active_task = current;
+        // A native usage sample predates the cut and cannot authorize maintenance.
+        self.context_usage_fresh = false;
         self.save_session()?;
         Ok(())
     }

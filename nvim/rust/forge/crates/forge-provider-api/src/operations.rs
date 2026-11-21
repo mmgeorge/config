@@ -104,6 +104,17 @@ pub struct ConfiguredSession {
 pub struct CancelRequest {
     /// Identify installed cancellation and collection ownership; never select the successor.
     pub scope: InvocationScope,
+    /// The requested treatment of the cancelled input.
+    pub input: InterruptInput,
+}
+
+/// Select whether interruption may remove this invocation's input from native history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptInput {
+    /// Stop execution and preserve its input.
+    Retain,
+    /// Withdraw the input atomically if it is unanswered and still safe to remove.
+    WithdrawUnanswered,
 }
 
 /// Confirm interruption observed the original turn's collection and stream boundary.
@@ -116,6 +127,9 @@ pub struct TurnInterruptResult {
     /// Identify the original host response cycle.
     pub turn_id: crate::TurnId,
     /// Consume through this published boundary before dependent transitions.
+    /// Exact accepted input removed from the provider's history by this stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn: Option<crate::CoveredInput>,
     pub watermark: EventSequence,
 }
 

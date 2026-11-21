@@ -1970,6 +1970,7 @@ impl ProviderBridge {
     ) -> Result<forge_provider_api::TurnInterruptResult, ProviderError> {
         self.cancel_in_context(
             scope,
+            forge_provider_api::operations::InterruptInput::Retain,
             OperationControl::fresh(ProviderOperation::TurnInterrupt)?,
         )
         .await
@@ -1981,7 +1982,21 @@ impl ProviderBridge {
         &self,
         scope: forge_provider_api::InvocationScope,
     ) -> Result<forge_provider_api::TurnInterruptResult, ProviderError> {
-        self.cancel_in_context(scope, OperationControl::cancellation_collection()?)
+        self.cancel_in_context(
+            scope,
+            forge_provider_api::operations::InterruptInput::Retain,
+            OperationControl::cancellation_collection()?,
+        )
+        .await
+    }
+
+    /// Collect an exact cancellation with the foreground owner's native input policy.
+    pub(crate) async fn collect_invocation_with_input(
+        &self,
+        scope: forge_provider_api::InvocationScope,
+        input: forge_provider_api::operations::InterruptInput,
+    ) -> Result<forge_provider_api::TurnInterruptResult, ProviderError> {
+        self.cancel_in_context(scope, input, OperationControl::cancellation_collection()?)
             .await
     }
 
@@ -1989,6 +2004,7 @@ impl ProviderBridge {
     async fn cancel_in_context(
         &self,
         scope: forge_provider_api::InvocationScope,
+        input: forge_provider_api::operations::InterruptInput,
         operation: OperationControl,
     ) -> Result<forge_provider_api::TurnInterruptResult, ProviderError> {
         let host = self
@@ -2034,6 +2050,7 @@ impl ProviderBridge {
                 &bound.binding.id,
                 forge_provider_api::CancelRequest {
                     scope: scope.clone(),
+                    input,
                 },
             ),
         )
@@ -2120,6 +2137,7 @@ impl ProviderBridge {
                     &bound.binding.id,
                     forge_provider_api::CancelRequest {
                         scope: scope.clone(),
+                        input: forge_provider_api::operations::InterruptInput::Retain,
                     },
                 )
                 .await

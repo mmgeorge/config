@@ -749,7 +749,10 @@ async fn interrupt_ends_the_turn_as_interrupted() {
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -875,7 +878,10 @@ async fn run_turn(
             .turn_interrupt(
                 operation_context(),
                 &binding,
-                forge_provider_api::CancelRequest { scope },
+                forge_provider_api::CancelRequest {
+                    scope,
+                    input: forge_provider_api::operations::InterruptInput::Retain,
+                },
             )
             .await
             .unwrap();
@@ -1019,7 +1025,10 @@ async fn interrupted_turn_events(
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -1354,7 +1363,10 @@ async fn end_turn_classifies_the_reply_before_the_result() {
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -1447,7 +1459,10 @@ async fn interrupted_reply_is_classified_as_the_response() {
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -1537,7 +1552,10 @@ async fn interrupted_tool_result_ends_the_tool_as_interrupted() {
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -2619,7 +2637,10 @@ async fn unanswered_interrupt_ends_the_turn() {
     let interrupt = provider.turn_interrupt(
         operation_context(),
         &binding,
-        forge_provider_api::CancelRequest { scope },
+        forge_provider_api::CancelRequest {
+            scope,
+            input: forge_provider_api::operations::InterruptInput::Retain,
+        },
     );
     let ended = async {
         loop {
@@ -2742,7 +2763,10 @@ async fn interrupt_after_the_result_abandons_the_context_query() {
         provider.turn_interrupt(
             unbounded_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         ),
     )
     .await
@@ -2818,7 +2842,10 @@ async fn unacknowledged_steer_cannot_outlive_its_interrupt() {
         provider.turn_interrupt(
             unbounded_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         ),
     )
     .await;
@@ -2897,7 +2924,10 @@ async fn interrupting_a_queued_input_ends_the_turn_and_keeps_the_binding() {
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -2970,7 +3000,10 @@ async fn interrupting_a_prompt_held_before_dispatch_reports_it_collected() {
             .turn_interrupt(
                 operation_context(),
                 &binding,
-                forge_provider_api::CancelRequest { scope },
+                forge_provider_api::CancelRequest {
+                    scope,
+                    input: forge_provider_api::operations::InterruptInput::Retain,
+                },
             )
             .await;
         assert!(
@@ -3053,7 +3086,10 @@ async fn unacknowledged_input_cannot_outlive_its_interrupt() {
     let interrupt = provider.turn_interrupt(
         operation_context(),
         &binding,
-        forge_provider_api::CancelRequest { scope },
+        forge_provider_api::CancelRequest {
+            scope,
+            input: forge_provider_api::operations::InterruptInput::Retain,
+        },
     );
     let started = tokio::time::timeout(std::time::Duration::from_secs(120), async {
         let _ = interrupt.await;
@@ -3126,6 +3162,109 @@ impl ClaudeLauncher for TranscriptlessLauncher {
             process: None,
         })
     }
+}
+
+/// Expose a fixture transcript directory through the same boundary as the installed CLI.
+struct RecoveryLauncher {
+    peer: Arc<PeerLauncher>,
+    projects: std::path::PathBuf,
+}
+
+#[async_trait]
+impl ClaudeLauncher for RecoveryLauncher {
+    fn available(&self) -> bool {
+        self.peer.available()
+    }
+
+    fn executable(&self) -> std::path::PathBuf {
+        self.peer.executable()
+    }
+
+    async fn version(
+        &self,
+        context: &forge_provider_api::OperationContext,
+    ) -> Result<String, ProviderError> {
+        self.peer.version(context).await
+    }
+
+    fn transcript_projects(&self) -> Option<std::path::PathBuf> {
+        Some(self.projects.clone())
+    }
+
+    fn launch(&self, spec: &LaunchSpec) -> Result<super::transport::ProcessIo, ProviderError> {
+        self.peer.launch(spec)
+    }
+}
+
+/// Finish durable recovery before publishing the reopened binding or admitting a new prompt.
+#[tokio::test]
+async fn reopened_binding_repairs_a_pending_stop_before_admission() -> anyhow::Result<()> {
+    use super::recovery::{RepairIntent, RepairJournal};
+    let root = tempfile::tempdir()?;
+    let runtime = root.path().join("runtime");
+    let projects = root.path().join("projects");
+    let workspace = projects.join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    let session = uuid::Uuid::new_v4();
+    let retained = uuid::Uuid::new_v4();
+    let stopped = uuid::Uuid::new_v4();
+    let transcript = workspace.join(format!("{session}.jsonl"));
+    let saved = [
+        json!({"type":"assistant","uuid":retained,"parentUuid":null}),
+        json!({"type":"user","uuid":stopped,"parentUuid":retained}),
+        json!({"type":"last-prompt","leafUuid":stopped}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(&transcript, format!("{saved}\n"))?;
+    let journal = RepairJournal::new(&runtime, projects.clone(), &session.to_string()).unwrap();
+    let mut request = session_request(root.path());
+    journal.save(&RepairIntent {
+        scope: forge_provider_api::InvocationScope::new(request.thread_id.clone(), "cancelled"),
+        inputs: vec![stopped],
+        retained: Some(retained),
+        unanswered: true,
+    })?;
+    let native = PeerLauncher::new(move || {
+        let mut answer = answering_peer(&["ready"]);
+        let transcript = transcript.clone();
+        let saved = saved.clone();
+        Box::new(move |frame| {
+            if frame["request"]["subtype"] == "rewind_conversation" {
+                assert_eq!(frame["request"]["target_message_uuid"], stopped.to_string());
+                let marker = json!({"type":"last-prompt","leafUuid":retained,"rewound":true,"cutUuid":stopped});
+                std::fs::write(&transcript, format!("{saved}\n{marker}\n")).unwrap();
+                return Some(vec![success(
+                    frame["request_id"].clone(),
+                    json!({
+                        "rewound":true,"targetMessageUuid":stopped,
+                    }),
+                )]);
+            }
+            answer(frame)
+        })
+    });
+    let provider = ClaudeProvider::with_launcher(
+        Arc::new(RecoveryLauncher {
+            peer: native,
+            projects,
+        }),
+        runtime,
+    );
+    request.history = forge_provider_api::SessionHistory::Durable {
+        resume: Some(session.to_string().try_into()?),
+    };
+    let mut opened = provider.thread_open(operation_context(), request).await?;
+    assert!(journal.load()?.is_none());
+    let answer = run_turn(&provider, &mut opened, "next", false).await;
+    assert!(matches!(
+        answer.result().outcome(),
+        forge_provider_api::turn::TurnOutcome::Completed { .. }
+    ));
+    provider.shutdown(operation_context()).await?;
+    Ok(())
 }
 
 /// Name how each recorded launch opened its conversation.
@@ -3727,7 +3866,10 @@ async fn stale_steer_start_reports_nothing_to_a_successor() {
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -3919,7 +4061,10 @@ async fn stop_a_follow_up_steer(directory: &std::path::Path) -> StoppedFollowUp 
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();
@@ -4061,7 +4206,10 @@ async fn a_steer_turn_stopped_before_any_answer_is_withdrawn() {
         .turn_interrupt(
             operation_context(),
             &binding,
-            forge_provider_api::CancelRequest { scope },
+            forge_provider_api::CancelRequest {
+                scope,
+                input: forge_provider_api::operations::InterruptInput::Retain,
+            },
         )
         .await
         .unwrap();

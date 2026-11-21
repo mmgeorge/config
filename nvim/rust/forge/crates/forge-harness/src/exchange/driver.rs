@@ -65,6 +65,7 @@ pub(super) const OWNER_QUEUE_CAPACITY: usize = forge_protocol::MAX_PENDING_FRAME
 /// Carry the current command and steering gate for one owner intake decision.
 struct OwnerIntake<'a> {
     active: Option<&'a mut ActiveCommand>,
+    foreground_target: Option<super::queue::StopTarget>,
     steering: SteeringAdmission,
 }
 

@@ -982,6 +982,7 @@ impl EventFixtureProvider {
             interrupt_settlement(binding.clone()).await?;
         }
         Ok(TurnInterruptResult {
+            withdrawn: None,
             operation_id: context.id().clone(),
             thread_id: request.scope.owner().thread_id(),
             turn_id: request.scope.turn_id().map_err(|_| {
@@ -1723,6 +1724,8 @@ impl Provider for EventFixtureProvider {
                                     &cleanup_binding,
                                     CancelRequest {
                                         scope: cleanup_scope,
+                                        input:
+                                            forge_provider_api::operations::InterruptInput::Retain,
                                     },
                                 )
                                 .await

@@ -438,7 +438,7 @@ impl ClaudeSessionState {
                 .is_none();
             let active = active
                 .as_mut()
-                .filter(|_| !ending)
+                .filter(|active| !ending && !active.interrupting)
                 .ok_or_else(|| provider_failure(ProviderFailureKind::WrongInvocation))?;
             active.commands.push(uuid.to_owned());
         }
@@ -556,6 +556,17 @@ impl ClaudeSessionState {
             }
             None => false,
         }
+    }
+
+    /// Get the written command identities after steering admission has been fenced.
+    pub(crate) async fn interrupt_commands(&self, scope: &InvocationScope) -> Vec<String> {
+        self.active
+            .read()
+            .await
+            .as_ref()
+            .filter(|active| &active.address.scope == scope)
+            .map(|active| active.commands.clone())
+            .unwrap_or_default()
     }
 
     /// Report whether native observations established the active turn.

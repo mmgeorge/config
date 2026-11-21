@@ -94,6 +94,7 @@ pub(super) enum TransitionOutcome {
 struct InvocationCollection {
     engine: std::sync::Arc<crate::provider::session_execution::SessionExecution>,
     scope: crate::provider::InvocationScope,
+    input: forge_provider_api::operations::InterruptInput,
     collection: std::sync::Arc<
         std::sync::Mutex<Option<crate::provider::session_execution::ExchangeCollection>>,
     >,
@@ -236,6 +237,7 @@ impl ExchangeStop {
         foreground: &TurnStatus,
         broker: &mut HarnessBroker,
         session: &str,
+        input: forge_provider_api::operations::InterruptInput,
     ) -> Result<(), TransitionFailure> {
         self.target_capture = TargetCapture::Admission;
         let owner = crate::provider::ThreadOwner::root(session);
@@ -257,6 +259,7 @@ impl ExchangeStop {
         self.invocation = scope.map(|scope| InvocationCollection {
             engine,
             scope,
+            input,
             collection: Default::default(),
         });
         Ok(())
@@ -644,6 +647,7 @@ impl ExchangeStop {
                             Ok::<_, TransitionFailure>(InvocationCollection {
                                 engine,
                                 scope,
+                                input: forge_provider_api::operations::InterruptInput::Retain,
                                 collection: Default::default(),
                             })
                         })
@@ -728,16 +732,11 @@ impl ExchangeStop {
                         self.intent.collected_status(true),
                     )
                     .map_err(transition_failure)?;
-                self.foreground_signals.push_back(
-                    crate::broker::ForegroundSignal::CollectionCompleted(match self.intent {
-                        StopIntent::Cancel(_) => {
-                            crate::broker::ForegroundCollection::Cancel(self.intent.input())
-                        }
-                        StopIntent::Reconfigure { .. } => {
-                            crate::broker::ForegroundCollection::Restart
-                        }
-                    }),
-                );
+                self.foreground_signals
+                    .push_back(collection_completed_signal(
+                        self.intent,
+                        self.invocation.as_ref(),
+                    ));
                 Ok(TransitionProgress::Waiting {
                     events,
                     input: None,
@@ -1280,12 +1279,7 @@ impl RetainedTransition {
 
     /// Report actual retained collection to the same foreground reducer as normal completion.
     pub(super) fn collection_completed_signal(&self) -> crate::broker::ForegroundSignal {
-        crate::broker::ForegroundSignal::CollectionCompleted(match self.intent {
-            StopIntent::Cancel(_) => {
-                crate::broker::ForegroundCollection::Cancel(self.intent.input())
-            }
-            StopIntent::Reconfigure { .. } => crate::broker::ForegroundCollection::Restart,
-        })
+        collection_completed_signal(self.intent, self.invocation.as_ref())
     }
 
     /// Join already-started checkpoint/observation work after host interruption is requested.
@@ -1603,6 +1597,22 @@ impl TransitionEvent {
     }
 }
 
+/// Carry exact native withdrawal evidence with the foreground collection outcome.
+fn collection_completed_signal(
+    intent: StopIntent,
+    invocation: Option<&InvocationCollection>,
+) -> crate::broker::ForegroundSignal {
+    let withdrawn = invocation.and_then(|invocation| {
+        let proof = invocation.collection.lock().ok()?;
+        proof.as_ref()?.withdrawn.clone()
+    });
+    let disposition = match intent {
+        StopIntent::Cancel(_) => crate::broker::ForegroundCollection::Cancel(intent.input()),
+        StopIntent::Reconfigure { .. } => crate::broker::ForegroundCollection::Restart,
+    };
+    crate::broker::ForegroundSignal::CollectionCompleted(disposition, withdrawn)
+}
+
 /// Collect native callbacks, child work, and the selected check without mutable broker access.
 async fn collect_resources(
     services: &OwnerServices,
@@ -1624,7 +1634,11 @@ async fn collect_resources(
         .await
         .map_err(collection_failure);
     let native = match invocation {
-        Some(invocation) => match invocation.engine.collect_exchange(invocation.scope).await {
+        Some(invocation) => match invocation
+            .engine
+            .collect_exchange(invocation.scope, invocation.input)
+            .await
+        {
             Ok(collection) => match invocation.collection.lock() {
                 Ok(mut slot) => {
                     *slot = Some(collection);

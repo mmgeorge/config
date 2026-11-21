@@ -2,6 +2,7 @@
 
 use super::conversation::{ClaudeConversation, ConversationOptions, failure, wait_command};
 use super::process::{ClaudeLauncher, ProcessLauncher, SessionStart};
+use super::recovery::{RepairIntent, RepairJournal, RepairStatus};
 use super::session::{ClaudeSessionState, timestamp};
 use super::wire::control::{OutboundControl, RewindRefusal, RewindResponse};
 use super::wire::stdin::UserInput;
@@ -85,6 +86,7 @@ struct ClaudeBinding {
     binding: SessionBinding,
     owner: ThreadId,
     conversation: Arc<ClaudeConversation>,
+    repair: Option<RepairJournal>,
     state: Arc<ClaudeSessionState>,
     sink: ProviderEventSink,
     cleanup: ResourceCleanup,
@@ -584,7 +586,13 @@ impl ClaudeProvider {
         scope: forge_provider_api::InvocationScope,
     ) -> Result<(), ProviderError> {
         match self
-            .cancel_invocation(binding, forge_provider_api::CancelRequest { scope })
+            .cancel_invocation(
+                binding,
+                forge_provider_api::CancelRequest {
+                    scope,
+                    input: forge_provider_api::operations::InterruptInput::Retain,
+                },
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -595,6 +603,60 @@ impl ClaudeProvider {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Reconcile a checkpoint fork's source before the fork helper can read its history.
+    async fn repair_fork_source(
+        &self,
+        source: &str,
+        journal: &RepairJournal,
+        options: &ConversationOptions,
+    ) -> Result<(), ProviderError> {
+        const OPERATION: ProviderOperation = ProviderOperation::ThreadFork;
+        let live = self
+            .bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .find(|binding| binding.conversation.id() == source)
+            .cloned();
+        if let Some(live) = live {
+            let _operation = live.operation.lock().await;
+            live.require_idle(OPERATION).await?;
+            return reconcile_stopped_input(&live.conversation, journal, OPERATION).await;
+        }
+        let cleanup = self.cleanup.scope();
+        let result = async {
+            let conversation = ClaudeConversation::open(
+                self.launcher.clone(),
+                Arc::new(ClaudeSessionState::new(self.admission.clone())),
+                source.to_owned(),
+                SessionStart::Resume {
+                    session_id: source.to_owned(),
+                    resume_at: None,
+                    drops_turn: None,
+                },
+                options.clone(),
+                self.unstarted_sessions.clone(),
+                &cleanup,
+            )
+            .await?;
+            reconcile_stopped_input(&conversation, journal, OPERATION).await
+        }
+        .await;
+        match (result, cleanup.shutdown().await) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(error), Err(cleanup)) => Err(with_cleanup(error, vec![cleanup])),
+        }
+    }
+
+    /// Resolve Claude's versioned repair record for a durable native conversation.
+    fn repair_journal(&self, session: &str) -> Option<RepairJournal> {
+        RepairJournal::new(
+            &self.runtime_root,
+            self.launcher.transcript_projects()?,
+            session,
+        )
     }
 
     /// Get the exact retained binding generation without opening a replacement.
@@ -941,6 +1003,9 @@ impl ClaudeProvider {
         let retained = Arc::new(ClaudeBinding {
             binding: binding.clone(),
             owner: request.thread_id.clone(),
+            repair: (!isolated)
+                .then(|| self.repair_journal(conversation.id()))
+                .flatten(),
             conversation: Arc::new(conversation),
             state,
             sink,
@@ -960,6 +1025,19 @@ impl ClaudeProvider {
             ledger: Mutex::new(Vec::new()),
             fork_point: std::sync::Mutex::new(None),
         });
+        if let Some(journal) = retained.repair.as_ref()
+            && let Err(error) = reconcile_stopped_input(
+                &retained.conversation,
+                journal,
+                ProviderOperation::ThreadOpen,
+            )
+            .await
+        {
+            return Err(match cleanup.shutdown().await {
+                Ok(()) => error,
+                Err(collection) => with_cleanup(error, vec![collection]),
+            });
+        }
         self.bindings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1156,6 +1234,18 @@ impl ClaudeProvider {
                 provider_session_id,
                 checkpoint,
             } => {
+                if let Some(journal) = self.repair_journal(provider_session_id.as_str())
+                    && journal
+                        .load()
+                        .map_err(|error| {
+                            super::recovery::failure(ProviderOperation::ThreadFork, error)
+                        })?
+                        .is_some()
+                {
+                    let _history = self.history_admission.lock().await;
+                    self.repair_fork_source(provider_session_id.as_str(), &journal, &options)
+                        .await?;
+                }
                 super::conversation::fork_session(
                     &*self.launcher,
                     &self.unstarted_sessions,
@@ -1818,6 +1908,60 @@ impl ClaudeProvider {
     }
 }
 
+/// Recover a stopped input and require its saved active branch to prove the cut.
+async fn reconcile_stopped_input(
+    conversation: &ClaudeConversation,
+    journal: &RepairJournal,
+    operation: ProviderOperation,
+) -> Result<(), ProviderError> {
+    let report = |error| super::recovery::failure(operation, error);
+    let Some(intent) = journal.load().map_err(report)? else {
+        return Ok(());
+    };
+    let RepairStatus::Cut { target, last_input } = journal.status(&intent).map_err(report)? else {
+        return journal.clear().map_err(report);
+    };
+    let result = conversation
+        .request(
+            operation,
+            OutboundControl::RewindConversation {
+                target_message_uuid: target.to_string(),
+                last_seen_user_message_uuid: last_input.to_string(),
+            },
+        )
+        .await?;
+    let response: RewindResponse =
+        serde_json::from_value(result).map_err(|error| report(error.into()))?;
+    if !response.rewound
+        || response.target_message_uuid.as_deref() != Some(target.to_string().as_str())
+    {
+        return Err(report(anyhow::anyhow!(
+            "Claude refused stopped-input repair: {}",
+            response.error.unwrap_or_default()
+        )));
+    }
+    // Claude acknowledges an in-memory cut before its transcript writer flushes the branch.
+    let persisted = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match journal.status(&intent) {
+                Ok(RepairStatus::Clean) => return journal.clear().map_err(report),
+                Ok(RepairStatus::Cut {
+                    target: pending, ..
+                }) if pending == target => {}
+                Ok(RepairStatus::Cut { .. }) => {
+                    return Err(report(anyhow::anyhow!(
+                        "Claude changed the pending repair boundary"
+                    )));
+                }
+                Err(error) => return Err(report(error)),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    persisted.map_err(|_| report(anyhow::anyhow!("Claude did not save the repaired branch")))?
+}
+
 /// Apply an exclusive cut on the live CLI and require it to confirm the requested target.
 async fn rewind_live(
     session: &ClaudeBinding,
@@ -2077,6 +2221,9 @@ async fn withdraw_unanswered_request(
     session: &ClaudeBinding,
     operation: ProviderOperation,
 ) -> Result<(), ProviderError> {
+    if let Some(journal) = session.repair.as_ref() {
+        reconcile_stopped_input(&session.conversation, journal, operation).await?;
+    }
     let mut ledger = session.ledger.lock().await;
     let Some(unanswered) = ledger.last().filter(|turn| turn.unanswered) else {
         return Ok(());
@@ -2415,6 +2562,7 @@ impl forge_provider_api::provider::Provider for ClaudeProvider {
                         .await?;
                     let session = provider.binding(&binding, ProviderOperation::TurnInterrupt)?;
                     Ok(forge_provider_api::TurnInterruptResult {
+                        withdrawn: None,
                         operation_id,
                         thread_id: request.scope.thread_id.clone(),
                         turn_id: request.scope.turn_id().map_err(|_| {
@@ -3122,6 +3270,20 @@ async fn run_prompt(
             end = &mut turn_end => end,
             _ = cancellation.cancelled() => {
                 session.state.mark_interrupting(&request.scope).await;
+                if let Some(journal) = session.repair.as_ref() {
+                    let _steering = session.steering.write().await;
+                    let commands = session.state.interrupt_commands(&request.scope).await;
+                    if !commands.is_empty() {
+                        let intent = RepairIntent {
+                            scope: request.scope.clone(),
+                            unanswered: false,
+                            inputs: commands.iter().map(|command| uuid::Uuid::parse_str(command))
+                                .collect::<Result<_, _>>().map_err(|error| super::recovery::failure(ProviderOperation::TurnInterrupt, error.into()))?,
+                            retained: follows.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()),
+                        };
+                        journal.save(&intent).map_err(|error| super::recovery::failure(ProviderOperation::TurnInterrupt, error))?;
+                    }
+                }
                 let interrupted = async {
                     if let Err(error) = session.conversation.interrupt().await {
                         session.invalidate(error).await;
@@ -3150,6 +3312,29 @@ async fn run_prompt(
             }
         };
         let _steering_boundary = session.steering.write().await;
+        let repaired = if let Some(journal) = session.repair.as_ref()
+            && let Some(mut intent) = journal.load().map_err(|error| super::recovery::failure(ProviderOperation::TurnInterrupt, error))?
+        {
+            if end.outcome == forge_provider_api::turn::TurnOutcome::Interrupted && end.unanswered {
+                intent.unanswered = true;
+                if let Some(checkpoint) = end.checkpoint.as_deref() {
+                    intent.retained = uuid::Uuid::parse_str(checkpoint).ok();
+                }
+                journal.save(&intent).map_err(|error| super::recovery::failure(ProviderOperation::TurnInterrupt, error))?;
+                if let Err(error) = reconcile_stopped_input(
+                    &session.conversation, journal, ProviderOperation::TurnInterrupt,
+                ).await {
+                    session.invalidate(error.clone()).await;
+                    return Err(error);
+                }
+                true
+            } else {
+                journal.clear().map_err(|error| super::recovery::failure(ProviderOperation::TurnInterrupt, error))?;
+                false
+            }
+        } else {
+            false
+        };
         if end.outcome == forge_provider_api::turn::TurnOutcome::Interrupted
             && !session.state.execution_started().await
         {
@@ -3158,7 +3343,9 @@ async fn run_prompt(
             // history, which the next prompt must not follow.
             if end.unanswered {
                 session.conversation.observe_turn();
-                record_ledger_turn(&session, &end, follows, true).await;
+                if !repaired {
+                    record_ledger_turn(&session, &end, follows, true).await;
+                }
             }
             return Err(ProviderError::Cancelled);
         }
@@ -3175,7 +3362,9 @@ async fn run_prompt(
         let _ = session.state.take_completion().await;
         let unanswered = end.outcome == forge_provider_api::turn::TurnOutcome::Interrupted
             && (end.unanswered || end.checkpoint.is_none());
-        record_ledger_turn(&session, &end, follows, unanswered).await;
+        if !repaired || end.checkpoint.is_some() {
+            record_ledger_turn(&session, &end, follows, unanswered && !repaired).await;
+        }
         let checkpoint = end
             .checkpoint
             .clone()

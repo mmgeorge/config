@@ -186,6 +186,18 @@ impl TurnTransaction {
         }
     }
 
+    /// Determine whether the foreground permits native draft withdrawal before collection starts.
+    pub(crate) fn output_free(&self) -> bool {
+        match self {
+            Self::Running { transaction, .. } | Self::Finalizing { transaction, .. } => transaction
+                .state
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.retraction_eligibility.is_output_free()),
+            Self::Admitting(_) | Self::Done(_) | Self::Transitioning => false,
+        }
+    }
+
     /// Get how far this turn's provider send has progressed.
     pub(crate) fn dispatch_stage(&self) -> DispatchStage {
         match self {
@@ -1987,12 +1999,26 @@ impl HarnessBroker {
                 &mut self.submitted_attachments,
                 admission.attachments.clone(),
             );
+            let plan_before = self.store.list_plan(&self.session.id)?;
+            let execution_before = self.store.list_plan_execution(&self.session.id)?;
             let staged = if let Some((mode, display, input)) = admission.local_interaction.take() {
                 self.stage_foreground_interaction(&admission.text, mode, display.as_ref(), input)
             } else {
                 self.normalize_foreground_interaction(admission)
             };
             self.submitted_attachments = previous;
+            if let Some(submission) = admission.submission.as_mut() {
+                submission.snapshot.plan = super::PromptArtifactChange::capture(
+                    plan_before,
+                    self.store.list_plan(&self.session.id)?,
+                    |plan| &plan.id,
+                )?;
+                submission.snapshot.execution = super::PromptArtifactChange::capture(
+                    execution_before,
+                    self.store.list_plan_execution(&self.session.id)?,
+                    |execution| &execution.id,
+                )?;
+            }
             let mut staged = match staged {
                 // A refused prompt settles like a rejected command: no turn ran, so none fails
                 // and the provider is not restarted, and the response carries the reason.

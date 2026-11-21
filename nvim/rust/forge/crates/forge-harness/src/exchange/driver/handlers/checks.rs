@@ -141,6 +141,12 @@ impl ExchangeDriver {
             &mut state.pending,
             OwnerIntake {
                 active: state.command.as_mut(),
+                foreground_target: state.foreground.as_ref().map(|turn| {
+                    crate::exchange::queue::StopTarget {
+                        foreground: turn.id,
+                        invocation: turn.transaction.invocation_scope().ok().flatten(),
+                    }
+                }),
                 steering: SteeringAdmission::from(state.foreground.as_ref()),
             },
             &mut state.command_messages,

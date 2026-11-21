@@ -737,7 +737,22 @@ async fn retracted_first_prompt_keeps_the_conversation_it_opened() -> Result<()>
     let mut fixture =
         slow_collection_fixture(Duration::ZERO, CollectionBoundary::ActiveAfterUserEcho).await?;
     let scenario = async {
+
+        let request = Request { id: 124, method: "session.configure".into(),
+            params: json!({"tool_timeout":{"amount":43,"unit":"s"},"approval_timeout":{"amount":45,"unit":"s"}}) };
+        let before = fixture.controller.broker.lock().await.snapshot()?.session;
+        let command = super::super::native_settings::decode_command(&request)?;
+        fixture.controller.exchange_owner.execute_identified(command,fixture.sink.clone()).await?;
+        let configured = fixture.controller.broker.lock().await.snapshot()?.session;
+        assert_ne!(before.tool_timeout,configured.tool_timeout, "tool timeout was unchanged before retraction");
+        assert_ne!(before.approval_timeout,configured.approval_timeout, "approval timeout was unchanged before retraction");
         fixture.retract_echoed_prompt().await?;
+        let after = fixture.controller.broker.lock().await.snapshot()?.session;
+        assert_eq!(after.approval_timeout,configured.approval_timeout,"retraction lost approval timeout");
+        assert_eq!(after.tool_timeout,configured.tool_timeout,"retraction lost the configured tool timeout");
+        use crate::session::SessionStore;
+        let stored = SqliteStore::read_only(&fixture.controller.data_root)?.load_session(&after.id)?.context("missing session")?;
+        assert_eq!(stored.tool_timeout,configured.tool_timeout,"retraction persisted the old tool timeout");
         fixture.run_prompt(802, "Answered prompt").await?;
         fixture.ensure_conversation_retained().await
     }

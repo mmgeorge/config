@@ -191,6 +191,10 @@ pub(crate) trait ClaudeLauncher: Send + Sync {
         &self,
         context: &forge_provider_api::OperationContext,
     ) -> Result<String, ProviderError>;
+    /// Locate durable native transcripts when the launcher's transport has a filesystem history.
+    fn transcript_projects(&self) -> Option<PathBuf> {
+        None
+    }
     /// Start one CLI process.
     fn launch(&self, spec: &LaunchSpec) -> Result<ProcessIo, ProviderError>;
 }
@@ -223,6 +227,14 @@ impl ProcessLauncher {
 
 #[async_trait]
 impl ClaudeLauncher for ProcessLauncher {
+    fn transcript_projects(&self) -> Option<PathBuf> {
+        let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|home| home.join(".claude")))?;
+        Some(config.join("projects"))
+    }
+
     fn available(&self) -> bool {
         self.program()
             .is_some_and(|(program, _)| std::path::Path::new(program).is_file())

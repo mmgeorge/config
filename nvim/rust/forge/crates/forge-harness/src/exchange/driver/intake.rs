@@ -15,6 +15,7 @@ impl ExchangeDriver {
     ) {
         let OwnerIntake {
             active,
+            foreground_target,
             steering: steering_admission,
         } = admission;
         let OwnerUpdateContext {
@@ -733,8 +734,14 @@ impl ExchangeDriver {
                 } else {
                     active.map(ActiveCommand::queued_mut)
                 };
+                let stop_target = if matches!(request.command, Command::CancelExchange(_)) {
+                    foreground_target
+                } else {
+                    None
+                };
                 self.commands.admit(
                     CommandAdmission {
+                        stop_target,
                         request,
                         reply,
                         task_admission,
