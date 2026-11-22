@@ -187,6 +187,17 @@ T["skill_marker_aligns_with_commentary"] = function()
   eq(skill_entry.metadata.layout.indent, commentary_entry.metadata.layout.indent)
   eq(tool_entry.metadata.layout.indent, skill_entry.metadata.layout.indent + 2)
   request("session.provider.mock_response", { operation = "release", id = "skill-visible" })
+  -- Instruction and skill rows both activate a file action carrying the recorded absolute path.
+  local skill_row = buffer.find_row(state.transcript_buf, "Skill · fixture")
+  vim.api.nvim_set_current_win(state.transcript_win)
+  vim.api.nvim_win_set_cursor(state.transcript_win, { skill_row, 0 })
+  keymap.invoke("<CR>")
+  local expected = vim.fs.normalize(skill_path)
+  wait_until(function()
+    return vim.fs.normalize(vim.api.nvim_buf_get_name(0)) == expected
+  end, "Enter did not open the recorded skill path", { timeout_ms = 1200 })
+  keymap.invoke(",")
+  eq(vim.api.nvim_get_current_buf(), state.transcript_buf)
   eq(host.stop(), true)
 end
 

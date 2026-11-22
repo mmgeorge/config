@@ -4,7 +4,7 @@ local M = {}
 local severity_types = { error = "E", warning = "W", info = "I", hint = "I" }
 
 ---@class ForgeHarnessSourceAction
----@field path string Repository-relative source file.
+---@field path string Absolute or workspace-relative source file.
 ---@field line? number One-based line, when known.
 ---@field column? number One-based UTF-8 byte column, when known.
 
@@ -16,11 +16,20 @@ local severity_types = { error = "E", warning = "W", info = "I", hint = "I" }
 ---@field title string
 ---@field items ForgeHarnessQuickfixItem[]
 
+---@param workspace string
+---@param path string
+---@return string
+local function source_path(workspace, path)
+  local normalized = vim.fs.normalize(path, { expand_env = false })
+  if vim.fs.abspath(normalized) == normalized then return normalized end
+  return vim.fs.joinpath(workspace, path)
+end
+
 ---Open a source location, clamping stale coordinates to the current file.
 ---@param workspace string
 ---@param action ForgeHarnessSourceAction
 function M.open_file(workspace, action)
-  local path = vim.fs.joinpath(workspace, action.path)
+  local path = source_path(workspace, action.path)
   if vim.fn.filereadable(path) ~= 1 then
     notifications.warn("Source file is no longer available: " .. path, "ForgeHarness")
     return
@@ -59,7 +68,7 @@ function M.quickfix(workspace, action)
   local items = {}
   for _, item in ipairs(action.items) do
     items[#items + 1] = {
-      filename = vim.fs.joinpath(workspace, item.path),
+      filename = source_path(workspace, item.path),
       lnum = type(item.line) == "number" and item.line or 0,
       col = type(item.column) == "number" and item.column or 0,
       text = item.message,
