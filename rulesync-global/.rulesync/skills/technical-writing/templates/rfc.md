@@ -1,69 +1,59 @@
 # RFC and Proposal Profile
 
-*Read when proposing a major design change, a new technology, an API redesign, or an engineering strategy.*
+*Read when proposing a major design change, a new subsystem, an API redesign, or an engineering strategy.*
 
-## Main Claim
+## Goal
 
-The proposal shows that its design meets the stated goals better than the alternatives, and records its costs, its risks, and the evidence still needed.
-
-### Example main claims
-
-These examples compare a proposal against an existing design or alternative. Use them as alternatives to adapt, not a checklist.
-
-- "Replacing polling with webhooks meets the one-second update target with fewer requests than polling."
-- "A shared connection pool meets the concurrency target with fewer database connections than per-worker pools."
-- "Supporting both credential formats during migration preserves client compatibility without the coordinated cutover required by an immediate format switch."
+Demonstrate that a proposed design satisfies measurable goals better than credible alternatives, while stating its costs, new failure modes, migration plan, and open questions honestly so reviewers can make an informed accept/reject decision.
 
 ## Sections
 
 Write these sections in order.
 
-### 1. Problem
+### Problem
 
-- Describe the use cases, bottlenecks, or user problems behind the proposal.
-- Describe what it costs to keep things as they are.
+- Describe the concrete user pain, bottleneck, or architectural limitation and what it costs to leave the current system unchanged.
 
-### 2. Goals and criteria
+### Goals, Non-Goals, and Criteria
 
-- List the measurable goals the proposal must meet.
-- List the non-goals, so reviewers know what is out of scope.
-- Name the criteria used to compare options, such as latency, durability, or backward compatibility.
+- State measurable goals the solution must hit and explicit non-goals so scope stays bounded.
+- Name the criteria used to compare options (such as p99 latency, memory ceiling, rollout risk, or backward compatibility).
 
-### 3. Proposal
+### Proposal
 
-- Show what users will see first, such as commands, API calls, or configuration.
-- Then describe the design: which part owns what, the states data passes through, the data formats, and how work runs in parallel.
-- State what stays true when something fails and the system recovers.
+- Show the caller-facing contract first (API, CLI, config, or workflow), then explain internal ownership, state transitions, concurrency, and failure recovery.
 
-### 4. Alternatives
+### Alternatives
 
-- Compare each alternative against the same criteria, in a table when that helps, and say why it falls short.
+- Compare each serious alternative against the same criteria—using a table when comparing three or more dimensions—and explain where each falls short.
 
-### 5. Risks
+### Risks and Mitigations
 
-- Describe new failure modes, added cost, operational work, and security exposure, and how each one is reduced.
+- List new failure modes, operational overhead, performance costs, or security exposure introduced by the design, paired with concrete mitigations.
 
-### 6. Migration
+### Migration and Rollback
 
-- Explain what stays compatible, how data formats change, and when old behavior is removed.
-- Describe how data moves without downtime and how to roll back.
+- Explain backward compatibility, data or schema transitions, cutover sequencing, and how to roll back safely if production metrics regress.
 
-### 7. Open questions
+### Open Questions
 
-- List the questions reviewers must settle before accepting the proposal.
-- Describe the prototype, benchmark, or experiment that will answer any uncertain claim.
+- List unresolved questions reviewers must settle before approval and the prototype or measurement needed to answer each uncertain claim.
 
-## Leave out
+## Leave Out
 
-- Do not include task tickets or checklists. Those belong in an implementation plan after the proposal is accepted.
-- Do not make claims the criteria cannot check, such as "this approach is far better."
+- Sprint checklists or task breakdowns (those belong in an implementation plan after approval).
+- Unverifiable claims ("this approach is much cleaner and faster").
 
 ## Example
 
-A shortened proposal:
-
-> Clients learn about document changes by polling the server every 30 seconds, so collaborators see each other's edits up to 30 seconds late, and polling makes up 60% of server requests. This proposal replaces polling with webhooks. The goal is to show changes within one second without adding server load. Moving existing third-party integrations off polling is out of scope.
+> ### Replace 30-Second Document Polling with Push Webhooks
 >
-> Clients register a callback URL when they open a document, and the server calls it with each change. In a test with 200 clients, changes arrived in 400 ms on average and server requests fell by half. Long polling also met the one-second goal, but it holds one open connection per client and doubled memory use in the same test.
+> Collaborators currently discover document changes by polling the server every 30 seconds. That polling delay leaves concurrent editors up to half a minute out of sync and accounts for 60% of total API request volume.
 >
-> Webhooks add a new way to fail: a client behind a firewall cannot receive callbacks. Those clients keep polling until they can register a reachable URL. Before this proposal is accepted, we need to measure how many current clients sit behind such firewalls.
+> **Goals and scope:** Deliver document change notifications within 1 second while cutting notification request volume by at least 40%. Third-party legacy integrations remain on polling and are out of scope. Options are compared on delivery latency, server memory per active client, and firewall resilience.
+>
+> **Proposal:** When a client opens a document, it registers a callback URL with the notification service; on every committed edit, the service pushes a signed event payload to subscribed URLs with three retries over 10 seconds. In a 200-client load test, median delivery latency dropped to 400 ms and total server requests fell by 52%.
+>
+> **Alternatives:** Long polling met the 1-second delivery goal in the same 200-client benchmark, but holding an open HTTP connection per client doubled server memory usage and complicates rolling restarts.
+>
+> **Risks and open questions:** Clients behind restrictive corporate firewalls cannot receive inbound webhook calls and must fall back to polling automatically when registration health checks fail. Before approving rollout, we need telemetry on what fraction of active clients sit behind unreachable NATs or firewalls.

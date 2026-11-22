@@ -2,47 +2,39 @@
 
 *Read when writing a runbook, an incident procedure, migration steps, or another guide to one task.*
 
-## Main Claim
+## Goal
 
-A reader who meets the stated prerequisites and follows the steps in order reaches one specific result.
-
-### Example main claims
-
-These examples state the result a procedure must produce. Use them as alternatives to adapt, not a checklist.
-
-- "These steps rotate production credentials without interrupting service."
-- "This procedure restores the database to a selected recovery point."
-- "Following these steps removes the deployment and its resources without affecting other applications."
+Enable a reader who meets the stated prerequisites to follow the steps in order and reach one verified result without guesswork or detours.
 
 ## Sections
 
 Write these sections in order.
 
-### 1. Result
+### Result
 
 - Say exactly what the reader has when they finish, such as "The production database uses a new password, with no downtime."
 
-### 2. Before you start
+### Before you start
 
 - List the tools, versions, and environment variables the reader needs.
 - List the permissions or roles they need.
 - Warn about any step that deletes data or cannot be undone, before the steps begin.
 
-### 3. Steps
+### Steps
 
 - Order the steps so each one depends only on the steps before it.
 - Give each step one action, starting with a verb such as "Deploy," "Export," or "Verify."
 - Give exact commands, paths, and settings the reader can copy. Put optional flags and notes under the command.
 
-### 4. Checks
+### Checks
 
 - After each important step, show the expected output, status code, or file, and a command that confirms it.
 
-### 5. Platform differences
+### Platform differences
 
 - Handle differences, such as macOS and Linux paths, inside the step where they occur.
 
-### 6. Troubleshooting
+### Troubleshooting
 
 - For each expected failure, give the exact error text, its cause, and the command that fixes it.
 

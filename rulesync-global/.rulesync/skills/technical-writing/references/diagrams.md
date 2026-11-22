@@ -8,7 +8,7 @@ Use a diagram when layout explains something faster than prose, such as how part
 
 - Put the diagram right next to the text that explains it.
 - State the point the reader should take from the diagram in the paragraph before it.
-- Never put a rule or contract only in a diagram. Repeat it in prose, alt text, or a table.
+- Never put a rule or contract only in a diagram. Repeat it in prose or a table.
 - Keep anything the reader may copy, such as names, commands, paths, and error codes, in text instead of in an image.
 
 ## One question per diagram
@@ -38,18 +38,26 @@ When a diagram tries to answer two unrelated questions, such as where things are
 - Use two labeled arrows instead of one double-headed arrow when each direction carries something different.
 - Draw a box around parts that are truly separate, such as different processes, trust zones, thread pools, or services, and label the box with what separates them.
 
+## UML Class Diagrams
+
+- Include only major architectural components and their key boundary methods using standard UML visibility (`+method`).
+- Put value payloads on arrow labels instead of adding separate boxes for small data structs.
+- Omit custom `<<...>>` lifetime stereotypes.
+
 ## Accessibility
 
 - Do not use color alone to carry meaning. Pair it with a shape, a line style, or a label.
 - Lay out hierarchy from top to bottom, and pipelines and request flows from left to right.
-- Give a rendered diagram alt text that describes the starting state, each step, and the result.
+- For static image files (PNG or SVG), provide alt text describing the starting state, each step, and the result. Omit `accTitle` and `accDescr` headers inside Mermaid blocks.
 
 ## Example
 
-The paragraph before the diagram states its point: a draft reaches the server only through the sync worker, and the worker deletes it only after the server confirms the save.
+The paragraph before the diagram states its point: a draft reaches the server only through the `SyncWorker`, and the worker deletes it from the `DraftJournal` only after the `DocumentApi` confirms persistence.
 
-```text
-Editor ──Draft──▶ DraftCache ──Draft──▶ SyncWorker ──SaveRequest──▶ DocumentServer
-                                            ▲                             │
-                                            └────────SaveConfirmed────────┘
+```mermaid
+flowchart LR
+    EditorView -->|DraftRecord| DraftJournal
+    DraftJournal -->|DraftRecord| SyncWorker
+    SyncWorker -->|POST DraftRecord| DocumentApi
+    DocumentApi -.->|200 Persisted| SyncWorker
 ```

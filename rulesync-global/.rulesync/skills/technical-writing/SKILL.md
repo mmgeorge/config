@@ -2,148 +2,126 @@
 name: technical-writing
 description: >-
   Author and revise technical documents, architectural overviews, RFCs,
-  specifications, reference docs, READMEs, API docstrings, and rustdoc. Use when creating or
-  editing standalone documentation files or docstrings. Source code comments
-  follow the active language skill.
+  specifications, reference docs, READMEs, API docstrings, and rustdoc. Use when
+  creating or editing standalone documentation files or docstrings. Source code
+  comments follow the active language skill.
 ---
 # Technical Writing
 
-Write for technically proficient readers. When audience context is unstated, address a developer who understands general software engineering but does not know this repository. Ground audience assumptions in the prompt, existing documentation, or repository context, and state unverified assumptions explicitly.
+Write for a technical reader who knows general systems engineering but does not know this codebase. Good technical writing is both **verifiable** and **readable**: it opens with the real constraint or failure mode the design solves, builds the mental model before dumping types or syntax, supports every claim with concrete evidence, and connects its paragraphs so the reader always knows *why* a boundary exists.
 
-## Claims
+Terse is not the same as clear. Stripping away causal explanations, motivating constraints, and synthesis sentences turns documentation into an obtuse checklist. Aim for precision and flow together.
 
-Technical writing asks readers to accept conclusions about a system: how it behaves, why a design satisfies its requirements, or whether a procedure achieves its goal. Treat those conclusions as **claims** that need support.
+## Lead with the Constraint, Not an Inventory
 
-A **claim** states what the reader should accept as true; its support explains why. Support can come from a directly verifiable fact, a measurement, or reasoning that connects several pieces of evidence. The broader the assertion, the more conditions the document must account for.
+Readers remember a design when they see what breaks without it. Open architectural and explanatory documents with the conflicting requirements or failure modes that force the structure, then show the mechanism and named components that resolve them. Compare against a realistic naive approach—such as autosaving straight from memory—rather than an unusable strawman no engineer would build, and avoid opening with a feature laundry list, a bare inventory of classes, or meta signposting ("This page documents...").
 
-Claims can be explicit or implied. An **explicit claim** appears in the text, such as:
+**Obtuse (front-loaded types, no failure mode):**
 
-- "These steps rotate the credentials without downtime."
-- "Retrying a failed upload never creates a duplicate record."
-- "The parser rejects input with an unknown version field."
-- "Webhooks cut sync delay from 30 seconds to under 1 second."
+> `IngestPipeline` connects `SocketReader` to `BatchWriter` through a bounded `ChunkChannel`.
 
-Some claims are better conveyed through evidence than stated outright, especially when an explicit assertion would sound promotional. These **implied claims** express judgments the writer intends readers to reach for themselves.
+**Readable (failure mode first, then the same named objects):**
 
-| Implied claim | What to show instead |
+> When storage stalls, an unbounded queue between network ingestion and disk writes exhausts process memory before backpressure reaches the client. Placing a bounded `ChunkChannel` between the `SocketReader` and the `BatchWriter` inside the `IngestPipeline` pauses socket reads automatically once memory reaches capacity.
+
+## Build Concepts Before Identifiers
+
+Introduce roles, lifetimes, modes, and ownership boundaries before showing raw structs, flags, or code signatures. When readers understand the shape of the system first, the code confirms their mental model instead of forcing them to reverse-engineer it.
+
+- **State ownership and lifetimes, then show the boundary type.** Say what each component owns and how long it lives—not just what actions it performs—before pasting a config struct or wire schema.
+- **Pair diagrams with the point they prove.** State the takeaway in the paragraph above a diagram, and show how secondary paths (such as retries, failover, or reloads) reuse the same contract when relevant.
+- **Order for a cold reader.** Readers often arrive from search or a cross-link rather than the previous page. Define unfamiliar domain terms on first use, place prerequisites before steps that depend on them, and put each mechanism beside its failure behavior.
+- **Give each topic one home.** Link to canonical pages instead of duplicating a contract in two places; split a page only when readers look up, maintain, or link its parts independently.
+
+## Support Claims with Evidence and Explicit Limits
+
+Technical documents ask readers to trust conclusions about how a system behaves, why a design satisfies its requirements, and what happens under failure. Back every conclusion—stated or implied—with verifiable evidence from source code, schemas, tests, traces, or measurements, and attach limits directly to the claim instead of appending vague disclaimers.
+
+- **Scope to one main claim:** Cut background facts or sections that do not help establish the document's core conclusion.
+- **State non-obvious links:** When evidence does not obviously prove a conclusion, spell out why it holds.
+- **Audit omissions:** Omitting a cost makes a recommendation read stronger than the evidence supports; omitting a failure condition makes a guarantee look unconditional.
+
+| Promotional or unsupported claim | Grounded evidence |
 | --- | --- |
-| "This change improves performance." | Compare measurements before and after the change, and state the test conditions. |
-| "This change reduces complexity." | Identify the dependencies, coordination steps, or background tasks it removes. |
-| "The system is robust." | Show recovery behavior, its verification, and the conditions it does not cover. |
-| "This design best fits the requirements." | Compare other alternatives, including its costs and limitations. |
+| *"This change improves performance."* | Compare latency or throughput before and after the change and state the workload. |
+| *"This change reduces complexity."* | Name the coordination steps, lock scopes, or background tasks it removes. |
+| *"The architecture is robust."* | Describe the recovery path, how tests verify it, and which failures still lose data. |
+| *"This design best fits the requirements."* | Compare the alternatives against the same criteria, including what the chosen option costs. |
 
-When supporting an implied claim, account for conclusions the reader may draw beyond the one intended. *Omitting a tradeoff can make a recommendation appear stronger than the evidence supports.* Omitting a failure condition can make a guarantee appear unconditional. Include the conditions, costs, and limitations that keep the implied claim within what the evidence establishes.
+Verify every symbol name, file path, flag, default, and error behavior against the implementation before writing it down. For API docs, inspect implementations, callers, and tests, and document only the caller contract.
 
-The **reader objective** is what the reader needs to do, decide, or understand. Use it to frame the document: choose the [document profile](#document-profiles), identify the claims to establish, and determine what belongs in scope.
+## Write Causal, Active Prose
 
-**Main claims** are the conclusions the document must establish to meet the reader's objective. They determine which supporting material belongs.
+Connect sentences and paragraphs by cause, contrast, or consequence. Open each paragraph with its point, substantiate it in the middle, and close on the invariant or transition that leads into the next paragraph.
 
-**Supporting claims** establish why a main claim holds. Each needs its own evidence and a clear connection to the main claim.
+**Choppy (disconnected facts):**
 
-Both main and supporting claims can be explicit or implied. Support each with:
+> `AccountWriter` updates the row in `PostgresStore`. Then it calls `RedisCache::delete`. Readers query `PostgresStore` on a miss.
 
-- **Evidence** the reader can check: facts, runtime behavior, schemas, code examples, or measurements.
-- **A warrant** when the link is not obvious: the reasoning that explains why the evidence proves the claim.
-- **A qualification** when the claim has limits: where it stops holding, attached to that claim instead of a generic disclaimer.
+**Readable (causal flow with the same named objects):**
 
-### Examples
+> The `AccountWriter` calls `RedisCache::delete` only *after* committing to the `PostgresStore`, so a concurrent reader cannot repopulate the cache with stale values before the commit becomes visible.
 
-For a reader who must rotate production credentials without interrupting service:
+### Common Prose Fixes
 
-- Objective: rotate production credentials without interrupting service.
-- Document profile: [How-to guide](templates/how-to.md), because the reader needs a procedure that produces a specific result.
-- Main claim: "Following these steps with the stated prerequisites rotates production credentials without interrupting service."
-- Supporting claim: "The new credential works before the old one is revoked."
-- Evidence: the credential-check command and its expected output.
-- Warrant: the command authenticates with only the new credential, so its success proves the new credential works alone.
-- Qualification: this holds only for clients that reread the secret on each connection.
+| Pattern to avoid | Before | After |
+| --- | --- | --- |
+| **Meta signposting** | *"This page documents the caching layer and breaks it into three sections."* | *"The response cache stores compiled query results in memory for 60 seconds."* |
+| **Over-generalized subject** | *"A browser-based document editor updates memory on every keystroke."* | *"The document editor updates its in-memory state on every keystroke."* |
+| **Abstract gerund solution** | *"Persisting drafts locally closes that gap."* | *"To close that gap, the editor persists drafts locally."* |
+| **Abstract framing** | *"Every edit crosses two durability boundaries in strict order."* | *"Saving happens in two stages: a local journal write, followed by an asynchronous upload."* |
+| **Anthropomorphic phrasing** | *"The view and worker never talk; they meet through the journal."* | *"Local persistence and background upload communicate strictly through the `DraftJournal`."* |
+| **Project-name filler** | *"Acme uses PostgreSQL for persistence and Redis for rate limiting."* | *"Account records live in PostgreSQL; rate limits track counters in Redis."* |
+| **Passive hiding the owner** | *"The cache is invalidated on save."* | *"`DraftStore::save` invalidates the cache entry for that document."* |
+| **Difficulty tiers** | *"This advanced guide is not for trivial setups."* | *"Assumes familiarity with async Rust and Redis."* |
+| **Generic nouns** | *"Coordinate two important things across the boundary."* | *"Coordinate retry budgets and circuit-breaker state across the gateway."* |
+| **Aphorisms and slogans** | *"Fail fast."* | *"Validate config at startup so a typo aborts launch instead of failing mid-request."* |
+| **Figurative verbs / buzzwords** | *"Our battle-tested pipeline unlocks seamless workflows."* | *"The queue retains unfinished jobs and reassigns them when a worker disconnects."* |
 
-For a fix to out-of-order search responses:
+Additional composition rules:
 
-- Objective: verify that the fix prevents older search results from replacing newer ones.
-- Document profile: [Technical explanation](templates/explanation.md) in a code-review comment.
-- Main claim: "This fix prevents stale search responses from overwriting the current results."
-- Supporting claim: "The handler rejects responses whose request ID no longer matches the current request."
-- Evidence: a regression test completes requests in reverse order. It fails before the fix and passes afterward.
-- Warrant: the test reproduces the original failure, and the identity check prevents the older response from reaching the state update.
-- Qualification: request IDs must remain unique while requests are outstanding.
+- **Prose over component lists:** Describe collaborating components and ownership in connected paragraphs rather than stacked bullet lists; reserve bullets for parallel items, ordered steps, or quick comparisons.
+- **Natural articles with type names:** Write `"through the DraftJournal"` or `"a sequenced DraftRecord"` rather than dropping articles as if code types were people's names (`"through DraftJournal"`), and use plain nouns (`"the journal"`, `"the worker"`) on nearby repeats.
+- **No inline struct braces in prose:** Describe fields in prose or a fenced code block instead of embedding `Record { a, b }` inside a sentence.
+- **One governing tense:** Describe implemented and target architecture in the present tense. Avoid "intended," "proposed," or "future" except for an active migration that changes how callers use the system today.
+- **No decoration:** Omit emoji in headings and checklists. Use the serial comma.
+- **Subject near verb:** Keep subjects close to verbs, modifiers beside what they modify, and pronouns near unambiguous antecedents. Put new or emphatic information at the end of the sentence.
+
+### Headings
+
+Write headings that capture **the point of the section** in plain domain terms so a reader scanning the outline understands the design without opening every paragraph.
+
+- **State the design point, not the template slot or class list:** Prefer `## Splitting Local Edits from Background Sync` over generic buckets (`## Components and Ownership`) or bare object lists (`## EditorView, DraftJournal, and SyncWorker`).
+- **Use plain words over mechanical or theatrical phrasing:** Prefer `## Recording and Syncing a Draft` over `## Journal Write and Sync Flow` or `## From Keystroke to Server Confirmation`, and `## Outages and Storage Quotas` over `## Failure Boundaries`.
+- **Never number headings:** Omit `## 1. ...` prefixes so reordering sections never breaks numbering or clutters tables of contents.
+
+## Terminology, Identifiers, and Guarantees
+
+- **Prefer established terms from the code.** Define a specialized term once where it first appears—what kind of entity it is, what it owns, and how it differs from similar concepts.
+- **Avoid vague placeholders.** Reserve `projection` for coordinate spaces. Replace `materialization` and `actor` with exact roles (`thread`, `task`, `worker`, `system`, `process`, `pipeline`, `load`, `populate`).
+- **Specify identifier contracts.** For every public or persistent ID, key, hash, handle, URI, or path, state what it identifies, who creates and resolves it, how long it stays valid, and what invalidates it.
+- **Qualify durability words.** Treat `stable`, `persistent`, `durable`, and `permanent` as guarantees and state the exact boundary where each stops holding (for example, "survives process restarts, resets on schema migration").
 
 ## Workflow
 
-Use this workflow when providing explanations to the user, or to develop new documents or assess existing ones. *When revising or reviewing documents, identify which claims, evidence, explanations, or structural relationships need attention within the existing document*. Frame your additions in this context, and prefer holistic document changes, where you may need to update prior claims rather than make narrow patches.
+1. **Survey existing docs.** Locate pages that already cover the topic or link to it. Update or consolidate affected pages instead of duplicating contracts across files.
+2. **Select a document profile.** Match the reader's objective to a profile below and read its template before outlining. Read [tables](references/tables.md) before adding a table and [diagrams](references/diagrams.md) before adding a diagram.
+3. **Verify against source.** Check symbols, schemas, config defaults, error paths, and tests in the codebase so every claim rests on live behavior.
+4. **Draft for a cold reader.** Lead with constraints and mental models, order concepts before raw identifiers, and illustrate non-obvious contracts with minimal working examples.
+5. **Proofread in two passes.**
+   - *Technical pass:* Verify every claim, qualification, identifier, code snippet, and cross-link. Check whether omitting a cost or failure mode makes a guarantee look unconditional.
+   - *Readability pass:* Read the opening and transitions aloud. Cut meta signposting, project-name filler, choppy stacked sentences, passive voice that hides the owner, and front-loaded type dumps.
 
-1. **Survey existing documentation.** Search for pages that already cover the topic or depend on it. Update every affected page instead of duplicating its content. When no page covers the topic, add one and link it from the nearest index or parent page.
-2. **Select a document profile.** Match the reader's objective to a row in the [document profiles](#document-profiles) table below, and read that profile's template.
-3. **Identify the main claims.** Adapt the selected template's Main Claim section and examples, such as the [architectural overview's](templates/architectural-overview.md#main-claim), to the subject and [reader objective](#claims). Include only claims that objective requires. Write each claim as one sentence to identify what the document must establish; not every claim needs to appear explicitly in the published document.
-4. **Verify against sources.** Check behavior against source code, schemas, tests, traces, or runtime output before asserting it. For API documentation, inspect implementations, callers, and tests, and document only the caller contract.
-5. **Outline and draft.** Order the content as the [reading path](#reading-path) describes, and write it under the [composition](#composition) rules.
-6. **Proofread.**
-   - **Claims:** Confirm that every main and supporting claim has evidence, whether stated explicitly or deliberately implied. Check for unsupported implications from wording, examples, or omissions, and revise the document to support, qualify, or remove them.
-   - **Consistency and links:** Check terms, identifiers, examples, links, cross-references, and other pages that describe the same behavior.
-   - **Structure:** After structural edits, recheck scope statements, transitions, and prerequisite order.
-   - **Prose:** Review the prose against the global communication rules and the [composition](#composition) and [terminology](#terminology) sections. Repair sentence emphasis, modifier attachment, pronoun reference, tense, and needless words. Preserve the author's tone and the repository's house style.
+## Document Profiles
 
-## Document profiles
-
-Each profile template describes its main claim, gives examples to adapt, and specifies what to include or leave out.
-
-When relaxing a specification, remove unnecessary restrictions rather than replace them with exhaustive permission statements or inherited format semantics.
-
-| Reader Objective | Document Profile |
+| Reader objective | Profile |
 | --- | --- |
 | Understand a system or subsystem architecture | [Architectural overview](templates/architectural-overview.md) |
-| Propose or evaluate a technical change or strategy | [RFC and proposal](templates/rfc.md) |
-| Record an architecturally significant decision | [Architecture decision record](templates/adr.md) |
-| Understand causal mechanics, mental models, or concepts | [Technical explanation](templates/explanation.md) |
-| Execute an operational procedure or runbook | [How-to guide](templates/how-to.md) |
-| Look up an exhaustive interface, CLI, schema, or error catalog | [Reference](templates/reference.md) |
-| Define or revise a format, protocol, schema, or conformance contract | [Specification](templates/specification.md) |
-| Learn a technology by building an end-to-end project | [Tutorial](templates/tutorial.md) |
+| Propose or evaluate a design change or strategy | [RFC and proposal](templates/rfc.md) |
+| Record a significant design decision and its tradeoffs | [Architecture decision record](templates/adr.md) |
+| Understand causal mechanics or why a behavior occurs | [Technical explanation](templates/explanation.md) |
+| Execute a procedure or runbook to reach one result | [How-to guide](templates/how-to.md) |
+| Look up an exhaustive API, CLI, schema, or error catalog | [Reference](templates/reference.md) |
+| Define or relax an interoperability or format contract | [Specification](templates/specification.md) |
+| Learn a technology by building one working project | [Tutorial](templates/tutorial.md) |
 | Predict how a public API, docstring, or endpoint behaves | [API documentation](templates/api-documentation.md) |
-
-
-## Composition
-
-- **Paragraph structure:** Open each expository paragraph with its point, support it in the body, and end on its strongest consequence or required transition. Connect paragraphs with explicit continuation, qualification, contrast, or causal transitions.
-- **Sentence structure:** Keep subjects near their verbs, modifiers beside what they modify, and pronouns near clear antecedents. Put new or emphatic information at the end of the sentence or paragraph.
-- **Tense and punctuation:** Keep each summary in one governing tense. Use the serial comma.
-- **No decoration:** Omit emoji in headings and checklists.
-- **No difficulty tiers:** Replace `basic`, `advanced`, `trivial`, or `complex` with the background the reader needs, phrased as "assumes a background in X" or "assumes familiarity with X".
-- **Grounded nouns:** Replace `things`, `details`, and importance words such as `important`, `critical`, or `major` with exact domain entities and attributes.
-- **Mapping rules over slogans:** State explicit conditions and consequences instead of aphorisms or circular qualifiers.
-- **Plain wording:** Write literal statements instead of punchy phrasing. Avoid catchphrases such as "show, don't tell", figurative verbs such as "earn" or "unlock", and contrasts written for rhythm rather than meaning.
-- **Buzzwords and promotion:** Replace vague labels and promotional claims with concrete mechanisms, measured results, or explicit guarantees. Keep technical terms when their precise meaning helps explain the subject.
-
-
-| Category | Before | After |
-| --- | --- | --- |
-| **Difficulty tiers** | *"This advanced tutorial is not for trivial tasks."* | *"This tutorial assumes a background in async Rust and Redis."* |
-| **Generic nouns** | *"Show interactions between two important things."* | *"Show interactions between two components or stores."* |
-| **Aphorisms** | *"Fail fast."* | *"Check the config file when the app starts, so a typo fails at launch instead of during a user's request."* |
-| **Circular qualifiers** | *"Retry the requests that can be retried."* | *"Retry requests that fail with a timeout or a 503 status."* |
-| **Punchy phrasing** | *"Keep implied claims implied and earn them: show, don't tell."* | *"Support implied claims with evidence rather than promotional descriptions."* |
-| **Buzzwords** | *"Our battle-tested, fault-tolerant architecture delivers rock-solid reliability."* | *"The queue retains unfinished jobs and reassigns them when a worker disconnects."* |
-
-
-## Terminology
-
-- **Specialized terms:** Use one only when the reader needs it. Take it from the code, an API, or an established industry concept instead of inventing one. Define it where it first appears, before any claim that depends on it: say what kind of thing it is, what it does, and how it differs from similar terms.
-- **Restricted terms:** Reserve `projection` for coordinate spaces. Replace `materialization` and `actor` with the exact role, such as `thread`, `task`, `worker`, `system`, `process`, or `pipeline`.
-- **Identifiers:** For every public or persistent ID, key, hash, handle, URI, or path, state what it identifies, who creates and resolves it, where it stays valid, and what replaces it.
-- **Durability words:** Treat `stable`, `persistent`, `durable`, and `permanent` as guarantees, and state when each one stops holding.
-
-## Reading path
-
-The claims set what the document must prove. The reading path sets the order in which the reader meets them.
-
-- Put each definition, prerequisite, and supporting claim before the first claim that depends on it.
-- Open every page with its scope, prerequisites, and result. Readers often arrive from a search or a link, not from the previous page.
-- Within a section, state a component's purpose before its implementation, inputs before transformations, initial state before mutation, and each mechanism beside its failure behavior.
-- Keep a heading only when readers navigate directly to its point. Use heading depth for containment, keep sibling headings at one level of abstraction, and name domain concepts instead of writing stages, such as "Cache invalidation" rather than "Step 2: Details".
-- Give each topic one primary page and link to it from the others. Split a page when readers look up, update, or link its parts separately.
-
-## Examples
-
-Use minimal code or data examples that demonstrate one constraint or interaction. Include the required setup and omit non-functional boilerplate.
-
-Read the [tables](references/tables.md) reference before adding or reviewing a table, and the [diagrams](references/diagrams.md) reference before adding or reviewing a diagram.

@@ -2,43 +2,35 @@
 
 *Read when writing a guided tutorial in which the reader builds a working project to learn a technology.*
 
-## Main Claim
+## Goal
 
-Building one working project from start to finish teaches the reader how the main concepts fit together and leaves them with a pattern they can reuse.
-
-### Example main claims
-
-These examples connect a working project to a learning outcome. Use them as alternatives to adapt, not a checklist.
-
-- "Building a task worker teaches how queued jobs move through execution, acknowledgment, and retry."
-- "Building an offline notes app teaches how local storage and synchronization preserve edits during network outages."
-- "Building a file watcher teaches how filesystem events trigger cache invalidation and reloads."
+Guide the reader through building one working project from start to finish so they see how the core concepts fit together and finish with a reusable pattern.
 
 ## Sections
 
 Write these sections in order.
 
-### 1. What you will build
+### What you will build
 
 - Name the project, such as "a task queue worker in Rust that reads jobs from Redis."
 - Say what the reader will be able to do afterward.
 
-### 2. Before you start
+### Before you start
 
 - Give the exact versions of the tools, compilers, and images the reader needs, and any credentials.
 - State the background the reader needs, such as "This tutorial assumes familiarity with async Rust and basic Redis commands."
 
-### 3. Milestones
+### Milestones
 
 - Start with the smallest project that runs, and a command that proves it runs.
 - Add one feature per milestone, and introduce each concept in the milestone that uses it.
 - Give complete code the reader can copy, and end each milestone with a check, such as a test or a `curl` request.
 
-### 4. Final check
+### Final check
 
 - Give one command that runs the whole project, and show its exact expected output.
 
-### 5. Next steps
+### Next steps
 
 - Explain how the pattern applies to a production system, and link the overviews, explanations, and references that go further.
 

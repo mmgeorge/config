@@ -2,66 +2,59 @@
 
 *Read when recording a significant design decision for future maintainers.*
 
-## Main Claim
+## Goal
 
-The record shows that one decision answers a stated problem under stated constraints, and what the decision costs.
-
-### Example main claims
-
-These examples justify a decision under stated constraints. Use them as alternatives to adapt, not a checklist.
-
-- "We chose a local draft cache to preserve unsent edits across restarts, accepting disk usage and background synchronization."
-- "We chose immutable audit records to retain change history, accepting the storage cost of keeping earlier revisions."
-- "We chose database-backed job scheduling to coordinate workers without another service, accepting additional database load."
+Show why one design choice answered a specific problem under explicit constraints, why credible alternatives were rejected, and what ongoing costs and failure modes the team accepted. A future maintainer should be able to tell whether the assumptions behind the decision still hold before reopening it.
 
 ## Sections
 
 Write these sections in order.
 
-### 1. Title and status
+### Title and Status
 
-- Give the decision a short title, such as "ADR-004: Keep drafts in a local cache for offline sync."
-- Record its status: Proposed, Accepted, Rejected, Superseded, or Deprecated.
-- Record the date, the authors, the reviewers, and any earlier record this one replaces.
+- Give the record a concrete title naming the choice and its purpose (for example, `ADR-004: Journal unsent edits in IndexedDB for offline sync`).
+- Record status (`Proposed`, `Accepted`, `Rejected`, `Superseded`, or `Deprecated`), date, authors, reviewers, and any record it supersedes.
 
-### 2. Context
+### Context
 
-- Describe how the system works today and the problem the decision solves.
-- State the constraints and requirements fairly, without slanting them toward the chosen option.
+- Describe the current behavior and the concrete failure or constraint forcing a change.
+- State the requirements fairly without slanting them toward the chosen option.
 
-### 3. Decision
+### Decision
 
-- State what was decided, in the present tense.
-- Say which parts of the system change, which part owns what, and how the parts communicate.
+- State the chosen design in the present tense: which components change, who owns each piece of data, and what invariant holds across the boundary.
 
-### 4. Alternatives
+### Alternatives Considered
 
-- List the other options considered, judged against the same requirements.
-- Say why each one was rejected.
+- Evaluate each credible alternative against the exact same constraints and state the decisive reason it was rejected.
 
-### 5. Consequences
+### Consequences
 
-- Describe what the decision makes possible, what it costs, and what it requires from other parts of the system, including any new ways the system can fail.
+- Document what the decision enables, what operational or code complexity it adds, and any new failure modes other components must handle.
 
-### 6. Verification
+### Verification
 
-- Say how the team will check that the decision works, such as with tests, load tests, or lint rules.
+- State how automated tests, benchmarks, or lint rules verify the decision's guarantees.
 
-## Leave out
+## Leave Out
 
-- Do not turn the record into a system overview, an API manual, or a task list. Link those documents instead.
-- Do not reopen a settled decision unless new constraints or measured failures justify it.
+- Full system overviews, API manuals, or implementation ticket lists (link those documents instead).
+- Re-litigating settled decisions unless constraints changed or measurements show a failure.
 
 ## Example
 
-A shortened decision record:
-
-> ADR-004: Keep drafts in a local cache for offline sync. Accepted in March 2026.
+> ### ADR-004: Journal Unsent Edits in IndexedDB for Offline Sync
 >
-> The editor sends each edit straight to the document server. When the network drops, the editor shows an error and the edit is lost. Any fix must work without a network connection and must not slow down typing.
+> **Status:** Accepted (March 2026)
 >
-> We will write each edit to a cache on the user's disk before it reaches the server, and a background worker will send cached edits whenever the server is reachable. The editor owns writing to the cache, and the worker owns removing entries once the server confirms them.
+> **Context:** The document editor applies edits in memory immediately and pushes autosaves directly from memory to the `DocumentApi`. When a tab crashes, reloads, or loses connectivity before an autosave completes, every unconfirmed edit is lost. Any replacement must preserve responsive in-memory typing while keeping unsent edits durable across crashes and offline periods.
 >
-> We also considered keeping unsent edits in memory, but they would be lost if the editor crashed. Retrying the request inside the editor would block typing while the network is down.
+> **Decision:** The `EditorView` continues mutating the open document in memory immediately and appends each sequenced `DraftRecord` to a per-document IndexedDB `DraftJournal`. A single background `SyncWorker` drains pending records in sequence order to the `DocumentApi` and deletes each entry only after the server confirms persistence.
 >
-> The cache adds a small disk write to every edit and a background worker to maintain. A full disk now stops edits from being saved, so the editor must report that error. An integration test that disconnects the network during an edit checks that no edit is lost.
+> **Alternatives:**
+> - *In-memory retry queue:* Avoids local storage writes, but loses every unsent edit if the browser tab crashes or reloads.
+> - *`localStorage` snapshots:* Simpler API than IndexedDB, but runs synchronously on the main thread and hits tight 5 MiB caps on large documents.
+>
+> **Consequences:** Unsent edits now survive crashes and offline intervals at the cost of a per-edit IndexedDB append and a background sync loop to maintain. Storage quota exhaustion becomes a new failure mode: when IndexedDB rejects a write, the `EditorView` marks the document unsaved and warns the user that new changes will not survive a reload until space is freed.
+>
+> **Verification:** An end-to-end Playwright test disconnects network routing mid-edit, reloads the tab, restores connectivity, and asserts that every edit reaches the server in sequence order with zero duplicates.

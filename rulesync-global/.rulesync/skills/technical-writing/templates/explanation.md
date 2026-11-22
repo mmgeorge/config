@@ -1,60 +1,54 @@
 # Technical Explanation Profile
 
-*Read when writing a deep dive, a concept explanation, or an analysis of how a mechanism works.*
+*Read when writing a deep dive, explaining a non-obvious mechanism, or analyzing why a system behaves the way it does.*
 
-## Main Claim
+## Goal
 
-The explanation gives the reader a model of why the system behaves as it does, clear enough to predict what happens when inputs, settings, or failures change.
-
-### Example main claims
-
-These examples connect an observed behavior to its cause. Use them as alternatives to adapt, not a checklist.
-
-- "Hourly latency spikes occur because cache entries expire together and trigger concurrent database reads."
-- "When retries lack deduplication, a timeout after commit can cause the same operation to run twice."
-- "Queue latency grows when jobs arrive faster than workers can finish them."
+Give the reader a causal model sharp enough to predict what happens when inputs, load, settings, or failure conditions change. Unlike a how-to guide or reference, an explanation answers *why* rather than *how to click* or *what every flag does*.
 
 ## Sections
 
 Write these sections in order.
 
-### 1. The question
+### The Behavior or Question
 
-- State the behavior or concept being explained, and what the reader can observe.
+- Open with the observable behavior, failure mode, or design tension being explained—what the reader actually sees in logs, traces, frames, or profiler output.
 
-### 2. Concepts first
+### Mental Model and Concepts
 
-- Define each concept before the explanation uses it, in the order the concepts depend on each other.
-- Relate unfamiliar ideas to familiar ones, such as comparing a custom consensus protocol to Raft.
+- Define each concept in dependency order before using it in the causal chain.
+- Anchor unfamiliar mechanisms to familiar engineering models when helpful (for example, comparing a custom lease loop to Raft heartbeats or a solver step to an implicit optimization problem).
 
-### 3. How it works
+### Causal Mechanism
 
-- Walk through causes and effects step by step, including the data that changes along the way.
-- Connect each intermediate step to the result the reader sees.
+- Walk step by step through what changes at each stage, connecting each internal state transition to its observable consequence.
+- Name the exact component, thread, or pass responsible for each step—avoid passive voice that hides the owner.
 
-### 4. Evidence
+### Evidence and Counterexample
 
-- Show short code traces, logs, or measurements that confirm the explanation.
-- Include a counterexample that shows what happens when an assumption breaks.
+- Ground the explanation in a concrete trace, log pattern, formula, or measurement.
+- Include a counterexample showing what happens when one underlying assumption breaks (and how changing that variable removes the behavior).
 
-### 5. Limits
+### Scope and Limits
 
-- Say where the explanation stops applying, such as above a certain load or when a fallback takes over.
+- State clearly where the model stops applying—for example, under a different failure mode, above a memory cap, or once a fallback takes over.
 
-## Leave out
+## Leave Out
 
-- Do not turn the explanation into step-by-step instructions. Link a how-to guide.
-- Do not list every API member. Link the reference.
-- Do not argue for a proposal or plan a roadmap.
+- Step-by-step operator instructions (link a how-to guide).
+- Exhaustive API listings (link a reference).
+- Proposals, roadmaps, or open-ended brainstorming (link an RFC).
 
 ## Example
 
-A shortened explanation:
+A causal explanation with an observable hook, concrete trace, counterexample, and explicit boundary:
 
-> The API slows down at the start of every hour because the response cache expires all of its entries at the same moment, and the next requests all miss the cache at once.
+> ### Why API Latency Spikes at the Top of Every Hour
 >
-> Each cache entry holds a response and the time it expires. When a request misses the cache, its handler builds the response from the database and writes it back. The handler cannot tell that another request is already rebuilding the same entry.
+> Read latency on the catalog API jumps from 5 ms to 900 ms during the first two seconds of every hour, even though request volume stays flat. The spike happens because the response cache aligns every entry's expiration to the clock hour, causing hundreds of unrelated endpoints to miss the cache simultaneously and stampede the database.
 >
-> At the top of the hour, hundreds of entries expire together. Every request for those entries reaches the database in the same second, and database latency rises from 5 ms to 900 ms until the cache fills again. The request logs show the misses grouped within two seconds of each hour.
+> Each cache entry stores a serialized response paired with an expiration timestamp computed as `floor_to_hour(now) + 1h`. When a request hits an expired entry, the request handler queries PostgreSQL directly and writes the fresh response back to Redis. Because the handler does not coalesce concurrent misses for the same key, every in-flight request for that endpoint issues its own database query until the first write completes.
 >
-> If entries expired at random times within the hour, the misses would spread out and the database would never see the spike. This explanation holds only while entries share an expiry time, so it does not cover the slowdowns during deploys, which clear the whole cache.
+> At `XX:00:00`, every cached key crosses its expiration timestamp in the same millisecond. Request logs confirm the mechanism: cache-miss bursts cluster tightly between `XX:00:00.000` and `XX:00:01.800`, and PostgreSQL active connections hit the pool ceiling of 64 during the exact same window before dropping back to idle.
+>
+> Adding ±5 minutes of per-key jitter breaks the lockstep expiry: misses spread evenly across a ten-minute window, database concurrency stays below 4, and p99 latency remains flat across the hour boundary. This explanation accounts only for periodic hourly spikes; it does not cover cold-start latency after a full Redis flush during deployments, which invalidates all keys regardless of TTL jitter.

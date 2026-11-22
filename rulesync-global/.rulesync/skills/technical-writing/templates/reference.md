@@ -2,33 +2,25 @@
 
 *Read when writing complete lookup documentation for an API, a schema, CLI commands, configuration, a protocol, or error codes.*
 
-## Main Claim
+## Goal
 
-The reference describes every item in its scope accurately, in an order the reader can scan quickly while coding or debugging.
-
-### Example main claims
-
-These examples state what a reader can look up within a defined scope. Use them as alternatives to adapt, not a checklist.
-
-- "This reference lists every supported configuration field for version 2, including defaults, allowed values, and validation errors."
-- "This command reference covers every backup subcommand, flag, and exit code in version 2."
-- "This event catalog defines each published event type, its fields, and the versions that support it."
+Describe every item in scope accurately—with exact syntax, types, defaults, side effects, and errors—in an order a reader can scan while coding or debugging.
 
 ## Sections
 
 Organize the reference the way the interface itself is organized.
 
-### 1. Scope and source
+### Scope and source
 
 - State the exact version covered.
 - Name the source the reference is generated from or checked against, such as an OpenAPI file or a protobuf definition.
 
-### 2. Structure
+### Structure
 
 - Mirror the interface's modules, namespaces, or command groups in the headings.
 - Start each large group with a summary table or index.
 
-### 3. Entries
+### Entries
 
 For every function, field, setting, flag, or error code, give:
 
@@ -38,7 +30,7 @@ For every function, field, setting, flag, or error code, give:
 - What it does, including side effects.
 - Every error or exit code it can produce.
 
-### 4. Examples
+### Examples
 
 - Give a short, working example for each entry, checked with the same compiler, schema, or tests that produce the reference.
 

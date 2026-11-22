@@ -2,9 +2,9 @@
 
 Read before authoring, reviewing, or relaxing a format, protocol, schema, or conformance specification. Specify the constraints that independent implementations need to interoperate; do not restate every possibility already supplied by the underlying format.
 
-## Main Claim
+## Goal
 
-Independent implementations can determine conformance from the specification's definitions and necessary constraints. Behavior already defined by referenced formats remains with those formats unless this specification explicitly changes it.
+State the definitions and necessary constraints independent implementations need to determine conformance, leaving behavior already defined by referenced formats with those formats unless this specification explicitly changes it.
 
 ## Relax by removing restrictions
 

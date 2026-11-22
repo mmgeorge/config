@@ -2,23 +2,15 @@
 
 *Read when writing or revising API reference pages, docstrings, rustdoc, JSDoc, OpenAPI descriptions, or other documentation that sits next to an interface.*
 
-## Main Claim
+## Goal
 
-A caller can predict what the interface does, how it fails, and what stays true, without reading its source code.
-
-### Example main claims
-
-These examples state behavior that callers can rely on. Use them as alternatives to adapt, not a checklist.
-
-- "Retrying an upload with the same idempotency key returns the original result without creating another object while the key remains valid."
-- "Closing the client cancels pending requests and releases the connections it owns."
-- "Reloading an invalid configuration returns a validation error and leaves the active configuration unchanged."
+Let a caller predict what an interface does, how it fails, and what invariants hold without reading its implementation.
 
 ## Sections
 
 Document each kind of item as follows.
 
-### 1. Types
+### Types
 
 - State the one job the type does.
 - Say whether it owns its data, borrows it, or shares it.
@@ -26,7 +18,7 @@ Document each kind of item as follows.
 - Say whether it is safe to use from several threads at once.
 - Describe how to create it, how its state changes, and what cleanup it needs.
 
-### 2. Fields and properties
+### Fields and properties
 
 - Describe a field with a short noun phrase that names its value and when that value is valid.
 - Leave out articles unless they remove ambiguity.
@@ -46,7 +38,7 @@ Bad:
 pub(crate) root: RootAssetKey,
 ```
 
-### 3. Functions and methods
+### Functions and methods
 
 - Start with one sentence that says what the call does, beginning with an imperative verb such as "Load" or "Validate."
 - For each parameter, give its valid range, format, and default, and say whether ownership moves to the callee.
@@ -54,12 +46,12 @@ pub(crate) root: RootAssetKey,
 - List every error, panic, or status code, the input that causes it, and whether a failure leaves partial changes behind.
 - Mention side effects such as file writes, network calls, or background tasks, and say whether calling twice is safe.
 
-### 4. Traits and interfaces
+### Traits and interfaces
 
 - State what every implementation must do, and any required order between methods.
 - Describe each default method and when an implementation should override it.
 
-### 5. Generated documentation
+### Generated documentation
 
 - When tools read the documentation to generate schemas or API listings, keep the annotations, tags, and formats those tools require.
 
