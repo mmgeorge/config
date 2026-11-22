@@ -191,23 +191,47 @@ local function picker_host(state)
   }
 end
 
-local function open_choice_picker(state, title, subtitle, option_list, callback, empty_text)
-  for index, option in ipairs(option_list) do
-    option.key = option.key or config.options.picker.choice_keys[index]
+---@class ForgeHarnessChoicePickerOptions
+---@field empty_text? string
+---@field selected_index? integer
+---@field wrap_selection? boolean
+---@field assign_choice_keys? boolean
+---@field height_ratio? number
+---@field column_headers? string[]
+---@field flexible_column? integer
+---@field preview? ForgeHarnessExchangePreview
+
+---@param options? ForgeHarnessChoicePickerOptions
+local function open_choice_picker(state, title, subtitle, option_list, callback, options)
+  options = options or {}
+  local preview = options.preview
+  if options.assign_choice_keys ~= false then
+    for index, option in ipairs(option_list) do
+      option.key = option.key or config.options.picker.choice_keys[index]
+    end
   end
   picker.open({
     host = picker_host(state),
+    height_ratio = options.height_ratio,
     page_list = {
       {
         id = title,
         title = title,
         subtitle = subtitle,
-        column_headers = { "Choice", "Details" },
+        column_headers = options.column_headers or { "Choice", "Details" },
+        flexible_column = options.flexible_column,
         option_list = option_list,
-        empty_text = empty_text,
+        empty_text = options.empty_text,
+        selected_index = options.selected_index,
+        wrap_selection = options.wrap_selection,
         footer = "↑↓ select  Enter confirm  q close",
       },
     },
+    on_change = preview and function(context)
+      local interaction = context.option and context.option.value
+      preview.show(interaction and interaction.id, context.preview_height)
+    end,
+    on_dispose = preview and preview.close,
     on_confirm = function(result) callback(result.option.value) end,
   })
 end
@@ -1545,7 +1569,7 @@ function M.open_artifact_picker()
   open_choice_picker(state, "Select Artifact", nil, option_list, function(artifact)
     if not artifact or not current() then return end
     M.open_artifact(state, artifact)
-  end, "This session has no artifacts.")
+  end, { empty_text = "This session has no artifacts." })
 end
 
 ---@class ForgeRollbackInteraction
@@ -1553,9 +1577,11 @@ end
 ---@field ordinal integer
 ---@field prompt string
 ---@field opening? ForgeExchangeOpening
----@field state "complete"|"failed"|"cancelled"|"interrupted"
----@field checkpoint_before string
----@field rollback_unavailable? string Why the host cannot roll back to this interaction.
+---@field state "queued"|"running"|"complete"|"failed"|"cancelled"|"interrupted"
+---@field checkpoint_before? string
+---@field elapsed_ms? integer
+---@field edits? { file_count: integer, additions: integer, deletions: integer }
+---@field rollback_unavailable? string Why the host cannot roll back starting with this interaction.
 ---@field task_command? string The `/goal` or `/plan` command a rollback of this task start returns.
 
 ---Put `text` in the composer and focus it for an immediate follow-up.
@@ -1617,7 +1643,8 @@ end
 ---@param preview table
 ---@param interaction? ForgeRollbackInteraction
 ---@param stopped_turn? boolean
-local function confirm_restore_preview(preview, interaction, stopped_turn)
+---@param selection? { exchange_id: string, latest_exchange_id: string }
+local function confirm_restore_preview(preview, interaction, stopped_turn, selection)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
   local function current()
@@ -1642,7 +1669,7 @@ local function confirm_restore_preview(preview, interaction, stopped_turn)
       client.request({ session_id = session_id, method = "session.exchange.rollback.preview", params = { preview_id = preview.preview_id, offset = preview.next_offset } }, function(page, err)
         if not current() then return end
         if err then report_undo_failure(err) return end
-        confirm_restore_preview(page, interaction, stopped_turn)
+        confirm_restore_preview(page, interaction, stopped_turn, selection)
       end)
       return
     end
@@ -1667,11 +1694,11 @@ local function confirm_restore_preview(preview, interaction, stopped_turn)
       end
       if err then
         report_undo_failure(err)
-        if err:find("preview is stale", 1, true) and interaction then
-          client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(refreshed, failure)
+        if err:find("preview is stale", 1, true) and selection then
+          client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = selection }, function(refreshed, failure)
             if not current() then return end
             if failure then report_undo_failure(failure) return end
-            confirm_restore_preview(refreshed, interaction, stopped_turn)
+            confirm_restore_preview(refreshed, interaction, stopped_turn, selection)
           end)
         end
         return
@@ -1713,9 +1740,10 @@ function M.restore_rolled_back_prompt(interaction, composer_free)
   end
 end
 
----@param interaction ForgeRollbackInteraction
+---@param first_removed ForgeRollbackInteraction
 ---@param latest_exchange_id string
-local function confirm_rollback(interaction, latest_exchange_id)
+---@param retained_ordinal? integer
+local function confirm_rollback(first_removed, latest_exchange_id, retained_ordinal)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
   if state.restore_applying then return end
@@ -1727,21 +1755,25 @@ local function confirm_rollback(interaction, latest_exchange_id)
     { label = "Conversation only", detail = (busy and "Stops the running turn. " or "") .. "Keep all current files",
       value = "conversation" },
   }
-  if interaction.checkpoint_before and not state.no_checkpoint then
+  if first_removed.checkpoint_before and not state.no_checkpoint then
     choices[#choices + 1] = { label = "Conversation and files",
-      detail = (busy and "Stops the running turn to preview the files. " or "") .. "Restore this interaction's checkpoint",
+      detail = (busy and "Stops the running turn to preview the files. " or "")
+        .. ("Restore files from before Exchange %s"):format(first_removed.ordinal),
       value = "workspace" }
   end
-  open_choice_picker(state, "Rollback interaction", "Choose what to roll back", choices, function(choice)
+  local title = retained_ordinal and ("Roll back after Exchange %s"):format(retained_ordinal)
+    or "Roll back to the start"
+  local selection = { exchange_id = first_removed.id, latest_exchange_id = latest_exchange_id }
+  open_choice_picker(state, title, "Choose what to roll back", choices, function(choice)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_get_generation() ~= generation then return end
     if not choice or choice == "cancel" or state.restore_applying then return end
     if choice == "workspace" then
-      client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(preview, err)
+      client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = selection }, function(preview, err)
         if harness_state() ~= state or not state.session or state.session.id ~= session_id
           or client.host_get_generation() ~= generation then return end
         if err then report_undo_failure(err) return end
-        confirm_restore_preview(preview, interaction, busy)
+        confirm_restore_preview(preview, first_removed, busy, selection)
       end)
       return
     end
@@ -1751,9 +1783,8 @@ local function confirm_rollback(interaction, latest_exchange_id)
     render_status_hint(state)
     local composer_free = state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
       and require("forge.views.harness.composer_draft").observe(state.composer_buf) or function() return false end
-    M.task_transition({ action = "undo", rollback = {
-      scope = "conversation", exchange_id = interaction.id, latest_exchange_id = latest_exchange_id,
-    } }, nil, function(applied, failure)
+    local rollback = vim.tbl_extend("force", selection, { scope = "conversation" })
+    M.task_transition({ action = "undo", rollback = rollback }, nil, function(applied, failure)
       if state.restore_applying ~= operation then return end
       state.restore_applying = nil
       render_status_hint(state)
@@ -1763,16 +1794,33 @@ local function confirm_rollback(interaction, latest_exchange_id)
       end
       if not applied or not state.session or state.session.id ~= session_id
         or client.host_get_generation() ~= generation then return end
-      M.with_state(state, function() M.restore_rolled_back_prompt(interaction, composer_free) end)
+      M.with_state(state, function() M.restore_rolled_back_prompt(first_removed, composer_free) end)
     end)
   end)
 end
 
+---@param edits? { file_count: integer, additions: integer, deletions: integer }
+---@param file_width integer
+---@param additions_width integer
+---@return string, table[]?
+local function undo_edit_cell(edits, file_width, additions_width)
+  if type(edits) ~= "table" then return string.rep(" ", file_width - 1) .. "—" end
+  if edits.file_count == 0 then return "" end
+  local file_count = ("%" .. file_width .. "d"):format(edits.file_count)
+  local additions = tostring(edits.additions)
+  local deletions = "−" .. edits.deletions
+  local separator = string.rep(" ", additions_width - #additions + 1)
+  local prefix = file_count .. " · "
+  local added = "+" .. additions
+  return prefix .. added .. separator .. deletions, {
+    { prefix }, { added, "ForgeAddRange" }, { separator }, { deletions, "ForgeDeleteRange" },
+  }
+end
+
 ---Open interaction history before choosing a rollback scope.
 ---
----The list offers every current exchange, running ones included: confirming a rollback collects
----a running turn first. A paused task's newest exchange stays `running` in history while it is
----parked, and the host marks it `paused`, which the list shows instead.
+---Each exchange row names the last exchange to keep. The host takes the first exchange to remove,
+---which also supplies the file checkpoint and the prompt to return to the composer.
 ---@param recovery? table restore journal status from `session.exchange.recovery`
 ---@param refused fun() puts the `/undo` command back when no list opens
 local function open_exchange_undo_picker(recovery, refused)
@@ -1793,49 +1841,87 @@ local function open_exchange_undo_picker(recovery, refused)
       refused()
       return
     end
-    local option_list = {}
-    for index = #(interaction_list or {}), 1, -1 do
-      local interaction = interaction_list[index]
+    local current_exchange_list = {}
+    local file_width, additions_width = 1, 1
+    for _, interaction in ipairs(interaction_list or {}) do
       if interaction.disposition == "current" and interaction.state ~= "queued" then
-        local host_notice = require("forge.render.harness.exchange_opening").notice(interaction.opening)
-        local prompt = host_notice or vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
-        -- The host names a rollback it cannot perform, so the option says so before any choice.
-        local unavailable = type(interaction.rollback_unavailable) == "string" and interaction.rollback_unavailable
-          or nil
-        local listed_state = interaction.paused == true and "paused" or tostring(interaction.state)
-        local detail = listed_state .. " · " .. (prompt ~= "" and prompt or "[empty prompt]")
-        option_list[#option_list + 1] = {
-          id = interaction.id,
-          label = "Exchange " .. tostring(interaction.ordinal) .. (unavailable and " · unavailable" or ""),
-          detail = unavailable and (unavailable .. " · " .. detail) or detail,
-          value = interaction,
-        }
+        current_exchange_list[#current_exchange_list + 1] = interaction
+        local edits = interaction.edits
+        if type(edits) == "table" then
+          file_width = math.max(file_width, #tostring(edits.file_count))
+          additions_width = math.max(additions_width, #tostring(edits.additions))
+        end
       end
     end
+    local option_list = {}
     if recovery and not recovery.pending then
       option_list[#option_list + 1] = { id = "undo-file-restore", label = "Undo last file restore",
-        detail = "Preview restoring files from before the last rollback", value = { undo_file_restore = true } }
+        columns = { "", "", "Undo last file restore" }, value = { undo_file_restore = true } }
+    end
+    local first_exchange = current_exchange_list[1]
+    if first_exchange then
+      local unavailable = first_exchange.rollback_unavailable
+      option_list[#option_list + 1] = {
+        id = "before-first-exchange",
+        label = "Before first exchange" .. (unavailable and " · unavailable" or ""),
+        columns = { "", "", unavailable and ("Before first exchange · " .. unavailable) or "Before first exchange" },
+        value = { first_removed = first_exchange },
+      }
+    end
+    for index, interaction in ipairs(current_exchange_list) do
+      local first_removed = current_exchange_list[index + 1]
+      local host_notice = require("forge.render.harness.exchange_opening").notice(interaction.opening)
+      local prompt = host_notice or vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
+      local unavailable = first_removed and first_removed.rollback_unavailable
+      local label_suffix = not first_removed and " · latest" or unavailable and " · unavailable" or ""
+      local detail = prompt ~= "" and prompt or "[empty prompt]"
+      local elapsed = type(interaction.elapsed_ms) == "number" and ("%ds"):format(math.floor(interaction.elapsed_ms / 1000))
+        or "—"
+      local edit_summary, edit_segments = undo_edit_cell(interaction.edits, file_width, additions_width)
+      option_list[#option_list + 1] = {
+        id = interaction.id,
+        label = "Exchange " .. tostring(interaction.ordinal) .. label_suffix,
+        columns = { elapsed, edit_summary, unavailable and (unavailable .. " · " .. detail) or detail },
+        column_segments = { { { elapsed, "ForgePickerDuration" } }, edit_segments },
+        disabled_reason = not first_removed and "There are no later exchanges to roll back" or nil,
+        value = { id = interaction.id, retained_ordinal = interaction.ordinal, first_removed = first_removed },
+      }
     end
     open_choice_picker(
       state,
-      "Select Exchange",
+      "Undo",
       nil,
       option_list,
-      function(interaction)
-        if interaction.undo_file_restore then
+      function(destination)
+        if harness_state() ~= state or not state.session or state.session.id ~= session_id
+          or client.host_get_generation() ~= generation then return end
+        if destination.undo_file_restore then
           client.request({ session_id = session_id, method = "session.exchange.recovery", params = { action = "undo" } }, function(preview, err)
             if harness_state() ~= state or not state.session or state.session.id ~= session_id
               or client.host_get_generation() ~= generation then return end
             if err then report_undo_failure(err, "Harness recovery") return end
             confirm_restore_preview(preview)
           end)
-        elseif type(interaction.rollback_unavailable) == "string" then
-          report_undo_failure(interaction.rollback_unavailable)
-        else
-          confirm_rollback(interaction, interaction_list[#interaction_list].id)
+        elseif destination.first_removed then
+          local removed = destination.first_removed
+          if removed.rollback_unavailable then
+            report_undo_failure(removed.rollback_unavailable)
+          else
+            confirm_rollback(removed, interaction_list[#interaction_list].id, destination.retained_ordinal)
+          end
         end
       end,
-      "This session has no exchanges available to undo."
+      {
+        empty_text = "This session has no exchanges available to undo.",
+        selected_index = #option_list,
+        wrap_selection = false,
+        assign_choice_keys = false,
+        height_ratio = 0.3,
+        column_headers = { "Time", "Edits", "Details" },
+        flexible_column = 3,
+        preview = state.presentation and state.presentation.exchange_preview
+          and state.presentation.exchange_preview(state.transcript_win),
+      }
     )
   end)
 end
@@ -2047,7 +2133,7 @@ function M.open_background_picker()
         if terminate_failure then notifications.error(terminate_failure, "Select Background Terminal") end
         if state.presentation and state.presentation.terminals then state.presentation.terminals.refresh() end
       end)
-    end, "No background terminals are running.")
+    end, { empty_text = "No background terminals are running." })
   end)
 end
 
@@ -2684,7 +2770,7 @@ function M.select_effort()
     end, choice)
     open_choice_picker(state, "Select Reasoning Effort", nil, options, function(effort)
       M.configure({ effort = effort })
-    end, "The selected model advertises no reasoning choices.")
+    end, { empty_text = "The selected model advertises no reasoning choices." })
   end)
 end
 
@@ -3030,7 +3116,7 @@ local function recover_unknown_input(state, entry)
     if choice == "reconcile" then input_state.retry(state, current)
     elseif current.local_only then input_state.discard_rejected(state, id)
     else input_state.perform(state, { kind = "remove", id = id, revision = revision }) end
-  end, "No recovery choices")
+  end, { empty_text = "No recovery choices" })
 end
 
 ---Open the question or approval the selected session's snapshot holds, once its view is on screen.

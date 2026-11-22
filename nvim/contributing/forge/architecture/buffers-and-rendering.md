@@ -61,6 +61,8 @@ Status keeps file bodies separately from visible rows. If a generation change di
 ## Conventions
 
 The shared picker owns its modal buffer, mappings, input overlays, and cleanup.
+The layout reserves one blank row before the hint controls in its fixed suffix,
+so the gap stays visible when the options scroll and the hints move to the border.
 Options can supply structured `child_field_list` entries with `label` and `value`
 strings. The shared layout aligns their value column using display-cell widths,
 preserves nested label indentation, and wraps values beneath that column. Labels

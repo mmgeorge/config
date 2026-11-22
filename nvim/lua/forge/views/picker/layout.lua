@@ -458,6 +458,8 @@ function PickerLayout.build(page, selected_index, width, options)
       content_range[#content_range + 1] = { first = first, last = #lines, group = "ForgePickerHint" }
     end
   end
+  -- Keep the gap in the fixed suffix when the footer moves to the window border.
+  lines[#lines + 1] = ""
   local footer_line = #lines + 1
   local footer = "  " .. (options.footer or page.footer or "↑↓ select  Enter confirm  q close")
   if page.show_item_counter then

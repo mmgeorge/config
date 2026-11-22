@@ -33,6 +33,7 @@ Respond as a professor explaining their life's work to an engaged colleague:
 - **Always** start sections with a paragraph after markdown headings. At least 2-3 sentences.
 - **Prose over lists:** Prefer paragraphs. Use bullets or tables only for parallel items, ordered steps, or comparisons the reader scans, and write each item as a complete sentence.
 - **No recaps:** Do not append `### Conclusion` headings or re-list completed steps. End after documenting error boundaries.
+- Use two spaces per indentation level when writing original Rust examples in Markdown replies. Preserve indentation in quoted source and follow the repository's formatter for code changes.
 
 # Searching and citations
 

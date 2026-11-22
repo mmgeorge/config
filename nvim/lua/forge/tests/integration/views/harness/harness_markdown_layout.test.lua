@@ -37,6 +37,8 @@ if vim.g.forge_markdown_layout_child then
     "",
     "```rust",
     "let sample = \"literal **code**\";",
+    "    rust_step();",
+    "        nested_step();",
     "```",
     "",
     "| Name | Value |",
@@ -120,7 +122,7 @@ T["harness_markdown_layout"] = function()
     end
     require("render-markdown").setup({})
   ]], { config_path })
-  child.api.nvim_ui_attach(120, 40, { rgb = true })
+  child.api.nvim_ui_attach(120, 43, { rgb = true })
   child.lua("local path, indent = ...; vim.g.forge_markdown_layout_child=true; vim.g.forge_markdown_layout_indent=indent; dofile(path)", {test_path, vim.g.forge_markdown_layout_indent or 2})
   local function capture()
     local lines = {}
@@ -128,7 +130,7 @@ T["harness_markdown_layout"] = function()
     return lines
   end
   local function verify_layout(width)
-    child.api.nvim_ui_try_resize(width, 40)
+    child.api.nvim_ui_try_resize(width, 43)
     child.lua([[
     require("forge.render.harness.markdown").render(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win(), {
     { first0 = 2, after0 = 3 }, { first0 = 3, after0 = 4, indent = vim.g.forge_markdown_layout_indent or 2, source_indent = (vim.g.forge_markdown_layout_indent or 2) - 2 },
@@ -142,6 +144,19 @@ T["harness_markdown_layout"] = function()
       context = function() return table.concat(capture(), "\n") end })
     local screen_lines = capture()
     local screen = table.concat(screen_lines, "\n")
+    local function code_column(text)
+      for _, line in ipairs(screen_lines) do
+        local start = line:find(text, 1, true)
+        if start then return vim.fn.strdisplaywidth(line:sub(1, start - 1)) end
+      end
+      error("Missing code in the transcript screen: " .. text)
+    end
+    local code_origin = code_column("let sample")
+    assert(code_column("rust_step") == code_origin + 2, "Rust code should display two spaces per indent")
+    assert(code_column("nested_step") == code_origin + 4, "Nested Rust code should keep both indent levels")
+    assert(child.lua_get([[vim.iter(vim.api.nvim_buf_get_lines(0, 0, -1, false)):any(function(line)
+      return line == string.rep(" ", (vim.g.forge_markdown_layout_indent or 2) + 6) .. "nested_step();"
+    end)]]), "Rust source indentation changed")
     -- Fold markers reflect expansion state; these headings own no folded body, so they display expanded.
     assert(screen_lines[1]:find("▾ what day is it?", 1, true) == 1, "prompt marker is indented:\n" .. screen)
     assert(screen_lines[2]:find("▾ Thought for 3s", 1, true) == 1, "summary marker is indented:\n" .. screen)

@@ -4,6 +4,14 @@ local replica = require("forge.buffer")
 local input = require("forge.input")
 local perf = require("forge.infra.perf")
 local diagnostic = require("forge.views.harness.diagnostic")
+local buffer_view = require("forge.buffer_view")
+local layout = require("forge.views.harness.layout")
+local exchange_preview_namespace = vim.api.nvim_create_namespace("forge.harness.exchange_preview")
+
+---@class ForgeHarnessExchangePreview
+---@field show fun(exchange_id: string?, height: integer)
+---@field close fun()
+
 -- A displayed transcript synchronizes on every wake: the host's output window already paces
 -- streamed text, and one request in flight absorbs the wakes that arrive during it. A timer here
 -- only added latency, and on Windows a sub-tick delay rounds up to a whole 15.6 ms tick.
@@ -17,7 +25,7 @@ local transcript_options = {
     fold_markers = true,
   conceal = { level = 3, cursor = "nvic" },
   columns = { signcolumn = "yes:1", statuscolumn = "%s" },
-  wrapping = require("forge.views.harness.layout").transcript_wrapping,
+  wrapping = layout.transcript_wrapping,
 }
 
 function M.open(options, callback)
@@ -39,6 +47,7 @@ function M.open(options, callback)
     timeline_key = "main", timeline_view = {}, epoch = 0,
     staging = { queue = {}, steering = {} }, applied_staging = { queue = {}, steering = {} } }
   local response_reveal = require("forge.views.harness.response_reveal").new(options.composer_window)
+  local exchange_preview_update
   ---Callers of `owner.when_rendered` waiting for the first rendered transcript, and whether the
   ---transcript opened (`true`) or can no longer open (`false`) once that is known.
   local rendered_waiter_list, rendered_outcome = {}, nil
@@ -153,7 +162,6 @@ function M.open(options, callback)
     -- be left showing empty rows below it until the scroll boundary is applied again.
     local function clamp_after_render()
       markdown.after_render(options.transcript_buffer, guard(function()
-        local layout = require("forge.views.harness.layout")
         for _, window in ipairs(window_list) do layout.clamp_scroll(options.transcript_buffer, window) end
       end))
     end
@@ -622,7 +630,7 @@ function M.open(options, callback)
       cancel_refresh_timer()
       owner.sync()
     elseif owner.ready and not owner.syncing and not owner.applying and owner.transcript.status == "Applied" then
-      response_reveal:publish(owner.transcript, owner.views, false, owner.status_view:handoff())
+      response_reveal:publish(owner.transcript, owner.views, exchange_preview_update ~= nil, owner.status_view:handoff())
     end
   end
 
@@ -686,13 +694,15 @@ function M.open(options, callback)
           end
           owner.restore_timeline = nil
         end
+        if exchange_preview_update then exchange_preview_update() end
         render_markdown(switched_timeline)
         owner.observe_sections()
         if options.on_update then options.on_update() end
         local revision = owner.transcript.revision
         markdown.after_render(options.transcript_buffer, guard(function(rendered)
           if owner.transcript.revision ~= revision then return end
-          response_reveal:publish(owner.transcript, owner.views, switched_timeline or not status_applied or not rendered,
+          response_reveal:publish(owner.transcript, owner.views,
+            exchange_preview_update ~= nil or switched_timeline or not status_applied or not rendered,
             owner.status_view:handoff())
         end))
         if result.syntax_pending then owner.highlight() end
@@ -1064,6 +1074,98 @@ function M.open(options, callback)
     end)
   end
 
+  ---Reveal the root exchange's opening and responses while the rollback picker owns focus.
+  ---@param window integer
+  ---@return ForgeHarnessExchangePreview?
+  function owner.exchange_preview(window)
+    if owner.timeline_key ~= "main" then return nil end
+    local origin, scrolloff
+    local exchange_id, visible_height, pending
+    local opening_mark
+    local epoch = owner.epoch
+    local transcript = owner.transcript
+    local function owns_window()
+      return vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == transcript.buffer
+    end
+    local function clear_opening_mark()
+      if opening_mark and vim.api.nvim_buf_is_valid(transcript.buffer) then
+        vim.api.nvim_buf_del_extmark(transcript.buffer, exchange_preview_namespace, opening_mark)
+      end
+      opening_mark = nil
+    end
+    local function close()
+      exchange_preview_update = nil
+      clear_opening_mark()
+      if not origin then return end
+      if vim.api.nvim_win_is_valid(window) then vim.w[window].forge_harness_preview_height = nil end
+      if owns_window() then
+        vim.wo[window].scrolloff = scrolloff
+        if owner.epoch == epoch and owner.timeline_key == "main" then
+          buffer_view.restore(owner.transcript, { origin })
+        end
+      end
+      origin = nil
+    end
+    local function expand_responses(opening_index)
+      local view = view_for(window)
+      if not view then return end
+      for index = opening_index + 1, transcript.sequence:count() - 1 do
+        local block = transcript.sequence:at(index)
+        -- Main inserts a separator before every subsequent exchange.
+        if block.id:match(":separator$") then break end
+        local metadata = block.entry.metadata
+        local node = metadata.node
+        local marker = metadata.layout and metadata.layout.marker
+        if node and node ~= vim.NIL and node.kind == "message" and node.display == "preview"
+          and (not node.parent or node.parent == vim.NIL)
+          and marker and marker ~= vim.NIL and marker.capture == "ForgeHarnessResponse" then
+          owner.set_section(node.id, true, false, view)
+        end
+      end
+    end
+    local function reveal()
+      if not pending or not alive() or not owner.ready or owner.epoch ~= epoch or owner.timeline_key ~= "main"
+        or not owns_window() then return end
+      -- The projection names user prompts, task notices, and input-free exchange headings.
+      local opening_index, row
+      for _, suffix in ipairs({ ":prompt", ":start", ":origin", ":summary" }) do
+        local index, start = transcript.sequence:position(exchange_id .. suffix)
+        if start then
+          opening_index, row = index, replica.physical_row(transcript, start) + 1
+          break
+        end
+      end
+      if not row then return end
+      pending = false
+      if not origin then
+        for _, saved in ipairs(buffer_view.capture(owner.transcript, function() return true end)) do
+          if saved.window == window then origin = saved break end
+        end
+        scrolloff = vim.wo[window].scrolloff
+        vim.wo[window].scrolloff = 0
+      end
+      vim.w[window].forge_harness_preview_height = visible_height
+      local bottom_topline = layout.maximum_content_topline(transcript.buffer, window, visible_height)
+      vim.api.nvim_win_call(window, function()
+        vim.fn.winrestview({ lnum = row, col = 0, topline = math.min(row, bottom_topline),
+          leftcol = 0, skipcol = 0, topfill = 0 })
+      end)
+      opening_mark = vim.api.nvim_buf_set_extmark(transcript.buffer, exchange_preview_namespace, row - 1, 0,
+        { id = opening_mark, line_hl_group = "ForgePickerSelectedLine", priority = 500 })
+      expand_responses(opening_index)
+    end
+    return {
+      show = function(id, height)
+        if not id then close() return end
+        if exchange_id ~= id then clear_opening_mark() end
+        exchange_id, visible_height, pending = id, height, true
+        exchange_preview_update = reveal
+        reveal()
+      end,
+      close = close,
+    }
+  end
+
   ---Select the timeline the transcript presents: a child run, or Main when `run_id` is nil.
   ---A selection made while another update is in flight is deferred and coalesced with later ones.
   ---`on_settled` runs once: with no failure when the transcript shows `run_id`; with the failure
@@ -1121,7 +1223,7 @@ function M.open(options, callback)
     if not alive() or not owner.ready then return end
     for window in pairs(owner.views) do
       if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == owner.transcript.buffer then
-        require("forge.views.harness.layout").position_tail(owner.transcript.buffer, window)
+        layout.position_tail(owner.transcript.buffer, window)
       end
     end
   end

@@ -182,7 +182,7 @@ T["settings"] = function()
     assert(window.row == bounds.bottom - window.height - 2, "configuration is not anchored to the bottom")
     assert(#current.frame.lines == window.height, "short category did not fill the fixed window")
     local help = current.frame.content_range[#current.frame.content_range]
-    assert(help.last == window.height and help.last - help.first + 1 == 2, "description moved away from the bottom")
+    assert(help.last == window.height - 1 and help.last - help.first + 1 == 2, "description moved away from the footer gap")
   end
   assert_configuration_geometry()
   assert(instance.spec.page_navigation == "tabs" and #instance.spec.page_list == 5)

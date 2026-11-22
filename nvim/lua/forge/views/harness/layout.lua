@@ -376,6 +376,7 @@ end
 function M.clamp_scroll(transcript_buf, transcript_win, visible_height)
   if not vim.api.nvim_win_is_valid(transcript_win)
     or vim.api.nvim_win_get_buf(transcript_win) ~= transcript_buf then return end
+  visible_height = visible_height or vim.w[transcript_win].forge_harness_preview_height
   local maximum_topline = M.maximum_content_topline(transcript_buf, transcript_win, visible_height)
   vim.api.nvim_win_call(transcript_win, function()
     local view = vim.fn.winsaveview()

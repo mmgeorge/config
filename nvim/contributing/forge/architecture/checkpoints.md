@@ -24,6 +24,10 @@ At terminal capture, `ProviderChangeIndex` collects paths from successful struct
 
 ## Comparison
 
+Undo reads each exchange's saved comparison and uses the same display patch
+statistics as the timeline's **Edits** heading. A completed empty patch provides
+a confirmed zero, while a pending, failed, or unreadable comparison supplies no count.
+
 Checkpoint comparisons run on the runtime `DiffEngine`. `forge-diff::raw` uses histogram comparison with `imara-diff`, and its hunk identities include both source hashes, representations, and exact byte ranges. `SourceVersion` keeps complete bytes with a lazy SHA-256 identity. Saved patch presentation compares LF and CRLF lines by text and reports line-ending conversions separately, while the raw patch and restore keep the original bytes.
 
 Check source identities hash each selected path's working-content digest and file mode. Git-backed files use the object store's cached digest after applying the captured checkout conversion; captured overrides already carry the same content digest. Committing unchanged bytes therefore preserves verification, while content or mode changes invalidate it. These identities never include the storage variant or commit identity.

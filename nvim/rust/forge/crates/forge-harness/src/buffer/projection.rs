@@ -1633,9 +1633,7 @@ impl TimelineRenderer<'_> {
                         column: 0,
                     },
                 },
-                capture: if interaction.approval_mode.is_some() {
-                    "ForgeHarnessRead".into()
-                } else if interaction.is_finished() {
+                capture: if interaction.is_finished() {
                     "ForgeHarnessThought".into()
                 } else {
                     "ForgeHarnessThinking".into()

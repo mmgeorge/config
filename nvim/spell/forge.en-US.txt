@@ -62,3 +62,7 @@ LF
 sys
 
 fanout
+
+vimrc
+
+prereq

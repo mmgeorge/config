@@ -20,6 +20,14 @@ impl fmt::Display for PatchParseError {
 
 impl std::error::Error for PatchParseError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+/// Counts changed files and textual lines in a patch.
+pub struct PatchStats {
+    pub file_count: usize,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
 #[derive(Debug)]
 /// Borrows patch bodies and owns decoded paths for display, never for applying edits.
 pub struct UnifiedPatch<'source> {
@@ -145,6 +153,21 @@ impl<'source> UnifiedPatch<'source> {
         }
         Ok(self)
     }
+
+    /// Count each file, including binary and metadata-only changes.
+    pub fn stats(&self) -> PatchStats {
+        let mut stats = PatchStats {
+            file_count: self.file.len(),
+            additions: 0,
+            deletions: 0,
+        };
+        for file in &self.file {
+            let (additions, deletions) = file.line_counts();
+            stats.additions += additions;
+            stats.deletions += deletions;
+        }
+        stats
+    }
 }
 
 #[derive(Debug)]
@@ -165,6 +188,20 @@ pub struct PatchFile<'source> {
 }
 
 impl PatchFile<'_> {
+    /// Count added and removed rows in this file's hunks.
+    pub fn line_counts(&self) -> (usize, usize) {
+        let mut additions = 0;
+        let mut deletions = 0;
+        for row in self.hunk.iter().flat_map(|hunk| &hunk.row) {
+            match row.kind() {
+                RowKind::Added => additions += 1,
+                RowKind::Removed => deletions += 1,
+                RowKind::Context => {}
+            }
+        }
+        (additions, deletions)
+    }
+
     /// Verify complete source coverage without reconstructing a file from sparse patch fragments.
     /// Both hunk bytes and all unchanged gaps must match. Memory use is constant in source length.
     pub fn matches_source(&self, source: &crate::source::SourcePair) -> bool {

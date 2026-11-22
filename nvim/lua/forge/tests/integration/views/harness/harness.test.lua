@@ -4727,4 +4727,124 @@ T["tabs_left_by_a_stopped_host_reconnect_from_their_own_view"] = function()
   eq(host.stop(), true)
 end
 
+-- requires-forge-host
+T["undo_selection_previews_the_exchange_and_restores_the_timeline"] = function()
+  local client = host.start({ config = true }).client
+  vim.o.lines = 32
+  require("forge").setup({ harness = { provider = "mock" }, picker = { max_height = 5 } })
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.harness.provider_preference"), "load",
+    function() return "mock" end)
+  vim.fn.chdir(temp.directory("undo-timeline"))
+  require("forge").open_harness()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local picker = require("forge.views.picker")
+  local activity = require("forge.views.harness.activity")
+  wait_until(function() return state.presentation and state.presentation.ready end, "Harness did not open")
+
+  local first_prompt, latest_prompt = "First rollback prompt", "Latest rollback prompt"
+  local response_end = "The end of the older response."
+  local scripted, script_failure
+  client.request({ session_id = state.session.id, method = "session.provider.mock_response", params = {
+    operation = "script", script = { steps = { { kind = "message", content = "response",
+      text = ("An earlier paragraph.\n\n"):rep(8) .. response_end } }, terminal = "completed" },
+  } }, function(_, failure) scripted, script_failure = true, failure end)
+  wait_until(function() return scripted end, "Mock response script did not install")
+  eq(script_failure, nil)
+  for index, prompt in ipairs({ first_prompt, "Second rollback prompt", "Third rollback prompt", latest_prompt }) do
+    buffer.set(state.composer_buf, { prompt })
+    controller.submit()
+    wait_until(function()
+      return not activity.busy(state)
+        and buffer.find_row(state.transcript_buf, index == 1 and response_end or "Mock response: " .. prompt)
+    end, "Mock turn did not finish")
+  end
+  wait_until(function() return not buffer.find_row(state.transcript_buf, response_end) end,
+    "The oldest response should be folded")
+  local document = state.presentation.transcript
+  local heading = require("forge.buffer").locate(document, buffer.find_row(state.transcript_buf, "Thought") - 1, 0)
+  eq(document.block[heading.block].metadata.layout.marker.capture, "ForgeHarnessThought")
+  local function marked_rows()
+    local namespace = vim.api.nvim_get_namespaces()["forge.harness.exchange_preview"]
+    if not namespace then return {} end
+    return vim.tbl_map(function(mark) return mark[2] + 1 end,
+      vim.api.nvim_buf_get_extmarks(state.transcript_buf, namespace, 0, -1, {}))
+  end
+  local transcript = state.transcript_win
+  local function view()
+    return vim.api.nvim_win_call(transcript, vim.fn.winsaveview)
+  end
+  local function opening()
+    return buffer.line(state.transcript_buf, view().lnum)
+  end
+  vim.api.nvim_win_set_cursor(transcript, { 1, 0 })
+  vim.api.nvim_set_current_win(state.composer_win)
+  local origin = view()
+  buffer.set(state.composer_buf, { "/undo" })
+  controller.submit()
+  wait_until(function() return picker.is_open() end, "Undo picker did not open")
+  local picker_window = vim.api.nvim_get_current_win()
+  local picker_buffer = vim.api.nvim_win_get_buf(picker_window)
+  local palette = require("theme.palette")
+  local function foreground(group)
+    return vim.api.nvim_get_hl(0, { name = group, link = false }).fg
+  end
+  eq(foreground("ForgeHarnessPrompt"), tonumber(palette.salmon:sub(2), 16))
+  eq(foreground("ForgeHarnessPickerSelected"), foreground("ForgeHarnessPrompt"))
+  eq(foreground("ForgePickerSelected"), tonumber(palette.light_blue:sub(2), 16))
+  eq(vim.wo[picker_window].winhighlight:find("ForgePickerSelected:ForgeHarnessPickerSelected", 1, true) ~= nil, true)
+  eq(buffer.find_row(picker_buffer, "Time%s+Edits%s+Details", { pattern = true }) ~= nil, true)
+  eq(buffer.find_row(picker_buffer, "Choice"), nil)
+  vim.cmd.redraw()
+  eq(opening():find(latest_prompt, 1, true) ~= nil, true, { fail_reason = "The initial choice should reveal its prompt" })
+  local latest_row = buffer.find_row(picker_buffer, latest_prompt)
+  local previous_row = buffer.find_row(picker_buffer, "Third rollback prompt")
+  eq(latest_row ~= nil and previous_row ~= nil and previous_row < latest_row, true,
+    { fail_reason = "The newest exchange should appear below the preceding exchange" })
+  eq(buffer.line(picker_buffer, latest_row):match("^%s*%d+s%s") ~= nil, true,
+    { fail_reason = "The host should supply the exchange duration" })
+  eq(buffer.line(picker_buffer, latest_row):find("complete ·", 1, true), nil,
+    { fail_reason = "Exchange details should omit execution status" })
+  eq(vim.api.nvim_win_get_cursor(picker_window)[1], latest_row)
+  eq(buffer.find_row(picker_buffer, first_prompt), nil)
+  local prompt_screen_row = vim.fn.screenpos(transcript, view().lnum, 1).row
+  eq(prompt_screen_row > 0 and prompt_screen_row < vim.fn.win_screenpos(picker_window)[1], true,
+    { fail_reason = "The selected prompt should be visible above the picker" })
+  local newest_transcript_row = view().lnum
+  keymap.invoke("<Down>")
+  eq(view().lnum, newest_transcript_row, { fail_reason = "Down should stop at the newest exchange" })
+  keymap.invoke("<Up>")
+  eq(view().lnum < newest_transcript_row, true)
+  eq(opening():find("Third rollback prompt", 1, true) ~= nil, true)
+  keymap.invoke("<Up>")
+  keymap.invoke("<Up>")
+  eq(opening():find(first_prompt, 1, true) ~= nil, true, { fail_reason = "Moving the selection should reveal the older prompt" })
+  eq(vim.api.nvim_win_get_cursor(picker_window)[1], buffer.find_row(picker_buffer, first_prompt))
+  eq(marked_rows(), { view().lnum }, { fail_reason = "Only the selected exchange's opening row should be highlighted" })
+  wait_until(function() return buffer.find_row(state.transcript_buf, response_end) end,
+    "Selecting the older exchange did not expand its response")
+  eq(marked_rows(), { view().lnum })
+  eq(vim.api.nvim_get_current_win(), picker_window)
+  keymap.invoke("q")
+  eq(marked_rows(), {})
+  eq(buffer.find_row(state.transcript_buf, response_end) ~= nil, true)
+  eq(view(), origin)
+  eq(vim.api.nvim_get_current_win(), state.composer_win)
+
+  buffer.set(state.composer_buf, { "/undo" })
+  controller.submit()
+  wait_until(function() return picker.is_open() end, "Undo picker did not reopen")
+  keymap.invoke("<Up>")
+  keymap.invoke("<Up>")
+  keymap.invoke("<CR>")
+  keymap.invoke("<Down>")
+  keymap.invoke("<CR>")
+  wait_until(function() return not buffer.find_row(state.transcript_buf, latest_prompt) end, "Rollback did not settle")
+  eq(buffer.find_row(state.transcript_buf, "Mock response: Second rollback prompt") ~= nil, true,
+    { fail_reason = "The selected exchange should stay in the timeline" })
+  eq(buffer.find_row(state.transcript_buf, first_prompt) ~= nil, true)
+  eq(buffer.find_row(state.transcript_buf, "Third rollback prompt"), nil)
+  eq(buffer.line(state.composer_buf, 1), "Third rollback prompt")
+end
+
 return T

@@ -935,6 +935,7 @@ impl BrokerObserver {
                 ),
         };
         Ok(crate::exchange::rollback::ExchangeRollbackReview::list(
+            SystemClock.now_ms(),
             interaction_list,
             &store.list_plan(&session.id)?,
             &provider,

@@ -4,6 +4,8 @@ local perf = require("forge.infra.perf")
 local failed = false
 local language_registered = false
 local layout_ranges = {}
+local code_indent_namespace = vim.api.nvim_create_namespace("ForgeHarnessCodeIndent")
+local rust_fence_query
 local layout_handlers = false
 local cursor_attached = {}
 local render_epoch = {}
@@ -344,6 +346,53 @@ local function prune_extmarks(buf, range_list)
   end)
 end
 
+--- Compress conventional four-space Rust indentation without editing the fenced source.
+local function render_code_indent(buf, parser)
+  vim.api.nvim_buf_clear_namespace(buf, code_indent_namespace, 0, -1)
+  if vim.bo[buf].filetype ~= "ForgeHarness" then return end
+  rust_fence_query = rust_fence_query or vim.treesitter.query.parse("markdown", [[
+    ((fenced_code_block
+      (info_string (language) @_language)
+      (code_fence_content) @content) @fence
+      (#eq? @_language "rust"))
+  ]])
+  for _, tree in ipairs(parser:trees()) do
+    for _, match in rust_fence_query:iter_matches(tree:root(), buf, 0, -1) do
+      local fence, content
+      for capture, nodes in pairs(match) do
+        local name = rust_fence_query.captures[capture]
+        if name == "fence" then fence = nodes[1] end
+        if name == "content" then content = nodes[1] end
+      end
+      if fence and content then
+        local _, margin = fence:range()
+        local first, _, after, final_column = content:range()
+        if final_column > 0 then after = after + 1 end
+        local lines = vim.api.nvim_buf_get_lines(buf, first, after, false)
+        local minimum
+        local indent_by_line = {}
+        for index, line in ipairs(lines) do
+          local spaces = line:sub(margin + 1):match("^( +)%S")
+          if spaces then
+            indent_by_line[index] = #spaces
+            minimum = math.min(minimum or #spaces, #spaces)
+          end
+        end
+        -- Leave existing two-space snippets alone, including deeper lines indented by four.
+        if minimum == 4 then
+          for index, indent in pairs(indent_by_line) do
+            local hidden = math.floor(indent / 4) * 2
+            local row = first + index - 1
+            vim.api.nvim_buf_set_extmark(buf, code_indent_namespace, row, margin, {
+              end_col = margin + hidden, conceal = "",
+            })
+          end
+        end
+      end
+    end
+  end
+end
+
 --- Clears markdown parser regions and rendered extmarks from a buffer.
 ---@param buf integer Target buffer number.
 function M.clear(buf)
@@ -355,6 +404,7 @@ function M.clear(buf)
   local math_handler = package.loaded["markdown_math.display_handler"]
   if math_handler then math_handler.invalidate(buf) end
   if not vim.api.nvim_buf_is_valid(buf) then return end
+  vim.api.nvim_buf_clear_namespace(buf, code_indent_namespace, 0, -1)
   vim.treesitter.stop(buf)
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
   if parser_ok and parser then
@@ -413,6 +463,7 @@ function M.render(buf, win, range_list)
     local highlight_ok, highlight_error = pcall(perf.trace, "harness", "ui.markdown.highlight", { buf = buf }, function()
       local query = transcript_highlight_query()
       vim.treesitter.highlighter.new(parser, query and { queries = { markdown = query } } or nil)
+      render_code_indent(buf, parser)
     end)
     if not highlight_ok then
       if not failed then

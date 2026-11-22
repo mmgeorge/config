@@ -29,7 +29,7 @@ end
 function PickerWindow.open(host, width, height, title, origin, placement)
   local bounds = picker_layout.host_bounds(host.window_list)
   local anchor = position(bounds, width, height, placement)
-  return popup_window.open({
+  local buffer, window = popup_window.open({
     relative = "editor",
     row = anchor.row,
     col = anchor.col,
@@ -45,6 +45,18 @@ function PickerWindow.open(host, width, height, title, origin, placement)
     wrap = false,
     zindex = 90,
   })
+  for _, host_window in ipairs(host.window_list) do
+    if vim.api.nvim_win_is_valid(host_window) then
+      local filetype = vim.bo[vim.api.nvim_win_get_buf(host_window)].filetype
+      if filetype == "ForgeHarness" or filetype == "ForgeHarnessInput" then
+        vim.api.nvim_win_call(window, function()
+          vim.opt_local.winhighlight:append({ ForgePickerSelected = "ForgeHarnessPickerSelected" })
+        end)
+        break
+      end
+    end
+  end
+  return buffer, window
 end
 
 ---@param win integer

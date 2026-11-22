@@ -402,6 +402,9 @@ globally, such as a `Y` mapped to paste. The status row, the transcript, and a p
 countdown keep updating while you sit at a `:` prompt. When another picker replaces a pending permission
 popup, the popup returns once that picker closes.
 
+Rust code fences in the Harness transcript display four-space indentation levels
+as two spaces. Copying the code preserves its source indentation.
+
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
 two latest prior responses stay open during the current exchange. Submitting another prompt folds
 the third-to-last response. Thinking and tool sections keep their usual folding behavior.
@@ -594,11 +597,25 @@ A session of another worktree is history-only; open Harness from that worktree t
 resume it. `Ctrl-J` deletes the selected saved session and closes every tab that shows it.
 Its row leaves the list at once and the selection moves to the next row; if Harness
 refuses the deletion, the row returns with the reason.
-After selecting an interaction, choose **Conversation only** to keep current files,
-or **Conversation and files** to restore its checkpoint too. Conversation-only
-rollback works without a file checkpoint. `/undo` also opens the list while a turn runs,
-and the list includes the running turn's interaction and the newest interaction of a
-paused goal, which it marks `paused`. A `/undo` that cannot open its list, because Harness refused it or a rollback is
+The `/undo` list uses up to 30% of the Harness area and opens on the newest exchange
+at the bottom. Press Up to move toward earlier exchanges. **Time** shows the
+timeline's Thought duration. **Edits** shows the changed file count, added lines,
+and removed lines as `2 · +3 −3`. The three counts align across rows, with
+green additions and red deletions. It leaves the cell blank for a confirmed empty comparison
+and `—` when a completed comparison is unavailable. In the Main timeline,
+the transcript follows the selection, highlights its opening row, and expands
+folded responses. Closing
+the list clears the highlight and restores the previous transcript position. Responses
+opened while browsing stay expanded.
+Selecting an exchange keeps it and every earlier exchange. Forge rolls back the exchanges
+that follow and returns the first removed exchange's prompt to the composer when you wrote it.
+The latest exchange is available for browsing. **Before first exchange** rolls back the
+whole conversation when the provider supports it.
+
+Choose **Conversation only** to keep current files or **Conversation and files** to restore
+the checkpoint from before the first removed exchange. Conversation-only
+rollback works without a file checkpoint. The list also includes the exchange of a
+running turn or a paused goal. A `/undo` that cannot open its list, because Harness refused it or a rollback is
 already in progress, leaves `/undo` in the composer. Confirming conversation rollback collects active execution before changing history and
 leaves a task that was working paused, while a plan waiting in review stays in review; choosing **Conversation and files** collects it before showing the
 files to restore, so the preview describes settled files, and both options say that they
@@ -615,10 +632,9 @@ provider's own conversation, so it requires a provider that supports native rewi
 Copilot, and Claude). With Antigravity, `/undo` reports that conversation rollback is
 unsupported and changes nothing. Claude can rewind only to the end of an earlier
 interaction, not before the first one, and not to a point before its context was compacted,
-because the compaction replaced the conversation before it. An interaction that cannot be
-rolled back is marked
-unavailable in the list with its reason, and choosing it reports that reason and changes
-nothing. A failed rollback stays in `:messages` after its notice fades.
+because the compaction replaced the conversation before it. An unavailable rollback
+destination shows the provider's reason. A failed rollback stays in `:messages` after its
+notice fades.
 Rolling back an interaction inside a goal leaves the goal paused; rolling back the
 interaction that started it, or an earlier one, removes the goal. The transcript drops every
 row of the rolled-back interactions, including task rows such as `Goal completed` and

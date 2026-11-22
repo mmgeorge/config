@@ -27,7 +27,7 @@ T["picker"] = function()
     local styled_frame = layout.build(styled_page, 20, 100)
     eq(styled_frame.lines[1]:find("Location", 1, true), 3, { fail_reason = "unkeyed columns must align with the title inset" })
     eq(styled_frame.lines[2]:find("foo.rs", 1, true), 3, { fail_reason = "unkeyed values must align with their headings" })
-    eq(styled_frame.footer_line, styled_frame.body_end + 1, { fail_reason = "footer must not add an empty result row" })
+    eq(styled_frame.footer_line, styled_frame.body_end + 2, { fail_reason = "The footer gap should sit outside the results" })
     styled_frame = layout.viewport(styled_frame, 8)
     local styled_buf = buffer.scratch()
     require("forge.views.picker.render").apply(styled_buf, styled_frame)
@@ -508,6 +508,8 @@ T["picker"] = function()
     assert(vim.api.nvim_win_get_config(active.win).footer[1][1]:find("Enter insert", 1, true),
       "overflowing picker lost its visible controls")
     eq(active.frame.footer_line, nil, { fail_reason = "overflowing picker duplicated its footer in scrollable content" })
+    eq(buffer.line(active.buf, vim.api.nvim_win_get_height(active.win)), "",
+      { fail_reason = "A blank row should separate the options from the border footer" })
     assert(vim.api.nvim_win_get_config(active.win).footer[1][1]:match("1 of 50%s*$"),
       "overflowing picker did not show its first selected item")
     eq(vim.fn.strdisplaywidth(vim.api.nvim_win_get_config(active.win).footer[1][1]),
@@ -521,6 +523,8 @@ T["picker"] = function()
     picker.update(overflow_spec)
     active = picker._state_for_test()
     assert(active.frame.footer_line ~= nil, "short picker did not restore its inline footer")
+    eq(buffer.line(active.buf, active.frame.footer_line - 1), "",
+      { fail_reason = "A blank row should separate the options from the inline footer" })
     assert(active.frame.lines[active.frame.footer_line]:match("1 of 1$"), "inline counter retained the old total")
     eq(vim.fn.strdisplaywidth(active.frame.lines[active.frame.footer_line]),
       vim.api.nvim_win_get_width(active.win) - 2, { fail_reason = "inline counter must align at the right inset" })
@@ -901,7 +905,8 @@ T["navigation"] = function()
         local frame = layout.build(page, selected, width)
         local help = frame.content_range[1]
         eq(help.last - help.first + 1, 2)
-        eq(frame.footer_line - help.last, 1)
+        eq(frame.footer_line - help.last, 2)
+        eq(frame.lines[frame.footer_line - 1], "")
         eq(#frame.lines, #first_frame.lines, { fail_reason = "help resized the picker" })
         eq(frame.option_range, first_frame.option_range, { fail_reason = "help displaced setting rows" })
         for _, line in ipairs(frame.lines) do assert(vim.fn.strdisplaywidth(line) <= width) end
@@ -910,11 +915,11 @@ T["navigation"] = function()
           assert(vim.trim(frame.lines[help.first]) == "" and frame.lines[help.last] == "")
         end
         if selected == 4 then assert(frame.lines[help.first]:find("Unavailable.", 1, true)) end
-        local visible = layout.viewport(frame, 6)
+        local visible = layout.viewport(frame, 7)
         local visible_help = visible.content_range[1]
         eq(visible_help.last - visible_help.first + 1, 2)
-        eq(visible.footer_line - visible_help.last, 1)
-        eq(#visible.lines, 6)
+        eq(visible.footer_line - visible_help.last, 2)
+        eq(#visible.lines, 7)
       end
     end
   end

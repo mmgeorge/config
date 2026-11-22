@@ -204,6 +204,11 @@ pub(crate) fn rollback_keeps_task(
 pub(crate) struct ExchangeRollbackReview {
     #[serde(flatten)]
     pub(crate) exchange: Exchange,
+    /// Active exchange time at the time of the review.
+    elapsed_ms: u64,
+    /// Net workspace changes from the exchange's completed checkpoint comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edits: Option<forge_diff::patch::PatchStats>,
     /// Why rolling back to this exchange cannot rewind the provider; absent when it can.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rollback_unavailable: Option<String>,
@@ -226,6 +231,7 @@ impl ExchangeRollbackReview {
     /// Annotate every current, finished exchange of one ordered history with its rollback refusal
     /// and, for a task start, the command a rollback returns; `plan_list` is the session's plans.
     pub(crate) fn list(
+        now_ms: i64,
         exchanges: Vec<Exchange>,
         plan_list: &[crate::plan::PlanRecord],
         provider: &RewindProvider<'_>,
@@ -243,6 +249,8 @@ impl ExchangeRollbackReview {
             .into_iter()
             .zip(unavailable)
             .map(|(exchange, rollback_unavailable)| Self {
+                elapsed_ms: exchange.elapsed(now_ms),
+                edits: captured_edit_stats(&exchange),
                 task_command: task_command(&exchange, plan_list),
                 paused: exchange.is_parked(),
                 exchange,
@@ -250,6 +258,15 @@ impl ExchangeRollbackReview {
             })
             .collect()
     }
+}
+
+/// Summarize the same display comparison as the timeline's Edits fold.
+fn captured_edit_stats(exchange: &Exchange) -> Option<forge_diff::patch::PatchStats> {
+    let super::ExchangeChangeResult::Captured(comparison) = exchange.change_result() else {
+        return None;
+    };
+    let patch = forge_diff::patch::UnifiedPatch::parse(comparison.text()).ok()?;
+    Some(patch.display().ok()?.stats())
 }
 
 /// Name the command that started a task start's task, as the user typed it.
@@ -475,6 +492,45 @@ fn digest(value: &impl Serialize) -> Result<String, RollbackFailure> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn edit_stats_distinguish_changed_empty_and_missing_comparisons() {
+        use forge_diff::patch::PatchStats;
+
+        let mut exchange = finished_exchange("edited", 1);
+        assert_eq!(captured_edit_stats(&exchange), None);
+
+        exchange.checkpoint_before = Some("before".into());
+        exchange.checkpoint_after = Some("after".into());
+        exchange.checkpoint_diff_text = Some(String::new());
+        assert_eq!(
+            captured_edit_stats(&exchange),
+            Some(PatchStats {
+                file_count: 0,
+                additions: 0,
+                deletions: 0,
+            })
+        );
+
+        exchange.checkpoint_diff_text = Some(
+            concat!(
+                "diff --git a/manifest.json b/manifest.json\n",
+                "--- a/manifest.json\n+++ b/manifest.json\n",
+                "@@ -1,2 +1,3 @@\n-old\n+new\n+extra\n context\n",
+                "diff --git a/main.js b/main.js\n",
+                "old mode 100644\nnew mode 100755\n",
+            )
+            .into(),
+        );
+        assert_eq!(
+            captured_edit_stats(&exchange),
+            Some(PatchStats {
+                file_count: 2,
+                additions: 2,
+                deletions: 1,
+            })
+        );
+    }
+
     /// Reject replacement even when the persisted preview identity is unchanged.
     #[test]
     fn preview_token_rejects_changed_history() {
@@ -514,7 +570,7 @@ mod tests {
         ));
         let refusal = rewind_target(&exchanges, 0, &provider).unwrap_err();
         assert_eq!(refusal.code(), "rollback_unsupported");
-        let review = ExchangeRollbackReview::list(exchanges, &[], &provider);
+        let review = ExchangeRollbackReview::list(0, exchanges, &[], &provider);
         assert_eq!(review[0].rollback_unavailable, Some(refusal.to_string()));
         assert_eq!(review[1].rollback_unavailable, None);
 
@@ -589,7 +645,7 @@ mod tests {
             rewind_target(&exchanges, 3, &provider),
             Ok(Some(Some(checkpoint))) if checkpoint == "checkpoint-third"
         ));
-        let review = ExchangeRollbackReview::list(exchanges.clone(), &[], &provider);
+        let review = ExchangeRollbackReview::list(0, exchanges.clone(), &[], &provider);
         let unavailable = review
             .iter()
             .map(|entry| entry.rollback_unavailable.is_some())
@@ -616,7 +672,7 @@ mod tests {
             capability: &crosses,
             ..idle
         };
-        let review = ExchangeRollbackReview::list(exchanges, &[], &crosses);
+        let review = ExchangeRollbackReview::list(0, exchanges, &[], &crosses);
         assert_eq!(
             review
                 .iter()
@@ -720,7 +776,7 @@ Keep the rounding rule.",
             native_history: true,
             newest_session_compaction_ms: None,
         };
-        let review = ExchangeRollbackReview::list(exchanges, &plan_list, &provider);
+        let review = ExchangeRollbackReview::list(0, exchanges, &plan_list, &provider);
         assert_eq!(
             review
                 .iter()

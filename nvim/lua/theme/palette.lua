@@ -9,6 +9,7 @@ return {
   light_gray = "#8a929c",
   white = "#ffffff",
   light_blue = "#3ec5ff",
+  salmon = "#f7758d",
   teal = "#9dffe7",
   dark_gray = "#151515",
   black = "#000000",

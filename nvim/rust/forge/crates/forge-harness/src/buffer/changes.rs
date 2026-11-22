@@ -5,9 +5,8 @@ use forge_buffer::block::{
     BlockAnchor, BufferBlock, Decoration, TargetRange, TextChunk, TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
-use forge_diff::display::RowKind;
 use forge_diff::file_header::FileChange;
-use forge_diff::patch::UnifiedPatch;
+use forge_diff::patch::{PatchStats, UnifiedPatch};
 
 use super::projection::TranscriptAction;
 use super::transcript::TranscriptRenderer;
@@ -133,21 +132,11 @@ impl ChangeTree {
         if patch.file.is_empty() {
             return Ok(tree);
         }
-        let added = patch
-            .file
-            .iter()
-            .flat_map(|file| &file.hunk)
-            .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind() == RowKind::Added)
-            .count();
-        let removed = patch
-            .file
-            .iter()
-            .flat_map(|file| &file.hunk)
-            .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind() == RowKind::Removed)
-            .count();
-        let count = patch.file.len();
+        let PatchStats {
+            file_count: count,
+            additions: added,
+            deletions: removed,
+        } = patch.stats();
         let unit = if declaration.is_some_and(|(_, document)| document) {
             "section"
         } else {
@@ -181,18 +170,7 @@ impl ChangeTree {
                 .or(file.old_path.as_ref())
                 .expect("validated patch path");
             let file_id = file_identity(id, path);
-            let added = file
-                .hunk
-                .iter()
-                .flat_map(|hunk| &hunk.row)
-                .filter(|row| row.kind() == RowKind::Added)
-                .count();
-            let removed = file
-                .hunk
-                .iter()
-                .flat_map(|hunk| &hunk.row)
-                .filter(|row| row.kind() == RowKind::Removed)
-                .count();
+            let (added, removed) = file.line_counts();
             let status = if file.old_path.is_none() {
                 FileChange::Added
             } else if file.new_path.is_none() {

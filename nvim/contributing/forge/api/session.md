@@ -409,7 +409,9 @@ List exchanges available for review.
 
 - **Context:** Explicit existing session; coordinator handles control methods.
 - **Input:** An empty parameter object.
-- **Result and effects:** Returns the exchange-review inventory.
+- **Result and effects:** Returns the exchange-review inventory. Each row includes
+  active exchange time as `elapsed_ms`. When it has a readable, completed checkpoint
+  comparison, it includes `edits` with `file_count`, `additions`, and `deletions`.
 - **Boundary:** Listing does not roll back or resume an exchange.
 - **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
 

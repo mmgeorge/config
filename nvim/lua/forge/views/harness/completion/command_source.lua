@@ -48,7 +48,7 @@ local command_list = {
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },
   { label = "/s", detail = "Alias for /sessions" },
-  { label = "/undo", detail = "Roll back to an interaction and restore its prompt" },
+  { label = "/undo", detail = "Keep an exchange and roll back what follows" },
   { label = "/provider", detail = "Switch the Harness CLI provider" },
   { label = "/skills", detail = "Browse and configure provider skills", capability = "skill_catalog" },
   { label = "/mcp", detail = "Browse and configure MCP servers", capability = "mcp_catalog" },

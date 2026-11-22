@@ -2059,7 +2059,7 @@ T["rollback_respects_newer_composer_text"] = function()
   local other_window = vim.api.nvim_get_current_win()
   local function roll_back()
     controller.open_undo_picker()
-    specs[#specs].on_confirm({ option = { value = interaction } })
+    specs[#specs].on_confirm({ option = specs[#specs].page_list[1].option_list[1] })
     specs[#specs].on_confirm({ option = { value = "conversation" } })
     return completions[#completions]
   end
@@ -2078,8 +2078,8 @@ T["rollback_respects_newer_composer_text"] = function()
   eq(vim.api.nvim_get_current_win(), other_window)
 end
 
----Open `/undo` on one listed interaction, recording every picker and rollback request it makes.
-local function undo_scene(interaction, busy)
+---Open `/undo` on a short history and record every picker and rollback request it makes.
+local function undo_scene(interaction, busy, earlier_exchanges)
   local client = require("forge.client")
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")
@@ -2093,7 +2093,11 @@ local function undo_scene(interaction, busy)
   end)
   client.request = function(request_specification, callback)
     if request_specification.method == "session.exchange.recovery" then callback(vim.NIL)
-    elseif request_specification.method == "session.exchange.list" then callback({ interaction }) end
+    elseif request_specification.method == "session.exchange.list" then
+      local exchanges = vim.list_extend({}, earlier_exchanges or {})
+      exchanges[#exchanges + 1] = interaction
+      callback(exchanges)
+    end
   end
   picker.open = function(spec) scene.specs[#scene.specs + 1] = spec end
   controller.task_transition = function(action, _, completed)
@@ -2105,19 +2109,26 @@ local function undo_scene(interaction, busy)
   dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, busy)
   controller.open_undo_picker()
   scene.state, scene.controller = state, controller
+  scene.choose = function(index)
+    local spec = scene.specs[1]
+    local options = spec.page_list[1].option_list
+    spec.on_confirm({ option = options[index or 1] })
+  end
   return scene
 end
 
 -- `/undo` during a running turn opens the interaction list; confirming a rollback collects the
 -- turn on the host, so the editor neither refuses the command nor discards it.
 T["undo_during_a_running_turn_opens_the_interaction_list"] = function()
-  local interaction = { id = "exchange", ordinal = 1, state = "complete", disposition = "current",
+  local interaction = { id = "exchange", ordinal = 2, state = "running", disposition = "current",
     prompt = "Original prompt", checkpoint_before = "checkpoint" }
-  local scene = undo_scene(interaction, true)
+  local scene = undo_scene(interaction, true,
+    { { id = "retained", ordinal = 1, state = "complete", disposition = "current", prompt = "Kept prompt" } })
   eq(scene.warnings, {})
   eq(#scene.specs, 1)
-  scene.specs[1].on_confirm({ option = { value = interaction } })
+  scene.choose(2)
   eq(#scene.specs, 2)
+  eq(scene.specs[2].page_list[1].title, "Roll back after Exchange 1")
   local scope = scene.specs[2].page_list[1].option_list
   eq(vim.tbl_map(function(option) return option.label end, scope),
     { "Cancel", "Conversation only", "Conversation and files" })
@@ -2179,7 +2190,7 @@ T["confirmed_rollback_shows_progress_and_keeps_the_paused_queue_heading"] = func
   local paused_hint = controller.paused_queue_hint(state)
   assert(paused_hint, "the paused queue has no heading hint before the rollback")
   eq(health.notice(state), nil)
-  scene.specs[1].on_confirm({ option = { value = interaction } })
+  scene.choose()
   scene.specs[2].on_confirm({ option = { value = "conversation" } })
   dofile("nvim/lua/forge/tests/support/activity.lua").set_busy(state, true)
   local notice = health.notice(state)
@@ -2193,15 +2204,17 @@ end
 -- A files preview is computed after the host collects the running turn, so the scope says that it
 -- stops the turn, and the preview's Cancel says the turn has already stopped and nothing changes.
 T["restore_preview_cancel_says_the_running_turn_already_stopped"] = function()
-  local interaction = { id = "exchange", ordinal = 1, state = "complete", disposition = "current",
+  local interaction = { id = "exchange", ordinal = 2, state = "complete", disposition = "current",
     prompt = "Prompt", checkpoint_before = "checkpoint" }
-  local scene = undo_scene(interaction, true)
+  local scene = undo_scene(interaction, true,
+    { { id = "retained", ordinal = 1, state = "complete", disposition = "current", prompt = "Kept prompt" } })
   require("forge.client").request = function(request_specification, callback)
     if request_specification.method == "session.exchange.rollback.prepare" then
+      eq(request_specification.params, { exchange_id = "exchange", latest_exchange_id = "exchange" })
       callback({ preview_id = "preview", files = 2, warning_count = 0, warnings = {} })
     end
   end
-  scene.specs[1].on_confirm({ option = { value = interaction } })
+  scene.choose(2)
   local files_scope = scene.specs[2].page_list[1].option_list[3]
   assert(files_scope.detail:find("Stops the running turn to preview the files", 1, true), files_scope.detail)
   scene.specs[2].on_confirm({ option = { value = "workspace" } })
@@ -2222,21 +2235,60 @@ T["restore_preview_names_one_file_in_the_singular"] = function()
       callback({ preview_id = "preview", files = 1, warning_count = 0, warnings = {} })
     end
   end
-  scene.specs[1].on_confirm({ option = { value = interaction } })
+  scene.choose()
   scene.specs[2].on_confirm({ option = { value = "workspace" } })
   local subtitle = scene.specs[3].page_list[1].subtitle
   assert(subtitle:find("^1 file will be restored%."), subtitle)
 end
 
--- A paused goal parks its newest exchange, which stays `running` in history with the output it
--- produced; the host marks it paused, and the list offers it like any other exchange, named paused.
+-- A paused goal parks its newest exchange with its output, so it remains available to preview.
 T["undo_lists_the_parked_exchange_of_a_paused_goal"] = function()
   local interaction = { id = "parked", ordinal = 3, state = "running", paused = true, disposition = "current",
-    prompt = "Goal resumed", checkpoint_before = "checkpoint" }
+    prompt = "Goal resumed", checkpoint_before = "checkpoint", elapsed_ms = 3250 }
   local scene = undo_scene(interaction, false)
-  eq(#scene.specs[1].page_list[1].option_list, 1)
-  eq(scene.specs[1].page_list[1].option_list[1].id, "parked")
-  eq(scene.specs[1].page_list[1].option_list[1].detail, "paused · Goal resumed")
+  local page = scene.specs[1].page_list[1]
+  eq(vim.tbl_map(function(option) return option.id end, page.option_list), { "before-first-exchange", "parked" })
+  eq(page.selected_index, 2)
+  eq(page.option_list[1].key, nil)
+  eq(page.option_list[2].key, nil)
+  eq(page.title, "Undo")
+  eq(page.column_headers, { "Time", "Edits", "Details" })
+  eq(page.option_list[2].columns, { "3s", "—", "Goal resumed" })
+  eq(page.option_list[2].disabled_reason, "There are no later exchanges to roll back")
+end
+
+T["undo_summarizes_captured_edits"] = function()
+  local retained = { id = "first", ordinal = 1, state = "complete", disposition = "current",
+    prompt = "Rename the plugin", elapsed_ms = 3250, edits = { file_count = 2, additions = 3, deletions = 3 } }
+  local unchanged = { id = "second", ordinal = 2, state = "complete", disposition = "current",
+    prompt = "Check the rename", elapsed_ms = 1700, edits = { file_count = 0, additions = 0, deletions = 0 } }
+  local latest = { id = "third", ordinal = 3, state = "complete", disposition = "current",
+    prompt = "Update plugin references", elapsed_ms = 4000, edits = { file_count = 18, additions = 54, deletions = 27 } }
+  local scene = undo_scene(latest, false, { retained, unchanged })
+  local page = scene.specs[1].page_list[1]
+  eq(page.option_list[2].columns, { "3s", " 2 · +3  −3", "Rename the plugin" })
+  eq(page.option_list[3].columns, { "1s", "", "Check the rename" })
+  eq(page.option_list[4].columns, { "4s", "18 · +54 −27", "Update plugin references" })
+
+  local frame = require("forge.views.picker.layout").build(page, page.selected_index, 80)
+  local buf = buffer.scratch()
+  require("forge.views.picker.render").apply(buf, frame)
+  local namespace = vim.api.nvim_get_namespaces().ForgePicker
+  local colored_counts = {}
+  local italic_durations = {}
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, { details = true })) do
+    local group = mark[4].hl_group
+    if group == "ForgeAddRange" or group == "ForgeDeleteRange" then
+      colored_counts[#colored_counts + 1] = { group, frame.lines[mark[2] + 1]:sub(mark[3] + 1, mark[4].end_col) }
+    elseif group == "ForgePickerDuration" then
+      italic_durations[#italic_durations + 1] = frame.lines[mark[2] + 1]:sub(mark[3] + 1, mark[4].end_col)
+    end
+  end
+  eq(italic_durations, { "3s", "1s", "4s" })
+  eq(colored_counts, {
+    { "ForgeAddRange", "+3" }, { "ForgeDeleteRange", "−3" },
+    { "ForgeAddRange", "+54" }, { "ForgeDeleteRange", "−27" },
+  })
 end
 
 -- A restore the host reports as still applying is a rollback in progress, not one to recover.
@@ -2268,13 +2320,14 @@ end
 -- kept in message history, without offering a scope to confirm.
 T["undo_names_an_unavailable_rollback_before_confirmation"] = function()
   local reason = "Conversation rollback is unsupported here: Claude Code can rewind only to the end of an earlier interaction"
-  local interaction = { id = "first", ordinal = 1, state = "complete", disposition = "current",
-    prompt = "First prompt", checkpoint_before = "checkpoint", rollback_unavailable = reason }
-  local scene = undo_scene(interaction, false)
-  local option = scene.specs[1].page_list[1].option_list[1]
+  local interaction = { id = "second", ordinal = 2, state = "complete", disposition = "current",
+    prompt = "Second prompt", checkpoint_before = "checkpoint", rollback_unavailable = reason }
+  local scene = undo_scene(interaction, false,
+    { { id = "first", ordinal = 1, state = "complete", disposition = "current", prompt = "First prompt" } })
+  local option = scene.specs[1].page_list[1].option_list[2]
   assert(option.label:find("unavailable", 1, true), option.label)
-  assert(option.detail:find(reason, 1, true), option.detail)
-  scene.specs[1].on_confirm({ option = { value = interaction } })
+  eq(option.columns, { "—", "—", reason .. " · First prompt" })
+  scene.choose(2)
   eq(#scene.specs, 1)
   eq(scene.errors, { reason })
   eq(#scene.history, 1)
@@ -2289,7 +2342,7 @@ T["rolled_back_goal_start_returns_its_command_to_the_composer"] = function()
     task_command = "/goal Add a test for every export",
     opening = { kind = "task_started", start = { kind = "goal", title = "Add a test for every export" } } }
   local scene = undo_scene(interaction, false)
-  scene.specs[1].on_confirm({ option = { value = interaction } })
+  scene.choose()
   scene.specs[2].on_confirm({ option = { value = "conversation" } })
   scene.transitions[1].completed(true)
   vim.wait(20, function() return false end, 5)
@@ -2306,7 +2359,7 @@ T["rolled_back_plan_start_returns_its_request_to_the_composer"] = function()
     task_command = "/plan Add moneyHalve",
     opening = { kind = "task_started", start = { kind = "plan", title = "Add moneyHalve" } } }
   local scene = undo_scene(interaction, false)
-  scene.specs[1].on_confirm({ option = { value = interaction } })
+  scene.choose()
   scene.specs[2].on_confirm({ option = { value = "conversation" } })
   scene.transitions[1].completed(true)
   vim.wait(20, function() return false end, 5)
