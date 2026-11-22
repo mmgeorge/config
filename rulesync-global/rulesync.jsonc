@@ -3,14 +3,17 @@
   "targets": {
     "claudecode": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks", "permissions"],
     "codexcli": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks"],
+    // The CLI target writes the rules, MCP servers, agents, and hooks shared with Desktop.
     "antigravity-cli": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks", "permissions"],
+    // The IDE target installs skills and converted commands in the directory Desktop reads.
+    "antigravity-ide": ["commands", "skills"],
     "copilotcli": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks", "permissions"]
   },
   "outputRoots": [
     "."
   ],
   "global": true,
-  "delete": false,
+  "delete": true,
   "verbose": false,
   "silent": false,
   "simulateCommands": false,

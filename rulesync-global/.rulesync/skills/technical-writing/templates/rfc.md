@@ -52,7 +52,7 @@ Write these sections in order.
 >
 > **Goals and scope:** Deliver document change notifications within 1 second while cutting notification request volume by at least 40%. Third-party legacy integrations remain on polling and are out of scope. Options are compared on delivery latency, server memory per active client, and firewall resilience.
 >
-> **Proposal:** When a client opens a document, it registers a callback URL with the notification service; on every committed edit, the service pushes a signed event payload to subscribed URLs with three retries over 10 seconds. In a 200-client load test, median delivery latency dropped to 400 ms and total server requests fell by 52%.
+> **Proposal:** When a client opens a document, it registers a callback URL with the notification service. On every committed edit, the service pushes a signed event payload to subscribed URLs with three retries over 10 seconds. In a 200-client load test, median delivery latency dropped to 400 ms and total server requests fell by 52%.
 >
 > **Alternatives:** Long polling met the 1-second delivery goal in the same 200-client benchmark, but holding an open HTTP connection per client doubled server memory usage and complicates rolling restarts.
 >

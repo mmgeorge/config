@@ -4,38 +4,38 @@
 
 ## Goal
 
-Show how a system meets its requirements through four connected beats: **Constraints → Ownership and Lifetime Hierarchy → Flows → Failure Boundaries**. A reader finishing an architectural overview should be able to predict where a new feature belongs, what crosses each boundary, and what happens when a component reloads, disconnects, or fails.
+Show how a system meets its requirements through four connected beats: **Purpose and Constraints → Ownership and Boundaries → Flows → Failure Boundaries**. A reader finishing an architectural overview should be able to predict where a new feature belongs, what crosses each boundary, and what happens when a component reloads, disconnects, or fails.
 
-Write in the present tense. Prefer flowing prose paragraphs and domain-named headings over bullet inventories or generic template labels such as "Components and Ownership" or "Failure Boundaries." Avoid words such as "intended," "proposed," or "future," except for an active migration that changes how callers use the system today.
+Write in a calm, matter-of-fact developer-to-developer voice (`we` is fine when explaining design choices). Use present indicative with definite subjects ("The scheduler...", not "A scheduler...") for the architecture that exists, and conditional mood (`would`, `could`) for rejected alternatives or unmitigated failure scenarios. Prefer flowing prose paragraphs and domain-named headings over bullet inventories or generic template labels such as "Components and Ownership" or "Failure Boundaries." Avoid words such as "intended," "proposed," or "future," except for an active migration that changes how callers use the system today.
 
 ## Guiding Structure
 
-Adapt headings to the system's domain concepts while preserving this reading order so concepts and lifetimes come before flows and raw types.
+Adapt headings to the system's domain concepts while preserving this reading order so concepts and ownership come before flows and raw types.
 
 ### Problem and Constraints
 
-- Open directly on the system being documented, the tension it must resolve, and what fails under a realistic naive design.
-- Keep this opening focused on behavior and guarantees; defer concrete class and module names to the next section.
+- Ground the opening sentence in the user action or calling subsystem that needs this component (the "so what"—for example, an asset browser displaying preview grids or admins uploading moderation rules), then name the system in the next sentence if it is not already the subject. Then either state the architecture directly and explain what it buys (design-first, best for straightforward or multi-part systems) or briefly explain the single tempting shortcut or concrete constraint it addresses (single-contrast or problem-first). Never stack multiple rejected designs back-to-back before describing the real system, and avoid theatrical failure triplets or stacked `To X without Y` clauses.
+- Keep this opening focused on plain behavior; defer concrete class names, undefined mechanism jargon, and exact edge-case qualifications (such as acknowledged vs. in-flight writes) to the sections that define them.
 - Define unfamiliar domain terms where they first appear.
 
-### Ownership and Lifetime Hierarchy
+### Ownership and Boundaries
 
 - Pick up directly from the opening paragraph's closing claim so the transition continues the same thread instead of restarting cold.
-- Name the major components for the first time here, stating what each one owns, how long it lives, and why those boundaries satisfy the constraints just introduced.
+- Name the major components for the first time here, stating what each one owns and why those boundaries satisfy the constraints just introduced.
+- When an abstraction or indirection exists to absorb real-world quirks (divergent provider behavior, OS watcher noise, lock contention), lead that paragraph with a brief empirical explanation of what happens in practice rather than a chronological history of past attempts—for example: *"Operating system file watchers rarely emit one clean event per save—editors write temporary files, rename them into place, and fire duplicate notifications within milliseconds. To avoid back-to-back rebuilds, the `WatchLoop` coalesces events over a short quiet window before notifying the `BuildRunner`."*
 - When a diagram helps establish the static structure, use a standard UML Mermaid `classDiagram` containing **only the major architectural components** with their key boundary methods and labeled ownership arrows—keep value payloads on the arrows instead of adding boxes for small data structs.
 - Use a comparison table only when scanning parallel modes or configurations with short cells, never to cram full behavioral paragraphs into a `Responsibility` column.
 
 ### Execution Flows
 
-- Open the flow with a plain summary of its stages (for example, "two stages: a local journal write followed by an asynchronous upload"), then trace chronologically from trigger to completion so each sentence picks up where the previous one ended.
+- Trace the flow chronologically from trigger to completion so each sentence picks up where the previous one ended. Add a one-sentence stage summary first only when the flow has distinct phases that would otherwise be hard to follow.
 - Avoid re-arguing design motives already established earlier; state what triggers each handoff and what completes it.
 - Pair a `sequenceDiagram` with that narrative, and include secondary paths (such as live reloads, upgrades, or retries) when they share the same boundary contract.
 - Show a concrete boundary struct or short code snippet only where it defines the exact contract crossing between layers.
 
 ### Failure Boundaries and Limits
 
-- Describe thread ownership, lock scopes, task draining, or ordering rules that prevent races.
-- State what happens when a dependency is missing, a network link drops, storage fills, or a worker crashes, including recovery bounds and where guarantees stop holding.
+- Cover only the concurrency rules (thread ownership, lock scopes, task draining, ordering) and failure modes (missing dependencies, dropped links, full storage, worker crashes) that actually apply to this system, including recovery bounds and where guarantees stop holding.
 
 ## Leave Out
 
@@ -45,20 +45,163 @@ Adapt headings to the system's domain concepts while preserving this reading ord
 
 ## Examples
 
-Two complete mini architectural overviews showing how the same four-part spine adapts to an asynchronous persistence pipeline and a multi-lifetime runtime host.
+Three complete mini architectural overviews showing how the opening adapts to the reader's first question: design-first when the architecture itself is straightforward (`Media Thumbnail Pipeline`), single-contrast when a simpler isolation mechanism is tempting (`Plugin Sandbox Host`), and problem-first when local persistence needs justification (`Offline Draft Sync`).
+
+### Media Thumbnail Pipeline
+
+````markdown
+# Media Thumbnail Pipeline
+
+The asset browser needs small thumbnails for uploaded images to quickly show asset previews without downloading full resolution files. On upload, it routes requests to the media service, which generates thumbnails for every image users upload. The endpoint writes files straight to object storage and queues a resize job for background workers. Keeping image decoding off the API servers prevents large uploads from starving other traffic.
+
+## Separating Uploads from Image Processing
+
+The `UploadApi` runs inside the API server, streaming each upload directly to the `ObjectStore` without decoding it, and recording a `ResizeJob` in the `JobQueue` once storage confirms the write. The `ObjectStore` holds both original uploads and thumbnails, keyed by asset ID and target dimensions.
+
+Separate `ResizeWorker` processes handle decoding and resizing and scale independently of the API servers. Each `ResizeWorker` pulls one `ResizeJob` at a time from the `JobQueue`, and writes the finished thumbnails back to the `ObjectStore`.
+
+```mermaid
+classDiagram
+    class UploadApi {
+        +handle_upload(stream) AssetId
+    }
+    class ObjectStore {
+        +put(key, bytes)
+        +get(key) Bytes
+    }
+    class JobQueue {
+        +enqueue(job)
+        +claim_next() ResizeJob
+        +acknowledge(job_id)
+    }
+    class ResizeWorker {
+        +process(job)
+    }
+
+    UploadApi --> ObjectStore : streams original image
+    UploadApi --> JobQueue : enqueues ResizeJob
+    ResizeWorker --> JobQueue : claims & acknowledges ResizeJob
+    ResizeWorker --> ObjectStore : reads original image & writes thumbnails
+```
+
+## Uploading and Generating Thumbnails
+
+Thumbnail generation runs in two stages: a synchronous upload path that persists the original file, followed by an asynchronous worker pass that produces the thumbnails. When a user uploads an image, the `UploadApi` validates the content type and size limit, streams the image bytes to the `ObjectStore`, and enqueues a `ResizeJob` carrying the asset ID and object key. Once the `JobQueue` accepts the job, the `UploadApi` returns the asset ID to the caller immediately.
+
+```mermaid
+sequenceDiagram
+    participant Api as UploadApi
+    participant Store as ObjectStore
+    participant Queue as JobQueue
+    participant Worker as ResizeWorker
+
+    Api->>Store: put(original_key, image_bytes)
+    Store-->>Api: Stored
+    Api->>Queue: enqueue(ResizeJob)
+    Queue-->>Api: Queued
+
+    Worker->>Queue: claim_next()
+    Queue-->>Worker: ResizeJob (claimed until timeout)
+    Worker->>Store: get(original_key)
+    Store-->>Worker: Original image bytes
+    Worker->>Worker: Decode and resize thumbnails
+    Worker->>Store: put(thumb_keys, thumbnails)
+    Store-->>Worker: Stored
+    Worker->>Queue: acknowledge(job_id)
+```
+
+In the background, an idle `ResizeWorker` claims the job, fetches the original file from the `ObjectStore`, and generates each thumbnail according to the requested size. The worker writes every thumbnail to the ObjectStore before acknowledging completion to JobQueue. If a client requests a thumbnail before the worker finishes, the serving layer returns a placeholder or falls back to the original image until the thumbnail generation completes.
+
+## Worker Crashes and Corrupt Uploads
+
+When a worker takes a job, the JobQueue hides it from other workers until a timeout expires. If a `ResizeWorker` crashes or is killed before acknowledging the job, the `JobQueue` makes the failed `ResizeJob` available to another worker. Because thumbnail keys are deterministic and `ObjectStore::put` overwrites atomically, re-running a partial job produces the same objects without leaving half-written files behind.
+
+Malformed uploads can still fail decoding or request excessive memory during decompression. Each `ResizeWorker` checks image dimensions before allocating a decode buffer, and jobs that fail three attempts are set aside for inspection. At that point, the original upload remains in the `ObjectStore`, and the asset stays without thumbnails until an operator inspects or removes it.
+````
+
+### Plugin Sandbox Host
+
+````markdown
+# Plugin Sandbox Host
+
+Community admins upload custom moderation rules that inspect incoming posts and check external blocklists before content is published. The plugin sandbox host runs those rules on incoming requests inside the API gateway. Spawning a fresh OS process per request would isolate untrusted code, but process startup would add tens of milliseconds to every call. Instead, the host runs extensions as WebAssembly modules in isolated memory. Each module compiles once on upload, and every request runs in a fresh sandbox.
+
+## Isolating Execution Across Three Lifetimes
+
+Everything runs inside one server process. The gateway isolates extensions by separating shared runtime state from per-request memory. The `HostProcess` holds onto an HTTP listener, worker threads, and WebAssembly engine. Alongside it, the `ModuleStore` stores the compiled `CompiledModule` for each uploaded plugin, sharing it across worker threads.
+
+User permissions and mutable memory live only for a single request. Before invoking an extension, the `HostProcess` creates a `CapabilityBridge` scoped to the calling user. The bridge exposes only the handles that user can call (a namespaced key-value store, an HTTP allowlist, and a logger) rather than raw sockets or credentials. For each request, the `HostProcess` creates a `SandboxInstance` with its own memory, backed by the stored `CompiledModule` and that `CapabilityBridge`. Once the call returns, the `HostProcess` drops the instance and its memory, meaning that they live only for a single request.
+
+```mermaid
+classDiagram
+    class HostProcess {
+        +handle_request(user, req)
+    }
+    class ModuleStore {
+        +get(plugin_id) CompiledModule
+        +swap(plugin_id, wasm)
+    }
+    class CapabilityBridge {
+        +kv_get(key)
+        +http_fetch(url)
+    }
+    class SandboxInstance {
+        +invoke(req)
+        +drop()
+    }
+
+    HostProcess --> ModuleStore : fetches CompiledModule
+    HostProcess --> CapabilityBridge : binds per user
+    HostProcess --> SandboxInstance : creates per request
+    SandboxInstance --> CapabilityBridge : invokes allowed host calls
+```
+
+## Invoking Requests and Deploying Upgrades
+
+When a request arrives, the `HostProcess` fetches the plugin's `CompiledModule` from the `ModuleStore`, binds a `CapabilityBridge` for the user, and starts a `SandboxInstance`. During execution, host calls route through the bridge. Once the handler returns, the `HostProcess` drops the instance and reclaims its memory.
+
+```mermaid
+sequenceDiagram
+    participant Host as HostProcess
+    participant Store as ModuleStore
+    participant Bridge as CapabilityBridge
+    participant Instance as SandboxInstance
+
+    Host->>Store: Fetch CompiledModule(plugin_id)
+    Store-->>Host: CompiledModule
+    Host->>Bridge: Bind user KV handle and allowlist
+    Host->>Instance: Instantiate(CompiledModule, Bridge)
+    Instance->>Bridge: kv_get(key)
+    Bridge-->>Instance: Value bytes
+    Instance-->>Host: Response payload
+    Host->>Instance: Drop memory
+
+    opt Plugin upgrade
+        Host->>Store: Compile and atomically swap CompiledModule
+    end
+```
+
+When a user uploads a new plugin version, the `ModuleStore` compiles the replacement binary in the background and swaps the stored module atomically. New requests pick up the updated `CompiledModule`, while any in-flight `SandboxInstance` finishes on the previous version before being dropped.
+
+## Handling Runaway Extensions
+
+Each `SandboxInstance` runs with an execution timeout and a 64 MiB memory limit. Exceeding those limits or crashing stops only that instance. The `HostProcess` reclaims its memory, logs the error, and returns `502 Bad Gateway` for that request while other users continue unaffected.
+
+Sandbox timeouts only trigger while WebAssembly code is running, not while an extension is blocked inside a host call. To keep a slow upstream from pinning a worker thread, every network and storage method on the `CapabilityBridge` enforces its own deadline.
+````
 
 ### Offline Draft Sync
 
 ````markdown
 # Offline Draft Sync
 
-The document editor updates its in-memory state on every keystroke so typing stays responsive, but this leaves a gap before those changes reach the server. When autosave reads only from memory, a tab crash, reload, or network outage wipes out every unconfirmed edit. To close that gap without tying typing to the network, the editor persists drafts locally and uploads them in the background.
+When users type, the document editor applies every keystroke directly to an in-memory store instead of waiting on network I/O. Because those edits are not confirmed by the server right away, unsent changes would be lost if the editor tab crashes or the network drops. To avoid losing unsent edits, we save drafts to a local database and upload them in the background.
 
 ## Splitting Local Edits from Background Sync
 
-Local persistence and background upload stay decoupled by communicating strictly through the `DraftJournal` in IndexedDB. The `EditorView` owns the open document in memory for the life of the tab; on each edit, it updates that state immediately and appends a sequenced `DraftRecord` to the journal. The `DraftJournal` owns all unconfirmed records on disk—stored in one IndexedDB object store per document—so unsent edits survive crashes and reloads, and a stalled save on one document never delays another.
+The editor separates local persistence from background upload by routing both through the DraftJournal. The EditorView holds the open document in memory. On each edit, it updates that state and appends a sequenced DraftRecord to the DraftJournal. The journal saves unconfirmed records in an IndexedDB object store, indexed by document ID and sequence number. This prevents a stalled save on one document from delaying others.
 
-The `SyncWorker` owns all background uploads to the `DocumentApi`, reading pending records from the journal in sequence order and deleting each entry only after the server confirms persistence. Because the `SyncWorker` is the sole caller of the `DocumentApi` and waits for confirmation before sending the next record, two save requests for the same document never race.
+The SyncWorker is the only caller of the DocumentApi. It sends pending records from the DraftJournal in sequence order, waiting for the server to confirm each save before deleting the record and sending the next.
 
 ```mermaid
 classDiagram
@@ -84,7 +227,7 @@ classDiagram
 
 ## Recording and Syncing a Draft
 
-Saving happens in two stages: a local journal write on each edit, followed by an asynchronous upload in the background. When the user types, the `EditorView` applies the patch in memory immediately, assigns the next sequence number, and writes a `DraftRecord` to the `DraftJournal`. That write wakes the `SyncWorker`—which also runs on tab startup and reconnect—to read the oldest pending record for that document and post it to the `DocumentApi`. Once the server confirms persistence, the worker deletes the local record and moves on to the next one.
+When the user types, the EditorView updates the document in memory, assigns the next sequence number, and writes a DraftRecord to the DraftJournal. That write wakes the SyncWorker, which reads the oldest pending record for that document and posts it to the DocumentApi. Once the server confirms the save, the worker deletes the record and moves on to the next one. The worker also runs on tab startup and reconnect.
 
 ```mermaid
 sequenceDiagram
@@ -105,82 +248,11 @@ sequenceDiagram
     end
 ```
 
-If the browser closes anywhere between the journal commit and the server acknowledgment, the next session restarts the `SyncWorker` and replays every unacknowledged record from the exact sequence number where the prior tab stopped.
+If the browser closes anywhere between the journal commit and the server acknowledgment, the next session restarts the `SyncWorker` and replays every unacknowledged record from the sequence number where the prior tab stopped.
 
 ## Outages and Storage Quotas
 
-When the network drops or the `DocumentApi` returns a server error, the `SyncWorker` leaves the pending draft in the `DraftJournal` and retries with exponential backoff capped at 30 seconds while the `EditorView` continues accepting local edits normally.
+When the network drops or the `DocumentApi` returns a server error, the `SyncWorker` leaves the pending draft in the `DraftJournal` and retries with exponential backoff capped at 30 seconds while the `EditorView` continues accepting local edits.
 
-Local durability stops at the browser's storage quota. If IndexedDB rejects an append because disk space is exhausted, the `EditorView` marks the document unsaved and displays a blocking storage warning so the user knows new changes will not survive a reload until space is freed.
-````
-
-### Plugin Sandbox Host
-
-````markdown
-# Plugin Sandbox Host
-
-The API gateway runs user-authored extensions on the request path, but executing untrusted code directly inside the server process lets a single panic, infinite loop, or memory bug crash the server or expose another tenant's secrets. Isolating extensions by spawning a fresh OS process on every request keeps tenants apart, but process startup adds tens of milliseconds to every call. To keep invocation fast without sharing mutable state across requests, the gateway precompiles uploaded WebAssembly plugins once and runs each request inside a short-lived sandbox.
-
-## Isolating Execution Across Three Lifetimes
-
-Fast invocation and tenant isolation hold together by separating long-lived runtime infrastructure from disposable per-request memory. The `HostProcess` owns the HTTP listener, worker threads, and WebAssembly engine for the life of the OS process, never executing guest bytecode directly. Alongside it, the `ModuleCache` owns compiled native code for every uploaded plugin, storing immutable `CompiledModule` values shared safely across worker threads so individual requests never pay compilation overhead.
-
-Everything tenant-specific or mutable lives strictly shorter. Before invoking an extension, the `HostProcess` creates a `CapabilityBridge` scoped to the calling tenant; the bridge owns the narrow host handles that tenant is permitted to call—a namespaced key-value store, an outbound HTTP allowlist, and a logger—without exposing raw sockets or credentials to guest memory. For each request, the runtime creates a `SandboxInstance` owning a fresh linear memory buffer bound to the cached `CompiledModule` and that `CapabilityBridge`, then drops the instance as soon as the call returns so state never leaks between requests.
-
-```mermaid
-classDiagram
-    class HostProcess {
-        +handle_request(tenant, req)
-    }
-    class ModuleCache {
-        +get(plugin_id) CompiledModule
-        +swap(plugin_id, wasm)
-    }
-    class CapabilityBridge {
-        +kv_get(key)
-        +http_fetch(url)
-    }
-    class SandboxInstance {
-        +invoke(req)
-        +drop()
-    }
-
-    HostProcess --> ModuleCache : fetches CompiledModule
-    HostProcess --> CapabilityBridge : binds per tenant
-    HostProcess --> SandboxInstance : creates per request
-    SandboxInstance --> CapabilityBridge : invokes allowed host calls
-```
-
-## Invoking Requests and Deploying Upgrades
-
-Handling a request takes two steps: binding a fresh sandbox to a precompiled module, then dropping its memory as soon as the response returns. When a request arrives, the `HostProcess` fetches the plugin's `CompiledModule` from the `ModuleCache`, binds a tenant-scoped `CapabilityBridge`, and instantiates a `SandboxInstance`. During execution, any permitted host call routes through the bridge; once the handler returns, the host drops the instance and reclaims its linear memory.
-
-```mermaid
-sequenceDiagram
-    participant Host as HostProcess
-    participant Cache as ModuleCache
-    participant Bridge as CapabilityBridge
-    participant Instance as SandboxInstance
-
-    Host->>Cache: Fetch CompiledModule(plugin_id)
-    Cache-->>Host: CompiledModule
-    Host->>Bridge: Bind tenant KV handle and allowlist
-    Host->>Instance: Instantiate(CompiledModule, Bridge)
-    Instance->>Bridge: kv_get(key)
-    Bridge-->>Instance: Value bytes
-    Instance-->>Host: Response payload
-    Host->>Instance: Drop linear memory
-
-    opt Plugin upgrade
-        Host->>Cache: Compile and atomically swap CompiledModule
-    end
-```
-
-When a tenant uploads a new plugin version, the `ModuleCache` compiles the replacement binary in the background and swaps the cache entry atomically. New requests immediately pick up the updated `CompiledModule`, while any in-flight `SandboxInstance` finishes against the previous compiled code and releases its reference on drop.
-
-## Trapping Runaway Extensions
-
-Every `SandboxInstance` runs with a hard CPU fuel budget and a 64 MiB linear memory ceiling. An infinite loop, out-of-memory allocation, or guest panic traps only that instance: the `HostProcess` reclaims its memory, logs the trap diagnostic, and returns `502 Bad Gateway` for that request while other tenants continue unaffected.
-
-Guest fuel stops ticking while an extension is blocked waiting on a host call. Every network or storage method on the `CapabilityBridge` therefore enforces its own deadline independent of the sandbox fuel budget so a slow upstream cannot pin a worker thread indefinitely.
+Local drafts are limited by the browser's storage quota. When IndexedDB rejects a write, the EditorView marks the document unsaved and warns that new edits will not survive a reload.
 ````

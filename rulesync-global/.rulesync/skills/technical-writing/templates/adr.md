@@ -47,7 +47,7 @@ Write these sections in order.
 >
 > **Status:** Accepted (March 2026)
 >
-> **Context:** The document editor applies edits in memory immediately and pushes autosaves directly from memory to the `DocumentApi`. When a tab crashes, reloads, or loses connectivity before an autosave completes, every unconfirmed edit is lost. Any replacement must preserve responsive in-memory typing while keeping unsent edits durable across crashes and offline periods.
+> **Context:** The document editor applies edits in memory immediately and pushes autosaves directly from memory to the `DocumentApi`. When a tab crashes, reloads, or loses connectivity before an autosave completes, every unconfirmed edit is lost. Any replacement must keep typing off the network path while keeping unsent edits durable across crashes and offline periods.
 >
 > **Decision:** The `EditorView` continues mutating the open document in memory immediately and appends each sequenced `DraftRecord` to a per-document IndexedDB `DraftJournal`. A single background `SyncWorker` drains pending records in sequence order to the `DocumentApi` and deletes each entry only after the server confirms persistence.
 >
