@@ -43,7 +43,7 @@ impl StatusReader {
     ) -> Result<StatusEnumeration> {
         Self::status_selected(
             repository,
-            None,
+            Vec::new(),
             gix::status::tree_index::TrackRenames::AsConfigured,
             check,
         )
@@ -58,9 +58,23 @@ impl StatusReader {
             !paths.is_empty() && paths.len() <= 256,
             "status requires 1 to 256 selected paths"
         );
+        // Forge records paths from the worktree root. gix resolves pathspecs from its cwd.
+        let prefix = if repository.pathspec_defaults()?.literal {
+            // Literal pathspec mode also disables the :(top) marker.
+            let depth = repository
+                .prefix()?
+                .map_or(0, |path| path.components().count());
+            b"../".repeat(depth)
+        } else {
+            b":(top,literal)".to_vec()
+        };
+        let patterns = paths
+            .iter()
+            .map(|path| gix::bstr::BString::from([prefix.as_slice(), path.raw()].concat()))
+            .collect();
         Self::status_selected(
             repository,
-            Some(paths),
+            patterns,
             gix::status::tree_index::TrackRenames::Disabled,
             check,
         )
@@ -72,7 +86,7 @@ impl StatusReader {
     ) -> Result<StatusEnumeration> {
         let mut result = Self::status_selected(
             repository,
-            None,
+            Vec::new(),
             gix::status::tree_index::TrackRenames::Given(Default::default()),
             check,
         )?;
@@ -121,20 +135,12 @@ impl StatusReader {
 
     fn status_selected(
         repository: &gix::Repository,
-        selected: Option<&[RepositoryPath]>,
+        patterns: Vec<gix::bstr::BString>,
         renames: gix::status::tree_index::TrackRenames,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<StatusEnumeration> {
         check()?;
         repository.workdir().context("status requires a worktree")?;
-        let patterns = selected
-            .map(|paths| {
-                paths
-                    .iter()
-                    .map(|path| gix::bstr::BString::from(path.raw()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         let mut iterator = repository
             .status(gix::progress::Discard)?
             .untracked_files(gix::status::UntrackedFiles::Files)

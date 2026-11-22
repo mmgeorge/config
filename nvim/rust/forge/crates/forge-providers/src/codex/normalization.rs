@@ -7,7 +7,7 @@ use forge_provider_api::compaction::CompactionResult;
 
 use forge_provider_api::*;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 /// Classify terminal status once for transcript and retained native execution.
 pub(super) fn terminal_outcome(
@@ -852,16 +852,29 @@ impl CodexNormalization {
             }
         } else if method == "turn/completed" {
             let outcome = terminal_outcome(&params["turn"])?;
-            if self
-                .terminal
-                .get(&address.turn_id)
-                .is_some_and(|(old, _)| old != &outcome)
-            {
-                return Err(protocol_error().into());
+            match self.terminal.entry(address.turn_id.clone()) {
+                Entry::Vacant(entry) => {
+                    if let forge_provider_api::turn::TurnOutcome::Failed { error, .. } = outcome {
+                        let native = &params["turn"]["error"];
+                        let info = &native["codexErrorInfo"];
+                        let code = info.as_str().or_else(|| {
+                            let variant = info.as_object().filter(|value| value.len() == 1)?;
+                            variant.keys().next().map(String::as_str)
+                        });
+                        tracing::error!(target: "forge::provider", event_name = "provider.turn.failed",
+                            provider = "codex", method = "turn/completed", phase = "observation",
+                            exchange_id = address.scope.exchange_id.as_str(),
+                            invocation_id = address.scope.invocation_id.as_str(),
+                            thread_id = params["threadId"].as_str(), turn_id = params["turn"]["id"].as_str(),
+                            kind = ?error.kind(), code, error = native["message"].as_str());
+                    }
+                    entry.insert((outcome, timestamp()));
+                }
+                Entry::Occupied(entry) if entry.get().0 != outcome => {
+                    return Err(protocol_error().into());
+                }
+                Entry::Occupied(_) => {}
             }
-            self.terminal
-                .entry(address.turn_id.clone())
-                .or_insert((outcome, timestamp()));
             // Codex 0.164 keeps unified_exec_manager in Session after normal TurnComplete;
             // only its exit watcher emits command completion. A known started process with
             // no command-end at this ordered boundary therefore retains an independent lifetime.
@@ -1470,9 +1483,7 @@ impl CodexNormalization {
                 if !native.starts_child {
                     return Err(protocol_error().into());
                 }
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.pending_agents.entry(pending_key)
-                {
+                if let Entry::Vacant(e) = self.pending_agents.entry(pending_key) {
                     let agent_id =
                         forge_provider_api::AgentId::new(uuid::Uuid::new_v4().to_string())
                             .expect("UUID is nonempty");

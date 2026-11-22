@@ -43,7 +43,7 @@ Each action has its own precondition:
 
 Every policy observes cancellation, deadlines, and HEAD validation. Metadata sampling cannot detect edits that preserve every sampled field.
 
-The writer groups adjacent compatible targets into commands of at most 256 paths and passes NUL-delimited pathspecs through stdin. A failed group marks all its targets uncertain, keeps completed earlier groups, and leaves later groups unstarted. After a write, the coordinator adopts the new observation and replays later edits through known byte transitions, cancelling an overlapping edit with a diagnostic. An unverified write quarantines conflicting writes until a read-only observation reconciles them, and a HEAD change cancels queued mutations.
+The writer groups adjacent compatible targets into commands of at most 256 paths and passes NUL-delimited pathspecs through stdin. A failed group marks all its targets uncertain, keeps completed earlier groups, and leaves later groups unstarted. After a write, the writer rereads the affected paths as literal names relative to the worktree root, even when the host started in a subdirectory. The coordinator adopts that observation and replays later edits through known byte transitions, cancelling an overlapping edit with a diagnostic. An unverified write quarantines conflicting writes until a read-only observation reconciles them, and a HEAD change cancels queued mutations.
 
 Forge Ignore on a staged file unstages it first, including both rename endpoints, and saves the ignore marker only after the unstage completes.
 

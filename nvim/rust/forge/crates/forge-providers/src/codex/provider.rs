@@ -6993,6 +6993,84 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
         }.await;
     }
 
+    /// The session log keeps Codex's explanation when the terminal code has no typed category.
+    #[tokio::test]
+    async fn failed_turn_records_native_reason_under_the_admitting_span() -> anyhow::Result<()> {
+        use crate::testing::diagnostics::CapturedFields;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (_provider, session, _events, _socket) =
+            compaction_fixture(forge_provider_api::SessionHistory::Temporary).await;
+        let request = request();
+        let address = session.normalization.lock().await.admit_turn(
+            "compaction-thread",
+            "failed-turn",
+            &request.scope,
+        )?;
+        let reason = "failed to load workspace requirements: invalid data";
+        let terminal = json!({"method": "turn/completed", "params": {
+            "threadId": "compaction-thread",
+            "turn": {"id": "failed-turn", "status": "failed", "error": {
+                "message": reason, "codexErrorInfo": "other", "additionalDetails": "private payload"
+            }}
+        }});
+        let (_cancel, receiver) = mpsc::unbounded_channel();
+        let driver = CodexTurnDriver {
+            session: session.clone(),
+            started_at_ms: now_ms(),
+            native_confirmation: None,
+            admission_model: None,
+            address: address.clone(),
+            native_address: NativeTurnAddress {
+                thread_id: "compaction-thread".into(),
+                turn_id: NativeTurnId::new("failed-turn")?,
+            },
+            submissions: Arc::new(Mutex::new(vec![forge_provider_api::CoveredInput::new(
+                request.submission_id.clone(),
+                request.attempt_id.clone(),
+            )])),
+            request,
+            cancel: Mutex::new(Some(receiver)),
+            initial_messages: Mutex::new(Some(vec![terminal])),
+            cleanup_errors: Arc::default(),
+        };
+        let fields = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::Registry::default().with(CapturedFields(fields.clone()));
+        let worker = async {
+            tracing::info_span!("provider.operation", session_id = "session").in_scope(|| {
+                crate::turn_runner::RetainedTurn::spawn(
+                    Arc::new(driver),
+                    session.sink.clone(),
+                    address,
+                )
+            })
+        }
+        .with_subscriber(subscriber)
+        .await?;
+        let completed = worker.join().await?;
+        assert!(
+            matches!(completed.result().outcome(), forge_provider_api::turn::TurnOutcome::Failed { error, .. }
+            if error.kind() == ProviderFailureKind::Unknown)
+        );
+        let recorded = fields.lock().unwrap().join("\n");
+        for expected in [
+            "provider.turn.failed",
+            reason,
+            "other",
+            "failed-turn",
+            "span=provider.operation",
+        ] {
+            assert!(
+                recorded.contains(expected),
+                "missing {expected} in {recorded}"
+            );
+        }
+        assert!(!recorded.contains("private payload"));
+        Ok(())
+    }
+
     /// Canonical failure and legacy publication share the same retained retry permission.
     #[tokio::test]
     async fn canonical_native_failure_preserves_coverage_and_retry_decision() {

@@ -10,6 +10,50 @@ local git_repository = dofile("nvim/lua/forge/tests/support/git_repository.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+local function stage_from_subdirectory(literal_pathspec)
+  local original_directory = vim.fn.getcwd()
+  vim.opt.runtimepath:prepend(original_directory .. "/nvim")
+  MiniTest.finally(function() pcall(vim.fn.chdir, original_directory) end)
+  local started = host.start({ config = true })
+  local path = "nested/[tracked].txt"
+  local repository = git_repository.create({ files = { [path] = { "before" } } })
+  if literal_pathspec then repository.run({ "config", "gitoxide.pathspec.literal", "true" }) end
+  vim.fn.writefile({ "after" }, repository.path .. "/" .. path)
+  vim.fn.chdir(repository.path .. "/nested")
+  require("forge").setup({ harness = { provider = "mock" }, about_auto_generate = false })
+  local status = require("forge.status")
+  local errors = notify.capture({ min_level = vim.log.levels.ERROR })
+  local state = status.open()
+  MiniTest.finally(function() pcall(status.close, state) end)
+  wait_until(function() return state.ready end, "Status did not open", { errors = errors })
+  local settled_revision
+  local unsubscribe = started.client.document_events_subscribe(state.document, function(event, update)
+    if event == "status.update" and update.phase == "settled" then settled_revision = update.delta.next end
+  end)
+  MiniTest.finally(function() pcall(unsubscribe) end)
+  local file_row = "Modified [tracked].txt"
+  local row = assert(buffer.find_row(state.replica.buffer, file_row))
+  vim.api.nvim_win_set_cursor(0, { row, 0 })
+  keymap.feed("S")
+  wait_until(function()
+    return settled_revision and state.replica.revision >= settled_revision
+  end, "Stage did not settle", { errors = errors })
+  MiniTest.expect.equality(vim.trim(repository.run({ "diff", "--cached", "--name-only" })), path)
+  MiniTest.expect.equality(state.replica.inventory.file[1] and state.replica.inventory.file[1].section, "staged")
+  local staged_row = assert(buffer.find_row(state.replica.buffer, "Staged changes (1):"))
+  MiniTest.expect.equality(buffer.find_row(state.replica.buffer, file_row), staged_row + 1)
+end
+
+-- requires-forge-host
+T["stage_from_subdirectory"] = function()
+  stage_from_subdirectory(false)
+end
+
+-- requires-forge-host
+T["stage_from_subdirectory_with_literal_pathspecs"] = function()
+  stage_from_subdirectory(true)
+end
+
 T["commit"] = function()
   dofile("nvim/lua/forge/tests/support/provider_catalog.lua").install()
   local commit = require("forge.integrations.commit")

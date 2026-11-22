@@ -4241,34 +4241,11 @@ async fn a_steer_turn_stopped_before_any_answer_is_withdrawn() {
     provider.shutdown(operation_context()).await.unwrap();
 }
 
-/// Record every field of every diagnostic event the adapter emits.
-struct CapturedFields(Arc<Mutex<Vec<String>>>);
-
-impl tracing::field::Visit for CapturedFields {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(format!("{}={value:?}", field.name()));
-    }
-}
-
-impl<SubscriberType: tracing::Subscriber> tracing_subscriber::Layer<SubscriberType>
-    for CapturedFields
-{
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: tracing_subscriber::layer::Context<'_, SubscriberType>,
-    ) {
-        event.record(&mut CapturedFields(self.0.clone()));
-    }
-}
-
 /// A rewind the CLI refuses at startup logs the CLI's own reason, which it prints as an error
 /// `result` before it exits, instead of only the closed output.
 #[tokio::test]
 async fn a_refused_rewind_logs_the_cli_reason() {
+    use crate::testing::diagnostics::CapturedFields;
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::SubscriberExt;
     let directory = tempfile::tempdir().unwrap();

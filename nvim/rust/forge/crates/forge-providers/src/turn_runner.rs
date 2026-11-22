@@ -9,6 +9,7 @@ use forge_provider_api::{
 use futures_util::FutureExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::{Instrument, instrument::WithSubscriber};
 
 use crate::retained_task::RetainedTask;
 
@@ -62,55 +63,56 @@ impl RetainedTurn {
         let native_result = Arc::new(Mutex::new(None));
         let retained = native_result.clone();
         let owned_driver = driver.clone();
+        let work = async move {
+            // Retain native evidence before entering provider-owned collection.
+            let result = std::panic::AssertUnwindSafe(owned_driver.run(owned_start))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(runtime_failure(ProviderPhase::Observation)));
+            *retained.lock().await = Some(result.clone());
+            publisher.native_ended().await;
+
+            // Collect the same resources even when observation failed or panicked.
+            let collected = std::panic::AssertUnwindSafe(owned_driver.collect())
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(runtime_failure(ProviderPhase::Collection)));
+            if let Err(error) = collected {
+                let original = match result {
+                    Ok(_) => error,
+                    Err(primary) => ProviderError::Combined {
+                        primary: Box::new(primary),
+                        secondary: vec![error],
+                    },
+                };
+                publisher
+                    .unavailable(normalized_failure(&original, ProviderPhase::Collection))
+                    .await;
+                return Err(original);
+            }
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let started = publisher.has_started().await;
+                    if started || invalidates_binding(&error) {
+                        publisher
+                            .unavailable(normalized_failure(&error, ProviderPhase::Observation))
+                            .await;
+                    }
+                    if !started {
+                        publisher.not_started(error.clone());
+                    }
+                    return Err(error);
+                }
+            };
+
+            // Publish only the retained native result after foreground ownership is collected.
+            let collected_at_ms = timestamp_ms();
+            publisher.completed(result, collected_at_ms).await
+        };
         let worker = RetainedTask::new(
             ProviderOperation::TurnStart,
-            tokio::spawn(async move {
-                // Retain native evidence before entering provider-owned collection.
-                let result = std::panic::AssertUnwindSafe(owned_driver.run(owned_start))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| Err(runtime_failure(ProviderPhase::Observation)));
-                *retained.lock().await = Some(result.clone());
-                publisher.native_ended().await;
-
-                // Collect the same resources even when observation failed or panicked.
-                let collected = std::panic::AssertUnwindSafe(owned_driver.collect())
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| Err(runtime_failure(ProviderPhase::Collection)));
-                if let Err(error) = collected {
-                    let original = match result {
-                        Ok(_) => error,
-                        Err(primary) => ProviderError::Combined {
-                            primary: Box::new(primary),
-                            secondary: vec![error],
-                        },
-                    };
-                    publisher
-                        .unavailable(normalized_failure(&original, ProviderPhase::Collection))
-                        .await;
-                    return Err(original);
-                }
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let started = publisher.has_started().await;
-                        if started || invalidates_binding(&error) {
-                            publisher
-                                .unavailable(normalized_failure(&error, ProviderPhase::Observation))
-                                .await;
-                        }
-                        if !started {
-                            publisher.not_started(error.clone());
-                        }
-                        return Err(error);
-                    }
-                };
-
-                // Publish only the retained native result after foreground ownership is collected.
-                let collected_at_ms = timestamp_ms();
-                publisher.completed(result, collected_at_ms).await
-            }),
+            tokio::spawn(work.in_current_span().with_current_subscriber()),
         );
         Self {
             driver,

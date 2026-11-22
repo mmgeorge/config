@@ -60,6 +60,8 @@ Provider errors expose typed operations and categories, never native response co
 
 Native adapters additionally emit Rust `tracing` diagnostics before normalization discards their causes. The host subscriber sends redacted display errors and source chains to the existing JSONL writer, not to the provider contract or host stdout. Provider operations carry session and operation spans, and retained workers and cleanup inherit their dispatcher and span. Severity filtering controls diagnostic recording only; it cannot change delivery evidence, retry decisions, or cleanup ownership. See [Debugging](../debugging.md) for levels, storage, and inspection boundaries.
 
+When Codex completes a turn with a failure, the adapter logs `provider.turn.failed` at Error level once for that turn. The session log records the native thread and turn IDs, the native error code when supplied, and the redacted error message. Open it with `/log open` when the transcript reports `TurnStart failed: Unknown`.
+
 Codex classifies process-creation failures at the spawn boundary as
 `ProviderError::RuntimeLaunch`, retaining the selected provider, configured
 executable without arguments, and a normalized missing, permission-denied, or
