@@ -1,6 +1,6 @@
-# RFC and Proposal Profile
+# Proposal Profile
 
-*Read when proposing a major design change, a new subsystem, an API redesign, or an engineering strategy.*
+*Read when writing an RFC or proposing a major design change, a new subsystem, an API redesign, or an engineering strategy.*
 
 ## Goal
 
@@ -46,14 +46,26 @@ Write these sections in order.
 
 ## Example
 
-> ### Replace 30-Second Document Polling with Push Webhooks
->
-> Collaborators currently discover document changes by polling the server every 30 seconds. That polling delay leaves concurrent editors up to half a minute out of sync and accounts for 60% of total API request volume.
->
-> **Goals and scope:** Deliver document change notifications within 1 second while cutting notification request volume by at least 40%. Third-party legacy integrations remain on polling and are out of scope. Options are compared on delivery latency, server memory per active client, and firewall resilience.
->
-> **Proposal:** When a client opens a document, it registers a callback URL with the notification service. On every committed edit, the service pushes a signed event payload to subscribed URLs with three retries over 10 seconds. In a 200-client load test, median delivery latency dropped to 400 ms and total server requests fell by 52%.
->
-> **Alternatives:** Long polling met the 1-second delivery goal in the same 200-client benchmark, but holding an open HTTP connection per client doubled server memory usage and complicates rolling restarts.
->
-> **Risks and open questions:** Clients behind restrictive corporate firewalls cannot receive inbound webhook calls and must fall back to polling automatically when registration health checks fail. Before approving rollout, we need telemetry on what fraction of active clients sit behind unreachable NATs or firewalls.
+````markdown
+# RFC: Replace Document Polling with Push Webhooks
+
+## Problem
+
+Currently, the editor polls the document API on a fixed interval to check for edits from other collaborators. That polling loop leaves concurrent editors seeing stale state between intervals and keeps the API serving repeated no-op reads even when documents sit idle.
+
+## Goals and Scope
+
+Deliver edit notifications as soon as commits land while eliminating steady-state no-op polls from active editors. Legacy third-party integrations remain on polling and stay outside this change. Options are evaluated on delivery latency, server memory per connected client, and behavior behind restrictive firewalls.
+
+## Proposal
+
+When a client opens a document, it registers a callback URL with the notification service. After each committed edit, the notification service signs the event payload and pushes it to every subscribed URL with bounded retries on transient failures.
+
+## Alternatives
+
+Long polling delivers updates without inbound callbacks, but holding an open HTTP connection per active client increases server memory proportional to concurrency and complicates rolling restarts when connections drain.
+
+## Risks and Open Questions
+
+Clients behind restrictive corporate firewalls cannot receive inbound webhook calls and fall back to polling when registration health checks fail. Before rollout, we need telemetry showing what share of active clients sit behind unreachable NATs or firewalls.
+````

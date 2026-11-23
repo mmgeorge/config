@@ -1,139 +1,38 @@
 ---
 name: rust
 description: >-
-  Design, implement, refactor, review, and test Rust code. Use for .rs files, Cargo
-  dependencies, type and ownership design, async state coordination, synchronization
-  (Mutex, RwLock, atomics, channels), Serde, Facet, thiserror, rustdoc, FFI, dynamic
-  libraries, hot reload, Criterion benchmarks, Samply profiling, and Rust performance
-  investigations.
+  Design, implement, refactor, review, and test Rust code. Use for .rs files,
+  Cargo.toml, type and invariant design, synchronization, Serde, Facet,
+  thiserror, rustdoc, FFI, dynamic libraries, hot reload, and Criterion or
+  Samply performance profiling.
 ---
 
 # Rust
 
-Apply every required convention to each Rust change. Read a reference only when the change matches its trigger in the reference table.
+## Required conventions
+
+- **Validate once:** Keep validated fields private and enforce invariants in fallible constructors or `TryFrom` (routing deserialization through `#[serde(try_from = "...")]` or Facet's proxy). Use newtypes or standard types (`Duration`, `PathBuf`, `NonZero*`) for confusable primitives, `Option` instead of sentinels, and `From`/`TryFrom` instead of lossy `as` casts.
+- **Enums over strings:** Treat `String` or `&str` for a finite set of cases as a code smell. Use exhaustive enums for closed cases, choices, states, and boundary contracts instead of `kind: String`, `bool` parameters, `serde_json::Value`, or co-dependent `Option`s, boxing large variants when `clippy::large_enum_variant` fires. Parse external protocols inside the receiving adapter, separating provider observations, internal state, and wire notifications, and modeling open external vocabularies with `Missing` and `Unknown(raw)`.
+- **Exhaustive matching and conversions:** Match crate-owned enums without `_`, and destructure structs completely instead of using `..Default::default()`.
+- **Ownership and lifetimes:** Consume `self` to enforce call order, tie acquire/release pairs to `Drop` guards, prefer generics or associated types over `dyn Trait` downcasting, and reserve `expect` for invariants types cannot express.
+- **Protect mutable state:** Keep mutable fields and interior mutability (`RefMut`, lock guards) private, expose `&[T]`, `&str`, or iterators for reads, combine check-then-act, and finish every fallible step before mutating `self`. Never add `Deref<Target = str>`, `PartialEq<&str>`, or `AsRef<str>` escape hatches on typed values.
+- **Match the existing stack:** Use Serde if any serialized type uses it and `thiserror` if any error type uses it, otherwise default to Facet. Ask the user before adding a parallel stack. Serialize only durable domain facts or explicit transport values (never locks, handles, caches, or callbacks), keep wire and persisted shapes stable across refactors, and validate complete replacements before publishing.
+- **Flat flow and single-owner async:** Return early, drop `else` after a return, and skip single-line forwarding or error-wrapping helpers. Centralize async mutations behind one owner (see [synchronization.md](references/synchronization.md) before adding locks, atomics, or channels).
+
+## Naming
+
+- **Methods:** Use `noun_verb` (`source_get`, `source_remove`), omitting the noun when the receiver makes the target clear (`get`, `get_mut`). Put context parameters first after the receiver.
+- **Types and fields:** Name fields by contents (`sources`, `assets`, never `data`), name monotonic counts `<domain>_count`, and skip single-caller `with_*` constructors or `Typed` prefixes.
 
 ## Crate Research
 
 - Research new crates and their APIs through the `docs` MCP server (`docs-mcp`) before falling back to GitHub source.
 
-## Required conventions
+## Code Comments
 
-### Compile-time guarantees
-
-An invariant checked only at runtime fails on a path that tests may never reach. Rust's type system turns the same violation into a `cargo check` error. Encode each invariant in a type so that misuse does not compile.
-
-- Make success values valid by construction. Keep fields private and expose a fallible constructor or `TryFrom` that validates once at entry. Downstream consumers stay infallible unless they add a new failure source.
-- Remember that a derived `Deserialize` or `Facet` impl bypasses the constructor. Deserialize a validated type through a raw type and `TryFrom` (Serde's `#[serde(try_from = "Raw")]`, or Facet's proxy) so loaded data passes the same validation.
-- Before using `String` or `&str`, check whether an enum can represent the domain values. Use enums for known cases; reserve plain strings for genuinely free-form text or raw input at external boundaries.
-- Use validated newtypes for structured values such as identifiers and quantities, so values sharing a primitive cannot be confused. A `type` alias does not provide this distinction.
-- Replace `bool` parameters, string discriminants, and flag fields with co-dependent `Option`s with an enum whose variants hold exactly the valid combinations.
-- Represent absence with `Option`, never a sentinel such as `-1`, `0`, or `""`.
-- Convert numbers with `From`, or with `TryFrom` when the value may not fit. Never use `as` where it can truncate, wrap, or change sign.
-- Match enums the crate owns exhaustively, without a `_` arm, so a new variant fails compilation at every consumer.
-- Destructure source structs completely in conversions, so a new field fails compilation. Never fill fields that a conversion must consider with `..Default::default()`.
-- Consume `self` to encode a required operation order when calling out of order is a bug. Use a state enum instead when transitions come from runtime data.
-- Tie paired operations, such as register and unregister, to a guard whose `Drop` performs the release.
-- Keep concrete types through abstractions with generics or associated types. Use `dyn Trait` only for heterogeneous collections or plugin boundaries, never recovered by downcasting.
-- Reserve `expect` for invariants the type system cannot express, and state the invariant in its message.
-
-### Typed boundaries
-
-Stringly typed contracts compile while hiding unhandled cases, misspelled kinds, and missing fields until runtime. Every trait, adapter, event, and message boundary carries typed values.
-
-- Model a closed set of cases as an exhaustive enum with typed payloads. Never use a `kind: String` discriminant, a `serde_json::Value` payload, or a struct of `Option` fields that consumers interpret by kind.
-- Return typed values from trait methods and contract types, never strings that callers parse or compare.
-- Parse external protocol data inside the adapter that receives it. Provider vocabulary, JSON paths, and wire spellings never cross the adapter boundary.
-- Keep identity that every case requires non-optional.
-- Give a field with an open external vocabulary explicit `Missing` and `Unknown(raw)` states. Never add a catch-all variant that defers parsing to consumers.
-- Never implement `Deref<Target = str>` or comparable string escape hatches on a typed value.
-
-A contract that consumers decode by string:
-
-```rust
-pub struct BackendEvent {
-  pub kind: String,
-  pub text: Option<String>,
-  pub data: serde_json::Value,
-}
-```
-
-must instead carry each case with exactly its typed payload:
-
-```rust
-pub enum BackendEvent {
-  Message { address: MessageAddress, update: MessageUpdate },
-  Tool { address: ToolAddress, update: ToolUpdate },
-}
-```
-
-### Encapsulation
-
-Each type owns and protects its invariants. Expose read-only access through `&T` and mutation methods that preserve validity without exposing implementation details.
-
-- Never expose `&mut` access or `pub` fields for state that carries an invariant. Provide mutation methods that preserve it.
-- Return `&[T]`, `&str`, or iterators instead of `&Vec<T>`, `&String`, or internal collections.
-- Combine check-then-act sequences into one operation, such as get-or-create.
-- Complete every fallible step before assigning in a `&mut self` method, so an error leaves the value unchanged.
-- Keep interior mutability private. Never return `RefMut`, lock guards, or other borrows of internal state from a public method.
-
-### Modules
-
-- Keep `mod.rs` limited to `mod` declarations and re-exports.
-- Start one owned concept in one file. Promote it to a directory only when distinct child modules emerge. Name the directory after the shared feature area so no child repeats its name. Never split a file only to reduce its length.
-- Order items after imports: constants, type aliases, enums, struct clusters, free functions, then the `#[cfg(test)]` module. Place exported items before private items in each group.
-- Follow each struct with its inherent `impl`, then its trait `impl`s, in the module that defines it. Order inherent methods `pub`, restricted visibility, then private.
-- Keep visibility as narrow as real consumers permit. Never widen visibility for a test.
-
-### Naming
-
-Name methods `noun_verb`, placing the target before the operation. Omit the noun when the receiver makes the target unambiguous (`get`, `get_mut`); otherwise, qualify only as much as needed (`source_get`, `asset_get`, `source_asset_get`). Keep target names consistent across related operations (`source_get`, `source_get_mut`, `source_remove`).
-
-- Name fields by their contents (`sources`, `assets`), never `data`. Name monotonic counts `<domain>_count`.
-- Put context parameters first after the receiver.
-- Do not add a `with_*` constructor for a single caller or a `Typed` prefix to a type name.
-
-### Serialization
-
-- Inspect the library's existing serialized types before adding one. Use Serde when any existing serialized type uses it. Otherwise use Facet. Never add a parallel serialization stack.
-- Never change a persisted or wire representation as a side effect of a Rust refactor.
-- Check the installed serialization crate's documentation before using a derive or attribute.
-
-### Async mutations
-
-Centralize related state changes so their ordering and interactions are easy to reason about. In complex async flows, have handlers record intent and let one coordinated update path apply changes. Consider commands with completion promises when the state owner should control execution order while callers await results. Use command queues, update passes, or schemas where they clarify that coordination.
-
-### Control flow
-
-- Return early from terminal paths. Drop the `else` after a returning branch.
-- Never add a helper that only forwards a call or wraps one error conversion.
-
-### Errors
-
-- Inspect the library's existing error types before adding one. Use thiserror when any existing error type uses it. Otherwise use Facet. Never add a parallel error stack.
-- Define Facet errors with `#[derive(Debug, Facet)]` and `#[facet(derive(Error))]`. Variant doc comments become the runtime `Display` text, so editing them changes behavior.
-- Never return `Result<T, String>` or flatten a typed cause in a domain API. Render error text only at a UI, log, command, or transport boundary.
-- Use `anyhow` only where no caller distinguishes failures, such as binary entry points and top-level orchestration. Library and domain APIs return typed errors.
-- Check the installed error crate's documentation before using a derive or attribute.
-
-
-### Documentation
-
-- Give every function a concise `///` comment that states its responsibility, contract, or non-obvious reason to exist. Document every non-function item visible outside its module.
-- Start doc comments with `Get` for accessors, `Create` for constructors, and a precise imperative verb otherwise. Never start with `Return` or `Returns`.
-- Place every doc comment above all attributes on its item, field, or variant, including `#[derive]`, `#[serde]`, `#[cfg]`, and attribute macros. Never place it between an attribute and the item.
-- Keep each `// SAFETY:` comment directly above its unsafe operation.
-- Use the technical-writing skill's API Documentation profile for rustdoc.
-
-### Comments
-
-Prefer types, names, and control flow over comments. Add an inline comment only when correctness depends on context the code cannot express.
-
-- Comment domain rules, safety preconditions, concurrency protocols such as lock order or atomic ordering, external API or platform quirks, and performance choices that look wrong without context.
-- Place the comment directly above the statement or branch that enforces the constraint. State the invariant and the failure it prevents.
-- Never narrate what the syntax already says, such as `// Increment the retry count`.
-- In a function of 40 or more nonblank lines that combines at least two of validation, state mutation or publication, and reconciliation or cleanup, label each phase with an imperative comment that names its state boundary. Do not append formulaic `so ...` clauses.
-- Use `//` line comments. Reserve multi-line comments for safety rules or synchronization sequences with several preconditions.
-- Delete a comment when a refactor moves its constraint into a type or API. Recheck nearby comments after changing the code they describe.
+- **Doc comments (`///`):** Document every function and every non-function item visible outside its module using the `technical-writing` API profile. Open function and method docs with `Get`, `Create`, or an imperative verb (never `Return`/`Returns`), and place doc comments above all attributes (`#[derive]`, `#[serde]`, `#[facet]`, `#[cfg]`, attribute macros).
+- **Safety and inline comments (`//`):** Place `// SAFETY:` directly above unsafe operations. Add other `//` comments only when correctness depends on non-obvious context (domain rules, lock or atomic ordering, platform quirks, non-obvious optimizations), directly above the statement, naming the invariant and failure prevented.
+- **Phase labels:** In 40+ line functions spanning multiple phases (validation, mutation/publication, cleanup), mark each phase with a short imperative state-boundary comment.
 
 ```rust
 // Flush before releasing the lock, or workers read the stale buffer.
@@ -145,23 +44,18 @@ drop(guard);
 
 | Reference | Read before |
 | --- | --- |
-| [invariant-apis.md](references/invariant-apis.md) | Designing public methods that read or mutate state, accessors, guards, transactions, or interior mutability |
-| [typed-boundaries.md](references/typed-boundaries.md) | Defining or changing traits, adapters, events, protocol messages, or code that parses external data |
-| [module-organization.md](references/module-organization.md) | Splitting, moving, or promoting modules, placing test helpers or `#[path]` declarations, ordering trait implementations, or changing re-exports |
-| [type-modeling.md](references/type-modeling.md) | Adding domain types, newtypes, enums, state transitions, behavioral owners, private state aggregates, `Result` success or failure types, retained fields, constructors, operation names, or type-erased stores |
-| [control-flow.md](references/control-flow.md) | Restructuring method chains, naming intermediate stages, or extracting fallible helpers |
-| [error-handling.md](references/error-handling.md) | Adding or reshaping error types, error derives, or error conversions |
-| [serialization.md](references/serialization.md) | Adding serialization derives or changing persisted or wire representations |
-| [documentation.md](references/documentation.md) | Writing doc comments, safety comments, or Facet error messages |
+| [invariants.md](references/invariants.md) | Designing public mutation methods, scoped edits, `Drop` guards, borrowing transactions, or interior mutability |
+| [modules.md](references/modules.md) | Splitting or promoting modules, placing test helpers or `#[path]`, ordering trait impls, or changing re-exports |
+| [errors.md](references/errors.md) | Defining error types, derives, source preservation, or error conversions |
+| [documentation.md](references/documentation.md) | Writing rustdoc contracts, safety comments, or Facet error messages |
 | [synchronization.md](references/synchronization.md) | Adding or restructuring locks, atomics, channels, completion queues, cancellation, or shared mutable state |
 | [dynamic-libraries.md](references/dynamic-libraries.md) | Changing Rust dylibs, FFI, native loading, host/plugin contracts, or hot-reload unload order |
-| [testing.md](references/testing.md) | Adding, moving, or removing tests, or setting up a project's test runner |
-| [benchmarking-and-profiling.md](references/benchmarking-and-profiling.md) | Setting up Criterion/Samply helpers, reading artifacts without a GUI, or supporting optimization changes with measurements |
+| [testing.md](references/testing.md) | Adding, moving, or removing tests, or bounding test runtime |
+| [performance.md](references/performance.md) | Setting up Criterion/Samply benchmarks, reading profiles without a GUI, or measuring optimizations |
 
 ## Verification
 
-- Run tests with `cargo nextest run`, never `cargo test`. nextest does not run doctests, so run `cargo test --doc` when the change touches documentation examples. When `cargo nextest` is not installed, report that rather than installing it or falling back to `cargo test`.
-- Never run broad automatic-fix commands such as `cargo clippy --fix` or `cargo fix`.
-- Pass `cargo check`, `cargo clippy`, `cargo nextest run`, and `cargo build` the same arguments as the project's development build. A mismatched argument invalidates the build cache and recompiles the dependency graph.
-- Do not add `--all-targets`, `--tests`, `--all-features`, `--release`, or a separate `--target-dir` by default. Select a named integration-test executable (`--test <name>`) only when the requested coverage requires it.
-- Select the smallest test coverage that exercises the change. Run individual tests with `cargo nextest run -p <package> <filter>`, batching related tests in one invocation. Use a filterset (`-E 'test(...)'`) when a name substring cannot select the tests precisely.
+- **Nextest only:** Run tests with `cargo nextest run`, never `cargo test`. If `cargo nextest` is missing, report that instead of installing it or falling back.
+- **No broad autofix:** Never run `cargo clippy --fix` or `cargo fix`.
+- **Match dev flags:** Pass `cargo check`, `cargo clippy`, `cargo nextest run`, and `cargo build` the project's exact development flags so the build cache stays valid. Do not add `--all-targets`, `--tests`, `--all-features`, `--release`, or a custom `--target-dir` unless requested.
+- **Narrowest scope:** Run the smallest relevant test selection (`cargo nextest run -p <package> <filter>`, or `-E 'test(...)'` when substrings are too broad), batching related tests in one command.

@@ -2,62 +2,87 @@
 
 *Read before adding or reviewing an architecture diagram, sequence chart, state diagram, or data-flow diagram.*
 
-## When to use a diagram
+## Scope and Placement
 
-Use a diagram when layout explains something faster than prose, such as how parts nest, which parts run in parallel, how state changes, or how data moves through a pipeline.
+- Use a diagram when layout shows structure, state transitions, or data flow more clearly than prose, answering one question per diagram.
+- Place each diagram directly below a lead-in paragraph that states its takeaway, and keep contracts or copyable text (commands, paths, error codes) in prose or tables.
+- Keep the longest arrow chain concise (around six nodes or fewer), splitting at ownership boundaries, network hops, or storage writes.
 
-- Put the diagram right next to the text that explains it.
-- State the point the reader should take from the diagram in the paragraph before it.
-- Never put a rule or contract only in a diagram. Repeat it in prose or a table.
-- Keep anything the reader may copy, such as names, commands, paths, and error codes, in text instead of in an image.
+## Labels and Conventions
 
-## One question per diagram
+- Name components with short plain nouns (`IngestWorker`, `DocumentStore`) without parenthetical summaries, and name states with adjectives or past participles (`Queued`, `Claimed`, `DeadLettered`).
+- Label arrows with what crosses them (`SignedEvent`, `HTTP POST /v1/events`) instead of vague verbs like *"calls"* or *"uses"*. Use solid arrows for synchronous calls and dashed arrows for asynchronous queues or events.
+- Group separate processes, trust zones, or services in labeled subgraphs. Lay out hierarchies top-to-bottom and flows left-to-right, pairing color with shape, line style, or labels, and omit Mermaid `accTitle`/`accDescr` headers.
+- In UML `classDiagram` blocks, include major architectural components with key `+method` boundaries, keep value payloads on arrow labels instead of separate boxes, and omit custom `<<...>>` lifetime stereotypes.
 
-Draw each diagram to answer one question, such as:
+## Examples
 
-- How does a payload move from input, through each change, to storage?
-- What path does a request take from the client through the gateway and service to the database?
-- What states can an item be in, and what moves it from one state to another?
-- Which part owns which data, and which parts depend on which?
+### Data Flow Across Trust Zones
 
-When a diagram tries to answer two unrelated questions, such as where things are deployed and how data flows at runtime, split it into two diagrams.
-
-## Size
-
-- Keep the longest path to six nodes or fewer. Count the longest chain of arrows, not the total number of nodes.
-- When a path is longer, split the diagram where data crosses an ownership boundary, a network hop, or a write to storage.
-- Merge internal steps into one named node when they do not change which part owns the data or what must stay true.
-
-## Nodes, arrows, and groups
-
-- Name components, services, stores, and workers with nouns, such as `IngestWorker` or `DocumentStore`.
-- Name a processing step with a verb only when the step itself is the subject, such as `ValidateSignature`.
-- Name states with adjectives or past participles, such as `Draft`, `PendingSync`, or `Failed`.
-- Label every arrow with what crosses it, such as `SyncRequest` or `HTTP POST /v1/events`. Avoid vague labels such as "sends," "calls," or "uses."
-- Use solid arrows for direct, blocking calls and dashed arrows for asynchronous events and queues.
-- Use two labeled arrows instead of one double-headed arrow when each direction carries something different.
-- Draw a box around parts that are truly separate, such as different processes, trust zones, thread pools, or services, and label the box with what separates them.
-
-## UML Class Diagrams
-
-- Include only major architectural components and their key boundary methods using standard UML visibility (`+method`).
-- Put value payloads on arrow labels instead of adding separate boxes for small data structs.
-- Omit custom `<<...>>` lifetime stereotypes.
-
-## Accessibility
-
-- Do not use color alone to carry meaning. Pair it with a shape, a line style, or a label.
-- Lay out hierarchy from top to bottom, and pipelines and request flows from left to right.
-- For static image files (PNG or SVG), provide alt text describing the starting state, each step, and the result. Omit `accTitle` and `accDescr` headers inside Mermaid blocks.
-
-## Example
-
-The paragraph before the diagram states its point: a draft reaches the server only through the `SyncWorker`, and the worker deletes it from the `DraftJournal` only after the `DocumentApi` confirms persistence.
+The gateway signs each event on the request path and hands a delivery job to an internal queue. Background workers post signed payloads to customer endpoints and route exhausted jobs to dead-letter storage:
 
 ```mermaid
 flowchart LR
-    EditorView -->|DraftRecord| DraftJournal
-    DraftJournal -->|DraftRecord| SyncWorker
-    SyncWorker -->|POST DraftRecord| DocumentApi
-    DocumentApi -.->|200 Persisted| SyncWorker
+    subgraph Edge["API Gateway"]
+        Ingress["IngressApi"]
+        Signer["EventSigner"]
+    end
+
+    subgraph Internal["Delivery Workers"]
+        Queue["DeliveryQueue"]
+        Dispatcher["WebhookDispatcher"]
+        DeadLetter["DeadLetterStore"]
+    end
+
+    subgraph Customer["Customer Network"]
+        Endpoint["WebhookEndpoint"]
+    end
+
+    Ingress -->|EventPayload| Signer
+    Signer -.->|DeliveryJob| Queue
+    Queue -.->|DeliveryJob| Dispatcher
+    Dispatcher -->|HTTP POST SignedEvent| Endpoint
+    Dispatcher -.->|ExhaustedJob| DeadLetter
+```
+
+### Ownership and Cardinality
+
+Pluggable sources publish immutable rule snapshots into the rule store, letting the evaluator match flags against shared audience segments without holding write locks:
+
+```mermaid
+classDiagram
+    class FlagSource {
+        <<interface>>
+        +subscribe(on_snapshot)
+    }
+    class StreamSource {
+        +connect(url, api_key)
+    }
+    class FileSource {
+        +watch(path)
+    }
+    class RuleStore {
+        +swap(snapshot)
+        +get_flag(key) FlagDefinition
+    }
+    class FlagDefinition {
+        +key
+        +default_variant
+        +rules
+    }
+    class SegmentRule {
+        +segment_id
+        +predicate
+    }
+    class FlagEvaluator {
+        +evaluate(key, context) Variant
+    }
+
+    FlagSource <|.. StreamSource
+    FlagSource <|.. FileSource
+    FlagSource --> RuleStore : publishes RuleSnapshot
+    RuleStore "1" *-- "*" FlagDefinition : owns active flags
+    RuleStore "1" *-- "*" SegmentRule : owns audience rules
+    FlagDefinition "*" --> "*" SegmentRule : matches targeting
+    FlagEvaluator --> RuleStore : reads rules lock-free
 ```
