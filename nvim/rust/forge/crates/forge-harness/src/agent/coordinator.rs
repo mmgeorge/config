@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -16,15 +17,60 @@ use crate::{
     provider::{ProviderCompletion, ThreadOwner},
 };
 
-pub const MAX_ACTIVE_CHILDREN: usize = 8;
 pub const MAX_PENDING_TASKS: usize = 1024;
+
+/// Maximum number of managed children that may hold execution slots in one root session.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct SubagentLimit(NonZeroUsize);
+
+impl Default for SubagentLimit {
+    /// Get the capacity for sessions without a saved limit.
+    fn default() -> Self {
+        Self(NonZeroUsize::new(8).expect("the default subagent limit is positive"))
+    }
+}
+
+/// Access requested for a single newly spawned child.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnAccess {
+    /// Remove the child's write authority.
+    Read,
+    /// Require the parent's existing write authority within the selected profile.
+    Write,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Describes a fresh child without inheriting parent transcript or workflow state.
 pub struct SpawnAgentRequest {
     pub profile: Option<String>,
+    /// Use the profile's access mode when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<SpawnAccess>,
     pub text: String,
+}
+
+impl SpawnAgentRequest {
+    /// Check whether retained child work satisfies this spawn request.
+    pub(crate) fn matches_admission(&self, agent: &Agent, task: &AgentTask) -> bool {
+        task.ordinal == 1
+            && task.message == self.text
+            && self
+                .profile
+                .as_deref()
+                .is_none_or(|profile| profile == agent.definition)
+            && self.access.is_none_or(|access| {
+                agent.selection.as_ref().is_some_and(|selection| {
+                    let write_scope = selection.access.write_access;
+                    match access {
+                        SpawnAccess::Read => write_scope == crate::session::WriteScope::Off,
+                        SpawnAccess::Write => write_scope != crate::session::WriteScope::Off,
+                    }
+                })
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,8 +209,8 @@ pub struct AgentCommandSender {
 impl AgentCommandSender {
     /// Admit only the still-current queued task before it starts a provider process.
     ///
-    /// `access` comes from the child's effective policy: shared readers coexist, and a writer
-    /// waits for every reader and writer. The reservation lasts until durable task publication.
+    /// Each child holds a shared source lock until its task result is durably published.
+    /// `access` limits the operations the child can borrow from that reservation.
     pub(crate) async fn repository_admit(
         &self,
         owner: &ThreadOwner,
@@ -197,8 +243,9 @@ impl AgentCommandSender {
                 }
             }
             // No coordinator or broker lock is held while inspecting repository ownership.
-            match crate::repository_access::RepositoryReservation::acquire(root, workspace, access)
-            {
+            match crate::repository_access::RepositoryReservation::acquire_for_child(
+                root, workspace, access,
+            ) {
                 Ok(repository) => {
                     let repository = Arc::new(repository);
                     let mut state = self
@@ -499,7 +546,7 @@ impl AgentAdmission {
                     .is_some_and(|task| task.agent_id == admission.agent.id)
             })
             && state.pending_launches.is_empty()
-            && state.execution_by_agent.len() < MAX_ACTIVE_CHILDREN
+            && state.has_capacity(0)
             && state.quiescence_count == 0
             && state.launch_hold_count == 0;
         if launch {
@@ -575,6 +622,7 @@ struct ChildExecution {
 
 #[derive(Default)]
 struct AgentStateStore {
+    subagent_limit: SubagentLimit,
     quiescence_count: usize,
     launch_hold_count: usize,
     foreground_claim_count: usize,
@@ -584,6 +632,13 @@ struct AgentStateStore {
     execution_by_agent: HashMap<String, ChildExecution>,
     pending_launches: VecDeque<String>,
     pending_task_slots: HashMap<String, tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl AgentStateStore {
+    /// Check execution capacity while accounting for slots reserved by pending admissions.
+    fn has_capacity(&self, reserved_launches: usize) -> bool {
+        self.execution_by_agent.len() + reserved_launches < self.subagent_limit.0.get()
+    }
 }
 
 /// Owns one root's identities, admission capacity, task queues, and cancellation.
@@ -747,6 +802,25 @@ impl AgentCoordinator {
 
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
+    }
+
+    /// Get the current capacity for managed child execution.
+    pub(crate) fn subagent_limit(&self) -> SubagentLimit {
+        self.state
+            .lock()
+            .expect("agent state poisoned")
+            .subagent_limit
+    }
+
+    /// Apply a new capacity and wake the owner to reconsider queued launches.
+    pub(crate) fn set_subagent_limit(&self, limit: SubagentLimit) {
+        self.state
+            .lock()
+            .expect("agent state poisoned")
+            .subagent_limit = limit;
+        self.sender
+            .revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     pub fn set_profiles(&self, profiles: Arc<super::AgentProfileStore>) {
@@ -957,7 +1031,7 @@ impl AgentCoordinator {
         if let Some(existing) = state.admission_by_operation.get(&request.operation_id) {
             ensure!(
                 existing.agent.definition == selection.profile
-                    && existing.task.message == spawn.text
+                    && spawn.matches_admission(&existing.agent, &existing.task)
                     && existing.task.source == request.source
                     && existing.task.parent_exchange_id == parent_exchange_id,
                 "operation identity was reused for different child work"
@@ -980,8 +1054,7 @@ impl AgentCoordinator {
                     && !state.task_by_id.contains_key(&admission.task.id)
             })
             .count();
-        let launch = state.execution_by_agent.len() + reservation_count < MAX_ACTIVE_CHILDREN
-            && state.pending_launches.is_empty();
+        let launch = state.has_capacity(reservation_count) && state.pending_launches.is_empty();
         ensure!(
             pending_task_count(&state) < MAX_PENDING_TASKS || launch,
             "child task queue already has 1024 pending tasks"
@@ -1104,7 +1177,7 @@ impl AgentCoordinator {
             .count();
         let launch = matches!(agent.continuation, AgentContinuationPolicy::Ready)
             && !state.execution_by_agent.contains_key(&agent.id)
-            && state.execution_by_agent.len() + reserved_launches < MAX_ACTIVE_CHILDREN
+            && state.has_capacity(reserved_launches)
             && state.pending_launches.is_empty();
         if let Some(execution) = state.execution_by_agent.get(&agent.id) {
             ensure!(
@@ -1116,16 +1189,9 @@ impl AgentCoordinator {
                 "child task queue already has 1024 pending tasks"
             );
         } else {
-            let reserved = state
-                .admission_by_operation
-                .values()
-                .filter(|admission| {
-                    admission.launch && !state.task_by_id.contains_key(&admission.task.id)
-                })
-                .count();
             ensure!(
                 pending_task_count(&state) < MAX_PENDING_TASKS
-                    || state.execution_by_agent.len() + reserved < MAX_ACTIVE_CHILDREN,
+                    || state.has_capacity(reserved_launches),
                 "child task queue already has 1024 pending tasks"
             );
         }
@@ -1661,10 +1727,7 @@ impl AgentCoordinator {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
-        if state.quiescence_count > 0
-            || state.launch_hold_count > 0
-            || state.execution_by_agent.len() >= MAX_ACTIVE_CHILDREN
-        {
+        if state.quiescence_count > 0 || state.launch_hold_count > 0 || !state.has_capacity(0) {
             return Ok(None);
         }
         let Some(index) = state.pending_launches.iter().position(|id| {

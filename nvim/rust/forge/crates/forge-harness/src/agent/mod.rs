@@ -21,9 +21,9 @@ pub use coordinator::AgentTarget;
 pub use coordinator::{
     AgentAdmission, AgentCommand, AgentCommandSender, AgentCommit, AgentCoordinator,
     AgentForegroundClaim, AgentOperation, AgentQuiescence, AgentRequest, AgentRequestAuthority,
-    AgentSettlementDisposition, AgentWork, SpawnAgentRequest,
+    AgentSettlementDisposition, AgentWork, SpawnAccess, SpawnAgentRequest, SubagentLimit,
 };
-pub use profile::{AgentProfile, AgentProfileDocument, AgentProfileStore};
+pub use profile::{AgentProfile, AgentProfileAccess, AgentProfileDocument, AgentProfileStore};
 pub use selection::AgentSelection;
 pub(crate) use selection::{effective_access, repository_access};
 pub use task::{AgentMessage, AgentSource, AgentTask, MessageDelivery};

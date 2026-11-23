@@ -318,6 +318,7 @@ pub(super) fn admit_child_fixture(
     );
     let spawn = crate::agent::SpawnAgentRequest {
         profile: Some(name.into()),
+        access: None,
         text: "Inspect".into(),
     };
     let request = crate::agent::AgentRequest {

@@ -2003,11 +2003,12 @@ function M.select_agent(selector)
 end
 
 --- Admit a fresh child using a global profile and explicit task text.
----@param profile string|table
+---@param profile string|ForgeSpawnRequest
 ---@param text? string
-function M.spawn_agent(profile, text)
+---@param access? ForgeSpawnAccess
+function M.spawn_agent(profile, text, access)
   local state = harness_state()
-  local request = type(profile) == "table" and profile or { profile = profile, text = text }
+  local request = type(profile) == "table" and profile or { profile = profile, text = text, access = access }
   if state.presentation then state.presentation.follow_tail() end
   client.request({ session_id = state.session.id, method = "session.agent.start", params = request }, function(result, request_error)
     if request_error then notifications.error(request_error, "Harness agent") end
@@ -2070,7 +2071,8 @@ end
 
 --- Select an enabled profile and compose its task text.
 ---@param profile? string
-function M.open_spawn_picker(profile)
+---@param access? ForgeSpawnAccess
+function M.open_spawn_picker(profile, access)
   local state = harness_state()
   local session_id = state.session and state.session.id
   client.request({ method = "agent.profile.get", params = {} }, function(snapshot, failure)
@@ -2078,7 +2080,7 @@ function M.open_spawn_picker(profile)
     if failure then notifications.error(failure, "Subagent profiles") return end
     if snapshot.error then notifications.warn(snapshot.error, "Subagent profiles") end
     require("forge.views.harness.spawn_picker").open({
-      host = picker_host(state), profile = profile, document = snapshot.document, on_spawn = M.spawn_agent,
+      host = picker_host(state), profile = profile, access = access, document = snapshot.document, on_spawn = M.spawn_agent,
     })
   end)
 end
@@ -2478,16 +2480,17 @@ function M.submit()
     M.open_undo_picker(function() refused() end)
     return
   end
-  local spawn_profile, spawn_task = text:match("^/agents%s+spawn%s+(%S+)%s+(.+)$")
-  if spawn_profile and spawn_task then
+  local spawn_arguments = text:match("^/agents%s+spawn%s+(.+)$")
+  if spawn_arguments then
+    local access, arguments = spawn_arguments:match("^%-%-(%S+)%s*(.*)$")
+    if access ~= nil and access ~= "read" and access ~= "write" then
+      notifications.warn("Use --read or --write for subagent access", "Harness agent")
+      return
+    end
+    local spawn_profile, spawn_task = (arguments or spawn_arguments):match("^(%S+)%s*(.*)$")
     set_composer_text(state.composer_buf, "")
-    M.spawn_agent(spawn_profile, spawn_task)
-    return
-  end
-  local spawn_profile_only = text:match("^/agents%s+spawn%s+(%S+)%s*$")
-  if spawn_profile_only then
-    set_composer_text(state.composer_buf, "")
-    M.open_spawn_picker(spawn_profile_only)
+    if spawn_task and spawn_task ~= "" then M.spawn_agent(spawn_profile, spawn_task, access)
+    else M.open_spawn_picker(spawn_profile, access) end
     return
   end
   local agent_selector = text:match("^/agents%s+(%S+)%s*$")
@@ -2497,7 +2500,7 @@ function M.submit()
     return
   elseif text:match("^/agents%s+") then
     set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /agents, /agents on|off, /agents edit [profile], or /agents spawn <profile> <text>", "ForgeHarness")
+    notifications.warn("Use /agents, /agents on|off, /agents edit [profile], or /agents spawn [--read|--write] [profile] [text]", "ForgeHarness")
     return
   end
   if text == "/compact" then

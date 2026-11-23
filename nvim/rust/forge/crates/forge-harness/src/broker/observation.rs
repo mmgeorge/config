@@ -681,6 +681,7 @@ impl BrokerObserver {
             access_preference,
             access_abbreviation: session.access.abbreviation().into(),
             subagent_tools: self.agent_coordinator.enabled(),
+            subagent_limit: self.agent_coordinator.subagent_limit(),
             lsp_tools: self.lsp.enabled(&source_session.id),
             session_tools: settings.session_tools.unwrap_or(true),
             status_thoughts,

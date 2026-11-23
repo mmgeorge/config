@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 
-use super::{AgentSelection, SpawnAgentRequest};
+use super::{AgentProfileAccess, AgentSelection, SpawnAccess, SpawnAgentRequest};
 use crate::provider::{
     PromptMode, Provider, ProviderId, ProviderInput, ProviderLaunch, ProviderRequest,
 };
@@ -108,6 +108,13 @@ impl AgentProviderFactory {
         spawn: &SpawnAgentRequest,
     ) -> Result<AgentSelection> {
         let (profile_name, profile) = self.profiles.resolve(spawn.profile.as_deref())?;
+        let mut access = root.access.clone();
+        access.write_access = resolve_spawn_write_scope(
+            access.write_access,
+            profile.write_access,
+            spawn.access,
+            &profile_name,
+        )?;
         let provider = if profile.provider == "inherit" {
             root_provider.clone()
         } else {
@@ -141,7 +148,6 @@ impl AgentProviderFactory {
                 serde_json::from_value(serde_json::json!(profile.approval_mode))?,
             )
         };
-        let denies_writes = profile.denies_writes();
         let mut selection = AgentSelection {
             profile: profile_name,
             instructions: profile.instructions,
@@ -156,12 +162,9 @@ impl AgentProviderFactory {
             service_tier,
             access: forge_providers::registry::resolve(&provider)?
                 .capability
-                .resolve_access(root.access.clone()),
+                .resolve_access(access),
             approval_mode,
         };
-        if denies_writes {
-            selection.access.write_access = crate::session::WriteScope::Off;
-        }
         if profile.model != "inherit" || profile.reasoning_effort != "inherit" || !same_provider {
             ensure!(
                 same_provider || profile.model != "inherit" || root.model != "default",
@@ -243,8 +246,7 @@ impl AgentProviderFactory {
             effort: selection.reasoning_effort.clone(),
             context_window: selection.context_window.clone(),
             service_tier: selection.service_tier,
-            // Capability resolution runs after narrowing; it can drop unsupported sandboxing but
-            // never restores write scope, so the reservation chosen from it stays accurate.
+            // Capability resolution runs after narrowing the captured write scope.
             access: forge_providers::registry::resolve(&selection.provider)?
                 .capability
                 .resolve_access(super::effective_access(&root.access, &selection.access)),
@@ -274,6 +276,31 @@ pub struct AgentModelCatalog {
     pub models: Vec<crate::provider::ProviderModel>,
     /// Controls which tuning options the provider accepts.
     pub capability: crate::provider::ProviderCapability,
+}
+
+/// Resolve explicit access against both the profile and the parent's write scope.
+fn resolve_spawn_write_scope(
+    parent: crate::session::WriteScope,
+    profile: AgentProfileAccess,
+    requested: Option<SpawnAccess>,
+    profile_name: &str,
+) -> Result<crate::session::WriteScope> {
+    use crate::session::WriteScope;
+    match (requested, profile) {
+        (Some(SpawnAccess::Read), _) | (None, AgentProfileAccess::Read) => Ok(WriteScope::Off),
+        (None, AgentProfileAccess::Inherit) => Ok(parent),
+        (Some(SpawnAccess::Write), AgentProfileAccess::Read) => {
+            anyhow::bail!("subagent profile {profile_name} is read-only")
+        }
+        (Some(SpawnAccess::Write), AgentProfileAccess::Inherit | AgentProfileAccess::Write)
+        | (None, AgentProfileAccess::Write) => {
+            ensure!(
+                parent != WriteScope::Off,
+                "parent session has write access turned off"
+            );
+            Ok(parent)
+        }
+    }
 }
 
 fn narrow_permission(

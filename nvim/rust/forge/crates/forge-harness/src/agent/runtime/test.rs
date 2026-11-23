@@ -288,12 +288,9 @@ async fn cancel_before_repository_admission_is_cancelled() -> Result<()> {
     Ok(())
 }
 
-/// Write-off children share the repository, so a second reader starts while the first runs.
-///
-/// Every child previously took the exclusive writer reservation, so explorers that could not
-/// write still ran one at a time.
-#[tokio::test]
-async fn read_only_children_start_before_any_child_finishes() -> Result<()> {
+/// Both access modes can start a second child while a write-capable child runs.
+#[tokio::test(start_paused = true)]
+async fn child_writers_and_readers_start_before_any_child_finishes() -> Result<()> {
     let directory = tempfile::tempdir()?;
     crate::storage::layout::prepare(directory.path())?;
     let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -301,11 +298,12 @@ async fn read_only_children_start_before_any_child_finishes() -> Result<()> {
     let release = Arc::new(tokio::sync::Notify::new());
     let services = RuntimeServices::open(directory.path())?;
     let mut runs = Vec::new();
-    // Start each child only after the previous one holds its reservation inside its provider.
-    // Starting them together would race on the reservation's admission gate, whose busy retry
-    // sleeps on the real clock; this order keeps every acquisition uncontended while a child
-    // that needed exclusive access would still wait behind the readers already running.
-    for name in ["reader-one", "reader-two"] {
+    // Wait for each provider to start before admitting the next child.
+    for (name, access) in [
+        ("first-writer", crate::session::WriteScope::Workspace),
+        ("second-writer", crate::session::WriteScope::Workspace),
+        ("reader", crate::session::WriteScope::Off),
+    ] {
         let mut fixture = RuntimeFixture::with_services(
             directory.path(),
             held_provider(started.clone(), arrived.clone(), release.clone())?,
@@ -313,7 +311,7 @@ async fn read_only_children_start_before_any_child_finishes() -> Result<()> {
             None,
             &services,
         )?;
-        fixture.runtime.request.access.write_access = crate::session::WriteScope::Off;
+        fixture.runtime.request.access.write_access = access;
         let expected = runs.len() + 1;
         let arrival = async {
             loop {
@@ -330,7 +328,7 @@ async fn read_only_children_start_before_any_child_finishes() -> Result<()> {
         runs.push((tokio::spawn(fixture.runtime.run()), fixture.cancel));
         tokio::time::timeout(std::time::Duration::from_secs(1), arrival)
             .await
-            .with_context(|| format!("write-off child {name} waited for a running reader"))?;
+            .with_context(|| format!("child {name} could not start alongside the first writer"))?;
     }
     release.notify_waiters();
     for (run, _cancel) in runs {

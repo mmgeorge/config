@@ -10,12 +10,21 @@ pub(super) fn definition() -> ControlToolDefinition {
     ControlToolDefinition {
         name: NAME,
         description: "Start a fresh child using a user-configured profile and task text. The profile owns provider, \
-                model, thinking, speed, and instructions. Omit profile to use the configured default. Returns its \
+                model, thinking, speed, and instructions. Omit profile to use the configured default. Set access \
+                to read for inspection or write for edits. Write requires permission from both the parent and \
+                the profile. Omit access to use the profile's setting. Returns its \
                 unique identity without waiting for completion. Child results arrive as separate messages. When \
                 only delegated work remains, end your turn. Harness waits for the children and resumes you with \
                 their results. New user input can resume you sooner.",
         input_schema: strict_object_input_schema(
-            vec![("profile", string_schema()), ("text", string_schema())],
+            vec![
+                ("profile", string_schema()),
+                (
+                    "access",
+                    serde_json::json!({"type": "string", "enum": ["read", "write"]}),
+                ),
+                ("text", string_schema()),
+            ],
             &["text"],
         ),
     }

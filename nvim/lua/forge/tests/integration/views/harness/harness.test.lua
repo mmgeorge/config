@@ -1786,8 +1786,8 @@ do
   local profiles = require("forge.views.harness.subagent_profiles")
   local routed = {}
   profiles.open = function(selected_state, _, profile) assert(selected_state == state) routed = { "edit", profile } end
-  controller.spawn_agent = function(profile, text) routed = { "spawn", profile, text } end
-  controller.open_spawn_picker = function(profile) routed = { "spawn_picker", profile } end
+  controller.spawn_agent = function(profile, text, access) routed = { "spawn", profile, text, access } end
+  controller.open_spawn_picker = function(profile, access) routed = { "spawn_picker", profile, access } end
   controller.open_agent_picker = function() routed = { "agents" } end
   controller.select_agent = function(name) routed = { "select", name } end
   controller.configure = function(params)
@@ -1803,6 +1803,8 @@ do
     { "/agents edit", { "edit" } },
     { "/agents edit reviewer", { "edit", "reviewer" } },
     { "/agents spawn reviewer Inspect parser", { "spawn", "reviewer", "Inspect parser" } },
+    { "/agents spawn --read worker Inspect parser", { "spawn", "worker", "Inspect parser", "read" } },
+    { "/agents spawn --write worker", { "spawn_picker", "worker", "write" } },
     { "/agents spawn reviewer", { "spawn_picker", "reviewer" } },
     { "/agents spawn", { "spawn_picker" } },
     { "/agents", { "agents" } },
@@ -3612,6 +3614,30 @@ do
   failures:assert_none()
 end
 end
+T["subagent_spawn_access"] = function()
+  local picker = require("forge.views.picker")
+  local spawn_picker = require("forge.views.harness.spawn_picker")
+  local control_win = vim.api.nvim_get_current_win()
+  local spawned
+  local options = {
+    host = { window_list = { control_win }, control_win = control_win },
+    profile = "worker",
+    document = { profiles = { worker = { enabled = true, description = "Implement a task" } }, default_profile = "worker" },
+    on_spawn = function(request) spawned = request end,
+  }
+  eq(spawn_picker.open(options), true)
+  local spec = picker._state_for_test().spec
+  local access = spec.page_list[1]
+  eq(access.id, "spawn-access")
+  eq(vim.tbl_map(function(option) return option.id end, access.option_list), { "inherit", "read", "write" })
+  spec.on_confirm({ option = access.option_list[2] })
+  local task = picker._state_for_test().spec
+  eq(task.page_list[1].id, "spawn-task")
+  task.on_confirm({ text = "Inspect the sources" })
+  eq(spawned, { profile = "worker", text = "Inspect the sources", access = "read" })
+  picker.close()
+end
+
 T["subagent_profiles"] = function()
 local client = require("forge.client")
 local config = require("forge.infra.config")
@@ -3786,7 +3812,10 @@ do
   assert(current_form:values().reasoning_effort == "high")
   focus("write_access")
   current_form:cycle(1)
-  assert(current_form:values().write_access == "off", "write access did not cycle to off")
+  eq(current_form:values().write_access, "read")
+  current_form:cycle(1)
+  eq(current_form:values().write_access, "write")
+  current_form:cycle(-1)
   edit("description", "Review carefully")
   edit("instructions", "Review instructions\nSecond line\n")
   focus("default")
@@ -3796,7 +3825,7 @@ do
   assert(saves == 1 and not vim.bo.modified)
   assert(snapshot.document.default_profile == "reviewer")
   assert(snapshot.document.profiles.reviewer.instructions == "Review instructions\nSecond line\n")
-  assert(snapshot.document.profiles.reviewer.write_access == "off", "saved profile lost write access")
+  eq(snapshot.document.profiles.reviewer.write_access, "read")
   focus("instructions")
   local field_text = current_form:values().instructions
   current_form:refresh()

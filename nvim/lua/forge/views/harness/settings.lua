@@ -51,6 +51,7 @@ local configuration_field_description = {
   ["approval_timeout"] = "Time allowed for approval. Enter to edit; Up/Down adjust from 15 seconds to 60 minutes.",
   ["tool_timeout"] = "Deadline for each tool call and shell command. Expiry stops execution with an error. Enter to edit.",
   ["subagent-tools"] = "Allow the assistant to delegate work to subagents.",
+  ["subagent_limit"] = "Maximum concurrent subagents in a session. Press Enter to edit.",
   ["lsp-tools"] = "Allow the assistant to use language-server tools.",
   ["session-tools"] = "Allow the assistant to search and read session history.",
   ["status-thoughts"] = "Show model thoughts in the status display.",
@@ -858,6 +859,10 @@ function M.open(state, host, resume_state, defaults)
             row("tools", "subagent-tools", "Tools", "Subagents", {
               field("subagent-tools", "toggle", (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true, "Enabled"),
             }),
+            row("tools", "subagent-limit", "Tools", "Subagent limit", {
+              { id = "subagent_limit", kind = "input", value = tostring(active.subagent_limit or state.subagent_limit or 8),
+                input = { kind = "integer", minimum = 1 } },
+            }),
             row("tools", "lsp-tools", "Tools", "LSP", {
               field("lsp-tools", "toggle", (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true, "Enabled"),
             }),
@@ -874,9 +879,17 @@ function M.open(state, host, resume_state, defaults)
         on_field_submit = function(context, value, complete)
           if not current() then complete("This session is no longer active.") return end
           if pending then complete("Another setting is being saved. Try again.") return end
-          local timeout = context.field.id
-          if timeout ~= "approval_timeout" and timeout ~= "tool_timeout" then complete("This setting does not accept text input.") return end
-          configure({ [timeout] = duration.parse(value) }, function(applied)
+          local id = context.field.id
+          local setting
+          if id == "approval_timeout" or id == "tool_timeout" then
+            setting = duration.parse(value)
+          elseif id == "subagent_limit" then
+            setting = value
+          else
+            complete("This setting does not accept text input.")
+            return
+          end
+          configure({ [id] = setting }, function(applied)
             complete(not applied and "Could not save the setting. Press Enter to retry." or nil)
           end)
         end,

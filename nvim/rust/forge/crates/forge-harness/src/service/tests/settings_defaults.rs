@@ -38,7 +38,7 @@ async fn global_defaults_do_not_create_or_modify_sessions() -> Result<()> {
                 id: 3,
                 method: "settings.update".into(),
                 params: json!({"scope":"global", "expected_revision":revision,
-            "desired":{"approval_mode":"deny", "status_thoughts":false}}),
+            "desired":{"approval_mode":"deny", "status_thoughts":false, "subagent_limit":12}}),
             },
             &sink,
         )
@@ -71,7 +71,9 @@ async fn global_defaults_do_not_create_or_modify_sessions() -> Result<()> {
     let opened = service
         .open_session(5, initialize(&fixture, "mock"))
         .await?;
-    let session_id = opened.result().context("session result missing")?["session"]["id"]
+    let opened = opened.result().context("session result missing")?;
+    assert_eq!(opened["subagent_limit"], 12);
+    let session_id = opened["session"]["id"]
         .as_str()
         .context("session id missing")?
         .to_owned();
@@ -86,7 +88,7 @@ async fn global_defaults_do_not_create_or_modify_sessions() -> Result<()> {
                 id: 6,
                 method: "settings.update".into(),
                 params: json!({"scope":"global", "expected_revision":revision,
-            "desired":{"approval_mode":"ask", "status_thoughts":true}}),
+            "desired":{"approval_mode":"ask", "status_thoughts":true, "subagent_limit":20}}),
             },
             &sink,
         )
@@ -108,9 +110,10 @@ async fn global_defaults_do_not_create_or_modify_sessions() -> Result<()> {
         )
         .await?;
     response_for(&mut output, 7).await?;
-    let after = controller.broker.lock().await.snapshot()?.session;
-    assert_eq!(after.approval_mode, before.approval_mode);
-    assert_eq!(after.effort, before.effort);
+    let after = controller.broker.lock().await.snapshot()?;
+    assert_eq!(after.session.approval_mode, before.approval_mode);
+    assert_eq!(after.session.effort, before.effort);
+    assert_eq!(serde_json::to_value(after.subagent_limit)?, 12);
     let next = crate::broker::prepare_new_session(
         std::path::Path::new(&registry.initialize.data_root),
         "service-test",
@@ -618,6 +621,37 @@ async fn session_timeout_edit_stays_out_of_the_global_defaults() -> Result<()> {
                 && snapshot.session.approval_timeout == expected,
             "a later configuration restored a stale approval timeout"
         );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let teardown = super::approval_deadline::stop_controller(controller, provider, reader).await;
+    scenario?;
+    teardown
+}
+
+/// Apply and publish a session override without changing the inherited limit of other sessions.
+#[tokio::test]
+async fn subagent_limit_edit_applies_to_the_current_session() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (controller, provider, sink, reader) = permissions_fixture(&root).await?;
+    let scenario = async {
+        let initial = controller.observer.snapshot()?;
+        assert_eq!(serde_json::to_value(initial.subagent_limit)?, 8);
+        execute(
+            &controller,
+            &sink,
+            "session.configure",
+            json!({"subagent_limit":24}),
+        )
+        .await?;
+
+        let current = controller.broker.lock().await.snapshot()?;
+        assert_eq!(serde_json::to_value(current.subagent_limit)?, 24);
+        let settings = crate::settings::SettingsStore::read_only(&controller.data_root)?;
+        let saved = settings.get(&current.session.workspace, &current.session.id, "mock")?;
+        assert_eq!(serde_json::to_value(saved.desired.subagent_limit)?, 24);
+        let other = settings.get(&current.session.workspace, "other-session", "mock")?;
+        assert!(other.desired.subagent_limit.is_none());
         Ok::<(), anyhow::Error>(())
     }
     .await;

@@ -59,7 +59,7 @@ Connect sentences and paragraphs by cause, contrast, or consequence rather than 
 Follow these baseline conventions:
 
 - **Name the owner in active voice.** Write `` `DraftStore::save` invalidates the cache `` instead of *"The cache is invalidated on save."*
-- **Cut filler, slogans, and vague performance adjectives.** Omit meta signposting (*"This page documents..."*), project-name filler (*"Acme uses PostgreSQL..."*), promotional buzzwords, and aphorisms (*"Fail fast."*). State the concrete work a path avoids (blocking I/O, network round-trips, full-file buffering) instead of writing *"stays fast"* or *"keeps X responsive."*
+- **Cut filler, slogans, and vague praise or performance adjectives.** Omit meta signposting (*"This page documents..."*), project-name filler (*"Acme uses PostgreSQL..."*), promotional buzzwords, aphorisms (*"Fail fast."*), and vague design praise (*"clean separation"*, *"clean architecture"*, *"seamless"*, *"elegant"*)—state the actual boundary or contract instead. State the concrete work a path avoids (blocking I/O, network round-trips, full-file buffering) instead of writing *"stays fast"* or *"keeps X responsive."*
 - **Prefer prose over lists.** Explain collaborating components and ownership in connected paragraphs; reserve bullets and tables for parallel items, ordered steps, or comparisons.
 - **Keep types natural in prose.** Use normal articles with type names (`the DraftJournal`, `a sequenced DraftRecord`) and describe struct fields in prose or code blocks rather than inline braces (`Record { a, b }`).
 - **Use present indicative for the design and conditional mood for counterfactuals.** Describe implemented and target architecture with definite subjects in the present indicative (`The scheduler runs...`, not `A scheduler runs...`), avoiding generic textbook definitions and words like "intended," "proposed," or "future" except for an active migration affecting callers today. Use conditional mood (`would`, `could`) for rejected alternatives or unmitigated failure scenarios (`a disk failure could lose acknowledged writes`) so they read as counterfactuals rather than live behavior.
@@ -83,7 +83,7 @@ Follow these baseline conventions:
 4. **Draft for a cold reader.** Open with what the system does and the constraints that shape it, order concepts before raw identifiers, and illustrate non-obvious contracts with minimal working examples.
 5. **Proofread in two passes.**
    - *Technical pass:* Verify every claim, qualification, identifier, code snippet, and cross-link. Check whether omitting a cost or failure mode makes a guarantee look unconditional.
-   - *Readability pass:* Read the opening and transitions aloud. Cut strawman foils, meta signposting, project-name filler, redundant modifiers (*"live consumer delivery"* → *"delivery"*, *"replication consensus"* → *"replication"*), synonym rotation (*"consumers"* → *"subscribers"*), choppy stacked sentences, passive voice that hides the owner, and front-loaded type dumps.
+   - *Readability pass:* Read the opening and transitions aloud. Cut strawman foils, meta signposting, project-name filler, vague design praise (*"clean separation"*, *"seamless"*), redundant modifiers (*"live consumer delivery"* → *"delivery"*, *"replication consensus"* → *"replication"*), synonym rotation (*"consumers"* → *"subscribers"*), choppy stacked sentences, passive voice that hides the owner, and front-loaded type dumps.
 
 ## Document Profiles
 

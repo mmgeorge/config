@@ -16,6 +16,20 @@ fn enabled() -> bool {
     true
 }
 
+/// Write authority selected by a saved subagent profile.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProfileAccess {
+    /// Use the current parent's write scope, including write-off.
+    #[default]
+    Inherit,
+    /// Deny writes even when the parent can write.
+    #[serde(alias = "off")]
+    Read,
+    /// Require write authority already granted to the parent.
+    Write,
+}
+
 /// Defines user-owned child behavior independently of model-supplied task text.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -36,17 +50,9 @@ pub struct AgentProfile {
     pub service_tier: String,
     #[serde(default = "inherit")]
     pub approval_mode: String,
-    /// `off` denies the child reported writes and lets write-off children share the repository;
-    /// `inherit` keeps the root's write scope. It can only narrow the root, never widen it.
-    #[serde(default = "inherit")]
-    pub write_access: String,
-}
-
-impl AgentProfile {
-    /// Report whether this profile removes the child's write authority.
-    pub fn denies_writes(&self) -> bool {
-        self.write_access == "off"
-    }
+    /// Write authority requested when a spawn leaves its access unspecified.
+    #[serde(default)]
+    pub write_access: AgentProfileAccess,
 }
 
 impl Default for AgentProfile {
@@ -60,7 +66,7 @@ impl Default for AgentProfile {
             reasoning_effort: inherit(),
             service_tier: inherit(),
             approval_mode: inherit(),
-            write_access: inherit(),
+            write_access: AgentProfileAccess::Inherit,
         }
     }
 }
@@ -76,13 +82,44 @@ pub struct AgentProfileDocument {
 impl Default for AgentProfileDocument {
     fn default() -> Self {
         let profiles = [
-            ("worker", "Implement a scoped task", "Complete the assigned task and report the result and verification."),
-            ("reviewer", "Review changes for defects", "Review the assigned changes for correctness and regressions. Report findings with file references. Do not modify files."),
-            ("code-explorer", "Explore the local codebase", "Inspect the local codebase and answer the assigned question with source references. Do not modify files."),
-            ("remote-explorer", "Research external code and documentation", "Research the assigned external code or documentation. Prefer primary sources and cite them. Do not modify local files."),
-        ].into_iter().map(|(name, description, instructions)| (name.into(), AgentProfile {
-            description: description.into(), instructions: instructions.into(), ..Default::default()
-        })).collect();
+            (
+                "worker",
+                "Implement a scoped task",
+                "Complete the assigned task and report the result and verification.",
+                AgentProfileAccess::Write,
+            ),
+            (
+                "reviewer",
+                "Review changes for defects",
+                "Review the assigned changes for correctness and regressions. Report findings with file references. Do not modify files.",
+                AgentProfileAccess::Read,
+            ),
+            (
+                "code-explorer",
+                "Explore the local codebase",
+                "Inspect the local codebase and answer the assigned question with source references. Do not modify files.",
+                AgentProfileAccess::Read,
+            ),
+            (
+                "remote-explorer",
+                "Research external code and documentation",
+                "Research the assigned external code or documentation. Prefer primary sources and cite them. Do not modify local files.",
+                AgentProfileAccess::Read,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, description, instructions, write_access)| {
+            (
+                name.into(),
+                AgentProfile {
+                    description: description.into(),
+                    instructions: instructions.into(),
+                    write_access,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
         Self {
             default_profile: "worker".into(),
             profiles,
@@ -136,10 +173,6 @@ impl AgentProfileDocument {
                     "inherit" | "ask" | "deny" | "allow"
                 ),
                 "profile {name} has an unsupported approval_mode"
-            );
-            ensure!(
-                matches!(profile.write_access.as_str(), "inherit" | "off"),
-                "profile {name} has an unsupported write_access; expected inherit or off"
             );
         }
         Ok(())
@@ -297,6 +330,15 @@ fn revision(bytes: Option<&[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Load the original read-only spelling and save the canonical profile access value.
+    #[test]
+    fn profile_access_reads_legacy_off() -> Result<()> {
+        let profile: AgentProfile = serde_json::from_str(r#"{"write_access":"off"}"#)?;
+        assert_eq!(profile.write_access, AgentProfileAccess::Read);
+        assert_eq!(serde_json::to_value(profile)?["write_access"], "read");
+        Ok(())
+    }
 
     #[test]
     fn profile_file_reloads_external_edits_and_rejects_stale_saves() -> Result<()> {

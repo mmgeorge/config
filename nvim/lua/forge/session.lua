@@ -105,6 +105,7 @@ M.empty_diff_rows = {}
 ---@field status_thoughts? boolean
 ---@field ask_model? ForgeAskModel
 ---@field subagent_tools? boolean
+---@field subagent_limit? integer
 ---@field lsp_tools? boolean
 ---@field session_tools? boolean
 ---@field check_editing? boolean

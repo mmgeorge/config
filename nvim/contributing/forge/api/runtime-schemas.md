@@ -1611,9 +1611,14 @@ Source: [agent/coordinator.rs](../../../rust/forge/crates/forge-harness/src/agen
 /// Describes a fresh child without inheriting parent transcript or workflow state.
 pub struct SpawnAgentRequest {
     pub profile: Option<String>,
+    /// Use the profile's access mode when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<SpawnAccess>,
     pub text: String,
 }
 ```
+
+`SpawnAccess` accepts `read` and `write`.
 
 ## Agent
 

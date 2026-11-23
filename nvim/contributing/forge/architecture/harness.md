@@ -247,7 +247,10 @@ cancels a requested but unstarted restart fails execution instead of leaving the
 
 A stop's retained transition outlives the stop as evidence, so once its host jobs join, the driver
 releases both its control permit and its child quiescence; a held quiescence parked every later
-root turn at completion. Child collection treats a child whose cleanup failed as settled with an
+root turn at completion. For an explicit stop, acquisition closes child admission. The collection
+stage sends the root and child interrupts independently and waits for both to settle. A restart
+that replaces the tree collects children during acquisition before parking and rerunning the root.
+Child collection treats a child whose cleanup failed as settled with an
 error, which makes the stop uncertain and restarts the provider, because that child keeps its
 execution slot and the active count never reaches zero. A cancellation settlement that fails, or
 whose command loses its state commit, releases the host-settlement fence of the exchange it was

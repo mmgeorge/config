@@ -94,6 +94,9 @@ pub struct PortableSettings {
     pub tool_timeout: Option<crate::session::InputTimeout>,
     /// Enables the root's model-facing child tools without restricting manual admission.
     pub subagent_tools: Option<bool>,
+    /// Maximum concurrent managed children in a root session, defaulting to 8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_limit: Option<crate::agent::SubagentLimit>,
     /// Enables editor-backed code queries and permission-checked rename tools.
     pub lsp_tools: Option<bool>,
     /// Exposes read-only session history tools independently of configuration inspection.
@@ -141,6 +144,9 @@ impl PortableSettings {
         }
         if overriding.subagent_tools.is_some() {
             self.subagent_tools = overriding.subagent_tools;
+        }
+        if overriding.subagent_limit.is_some() {
+            self.subagent_limit = overriding.subagent_limit;
         }
         if overriding.lsp_tools.is_some() {
             self.lsp_tools = overriding.lsp_tools;

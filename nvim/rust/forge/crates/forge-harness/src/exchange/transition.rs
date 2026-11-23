@@ -404,8 +404,14 @@ impl ExchangeStop {
         let reporting = TransitionReporting::new(&id, intent, admitted_at);
         let control = services.control.clone();
         let children = services.children.clone();
-        let worker_id = id.clone();
         let child_policy = intent.children();
+        let restart = matches!(
+            intent,
+            StopIntent::Reconfigure {
+                children: ChildCollectionPolicy::Collect
+            }
+        )
+        .then(|| id.clone());
         let task = tokio::spawn(async move {
             let control = match admitted_control {
                 Some(control) => control,
@@ -421,30 +427,12 @@ impl ExchangeStop {
                     ChildCollectionPolicy::Preserve => None,
                 },
             };
-            // Queued launches hold no execution slot but remain admitted work, so collection
-            // must cancel them as well; only a coordinator with no admitted work skips it.
-            if matches!(child_policy, ChildCollectionPolicy::Preserve)
-                || !children.collection_count().has_work()
+            if let Some(id) = restart
+                && interrupt_children(&children, &id).await.is_err()
             {
-                return Acquisition::Ready(ownership);
+                return Acquisition::Uncertain(ownership);
             }
-            let result = async {
-                let mut changed = children.activity();
-                children
-                    .sender()
-                    .request(crate::agent::AgentRequest {
-                        operation_id: format!("{}:collect-children", worker_id.operation_id()),
-                        source: crate::agent::AgentSource::User,
-                        operation: crate::agent::AgentOperation::InterruptAll,
-                    })
-                    .await?;
-                children_settled(&children, &mut changed).await
-            }
-            .await;
-            match result {
-                Ok(()) => Acquisition::Ready(ownership),
-                Err(_) => Acquisition::Uncertain(ownership),
-            }
+            Acquisition::Ready(ownership)
         });
         Self {
             backstop: StopBackstop::new(services),
@@ -653,10 +641,14 @@ impl ExchangeStop {
                         })
                         .transpose()?;
                 }
-                let native = matches!(foreground, TurnStatus::Running(_) | TurnStatus::Local)
-                    || self.invocation.is_some()
-                    || check.is_some();
-                if native {
+                let children = self.intent.children();
+                let has_collection_work =
+                    matches!(foreground, TurnStatus::Running(_) | TurnStatus::Local)
+                        || self.invocation.is_some()
+                        || check.is_some()
+                        || (matches!(children, ChildCollectionPolicy::Collect)
+                            && services.children.collection_count().has_work());
+                if has_collection_work {
                     // A collection of the whole tree, such as a task control (`/plan cancel`,
                     // a pause, a plan decision) or a tree-wide configuration change, stops the
                     // delegating turn and the provider's native subagents with it, as a
@@ -686,11 +678,20 @@ impl ExchangeStop {
                     );
                     services.cancellation.block_submissions();
                     let services = services.clone();
-                    let children = self.intent.children();
+                    let child_operation =
+                        matches!(self.intent, StopIntent::Cancel(_)).then(|| self.id.clone());
                     let generation = self.generation.clone();
                     let invocation = self.invocation.clone();
                     let task = tokio::spawn(async move {
-                        collect_resources(&services, check, children, generation, invocation).await
+                        collect_resources(
+                            &services,
+                            child_operation.as_ref(),
+                            check,
+                            children,
+                            generation,
+                            invocation,
+                        )
+                        .await
                     });
                     self.stage = TransitionStage::Collecting {
                         target: view.selection,
@@ -996,6 +997,7 @@ impl ExchangeStop {
         RetainedTransition {
             stage: self.stage,
             intent: self.intent,
+            child_operation: matches!(self.intent, StopIntent::Cancel(_)).then_some(self.id),
             jobs: Vec::new(),
             compaction_jobs: Vec::new(),
             compactions: Vec::new(),
@@ -1032,6 +1034,7 @@ impl TransitionIdentity {
 pub(super) struct RetainedTransition {
     stage: TransitionStage,
     intent: StopIntent,
+    child_operation: Option<TransitionIdentity>,
     jobs: Vec<tokio::task::JoinHandle<Result<(), ProviderError>>>,
     generation: Option<ProviderGenerationPermit>,
     invocation: Option<InvocationCollection>,
@@ -1057,6 +1060,7 @@ impl RetainedTransition {
             intent: StopIntent::Reconfigure {
                 children: ChildCollectionPolicy::Preserve,
             },
+            child_operation: None,
             jobs: Vec::new(),
             compaction_jobs: Vec::new(),
             compactions: Vec::new(),
@@ -1258,6 +1262,7 @@ impl RetainedTransition {
                 }
                 collect_resources(
                     services,
+                    self.child_operation.as_ref(),
                     check,
                     self.intent.children(),
                     self.generation.clone(),
@@ -1416,11 +1421,11 @@ pub(super) enum TransitionEvent {
 pub(super) enum Acquisition {
     /// Compatibility control and child quiescence were acquired successfully.
     Ready(ControlOwnership),
-    /// Child collection remains uncertain while its admission guard stays held.
+    /// A restart could not collect its children while acquiring control.
     Uncertain(ControlOwnership),
-    /// Control admission ended or timed out before any child mutation began.
+    /// Control admission ended before collection began.
     Unavailable,
-    /// An acquisition worker failed after possibly requesting child interruption.
+    /// The acquisition worker's result was lost.
     ObservationLost,
 }
 
@@ -1616,6 +1621,7 @@ fn collection_completed_signal(
 /// Collect native callbacks, child work, and the selected check without mutable broker access.
 async fn collect_resources(
     services: &OwnerServices,
+    child_operation: Option<&TransitionIdentity>,
     check: Option<String>,
     child_policy: ChildCollectionPolicy,
     generation: Option<ProviderGenerationPermit>,
@@ -1633,42 +1639,49 @@ async fn collect_resources(
         .cancel_owner(&owner, None)
         .await
         .map_err(collection_failure);
-    let native = match invocation {
-        Some(invocation) => match invocation
+    let native = async {
+        let Some(invocation) = invocation else {
+            return Ok(());
+        };
+        let collection = invocation
             .engine
             .collect_exchange(invocation.scope, invocation.input)
-            .await
-        {
-            Ok(collection) => match invocation.collection.lock() {
-                Ok(mut slot) => {
-                    *slot = Some(collection);
-                    Ok(())
-                }
-                Err(_) => Err(ProviderError::DeliveryUncertain),
-            },
-            Err(error) => Err(error),
-        },
-        None => Ok(()),
+            .await?;
+        *invocation
+            .collection
+            .lock()
+            .map_err(|_| ProviderError::DeliveryUncertain)? = Some(collection);
+        Ok(())
     };
-    let host = async {
-        if let Some(id) = check {
+    let checks = async {
+        if let Some(check) = check {
             loop {
-                let run = services.checks.status(&id, 60_000, true).await?;
+                let run = services.checks.status(&check, 60_000, true).await?;
                 if run.state != crate::checks::CheckState::Running {
                     break;
                 }
             }
         }
-        if matches!(child_policy, ChildCollectionPolicy::Collect) {
+        Ok::<(), anyhow::Error>(())
+    };
+    let children = async {
+        if let Some(id) = child_operation {
+            interrupt_children(&services.children, id).await?;
+        } else if matches!(child_policy, ChildCollectionPolicy::Collect) {
             let mut changed = services.children.activity();
             children_settled(&services.children, &mut changed).await?;
         }
         Ok::<(), anyhow::Error>(())
-    }
-    .await
-    .map_err(collection_failure);
+    };
+    // Keep the root interrupt independent of the child command lane and check cleanup.
+    let (native, checks, children) = tokio::join!(native, checks, children);
     let mut errors = Vec::new();
-    for outcome in [approvals, native, host] {
+    for outcome in [
+        approvals,
+        native,
+        checks.map_err(collection_failure),
+        children.map_err(collection_failure),
+    ] {
         if let Err(error) = outcome {
             errors.push(error);
         }
@@ -1683,6 +1696,26 @@ async fn collect_resources(
         primary: Box::new(primary),
         secondary: errors,
     })
+}
+
+/// Interrupt queued and active child work and wait for the coordinator's settlement evidence.
+async fn interrupt_children(
+    children: &crate::agent::AgentCoordinator,
+    id: &TransitionIdentity,
+) -> anyhow::Result<()> {
+    if !children.collection_count().has_work() {
+        return Ok(());
+    }
+    let mut changed = children.activity();
+    children
+        .sender()
+        .request(crate::agent::AgentRequest {
+            operation_id: format!("{}:collect-children", id.operation_id()),
+            source: crate::agent::AgentSource::User,
+            operation: crate::agent::AgentOperation::InterruptAll,
+        })
+        .await?;
+    children_settled(children, &mut changed).await
 }
 
 /// Wait until every child execution settled, failing once any settled with failed cleanup.
@@ -1743,6 +1776,7 @@ mod tests {
     fn launched_child(coordinator: &AgentCoordinator) -> AgentWork {
         let spawn = SpawnAgentRequest {
             profile: Some("review".into()),
+            access: None,
             text: "bounded task".into(),
         };
         let request = AgentRequest {
@@ -1814,6 +1848,7 @@ mod tests {
         let coordinator = AgentCoordinator::new("root".into());
         let spawn = SpawnAgentRequest {
             profile: Some("review".into()),
+            access: None,
             text: "bounded task".into(),
         };
         let request = AgentRequest {

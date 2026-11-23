@@ -364,11 +364,8 @@ T["recorded_hand_off_status_reports_the_hand_off"] = function()
 end
 
 
--- Each frame in which the status split changed height re-scrolled the whole transcript above it,
--- and a parent stopping with children changed it once per departing child. While the host marks
--- the status as stopping, the split keeps the height it reached, and it closes in one step when
--- the settled stop ends the status.
-T["a_stop_keeps_the_status_height_until_it_settles"] = function()
+T["status_caps_at_twelve_rows_and_shrinks_during_stop"] = function()
+  vim.o.lines = 40
   local layout = require("forge.views.harness.layout")
   local transcript_buffer, transcript_window, _, composer_window = layout.open("status-stopping")
   local status = require("forge.views.harness.status_view").new({
@@ -394,6 +391,11 @@ T["a_stop_keeps_the_status_height_until_it_settles"] = function()
     eq(applied, true)
   end
   local function height() return status.window and vim.api.nvim_win_get_height(status.window) end
+  local workers = { "Waiting for agents" }
+  for index = 1, 16 do workers[#workers + 1] = "Worker " .. index end
+  publish(workers, false)
+  eq(height(), 12)
+  eq(vim.api.nvim_buf_line_count(status.buffer), #workers)
   local children = vim.list_slice(recorded.block[1].text, 2)
   publish(vim.list_extend({ "Waiting for agents · 2 running" }, children), false)
   eq(height(), 3)
@@ -403,20 +405,15 @@ T["a_stop_keeps_the_status_height_until_it_settles"] = function()
   wait_until(function() return applied ~= nil end, "status view did not settle the recorded stop")
   eq({ applied, height() }, { true, 3 })
   publish({ "Stopping", children[2] }, true)
-  eq(height(), 3)
+  eq(height(), 2)
   publish({ "Stopping" }, true)
-  eq(height(), 3)
-  eq(vim.wo[status.window].fillchars:find("eob: ", 1, true) ~= nil, true)
+  eq(height(), 1)
   publish({}, false)
   eq(status.window, nil)
 end
 
 
--- A stop that leads into more work, such as a compaction that runs the stopped turn again, kept
--- its status line in the split's first row while it stopped and then lowered the split to fit the
--- next status, so that line jumped down to the split's last row. The held height carries into
--- the work that follows the stop and ends only when nothing runs any more.
-T["a_stop_keeps_the_status_row_into_the_work_that_follows"] = function()
+T["work_after_stop_uses_the_current_status_height"] = function()
   local layout = require("forge.views.harness.layout")
   local transcript_buffer, transcript_window, _, composer_window = layout.open("status-stop-handover")
   local status = require("forge.views.harness.status_view").new({
@@ -450,11 +447,12 @@ T["a_stop_keeps_the_status_row_into_the_work_that_follows"] = function()
   local working = placement()
   eq(working[2], 3)
   publish({ "Stopping" }, { animated = true, stopping = true })
-  eq(placement(), working)
+  local stopping = placement()
+  eq(stopping[2], 1)
   publish({ "Compacting · 0s" }, { animated = true })
-  eq(placement(), working)
+  eq(placement(), stopping)
   publish({ "Compacting · 1s" }, { animated = true })
-  eq(placement(), working)
+  eq(placement(), stopping)
   publish({ "Paused" }, { animated = false })
   eq(vim.api.nvim_win_get_height(status.window), 1)
 end

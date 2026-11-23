@@ -200,6 +200,7 @@ pub(crate) struct ConfigurationCandidate {
     check_timing: Option<crate::checks::CheckTiming>,
     automatic_checks: Option<bool>,
     subagent_tools: Option<bool>,
+    subagent_limit: Option<crate::agent::SubagentLimit>,
     lsp_tools: Option<bool>,
     session_tools: Option<bool>,
     status_thoughts: Option<bool>,
@@ -617,6 +618,8 @@ impl HarnessBroker {
             )?;
             self.agent_coordinator
                 .set_enabled(snapshot.desired.subagent_tools.unwrap_or(false));
+            self.agent_coordinator
+                .set_subagent_limit(snapshot.desired.subagent_limit.unwrap_or_default());
             self.lsp.set_enabled(
                 &self.session.id,
                 snapshot.desired.lsp_tools.unwrap_or(false),
@@ -820,6 +823,8 @@ impl HarnessBroker {
                 serde_json::to_value(settings.desired.approval_timeout.unwrap_or_default())?;
             params["tool_timeout"] =
                 serde_json::to_value(settings.desired.tool_timeout.unwrap_or_default())?;
+            params["subagent_limit"] =
+                serde_json::to_value(settings.desired.subagent_limit.unwrap_or_default())?;
 
             let desired = serde_json::to_value(&settings.desired)?;
             for (key, value) in desired.as_object().context("settings must be an object")? {
@@ -1112,6 +1117,11 @@ impl HarnessBroker {
             })
             .transpose()?;
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
+        let subagent_limit = params
+            .get("subagent_limit")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
         let session_tools = params
             .get("session_tools")
@@ -1152,6 +1162,7 @@ impl HarnessBroker {
             check_timing,
             automatic_checks,
             subagent_tools,
+            subagent_limit,
             lsp_tools,
             session_tools,
             status_thoughts,
@@ -1316,13 +1327,14 @@ impl HarnessBroker {
         let workspace = candidate.configured.workspace.clone();
         let session_id = candidate.configured.id.clone();
         let provider_id = candidate.configured.provider.clone();
-        // Permissions edited in a session's /config belong to that session, as the slash
-        // commands' do; `settings.update` alone writes the global defaults new sessions start from.
+        // Session policy edits belong to the current session. The standalone defaults editor
+        // writes the global layer through `settings.update`.
         let scope = if candidate.params.get("auto_compaction").is_some()
             || candidate.params["session_policy"] == true
             || candidate.params.get("access").is_some()
             || candidate.params.get("approval_timeout").is_some()
             || candidate.params.get("tool_timeout").is_some()
+            || candidate.subagent_limit.is_some()
         {
             crate::settings::SettingScope::Session
         } else {
@@ -1365,6 +1377,10 @@ impl HarnessBroker {
             }
             if let Some(enabled) = candidate.subagent_tools {
                 portable.subagent_tools = Some(enabled);
+                changed = true;
+            }
+            if let Some(limit) = candidate.subagent_limit {
+                portable.subagent_limit = Some(limit);
                 changed = true;
             }
             if let Some(enabled) = candidate.lsp_tools {
@@ -1429,6 +1445,7 @@ impl HarnessBroker {
         let ConfigurationCandidate {
             configured,
             subagent_tools,
+            subagent_limit,
             lsp_tools,
             status_thoughts,
             update_model_preference,
@@ -1473,6 +1490,9 @@ impl HarnessBroker {
         }
         if let Some(enabled) = subagent_tools {
             self.agent_coordinator.set_enabled(enabled);
+        }
+        if let Some(limit) = subagent_limit {
+            self.agent_coordinator.set_subagent_limit(limit);
         }
         if let Some(enabled) = lsp_tools {
             self.lsp.set_enabled(&self.session.id, enabled);

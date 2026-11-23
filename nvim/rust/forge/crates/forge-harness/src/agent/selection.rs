@@ -44,11 +44,7 @@ pub(crate) fn effective_access(
     access
 }
 
-/// Choose the repository reservation that an effective child policy requires.
-///
-/// Write-off children share a reader reservation so several can run at once; any write
-/// authority takes the exclusive writer reservation. The shared mode only admits concurrency;
-/// write denial itself comes from the policy, not from the reservation.
+/// Limit operations on the child's shared reservation to its effective access policy.
 pub(crate) fn repository_access(
     access: &crate::session::AccessPolicy,
 ) -> crate::repository_access::RepositoryAccess {

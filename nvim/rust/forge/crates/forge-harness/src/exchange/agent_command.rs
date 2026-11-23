@@ -49,17 +49,7 @@ impl AgentCommand {
                 .map_err(|_| AgentFailure::StaleTarget)
         };
         match operation {
-            AgentOperation::Spawn(request) => {
-                if request.text.trim().is_empty() {
-                    return Err(AgentFailure::EmptyMessage);
-                }
-                Ok(Self::Start(AgentStartRequest::try_from(
-                    StoredAgentStart {
-                        profile: request.profile,
-                        text: request.text,
-                    },
-                )?))
-            }
+            AgentOperation::Spawn(request) => Ok(Self::Start(request.try_into()?)),
             AgentOperation::Message { target, message } => {
                 if message.trim().is_empty() {
                     return Err(AgentFailure::EmptyMessage);
@@ -103,7 +93,9 @@ impl AgentCommand {
     pub(crate) fn matches_operation(&self, operation: &AgentOperation) -> bool {
         match (self, operation) {
             (Self::Start(start), AgentOperation::Spawn(request)) => {
-                start.profile == request.profile && start.text == request.text
+                start.profile == request.profile
+                    && start.text == request.text
+                    && start.access == request.access
             }
             (Self::SendMessage(saved), AgentOperation::Message { target, message })
             | (Self::FollowUp(saved), AgentOperation::Followup { target, message }) => {
@@ -135,9 +127,13 @@ impl AgentCommand {
 
 /// Preserve explicit child startup input without inheriting the parent transcript.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(try_from = "StoredAgentStart", into = "StoredAgentStart")]
+#[serde(
+    try_from = "crate::agent::SpawnAgentRequest",
+    into = "crate::agent::SpawnAgentRequest"
+)]
 pub(crate) struct AgentStartRequest {
     profile: Option<String>,
+    access: Option<crate::agent::SpawnAccess>,
     text: String,
 }
 
@@ -150,18 +146,15 @@ pub(crate) struct AgentMessage {
     text: String,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StoredAgentStart {
-    profile: Option<String>,
-    text: String,
-}
-
-impl TryFrom<StoredAgentStart> for AgentStartRequest {
+impl TryFrom<crate::agent::SpawnAgentRequest> for AgentStartRequest {
     type Error = AgentFailure;
     /// Validate new and recovered startup requests through the same boundary.
-    fn try_from(stored: StoredAgentStart) -> Result<Self, Self::Error> {
-        let StoredAgentStart { profile, text } = stored;
+    fn try_from(stored: crate::agent::SpawnAgentRequest) -> Result<Self, Self::Error> {
+        let crate::agent::SpawnAgentRequest {
+            profile,
+            access,
+            text,
+        } = stored;
         if text.trim().is_empty() {
             return Err(AgentFailure::EmptyMessage);
         }
@@ -171,15 +164,27 @@ impl TryFrom<StoredAgentStart> for AgentStartRequest {
         {
             return Err(AgentFailure::InvalidProfile);
         }
-        Ok(Self { profile, text })
+        Ok(Self {
+            profile,
+            access,
+            text,
+        })
     }
 }
 
-impl From<AgentStartRequest> for StoredAgentStart {
+impl From<AgentStartRequest> for crate::agent::SpawnAgentRequest {
     /// Preserve validated startup intent in durable command records.
     fn from(request: AgentStartRequest) -> Self {
-        let AgentStartRequest { profile, text } = request;
-        Self { profile, text }
+        let AgentStartRequest {
+            profile,
+            access,
+            text,
+        } = request;
+        Self {
+            profile,
+            access,
+            text,
+        }
     }
 }
 
@@ -468,10 +473,7 @@ async fn run(
             let value = request(
                 &children,
                 &operation_id,
-                AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
-                    profile: start.profile,
-                    text: start.text,
-                }),
+                AgentOperation::Spawn(start.into()),
                 None,
                 task_admission,
             )

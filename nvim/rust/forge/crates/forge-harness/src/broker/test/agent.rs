@@ -380,6 +380,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     for name in ["first", "sibling"] {
         let spawn = crate::agent::SpawnAgentRequest {
             profile: Some(name.into()),
+            access: None,
             text: "Inspect".into(),
         };
         let request = crate::agent::AgentRequest {
@@ -1211,6 +1212,7 @@ async fn stopped_child_retry_rejects_without_blocking_parent_save() -> Result<()
             &mut parent,
             crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
                 profile: Some("explorer".into()),
+                access: None,
                 text: "Inspect".into(),
             }),
         )?;
@@ -1690,6 +1692,7 @@ async fn continuation_authorization_cannot_clear_newer_stop() -> Result<()> {
         &mut parent,
         crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
             profile: Some("explorer".into()),
+            access: None,
             text: "Inspect".into(),
         }),
     )?;
@@ -1806,6 +1809,7 @@ async fn recovery_settles_children_before_parent_checkpoint() -> Result<()> {
         &mut parent,
         crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
             profile: Some("explorer".into()),
+            access: None,
             text: "Inspect".into(),
         }),
     )?;
@@ -1877,6 +1881,7 @@ async fn recovery_settles_children_before_parent_checkpoint() -> Result<()> {
         &mut orphaned,
         crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
             profile: Some("explorer".into()),
+            access: None,
             text: "Inspect elsewhere".into(),
         }),
     )?;
@@ -1921,6 +1926,7 @@ async fn write_off_child_dispatch_denies_writes_under_a_shared_reservation() -> 
         &mut parent,
         crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
             profile: Some("explorer".into()),
+            access: None,
             text: "Inspect".into(),
         }),
     )?;
@@ -1996,6 +2002,7 @@ async fn cancel_collects_pending_children_without_execution_slots() -> Result<()
     );
     let spawn = crate::agent::SpawnAgentRequest {
         profile: Some("explorer".into()),
+        access: None,
         text: "Inspect".into(),
     };
     let request = crate::agent::AgentRequest {
@@ -2196,6 +2203,66 @@ async fn running_children_move_from_status_to_the_agents_summary() -> Result<()>
     Ok(())
 }
 
+/// Resolve requested spawn access through the same profile lookup used by the owner.
+#[tokio::test]
+async fn child_spawn_access_follows_parent_and_profile() -> Result<()> {
+    use crate::session::WriteScope;
+
+    let workspace = repository();
+    let data = tempfile::tempdir()?;
+    let broker = planning_question_broker(workspace.path(), data.path(), false);
+    let provider = forge_providers::registry::select(&broker.session.provider)?;
+    let mut root = broker.provider_request(
+        ProviderInput::from_user_text(String::new()),
+        PromptMode::Chat,
+    )?;
+    for (parent, profile, access, expected) in [
+        (
+            WriteScope::Workspace,
+            "worker",
+            Some("read"),
+            Some(WriteScope::Off),
+        ),
+        (
+            WriteScope::Workspace,
+            "worker",
+            Some("write"),
+            Some(WriteScope::Workspace),
+        ),
+        (
+            WriteScope::Workspace,
+            "code-explorer",
+            None,
+            Some(WriteScope::Off),
+        ),
+        (WriteScope::Workspace, "code-explorer", Some("write"), None),
+        (WriteScope::Off, "worker", Some("write"), None),
+        (WriteScope::Off, "worker", None, None),
+        (
+            WriteScope::Off,
+            "worker",
+            Some("read"),
+            Some(WriteScope::Off),
+        ),
+    ] {
+        root.access.write_access = parent;
+        let mut params = json!({"profile": profile, "text": "Inspect the checkout"});
+        if let Some(access) = access {
+            params["access"] = json!(access);
+        }
+        let spawn = serde_json::from_value(params)?;
+        let selection = broker
+            .agent_provider_factory
+            .resolve(&root, provider.clone(), &spawn)
+            .await;
+        match expected {
+            Some(expected) => assert_eq!(selection?.access.write_access, expected),
+            None => assert!(selection.is_err(), "{profile} gained write authority"),
+        }
+    }
+    Ok(())
+}
+
 /// Which children the user cancels in `run_parent_with_user_cancelled_child`.
 #[derive(Clone, Copy)]
 enum UserChildCancel {
@@ -2221,16 +2288,17 @@ async fn run_parent_with_user_cancelled_child(
     let snapshot = profiles.snapshot()?;
     let mut document = snapshot.document.clone();
     let mut reader = document.profiles["worker"].clone();
-    reader.write_access = "off".into();
+    reader.write_access = crate::agent::AgentProfileAccess::Read;
     document.profiles.insert("reader".into(), reader);
     profiles.save(&snapshot.revision, document)?;
-    // A shared reservation keeps the writing child waiting for repository ownership until the
-    // user's cancel ends it, while the write-off sibling shares the reservation and runs.
-    let reservation = crate::repository_access::RepositoryReservation::acquire(
-        broker.trace.root(),
-        workspace,
-        crate::repository_access::RepositoryAccess::Read,
-    )?;
+    // Retain an exclusive operation until the interrupt has captured its targets.
+    let reservation = Arc::new(std::sync::Mutex::new(Some(
+        crate::repository_access::RepositoryReservation::acquire(
+            broker.trace.root(),
+            workspace,
+            crate::repository_access::RepositoryAccess::Write,
+        )?,
+    )));
     let input = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let coordinator = broker.agent_coordinator.clone();
     let recorded = input.clone();
@@ -2239,6 +2307,7 @@ async fn run_parent_with_user_cancelled_child(
         move |request, sink, start, _cancelled| {
             let recorded = recorded.clone();
             let coordinator = coordinator.clone();
+            let reservation = reservation.clone();
             async move {
                 start.observed(0).await?;
                 let text = crate::provider::test_support::input_text(&request.input);
@@ -2282,6 +2351,7 @@ async fn run_parent_with_user_cancelled_child(
                         })
                         .await
                         .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?;
+                    reservation.lock().unwrap().take();
                 }
                 let scope = request.scope.clone();
                 let address = crate::provider::TurnAddress {
@@ -2326,7 +2396,6 @@ async fn run_parent_with_user_cancelled_child(
             Some(ExchangeAdmission::chat("Delegate two inspections".into())),
         )
         .await?;
-    drop(reservation);
     Ok(input)
 }
 

@@ -1418,12 +1418,11 @@ impl MockOwnerFixture {
             TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
             TestPromptTerminal,
         };
-        // A shared reservation holds the writing child in repository admission, so the parent's
-        // own turn ends while its child still runs.
+        // Retain an exclusive repository operation while the parent parks for its child.
         self.reservation = Some(crate::repository_access::RepositoryReservation::acquire(
             &self.controller.data_root,
             self.root.path(),
-            crate::repository_access::RepositoryAccess::Read,
+            crate::repository_access::RepositoryAccess::Write,
         )?);
         self.control()?
             .dispatch(

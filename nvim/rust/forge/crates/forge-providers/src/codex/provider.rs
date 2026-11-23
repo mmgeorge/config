@@ -5864,17 +5864,22 @@ async fn handle_native_request(
                     false,
                 )
             } else {
-                match &owner {
+                let admission = match &owner {
                     super::normalization::NativeCallbackOwner::Root => {
-                        request.permissions.before_tool(&request.scope).await?
+                        request.permissions.before_tool(&request.scope).await
                     }
                     super::normalization::NativeCallbackOwner::ObservedChild(child) => {
                         request
                             .permissions
                             .before_observed_child(&request.scope, child)
-                            .await?
+                            .await
                     }
+                };
+                // A stop revokes the host callback before the native turn can report its terminal.
+                if matches!(&admission, Err(ProviderError::Cancelled)) {
+                    return session.rpc.lock().await.reject_request(id).await;
                 }
+                admission?;
                 let permission = PermissionRequest {
                     id: uuid::Uuid::new_v4().to_string(),
                     provider: crate::registry::select("codex").expect("Codex is registered"),
@@ -5902,7 +5907,7 @@ async fn handle_native_request(
                 match authorization {
                     PermissionResponse::Allow => {
                         if session.is_fenced() {
-                            return Err(ProviderError::Cancelled);
+                            return session.rpc.lock().await.reject_request(id).await;
                         }
                         session.normalization.lock().await.replay_sensitive = true;
                         let result = match &owner {
@@ -5970,7 +5975,7 @@ async fn handle_native_request(
                 }
             };
             if session.is_fenced() {
-                return Err(ProviderError::Cancelled);
+                return session.rpc.lock().await.reject_request(id).await;
             }
             // Codex reports the item declined after both `decline` and `cancel`, and its decline
             // reply carries no reason, so the declined item would otherwise report a generic
@@ -7723,8 +7728,39 @@ retained_cleanup: Arc::new(Mutex::new(Vec::new())),
             &self,
             _: &forge_provider_api::InvocationScope,
         ) -> Result<(), ProviderError> {
-            Ok(())
+            Err(ProviderError::Cancelled)
         }
+    }
+
+    /// Reject a tool callback whose host authority was revoked during a stop.
+    #[tokio::test]
+    async fn tool_callback_cancellation_preserves_observation() {
+        use futures_util::StreamExt;
+
+        let (_, session, _events, mut socket) =
+            compaction_fixture(forge_provider_api::SessionHistory::Durable { resume: None }).await;
+        let mut request = request();
+        request.permissions = Arc::new(CancelledApproval);
+        request.tools.push(forge_provider_api::control::ControlToolDefinition {
+            name: "agent_spawn",
+            description: "fixture",
+            input_schema: json!({}),
+        });
+        session
+            .normalization
+            .lock()
+            .await
+            .admit_turn("compaction-thread", "native-turn", &request.scope)
+            .unwrap();
+        let callback = json!({"id":23,"method":"item/tool/call","params":{
+            "threadId":"compaction-thread","turnId":"native-turn",
+            "callId":"delegate","tool":"agent_spawn","arguments":{}}});
+        handle_native_request(&session, &request, &callback).await.unwrap();
+        let message = socket.next().await.unwrap().unwrap();
+        let reply: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+        assert_eq!(reply["id"], 23);
+        assert!(reply.get("error").is_some(), "{reply}");
+        session.rpc.lock().await.close().await.unwrap();
     }
 
     /// An approval that Harness cancelled because it stopped the turn is not a denial, although

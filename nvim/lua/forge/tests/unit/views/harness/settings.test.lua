@@ -109,6 +109,7 @@ T["settings"] = function()
       if params.plan_executor_effort then configured_session.plan_executor.effort = params.plan_executor_effort end
       callback(vim.deepcopy(configured_session))
       if params.session_tools ~= nil then state.session_tools = params.session_tools end
+      if params.subagent_limit ~= nil then state.subagent_limit = params.subagent_limit end
       return
     end
     if method == "host.trace.configure" then log_level = params.level end
@@ -335,6 +336,19 @@ T["settings"] = function()
     "Shift-Tab did not switch to the previous category")
   focused = require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec)
   assert(focused.id == "subagent-tools", "returning to a category lost its selected setting")
+  local _, subagent_limit = find("subagent_limit")
+  eq(subagent_limit.value, "8")
+  key("subagent_limit", "<CR>")
+  local limit_editor = assert(picker._state_for_test().field_editor)
+  vim.api.nvim_buf_set_lines(limit_editor.buffer, 0, -1, false, { "0" })
+  keymap.invoke("<CR>", { buffer = limit_editor.buffer })
+  eq(limit_editor.error, "Enter a whole number of at least 1.")
+  eq(state.subagent_limit, nil)
+  vim.api.nvim_buf_set_lines(limit_editor.buffer, 0, -1, false, { "24" })
+  keymap.invoke("<CR>", { buffer = limit_editor.buffer })
+  eq(state.subagent_limit, 24)
+  local _, saved_limit = find("subagent_limit")
+  eq(saved_limit.value, "24")
   local timeout_row = find("approval_timeout")
   assert(#timeout_row.fields == 1 and timeout_row.fields[1].value == "10m", "timeout must be one combined value")
   assert(not pcall(find, "approval_timeout:unit") and not pcall(find, "answer_timeout:unit"), "timeout retained a unit field")

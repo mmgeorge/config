@@ -276,6 +276,8 @@ pub struct BrokerSnapshot {
     /// Confirmed access label computed by the authoritative filesystem policy.
     pub access_abbreviation: String,
     pub subagent_tools: bool,
+    /// Current limit for concurrent managed children in this session.
+    pub subagent_limit: crate::agent::SubagentLimit,
     pub lsp_tools: bool,
     pub session_tools: bool,
     pub status_thoughts: bool,
@@ -2887,6 +2889,7 @@ impl HarnessBroker {
         );
         let agent_coordinator = crate::agent::AgentCoordinator::new(session.id.clone());
         agent_coordinator.set_enabled(shared.desired.subagent_tools.unwrap_or(false));
+        agent_coordinator.set_subagent_limit(shared.desired.subagent_limit.unwrap_or_default());
         runtime
             .lsp
             .set_enabled(&session.id, shared.desired.lsp_tools.unwrap_or(false));
@@ -4099,14 +4102,7 @@ impl HarnessBroker {
         {
             let agent = self.agent_coordinator.resolve(&task.agent_id)?;
             let same_work = match &request.operation {
-                AgentOperation::Spawn(spawn) => {
-                    task.ordinal == 1
-                        && task.message == spawn.text
-                        && spawn
-                            .profile
-                            .as_deref()
-                            .is_none_or(|profile| profile == agent.definition)
-                }
+                AgentOperation::Spawn(spawn) => spawn.matches_admission(&agent, &task),
                 AgentOperation::Followup { target, message } => {
                     task.ordinal > 1
                         && task.message == *message
@@ -7638,14 +7634,7 @@ impl HarnessBroker {
             let replay = (|| {
                 let agent = self.agent_coordinator.resolve(&task.agent_id)?;
                 let same = match &owned.request.operation {
-                    AgentOperation::Spawn(spawn) => {
-                        task.ordinal == 1
-                            && task.message == spawn.text
-                            && spawn
-                                .profile
-                                .as_deref()
-                                .is_none_or(|profile| profile == agent.definition)
-                    }
+                    AgentOperation::Spawn(spawn) => spawn.matches_admission(&agent, &task),
                     AgentOperation::Followup { target, message } => {
                         task.ordinal > 1
                             && task.message == *message

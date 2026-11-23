@@ -13,6 +13,22 @@ pub(crate) enum RepositoryAccess {
     Write,
 }
 
+/// Source-lock mode, independent of the operations authorized for one reservation.
+enum SourceLock {
+    Shared,
+    Exclusive,
+}
+
+impl From<RepositoryAccess> for SourceLock {
+    /// Get the source-lock mode for an independent repository operation.
+    fn from(access: RepositoryAccess) -> Self {
+        match access {
+            RepositoryAccess::Read => Self::Shared,
+            RepositoryAccess::Write => Self::Exclusive,
+        }
+    }
+}
+
 /// Preserve admission failures independently of their presentation in a tool response.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RepositoryAccessError {
@@ -22,7 +38,7 @@ pub(crate) enum RepositoryAccessError {
     Busy(PathBuf),
     #[error("repository_scope_expired: repository ownership was revoked for {}", .0.display())]
     Expired(PathBuf),
-    #[error("repository_read_only: shared access cannot authorize a writer for {}", .0.display())]
+    #[error("repository_read_only: read-only access cannot authorize a writer for {}", .0.display())]
     ReadOnly(PathBuf),
     #[error("repository_scope_mismatch: access to {} cannot authorize {}", owned.display(), requested.display())]
     DifferentRepository { owned: PathBuf, requested: PathBuf },
@@ -45,7 +61,7 @@ impl RepositoryAccessError {
     }
 }
 
-/// Retain repository exclusion while delegating one execution slot at a time.
+/// Retain source protection while delegating one execution slot at a time.
 #[derive(Debug)]
 #[must_use = "retain repository ownership until its operations have been collected"]
 pub(crate) struct RepositoryReservation {
@@ -73,7 +89,28 @@ impl RepositoryReservation {
         workspace: &Path,
         access: RepositoryAccess,
     ) -> Result<Self, RepositoryAccessError> {
-        Self::acquire_at(root, &reservation_directory()?, workspace, access)
+        Self::acquire_at(
+            root,
+            &reservation_directory()?,
+            workspace,
+            access,
+            access.into(),
+        )
+    }
+
+    /// Retain a managed child's process ownership under a shared source lock.
+    pub(crate) fn acquire_for_child(
+        root: &Path,
+        workspace: &Path,
+        access: RepositoryAccess,
+    ) -> Result<Self, RepositoryAccessError> {
+        Self::acquire_at(
+            root,
+            &reservation_directory()?,
+            workspace,
+            access,
+            SourceLock::Shared,
+        )
     }
 
     /// Get a revocable capability without extending this owner's lifetime.
@@ -92,7 +129,13 @@ impl RepositoryReservation {
         workspace: &Path,
         access: RepositoryAccess,
     ) -> Result<Self, RepositoryAccessError> {
-        Self::acquire_at(&directory.join("harness"), directory, workspace, access)
+        Self::acquire_at(
+            &directory.join("harness"),
+            directory,
+            workspace,
+            access,
+            access.into(),
+        )
     }
 
     /// Retain a state version while preserving the shared repository lock identity.
@@ -101,6 +144,7 @@ impl RepositoryReservation {
         directory: &Path,
         workspace: &Path,
         access: RepositoryAccess,
+        source_lock: SourceLock,
     ) -> Result<Self, RepositoryAccessError> {
         let state =
             crate::storage::state::StateLease::open(root).map_err(RepositoryAccessError::State)?;
@@ -115,9 +159,9 @@ impl RepositoryReservation {
             path: directory.to_owned(),
             source,
         })?;
-        // Keep the gate separate from source access so healthy readers can coexist.
+        // Serialize journal admission without holding the gate over source operations.
         let gate = lock_file(&directory.join(format!("{key}.admission.lock")))?;
-        lock(&gate, &workspace, RepositoryAccess::Write)?;
+        lock(&gate, &workspace, SourceLock::Exclusive)?;
         let legacy = directory.join(format!("{key}.operations"));
         if legacy
             .try_exists()
@@ -127,7 +171,7 @@ impl RepositoryReservation {
             })?
         {
             let source = lock_file(&directory.join(format!("{key}.lock")))?;
-            lock(&source, &workspace, RepositoryAccess::Write)?;
+            lock(&source, &workspace, SourceLock::Exclusive)?;
             return Err(RepositoryAccessError::Unavailable(
                 "incompatible repository operation storage; run :ForgeHistoryClear before starting Harness",
             ));
@@ -136,7 +180,7 @@ impl RepositoryReservation {
         let operations = crate::storage::state::directory(root).join("repository-operations");
         RepositoryJournal::recover_at(&operations, directory, &key, &workspace)?;
         let file = lock_file(&directory.join(format!("{key}.lock")))?;
-        lock(&file, &workspace, access)?;
+        lock(&file, &workspace, source_lock)?;
         let id = uuid::Uuid::new_v4();
         let journal = RepositoryJournal::begin_at(
             &operations,
@@ -324,8 +368,7 @@ struct RepositorySessionProcess {
 impl forge_shell::process::ProcessOwner for RepositorySessionProcess {
     /// Admit provider startup under its enclosing reservation before any native child exists.
     ///
-    /// Startup runs at the reservation's own level, so a provider can start under a shared
-    /// reader reservation; source writers still borrow `Write` and are refused there.
+    /// Startup uses the reservation's operation rights. Source mutations require a `Write` borrow.
     fn spawn(
         &self,
         command: tokio::process::Command,
@@ -509,14 +552,10 @@ fn lock_file(path: &Path) -> Result<File, RepositoryAccessError> {
 }
 
 /// Preserve lock contention separately from filesystem or platform errors.
-fn lock(
-    file: &File,
-    workspace: &Path,
-    access: RepositoryAccess,
-) -> Result<(), RepositoryAccessError> {
-    let result = match access {
-        RepositoryAccess::Read => file.try_lock_shared(),
-        RepositoryAccess::Write => file.try_lock(),
+fn lock(file: &File, workspace: &Path, mode: SourceLock) -> Result<(), RepositoryAccessError> {
+    let result = match mode {
+        SourceLock::Shared => file.try_lock_shared(),
+        SourceLock::Exclusive => file.try_lock(),
     };
     match result {
         Ok(()) => Ok(()),
@@ -701,6 +740,7 @@ mod tests {
             directory.path(),
             workspace.path(),
             RepositoryAccess::Read,
+            SourceLock::Shared,
         )?;
         reservation.published()?;
         Ok(())
@@ -718,13 +758,15 @@ mod tests {
             directory.path(),
             workspace.path(),
             RepositoryAccess::Write,
+            SourceLock::Exclusive,
         )?;
         assert!(matches!(
             RepositoryReservation::acquire_at(
                 second_root.path(),
                 directory.path(),
                 workspace.path(),
-                RepositoryAccess::Read
+                RepositoryAccess::Read,
+                SourceLock::Shared,
             ),
             Err(RepositoryAccessError::Busy(_))
         ));
@@ -743,6 +785,7 @@ mod tests {
             directory.path(),
             workspace.path(),
             RepositoryAccess::Read,
+            SourceLock::Shared,
         )?;
         assert!(
             crate::storage::state::directory(second_root.path())

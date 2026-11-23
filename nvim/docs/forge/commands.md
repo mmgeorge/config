@@ -444,6 +444,8 @@ The agents picker (`og` or `/agents`) lists running children, then finished ones
 
 `/agents on` and `/agents off` take effect at once: the picker's title shows the new setting, and a model that tries to start a child after `/agents off` is refused. Changing the setting while children run stops nothing; the children finish and report to the parent, and the model's own tool list changes when its next turn starts.
 
+`/agents spawn` lets you choose a profile, access mode, and task. Use `/agents spawn --read <profile> <text>` for an inspection or `--write` to require write access from the session and profile. The model can make the same choice with the `access` field in `agent_spawn`. Omit the choice to use the profile's default. `/agents edit` saves each profile's Access setting as `inherit`, `read`, or `write`.
+
 Thoughts with activity start collapsed and preserve the assistant's text in their heading.
 Expanding a thought shows its events first, then its tool summary, then its file changes,
 one indentation level deeper. Thoughts without activity keep the `○` marker. Your explicit
@@ -680,13 +682,10 @@ prompt. An exchange cut off because Forge itself stopped reports the active time
 last recorded event.
 When interruption begins, the execution timer stops and status changes to **Stopping**,
 which stays unchanged until the stop settles. Running children stay listed beneath it until
-each is cancelled, and the status area keeps its height until the stop settles, so the
-transcript above it moves once rather than as each child leaves. When the stop leads into more
-work, such as a compaction that runs the stopped turn again, the status area keeps that height
-while the work runs, so the status line stays in the row where **Stopping** was; it fits its
-content again once nothing runs. A turn that runs while its task is paused, such as a prompt
-sent to a session whose plan a restart paused, shows its own **Working** status with its time
-and interrupt key; **Paused** appears only while nothing runs.
+each is cancelled. The status area shrinks as those rows disappear and shows at most 12 screen
+lines. Open status details with `oS` to see the full list. A turn that runs while its task is
+paused, such as a prompt sent to a session whose plan a restart paused, shows its own **Working**
+status with its time and interrupt key. **Paused** appears only while nothing runs.
 If cleanup outlives its response deadline, **Cleanup timed out - provider state uncertain**
 replaces the spinner. Harness retains ownership until cleanup settles; the timeout does not
 authorize another turn against uncertain provider state. Copilot force-stops its shared native
@@ -1080,6 +1079,13 @@ not appear briefly as steering messages.
 Expand it to read the questions and answers. Pending questions retain their status display
 and picker behavior.
 **Tools** contains toggles for Subagents, LSP, and Session history.
+**Subagent limit** sets the maximum number of Forge-managed subagents that can run
+concurrently in one session. It defaults to **8**. Press Enter to edit the limit
+as a positive integer. Additional work waits for a slot. Lowering the limit lets
+active subagents keep their slots until they finish. Edits in a session apply to
+that session, and the standalone configuration editor sets the global default.
+Read-only and write-capable subagents can run concurrently in the same checkout.
+Write-capable subagents share the same files and can overwrite one another's edits.
 Both timeout settings show one value, such as `10m`. Enter opens an
 inline editor: Up/Down adjust the duration, Enter saves, and Esc cancels. Values
 step through `15s`, `30s`, `45s`, `60s`, then whole minutes from `2m` to `60m`.

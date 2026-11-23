@@ -22,6 +22,7 @@ fn selection(provider: ProviderId) -> AgentSelection {
 fn request(operation_id: &str, task_name: &str) -> (AgentRequest, SpawnAgentRequest) {
     let spawn = SpawnAgentRequest {
         profile: Some(task_name.into()),
+        access: None,
         text: "bounded task".into(),
     };
     (
@@ -56,6 +57,31 @@ pub(super) fn admit(
         AgentCommit::Admitted(work) => work,
         AgentCommit::Existing(_) => panic!("new request reused an admission"),
     }
+}
+
+/// Queue excess work under the current limit and reconsider it when capacity increases.
+#[test]
+fn subagent_limit_applies_to_queued_launches() {
+    let coordinator = AgentCoordinator::new("root".into());
+    for ordinal in 0..8 {
+        assert!(admit(&coordinator, &format!("child-{ordinal}"), "worker").launch);
+    }
+    let queued = admit(&coordinator, "queued", "worker");
+    assert!(!queued.launch);
+    assert!(coordinator.ready_launch().unwrap().is_none());
+
+    coordinator.set_subagent_limit(serde_json::from_str("1").unwrap());
+    assert_eq!(coordinator.active_count(), 8);
+    assert!(coordinator.ready_launch().unwrap().is_none());
+
+    let revision = coordinator.subscribe();
+    coordinator.set_subagent_limit(serde_json::from_str("9").unwrap());
+    assert!(revision.has_changed().unwrap());
+    assert_eq!(
+        coordinator.ready_launch().unwrap().unwrap().task.id,
+        queued.task.id
+    );
+    assert_eq!(coordinator.active_count(), 9);
 }
 
 /// A check closes child admission without parking the root, including a reservation race.
@@ -189,6 +215,7 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
 fn admitted_model_child(coordinator: &AgentCoordinator) -> super::AgentWork {
     let spawn = SpawnAgentRequest {
         profile: Some("review".into()),
+        access: None,
         text: "bounded task".into(),
     };
     let request = AgentRequest {

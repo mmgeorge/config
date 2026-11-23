@@ -31,6 +31,7 @@ impl SessionConfigurationPatch {
             approval_timeout: _,
             tool_timeout: _,
             subagent_tools,
+            subagent_limit: _,
             lsp_tools,
             session_tools,
             status_thoughts: _,
@@ -112,6 +113,7 @@ impl TryFrom<SettingsFields> for SessionConfigurationPatch {
             approval_timeout,
             tool_timeout,
             subagent_tools,
+            subagent_limit,
             lsp_tools,
             session_tools,
             status_thoughts,
@@ -137,6 +139,7 @@ impl TryFrom<SettingsFields> for SessionConfigurationPatch {
             && approval_timeout.is_none()
             && tool_timeout.is_none()
             && subagent_tools.is_none()
+            && subagent_limit.is_none()
             && lsp_tools.is_none()
             && session_tools.is_none()
             && status_thoughts.is_none()
@@ -371,6 +374,11 @@ struct SettingsFields {
         skip_serializing_if = "Option::is_none"
     )]
     subagent_tools: Option<bool>,
+    #[serde(
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    subagent_limit: Option<crate::agent::SubagentLimit>,
     #[serde(
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"

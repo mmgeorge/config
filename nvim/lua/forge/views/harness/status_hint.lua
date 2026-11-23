@@ -71,7 +71,6 @@ function M.compose(snapshot, context, commands, width)
     local rendered_rows = {}
     local column_shift = {}
     local thought_rows, thought = {}, {}
-    if type(status) == "table" and status.stopping == true then content.stopping = true end
     if type(status) == "table" then
       for _, decoration in ipairs(metadata.decoration or {}) do
         if decoration.capture == "ForgeHarnessCommentary" then

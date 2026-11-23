@@ -744,7 +744,10 @@ impl OperationRecord {
                 return Err(invalid(path, "invalid borrowed ownership chain"));
             }
             if access == RepositoryAccess::Read && borrower.access == RepositoryAccess::Write {
-                return Err(invalid(path, "borrowed ownership upgrades shared access"));
+                return Err(invalid(
+                    path,
+                    "borrowed ownership upgrades read-only access",
+                ));
             }
             parent = borrower.operation;
             access = borrower.access;
