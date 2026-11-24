@@ -41,7 +41,7 @@ Replace vague self-praise (*"clean separation"*, *"seamless"*, *"robust"*) and u
 2. **Select a profile.** Match the reader's goal to a profile below and read its template before outlining. Read [tables](references/tables.md) before adding a table and [diagrams](references/diagrams.md) before adding a diagram.
 3. **Draft and verify.** Follow the selected profile and the principles above, then verify every symbol, file path, snippet, and cross-link against the repository.
 
-## Document Profiles
+## Profiles
 
 | Reader goal                                             | Profile                                     |
 | ------------------------------------------------------- | ------------------------------------------- |

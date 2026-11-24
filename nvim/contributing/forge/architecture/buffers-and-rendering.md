@@ -38,6 +38,13 @@ A displayed transcript synchronizes on every `document_changed` wake, with one r
 
 ## Editable regions
 
+The Harness composer gives its visible Blink completion menu first use of the
+history keys. With the menu closed, prompt history starts only from an empty
+composer. Up uses native cursor movement while editing an unsent draft.
+While browsing, `prompt_history` tracks typed keys and ends the selection on the
+first key outside the configured history bindings. Leaving the composer or changing
+its text independently also ends the selection, with the current draft intact.
+
 `forge/editable.lua` owns region anchors and locally pending text. Native `on_bytes` validates the change, shifts later anchors, records the field, and suspends generated text synchronously, but it never sends an edit request.
 
 Explicit save and submit actions call `capture_draft` for an immutable capture of the document, region, base revision, sequence, and exact text. `saved_capture` advances accepted revisions and clears only pending values whose sequence matches, so newer typing stays dirty. Generated patches wait while drafts remain, and closing a dirty buffer hides it instead of discarding it.

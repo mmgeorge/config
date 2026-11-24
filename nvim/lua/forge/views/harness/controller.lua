@@ -265,6 +265,15 @@ local function dismiss_composer_completion(buf)
   if completion and vim.api.nvim_get_current_buf() == buf then completion.hide() end
 end
 
+---@param direction "select_prev"|"select_next"
+---@return boolean handled
+local function navigate_composer_completion(direction)
+  local completion = package.loaded["blink.cmp"]
+  if not (completion and completion.is_menu_visible()) then return false end
+  completion[direction]()
+  return true
+end
+
 ---@param buf integer
 ---@param text string
 local function set_composer_text(buf, text, attachments)
@@ -3232,8 +3241,12 @@ function M.composer_command_set()
   command_set.unregister(set, "open_timeline")
   command_set.unregister(set, "toggle_visibility")
   command_set.unregister(set, "toggle_presentation")
-  command_set.register(set, "history_previous", prompt_history.previous)
-  command_set.register(set, "history_next", prompt_history.next)
+  command_set.register(set, "history_previous", function()
+    if not navigate_composer_completion("select_prev") then prompt_history.previous() end
+  end)
+  command_set.register(set, "history_next", function()
+    if not navigate_composer_completion("select_next") then prompt_history.next() end
+  end)
   return set
 end
 

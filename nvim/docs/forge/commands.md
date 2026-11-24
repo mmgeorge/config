@@ -220,6 +220,15 @@ file list but have no excerpts, including license files with Markdown or text ex
 
 ## Harness and permissions
 
+`Up` and `Down` move through suggestions while the completion menu is open.
+With the menu closed, `Up` starts browsing prompt history from an empty composer.
+Once browsing, `Up` moves to older prompts and `Down` moves toward the empty composer.
+Any other key or leaving the composer ends browsing and keeps the selected prompt as a draft.
+
+Type `$` anywhere in the composer to complete an enabled, user-invocable skill.
+Forge sends a `$skill` at the start of the prompt as a structured skill invocation.
+An inline `$skill` travels as prompt text.
+
 `@` file completion shows paths relative to the Harness session's workspace.
 Long menu labels use Snacks middle shortening, retaining the first directory and
 the trailing path components that fit. Extremely long filenames can shorten too.

@@ -1,5 +1,6 @@
 -- Unit tests for `forge.views.harness.provider_picker` (provider_picker.lua).
 local MiniTest = require("mini.test")
+local eq = MiniTest.expect.equality
 local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
 local mock_client = dofile("nvim/lua/forge/tests/support/mock_client.lua")
@@ -120,9 +121,11 @@ T["provider_catalog"] = function()
   assert(completion.items[1].label == "$walkthrough", "$ completion should label the enabled skill")
   assert(completion.items[1].textEdit.newText == "walkthrough ", "$ completion should preserve the leading $")
 
-  buffer.set(input_buf, { "use $wa" })
-  vim.api.nvim_win_set_cursor(0, { 1, 7 })
-  assert(not command_source:enabled(), "$ completion should not activate after ordinary text")
+  buffer.set(input_buf, { "use $ now" })
+  vim.api.nvim_win_set_cursor(0, { 1, 5 })
+  eq(command_source:enabled(), true)
+  command_source:get_completions({}, function(result) completion = result end)
+  eq(completion.items[1].textEdit.range.start, { line = 0, character = 5 })
   buffer.set(input_buf, { "$walkthrough explain" })
   vim.api.nvim_win_set_cursor(0, { 1, 20 })
   assert(not command_source:enabled(), "$ completion should stop after the skill selector")

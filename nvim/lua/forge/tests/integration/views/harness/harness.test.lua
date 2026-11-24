@@ -15,6 +15,64 @@ local check_tool_path = vim.fs.normalize(vim.fn.fnamemodify("nvim/lua/forge/test
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 -- requires-forge-host
+T["composer_arrows_prioritize_completion"] = function()
+  local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
+  local workspace = temp.directory("composer-completion")
+  host.start({ config = true })
+  require("forge").setup({ harness = { provider = "mock" } })
+  stub(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+
+  local menu_visible = true
+  local selection = {}
+  stub(package.loaded, "blink.cmp", {
+    is_menu_visible = function() return menu_visible end,
+    select_prev = function() selection[#selection + 1] = "previous" end,
+    select_next = function() selection[#selection + 1] = "next" end,
+  })
+  require("forge.views.harness.prompt_history").replace({ "Earlier prompt", "Oldest prompt" })
+  buffer.set(state.composer_buf, { "/" })
+  local mapping = { mode = "i", window = state.composer_win }
+  keymap.invoke("<Up>", mapping)
+  eq(buffer.text(state.composer_buf), "/")
+  keymap.invoke("<Down>", mapping)
+  eq(selection, { "previous", "next" })
+  eq(state.prompt_history_index, 0)
+
+  menu_visible = false
+  keymap.invoke("<Up>", mapping)
+  eq(buffer.text(state.composer_buf), "/")
+  eq(state.prompt_history_index, 0)
+
+  buffer.set(state.composer_buf, { "" })
+  keymap.invoke("<Up>", mapping)
+  eq(buffer.text(state.composer_buf), "Earlier prompt")
+  keymap.invoke("<Up>", mapping)
+  eq(buffer.text(state.composer_buf), "Oldest prompt")
+  keymap.invoke("<Down>", mapping)
+  eq(buffer.text(state.composer_buf), "Earlier prompt")
+  keymap.invoke("<Down>", mapping)
+  eq(buffer.text(state.composer_buf), "")
+  eq(selection, { "previous", "next" })
+
+  keymap.feed("<Esc><Up><Up><Down><Left><Up>")
+  eq(buffer.text(state.composer_buf), "Earlier prompt")
+  eq(state.prompt_history_index, 0)
+  keymap.feed("<Down>")
+  eq(buffer.text(state.composer_buf), "Earlier prompt")
+
+  buffer.set(state.composer_buf, { "" })
+  keymap.feed("i<Up>!<Up>", "xt!")
+  eq(buffer.text(state.composer_buf), "Earlier prompt!")
+  eq(state.prompt_history_index, 0)
+  keymap.feed("<Esc>")
+end
+
+-- requires-forge-host
 T["check_completion_with_gitlink"] = function()
   local repository = git_repository.create({ files = {
     [".forge.json"] = { vim.json.encode({ checks = { fixture = {
@@ -136,6 +194,45 @@ T["live_tool_groups_stay_folded_until_opened"] = function()
   end
   wait_until(function() return not require("forge.views.harness.activity").busy(state) end, "inspection did not settle")
   eq(host.stop(), true)
+end
+
+-- requires-forge-host
+T["inline_skill_completion_preserves_surrounding_prompt"] = function()
+  local mock_provider = dofile("nvim/lua/forge/tests/support/mock_provider.lua")
+  local workspace = temp.directory("inline-skill")
+  local skill_path = workspace .. "/.rulesync/skills/fixture/SKILL.md"
+  vim.fn.mkdir(vim.fn.fnamemodify(skill_path, ":h"), "p")
+  vim.fn.writefile({ "---", "name: fixture", "description: Completion fixture", "targets: ['*']", "---" }, skill_path)
+  host.start({ config = true })
+  require("forge").setup({ harness = { provider = "mock" } })
+  dofile("nvim/lua/forge/tests/support/stub.lua")(require("forge.harness.provider_preference"), "load", function() return "mock" end)
+  vim.fn.chdir(workspace)
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
+    "Harness did not start")
+
+  -- MockProvider leaves catalog discovery to the host's configured resources.
+  state.capability.catalog.skill = true
+  vim.api.nvim_set_current_win(state.composer_win)
+  local prefix = "Résumé with ($fi"
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Review the draft.", prefix .. "x) before sending." })
+  vim.api.nvim_win_set_cursor(0, { 2, #prefix })
+  local source = require("forge.views.harness.completion.command_source").new()
+  eq(source:enabled(), true)
+  local completion
+  source:get_completions({}, function(result) completion = result end)
+  wait_until(function() return completion ~= nil end, "Skill catalog did not arrive")
+  eq(#completion.items, 1)
+  eq(completion.items[1].label, "$fixture")
+  vim.lsp.util.apply_text_edits({ completion.items[1].textEdit }, state.composer_buf, "utf-8")
+  local expected = "Review the draft.\nRésumé with ($fixture) before sending."
+  eq(buffer.text(state.composer_buf), expected)
+
+  local hold = mock_provider.hold(state.session.id)
+  require("forge.views.harness.controller").submit()
+  eq(hold:wait().prompt, expected)
+  hold:release()
 end
 
 -- requires-forge-host
@@ -3346,11 +3443,11 @@ do
   assert(not state.queue_edit and #state.queue == 1 and text() == selected,
     "unqueue lost the complete message or removed another entry")
   assert(state.prompt_history[1] and state.prompt_history[1].text == saved_draft, "unqueue discarded the saved draft")
-  vim.api.nvim_win_set_cursor(state.composer_win, { 1, 0 })
+  compose("")
   require("forge.views.harness.prompt_history").previous()
   assert(text() == saved_draft, "Up did not recall the saved draft")
   require("forge.views.harness.prompt_history").next()
-  assert(text() == selected, "Down did not return to the unqueued message")
+  assert(text() == "", "Down did not return to the empty composer")
 end
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

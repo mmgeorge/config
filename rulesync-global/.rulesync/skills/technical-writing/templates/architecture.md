@@ -4,22 +4,32 @@
 
 ## Goal
 
-Build a mental model of how a system is structured and how its parts interact. A reader finishing an architectural overview should understand what each major part owns, how data or control flows across them, and—where applicable—the limits or failure modes that shape the design.
+Build a mental model of how a system is structured and how its parts interact. A reader finishing an architectural overview should understand its core concepts, what each major part owns, how data or control flows across boundaries, and, where applicable, the limits or failure modes that shape the design.
 
 ## Guiding Structure
 
-Adapt headings and section count to the system's domain concepts, introducing core roles and ownership before detailed execution paths and edge cases.
+Adapt headings and section count to the system's domain concepts, introducing concepts and ownership before execution paths and edge cases. Across the whole page:
+
+- Use concise, single-topic domain headings (`## Launchers`, `## Scene Identity`).
+- Keep prose at conceptual altitude, referring to subsystems by plain role names (`the scene store`, `the upload API`, `the background worker`) instead of scattering internal struct names or `Type::method` calls across paragraphs.
+- Explain concepts in prose before showing a short, import-free code or config snippet with unqualified names, letting the snippet carry syntax, attributes, and signatures instead of narrating them.
 
 ### Opening
 
 - Establish what the system is, what it does, and the scope of the page. Lead directly with its role when the need is obvious, bridge from a neighboring concept when it complements another subsystem, or open with the motivating problem or paradigm when the design would otherwise look arbitrary.
-- Keep the opening focused on the core idea—include a load-bearing type when it clarifies the concept, or a short entry-point snippet when the page centers on a public or widely used internal API, and save internal types, deep mechanics, and edge-case qualifications for the sections that explain them.
+- Keep the opening focused on the core idea. Include a load-bearing type when it clarifies the concept, or a short entry-point snippet when the page centers on a public or widely used internal API, saving internal types, deep mechanics, and edge cases for later sections.
+
+### Core Concepts (Optional)
+
+- When a system introduces several domain building blocks, a data model, or an authoring format, walk through them one single-topic section at a time before tying them together.
+- Anchor abstract distinctions (such as definitions vs. instances, or layered identities) with a small concrete running example carried across the operations that follow.
 
 ### Ownership and Boundaries
 
-- Continue from the opening so the first body section develops the same thread rather than restarting cold.
-- When an abstraction exists to absorb real-world quirks (divergent provider behavior, OS watcher noise, lock contention), lead that paragraph with a brief empirical explanation of what happens in practice rather than a chronological history of past attempts—for example: *"Operating system file watchers rarely emit one clean event per save—editors write temporary files, rename them into place, and fire duplicate notifications within milliseconds. To avoid back-to-back rebuilds, the watch loop collapses rapid bursts into a single notification for the build runner."*
-- When a diagram helps establish static structure, use a standard UML Mermaid `classDiagram` for the major components, their key boundary methods, and labeled ownership arrows, keeping value payloads on the arrows instead of adding boxes for small data structs.
+- Continue from the opening or core concepts so the narrative develops the same thread rather than restarting cold.
+- When an abstraction exists to absorb real-world quirks (divergent provider behavior, OS watcher noise, lock contention), lead that paragraph with a brief empirical explanation of what happens in practice rather than a chronological history of past attempts. For example: *"Operating system file watchers rarely emit one clean event per save. Editors write temporary files, rename them into place, and fire duplicate notifications within milliseconds. To avoid back-to-back rebuilds, the watch loop collapses rapid bursts into a single notification for the build runner."*
+- Use a comparison table when ownership or transport shifts across deployment modes or reload boundaries.
+- When static structure benefits from a visual, pair a UML Mermaid `classDiagram` with the prose (following `references/diagrams.md`), keeping exact component names in the diagram even while surrounding prose uses plain role names.
 
 ### Execution Flows (Optional)
 
@@ -39,7 +49,7 @@ Adapt headings and section count to the system's domain concepts, introducing co
 
 ## Examples
 
-Three short architectural overviews:
+Four architectural overviews:
 
 ### Media Thumbnail Pipeline
 
@@ -201,13 +211,11 @@ pub fn service(verifier: TokenVerifier) -> Service {
 
 Layers wrap handlers in declaration order, so tracing measures the full request lifetime and authentication rejects unauthorized calls before route logic runs. Because `Service` builds a routing table and middleware chain without binding a socket, the same definition runs behind a production TLS listener, inside an in-memory test harness, or behind a serverless adapter.
 
-On its own, a `Service` is a passive definition—handling live traffic requires a transport to decode incoming connections and a server to own the process lifecycle.
-
 ## Middleware
 
 Cross-cutting behaviors such as tracing, authentication, and rate limiting live in composable `Layer` implementations rather than inside individual handlers. Each layer receives the incoming request and a `Next` handle to the remainder of the chain, letting it short-circuit with an error response, attach typed data to the request's extension map, or inspect the outgoing response on the way back.
 
-A custom `AuthLayer` validates bearer tokens against a `TokenVerifier` that reads public signing keys from a cached `KeyStore` rather than calling the identity provider on every request. When a token carries an unrecognized key ID, the key store triggers a bounded background refresh so key rotation takes effect without stalling active requests. On success, `AuthLayer` attaches the verified `Identity` to the request extensions and forwards it down the chain.
+For example, when a client sends `POST /orders` with a bearer token and a JSON body, a custom `AuthLayer` validates the token against a `TokenVerifier` backed by a cached `KeyStore` rather than calling the identity provider on every call. When a token carries an unrecognized key ID, the key store triggers a bounded background refresh so key rotation takes effect without stalling active requests. On success, `AuthLayer` inserts the verified `Identity` into the request's extension map and forwards the request down the chain.
 
 ```rust
 pub struct AuthLayer {
@@ -227,18 +235,29 @@ impl Layer for AuthLayer {
 }
 ```
 
-Downstream handlers declare `Identity` directly as an extractor parameter instead of re-parsing authorization headers or holding a verifier reference:
+## Extractors
+
+Downstream handlers do not read raw headers, byte streams, or the extension map directly. An *extractor* parses one typed input from an incoming request so route handlers can declare the values they need as function parameters. Before invoking a handler, the router runs each parameter's extractor and returns a `400` or `401` response if extraction fails.
+
+For that `POST /orders` request, `create_order` extracts the `Identity` that `AuthLayer` attached alongside the deserialized `NewOrder` JSON body:
 
 ```rust
 async fn create_order(identity: Identity, body: Json<NewOrder>) -> Response {
-  // Runs after AuthLayer attaches Identity to the request extensions
   Order::create(identity.user_id, body.0).into_response()
 }
 ```
 
 ## Transports
 
-A transport adapts an external protocol or runtime environment into Cobalt's uniform request and response types. In production, a `TlsListener` accepts TCP connections, negotiates TLS, parses HTTP frames, and dispatches each request into the service while `Server` coordinates process lifecycle and graceful shutdown. In automated tests, a `TestClient` dispatches requests in memory against the same `Service` backed by a local test verifier, without opening sockets or claiming ports.
+On its own, a `Service` is a passive definition. Handling live traffic requires a transport to adapt an external protocol or runtime environment into Cobalt's uniform request and response types, keeping socket management and HTTP framing out of handlers and middleware:
+
+| Transport | Connection source | Binds socket | Typical use |
+| --- | --- | :---: | --- |
+| `TlsListener` | TCP listener with TLS termination | Yes | Production services behind `Server` |
+| `TestClient` | Direct in-memory calls | No | Integration tests with local verifiers |
+| `ServerlessAdapter` | Platform event invocation | No | Function-as-a-service deployments |
+
+In production, `Server` drives a `TlsListener` and coordinates graceful shutdown. In automated tests, a `TestClient` dispatches requests in memory against the same `Service` backed by a local test verifier, without opening sockets or claiming ports.
 
 ```rust
 // Production binary
@@ -252,8 +271,6 @@ Server::new(service(verifier))
 let client = TestClient::new(service(TokenVerifier::for_test(test_key)));
 let response = client.post("/orders").bearer(test_token).send().await;
 ```
-
-Keeping socket management and protocol framing inside the transport lets handlers and middleware stay agnostic to HTTP version, TLS configuration, and deployment target.
 
 ## Putting It Together
 
@@ -309,5 +326,72 @@ classDiagram
     AuthLayer --> TokenVerifier : verifies bearer token
     TokenVerifier --> KeyStore : reads cached signing keys
     Layer --> Router : forwards Request with Identity via Next
+```
+````
+
+### Physically Based Lighting
+
+````markdown
+# Physically Based Lighting
+
+The renderer shades 3D surfaces using a *physically based rendering* (PBR) pipeline that evaluates materials with an approximate model of how light reflects off real surfaces. Artists author lighting-independent surface parameters such as base color, roughness, and metallic response once, and the pipeline shades them consistently across outdoor sun, indoor point lights, and changing environments.
+
+## Prior Shading Models
+
+Early real-time renderers shaded surfaces with empirical models such as Phong ([Phong, 1975](https://doi.org/10.1145/360825.360839)) and Blinn-Phong ([Blinn, 1977](https://doi.org/10.1145/563858.563893)). Blinn-Phong added a Lambertian diffuse color to a specular highlight controlled by a hand-tuned specular color and a shininess exponent driven by the halfway vector between the light and camera. Those models were cheap to compute and easy to tune for a single lighting setup, but nothing linked a highlight's width to its brightness or capped total reflection at incoming light energy. Widening a highlight did not dim it, and bright diffuse and specular terms could sum to more energy than the surface received, so materials adjusted under overcast skies often looked plastic or clipped under direct sunlight.
+
+## Microfacets and Roughness
+
+Physically based shading replaces those ad-hoc controls with a model of surface geometry derived from optical microfacet theory ([Torrance and Sparrow, 1967](https://doi.org/10.1364/JOSA.57.001105)). At a microscopic scale, even visually flat surfaces consist of tiny mirror-like tilts called *microfacets*. A single *roughness* parameter controls how tightly those microfacets align with the surface normal. On polished copper, microfacets align closely and concentrate incoming light into a sharp, bright reflection. On matte clay, microfacets point in scattered directions and spread that same incoming energy into a wide, dim highlight.
+
+## The BRDF
+
+A *Bidirectional Reflectance Distribution Function* (*BRDF*) formalizes that surface response at each shaded point: given an incoming light direction `l` and a view direction `v`, what fraction of incoming radiance reflects toward the camera? Our lighting shader combines a Lambertian diffuse term with a Cook-Torrance microfacet specular term ([Cook and Torrance, 1982](https://doi.org/10.1145/357290.357293)):
+
+$$f(l, v) = k_d \frac{c}{\pi} + \frac{D(h)\,G(l, v)\,F(v, h)}{4\,(n \cdot l)(n \cdot v)}$$
+
+Here `c` is the surface base color, `k_d` is the diffuse energy weight, `n` is the surface normal, and `h` is the halfway vector between `l` and `v`. The specular numerator multiplies three physical factors, divided by `4 (n · l)(n · v)` to normalize reflection between the microfacet and macrosurface geometry:
+
+- **Normal distribution (`D`):** Estimates the fraction of microfacets aligned with `h` based on roughness, using the GGX distribution ([Walter et al., 2007](https://doi.org/10.2312/EGWR/EGSR07/195-206)).
+- **Geometry masking and shadowing (`G`):** Accounts for microfacets that block incoming light or occlude reflected rays at grazing angles, using the paired Smith masking-shadowing term.
+- **Fresnel reflectance (`F`):** Increases surface reflectivity as the viewing angle becomes shallower, approximated with Schlick's polynomial ([Schlick, 1994](https://doi.org/10.1111/1467-8659.1330233)) so even rough surfaces turn mirror-like near grazing edges.
+
+## Metallic Workflow and Energy Conservation
+
+Two physical rules connect artist-authored textures to the BRDF. First, *energy conservation* requires that reflected light never exceed incoming light. Whatever fraction `F` reflects specularly at the surface leaves the remaining energy (`k_d`) to refract into the material and scatter out as diffuse light.
+
+Second, insulators (dielectrics such as clay, wood, and plastic) behave differently from conductors (metals such as copper, gold, and iron). Dielectrics reflect a small, untinted specular fraction at the surface and tint the refracted diffuse light with their base color. Metals absorb refracted light immediately, setting `k_d` to zero, and tint their specular reflection with their base color. Following the Disney principled parameterization ([Burley, 2012](https://blog.selfshadow.com/publications/s2012-shading-course/burley/s2012_pbs_disney_brdf_notes_v3.pdf)), a single `metallic` parameter blends between the two responses during shading, letting one material representation cover both clay and copper without separate shaders.
+
+## Direct and Image-Based Lighting
+
+Evaluating analytical lights (directional sun, point lights, spotlights) covers direct illumination, but leaves shadowed areas pitch black because real surfaces also receive bounced light from every direction around them. *Image-based lighting* (IBL) approximates that ambient environment from a surround cubemap pre-integrated offline into two lookup textures:
+
+- **Irradiance cubemap:** Convolves the environment over the full hemisphere for low-frequency diffuse bounce light.
+- **Prefiltered radiance cubemap:** Stores progressively blurred environment mip levels indexed by roughness, paired with a precomputed 2D split-sum BRDF lookup table for glossy reflections ([Karis, 2013](https://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf)).
+
+## Deferred Lighting Pipeline
+
+Shading every triangle in a complex scene wastes BRDF evaluations on fragments later hidden behind closer geometry. Our renderer splits opaque rendering into a geometry pass and a screen-space lighting pass connected by a *G-buffer*, evaluating the BRDF once per visible pixel:
+
+| Target | Channels | Contents |
+| --- | --- | --- |
+| `RT0` | `RGB8` + `A8` | Base color and ambient occlusion |
+| `RT1` | `RGB10A2` | Encoded world-space normal |
+| `RT2` | `RG8` | Roughness and metallic scalars |
+| `Depth` | `D32F` | Hardware depth used to reconstruct world position |
+
+The geometry pass writes material parameters into the G-buffer. The lighting pass reconstructs each pixel's world position from depth, accumulates direct light contributions from the active light buffer alongside IBL lookups into a linear HDR target, and hands that HDR image to the tone-mapping pass for display conversion:
+
+```mermaid
+flowchart TD
+    Scene["SceneMeshes"] --> Geom["GeometryPass"]
+    Geom -->|RT0..RT2, Depth| GBuffer[("GBuffer")]
+
+    GBuffer --> Light["LightingPass"]
+    Lights[("LightBuffer")] --> Light
+    Ibl[("IblMaps")] --> Light
+
+    Light -->|Linear HDR| Tonemap["TonemapPass"]
+    Tonemap -->|Display sRGB| Swapchain["Swapchain"]
 ```
 ````

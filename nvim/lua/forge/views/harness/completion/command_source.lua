@@ -134,11 +134,19 @@ function CommandSource:get_trigger_characters()
   return { "/", "$", " " }
 end
 
+local skill_name_pattern = "[%w_.:%-]*"
+
+---@param prefix string
+---@return integer? start_column
+local function skill_name_start(prefix)
+  return prefix:match("%$()" .. skill_name_pattern .. "$")
+end
+
 function CommandSource:enabled()
   local line = vim.api.nvim_get_current_line()
   local cursor_column = vim.api.nvim_win_get_cursor(0)[2]
   local prefix = line:sub(1, cursor_column)
-  return prefix:match("^%s*/") ~= nil or prefix:match("^%s*%$[^%s]*$") ~= nil
+  return prefix:match("^%s*/") ~= nil or skill_name_start(prefix) ~= nil
 end
 
 ---@param label string
@@ -244,13 +252,16 @@ function CommandSource:get_completions(_, callback)
   local prefix = line:sub(1, cursor_column)
   local command_start = prefix:find("/")
   local items = {}
-  local skill_start = prefix:match("^%s*%$()([^%s]*)$")
+  local skill_start = skill_name_start(prefix)
   if skill_start then
     local capability = session.harness.capability or {}
     if not (capability.catalog and capability.catalog.skill) then
       callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
       return
     end
+    local suffix = line:sub(cursor_column + 1):match("^" .. skill_name_pattern)
+    local skill_end = cursor_column + #suffix
+    local separator = skill_end == #line and " " or ""
     provider_catalog.skills(false, function(skill_list, request_error)
       if request_error then
         notifications.error("Failed to complete Harness skill: " .. request_error, "ForgeHarness")
@@ -265,10 +276,10 @@ function CommandSource:get_completions(_, callback)
             detail = skill.description,
             kind = vim.lsp.protocol.CompletionItemKind.Reference,
             textEdit = {
-              newText = skill.name .. " ",
+              newText = skill.name .. separator,
               range = {
                 start = { line = row, character = skill_start - 1 },
-                ["end"] = { line = row, character = cursor_column },
+                ["end"] = { line = row, character = skill_end },
               },
             },
           }
