@@ -102,6 +102,8 @@ end
 ---@field after0 integer Exclusive end row.
 ---@field indent? integer Display indentation.
 ---@field source_indent? integer Prefix bytes to skip on each row.
+---@field annotation? boolean An independently parsed Plan Review message.
+---@field frame? {width: integer, indent: integer} Text area inside a Plan Review card.
 ---@field continues_region? boolean Parse with the previous range while skipping intervening rows.
 
 --- Format line ranges as Tree-sitter parser regions.
@@ -426,13 +428,54 @@ function M.clear(buf)
   if ui_ok and ui.ns then pcall(vim.api.nvim_buf_clear_namespace, buf, ui.ns, 0, -1) end
 end
 
+--- Fence labels and rules can span a whole window. Keep their virtual text inside a card.
+local function clip_chunks(chunks, width)
+  local clipped = {}
+  for _, chunk in ipairs(chunks) do
+    if width <= 0 then break end
+    local text = chunk[1]
+    local used = vim.fn.strdisplaywidth(text)
+    if used > width then
+      clipped[#clipped + 1] = { require("forge.render.display_text").take_prefix(text, width).prefix, chunk[2] }
+      break
+    end
+    clipped[#clipped + 1] = chunk
+    width = width - used
+  end
+  return clipped
+end
+
+--- Fit window-wide decorations to the content area after the card's inline border.
+local function fit_frame_mark(buf, mark, frame)
+  local options = mark.opts
+  options.hl_eol = nil
+  if options.virt_text then
+    local column = options.virt_text_win_col
+    if not column then
+      column = 0
+      if mark.start_col > 0 then
+        local text = vim.api.nvim_buf_get_lines(buf, mark.start_row, mark.start_row + 1, false)[1]
+        column = vim.fn.strdisplaywidth(text:sub(1, mark.start_col), frame.indent)
+      elseif options.virt_text_pos == "overlay" then
+        options.virt_text_win_col = frame.indent
+      end
+    else
+      options.virt_text_win_col = frame.indent + column
+    end
+    options.virt_text = clip_chunks(options.virt_text, frame.width - column)
+  end
+  for index, line in ipairs(options.virt_lines or {}) do
+    options.virt_lines[index] = clip_chunks(line, frame.width)
+    table.insert(options.virt_lines[index], 1, { string.rep(" ", frame.indent), "Normal" })
+  end
+end
+
 --- Configures Tree-sitter regions and triggers markdown rendering for specified buffer ranges.
 ---@param buf integer Target buffer number.
 ---@param win integer? Target window handle.
 ---@param range_list ForgeMarkdownRange[] Array of zero-based line ranges.
----@param syntax_regions? Range4[][] Additional regions for Tree-sitter highlighting.
-function M.render(buf, win, range_list, syntax_regions)
-  if #range_list == 0 and not (syntax_regions and #syntax_regions > 0) then
+function M.render(buf, win, range_list)
+  if #range_list == 0 then
     M.clear(buf)
     return
   end
@@ -446,13 +489,11 @@ function M.render(buf, win, range_list, syntax_regions)
   perf.trace("harness", "ui.markdown.regions", { buf = buf, count = #range_list }, function()
     -- Preserve source coordinates while excluding non-Markdown and folded transcript content.
     local regions = parser_region_list(range_list)
-    if syntax_regions then vim.list_extend(regions, vim.deepcopy(syntax_regions)) end
     ---@diagnostic disable-next-line: invisible
     pcall(parser.set_included_regions, parser, regions)
     -- An annotation edit can shift included ranges without invalidating the Markdown tree.
     -- Recompute injections in case the edit interrupted parsing before their trees were built.
-    if syntax_regions and #syntax_regions > 0
-      or vim.iter(range_list):any(function(range) return range.continues_region end) then
+    if vim.iter(range_list):any(function(range) return range.continues_region or range.annotation end) then
       parser:invalidate()
     end
   end)
@@ -503,10 +544,22 @@ function M.render(buf, win, range_list, syntax_regions)
           local ranges = layout_ranges[context.buf]
           if not ranges then return marks end
           local visible = {}
+          local annotation
+          if ranges[#ranges] and ranges[#ranges].annotation then
+            local root_row = context.root:start()
+            for index = #ranges, 1, -1 do
+              local range = ranges[index]
+              if not range.annotation then break end
+              if root_row >= range.first0 and root_row < range.after0 then annotation = range break end
+            end
+          end
           for _, source_mark in ipairs(marks) do
             for _, range in ipairs(ranges) do
               -- Incremental trees can retain deleted list items at a shortened region's boundary.
-              if source_mark.start_row >= range.first0 and source_mark.start_row < range.after0 then
+              -- A source fence interrupted by a card can produce a background mark for
+              -- every intervening row. Only the card's own parse may paint those rows.
+              if (annotation == range or not annotation and not range.annotation)
+                and source_mark.start_row >= range.first0 and source_mark.start_row < range.after0 then
                 local shift = math.max(0, (range.indent or 2) - 2)
                 local padding = math.max(0, (range.indent or 2) - 2 - (range.source_indent or 0))
                 local options = source_mark.opts
@@ -516,10 +569,12 @@ function M.render(buf, win, range_list, syntax_regions)
                 -- Most marks pass through unchanged, and only a mark that is rewritten needs its
                 -- own copy; copying every mark of every parse dominated this handler.
                 local mark = source_mark
-                if clipped or shifted or padded then
+                local framed = range.frame and (options.virt_text or options.virt_lines or options.hl_eol)
+                if clipped or shifted or padded or framed then
                   mark = vim.deepcopy(source_mark)
                   if clipped then mark.opts.end_row, mark.opts.end_col = range.after0, 0 end
                   if shifted then mark.opts.virt_text_win_col = mark.opts.virt_text_win_col + shift end
+                  if framed then fit_frame_mark(context.buf, mark, range.frame) end
                   if padded then
                     for _, line in ipairs(mark.opts.virt_lines) do
                       table.insert(line, 1, { string.rep(" ", padding), "Normal" })

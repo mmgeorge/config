@@ -55,13 +55,24 @@ The annotation projection inserts comment and answer rows into the review buffer
 Consecutive Markdown source rows stay in one Tree-sitter region across those gaps.
 Each compact comment and read-only answer has its own syntax region. The projection
 includes its body bytes and newlines, so Tree-sitter omits box padding, borders,
-headings, and reply dividers. Markdown block layout applies to the plan source.
-Fenced examples inside annotations keep their authored spacing.
+headings, and reply dividers. Each message also owns its Markdown layout marks.
+A plan fence that spans an inserted comment can only paint plan rows. In a comment,
+fence labels and rules fit between the card borders, and Tree-sitter token colors take
+precedence over the card's default text color. Fenced examples keep their authored spacing.
 
-Plan Review keeps annotation cards boxed during cursor movement. `draft_comments.input_target`
+Plan Review stores the card bodies as buffer text. Extmarks draw the headings and footer
+as virtual lines and the side borders as virtual text. Native cursor movement and Visual
+selection therefore operate directly on the bodies. The popup reads the selection before
+leaving Visual mode and uses the timeline's quote formatter. `draft_comments.input_target`
 captures the selected source range or the message under the cursor. For a follow-up it
 uses that message as the parent and the thread's final footer as the popup anchor.
-The popup tracks the footer across redraws. Confirming a nonempty input appends a new
+For an empty body row, the review positions the idle cursor after the virtual border
+and restores the logical end of line before input so motions, yanks, and quotes use
+the same bytes as an ordinary empty row.
+Opening the review folds existing threads. While the review is open it keeps fold
+choices by root message ID. A folded thread projects one
+summary row counting its question and comment annotations, and incoming answers update
+the underlying thread while it stays folded. The popup tracks the footer across redraws. Confirming a nonempty input appends a new
 annotation to the review. Saving uses the existing annotation queue and submits unanswered
 questions. Canceling discards the popup buffer.
 

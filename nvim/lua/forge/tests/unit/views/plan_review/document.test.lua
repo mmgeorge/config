@@ -8,6 +8,30 @@ local eq = MiniTest.expect.equality
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+local function frame_lines(buffer)
+  local namespace = vim.api.nvim_get_namespaces().ForgeDraftComments
+  local lines = {}
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buffer, namespace, 0, -1, { details = true })) do
+    for _, chunks in ipairs(mark[4].virt_lines or {}) do
+      lines[#lines + 1] = table.concat(vim.tbl_map(function(chunk) return chunk[1] end, chunks))
+    end
+  end
+  return lines
+end
+
+local function expand_saved_threads(owner, buffer)
+  local win = vim.api.nvim_get_current_win()
+  -- Expand bottom to top so the remaining summaries keep their physical rows.
+  local ranges = owner.comment_state.range_list
+  for index = #ranges, 1, -1 do
+    local range = ranges[index]
+    if range.folded then
+      vim.api.nvim_win_set_cursor(win, { range.first_row + 1, 0 })
+      assert(require("forge.draft_comments").toggle_thread_fold(buffer, win))
+    end
+  end
+end
+
 T["document"] = function()
   local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
   local client = require("forge.client")
@@ -327,7 +351,7 @@ T["questions"] = function()
   end
   owner.action("question", function() end)
   finish_input({ "Why own this state?" })
-  assert(buffer_support.text(buffer):find("Plan question", 1, true), "question used the ordinary comment heading")
+  assert(table.concat(frame_lines(buffer), "\n"):find("Plan question", 1, true), "question used the ordinary comment heading")
   vim.cmd("write")
   eq(pending[2].method, "session.plan.question.answer", { fail_reason = "saving did not ask the LLM" })
   eq(saves[1].annotation[1].kind, "question", { fail_reason = "question kind was lost in the saved annotation" })
@@ -346,7 +370,7 @@ T["questions"] = function()
   pending[2].callback(response("Why own this state?", "It gives one component ownership. Callers use its public interface."))
   assert(owner.ready and not owner.closed, "answer closed the review")
   assert(not vim.bo[buffer].modified, "answer made a saved question dirty")
-  assert(buffer_support.text(buffer):find("Thought for 3 seconds", 1, true) and buffer_support.text(buffer):find("It gives one component ownership.", 1, true), "answer did not attach with its recorded duration")
+  assert(table.concat(frame_lines(buffer), "\n"):find("Thought for 3 seconds", 1, true) and buffer_support.text(buffer):find("It gives one component ownership.", 1, true), "answer did not attach with its recorded duration")
   eq(comments.capture(buffer)[1].source.body, "Why own this state?", { fail_reason = "reply entered the saved question body" })
   leave_and_return("It gives one component ownership.")
   vim.cmd("write")
@@ -399,7 +423,7 @@ T["questions"] = function()
     reply = { question_body = "Which getter should I use?", body = "Use the state getter.", duration_ms = 1000 } }
   pending[7].callback(threaded)
   assert(not vim.bo[buffer].modified and buffer_support.text(buffer):find("Use the state getter.", 1, true), "follow-up answer was not retained")
-  assert(buffer_support.text(buffer):find("Thought for 1 second", 1, true), "one-second duration was not rendered correctly")
+  assert(table.concat(frame_lines(buffer), "\n"):find("Thought for 1 second", 1, true), "one-second duration was not rendered correctly")
   local follow_up_row = buffer_support.find_row(buffer, "Use the state getter.")
   if follow_up_row then
     vim.api.nvim_win_set_cursor(0, { follow_up_row, 0 })
@@ -435,6 +459,7 @@ T["question_whose_answer_did_not_survive_shows_interrupted"] = function()
   snapshot = { document = owner.document, revision = 0, block = {
     { id = "plan:source", text = { "pub struct State;" }, metadata = { target = {}, editable_region = {}, decoration = {} } },
   } } })
+  expand_saved_threads(owner, buffer)
   assert(buffer_support.text(buffer):find("No answer · interrupted · <C-s> to regenerate", 1, true),
     "a question whose answer did not survive showed no state: " .. buffer_support.text(buffer))
   owner.close()
@@ -534,6 +559,7 @@ local function open_saving_review(annotation, source_text)
     pcall(owner.close, true)
     pcall(vim.api.nvim_buf_delete, buffer, { force = true })
   end)
+  expand_saved_threads(owner, buffer)
   return owner, buffer, saves
 end
 
@@ -575,7 +601,7 @@ T["every card row opens a follow-up at the footer"] = function()
   local parent = vim.api.nvim_get_current_win()
   local range = owner.comment_state.range_list[1]
   local lines = buffer_support.lines(buffer)
-  local width = vim.fn.strdisplaywidth(lines[range.last_row + 1]) - 4
+  local width = vim.fn.strdisplaywidth(frame_lines(buffer)[1]) - 4
   for row = range.first_row, range.last_row do
     vim.api.nvim_win_set_cursor(parent, { row + 1, 0 })
     vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
@@ -586,8 +612,8 @@ T["every card row opens a follow-up at the footer"] = function()
     eq({ config.win, config.bufpos, config.width }, { parent, { range.last_row, 0 }, width })
     eq(vim.api.nvim_win_get_cursor(parent)[1], range.last_row + 1)
     vim.cmd("redraw")
-    local position = vim.fn.screenpos(parent, range.last_row + 1, 3)
-    eq(vim.api.nvim_win_get_position(window), { position.row, position.col - 1 })
+    local position = vim.fn.screenpos(parent, range.last_row + 1, 1)
+    eq(vim.api.nvim_win_get_position(window), { position.row + 1, position.col + 1 })
     finish_input({ "Discard this follow-up" }, "<Esc>")
     eq(#comments.capture(buffer), 1)
   end
@@ -608,9 +634,9 @@ T["every card row opens a follow-up at the footer"] = function()
   thread_footer = owner.comment_state.range_list[2].last_row
   eq(vim.api.nvim_win_get_config(window).bufpos, { thread_footer, 0 })
   vim.cmd("redraw")
-  local position = vim.fn.screenpos(parent, thread_footer + 1, 3)
+  local position = vim.fn.screenpos(parent, thread_footer + 1, 1)
   assert(position.row > 0, "the expanded answer pushed the popup anchor off screen")
-  eq(vim.api.nvim_win_get_position(window), { position.row, position.col - 1 })
+  eq(vim.api.nvim_win_get_position(window), { position.row + 1, position.col + 1 })
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { "Another follow-up" })
   vim.cmd("write")
   eq(comments.capture(buffer)[3].parent_id, "1")
@@ -630,7 +656,7 @@ T["saved_follow_up_draws_its_block_like_the_others"] = function()
   ---@return string[] block_headings the first row of each question block, in document order
   local function block_headings()
     local headings = {}
-    for _, line in ipairs(buffer_support.lines(buffer)) do
+    for _, line in ipairs(frame_lines(buffer)) do
       if line:find("Plan question", 1, true) then headings[#headings + 1] = line end
     end
     return headings

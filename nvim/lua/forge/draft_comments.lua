@@ -6,6 +6,7 @@ local notifications = require("forge.infra.notifications")
 local editable = require("forge.editable")
 
 local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
+local blank_cursor_keys = vim.api.nvim_create_namespace("ForgeDraftCommentCursorInput")
 
 ---@class ForgeDraftComment
 ---@field id integer|string
@@ -28,6 +29,8 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field kind string?
 
 ---@class ForgeDraftCommentRange
+---@field folded? boolean Single summary row for the entire thread.
+---@field inner_width? integer Interior width of a virtually framed card.
 ---@field reply_index integer?
 ---@field reply_start_list integer[]?
 ---@field annotation ForgeDraftComment
@@ -63,6 +66,8 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field guard? table
 ---@field guard_source boolean
 ---@field reposition_input? fun()
+---@field folded_thread table<string, boolean>
+---@field blank_cursor? {window: integer, virtualedit: string}
 ---@field popup_input boolean
 ---@field markdown boolean
 
@@ -89,6 +94,7 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field before_render? fun(buf: integer, win: integer?)
 ---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 ---@field guard_source? boolean
+---@field folded_thread? table<string, boolean> Local fold choices keyed by root message ID.
 ---@field popup_input? boolean Keep annotations boxed during navigation and composition.
 ---@field markdown? boolean Render Markdown in compact bodies and read-only replies.
 
@@ -251,6 +257,7 @@ end
 
 local function focus_thread(state, annotation)
   local root = thread_root(state, annotation)
+  state.folded_thread[tostring(root.id)] = nil
   for _, candidate in ipairs(state.annotation_list) do
     candidate.focused = thread_root(state, candidate) == root
   end
@@ -282,6 +289,7 @@ end
 ---@field line_list string[]
 ---@field source_row_by_line table<integer, integer>
 ---@field range_list ForgeDraftCommentRange[]
+---@field frame_mark {row: integer, col: integer, options: vim.api.keyset.set_extmark}[]
 ---@field compact_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string, border_column?: integer }[]
 ---@field source_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string }[]
 ---@field source_record_list { row: integer, source_line: integer, source_index: integer }[]
@@ -307,6 +315,50 @@ local function add_markdown_row(projection, row, first_col, end_col, starts_body
   end
 end
 
+--- Keep only the body in the buffer. Virtual lines draw headings and the footer,
+--- and virtual text draws the side borders outside the native selection.
+---@param projection ForgeDraftCommentProjection
+---@param box ForgeCommentBoxLines
+---@param ancestors string[]
+---@param continuation boolean?
+---@return integer[] reply_rows
+local function append_card(projection, box, ancestors, continuation)
+  local marks = projection.frame_mark
+  if continuation then table.remove(marks) end -- Replace the previous footer with the shared heading.
+  local reply_rows = {}
+  local headings = {}
+  local first_body_row = #projection.line_list
+  local frame = { width = box.inner_width - 2, indent = vim.fn.strdisplaywidth(box[2][1][1]) }
+  for index, segments in ipairs(box) do
+    local span = box.markdown_rows[index]
+    if span then
+      local row = #projection.line_list
+      local body = segments[2][1]:sub(1, span.end_col - span.first_col)
+      projection.line_list[row + 1] = body
+      projection.line_meta_list[row + 1] = { ancestor_ids = ancestors, comment_frame = frame }
+      add_markdown_row(projection, row, 0, #body, span.starts_body)
+      if #headings > 0 then
+        marks[#marks + 1] = { row = row, col = 0, options = { virt_lines = headings, virt_lines_above = true } }
+        headings = {}
+      end
+      if span.starts_body and row > first_body_row then reply_rows[#reply_rows + 1] = row end
+      marks[#marks + 1] = { row = row, col = 0, options = { virt_text = { segments[1] },
+        virt_text_pos = "inline", right_gravity = false } }
+      if #body > 0 then
+        marks[#marks + 1] = { row = row, col = 0, options = { end_col = #body, hl_group = segments[2][2],
+          priority = vim.hl.priorities.syntax - 1 } }
+      end
+      marks[#marks + 1] = { row = row, col = #body, options = { virt_text = { { "│", segments[3][2] } },
+        virt_text_win_col = 3 + box.inner_width } }
+    elseif index < #box then
+      headings[#headings + 1] = segments
+    else
+      marks[#marks + 1] = { row = #projection.line_list - 1, col = 0, options = { virt_lines = { segments } } }
+    end
+  end
+  return reply_rows
+end
+
 ---@param state ForgeDraftCommentState
 ---@param width integer
 ---@return ForgeDraftCommentProjection
@@ -316,6 +368,7 @@ local function build_projection(state, width)
     source_row_by_line = {},
     range_list = {},
     compact_highlight_list = {},
+    frame_mark = {},
     source_highlight_list = {},
     source_record_list = {},
     line_meta_list = {},
@@ -349,11 +402,27 @@ local function build_projection(state, width)
       annotation_row_by_source[tonumber(source_row.source_line) or source_index] = source_index
     end
   end
-  local ordered = {}
+  local thread = {}
+  for _, annotation in ipairs(state.annotation_list) do
+    local root = thread_root(state, annotation)
+    thread[root] = thread[root] or {}
+    table.insert(thread[root], annotation)
+  end
+  local ordered, summary = {}, {}
   for _, root in ipairs(state.annotation_list) do
     if not root.parent_id then
-      for _, candidate in ipairs(state.annotation_list) do
-        if thread_root(state, candidate) == root then ordered[#ordered + 1] = candidate end
+      local messages = thread[root]
+      if state.folded_thread[tostring(root.id)] then
+        local questions = 0
+        for _, message in ipairs(messages) do
+          if message.kind == "question" then questions = questions + 1 end
+        end
+        local comments = #messages - questions
+        summary[root] = ("  ▸ %d question%s · %d comment%s"):format(questions,
+          questions == 1 and "" or "s", comments, comments == 1 and "" or "s")
+        ordered[#ordered + 1] = root
+      else
+        vim.list_extend(ordered, messages)
       end
     end
   end
@@ -397,13 +466,20 @@ local function build_projection(state, width)
       local heading = annotation.heading or state.heading
       local replies = annotation.replies
       if annotation.replies_body and annotation.replies_body ~= annotation.body then replies = nil end
-      local reply_start_row, reply_start_list
+      local reply_start_row, reply_start_list, inner_width
       local previous = projection.range_list[#projection.range_list]
       local shared_divider = annotation.parent_id and previous
         and previous.compact == not annotation.focused
         and thread_root(state, previous.annotation) == thread_root(state, annotation)
-      if shared_divider then first_row = #projection.line_list - 1 end
-      if annotation.focused then
+      local virtual_frame = state.popup_input and not annotation.focused
+      if shared_divider and not virtual_frame then first_row = #projection.line_list - 1 end
+      if summary[annotation] then
+        projection.line_list[first_row + 1] = ""
+        projection.line_meta_list[first_row + 1] = { ancestor_ids = source_row.ancestor_ids or {} }
+        projection.frame_mark[#projection.frame_mark + 1] = { row = first_row, col = 0,
+          options = { virt_text = { { summary[annotation], comment_box.default_style.heading } }, virt_text_pos = "overlay" } }
+        inner_width = comment_box.inner_width(width + 1)
+      elseif annotation.focused then
         local heading_row = shared_divider and #projection.line_list or #projection.line_list + 1
         projection.line_list[heading_row] = comment_editor.rule_line(
           " " .. heading .. " ",
@@ -435,45 +511,53 @@ local function build_projection(state, width)
           markdown = state.markdown,
         }
         local box_lines = comment_box.build_box_lines(descriptor, width + 1)
-        reply_start_row = box_lines.reply_start_row and first_row + box_lines.reply_start_row
-        reply_start_list = {}
-        for _, reply_row in ipairs(box_lines.reply_start_list or {}) do
-          reply_start_list[#reply_start_list + 1] = first_row + reply_row
-        end
-        if shared_divider then
-          for index = #projection.compact_highlight_list, 1, -1 do
-            if projection.compact_highlight_list[index].row == first_row then
-              table.remove(projection.compact_highlight_list, index)
+        if virtual_frame then
+          inner_width = box_lines.inner_width
+          reply_start_list = append_card(projection, box_lines, source_row.ancestor_ids or {}, shared_divider)
+          reply_start_row = reply_start_list[1]
+        else
+          reply_start_row = box_lines.reply_start_row and first_row + box_lines.reply_start_row
+          reply_start_list = {}
+          for _, reply_row in ipairs(box_lines.reply_start_list or {}) do
+            reply_start_list[#reply_start_list + 1] = first_row + reply_row
+          end
+          if shared_divider then
+            for index = #projection.compact_highlight_list, 1, -1 do
+              if projection.compact_highlight_list[index].row == first_row then
+                table.remove(projection.compact_highlight_list, index)
+              end
             end
           end
-        end
-        for index, segmented_line in ipairs(box_lines) do
-          local text, highlight_list = flatten_segmented_line(segmented_line)
-          local row = shared_divider and index == 1 and first_row or #projection.line_list
-          projection.line_list[row + 1] = text
-          local markdown = box_lines.markdown_rows[index]
-          if markdown then add_markdown_row(projection, row, markdown.first_col, markdown.end_col, markdown.starts_body) end
-          projection.line_meta_list[row + 1] = {
-            ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}),
-          }
-          for highlight_index, highlight in ipairs(highlight_list) do
-            local border_column
-            if markdown and highlight_index == #highlight_list and vim.fn.strdisplaywidth(text) <= width then
-              border_column = vim.fn.strdisplaywidth(text:sub(1, highlight.start_col))
-            end
-            projection.compact_highlight_list[#projection.compact_highlight_list + 1] = {
-              row = row,
-              start_col = highlight.start_col,
-              end_col = highlight.end_col,
-              hl = highlight.hl,
-              border_column = border_column,
+          for index, segmented_line in ipairs(box_lines) do
+            local text, highlight_list = flatten_segmented_line(segmented_line)
+            local row = shared_divider and index == 1 and first_row or #projection.line_list
+            projection.line_list[row + 1] = text
+            local markdown = box_lines.markdown_rows[index]
+            if markdown then add_markdown_row(projection, row, markdown.first_col, markdown.end_col, markdown.starts_body) end
+            projection.line_meta_list[row + 1] = {
+              ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}),
             }
+            for highlight_index, highlight in ipairs(highlight_list) do
+              local border_column
+              if markdown and highlight_index == #highlight_list and vim.fn.strdisplaywidth(text) <= width then
+                border_column = vim.fn.strdisplaywidth(text:sub(1, highlight.start_col))
+              end
+              projection.compact_highlight_list[#projection.compact_highlight_list + 1] = {
+                row = row,
+                start_col = highlight.start_col,
+                end_col = highlight.end_col,
+                hl = highlight.hl,
+                border_column = border_column,
+              }
+            end
           end
         end
       end
       projection.range_list[#projection.range_list + 1] = {
         annotation = annotation,
         compact = not annotation.focused,
+        inner_width = inner_width,
+        folded = summary[annotation] ~= nil,
         first_row = first_row,
         last_row = #projection.line_list - 1,
         reply_start_row = reply_start_row,
@@ -535,6 +619,9 @@ local function apply_projection(state, projection, mark_phase)
       end_col = highlight.end_col,
       hl_group = highlight.hl,
     })
+  end
+  for _, mark in ipairs(projection.frame_mark) do
+    vim.api.nvim_buf_set_extmark(state.buf, namespace, mark.row, mark.col, mark.options)
   end
   for _, highlight in ipairs(projection.compact_highlight_list) do
     local options = {
@@ -598,6 +685,48 @@ local function target_row(state, projection, target)
 end
 
 ---@param state ForgeDraftCommentState
+local function release_blank_cursor(state)
+  local owner = state.blank_cursor
+  if not owner then return end
+  state.blank_cursor = nil
+  vim.on_key(nil, blank_cursor_keys)
+  if vim.api.nvim_win_is_valid(owner.window) then
+    local position = owner.window == vim.api.nvim_get_current_win() and vim.fn.getcurpos()
+    vim.wo[owner.window].virtualedit = owner.virtualedit
+    if position then vim.fn.cursor({ position[2], position[3], 0, position[5] }) end
+  end
+end
+
+--- On an empty buffer line Neovim draws the cursor before inline virtual text.
+--- Give that line a single virtual cursor position at the start of the card body.
+---@param state ForgeDraftCommentState
+local function align_blank_cursor(state)
+  if not state.popup_input or vim.api.nvim_get_current_buf() ~= state.buf then return end
+  local window = vim.api.nvim_get_current_win()
+  local mode = vim.api.nvim_get_mode().mode
+  if (mode == "n" or mode == "v" or mode == "V" or mode == "\22") and vim.api.nvim_get_current_line() == "" then
+    local position = vim.fn.getcurpos()
+    local start = { position[2] - 1, 0 }
+    local marks = vim.api.nvim_buf_get_extmarks(state.buf, namespace, start, start, { type = "virt_text", details = true })
+    for _, mark in ipairs(marks) do
+      if mark[4].virt_text_pos == "inline" then
+        local column = vim.fn.strdisplaywidth(mark[4].virt_text[1][1])
+        if not state.blank_cursor then
+          state.blank_cursor = { window = window, virtualedit = vim.wo[window].virtualedit }
+          -- Native motions and operators must consume the real EOL, including when a
+          -- single blank line is yanked. Reapply the display offset when input settles.
+          vim.on_key(function() release_blank_cursor(state) end, blank_cursor_keys)
+        end
+        if vim.wo[window].virtualedit ~= "all" then vim.wo[window].virtualedit = "all" end
+        if position[4] ~= column then vim.fn.cursor({ position[2], 1, column, position[5] }) end
+        return
+      end
+    end
+  end
+  release_blank_cursor(state)
+end
+
+---@param state ForgeDraftCommentState
 ---@param win integer?
 local function sync_cursor_modifiable(state, win)
   local cursor_row = win and vim.api.nvim_win_get_cursor(win)[1] - 1 or -1
@@ -655,6 +784,7 @@ local function render(state, target, mark_phase)
   local requested_row = target_row(state, projection, target)
   if win and requested_row then vim.api.nvim_win_set_cursor(win, { requested_row + 1, 0 }) end
   sync_cursor_modifiable(state, win)
+  align_blank_cursor(state)
   state.rendering = false
   if state.reposition_input then state.reposition_input() end
   if state.guard and state.guard.native then editable.applying(state.guard, false) end
@@ -664,6 +794,7 @@ end
 local function handle_cursor_moved(state)
   if state.rendering or not vim.api.nvim_buf_is_valid(state.buf)
     or state.guard and state.guard.native and state.guard.native.rejecting then return end
+  align_blank_cursor(state)
   if state.readonly then set_modifiable(state, false) return end
   local win = displayed_window(state)
   if not win then return end
@@ -724,6 +855,12 @@ end
 local function install_autocmd(state)
   local group = vim.api.nvim_create_augroup("ForgeDraftComment" .. tostring(state.buf), { clear = true })
   state.group = group
+  if state.popup_input then
+    vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave" }, { group = group, buffer = state.buf,
+      callback = function() release_blank_cursor(state) end })
+    vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter", "ModeChanged", "SafeState" }, { group = group, buffer = state.buf,
+      callback = function() align_blank_cursor(state) end })
+  end
   vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
     group = group,
     buffer = state.buf,
@@ -747,6 +884,7 @@ local function install_autocmd(state)
     group = group,
     buffer = state.buf,
     callback = function()
+      release_blank_cursor(state)
       state_by_buf[state.buf] = nil
       pcall(vim.api.nvim_del_augroup_by_id, group)
     end,
@@ -764,6 +902,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
   opts = opts or {}
   local previous = state_by_buf[buf]
   if previous then
+    release_blank_cursor(previous)
     pcall(vim.api.nvim_del_augroup_by_id, previous.group)
     if previous.guard then editable.detach(previous.guard) end
   end
@@ -793,6 +932,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
     after_render = opts.after_render,
     markdown = opts.markdown == true,
     popup_input = opts.popup_input == true,
+    folded_thread = opts.folded_thread or {},
     guard_source = opts.guard_source == true,
   }
   state_by_buf[buf] = state
@@ -878,6 +1018,55 @@ function M.saved(buf, captured)
   if state.guard and state.guard.native then state.guard.native.modified = vim.bo[buf].modified end
 end
 
+---@param annotations ForgeDraftComment[]
+---@return table<string, boolean>
+function M.folded_roots(annotations)
+  local folded = {}
+  for _, annotation in ipairs(annotations) do
+    if not annotation.parent_id then folded[tostring(annotation.id)] = true end
+  end
+  return folded
+end
+
+--- A retained review can reopen while its answer request or unsaved feedback still owns the buffer.
+---@param buf integer
+function M.fold_all_threads(buf)
+  local state = state_by_buf[buf]
+  if not state then return end
+  local win = displayed_window(state)
+  local row = win and vim.api.nvim_win_get_cursor(win)[1] - 1
+  local annotation = row and annotation_at_row(state, row)
+  local source = row and source_line_at_row(state, row)
+  local folded = M.folded_roots(state.annotation_list)
+  if vim.deep_equal(state.folded_thread, folded) then return end
+  sync_focused_body(state)
+  for _, message in ipairs(state.annotation_list) do message.focused = false end
+  for id in pairs(state.folded_thread) do state.folded_thread[id] = nil end
+  for id in pairs(folded) do state.folded_thread[id] = true end
+  render(state, { annotation_id = annotation and thread_root(state, annotation).id, source_line = source })
+end
+
+--- Toggle the entire conversation under the cursor, including its read-only answers.
+---@param buf integer
+---@param win integer
+---@return boolean handled
+function M.toggle_thread_fold(buf, win)
+  local state = state_by_buf[buf]
+  if not state or not state.popup_input then return false end
+  local annotation = annotation_at_row(state, vim.api.nvim_win_get_cursor(win)[1] - 1)
+  if not annotation then return false end
+  sync_focused_body(state)
+  local root = thread_root(state, annotation)
+  local id = tostring(root.id)
+  state.folded_thread[id] = not state.folded_thread[id] or nil
+  for _, message in ipairs(state.annotation_list) do
+    if message.focused and thread_root(state, message) == root then message.focused = false end
+  end
+  state.win = win
+  render(state, { annotation_id = root.id })
+  return true
+end
+
 ---@param buf integer
 function M.delete_at_cursor(buf)
   local state = state_by_buf[buf]
@@ -927,7 +1116,8 @@ function M.add(buf, annotation, start_insert)
   for _, candidate in ipairs(state.annotation_list) do candidate.focused = false end
   annotation.focused, annotation.new = not state.popup_input, true
   state.annotation_list[#state.annotation_list + 1] = annotation
-  if not state.popup_input then focus_thread(state, annotation) end
+  if state.popup_input then state.folded_thread[tostring(thread_root(state, annotation).id)] = nil
+  else focus_thread(state, annotation) end
   render(state, { annotation_id = annotation.id })
   if not state.popup_input and start_insert ~= false then start_insert_later(state) end
   return annotation
@@ -959,13 +1149,21 @@ local function comment_target(state, win)
   if mode == "v" or mode == "V" or mode == "\22" then
     first_row = vim.fn.getpos("v")[2] - 1
   end
-  local source_line, end_source_line = source_range_at_rows(state, first_row, last_row)
-  local parent, range, on_answer
-  if first_row == last_row then
-    parent, range, on_answer = annotation_at_row(state, cursor_row)
+  local bottom = math.max(first_row, last_row)
+  local parent, range, on_answer = annotation_at_row(state, cursor_row)
+  local anchor = parent
+  if first_row ~= last_row then anchor = state.popup_input and annotation_at_row(state, first_row) or nil end
+  if parent and anchor and (parent == anchor or thread_root(state, parent) == thread_root(state, anchor)) then
+    return parent.source_line, parent.end_source_line, parent, range, on_answer, bottom
   end
-  if parent then source_line, end_source_line = parent.source_line, parent.end_source_line end
-  return source_line, end_source_line, parent, range, on_answer, math.max(first_row, last_row)
+  local first, last = source_range_at_rows(state, first_row, last_row)
+  if state.popup_input then
+    for _, endpoint in pairs({ anchor = anchor, cursor = parent }) do
+      first = math.min(first or endpoint.source_line, endpoint.source_line)
+      last = math.max(last or endpoint.end_source_line, endpoint.end_source_line)
+    end
+  end
+  return first, last, nil, nil, nil, bottom
 end
 
 --- Add a comment on the selected rows; a refusal notifies and returns nil without other effects.
@@ -1015,7 +1213,7 @@ end
 ---@field window integer
 ---@field heading string
 ---@field state ForgeDraftCommentState
----@field placement fun(): integer?, integer?, integer? Footer row, left indent and interior width.
+---@field placement fun(): integer?, integer?, integer?, integer? Anchor row, column offset, interior width, and row offset.
 ---@field append fun(body: string, kind?: string, heading?: string): boolean
 
 --- Capture the selected source or message before moving the review viewport. A reply
@@ -1026,6 +1224,7 @@ function M.input_target(buf)
   local state = state_by_buf[buf]
   local win = state and displayed_window(state)
   if not state or not win or state.readonly then return end
+  release_blank_cursor(state)
   local first, last, parent, _, _, row = comment_target(state, win)
   if not first or not last then
     notifications.error("Selected rows have no source identity", "Forge comments")
@@ -1041,6 +1240,11 @@ function M.input_target(buf)
         if thread_root(state, range.annotation) == root then
           local footer = mark_row(state, range.footer_mark)
           if not footer then return end
+          if range.folded then return footer, 2, math.max(1, math.min(range.inner_width, usable - 4)), 1 end
+          if range.inner_width then
+            local body_height = vim.api.nvim_win_text_height(win, { start_row = footer, start_vcol = 0, end_row = footer }).all
+            return footer, 2, math.max(1, math.min(range.inner_width, usable - 4)), body_height + 1
+          end
           local line = vim.api.nvim_buf_get_lines(buf, footer, footer + 1, false)[1]
           local indent = #line:match("^ *")
           local width = vim.api.nvim_win_call(win, function() return vim.fn.strdisplaywidth(line) end) - indent - 2
@@ -1160,6 +1364,7 @@ function M.detach(buf, restore_source)
   local state = state_by_buf[buf]
   if not state then return end
   sync_focused_body(state)
+  release_blank_cursor(state)
   if state.guard then editable.detach(state.guard) end
   for _, annotation in ipairs(state.annotation_list) do annotation.focused = false end
   pcall(vim.api.nvim_del_augroup_by_id, state.group)

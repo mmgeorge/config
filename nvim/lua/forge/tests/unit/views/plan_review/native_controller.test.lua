@@ -415,6 +415,16 @@ local function leave_question(scene, id)
   return vim.api.nvim_win_get_cursor(scene.review.win)
 end
 
+local function expand_thread(review, id)
+  for _, range in ipairs(review.owner.comment_state.range_list) do
+    if range.folded and tostring(range.annotation.id) == tostring(id) then
+      vim.api.nvim_win_set_cursor(review.win, { range.first_row + 1, 0 })
+      keymap.invoke("<Tab>", { window = review.win })
+      return
+    end
+  end
+end
+
 local function reopen(scene)
   vim.api.nvim_set_current_win(scene.review.win)
   keymap.feed("q")
@@ -426,6 +436,7 @@ end
 -- `options.others_pending` marks a review in which another question still awaits its answer, so
 -- only this question's own progress row must be gone.
 local function assert_answer(scene, question, body, options)
+  expand_thread(scene.review, question.id)
   local question_row = row_containing(scene, question.source.body)
   local answer_row = row_containing(scene, body, question_row + 1)
   assert(answer_row > question_row, "answer did not appear below its question")
@@ -446,6 +457,45 @@ local function ask(scene, body, answer)
   scene.host.answer(#scene.host.answers, answer)
   assert_answer(scene, question, answer)
   return question
+end
+
+T["Tab folds only the selected comment chain and counts its messages"] = function()
+  local host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua").start({ lines = { "Source" } })
+  local function message(id, body, kind, parent, answer)
+    return { id = id, kind = kind, parent_id = parent, source = { start_line = 1, end_line = 1, body = body },
+      reply = answer and { question_body = body, body = answer, duration_ms = 1000 } or nil }
+  end
+  host.annotation = {
+    message("1", "First question", "question", nil, "First answer"),
+    message("2", "Separate comment"),
+    message("3", "Follow-up comment", nil, "1"),
+    message("4", "Nested question", "question", "3", "Nested answer"),
+  }
+  local review = host.open()
+  local function toggle() keymap.invoke("<Tab>", { buffer = review.buf }) end
+  local function summary()
+    local row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, review.owner.comment_state.namespace,
+      { row, 0 }, { row, -1 }, { details = true })) do
+      if mark[4].virt_text then return vim.trim(mark[4].virt_text[1][1]) end
+    end
+  end
+  eq(buffer_support.lines(review.buf), { "Source", "", "" })
+  expand_thread(review, "1")
+  expand_thread(review, "2")
+  for _, body in ipairs({ "First question", "First answer", "Follow-up comment", "Nested question", "Nested answer" }) do
+    vim.api.nvim_win_set_cursor(review.win, { assert(buffer_support.find_row(review.buf, body)), 0 })
+    toggle()
+    eq(summary(), "▸ 2 questions · 1 comment")
+    eq(buffer_support.lines(review.buf), { "Source", "", "Separate comment" })
+    toggle()
+    eq(vim.api.nvim_get_current_line(), "First question")
+  end
+  vim.api.nvim_win_set_cursor(review.win, { assert(buffer_support.find_row(review.buf, "Separate comment")), 0 })
+  toggle()
+  eq(summary(), "▸ 0 questions · 1 comment")
+  assert(buffer_support.find_row(review.buf, "Nested answer"))
+  eq({ vim.bo[review.buf].modified, host.saves }, { false, 0 })
 end
 
 T["answer arrives after cursor leaves question"] = function()
@@ -495,6 +545,7 @@ T["prose comment preserves both selected range endpoints"] = function()
   reopen(scene)
   eq(scene.comments.capture(scene.review.buf)[1].source, comment.source,
     { fail_reason = "reopening changed the comment's source range" })
+  expand_thread(scene.review, comment.id)
   assert(row_containing(scene, comment.source.body) > row_containing(scene, requirement),
     "range comment moved before the end of its selected source")
 end
@@ -507,6 +558,7 @@ T["comment over a visual selection leaves Visual mode for the editor"] = functio
   local heading_row = vim.api.nvim_win_get_cursor(scene.review.win)[1]
   keymap.feed("V" .. string.rep("<Down>", row_containing(scene, requirement, heading_row) - heading_row))
   eq(vim.api.nvim_get_mode().mode, "V")
+  local selected_lines = vim.fn.getregion(vim.fn.getpos("v"), vim.fn.getpos("."), { type = "V" })
   local inserted = 0
   local original_cmd = vim.cmd
   vim.cmd = setmetatable({}, { __index = original_cmd, __call = function(_, command)
@@ -517,6 +569,9 @@ T["comment over a visual selection leaves Visual mode for the editor"] = functio
   keymap.invoke("C", { buffer = scene.review.buf, mode = "x" })
   vim.cmd = original_cmd
   eq({ vim.api.nvim_get_mode().mode, inserted }, { "n", 1 })
+  local quote = vim.tbl_map(function(line) return line == "" and ">" or "> " .. line end, selected_lines)
+  vim.list_extend(quote, { "", "" })
+  eq(vim.api.nvim_buf_get_lines(0, 0, -1, true), quote)
   finish_input({ "Selected range" })
   local comment = scene.comments.capture(scene.review.buf)[1]
   assert(comment and comment.source.end_line > comment.source.start_line, "the comment lost its selected range")
@@ -546,11 +601,14 @@ T["unsaved comment survives closing and reopening the plan"] = function()
   keymap.feed("q")
   eq(vim.api.nvim_get_current_tabpage(), scene.review.return_tab, { fail_reason = "dirty PlanReview did not return to Harness" })
   scene.review = scene.host.open()
+  eq(scene.review.owner.comment_state.range_list[1].folded, true)
+  expand_thread(scene.review, comment.id)
   assert(buffer_support.text(scene.review.buf):find(comment.source.body, 1, true), "reopening discarded the unsaved comment")
   assert(vim.bo[scene.review.buf].modified, "reopening cleared the unsaved marker")
   save(scene)
   assert(not scene.review.owner.saving, "reopened comment did not save")
   reopen(scene)
+  expand_thread(scene.review, comment.id)
   assert(buffer_support.text(scene.review.buf):find(comment.source.body, 1, true), "saving discarded the recovered comment")
   assert(not vim.bo[scene.review.buf].modified, "saved recovered comment remained dirty")
 end

@@ -175,7 +175,7 @@ M.view_specs = {
     { id = "entity_info", label = "info", desc = "Show the selected entity's captured definition", modes = "n", pinned = false },
     { id = "schema", label = "schema", desc = "Show the canonical plan document as JSON", modes = "n", pinned = false },
     { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = false },
-    { id = "toggle", label = "fold", desc = "Toggle the current declaration diff file or hunk", modes = "n", pinned = false },
+    { id = "toggle", label = "fold", desc = "Fold or expand the current comment thread, plan heading, file, or hunk", modes = "n", pinned = false },
     { id = "open", label = "open", desc = "Jump to the selected definition or open the source file", modes = "n", pinned = false },
     { id = "comment", label = "comment", desc = "Comment on the plan selection or follow up in a comment card", modes = { "n", "x" }, visual = true, pinned = false },
     { id = "question", label = "ask", desc = "Ask about the plan selection or follow up in a comment card", modes = { "n", "x" }, visual = true, pinned = false },

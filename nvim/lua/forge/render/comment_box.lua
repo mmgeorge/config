@@ -30,6 +30,7 @@ local display_text = require("forge.render.display_text")
 local M = {}
 
 ---@class ForgeCommentBoxLines : table[]
+---@field inner_width integer
 ---@field reply_start_row? integer
 ---@field reply_start_list? integer[]
 ---@field markdown_rows table<integer, { first_col: integer, end_col: integer, starts_body: boolean }>
@@ -141,6 +142,7 @@ function M.build_box_lines(desc, win_width, style)
 
   local box_lines = {}
   box_lines.markdown_rows = {}
+  box_lines.inner_width = inner_width
   box_lines[#box_lines + 1] = {
     { pad .. (desc.continuation and "├─" or "╭─"), style.border },
     { heading, style.heading },

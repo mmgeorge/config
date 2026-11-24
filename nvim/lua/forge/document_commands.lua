@@ -83,6 +83,16 @@ function M.selection_lines(session)
   return vim.fn.getregion(vim.fn.getpos("v"), vim.fn.getpos("."), { type = mode })
 end
 
+--- Format selected content for a composer and leave a blank line for the response.
+---@param lines string[]
+---@return string[]
+function M.quote_lines(lines)
+  local quote = {}
+  for _, line in ipairs(lines) do quote[#quote + 1] = line == "" and ">" or "> " .. line end
+  vim.list_extend(quote, { "", "" })
+  return quote
+end
+
 ---Own visual selection and copying of native diff gutters for any document view.
 ---@param session table
 ---@param options { normalize: boolean }

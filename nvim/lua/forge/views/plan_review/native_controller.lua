@@ -38,9 +38,10 @@ end
 
 ---@param review table
 ---@param on_projected fun()
-local function toggle_task_fold(review, on_projected)
+local function toggle_fold(review, on_projected)
   local view = review.owner.current_view()
   if not view then return end
+  if require("forge.draft_comments").toggle_thread_fold(review.buf, view.window) then return end
   require("forge.nodes").toggle_heading(review.owner.replica, view.window, {
     on_projected = on_projected,
   })
@@ -384,7 +385,7 @@ end
 
 local function commands(review)
   local set = command_set.new()
-  command_set.register(set, "toggle", function() toggle_task_fold(review, function() action(review, "toggle_declaration") end) end)
+  command_set.register(set, "toggle", function() toggle_fold(review, function() action(review, "toggle_declaration") end) end)
   command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
   command_set.register(set, "delete_tests", function() delete_tests(review) end)
   command_set.register(set, "checks", function()
@@ -446,6 +447,7 @@ function M.open(plan, options)
       previous.win = vim.api.nvim_get_current_win()
       previous.tab = vim.api.nvim_get_current_tabpage()
       previous.owner.refresh_views()
+      if not window then require("forge.draft_comments").fold_all_threads(previous.buf) end
       return
     end
     if not previous.owner.closed then

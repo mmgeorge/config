@@ -32,6 +32,7 @@ function M.attach(options, callback)
   local open_started = options.open_started or perf.now()
   local plan_key = options.session_id .. "\0" .. options.plan.id
   local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_get_generation(), views = {}, pending_operation = {} }
+  local folded_thread
   local symbol_namespace = vim.api.nvim_create_namespace("forge.plan_review.symbols")
   local delivery = {}
   local function alive()
@@ -401,6 +402,7 @@ function M.attach(options, callback)
         end_source_line = item.source.end_line, body = item.source.body, kind = item.kind, parent_id = item.parent_id,
         heading = item.kind == "question" and "Plan question" or nil }
     end
+    if not folded_thread then folded_thread = comments.folded_roots(annotation) end
     owner.comment_state = nil
     local source = assert(opened.source_row, "Plan review source rows are missing")
     owner.source = source
@@ -461,7 +463,7 @@ function M.attach(options, callback)
       if owner.comment_state and options.configure_view then options.configure_view(owner.view, owner) end
       local ranges = require("forge.views.plan_review.markdown").ranges(source, projection)
       for _, window in ipairs(vim.fn.win_findbuf(options.buffer)) do
-        require("forge.render.harness.markdown").render(options.buffer, window, ranges, projection.markdown_regions)
+        require("forge.render.harness.markdown").render(options.buffer, window, ranges)
       end
     end
     owner.comment_state = nil
@@ -475,6 +477,7 @@ function M.attach(options, callback)
       readonly = options.plan.historical_revision ~= nil,
       markdown = true,
       popup_input = true,
+      folded_thread = folded_thread,
       guard_source = true,
     }, mark_phase)
     if mark_phase then mark_phase("source_paint_ms") end
@@ -644,8 +647,7 @@ function M.attach(options, callback)
     owner.views[window] = view
     if owner.projection then
       require("forge.render.harness.markdown").render(options.buffer, window,
-        require("forge.views.plan_review.markdown").ranges(owner.source, owner.projection),
-        owner.projection.markdown_regions)
+        require("forge.views.plan_review.markdown").ranges(owner.source, owner.projection))
     end
     if owner.ready and alive() then
       request({ operation = "plan_view", document = owner.document, view = view.id, width = owner.source_width }, function(result, failure)

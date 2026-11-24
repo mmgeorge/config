@@ -8,29 +8,34 @@ local popup = require("forge.infra.popup_window")
 ---@param save fun()
 function M.open(target, question, save)
   local parent = target.window
-  local row, indent, width = target.placement()
+  local row, indent, width, offset = target.placement()
   if not row or not indent or not width then return end
-  if vim.api.nvim_get_mode().mode:match("^[vVsS\22\19]") then vim.cmd("normal! " .. vim.keycode("<Esc>")) end
+  local quote
+  if vim.api.nvim_get_mode().mode:match("^[vV\22]") then
+    local commands = require("forge.document_commands")
+    quote = commands.quote_lines(commands.selection_lines())
+    vim.cmd("normal! " .. vim.keycode("<Esc>"))
+  end
   local heading = question and "Plan question" or target.heading
-  local function reveal(footer)
+  local function reveal(footer, row_offset)
     local parent_height = vim.api.nvim_win_get_height(parent)
     local height = math.max(1, math.min(4, parent_height - 4))
     vim.api.nvim_win_set_cursor(parent, { footer + 1, 0 })
     vim.api.nvim_win_call(parent, function()
       vim.cmd("normal! zz")
-      if parent_height - vim.fn.winline() < height + 2 then vim.cmd("normal! zt") end
+      if parent_height - vim.fn.winline() < height + 1 + row_offset then vim.cmd("normal! zt") end
     end)
     return height
   end
-  local height = reveal(row)
-  local buf, win = popup.open({ parent_win = parent, bufpos = { row, 0 }, row = 1, col = indent,
+  local height = reveal(row, offset or 1)
+  local buf, win = popup.open({ parent_win = parent, bufpos = { row, 0 }, row = offset or 1, col = indent,
     width = width, height = height, title = heading, filetype = "ForgePlanCommentInput", wrap = true, linebreak = true })
   local function reposition()
     if not vim.api.nvim_win_is_valid(win) then return end
-    local footer, left, interior = target.placement()
+    local footer, left, interior, below = target.placement()
     if footer and left and interior then
       vim.api.nvim_win_set_config(win, { relative = "win", win = parent, bufpos = { footer, 0 },
-        col = left, row = 1, width = interior, height = reveal(footer) })
+        col = left, row = below or 1, width = interior, height = reveal(footer, below or 1) })
     end
   end
   target.state.reposition_input = reposition
@@ -58,6 +63,10 @@ function M.open(target, question, save)
   vim.keymap.set("n", "<CR>", function() finish(false) end, { buffer = buf, desc = "Keep draft in plan review" })
   vim.keymap.set("n", "<Esc>", cancel, { buffer = buf, desc = "Cancel draft" })
   vim.keymap.set({ "n", "i" }, "<C-c>", cancel, { buffer = buf, desc = "Cancel draft" })
+  if quote then
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, quote)
+    vim.api.nvim_win_set_cursor(win, { #quote, 0 })
+  end
   vim.cmd("startinsert")
 end
 

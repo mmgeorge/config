@@ -14,6 +14,7 @@ local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
 -- requires-forge-host
 T["directory_planning"] = function()
+  vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/render-markdown.nvim")
   local started = host.start({ config = true })
   local workspace = temp.directory("planning-workspace")
   vim.fn.writefile({ '{"checks":{}}' }, workspace .. "/.forge.json")
@@ -114,13 +115,28 @@ T["directory_planning"] = function()
   local function add_message(key, source, message)
     assert(vim.fn.search(source, "cw") > 0, "annotation source is missing")
     keymap.invoke(key, { buffer = review.buf })
-    finish_input({ message })
+    finish_input(vim.split(message, "\n", { plain = true }))
     local draft = comments.capture(review.buf)
     return draft[#draft].id
   end
   local question_body = "Why does this declaration need its own file?"
   local question_id = add_message("A", "/// Apply the requested behavior", question_body)
-  add_message("C", "pub fn requested_change", "Keep this declaration.")
+  add_message("C", "pub fn requested_change", "Keep this declaration.\n\nKeep its documentation.\n\n```rust\nuse scene::Scene;\n```")
+  vim.api.nvim_win_set_cursor(review.win, { assert(buffer.find_row(review.buf, "Keep this declaration.")), 0 })
+  vim.cmd("normal! 0")
+  local content_column = vim.fn.wincol()
+  vim.cmd("normal! j0")
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = review.buf })
+  MiniTest.expect.equality(vim.api.nvim_get_current_line(), "")
+  MiniTest.expect.equality(vim.fn.wincol(), content_column, { fail_reason = "the blank comment row placed the cursor outside its gutter" })
+  local rendered
+  require("forge.render.harness.markdown").after_render(review.buf, function(done) rendered = done end)
+  wait_until(function() return rendered ~= nil end, "comment Markdown did not settle")
+  local fence_row = assert(buffer.find_row(review.buf, "use scene::Scene;")) - 2
+  local layout_namespace = vim.api.nvim_get_namespaces()["render-markdown.nvim"]
+  local fence_marks = vim.api.nvim_buf_get_extmarks(review.buf, layout_namespace, { fence_row, 0 }, { fence_row, -1 }, { details = true })
+  assert(vim.iter(fence_marks):any(function(mark) return mark[4].virt_text or mark[4].conceal end),
+    "expanded comment displayed a literal Rust fence")
   local draft = comments.capture(review.buf)
   assert(vim.fn.search([[src/change\.rs]], "cw") > 0)
   keymap.invoke("U", { buffer = review.buf })
@@ -139,6 +155,11 @@ T["directory_planning"] = function()
     assert(buffer.find_row(review.buf, "Generating response"), "the moved question lost its progress row")
     MiniTest.expect.equality(comments.capture(review.buf), draft)
   end
+  local progress_row = assert(buffer.find_row(review.buf, "Generating response"))
+  vim.api.nvim_win_set_cursor(review.win, { progress_row, 0 })
+  keymap.invoke("<Tab>", { buffer = review.buf })
+  MiniTest.expect.equality(buffer.find_row(review.buf, question_body), nil, { fail_reason = "Tab inside the pending answer did not fold the question thread" })
+  assert(buffer.find_row(review.buf, "Keep this declaration."), "folding the question hid another comment")
   answer:release()
   wait_until(function()
     local reply = review.owner.reply_by_id[question_id]
@@ -146,6 +167,10 @@ T["directory_planning"] = function()
   end, "moved file's comment and question did not save and receive an answer", { errors = errors })
   local reply = review.owner.reply_by_id[question_id]
   MiniTest.expect.equality(reply.question_body, question_body)
+  MiniTest.expect.equality(buffer.find_row(review.buf, question_body), nil)
+  MiniTest.expect.equality(vim.bo[review.buf].modified, false)
+  MiniTest.expect.equality(comments.capture(review.buf), draft)
+  keymap.invoke("<Tab>", { buffer = review.buf })
   local question_row = assert(buffer.find_row(review.buf, question_body), "moved question is missing")
   assert(buffer.find_row(review.buf, "Mock response:", { first_row = question_row + 1 }),
     "answer did not render below the moved question")
@@ -153,9 +178,15 @@ T["directory_planning"] = function()
   vim.api.nvim_win_set_cursor(review.win, { question_row, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = review.buf })
   MiniTest.expect.equality(buffer.lines(review.buf), boxed_lines, { fail_reason = "hovering opened the saved question for editing" })
-  keymap.invoke("C", { buffer = review.buf })
+  local answer_line = buffer.line(review.buf, question_row + 1)
+  assert(vim.startswith(reply.body, answer_line) and vim.startswith(answer_line, "Mock response:"))
+  vim.cmd("normal! 0Vj")
+  MiniTest.expect.equality(vim.fn.getregion(vim.fn.getpos("v"), vim.fn.getpos("."), { type = "V" }),
+    { question_body, answer_line }, { fail_reason = "card decorations entered the native line selection" })
+  keymap.invoke("C", { buffer = review.buf, mode = "x" })
   local composer = vim.api.nvim_get_current_buf()
   MiniTest.expect.equality(vim.bo[composer].filetype, "ForgePlanCommentInput")
+  MiniTest.expect.equality(buffer.lines(composer), { "> " .. question_body, "> " .. answer_line, "", "" })
   keymap.invoke("<Esc>", { buffer = composer })
   MiniTest.expect.equality(comments.capture(review.buf), draft)
   toggle_file()
@@ -166,6 +197,12 @@ T["directory_planning"] = function()
   MiniTest.expect.equality(comments.capture(review.buf), draft)
   MiniTest.expect.equality(review.owner.reply_by_id[question_id], reply)
   assert(not vim.bo[review.buf].modifiable, "reviewed declarations became an editable proposal")
+  toggle_file()
+  wait_until(declaration_visible, "reopened review did not show the declaration")
+  MiniTest.expect.equality(buffer.find_row(review.buf, question_body), nil, { fail_reason = "reopened plan expanded an existing comment" })
+  MiniTest.expect.equality(#review.owner.comment_state.range_list, 2)
+  for _, range in ipairs(review.owner.comment_state.range_list) do MiniTest.expect.equality(range.folded, true) end
+  toggle_file()
   local function schema()
     local result, failure, done
     review.owner.action("schema", function(value, problem) result, failure, done = value, problem, true end)
@@ -626,6 +663,153 @@ T["plan_test_delete"] = function()
   assert(opened == 1 and closed == 0, "subsequent deletion reopened the native document")
 end
 
+T["card navigation and native visual selection exclude the frame"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.api.nvim_ui_attach(72, 28, { rgb = true })
+  child.lua([[vim.api.nvim__inspect_cell(1, 0, 0)]])
+  child.lua([[
+    vim.opt.rtp:prepend(...)
+    vim.api.nvim_set_hl(0, "Normal", { fg = 0xffffff, bg = 0x000000 })
+    vim.api.nvim_set_hl(0, "Visual", { bg = 0x123456 })
+    local buf, win = vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win()
+    require("forge.draft_comments").attach(buf, win, { "plan" }, {
+      { id = "1", source_line = 1, body = "Why café?", replies = {
+        { heading = "Thought for 3 seconds", body_lines = { "Because.", "", "Last line." } },
+      } },
+    }, { markdown = true, popup_input = true })
+    vim.api.nvim_win_set_cursor(win, { 2, 0 })
+  ]], { vim.fs.normalize(vim.fn.fnamemodify("nvim", ":p")) })
+  child.api.nvim_win_set_cursor(0, { 3, 0 })
+  local content_column = child.fn.wincol()
+  child.type_keys("j", "0")
+  MiniTest.expect.equality(child.fn.wincol(), content_column)
+  for _, motion in ipairs({ "h", "l", "$", "0" }) do
+    child.type_keys(motion)
+    MiniTest.expect.equality(child.fn.wincol(), content_column, { fail_reason = "blank row after " .. motion })
+  end
+  child.type_keys("v", "y")
+  MiniTest.expect.equality(child.fn.getreg('"'), "\n")
+  child.type_keys("V", "y")
+  MiniTest.expect.equality(child.fn.getreg('"', 1, true), { "" })
+  child.type_keys("v", "j", "y")
+  MiniTest.expect.equality(child.fn.getreg('"', 1, true), { "", "L" })
+  child.api.nvim_win_set_cursor(0, { 3, 4 })
+  child.type_keys("j", "j")
+  MiniTest.expect.equality(child.api.nvim_win_get_cursor(0), { 5, 4 })
+  MiniTest.expect.equality(child.lua_get("vim.wo.virtualedit"), "")
+  child.type_keys("k", "v")
+  child.lua([[
+    local target = assert(require("forge.draft_comments").input_target(vim.api.nvim_get_current_buf()))
+    require("forge.views.plan_review.comment_input").open(target, false, function() end)
+  ]])
+  MiniTest.expect.equality(child.api.nvim_buf_get_lines(0, 0, -1, true), { ">", "", "" })
+  child.type_keys("<C-c>")
+  child.api.nvim_win_set_cursor(0, { 2, 0 })
+  child.type_keys("0", "h")
+  MiniTest.expect.equality(child.api.nvim_win_get_cursor(0), { 2, 0 })
+  child.type_keys("V", "j")
+  local painted = child.lua([[
+    vim.cmd("redraw!")
+    local position = vim.fn.screenpos(vim.api.nvim_get_current_win(), 2, 1)
+    local function cell(line, column)
+      local value = vim.api.nvim__inspect_cell(1, line - 1, column - 1)
+      assert(value and value[2], vim.inspect({ position, line, column, value }))
+      return value
+    end
+    return {
+      body = cell(position.row, position.curscol)[2].background,
+      border = cell(position.row, position.curscol - 2)[2].background == 0x123456,
+      padding = cell(position.row, position.curscol + 12)[2].background == 0x123456,
+      divider = cell(position.row + 1, position.curscol)[2].background == 0x123456,
+    }
+  ]])
+  MiniTest.expect.equality(painted, { body = 0x123456, border = false, padding = false, divider = false })
+  child.type_keys("y")
+  MiniTest.expect.equality(child.fn.getreg('"', 1, true), { "Why café?", "Because." })
+  child.type_keys("0", "w", "v", "e", "y")
+  MiniTest.expect.equality(child.fn.getreg('"'), "café")
+
+  -- A reversed character selection captures exactly its UTF-8 bytes for the popup.
+  child.type_keys("e", "v", "b")
+  child.lua([[
+    local target = assert(require("forge.draft_comments").input_target(vim.api.nvim_get_current_buf()))
+    _G.card_parent = target.window
+    require("forge.views.plan_review.comment_input").open(target, true, function() end)
+  ]])
+  MiniTest.expect.equality(child.api.nvim_buf_get_lines(0, 0, -1, true), { "> café", "", "" })
+  MiniTest.expect.equality(child.api.nvim_win_get_cursor(0), { 3, 0 })
+  local placement = child.lua([[
+    vim.cmd("redraw!")
+    local last = vim.fn.screenpos(card_parent, 5, 1)
+    local popup = vim.api.nvim_win_get_position(0)
+    local footer = vim.api.nvim__inspect_cell(1, last.row, last.curscol - 3)
+    return { footer[1], popup[1] - last.row, popup[2] - (last.curscol - 3) }
+  ]])
+  MiniTest.expect.equality(placement, { "╰", 1, 0 })
+end
+
+T["expanded answer paints fenced Rust inside the card borders"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  child.api.nvim_ui_attach(100, 32, { rgb = true })
+  child.lua([[vim.api.nvim__inspect_cell(1, 0, 0)]])
+  child.lua([[
+    vim.opt.runtimepath:prepend(...)
+    local plugins = vim.fn.stdpath("data") .. "/lazy/"
+    vim.opt.runtimepath:append(plugins .. "render-markdown.nvim")
+    vim.opt.runtimepath:append(plugins .. "nvim-treesitter/runtime")
+    vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/site")
+    require("render-markdown").setup({})
+    vim.api.nvim_set_hl(0, "@markup.strong.markdown_inline", { fg = "#22cc44", bold = true })
+    vim.api.nvim_set_hl(0, "@keyword.import.rust", { fg = "#ffcc22" })
+    vim.api.nvim_set_hl(0, "@string.rust", { fg = "#1199ff" })
+    vim.api.nvim_set_hl(0, "ForgeWalkthroughComment", { fg = "#999999" })
+    local buf, win = vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win()
+    vim.bo[buf].filetype = "ForgePlan"
+    local code = 'use scene::Scene;'
+    local lines = { "```rust", code, 'let a = "source";', "```" }
+    local source = vim.tbl_map(function(line) return { text = line, metadata = { markdown = true } } end, lines)
+    local renderer = require("forge.render.harness.markdown")
+    require("forge.draft_comments").attach(buf, win, lines, {
+      { id = "q", source_line = 2, body = "Show **both** versions.", replies = {
+        { heading = "Thought for 7 seconds", body_lines = {
+          "Current code", "```rust", "use engine::scene::Scene;", 'let a = "before";', "```",
+          "Proposed code", "```rust", code, 'let a = "after";', "```",
+        } },
+      } },
+    }, { markdown = true, popup_input = true, after_render = function(_, _, projection)
+      renderer.render(buf, win, require("forge.views.plan_review.markdown").ranges(source, projection))
+    end })
+    renderer.after_render(buf, function(done) _G.rendered = done end)
+  ]], { vim.fs.normalize(vim.fn.fnamemodify("nvim", ":p")) })
+  wait_until(function() return child.lua_get("rendered == true") end, "Rust answer did not render")
+  local cells = child.lua([[
+    vim.cmd("redraw!")
+    local function cell(row, col)
+      return vim.api.nvim__inspect_cell(1, row - 1, col - 1)
+    end
+    local function color(row, col)
+      local pos = vim.fn.screenpos(vim.api.nvim_get_current_win(), row, col)
+      return cell(pos.row, pos.curscol)[2].foreground
+    end
+    local result = { color(2, 1), color(6, 1), color(7, 10), color(11, 1), color(12, 10), color(14, 10), color(3, 8) }
+    for _, row in ipairs({ 5, 10 }) do
+      local pos = vim.fn.screenpos(vim.api.nvim_get_current_win(), row, 1)
+      local text = {}
+      for col = 5, 88 do text[#text + 1] = cell(pos.row, col)[1] end
+      result[#result + 1] = { cell(pos.row, 3)[1], table.concat(text):find("```", 1, true) == nil,
+        table.concat(text):find("rust", 1, true) ~= nil, cell(pos.row, 88)[1] }
+    end
+
+    return result
+  ]])
+  MiniTest.expect.equality(cells, { 0xffcc22, 0xffcc22, 0x1199ff, 0xffcc22, 0x1199ff, 0x1199ff, 0x22cc44,
+    { "│", true, true, "│" }, { "│", true, true, "│" } })
+end
+
 T["question_preserves_fenced_code_rendering"] = function()
   vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/render-markdown.nvim")
   require("render-markdown").setup({})
@@ -643,6 +827,8 @@ T["question_preserves_fenced_code_rendering"] = function()
       }, "\n"), duration_ms = 1000 } },
   }
   local review = plan_host.open()
+  vim.api.nvim_win_set_cursor(review.win, { review.owner.comment_state.range_list[1].first_row + 1, 0 })
+  keymap.invoke("<Tab>", { buffer = review.buf })
   local function wait_for_markdown()
     local rendered
     require("forge.render.harness.markdown").after_render(review.buf, function(success) rendered = success end)
@@ -682,15 +868,18 @@ T["question_preserves_fenced_code_rendering"] = function()
   local namespace = vim.api.nvim_get_namespaces()["render-markdown.nvim"]
   local closing_row = assert(buffer.find_row(review.buf, "local after = 2"))
   local next_fence_row = assert(buffer.find_row(review.buf, "```text")) - 1
-  local before_row = assert(buffer.find_row(review.buf, "local before = 1")) - 1
-  local after_row = closing_row - 1
+  local question_row = assert(buffer.find_row(review.buf, question)) - 1
+  local answer_fence = assert(buffer.find_row(review.buf, example)) - 2
   local concealed = {}
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, { details = true })) do
-    MiniTest.expect.equality(mark[2] > before_row and mark[2] < after_row, false, {
-      fail_reason = function() return vim.inspect(mark) end,
-    })
+    if mark[2] == question_row then
+      MiniTest.expect.no_equality(mark[4].hl_group, "RenderMarkdownCode",
+        { fail_reason = "the surrounding plan fence painted its code background over the question" })
+    end
     if mark[4].conceal == "" then concealed[mark[2]] = true end
   end
+  MiniTest.expect.equality(concealed[answer_fence], true)
+  MiniTest.expect.equality(concealed[answer_fence + 2], true)
   MiniTest.expect.equality(concealed[closing_row], true)
   MiniTest.expect.equality(concealed[next_fence_row], true)
 

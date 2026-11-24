@@ -3164,10 +3164,7 @@ local function ask_about_selection()
   elseif #tail == 1 or tail[1] == "" then
     start = count - 1
   end
-  for _, line in ipairs(lines) do
-    quote[#quote + 1] = line == "" and ">" or "> " .. line
-  end
-  vim.list_extend(quote, { "", "" })
+  vim.list_extend(quote, require("forge.document_commands").quote_lines(lines))
   vim.api.nvim_buf_set_lines(buffer, start, count, true, quote)
   vim.api.nvim_win_set_cursor(window, { start + #quote, 0 })
   layout.resize_composer(buffer, window)

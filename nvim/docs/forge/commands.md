@@ -1286,7 +1286,15 @@ While a planning response is running, follow-up instructions can revise and resu
 in that same response. A later edit requires a new submission before review. Submission never
 authorizes implementation.
 Press `A` to ask a question or `C` to add a comment on a plan line or selection.
-On any row of a comment card, either key starts a follow-up to the selected message.
+Inside a comment card, the cursor moves through the question, comment, and answer text.
+Markdown renders inside the card, including syntax highlighting for fenced examples
+when the language parser is installed. Visual selections and yanks skip the card headings,
+dividers, padding, and borders.
+Existing threads start folded when you open the plan. Each summary shows its question
+and comment counts. Press `Tab` on the summary to expand it, or anywhere in the thread
+to fold it again. On blank lines inside a card, the cursor stops at the text column.
+Pressing either key with a selection quotes it in the popup and places the cursor on a
+blank line below it. A selection within a thread follows up on the message at the cursor.
 The card stays boxed as you move through it. Plan Review scrolls to the bottom of its
 thread and opens a multiline input aligned with the card's borders.
 In Insert mode, `Enter` adds a line. `Ctrl-S` or `:write` saves feedback and submits
