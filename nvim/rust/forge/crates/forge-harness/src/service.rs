@@ -59,6 +59,7 @@ mod question_event_test;
 mod question_wait_test;
 mod reconnect;
 mod review_questions;
+mod review_standby;
 #[cfg(test)]
 mod session_observation_test;
 mod settings_defaults;
@@ -256,6 +257,7 @@ impl HarnessService {
         &self,
         session_id: Option<String>,
         request: crate::buffer::session::PresentationRequest,
+        sink: &MessageSender,
     ) -> Result<Value> {
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
@@ -426,6 +428,8 @@ impl HarnessService {
                 }
                 admission.check()?;
                 controller.plan_review.restore_presentation(&mut source)?;
+                let warm = !source.is_historical() && source.document.design.is_some();
+                let review_id = document.clone();
                 let document = crate::plan::review_document::ReadOnlyPlanReview::new(
                     document.clone(),
                     view.clone(),
@@ -433,7 +437,13 @@ impl HarnessService {
                     width.clone(),
                     focused_annotation.clone(),
                 )?;
-                return controller.plan_review.insert(document, admission);
+                let opened = controller.plan_review.insert(document, admission)?;
+                if warm {
+                    review_standby::activate(&registry, &controller, review_id, sink).await;
+                } else {
+                    registry.review_standby.lock().await.close_view(&session_id, &review_id);
+                }
+                return Ok(opened);
             }
             crate::buffer::session::PresentationRequest::PlanBody {
                 document,
@@ -513,6 +523,7 @@ impl HarnessService {
             }
             crate::buffer::session::PresentationRequest::PlanClose { document } => {
                 controller.plan_review.close(document).await?;
+                registry.review_standby.lock().await.close_view(&session_id, document);
                 return Ok(json!({}));
             }
             _ => {}
@@ -1067,6 +1078,7 @@ impl HarnessService {
         tokio::time::timeout(deadline, async {
             let registry = self.registry.lock().await.clone();
             if let Some(registry) = &registry {
+                review_standby::shutdown(registry).await?;
                 registry.runtime.lsp.close();
                 let controllers: Vec<_> = registry
                     .controller_by_id
@@ -1970,6 +1982,7 @@ struct SessionControllerRegistry {
     /// Serialize replacing failed owners, so concurrent resumes stop one controller once.
     reopen: Mutex<()>,
     provider_fork_by_id: RwLock<HashMap<String, Arc<ProviderForkGate>>>,
+    review_standby: Mutex<review_standby::ReviewStandbyPool>,
     fork_task: Mutex<JoinSet<()>>,
     /// The editor connection, retained from requests so work no request started, such as a
     /// message one session sends another, can publish the events it causes.
@@ -2045,6 +2058,7 @@ impl SessionControllerRegistry {
             controller_by_id: RwLock::new(initial.into_iter().collect()),
             reopen: Mutex::new(()),
             provider_fork_by_id: RwLock::new(HashMap::new()),
+            review_standby: Mutex::default(),
             fork_task: Mutex::new(JoinSet::new()),
             client_sink: std::sync::Mutex::new(None),
             runtime,
@@ -2818,7 +2832,7 @@ async fn route_request(
             .await;
     }
     if method == RuntimeMethod::SessionPlanQuestionAnswer {
-        return review_questions::answer(registry, controller, session_id, request, message_sink)
+        return review_questions::answer(registry, controller, request, message_sink)
             .await;
     }
     if method == RuntimeMethod::SessionProviderMockResponse {
@@ -2851,7 +2865,9 @@ async fn route_request(
         return local_configuration::apply(&controller, &request, message_sink).await;
     }
     if native_settings::handles(&request) {
-        return native_settings::apply(&controller, &request, message_sink).await;
+        native_settings::apply(&controller, &request, message_sink).await?;
+        review_standby::refresh_open(&registry, message_sink).await;
+        return Ok(());
     }
     if compaction::handles(&request) {
         drop(admission.take());
@@ -3360,6 +3376,7 @@ async fn delete_session(
         controller.input_stopping.store(true, Ordering::Release);
         controller.coordinator.submissions.changed.notify_one();
     }
+    registry.review_standby.lock().await.close_session(&target);
     let deleted = delete_stopping_session(&registry, &target, selected.as_ref()).await;
     if let Err(error) = deleted {
         // A stopping controller has closed its exchange owner and refuses every request, and

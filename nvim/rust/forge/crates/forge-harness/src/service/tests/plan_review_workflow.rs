@@ -2144,3 +2144,199 @@ async fn review_asks_reuse_the_comment_chain_session() -> Result<()> {
     }
     fixture.finish().await
 }
+
+/// Open an editable review and observe its idle provider binding before any question is sent.
+#[tokio::test]
+async fn plan_tab_warms_an_idle_answer_fork() -> Result<()> {
+    use crate::buffer::session::PresentationRequest;
+    use forge_buffer::identity::{DocumentId, ViewId};
+    let fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    let mut settings = crate::settings::SettingsStore::open(&fixture.controller.data_root)?;
+    let workspace = fixture.root.path().to_string_lossy();
+    let revision = settings
+        .get(&workspace, &fixture.session_id, "mock")?
+        .revision;
+    settings.save_provider(
+        revision,
+        "mock",
+        &json!({"ask_model":{"model":"mock-alternate","effort":"low"}}),
+    )?;
+    let document = DocumentId("warm-review".into());
+    let view = ViewId("review".into());
+    let opened = fixture
+        .service
+        .document(
+            Some(fixture.session_id.clone()),
+            PresentationRequest::PlanOpen {
+                document: document.clone(),
+                view: view.clone(),
+                plan_id: plan.id.clone(),
+                digest: plan.review_digest.clone().unwrap(),
+                revision: None,
+                width: Default::default(),
+                expanded_files: Default::default(),
+                focused_annotation: None,
+                saved_source_digest: None,
+            },
+            &fixture.sink,
+        )
+        .await?;
+    let registry = fixture.service.registry().await?;
+    let ready_child = |excluded: Option<String>| {
+        let registry = registry.clone();
+        let source = fixture.session_id.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(child) = registry.review_standby.lock().await.ready_child(&source)
+                        && Some(&child.observer.session_id().to_owned()) != excluded.as_ref()
+                    {
+                        return child.observer.session_id().to_owned();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("review has no ready standby")
+        }
+    };
+    let first = ready_child(None).await?;
+    assert!(fixture.store()?.list_exchange(&first)?.is_empty());
+    let snapshot: forge_buffer::patch::BufferSnapshot =
+        serde_json::from_value(opened["snapshot"].clone())?;
+    let block = &snapshot.block[0];
+    let target = &block.metadata.target[0];
+    let input = json!({"document":document,"view":view,"revision":snapshot.revision,"sequence":1,
+        "action":"session.plan.question.answer","block":block.id,"position":target.range.start,"target":target.id});
+    fixture.dispatch(44,"session.plan.question.answer",json!({"review":input,
+        "draft_source_digest":opened["saved_source_digest"],"draft_annotation":[{"id":"first","kind":"question",
+        "source":{"start_line":1,"end_line":1,"body":"Explain the objective."}}]})).await?;
+    assert_eq!(fixture.store()?.list_exchange(&first)?.len(), 1);
+    let spare = ready_child(Some(first.clone())).await?;
+    assert!(fixture.store()?.list_exchange(&spare)?.is_empty());
+    // Only thinking effort changes. This external save sends no configure event to this host.
+    let revision = settings
+        .get(&registry.initialize.workspace, &fixture.session_id, "mock")?
+        .revision;
+    settings.save_provider(
+        revision,
+        "mock",
+        &json!({"ask_model":{"model":"mock-alternate","effort":"high"}}),
+    )?;
+    let mut annotations = fixture.response(44).await?["result"]["annotation"]
+        .as_array()
+        .unwrap()
+        .clone();
+    annotations.push(json!({"id":"second","kind":"question","source":{"start_line":1,"end_line":1,"body":"How does this work?"}}));
+    fixture
+        .dispatch(
+            45,
+            "session.plan.question.answer",
+            json!({"review":input,"draft_source_digest":opened["saved_source_digest"],
+        "draft_annotation":annotations,"question_ids":["second"]}),
+        )
+        .await?;
+    let replacement = ready_child(Some(spare.clone())).await?;
+    assert!(fixture.store()?.list_exchange(&spare)?.is_empty());
+    let controllers = registry.controller_by_id.read().await.clone();
+    let mut answering = Vec::new();
+    for child in controllers.keys().filter(|id| *id != &fixture.session_id) {
+        if let Some(exchange) = fixture.store()?.latest_exchange(child)? {
+            answering.push(child.clone());
+            if child != &first {
+                let model = exchange.turn.last().unwrap().resolved_model().unwrap();
+                assert_eq!(model.model_id.as_str(), "mock-alternate");
+                assert_ne!(child, &replacement);
+            }
+        }
+    }
+    assert_eq!(answering.len(), 2);
+    annotations.push(
+        json!({"id":"followup","parent_id":"first","kind":"question",
+        "source":{"start_line":1,"end_line":1,"body":"Explain the first answer."}}),
+    );
+    fixture
+        .dispatch(
+            46,
+            "session.plan.question.answer",
+            json!({"review":input,"draft_source_digest":opened["saved_source_digest"],
+        "draft_annotation":annotations,"question_ids":["followup"]}),
+        )
+        .await?;
+    assert_eq!(fixture.store()?.list_exchange(&first)?.len(), 2);
+    assert_eq!(
+        registry
+            .review_standby
+            .lock()
+            .await
+            .ready_child(&fixture.session_id)
+            .unwrap()
+            .observer
+            .session_id(),
+        replacement
+    );
+    fixture
+        .service
+        .document(
+            Some(fixture.session_id.clone()),
+            PresentationRequest::PlanClose { document },
+            &fixture.sink,
+        )
+        .await?;
+    super::super::review_standby::shutdown(&registry).await?;
+    assert!(
+        !registry
+            .controller_by_id
+            .read()
+            .await
+            .contains_key(&replacement)
+    );
+    assert!(!registry.controller_by_id.read().await.contains_key(&spare));
+    assert!(registry.controller_by_id.read().await.contains_key(&first));
+    fixture.finish().await
+}
+
+/// A request admitted before its standby worker is polled takes the ordinary fork path.
+#[tokio::test]
+async fn opening_standby_does_not_delay_a_new_chain() -> Result<()> {
+    use super::super::review_standby;
+    use forge_buffer::identity::DocumentId;
+    let fixture = ReviewFixture::open(true).await?;
+    let registry = fixture.service.registry().await?;
+    let (selection, _) = fixture.controller.broker.lock().await.review_settings()?;
+    let document = DocumentId("pending-review".into());
+    review_standby::activate(
+        &registry,
+        &fixture.controller,
+        document.clone(),
+        &fixture.sink,
+    )
+    .await;
+    // This current-thread test has not yielded to the spawned preparation worker.
+    assert!(
+        registry
+            .review_standby
+            .lock()
+            .await
+            .ready_child(&fixture.session_id)
+            .is_none()
+    );
+    let chain = uuid::Uuid::new_v4();
+    let child = review_standby::claim(
+        &registry,
+        &fixture.controller,
+        chain,
+        &selection,
+        &fixture.sink,
+    )
+    .await?;
+    assert_eq!(child.observer.session_id(), chain.to_string());
+    registry
+        .review_standby
+        .lock()
+        .await
+        .close_view(&fixture.session_id, &document);
+    review_standby::shutdown(&registry).await?;
+    fixture.finish().await
+}

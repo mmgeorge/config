@@ -1382,6 +1382,19 @@ impl ProviderBridge {
         }
     }
 
+    /// Inspect an already open binding without waiting for an opening or retiring owner.
+    pub(crate) fn ready_binding(&self, owner: &ThreadOwner) -> Option<BindingId> {
+        let sessions = self.sessions.try_lock().ok()?;
+        let session = sessions.get(owner)?;
+        session.ensure_resource_admission().ok()?;
+        let bound = session.initialized.get()?;
+        (self
+            .binding_source_status(&bound.binding.id, owner, None)
+            .ok()?
+            == NativeBindingStatus::Active)
+            .then(|| bound.binding.id.clone())
+    }
+
     /// Open or resume native history without creating an exchange.
     pub async fn thread_open(
         &self,

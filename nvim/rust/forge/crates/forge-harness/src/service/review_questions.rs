@@ -5,7 +5,6 @@ use crate::plan::review_answer::ReviewAnswerScope;
 pub(super) async fn answer(
     registry: Arc<SessionControllerRegistry>,
     source: Arc<SessionController>,
-    session_id: String,
     request: Request,
     message_sink: &MessageSender,
 ) -> Result<()> {
@@ -26,7 +25,6 @@ pub(super) async fn answer(
     for (answer_session, questions) in chains {
         let registry = Arc::clone(&registry);
         let source = Arc::clone(&source);
-        let session_id = session_id.clone();
         let document = document.clone();
         let selection = selection.clone();
         let message_sink = message_sink.clone();
@@ -39,8 +37,14 @@ pub(super) async fn answer(
             .clone();
         pending.spawn(async move {
             let _turn = lane.lock().await;
-            let child =
-                open_answer_session(&registry, &session_id, answer_session, &message_sink).await?;
+            let child = review_standby::claim(
+                &registry,
+                &source,
+                answer_session,
+                &selection,
+                &message_sink,
+            )
+            .await?;
             for question in questions {
                 if !source.plan_review.question_pending(&document, &question)? {
                     continue;
@@ -74,7 +78,7 @@ pub(super) async fn answer(
 }
 
 /// Resume the chain's durable provider binding, or fork the source for its first Ask.
-async fn open_answer_session(
+pub(super) async fn open_answer_session(
     registry: &Arc<SessionControllerRegistry>,
     source: &str,
     answer_session: uuid::Uuid,

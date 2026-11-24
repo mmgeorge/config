@@ -367,9 +367,11 @@ async fn settings(
             params: json!({"operation_id":operation_id,"action":"configure","config":{"settings_revision":mutation.revision,"setting_fields":mutation.field}}),
         };
         native_settings::apply(&controller, &request, message_sink).await?;
+        review_standby::refresh_open(&registry, message_sink).await;
         return Ok(());
     }
     message_sink.send_response(Response::success(request.id, json!({"id":operation_id,"state":"saved","revision":mutation.revision,"restart_required":false}))?).await?;
+    review_standby::refresh_open(&registry, message_sink).await;
     Ok(())
 }
 

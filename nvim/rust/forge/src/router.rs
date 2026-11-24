@@ -615,7 +615,7 @@ impl HostRouter {
                 let result = self
                     .host
                     .harness
-                    .document(envelope.session_id, params)
+                    .document(envelope.session_id, params, sink)
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }

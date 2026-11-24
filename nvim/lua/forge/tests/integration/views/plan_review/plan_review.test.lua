@@ -804,10 +804,12 @@ T["expanded answer paints fenced Rust inside the card borders"] = function()
         table.concat(text):find("rust", 1, true) ~= nil, cell(pos.row, 88)[1] }
     end
 
+    local last_code = vim.fn.screenpos(vim.api.nvim_get_current_win(), 12, 1)
+    result[#result + 1] = { cell(last_code.row + 1, 3)[1], cell(last_code.row + 1, 88)[1] }
     return result
   ]])
   MiniTest.expect.equality(cells, { 0xffcc22, 0xffcc22, 0x1199ff, 0xffcc22, 0x1199ff, 0x1199ff, 0x22cc44,
-    { "│", true, true, "│" }, { "│", true, true, "│" } })
+    { "│", true, true, "│" }, { "│", true, true, "│" }, { "╰", "╯" } })
 end
 
 T["question_preserves_fenced_code_rendering"] = function()

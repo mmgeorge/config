@@ -5,7 +5,7 @@ use crate::provider::{ProviderModel, ServiceTier};
 use crate::session::HarnessSession;
 
 /// Overrides the planning model only for forked Plan Review answers.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AskModel {
     #[serde(skip_serializing_if = "Option::is_none")]
