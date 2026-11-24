@@ -10,6 +10,7 @@ local display_text = require("forge.render.display_text")
 ---@field stale_note string? optional dim note appended below the body
 ---@field replies { heading: string, body_lines: string[] }[]? read-only reply sub-rows
 ---@field continuation boolean? Share the preceding message's bottom border as an internal divider.
+---@field markdown boolean? Preserve fenced examples and describe Markdown content spans.
 
 ---@class ForgeCommentDescriptor : ForgeCommentBoxContent
 ---@field id string? stable identity; drives focus dispatch (required for editable surfaces)
@@ -31,6 +32,7 @@ local M = {}
 ---@class ForgeCommentBoxLines : table[]
 ---@field reply_start_row? integer
 ---@field reply_start_list? integer[]
+---@field markdown_rows table<integer, { first_col: integer, end_col: integer, starts_body: boolean }>
 
 M.box_max_inner_width = 84
 
@@ -55,7 +57,34 @@ local function truncate_display(value, width)
   return split.prefix .. "…"
 end
 
-M.wrap_text = display_text.wrap
+--- Wrap prose while preserving the authored lines and spacing in fenced examples.
+---@param lines string[]
+---@param width integer
+---@param markdown boolean?
+---@return string[]
+function M.wrap_body(lines, width, markdown)
+  if not markdown then return display_text.wrap(table.concat(lines, "\n"), width) end
+  if #lines == 0 then return { "" } end
+  local wrapped, fence = {}, nil
+  for _, line in ipairs(lines) do
+    local marker, rest = line:match("^ ? ? ?(```+)(.*)$")
+    if not marker then marker, rest = line:match("^ ? ? ?(~~~+)(.*)$") end
+    if fence then
+      wrapped[#wrapped + 1] = line
+      if marker and marker:sub(1, 1) == fence:sub(1, 1) and #marker >= #fence and vim.trim(rest) == "" then
+        fence = nil
+      end
+    elseif marker and (marker:sub(1, 1) == "~" or not rest:find("`", 1, true)) then
+      wrapped[#wrapped + 1] = line
+      fence = marker
+    elseif vim.fn.strdisplaywidth(line, 4) <= width then
+      wrapped[#wrapped + 1] = line
+    else
+      vim.list_extend(wrapped, display_text.wrap(line, width))
+    end
+  end
+  return wrapped
+end
 
 --- Builds styled row segment lists representing a framed comment box.
 --- Wraps content text to the computed inner column budget.
@@ -65,14 +94,21 @@ M.wrap_text = display_text.wrap
 ---@return ForgeCommentBoxLines box_lines Rendered rows and reply boundaries.
 function M.build_box_lines(desc, win_width, style)
   style = style or M.default_style
+  local pad = "  "
+  local body_prefix = pad .. "│ "
+  local body_column = desc.markdown and vim.fn.strdisplaywidth(body_prefix) or 0
   local inner_width = math.max(4, math.min(M.box_max_inner_width, (tonumber(win_width) or 80) - 8))
   local content_width = math.max(1, inner_width - 2)
 
-  ---@type { text: string, hl: string, divider?: boolean }[]
+  ---@type { text: string, hl: string, divider?: boolean, markdown?: boolean, starts_body?: boolean }[]
   local content = {}
-  for _, line in ipairs(display_text.wrap(table.concat(desc.body_lines or {}, "\n"), content_width)) do
-    content[#content + 1] = { text = line, hl = style.body }
+  local function append_body(lines)
+    for index, line in ipairs(M.wrap_body(lines, content_width, desc.markdown)) do
+      content[#content + 1] = { text = line, hl = style.body, markdown = desc.markdown, starts_body = index == 1 }
+      if desc.markdown then inner_width = math.max(inner_width, vim.fn.strdisplaywidth(line, body_column) + 2) end
+    end
   end
+  append_body(desc.body_lines or {})
   local reply_content_start
   local reply_start_list = {}
   for _, reply in ipairs(desc.replies or {}) do
@@ -85,9 +121,7 @@ function M.build_box_lines(desc, win_width, style)
         divider = true,
       }
     end
-    for _, line in ipairs(display_text.wrap(table.concat(reply.body_lines or {}, "\n"), content_width)) do
-      content[#content + 1] = { text = line, hl = style.body }
-    end
+    append_body(reply.body_lines or {})
   end
   if desc.stale_note then
     content[#content + 1] = { text = "", hl = style.body }
@@ -99,8 +133,8 @@ function M.build_box_lines(desc, win_width, style)
   local heading = truncate_display(tostring(desc.heading or ""), math.max(1, inner_width - 3))
   local heading_width = vim.fn.strdisplaywidth(heading)
 
-  local pad = "  "
   local box_lines = {}
+  box_lines.markdown_rows = {}
   box_lines[#box_lines + 1] = {
     { pad .. (desc.continuation and "├─" or "╭─"), style.border },
     { heading, style.heading },
@@ -117,9 +151,15 @@ function M.build_box_lines(desc, win_width, style)
         { "─┤", style.border },
       }
     else
-      local fill = (" "):rep(math.max(inner_width - vim.fn.strdisplaywidth(row.text) - 2, 0))
+      local row_width = vim.fn.strdisplaywidth(row.text, body_column)
+      local fill = (" "):rep(math.max(inner_width - row_width - 2, 0))
+      if row.markdown then
+        box_lines.markdown_rows[#box_lines + 1] = {
+          first_col = #body_prefix, end_col = #body_prefix + #row.text, starts_body = row.starts_body,
+        }
+      end
       box_lines[#box_lines + 1] = {
-        { pad .. "│ ", style.border },
+        { body_prefix, style.border },
         { row.text .. fill, row.hl },
         { " │", style.border },
       }

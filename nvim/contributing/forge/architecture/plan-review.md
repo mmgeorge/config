@@ -53,8 +53,10 @@ The plan keeps an ordered `manual_changes` list of review edits no planner promp
 
 The annotation projection inserts comment and answer rows into the review buffer.
 Consecutive Markdown source rows stay in one Tree-sitter region across those gaps.
-The parser and Markdown decorations skip annotation rows, so a code fence keeps
-its syntax and closing delimiter when a question or comment appears inside it.
+Each compact comment and read-only answer has its own syntax region. The projection
+includes its body bytes and newlines, so Tree-sitter omits box padding, borders,
+headings, and reply dividers. Markdown block layout applies to the plan source.
+Fenced examples inside annotations keep their authored spacing.
 
 Annotations attach to a source line, and `Ctrl-S` saves feedback and submits unanswered questions. `draft_comments.add_at_cursor` gives a new annotation a `parent_id` only on an answer row, which makes it a follow-up in that question's thread; inside an annotation's own rows it focuses that annotation for editing instead, so the key never stacks a second comment on the same line. A save collapses each saved comment the cursor was editing, with its thread, into the same box as every other saved comment, and `draft_comments.saved` returns the cursor to the source line the comment annotates: a cursor left inside the collapsed rows focused the thread again on the editor's next `CursorMoved`, so the block just saved reopened as the plain editor while the others kept their boxes. Before each save, `draft_comments.discard_empty` removes every annotation without text that no follow-up names as its parent, so the store never holds an empty comment and a saved comment emptied by an edit is deleted, as an emptied queue entry is. A follow-up question or comment carries its ancestors, oldest first and each with its answer, as conversation context (`ReviewAnnotationStore::thread_context`); its own body follows that context once, and its siblings and its own follow-ups stay out, so every saved comment reaches the revising model exactly once as its own requested change. Revision requests carry structured comment anchors. Feedback formatting finishes before the broker changes plan state, so an invalid anchor cannot drop comments from a revision.
 

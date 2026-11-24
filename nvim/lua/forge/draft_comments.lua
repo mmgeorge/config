@@ -62,6 +62,7 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 ---@field guard? table
 ---@field guard_source boolean
+---@field markdown boolean
 
 ---@class ForgeDraftSourceRow
 ---@field id string
@@ -86,6 +87,7 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field before_render? fun(buf: integer, win: integer?)
 ---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 ---@field guard_source? boolean
+---@field markdown? boolean Render Markdown in compact bodies and read-only replies.
 
 ---@type table<integer, ForgeDraftCommentState>
 local state_by_buf = {}
@@ -277,10 +279,30 @@ end
 ---@field line_list string[]
 ---@field source_row_by_line table<integer, integer>
 ---@field range_list ForgeDraftCommentRange[]
----@field compact_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string }[]
+---@field compact_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string, border_column?: integer }[]
 ---@field source_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string }[]
 ---@field source_record_list { row: integer, source_line: integer, source_index: integer }[]
 ---@field line_meta_list table[]
+---@field markdown_regions Range4[][]
+
+--- Include only body bytes and newlines in each annotation's Markdown parse.
+---@param projection ForgeDraftCommentProjection
+---@param row integer
+---@param first_col integer
+---@param end_col integer
+---@param starts_body boolean
+local function add_markdown_row(projection, row, first_col, end_col, starts_body)
+  local regions = projection.markdown_regions
+  if starts_body then regions[#regions + 1] = {} end
+  local region = regions[#regions]
+  local line_length = #projection.line_list[row + 1]
+  if end_col == line_length then
+    region[#region + 1] = { row, first_col, row + 1, 0 }
+  else
+    if first_col < end_col then region[#region + 1] = { row, first_col, row, end_col } end
+    region[#region + 1] = { row, line_length, row + 1, 0 }
+  end
+end
 
 ---@param state ForgeDraftCommentState
 ---@param width integer
@@ -294,6 +316,7 @@ local function build_projection(state, width)
     source_highlight_list = {},
     source_record_list = {},
     line_meta_list = {},
+    markdown_regions = {},
   }
   local annotation_by_source = {}
   local source_count = math.max(1, #state.source_lines)
@@ -406,6 +429,7 @@ local function build_projection(state, width)
           readonly = annotation.readonly == true,
           replies = replies,
           continuation = shared_divider,
+          markdown = state.markdown,
         }
         local box_lines = comment_box.build_box_lines(descriptor, width + 1)
         reply_start_row = box_lines.reply_start_row and first_row + box_lines.reply_start_row
@@ -424,15 +448,22 @@ local function build_projection(state, width)
           local text, highlight_list = flatten_segmented_line(segmented_line)
           local row = shared_divider and index == 1 and first_row or #projection.line_list
           projection.line_list[row + 1] = text
+          local markdown = box_lines.markdown_rows[index]
+          if markdown then add_markdown_row(projection, row, markdown.first_col, markdown.end_col, markdown.starts_body) end
           projection.line_meta_list[row + 1] = {
             ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}),
           }
-          for _, highlight in ipairs(highlight_list) do
+          for highlight_index, highlight in ipairs(highlight_list) do
+            local border_column
+            if markdown and highlight_index == #highlight_list and vim.fn.strdisplaywidth(text) <= width then
+              border_column = vim.fn.strdisplaywidth(text:sub(1, highlight.start_col))
+            end
             projection.compact_highlight_list[#projection.compact_highlight_list + 1] = {
               row = row,
               start_col = highlight.start_col,
               end_col = highlight.end_col,
               hl = highlight.hl,
+              border_column = border_column,
             }
           end
         end
@@ -449,12 +480,14 @@ local function build_projection(state, width)
         for reply_index, reply in ipairs(replies or {}) do
           local first_reply_row = #projection.line_list - 1
           projection.line_list[#projection.line_list] = comment_editor.rule_line(" " .. reply.heading .. " ", "", width)
-          local reply_lines = comment_box.wrap_text(table.concat(reply.body_lines or {}, "\n"), width)
-          reply_lines[#reply_lines + 1] = comment_editor.footer_line(width)
-          for _, line in ipairs(reply_lines) do
+          local reply_lines = comment_box.wrap_body(reply.body_lines or {}, width, state.markdown)
+          for index, line in ipairs(reply_lines) do
             projection.line_list[#projection.line_list + 1] = line
             projection.line_meta_list[#projection.line_list] = { ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}) }
+            if state.markdown then add_markdown_row(projection, #projection.line_list - 1, 0, #line, index == 1) end
           end
+          projection.line_list[#projection.line_list + 1] = comment_editor.footer_line(width)
+          projection.line_meta_list[#projection.line_list] = { ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}) }
           projection.range_list[#projection.range_list + 1] = { annotation = annotation, compact = false,
             readonly = true, reply_index = reply_index, first_row = first_reply_row, last_row = #projection.line_list - 1 }
         end
@@ -501,10 +534,19 @@ local function apply_projection(state, projection, mark_phase)
     })
   end
   for _, highlight in ipairs(projection.compact_highlight_list) do
-    vim.api.nvim_buf_set_extmark(state.buf, namespace, highlight.row, highlight.start_col, {
+    local options = {
       end_col = highlight.end_col,
       hl_group = highlight.hl,
-    })
+    }
+    if highlight.border_column then
+      -- Concealed Markdown delimiters change the display width of the body.
+      options.conceal = ""
+      options.virt_text_win_col = highlight.border_column
+      options.virt_text = {
+        { projection.line_list[highlight.row + 1]:sub(highlight.start_col + 1, highlight.end_col), highlight.hl },
+      }
+    end
+    vim.api.nvim_buf_set_extmark(state.buf, namespace, highlight.row, highlight.start_col, options)
   end
   for _, range in ipairs(projection.range_list) do
     range.header_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.first_row, 0, { right_gravity = false })
@@ -742,6 +784,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
     source_provider = opts.source_provider,
     before_render = opts.before_render,
     after_render = opts.after_render,
+    markdown = opts.markdown == true,
     guard_source = opts.guard_source == true,
   }
   state_by_buf[buf] = state

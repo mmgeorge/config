@@ -627,32 +627,54 @@ T["question_preserves_fenced_code_rendering"] = function()
   vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/render-markdown.nvim")
   require("render-markdown").setup({})
   local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
-  local question = "Why is this a local?"
+  local question = "Why **local** here?"
+  local example = '    local example = "two  spaces"'
   local plan_host = plan_review_host.start({ markdown = true, lines = {
     "```lua", "local before = 1", "local after = 2", "```", "", "See usage below.",
     "", "```text", "application command", "```",
   } })
   plan_host.annotation = {
     { id = "question", kind = "question", source = { start_line = 2, end_line = 2, body = question },
-      reply = { question_body = question, body = "The function owns it.", duration_ms = 1000 } },
+      reply = { question_body = question, body = table.concat({
+        "Call `example()` like this.", "", "```lua", example, "```",
+      }, "\n"), duration_ms = 1000 } },
   }
   local review = plan_host.open()
-  local rendered
-  require("forge.render.harness.markdown").after_render(review.buf, function(success) rendered = success end)
-  wait_until(function() return rendered ~= nil end, "plan Markdown did not finish rendering")
-  MiniTest.expect.equality(rendered, true)
+  local function wait_for_markdown()
+    local rendered
+    require("forge.render.harness.markdown").after_render(review.buf, function(success) rendered = success end)
+    wait_until(function() return rendered ~= nil end, "plan Markdown did not finish rendering")
+    MiniTest.expect.equality(rendered, true)
+  end
+  wait_for_markdown()
 
   local parser = vim.treesitter.get_parser(review.buf, "markdown")
   local lua = assert(parser:children().lua, "the code fence did not inject Lua")
-  local rows = {}
+  local code_by_row = {}
   for _, tree in pairs(lua:trees()) do
     for _, range in ipairs(tree:included_ranges(true)) do
       for row = range[1], range[4] - (range[5] == 0 and 1 or 0) do
-        rows[#rows + 1] = buffer.line(review.buf, row + 1)
+        local line = buffer.line(review.buf, row + 1)
+        local first = row == range[1] and range[2] or 0
+        local last = row == range[4] and range[5] or #line
+        if first < last then code_by_row[row] = (code_by_row[row] or "") .. line:sub(first + 1, last) end
       end
     end
   end
-  MiniTest.expect.equality(rows, { "local before = 1", "local after = 2" })
+  local code_rows = vim.tbl_keys(code_by_row)
+  table.sort(code_rows)
+  MiniTest.expect.equality(vim.tbl_map(function(row) return code_by_row[row] end, code_rows),
+    { "local before = 1", example, "local after = 2" })
+
+  local function has_capture(text, language, name)
+    local row = assert(buffer.find_row(review.buf, text)) - 1
+    local col = assert(buffer.line(review.buf, row + 1):find(text, 1, true)) - 1
+    return vim.iter(vim.treesitter.get_captures_at_pos(review.buf, row, col)):any(function(capture)
+      return capture.lang == language and capture.capture == name
+    end)
+  end
+  MiniTest.expect.equality(has_capture("local** here?", "markdown_inline", "markup.strong"), true)
+  MiniTest.expect.equality(has_capture("example()`", "markdown_inline", "markup.raw"), true)
 
   local namespace = vim.api.nvim_get_namespaces()["render-markdown.nvim"]
   local closing_row = assert(buffer.find_row(review.buf, "local after = 2"))
@@ -661,11 +683,19 @@ T["question_preserves_fenced_code_rendering"] = function()
   local after_row = closing_row - 1
   local concealed = {}
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, { details = true })) do
-    MiniTest.expect.equality(mark[2] > before_row and mark[2] < after_row, false)
+    MiniTest.expect.equality(mark[2] > before_row and mark[2] < after_row, false, {
+      fail_reason = function() return vim.inspect(mark) end,
+    })
     if mark[4].conceal == "" then concealed[mark[2]] = true end
   end
   MiniTest.expect.equality(concealed[closing_row], true)
   MiniTest.expect.equality(concealed[next_fence_row], true)
+
+  local comments = require("forge.draft_comments")
+  assert(comments.focus(review.buf, "question"))
+  wait_for_markdown()
+  MiniTest.expect.equality(has_capture("example()`", "markdown_inline", "markup.raw"), true)
+  MiniTest.expect.equality(has_capture('local example = "two  spaces"', "lua", "keyword"), true)
 end
 
 return T

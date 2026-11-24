@@ -1059,8 +1059,8 @@ name an existing directory. Failed saves retain the draft. Read and write lists
 are independent, and neither changes sandbox settings.
 After saving a question, its answer block shows
 `Generating response · <model> · Thinking: <effort>`. Leaving and returning to the
-block preserves the pending status and the eventual answer. Comments and
-questions inside a fenced example preserve its code formatting. Closing PlanReview
+block preserves the pending status and the eventual answer. Plan Review formats
+Markdown and highlights fenced code in compact comments and answers. Closing PlanReview
 while an answer, save, or review edit is running keeps the review open with the notice
 "Plan review stays open until its running answers and edits finish."
 If the buffer is forcibly closed, completed answers remain available after reopening.

@@ -461,7 +461,7 @@ function M.attach(options, callback)
       if owner.comment_state and options.configure_view then options.configure_view(owner.view, owner) end
       local ranges = require("forge.views.plan_review.markdown").ranges(source, projection)
       for _, window in ipairs(vim.fn.win_findbuf(options.buffer)) do
-        require("forge.render.harness.markdown").render(options.buffer, window, ranges)
+        require("forge.render.harness.markdown").render(options.buffer, window, ranges, projection.markdown_regions)
       end
     end
     owner.comment_state = nil
@@ -473,6 +473,7 @@ function M.attach(options, callback)
       baseline = recovered and baseline or nil,
       focused_id = focused_id,
       readonly = options.plan.historical_revision ~= nil,
+      markdown = true,
       guard_source = true,
     }, mark_phase)
     if mark_phase then mark_phase("source_paint_ms") end
@@ -642,7 +643,8 @@ function M.attach(options, callback)
     owner.views[window] = view
     if owner.projection then
       require("forge.render.harness.markdown").render(options.buffer, window,
-        require("forge.views.plan_review.markdown").ranges(owner.source, owner.projection))
+        require("forge.views.plan_review.markdown").ranges(owner.source, owner.projection),
+        owner.projection.markdown_regions)
     end
     if owner.ready and alive() then
       request({ operation = "plan_view", document = owner.document, view = view.id, width = owner.source_width }, function(result, failure)

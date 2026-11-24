@@ -430,8 +430,9 @@ end
 ---@param buf integer Target buffer number.
 ---@param win integer? Target window handle.
 ---@param range_list ForgeMarkdownRange[] Array of zero-based line ranges.
-function M.render(buf, win, range_list)
-  if #range_list == 0 then
+---@param syntax_regions? Range4[][] Additional regions for Tree-sitter highlighting.
+function M.render(buf, win, range_list, syntax_regions)
+  if #range_list == 0 and not (syntax_regions and #syntax_regions > 0) then
     M.clear(buf)
     return
   end
@@ -444,11 +445,16 @@ function M.render(buf, win, range_list)
   if not parser_ok or not parser then return end
   perf.trace("harness", "ui.markdown.regions", { buf = buf, count = #range_list }, function()
     -- Preserve source coordinates while excluding non-Markdown and folded transcript content.
+    local regions = parser_region_list(range_list)
+    if syntax_regions then vim.list_extend(regions, vim.deepcopy(syntax_regions)) end
     ---@diagnostic disable-next-line: invisible
-    pcall(parser.set_included_regions, parser, parser_region_list(range_list))
+    pcall(parser.set_included_regions, parser, regions)
     -- An annotation edit can shift included ranges without invalidating the Markdown tree.
     -- Recompute injections in case the edit interrupted parsing before their trees were built.
-    if vim.iter(range_list):any(function(range) return range.continues_region end) then parser:invalidate() end
+    if syntax_regions and #syntax_regions > 0
+      or vim.iter(range_list):any(function(range) return range.continues_region end) then
+      parser:invalidate()
+    end
   end)
   local epoch = (render_epoch[buf] or 0) + 1
   render_epoch[buf] = epoch
@@ -556,7 +562,7 @@ function M.render(buf, win, range_list)
       -- editor provides it, and render-markdown's built-in handler renders it unconverted.
       local math_handler = require("forge.integrations.markdown_math").module("display_handler")
       local math_handler_by_language = math_handler and { markdown = math_handler, latex = math_handler.latex } or {}
-      for _, language in ipairs({ "markdown", "latex" }) do
+      for _, language in ipairs({ "markdown", "markdown_inline", "latex" }) do
         state.custom_handlers[language] = handler(state.custom_handlers[language]
           or math_handler_by_language[language]
           or require("render-markdown.handler." .. language))
