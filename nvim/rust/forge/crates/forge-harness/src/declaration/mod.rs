@@ -235,6 +235,13 @@ struct RustAccess<'scope> {
     macro_namespace: bool,
 }
 
+/// Track exact member visits and wildcard searches on the current recursion branch.
+#[derive(Default)]
+struct RustLookup {
+    members: HashSet<String>,
+    wildcards: HashMap<(String, Vec<String>, String, bool), usize>,
+}
+
 fn accessible(
     visibility: SymbolVisibility,
     package: &str,
@@ -521,6 +528,7 @@ impl DeclarationResolver {
     }
 
     fn load_rust(&mut self, path: &Path, package: &str, module: &[String]) -> Result<()> {
+        crate::plan::resolution_deadline::ResolutionDeadline::check()?;
         enum ModuleStep {
             Load(PathBuf, Vec<String>),
             Conditional(Vec<String>),
@@ -674,6 +682,7 @@ impl DeclarationResolver {
         }
         for file in files {
             for reference in &file.index.reference {
+                crate::plan::resolution_deadline::ResolutionDeadline::check()?;
                 if reference.macro_namespace {
                     continue;
                 }
@@ -688,6 +697,7 @@ impl DeclarationResolver {
                 );
             }
             for import in &file.index.import {
+                crate::plan::resolution_deadline::ResolutionDeadline::check()?;
                 if import.conditional {
                     continue;
                 }
@@ -716,7 +726,7 @@ impl DeclarationResolver {
                             navigation: false,
                             macro_namespace: false,
                         },
-                        &mut HashSet::new(),
+                        &mut RustLookup::default(),
                     );
                     if matches!(result, DeclarationResolution::Invalid { .. }) {
                         self.resolve_rust_path(
@@ -730,7 +740,7 @@ impl DeclarationResolver {
                                 navigation: false,
                                 macro_namespace: false,
                             },
-                            &mut HashSet::new(),
+                            &mut RustLookup::default(),
                         )
                     } else {
                         result
@@ -838,7 +848,7 @@ impl DeclarationResolver {
                             navigation: true,
                             macro_namespace: false,
                         },
-                        &mut HashSet::new(),
+                        &mut RustLookup::default(),
                     )
                 };
             }
@@ -1280,7 +1290,7 @@ impl DeclarationResolver {
                     navigation,
                     macro_namespace: reference.macro_namespace,
                 },
-                &mut HashSet::new(),
+                &mut RustLookup::default(),
             );
             let bound = reference.path.first().is_some_and(|name| {
                 self.rust_bound(
@@ -1321,7 +1331,7 @@ impl DeclarationResolver {
                     navigation,
                     macro_namespace: reference.macro_namespace,
                 },
-                &mut HashSet::new(),
+                &mut RustLookup::default(),
             );
         }
         if !reference.value_namespace && reference.path.len() == 1 && rust_primitive(first) {
@@ -1363,7 +1373,7 @@ impl DeclarationResolver {
         path: &[String],
         value: bool,
         origin: RustAccess<'_>,
-        visited: &mut HashSet<String>,
+        visited: &mut RustLookup,
     ) -> DeclarationResolution {
         let Some(first) = path.first().map(String::as_str) else {
             return invalid("empty Rust import path");
@@ -1446,21 +1456,24 @@ impl DeclarationResolver {
         path: &[String],
         value: bool,
         origin: RustAccess<'_>,
-        visited: &mut HashSet<String>,
+        visited: &mut RustLookup,
     ) -> DeclarationResolution {
+        if crate::plan::resolution_deadline::ResolutionDeadline::check().is_err() {
+            return unverified("plan resolution expired");
+        }
         if self.trace.is_some() {
             self.work.member_calls += 1;
-            self.work.max_depth = self.work.max_depth.max(visited.len());
+            self.work.max_depth = self.work.max_depth.max(visited.members.len());
         }
         let key = format!("{package}:{}:{}:{value}", scope.join("::"), path.join("::"));
-        if visited.len() > 256 || !visited.insert(key.clone()) {
+        if visited.members.len() > 256 || !visited.members.insert(key.clone()) {
             if self.trace.is_some() {
                 self.work.cycle_or_depth_stops += 1;
             }
             return unverified("cyclic or excessively deep re-export chain");
         }
         let result = self.rust_member_inner(package, scope, path, value, origin, visited);
-        visited.remove(&key);
+        visited.members.remove(&key);
         result
     }
 
@@ -1471,7 +1484,7 @@ impl DeclarationResolver {
         path: &[String],
         value: bool,
         origin: RustAccess<'_>,
-        visited: &mut HashSet<String>,
+        visited: &mut RustLookup,
     ) -> DeclarationResolution {
         for depth in 0..=scope.len() {
             let module = &scope[..depth];
@@ -1599,6 +1612,14 @@ impl DeclarationResolver {
                 origin.navigation,
             );
         }
+        // A wildcard must resolve its source module before it can supply this name.
+        // Re-entering the same wildcard lookup with a growing suffix cannot locate that module.
+        let wildcard = (package.to_owned(), scope.to_vec(), first.clone(), value);
+        let previous = visited.wildcards.get(&wildcard).copied();
+        if previous.is_some_and(|length| path.len() >= length) {
+            return self.missing_rust(package, first);
+        }
+        visited.wildcards.insert(wildcard.clone(), path.len());
         for file in &files {
             let Some(relative) = scope.strip_prefix(file.module.as_slice()) else {
                 continue;
@@ -1634,6 +1655,11 @@ impl DeclarationResolver {
                 );
                 results.push(self.exported_resolution(result, import.visibility));
             }
+        }
+        if let Some(length) = previous {
+            visited.wildcards.insert(wildcard, length);
+        } else {
+            visited.wildcards.remove(&wildcard);
         }
         combine(
             results,

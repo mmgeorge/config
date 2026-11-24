@@ -1296,6 +1296,7 @@ and planned exports, and asks for confirmation before applying; a name that alre
 exists in the scope is refused. Turning a check off and back on, or a planner that writes
 Windows line endings, does not count as a change to the plan.
 Every new Plan task starts with automatic acceptance off.
+Forge gives automated plan resolution ten seconds. If it expires, the agent receives a Harness bug diagnostic asking it to stop and report the error. Your draft stays available. Time spent reviewing a submitted revision is outside this limit.
 Use `/plan accept on` or `/plan accept off` at any time during a Plan or Execute task
 to change automatic acceptance without interrupting the agent. The winbar appends `pa`
 while it is on. Turning it on while a plan awaits review accepts that revision at once;

@@ -1,3 +1,4 @@
+use crate::plan::resolution_deadline::{LIMIT, ResolutionDeadline};
 use crate::plan::{PlanState, render_plan, validate_workspace_references};
 use crate::tools::ControlToolDefinition;
 use crate::tools::error::ToolContext;
@@ -33,6 +34,10 @@ pub(super) fn definition() -> ControlToolDefinition {
                 ("reason", string_schema()),
                 ("authoring_snapshot", string_schema()),
                 (
+                    "resolution_remaining",
+                    json!({"type":"object","properties":{"secs":{"type":"integer","minimum":0},"nanos":{"type":"integer","minimum":0,"maximum":999999999}},"required":["secs","nanos"],"additionalProperties":false}),
+                ),
+                (
                     "expected_version",
                     json!({ "type": "integer", "minimum": 1 }),
                 ),
@@ -48,7 +53,12 @@ pub(super) async fn execute(
     mut invocation: crate::tools::ControlToolInvocation,
     output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
+    let deadline = ResolutionDeadline::new(LIMIT);
     runtime.require_editable_plan()?;
+    crate::tools::error::ensure!(
+        invocation.arguments.get("resolution_remaining").is_none(),
+        "the plan resolution budget is owned by Harness"
+    );
     crate::tools::error::ensure!(
         invocation.arguments.get("authoring_snapshot").is_none(),
         "authoring snapshot identities are owned by Harness, not tool arguments"
@@ -62,7 +72,8 @@ pub(super) async fn execute(
         let requested = invocation.arguments["plan_id"]
             .as_str()
             .context("submission requires a plan ID")?;
-        let (original, mut document) = authoring.snapshot()?;
+        let capture = authoring.clone();
+        let (original, mut document) = deadline.process(move || capture.snapshot()).await?;
         runtime.plan_document = Some(document.clone());
         crate::tools::error::ensure!(
             document.plan_id == requested,
@@ -73,22 +84,33 @@ pub(super) async fn execute(
             .workspace_root
             .as_deref()
             .context("submission requires a workspace")?;
-        let validated = document
-            .design
-            .as_ref()
-            .context("submission requires semantic structure")?
-            .validated(workspace, &document.title)
+        let validated = deadline
+            .wait(
+                document
+                    .design
+                    .as_ref()
+                    .context("submission requires semantic structure")?
+                    .validated(workspace, &document.title),
+            )
             .await?;
         let mut warnings = validated.warnings();
         let mut design = validated.into_design();
-        warnings
-            .extend(planned_test_warnings(&runtime.context, &mut design, document.version).await?);
+        warnings.extend(
+            deadline
+                .wait(planned_test_warnings(
+                    &runtime.context,
+                    &mut design,
+                    document.version,
+                ))
+                .await?,
+        );
         let warnings = grouped_warnings(warnings);
         document.design = Some(design);
         document.validate_for_submission()?;
         let snapshot = authoring.snapshot_save(&document)?;
         invocation.arguments["expected_version"] = json!(original.version);
         invocation.arguments["authoring_snapshot"] = json!(snapshot);
+        invocation.arguments["resolution_remaining"] = json!(deadline.remaining()?);
         runtime.plan_document = Some(document);
         runtime.context.plan_state = Some(PlanState::AwaitingReview);
         return Ok(crate::tools::ControlToolResult {
@@ -125,16 +147,25 @@ pub(super) async fn execute(
             .as_deref()
             .context("design submission has no workspace root")?;
         let design = if runtime.context.execution.is_some() {
-            design
-                .validated_revision(workspace, &document.title)
+            deadline
+                .wait(design.validated_revision(workspace, &document.title))
                 .await?
         } else {
-            design.validated(workspace, &document.title).await?
+            deadline
+                .wait(design.validated(workspace, &document.title))
+                .await?
         };
         let mut warnings = design.warnings();
         let mut design = design.into_design();
-        warnings
-            .extend(planned_test_warnings(&runtime.context, &mut design, document.version).await?);
+        warnings.extend(
+            deadline
+                .wait(planned_test_warnings(
+                    &runtime.context,
+                    &mut design,
+                    document.version,
+                ))
+                .await?,
+        );
         let mut submitted = document.clone();
         let warnings = grouped_warnings(warnings);
         submitted.design = Some(design);
@@ -151,6 +182,7 @@ pub(super) async fn execute(
                     baseline: Box::new(document.clone()),
                     document: Box::new(submitted),
                     reason: reason.into(),
+                    resolution_remaining: deadline.remaining()?,
                 })
                 .await?;
             let generation = response["generation"]
@@ -184,6 +216,7 @@ pub(super) async fn execute(
                 message,
             });
         }
+        invocation.arguments["resolution_remaining"] = json!(deadline.remaining()?);
         runtime.plan_document = Some(submitted);
         runtime.context.plan_state = Some(PlanState::AwaitingReview);
         let mut message = runtime.plan_version_message("Declaration design submitted for review");
@@ -206,6 +239,7 @@ pub(super) async fn execute(
         .context("plan submission has no workspace root")?;
     validate_workspace_references(document, workspace_root)?;
     render_plan(document)?;
+    invocation.arguments["resolution_remaining"] = json!(deadline.remaining()?);
     runtime.plan_document = Some(document.clone());
     runtime.context.plan_state = Some(PlanState::AwaitingReview);
     Ok(crate::tools::ControlToolResult {

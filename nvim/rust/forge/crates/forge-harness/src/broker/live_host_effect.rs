@@ -43,7 +43,7 @@ fn live_host_failure(error: &anyhow::Error) -> ProviderError {
 pub(crate) struct LiveHostState {
     scope: crate::provider::InvocationScope,
     call_id: forge_provider_api::control::ToolCallId,
-    batch_revision: u64,
+    batch: crate::provider::HostEffectBatch,
     reply: Option<
         tokio::sync::oneshot::Sender<Result<crate::provider::LiveHostCommit, ProviderError>>,
     >,
@@ -60,7 +60,7 @@ impl HarnessBroker {
             &self.session.id,
             "host_effect.lifecycle",
             json!({
-                "scope":live.scope,"call_id":live.call_id,"batch_revision":live.batch_revision,
+                "scope":live.scope,"call_id":live.call_id,"batch_revision":live.batch.revision,
                 "stage":stage,"outcome":outcome,
             }),
         );
@@ -116,7 +116,7 @@ impl HarnessBroker {
             transaction.live_host = Some(LiveHostState {
                 scope: request.scope,
                 call_id: request.call_id,
-                batch_revision: request.batch.revision,
+                batch: request.batch,
                 reply: Some(request.reply),
                 committed: true,
                 plan: None,
@@ -138,7 +138,9 @@ impl HarnessBroker {
                 request.reject(live_host_failure(&error));
                 return Ok(ForegroundAction::Wait);
             }
-            let _ = request.reply.send(Ok(crate::provider::LiveHostCommit));
+            let _ = request
+                .reply
+                .send(Ok(crate::provider::LiveHostCommit::Committed));
             return Ok(ForegroundAction::Wait);
         }
         let prepared = (|| -> Result<_> {
@@ -220,7 +222,7 @@ impl HarnessBroker {
                 transaction.live_host = Some(LiveHostState {
                     scope: request.scope,
                     call_id: request.call_id,
-                    batch_revision: request.batch.revision,
+                    batch: request.batch,
                     reply: Some(request.reply),
                     committed: false,
                     plan: Some(plan),
@@ -248,6 +250,21 @@ impl HarnessBroker {
         else {
             anyhow::bail!("live host effect lost its foreground");
         };
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is::<crate::plan::resolution_deadline::ResolutionTimeout>())
+        {
+            let mut live = transaction
+                .live_host
+                .take()
+                .context("expired plan submission has no owner")?;
+            live.batch.reject();
+            self.trace_live_host(&live, "rejected", "plan_resolution_timeout");
+            if let Some(reply) = live.reply.take() {
+                let _ = reply.send(Ok(crate::provider::LiveHostCommit::ResolutionTimedOut));
+            }
+            return Ok(ForegroundAction::Wait);
+        }
         let live = transaction
             .live_host
             .as_mut()
@@ -345,7 +362,7 @@ impl HarnessBroker {
             .expect("committed live mutation retains its reply");
         self.trace_live_host(&live, "replied", "committed");
         if let Some(reply) = live.reply.take() {
-            let _ = reply.send(Ok(crate::provider::LiveHostCommit));
+            let _ = reply.send(Ok(crate::provider::LiveHostCommit::Committed));
         }
         Ok(ForegroundAction::Wait)
     }
@@ -368,7 +385,7 @@ impl HarnessBroker {
             Ok(_) => {
                 self.trace_live_host(&live, "replied", "committed");
                 if let Some(reply) = live.reply.take() {
-                    let _ = reply.send(Ok(crate::provider::LiveHostCommit));
+                    let _ = reply.send(Ok(crate::provider::LiveHostCommit::Committed));
                 }
                 Ok(ForegroundAction::Wait)
             }
@@ -384,7 +401,7 @@ impl HarnessBroker {
                 );
                 if let Some(reply) = live.reply.take() {
                     let _ = reply.send(if live.committed {
-                        Ok(crate::provider::LiveHostCommit)
+                        Ok(crate::provider::LiveHostCommit::Committed)
                     } else {
                         Err(ProviderError::DeliveryUncertain)
                     });
@@ -421,10 +438,10 @@ impl ForegroundTransaction {
             && let Some(reply) = live.reply.take()
         {
             trace.record(session, "host_effect.lifecycle", json!({"scope":live.scope,"call_id":live.call_id,
-                "batch_revision":live.batch_revision,"stage":"replied",
+                "batch_revision":live.batch.revision,"stage":"replied",
                 "outcome":if live.committed { "committed_publication_pending" } else { "recovery_required" }}));
             let _ = reply.send(if live.committed {
-                Ok(crate::provider::LiveHostCommit)
+                Ok(crate::provider::LiveHostCommit::Committed)
             } else {
                 Err(ProviderError::DeliveryUncertain)
             });

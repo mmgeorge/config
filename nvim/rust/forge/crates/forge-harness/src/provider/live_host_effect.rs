@@ -26,7 +26,10 @@ impl LiveHostEffect {
 ///
 /// The owner adopts any task revision the commit produced into the invocation's task authority
 /// in the commit step itself, so the acknowledgment carries no authority of its own.
-pub(crate) struct LiveHostCommit;
+pub(crate) enum LiveHostCommit {
+    Committed,
+    ResolutionTimedOut,
+}
 
 /// Apply bounded backpressure while the owner commits a callback's logical effects.
 #[derive(Clone)]

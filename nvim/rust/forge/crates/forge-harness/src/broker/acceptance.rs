@@ -2307,6 +2307,7 @@ mod tests {
                     baseline: Box::new(baseline),
                     document: Box::new(document),
                     reason: "Clarify ownership".into(),
+                    resolution_remaining: crate::plan::resolution_deadline::LIMIT,
                 },
                 exchange,
             )

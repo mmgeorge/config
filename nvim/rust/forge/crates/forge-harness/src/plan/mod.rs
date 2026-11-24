@@ -44,6 +44,7 @@ mod deviation;
 mod document;
 mod entry;
 mod question_answer;
+pub(crate) mod resolution_deadline;
 pub(crate) use question_answer::{
     PlanQuestionAnswerCommit, PlanQuestionAnswerError, PlanQuestionAnswerRequest, PlanQuestionOwner,
 };
@@ -1558,6 +1559,7 @@ impl PlanFileStore {
             .context("execution revision has no validation evidence")?
             .ensure_valid()?;
         document.validate_for_submission()?;
+        resolution_deadline::ResolutionDeadline::check()?;
         self.persist_revision(session_id, plan_id, revision, document, Some(current), None)
     }
 
@@ -1573,6 +1575,7 @@ impl PlanFileStore {
         let rendered = measure(trace, "persist.render_plan", || {
             self.render_review(&document)
         })?;
+        resolution_deadline::ResolutionDeadline::check()?;
         self.persist_rendered_revision(
             session_id,
             plan_id,

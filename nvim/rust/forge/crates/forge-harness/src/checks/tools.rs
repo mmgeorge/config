@@ -237,7 +237,9 @@ impl CheckToolScope {
             .unwrap_or_default()
             .require_expiry()?
             .duration();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = crate::plan::resolution_deadline::ResolutionDeadline::restrict(
+            tokio::time::Instant::now() + timeout,
+        );
         let before = tokio::time::timeout_at(
             deadline,
             self.runner.changes.capture(&self.runner.session_id),

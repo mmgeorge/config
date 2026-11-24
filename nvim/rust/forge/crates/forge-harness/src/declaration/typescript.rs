@@ -200,6 +200,9 @@ impl DeclarationResolver {
         exported: bool,
         visited: &mut HashSet<String>,
     ) -> DeclarationResolution {
+        if crate::plan::resolution_deadline::ResolutionDeadline::check().is_err() {
+            return unverified("plan resolution expired");
+        }
         let key = format!(
             "{}:{}:{}:{value}:{exported}",
             path.display(),

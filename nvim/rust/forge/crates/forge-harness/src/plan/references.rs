@@ -158,6 +158,7 @@ impl PlanReferenceIndex {
             lua_index.insert(path.clone(), index);
         }
         for (path, text) in &files {
+            crate::plan::resolution_deadline::ResolutionDeadline::check()?;
             if forge_diff::syntax::ConfigurationFormat::for_path(path).is_some() {
                 continue;
             }
@@ -242,6 +243,7 @@ impl PlanReferenceIndex {
                 }
             }
             for reference in &index.reference {
+                crate::plan::resolution_deadline::ResolutionDeadline::check()?;
                 if let Some(symbol) = if path.ends_with(".lua") {
                     lua_target(path, &reference.path.join("."), &index, &lua_function)
                 } else {
@@ -271,6 +273,7 @@ impl PlanReferenceIndex {
                 }
             }
             for reference in &index.reference {
+                crate::plan::resolution_deadline::ResolutionDeadline::check()?;
                 if reference.conditional {
                     continue;
                 }
@@ -312,6 +315,7 @@ impl PlanReferenceIndex {
                 }
             }
             for import in &index.import {
+                crate::plan::resolution_deadline::ResolutionDeadline::check()?;
                 if let Some(symbol) =
                     identity(resolver.at(path, import.position.line, import.position.column))
                         .or_else(|| {

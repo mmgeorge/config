@@ -225,6 +225,9 @@ pub struct PlanSubmitRequest {
     /// Identify host-captured planning inputs, never a caller-selected filesystem location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) authoring_snapshot: Option<String>,
+    /// Carry unused processing time from tool validation to broker preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolution_remaining: Option<std::time::Duration>,
 }
 
 /// Describes a provider fork after the Harness child identity is allocated.

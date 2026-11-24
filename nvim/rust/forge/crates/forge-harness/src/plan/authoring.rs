@@ -528,6 +528,7 @@ impl PlanFileStore {
             );
         }
         for (path, text) in &inventory {
+            super::resolution_deadline::ResolutionDeadline::check()?;
             if let Some(path) = path.strip_prefix("files/") {
                 super::design::validate_path(path)?;
                 design.proposed_source.insert(path.into(), text.clone());
@@ -851,6 +852,7 @@ fn directory_contents(root: &Path) -> Result<BTreeMap<String, String>> {
     let mut contents = BTreeMap::new();
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
+            super::resolution_deadline::ResolutionDeadline::check()?;
             let entry = entry?;
             let path = entry.path();
             let relative = path

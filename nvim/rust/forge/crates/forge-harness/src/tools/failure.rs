@@ -299,6 +299,10 @@ pub(crate) fn control_tool_failure_text(
     document: Option<&PlanDocument>,
     authoring_directory: Option<&std::path::Path>,
 ) -> String {
+    if let Some(timeout) = find_error::<crate::plan::resolution_deadline::ResolutionTimeout>(error)
+    {
+        return format!("plan_submit: error[harness_plan_resolution_timeout]: {timeout}");
+    }
     let (phase, mut violation) = if let Some(argument_error) =
         find_error::<ControlToolArgumentError>(error)
     {
@@ -410,7 +414,12 @@ pub(crate) fn control_tool_failure_text(
                 fields.retain(|field| {
                     !matches!(
                         field.as_str(),
-                        Some("expected_version" | "authoring_snapshot" | "reason")
+                        Some(
+                            "expected_version"
+                                | "authoring_snapshot"
+                                | "resolution_remaining"
+                                | "reason"
+                        )
                     )
                 });
             }

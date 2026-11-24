@@ -583,6 +583,7 @@ pub enum ExecutionOperation {
         baseline: Box<PlanDocument>,
         document: Box<PlanDocument>,
         reason: String,
+        resolution_remaining: std::time::Duration,
     },
 }
 

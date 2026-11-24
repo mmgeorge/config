@@ -154,8 +154,7 @@ impl ValidatedDesign {
 impl DeclarationDesign {
     /// Validate one submission using only captured declaration evidence.
     pub(crate) async fn validated(&self, workspace: &Path, title: &str) -> Result<ValidatedDesign> {
-        self.check_workspace(workspace)?;
-        self.validated_revision(workspace, title).await
+        self.resolve_submission(workspace, title, true).await
     }
 
     /// Collect every rule the planning model must satisfy in authored declarations: comment
@@ -183,8 +182,40 @@ impl DeclarationDesign {
         workspace: &Path,
         title: &str,
     ) -> Result<ValidatedDesign> {
+        self.resolve_submission(workspace, title, false).await
+    }
+
+    /// Process one captured design, checking workspace identity for pre-execution submissions.
+    async fn resolve_submission(
+        &self,
+        workspace: &Path,
+        title: &str,
+        check_workspace: bool,
+    ) -> Result<ValidatedDesign> {
+        let deadline = super::resolution_deadline::ResolutionDeadline::current();
+        let design = self.clone();
+        let root = workspace.to_owned();
+        let title = title.to_owned();
+        let mut validated = deadline
+            .process(move || {
+                if check_workspace {
+                    design.check_workspace(&root)?;
+                }
+                design.resolve_declarations(&root, &title)
+            })
+            .await?;
+        validated.design.check_preview = deadline
+            .wait(crate::checks::preview_plan(workspace, &validated.design))
+            .await?;
+        validated.design.check_preview_source = validated.design.check_preview_fingerprint()?;
+        deadline.remaining()?;
+        Ok(validated)
+    }
+
+    /// Resolve the captured declarations on the read-only processing worker.
+    fn resolve_declarations(self, workspace: &Path, title: &str) -> Result<ValidatedDesign> {
         self.validate()?;
-        let mut design = self.clone();
+        let mut design = self;
         let (parsed, structure) = design.derive_parsed()?;
         design.parsed = Some(parsed);
         let configuration = crate::checks::ConfigSnapshot::load(workspace)?;
@@ -230,6 +261,7 @@ impl DeclarationDesign {
             .cloned()
             .collect::<Vec<_>>();
         for path in paths {
+            super::resolution_deadline::ResolutionDeadline::check()?;
             for directory in Path::new(&path).ancestors().skip(1) {
                 let lock = directory
                     .join("Cargo.lock")
@@ -252,8 +284,6 @@ impl DeclarationDesign {
         crate::declaration::DeclarationValidationError::ensure_empty(
             report.diagnostic.iter().cloned().chain(authored).collect(),
         )?;
-        design.check_preview = crate::checks::preview_plan(workspace, &design).await?;
-        design.check_preview_source = design.check_preview_fingerprint()?;
         Ok(ValidatedDesign { design, report })
     }
 
@@ -543,6 +573,7 @@ impl DeclarationDesign {
         };
         let mut diagnostic = Vec::new();
         for (path, text) in &self.proposed_source {
+            super::resolution_deadline::ResolutionDeadline::check()?;
             match super::calls::parse(path, text) {
                 Ok((declarations, calls)) => {
                     parsed.proposed.insert(path.clone(), declarations);
@@ -618,6 +649,7 @@ impl DeclarationDesign {
             self.changed_paths().into_iter().collect()
         };
         for path in paths {
+            super::resolution_deadline::ResolutionDeadline::check()?;
             let source = read(&path)?;
             match self.baseline.get(&path) {
                 Some(before) => ensure!(

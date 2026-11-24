@@ -1110,7 +1110,7 @@ async fn mcp_mutation_reply_waits_for_live_commit_and_replays_same_call() -> any
     );
     effect
         .reply
-        .send(Ok(crate::provider::LiveHostCommit))
+        .send(Ok(crate::provider::LiveHostCommit::Committed))
         .map_err(|_| anyhow::anyhow!("callback lost its commit waiter"))?;
     let reply = pending.await?;
     assert_eq!(concurrent.await?.message, reply.message);

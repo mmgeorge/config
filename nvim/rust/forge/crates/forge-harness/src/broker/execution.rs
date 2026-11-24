@@ -965,6 +965,7 @@ impl HarnessBroker {
                 baseline,
                 document,
                 reason,
+                resolution_remaining,
             } => {
                 anyhow::ensure!(
                     !reason.trim().is_empty(),
@@ -980,13 +981,17 @@ impl HarnessBroker {
                     execution.revision,
                 )?;
                 plan.model_revision += 1;
-                let (document, _, digest) = self.plan_file.submit_execution_revision_if_unchanged(
-                    &self.session.id,
-                    &plan.id,
-                    plan.model_revision,
-                    &baseline,
-                    *document,
-                )?;
+                let deadline =
+                    crate::plan::resolution_deadline::ResolutionDeadline::new(resolution_remaining);
+                let (document, _, digest) = deadline.scope(|| {
+                    self.plan_file.submit_execution_revision_if_unchanged(
+                        &self.session.id,
+                        &plan.id,
+                        plan.model_revision,
+                        &baseline,
+                        *document,
+                    )
+                })?;
                 plan.review_digest = Some(digest.clone());
                 plan.document_version = document.version;
                 plan.submitted_version = Some(document.version);

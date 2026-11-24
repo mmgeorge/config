@@ -922,6 +922,7 @@ mod receipt_tests {
                     plan_id: "plan".into(),
                     expected_version: 1,
                     authoring_snapshot: None,
+                    resolution_remaining: None,
                 }),
                 ..Default::default()
             },

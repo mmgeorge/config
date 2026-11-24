@@ -141,6 +141,11 @@ impl PlanSubmissionJob {
             request.plan_id == plan.id,
             "submitted plan id does not match active plan"
         );
+        let deadline = crate::plan::resolution_deadline::ResolutionDeadline::new(
+            request
+                .resolution_remaining
+                .unwrap_or(crate::plan::resolution_deadline::LIMIT),
+        );
         let original = store.read_working_document(&session_id, &plan.id)?;
         anyhow::ensure!(
             original.version == request.expected_version,
@@ -159,7 +164,9 @@ impl PlanSubmissionJob {
             None => original.clone(),
         };
         let warnings = if let Some(design) = &mut document.design {
-            let validated = design.validated(&workspace, &document.title).await?;
+            let validated = deadline
+                .wait(design.validated(&workspace, &document.title))
+                .await?;
             let warnings = validated.warnings();
             *design = validated.into_design();
             warnings
@@ -175,15 +182,23 @@ impl PlanSubmissionJob {
             .model_revision
             .checked_add(1)
             .context("plan revision exhausted")?;
-        let prepared = store.prepare_validated_submission(
-            &session_id,
-            &plan.id,
-            revision,
-            request.expected_version,
-            &original,
-            document,
-        )?;
+        let prepare_store = store.clone();
+        let prepare_session = session_id.clone();
+        let prepare_plan = plan.id.clone();
+        let prepared = deadline
+            .process(move || {
+                prepare_store.prepare_validated_submission(
+                    &prepare_session,
+                    &prepare_plan,
+                    revision,
+                    request.expected_version,
+                    &original,
+                    document,
+                )
+            })
+            .await?;
         let review_comments = store.review_comment_snapshot(&session_id, &plan.id)?;
+        deadline.remaining()?;
         guard.begin_mutation();
         let result = task_controller
             .commit_plan_write(&permit, || store.commit_prepared_submission(prepared));

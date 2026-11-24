@@ -684,7 +684,14 @@ impl HostInvocation {
                 })?;
                 // The owner adopts any task revision the commit produced in the commit
                 // step itself, before this reply can be observed.
-                owner.commit(scope, call_id, batch).await?;
+                match owner.commit(scope, call_id, batch).await? {
+                    super::LiveHostCommit::Committed => {}
+                    super::LiveHostCommit::ResolutionTimedOut => {
+                        return Ok(ToolReply::failed(
+                            crate::plan::resolution_deadline::ResolutionTimeout.to_string(),
+                        ));
+                    }
+                }
             }
             Ok(message)
         }

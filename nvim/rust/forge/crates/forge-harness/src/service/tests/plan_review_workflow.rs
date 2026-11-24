@@ -1408,6 +1408,83 @@ async fn edits_a_discussion_delivered_retire_with_the_revision_it_led_to() -> Re
     fixture.finish().await
 }
 
+/// A package omitted from the plan leaves its dependencies unverified without recursively
+/// qualifying the same missing name through a wildcard in the proposed crate root.
+#[tokio::test]
+async fn submission_with_an_uncaptured_package_and_wildcard_reaches_review() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestPromptScript, TestPromptStep, TestPromptTerminal,
+    };
+    let fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    let files =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?;
+    let directory = files.authoring_directory(&fixture.session_id, &plan.id);
+    let write = |path: &str, text: &str| TestPromptStep::FileWrite {
+        path: directory.join(path).to_string_lossy().into_owned(),
+        text: text.into(),
+    };
+    fixture
+        .controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?
+        .dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        write("files/Cargo.toml", "[workspace]\nmembers = []\n"),
+                        write(
+                            "files/engine/src/lib.rs",
+                            "pub use bridge::AppDefinition;\npub use runtime::{executor::*, fetch::*, macros::*};\n",
+                        ),
+                        TestPromptStep::ToolCall {
+                            name: "plan_submit".into(),
+                            arguments: json!({"plan_id":plan.id}),
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    fixture
+        .dispatch(
+            20,
+            "session.command.apply",
+            json!({"action":"request_changes",
+        "operation_id":"wildcard-revision","plan_id":plan.id,"comment":"Expose the bridge type."}),
+        )
+        .await?;
+    fixture
+        .settled("wildcard submission", |fixture| {
+            Ok(fixture.plan()?.is_some_and(|plan| {
+                plan.state == crate::plan::PlanState::AwaitingReview && plan.model_revision == 2
+            }))
+        })
+        .await?;
+    let document = files.read_submitted_document(&fixture.session_id, &plan.id, 2)?;
+    let design = document.design.context("missing declaration design")?;
+    let report = design
+        .parsed()?
+        .validation
+        .as_ref()
+        .context("missing validation report")?;
+    let lookup = report
+        .diagnostic
+        .iter()
+        .find(|entry| entry.reference == "bridge::AppDefinition")
+        .context("missing warning for the uncaptured dependency")?;
+    assert!(
+        !lookup.error && lookup.reason.contains("unavailable"),
+        "{lookup:?}"
+    );
+    fixture.finish().await
+}
+
 /// The live transcript draws `Plan submitted` as soon as the submission is committed, while the
 /// turn that submitted it still runs, so it shows the same rows a restored transcript shows.
 #[tokio::test]

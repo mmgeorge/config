@@ -46,6 +46,7 @@ fn remove_harness_submission_fields(definition: &mut ControlToolDefinition) {
         .as_object_mut()
         .expect("plan submit properties are an object");
     properties.remove("authoring_snapshot");
+    properties.remove("resolution_remaining");
     properties.remove("expected_version");
 }
 

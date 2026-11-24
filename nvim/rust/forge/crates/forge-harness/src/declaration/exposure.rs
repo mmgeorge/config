@@ -149,6 +149,7 @@ pub(crate) fn symbols(workspace: &Path, design: &DeclarationDesign) -> Result<BT
     }
     let mut visited = HashSet::new();
     while let Some(scope) = queue.pop_front() {
+        crate::plan::resolution_deadline::ResolutionDeadline::check()?;
         if !visited.insert(scope.clone()) {
             continue;
         }
