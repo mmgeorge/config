@@ -80,6 +80,7 @@
 
 ---@class ForgeHarnessKeymapConfig
 ---@field visual_line_with_gutter ForgeKeymap
+---@field ask ForgeKeymap quote the timeline selection in the composer
 ---@field submit ForgeKeymap
 ---@field queue ForgeKeymap
 ---@field steer ForgeKeymap
@@ -309,6 +310,7 @@ M.defaults = {
     },
     harness = {
       visual_line_with_gutter = "W",
+      ask = "A",
       submit = "<C-s>",
       queue = "<C-q>",
       steer = false,

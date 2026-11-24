@@ -928,7 +928,12 @@ and gutter selection remain in the upper pane.
 
 In the timeline, press `W` to select whole lines from the left gutter, including
 markers and indentation. Extend the selection, then press `<Space>l` to copy the
-displayed lines and their gutters to the clipboard for pasting into a prompt.
+displayed lines and their gutters to the clipboard.
+
+To ask about part of the timeline, select it in Visual mode and press `A`.
+Harness appends the selection to your draft as a Markdown blockquote and enters
+Insert mode a blank line below it, ready for your question. A selection started
+with `W` includes the displayed gutters.
 
 Unknown or unfinished slash commands keep the draft and show a warning. A leading
 path with a filename extension, such as `/workspace/screenshot.png`, submits and

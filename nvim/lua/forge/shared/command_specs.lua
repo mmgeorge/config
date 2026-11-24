@@ -115,6 +115,7 @@ M.view_specs = {
     { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = false },
     { id = "toggle_presentation", label = "presentation", desc = "Toggle Full/Semantic diff presentation", modes = "n", keymap = "diff", pinned = false },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
+    { id = "ask", label = "ask", desc = "Quote the timeline selection in the prompt", modes = "x", visual = true, pinned = false },
     { id = "submit", label = "submit", desc = "Submit the composer", modes = { "n", "i" }, pinned = false,
       hints = { composer = function() return "submit" end } },
     { id = "queue", label = "queue", desc = "Queue the composer, or move the edited queued message back to the prompt", modes = { "n", "i" }, pinned = false,

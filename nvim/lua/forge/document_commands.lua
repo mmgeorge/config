@@ -71,6 +71,18 @@ local function selected_rows(session)
   return rows
 end
 
+---Read the active Visual region, including displayed gutters when selected with the gutter command.
+---@param session? {gutter_selection?: {window: integer}}
+---@return string[]
+function M.selection_lines(session)
+  local mode = vim.fn.mode()
+  local gutter_selection = session and session.gutter_selection
+  if mode == "V" and gutter_selection and gutter_selection.window == vim.api.nvim_get_current_win() then
+    return selected_rows(session)
+  end
+  return vim.fn.getregion(vim.fn.getpos("v"), vim.fn.getpos("."), { type = mode })
+end
+
 ---Own visual selection and copying of native diff gutters for any document view.
 ---@param session table
 ---@param options { normalize: boolean }

@@ -2026,6 +2026,51 @@ do
   end
 end
 end
+T["ask_about_timeline_selection"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  local transcript, composer = unpack(child.lua([[
+    vim.opt.rtp:prepend(...)
+    require("forge.infra.config").setup({})
+    local state = require("forge.session").harness
+    state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
+      require("forge.views.harness.layout").open("ask-selection")
+    require("forge.views.harness.controller").attach_transcript(state.transcript_buf)
+    vim.bo[state.transcript_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(state.transcript_buf, 0, -1, true, { "prefix café", "", "last suffix" })
+    vim.bo[state.transcript_buf].modifiable = false
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, true, { "Existing draft" })
+    vim.api.nvim_set_current_win(state.transcript_win)
+    vim.fn.setreg('"', "keep register")
+    return { state.transcript_win, state.composer_win }
+  ]], { vim.fs.normalize(vim.fn.fnamemodify("nvim", ":p")) }))
+
+  -- Select backwards, ending partway through each nonempty line.
+  child.api.nvim_win_set_cursor(transcript, { 3, 3 })
+  child.type_keys("v")
+  child.api.nvim_win_set_cursor(transcript, { 1, 7 })
+  child.type_keys("A")
+  eq(child.api.nvim_get_current_win(), composer)
+  eq(child.api.nvim_get_mode().mode, "i")
+  eq(child.api.nvim_win_get_cursor(composer), { 7, 0 })
+  child.type_keys("Why?")
+  eq(child.api.nvim_buf_get_lines(0, 0, -1, true),
+    { "Existing draft", "", "> café", ">", "> last", "", "Why?" })
+  eq(child.fn.getreg('"'), "keep register")
+
+  child.type_keys("<Esc>")
+  child.api.nvim_buf_set_lines(0, 0, -1, true, { "" })
+  child.api.nvim_set_current_win(transcript)
+  child.api.nvim_win_set_cursor(transcript, { 3, 0 })
+  child.type_keys("<C-v>2lA")
+  eq(child.api.nvim_buf_get_lines(0, 0, -1, true), { "> las", "", "" })
+  child.type_keys("<Esc>")
+  child.api.nvim_set_current_win(transcript)
+  child.type_keys("VA")
+  eq(child.api.nvim_buf_get_lines(0, 0, -1, true), { "> las", "", "> last suffix", "", "" })
+end
+
 T["gutter_selection"] = function()
 local runtime = vim.fs.normalize(vim.fn.fnamemodify("nvim", ":p"))
 local child = MiniTest.new_child_neovim()
@@ -2170,6 +2215,18 @@ do
     end
     assert(presentation.transcript.gutter_selection == nil and vim.api.nvim_get_mode().mode == "n")
     assert(vim.deep_equal(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, true), source))
+    start(3)
+    move(6)
+    keymap.invoke("A", { mode = "x" })
+    assert(vim.api.nvim_get_current_win() == state.composer_win and presentation.transcript.gutter_selection == nil)
+    local quoted = {}
+    for index = 1, 4 do quoted[index] = "> " .. clipboard.lines[index] end
+    local draft = vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, true)
+    vim.list_extend(quoted, { "", "" })
+    assert(vim.deep_equal(draft, quoted), vim.inspect({ draft = draft, expected = quoted }))
+    assert(vim.fn.maparg("A", "x", false, true).buffer ~= 1, "composer binds timeline ask")
+    vim.cmd("stopinsert")
+    vim.api.nvim_set_current_win(state.transcript_win)
     start(6)
     vim.cmd("redraw!")
     local position = vim.fn.screenpos(state.transcript_win, 6, 1)

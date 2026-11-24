@@ -3141,9 +3141,43 @@ function M.present_held_prompts()
   if #(state.approval or {}) > 0 then vim.schedule(function() M.present_approval(false, state) end) end
 end
 
+local function ask_about_selection()
+  local state = harness_state()
+  local buffer, window = state.composer_buf, state.composer_win
+  if vim.api.nvim_get_current_buf() ~= state.transcript_buf then return end
+  if not window or not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= buffer then
+    notifications.warn("The prompt window is unavailable.", "ForgeHarness")
+    return
+  end
+  local ok, lines = pcall(require("forge.document_commands").selection_lines,
+    state.presentation and state.presentation.transcript)
+  if not ok then notifications.error(tostring(lines), "ForgeHarness") return end
+  vim.cmd("normal! " .. vim.keycode("<Esc>"))
+  vim.api.nvim_set_current_win(window)
+
+  local count = vim.api.nvim_buf_line_count(buffer)
+  local tail = vim.api.nvim_buf_get_lines(buffer, math.max(0, count - 2), count, true)
+  local start = count
+  local quote = {}
+  if tail[#tail] ~= "" then
+    quote[1] = ""
+  elseif #tail == 1 or tail[1] == "" then
+    start = count - 1
+  end
+  for _, line in ipairs(lines) do
+    quote[#quote + 1] = line == "" and ">" or "> " .. line
+  end
+  vim.list_extend(quote, { "", "" })
+  vim.api.nvim_buf_set_lines(buffer, start, count, true, quote)
+  vim.api.nvim_win_set_cursor(window, { start + #quote, 0 })
+  layout.resize_composer(buffer, window)
+  vim.cmd("startinsert")
+end
+
 ---@return ForgeViewCommandSet
 function M.command_set()
   local set = command_set.new()
+  command_set.register(set, "ask", ask_about_selection)
   command_set.register(set, "visual_line_with_gutter", function()
     local state = harness_state()
     local presentation = state.presentation
@@ -3237,6 +3271,7 @@ end
 ---@return ForgeViewCommandSet
 function M.composer_command_set()
   local set = M.command_set()
+  command_set.unregister(set, "ask")
   command_set.unregister(set, "visual_line_with_gutter")
   command_set.unregister(set, "open_timeline")
   command_set.unregister(set, "toggle_visibility")
