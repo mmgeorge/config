@@ -18,7 +18,7 @@ The winbar appends gray `ce` to the permissions code while enabled, such as
 available in `/config` under **Workflow → Checks → Setup**, toggled with Space. Enabling
 permission does not run checks, send a prompt, or change which checks are enabled.
 Request configuration changes in ordinary chat, such as "Configure targeted checks
-for this repository." The `harness-checks` skill supplies discovery, schema, and
+for this repository." The `forge-checks` skill supplies discovery, schema, and
 scoped-runner guidance through the shared Rulesync skill catalog. Bare
 `/checks edit` and `/checks edit <check-id>` are not commands.
 

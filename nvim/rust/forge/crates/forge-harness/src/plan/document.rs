@@ -1025,7 +1025,12 @@ impl PlanDocument {
         if let Some(design) = &self.design {
             self.validate()?;
             design.parsed()?;
-            design.document.validate_for_submission()?;
+            let overview =
+                super::design_artifact_text(super::PlanArtifact::Overview, &self.title, design)?;
+            anyhow::ensure!(
+                !overview.trim().is_empty(),
+                "plan:overview.md must contain non-whitespace text"
+            );
             return Ok(());
         }
         validate_plan_submission(self)

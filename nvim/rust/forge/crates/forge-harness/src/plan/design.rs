@@ -337,6 +337,15 @@ impl DeclarationDesign {
             && self.check_preview_source == self.check_preview_fingerprint()?)
     }
 
+    /// Start a filesystem draft with an empty overview for the planner to author.
+    pub(crate) fn open_draft(workspace: &Path) -> Result<Self> {
+        let mut design = Self::open(workspace)?;
+        design
+            .artifact_text
+            .insert(super::PlanArtifact::Overview.path().into(), String::new());
+        Ok(design)
+    }
+
     /// Initialize plan settings without discovering or extracting workspace files.
     pub fn open(workspace: &Path) -> Result<Self> {
         let mut design = Self::default();

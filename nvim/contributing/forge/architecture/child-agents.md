@@ -66,7 +66,7 @@ Child approvals cancel only that child's requests on interruption, and the `appr
 
 ## Session inspection
 
-The root interaction exposes `harness_config` and seven `harness_session_*` tools through `tools/session/` and `tools/config.rs`, and the `harness-sessions` skill documents them. The portable `session_tools` setting is on by default, and turning it off removes the history tools but keeps `harness_config`. An aside session keeps the history tools regardless of that setting and additionally receives `origin_message` from `tools/origin.rs`; "Aside sessions" in [harness.md](harness.md) describes both.
+The root interaction exposes `harness_config` and seven `harness_session_*` tools through `tools/session/` and `tools/config.rs`, and the `forge-sessions` skill documents them. The portable `session_tools` setting is on by default, and turning it off removes the history tools but keeps `harness_config`. An aside session keeps the history tools regardless of that setting and additionally receives `origin_message` from `tools/origin.rs`; "Aside sessions" in [harness.md](harness.md) describes both.
 
 Inspection uses read-only SQLite connections without migrations or leases. Reading another session requires authorization against its workspace, and that session's saved permissions never authorize the caller. Results go to a private temporary snapshot with opaque continuations, and page budgets bound each delivery, not the total size. Log inspection exposes only allowlisted diagnostic metadata, never prompts, credentials, or private reasoning.
 

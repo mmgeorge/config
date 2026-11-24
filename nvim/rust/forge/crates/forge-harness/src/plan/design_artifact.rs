@@ -18,7 +18,6 @@ use crate::declaration::{DeclarationDiagnostic, DeclarationDiagnosticKind};
 /// Reserves the artifact namespace so it can never collide with a workspace path.
 pub(crate) const ARTIFACT_PREFIX: &str = "plan:";
 
-type ArtifactSection<'text> = (usize, Vec<(usize, &'text str)>);
 type ArtifactFlowBlock<'text> = (usize, &'text str, Vec<(usize, &'text str)>);
 
 /// Names one Harness-owned plan artifact addressed through the plan file tools.
@@ -258,8 +257,8 @@ pub(crate) fn changed_artifacts(
 
 /// Holds the result of parsing every authored artifact for one submission.
 ///
-/// The plan title needs no field here: every overview edit already copies its `# Title` line
-/// into the plan, and a missing title is one of the diagnostics.
+/// An authored `# Title` updates the plan title. A headingless overview retains the
+/// title already attached to the plan.
 pub(crate) struct ParsedArtifacts {
     /// Document assembled from the artifacts, complete only when `diagnostic` has no errors.
     pub(crate) document: DesignDocument,
@@ -268,9 +267,6 @@ pub(crate) struct ParsedArtifacts {
 }
 
 /// Parse every authored artifact into a document, reporting each problem at its line.
-///
-/// A clean parse produces a document that `DesignDocument::validate_for_submission` accepts,
-/// because these checks cover every rule it enforces.
 pub(crate) fn parse_authored(
     title: &str,
     design: &DeclarationDesign,
@@ -284,15 +280,19 @@ pub(crate) fn parse_authored(
     };
     let mut diagnostic = Vec::new();
     let mut document = DesignDocument::default();
-    parse_overview(
-        &text(PlanArtifact::Overview)?,
-        &mut document,
-        true,
-        &mut ArtifactReport {
+    let overview = text(PlanArtifact::Overview)?;
+    if overview.trim().is_empty() {
+        ArtifactReport {
             path: PlanArtifact::Overview.path(),
             diagnostic: &mut diagnostic,
-        },
-    );
+        }
+        .content(
+            1,
+            "",
+            "the overview must contain non-whitespace text".into(),
+        );
+    }
+    parse_overview(&overview, &mut document);
     document.flows = parse_flows(
         &text(PlanArtifact::Flows)?,
         &mut ArtifactReport {
@@ -356,17 +356,9 @@ pub(crate) fn preview_authored(design: &DeclarationDesign) -> DesignDocument {
             .get(artifact.path())
             .map(|text| (text.clone(), artifact.path()))
     };
-    if let Some((text, path)) = parse(PlanArtifact::Overview) {
+    if let Some((text, _)) = parse(PlanArtifact::Overview) {
         let mut overview = DesignDocument::default();
-        parse_overview(
-            &text,
-            &mut overview,
-            false,
-            &mut ArtifactReport {
-                path,
-                diagnostic: &mut ignored,
-            },
-        );
+        parse_overview(&text, &mut overview);
         overview.flows = std::mem::take(&mut document.flows);
         overview.tests = std::mem::take(&mut document.tests);
         overview.checks = std::mem::take(&mut document.checks);
@@ -485,8 +477,11 @@ fn overview_text(title: &str, document: &DesignDocument) -> String {
         ("Design", document.design.clone()),
         (MANUAL_CHECKS, list_text(&document.manual_checks)),
     ] {
-        text.push_str(&format!("\n## {heading}\n"));
         let body = body.trim_matches('\n');
+        if matches!(heading, "Requirements" | "Decisions") && body.trim().is_empty() {
+            continue;
+        }
+        text.push_str(&format!("\n## {heading}\n"));
         if !body.trim().is_empty() {
             text.push_str(body);
             text.push('\n');
@@ -504,154 +499,92 @@ fn list_text(items: &[String]) -> String {
         .join("\n")
 }
 
-/// Names the part of the overview a line belongs to while parsing.
-#[derive(Clone, Copy)]
-enum OverviewBody {
-    Preamble,
-    Skipped,
-    Section(&'static str),
-}
-
-/// Parse the overview into the document's prose fields and return its title.
-///
-/// `submission` adds the rules that only a submitted plan must satisfy, such as required
-/// sections. The title is `None` when the overview has no usable `# Title` line.
-fn parse_overview(
-    text: &str,
-    document: &mut DesignDocument,
-    submission: bool,
-    report: &mut ArtifactReport<'_>,
-) -> Option<String> {
-    let mut title = None;
-    let mut body = OverviewBody::Preamble;
-    let mut sections: BTreeMap<&'static str, ArtifactSection<'_>> = BTreeMap::new();
+/// Project familiar headings for review and execution. Carry other narrative into Design.
+fn parse_overview(text: &str, document: &mut DesignDocument) {
+    let mut section = "";
     let mut fenced = false;
-    for (index, line) in text.lines().enumerate() {
-        let number = index + 1;
-        if line.contains('\0') {
-            report.syntax(number, "NUL", "the line contains a NUL byte".into());
-            continue;
-        }
+    let mut sections = BTreeMap::<&str, Vec<&str>>::new();
+    let mut narrative = Vec::new();
+    for line in text.lines() {
         if !fenced {
             if let Some(heading) = line.strip_prefix("## ") {
-                let heading = heading.trim();
-                body = match OVERVIEW_SECTIONS
-                    .into_iter()
-                    .find(|section| section.eq_ignore_ascii_case(heading))
-                {
-                    Some(section) if sections.contains_key(section) => {
-                        report.syntax(
-                            number,
-                            &format!("## {section}"),
-                            "the section appears twice; merge it into the first one".into(),
-                        );
-                        OverviewBody::Skipped
-                    }
-                    Some(section) => {
-                        sections.insert(section, (number, Vec::new()));
-                        OverviewBody::Section(section)
-                    }
-                    None => {
-                        report.syntax(
-                            number,
-                            &format!("## {heading}"),
-                            format!(
-                                "unknown section; sections are {}",
-                                OVERVIEW_SECTIONS.join(", ")
-                            ),
-                        );
-                        OverviewBody::Skipped
-                    }
-                };
-                continue;
-            }
-            if let Some(heading) = line.strip_prefix("# ") {
-                if title.is_none() && matches!(body, OverviewBody::Preamble) {
-                    title = Some(heading.trim().to_owned());
-                } else {
-                    report.syntax(
-                        number,
-                        &format!("# {}", heading.trim()),
-                        "only the first line may be a `# Title` heading; use `##` for sections"
-                            .into(),
-                    );
+                section = OVERVIEW_SECTIONS
+                    .iter()
+                    .copied()
+                    .find(|name| name.eq_ignore_ascii_case(heading.trim()))
+                    .unwrap_or("");
+                if !section.is_empty() {
+                    continue;
                 }
+            } else if line.starts_with("# ")
+                && section.is_empty()
+                && narrative.iter().all(|line: &&str| line.trim().is_empty())
+            {
                 continue;
             }
         }
         if line.trim_start().starts_with("```") {
             fenced = !fenced;
         }
-        match body {
-            OverviewBody::Preamble => {
-                if !line.trim().is_empty() {
-                    report.syntax(
-                        number,
-                        line.trim(),
-                        "text must follow `# Title` and a `## Section` heading".into(),
-                    );
+        if section.is_empty() {
+            narrative.push(line);
+        } else {
+            sections.entry(section).or_default().push(line);
+        }
+    }
+    for (name, lines) in sections {
+        let body = lines.join("\n").trim_matches('\n').to_owned();
+        match name {
+            "Objective" => document.objective = body,
+            "Usage" => document.usage = Some(body).filter(|s| !s.trim().is_empty()),
+            "Background" => document.background = body,
+            "Design" => document.design = body,
+            _ => {
+                let mut items = Vec::<String>::new();
+                for line in lines {
+                    if let Some(item) = line.strip_prefix("- ") {
+                        items.push(item.to_owned());
+                    } else if let Some(rest) = line.strip_prefix("  ")
+                        && let Some(item) = items.last_mut()
+                    {
+                        item.push('\n');
+                        item.push_str(rest);
+                    } else if !line.trim().is_empty() {
+                        narrative.push(line);
+                    }
+                }
+                for item in items.into_iter().filter(|s| !s.trim().is_empty()) {
+                    match name {
+                        "Requirements" => document.requirements.push(item),
+                        "Decisions" => {
+                            if let Some((choice, rationale)) =
+                                item.strip_prefix("**").and_then(|s| s.split_once("**"))
+                            {
+                                document.decisions.push(DesignDecision {
+                                    decision: choice.trim().into(),
+                                    rationale: rationale.trim().into(),
+                                });
+                            } else {
+                                document.decisions.push(DesignDecision {
+                                    decision: item,
+                                    rationale: String::new(),
+                                });
+                            }
+                        }
+                        MANUAL_CHECKS => document.manual_checks.push(item),
+                        _ => unreachable!(),
+                    }
                 }
             }
-            OverviewBody::Skipped => {}
-            OverviewBody::Section(section) => {
-                if let Some((_, lines)) = sections.get_mut(section) {
-                    lines.push((number, line));
-                }
-            }
         }
     }
-    let title = title.filter(|title| !title.is_empty());
-    if title.is_none() {
-        report.syntax(
-            1,
-            "# Title",
-            "the overview must start with a nonempty `# Title` line".into(),
-        );
-    }
-    for (section, (_, lines)) in &sections {
-        match *section {
-            "Objective" => document.objective = prose(lines),
-            "Usage" => document.usage = Some(prose(lines)).filter(|usage| !usage.trim().is_empty()),
-            "Requirements" => {
-                document.requirements = list_items(section, lines, report)
-                    .into_iter()
-                    .map(|(_, item)| item)
-                    .collect();
-            }
-            "Background" => document.background = prose(lines),
-            "Decisions" => {
-                document.decisions = list_items(section, lines, report)
-                    .into_iter()
-                    .filter_map(|(number, item)| decision(number, &item, report))
-                    .collect();
-            }
-            "Design" => document.design = prose(lines),
-            MANUAL_CHECKS => {
-                document.manual_checks = list_items(section, lines, report)
-                    .into_iter()
-                    .map(|(_, item)| item)
-                    .collect();
-            }
-            _ => {}
+    let extra = narrative.join("\n");
+    if !extra.trim().is_empty() {
+        if !document.design.is_empty() {
+            document.design.push_str("\n\n");
         }
+        document.design.push_str(extra.trim_matches('\n'));
     }
-    if submission {
-        for (section, text) in [
-            ("Objective", &document.objective),
-            ("Background", &document.background),
-            ("Design", &document.design),
-        ] {
-            if text.trim().is_empty() {
-                let line = sections.get(section).map_or(1, |(line, _)| *line);
-                report.content(
-                    line,
-                    &format!("## {section}"),
-                    "the section is required and must not be empty".into(),
-                );
-            }
-        }
-    }
-    title
 }
 
 /// Join section lines verbatim after removing blank lines at either edge.
@@ -669,77 +602,6 @@ fn prose(lines: &[(usize, &str)]) -> String {
         .map(|(_, line)| *line)
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Parse `- item` lines with two-space continuation lines, keeping each item's first line.
-fn list_items(
-    section: &str,
-    lines: &[(usize, &str)],
-    report: &mut ArtifactReport<'_>,
-) -> Vec<(usize, String)> {
-    let mut items: Vec<(usize, String)> = Vec::new();
-    for (number, line) in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(item) = line
-            .strip_prefix("- ")
-            .or_else(|| (*line == "-").then_some(""))
-        {
-            items.push((*number, item.trim_end().to_owned()));
-        } else if let (Some(continuation), Some((_, item))) =
-            (line.strip_prefix("  "), items.last_mut())
-        {
-            item.push('\n');
-            item.push_str(continuation.trim_end());
-        } else {
-            report.syntax(
-                *number,
-                line.trim(),
-                format!(
-                    "`## {section}` items start with `- `, and continuation lines are indented by \
-                     two spaces"
-                ),
-            );
-        }
-    }
-    items.retain(|(number, item)| {
-        let empty = item.trim().is_empty();
-        if empty {
-            report.content(
-                *number,
-                "-",
-                format!("`## {section}` items must not be empty"),
-            );
-        }
-        !empty
-    });
-    items
-}
-
-/// Split a `**Decision.** Rationale.` item into its choice and justification.
-fn decision(number: usize, item: &str, report: &mut ArtifactReport<'_>) -> Option<DesignDecision> {
-    let parsed = item
-        .strip_prefix("**")
-        .and_then(|rest| rest.split_once("**"));
-    match parsed {
-        Some((decision, rationale))
-            if !decision.trim().is_empty() && !rationale.trim().is_empty() =>
-        {
-            Some(DesignDecision {
-                decision: decision.trim().into(),
-                rationale: rationale.trim().into(),
-            })
-        }
-        _ => {
-            report.syntax(
-                number,
-                item.lines().next().unwrap_or_default(),
-                "decisions use `- **Decision.** Rationale.` with both parts present".into(),
-            );
-            None
-        }
-    }
 }
 
 /// Check every `## Title` flow block and return the flow Markdown unchanged.
@@ -1164,46 +1026,23 @@ mod test {
         let document = sample_document();
         let text = overview_text("Neon Salvager", &document);
         assert!(text.contains("## Manual checks\n- Run the game."));
-        let mut diagnostic = Vec::new();
         let mut parsed = DesignDocument::default();
-        let title = parse_overview(&text, &mut parsed, true, &mut report(&mut diagnostic));
-        assert_eq!(diagnostic, Vec::new());
-        assert_eq!(title.as_deref(), Some("Neon Salvager"));
+        parse_overview(&text, &mut parsed);
         assert_eq!(parsed, document);
     }
 
-    /// Every overview problem is reported at its line in one pass.
     #[test]
-    fn overview_reports_every_problem_at_its_line() {
-        let text = "# Title\n\n## Goals\nx\n\n## Decisions\n- Keep one file.\n\n## Objective\n\n";
-        let mut diagnostic = Vec::new();
+    fn freeform_overview_keeps_narrative_and_manual_actions() {
+        let mut document = DesignDocument::default();
         parse_overview(
-            text,
-            &mut DesignDocument::default(),
-            true,
-            &mut report(&mut diagnostic),
+            "A free-form plan.\n## Notes\nKeep this section.\n## Manual checks\n- Open the view.",
+            &mut document,
         );
         assert_eq!(
-            lines(&diagnostic),
-            vec![
-                (3, "invalid_plan_artifact"),
-                (7, "invalid_plan_artifact"),
-                (9, "invalid_plan_content"),
-                (1, "invalid_plan_content"),
-                (1, "invalid_plan_content"),
-            ]
+            document.design,
+            "A free-form plan.\n## Notes\nKeep this section."
         );
-        let mut diagnostic = Vec::new();
-        assert_eq!(
-            parse_overview(
-                "## Objective\nx\n",
-                &mut DesignDocument::default(),
-                false,
-                &mut report(&mut diagnostic),
-            ),
-            None
-        );
-        assert_eq!(lines(&diagnostic), vec![(1, "invalid_plan_artifact")]);
+        assert_eq!(document.manual_checks, ["Open the view."]);
     }
 
     /// Flow Markdown is kept exactly as written, with no diagnostics for a well-formed flow.

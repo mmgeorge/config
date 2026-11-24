@@ -24,6 +24,7 @@ local plan_review_host = {}
 
 ---@class PlanReviewHostOptions
 ---@field lines string[] the plan's source lines, one presentation row each
+---@field markdown? boolean mark the fixture's source rows as Markdown
 ---@field session_id? string defaults to "plan-session"
 ---@field rename? table the `rename` result of a `rename_entity` action
 
@@ -52,7 +53,7 @@ function plan_review_host.start(options)
     local source_row, block = {}, {}
     for index, text in ipairs(options.lines) do
       local id = "plan:" .. index
-      local metadata = { decoration = {}, editable_region = {}, target = {
+      local metadata = { decoration = {}, editable_region = {}, markdown = options.markdown, target = {
         { id = id, range = { start = { row = 0, column = 0 }, ["end"] = { row = 1, column = 0 } } } } }
       source_row[index] = { id = id, target = id, text = text, source_line = index, block = id,
         position = { row = 0, column = 0 }, metadata = metadata }

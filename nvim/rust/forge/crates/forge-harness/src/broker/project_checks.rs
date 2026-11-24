@@ -84,7 +84,7 @@ impl HarnessBroker {
             .read_working_document(&self.session.id, &plan_id)?;
         if document.design.is_none() {
             let original = document.clone();
-            document.design = Some(crate::plan::DeclarationDesign::open(Path::new(
+            document.design = Some(crate::plan::DeclarationDesign::open_draft(Path::new(
                 &self.session.workspace,
             ))?);
             self.plan_file.write_working_document_if_unchanged(

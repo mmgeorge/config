@@ -2,8 +2,9 @@
 name: walkthrough
 description: >-
   Generate, regenerate, validate, or repair a Forge `.walkthrough.json` artifact
-  directly from repository changes. Use when creating review walkthroughs, guided
-  code review artifacts, or `.walkthrough.json` files after local modifications.
+  directly from repository changes. Use only inside Forge Harness when creating
+  review walkthroughs, guided code review artifacts, or `.walkthrough.json`
+  files after local modifications.
 targets:
   - '*'
 ---

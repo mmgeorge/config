@@ -1,19 +1,31 @@
+---
+name: forge-planning
+description: >-
+  Author, revise, and submit implementation plans. Use only inside Forge Harness
+  when an active Plan task supplies a planning directory. Covers declaration
+  proposals, behavior blocks, design artifacts, test coverage, and submission diagnostics.
+targets:
+  - '*'
+---
+
 # Planning directory authoring
 
 The plan is the supplied planning directory. Read it with your usual read tools, and create, edit, move, and delete its files with your file-editing tool, such as `apply_patch`, using absolute paths. Never write planning files with shell commands such as `Set-Content`, `Out-File`, or output redirection.
+
+Investigate the repository and resolve important design decisions with `question_ask` when the code cannot settle them. Keep the existing draft on continuation. After a baseline refresh, review the reported changes against the proposals and revise or resubmit.
 
 ## Layout
 
 ```text
 <planning directory>/
-  docs/overview.md   design narrative; starts with its section headings
+  docs/overview.md   design narrative; starts empty
   docs/flows.md      runtime flows; starts empty
   docs/tests.md      test coverage; starts empty
   docs/checks.md     extra saved check IDs; starts empty
   files/<path>       one proposal per repository file the plan adds, changes, or deletes
 ```
 
-`docs/` holds exactly these four files and no subdirectories. `files/` mirrors repository-relative paths: the proposal for `src/main.rs` is `files/src/main.rs`. Any other entry fails submission. Harness keeps this guide, captured originals, and review snapshots outside the directory.
+`docs/` holds exactly these four files and no subdirectories. `files/` mirrors repository-relative paths: the proposal for `src/main.rs` is `files/src/main.rs`. Any other entry fails submission. Harness keeps captured originals, and review snapshots outside the directory.
 
 ## Proposals
 
@@ -69,7 +81,29 @@ Every declaration the plan introduces needs a documentation comment directly abo
 
 ## Design artifacts
 
-`docs/overview.md` starts with `# Title`, followed by Objective, Usage, Requirements, Background, Decisions, Design, and Manual checks sections. Objective, Background, and Design are required. List sections use `- item` with two-space continuation lines; decisions use `- **Decision.** Rationale.`. Manual checks state observations automated checks cannot establish; every item is a manual action Verify performs, so a plan without one omits the section rather than listing "None".
+Write `docs/overview.md` using the template below. Replace the placeholders with plan-specific content. Use the title, Objective, Background, and Design as the default structure. Submission requires only non-whitespace text in the overview. Adapt the headings to the plan. Usage, Decisions, and Manual checks are optional. Keep prose plain, concise, and non-redundant: describe current behavior and its problems in Background, show caller-facing APIs with short snippets in Usage, limit Decisions to real tradeoffs, and leave per-callable mechanics to `files/`. See [overview-examples.md](references/overview-examples.md) for reference overviews. Indent list continuation lines by two spaces. Each Manual checks item is an action Verify performs, so include this section only for observations automated checks cannot establish.
+
+```markdown
+# <Plan title>
+
+## Objective
+<What the change must accomplish.>
+
+## Background
+<Current behavior and why it needs to change.>
+
+## Usage
+<How a caller uses the changed behavior.>
+
+## Decisions
+- **<Decision>.** <Rationale.>
+
+## Design
+<How the implementation meets the objective.>
+
+## Manual checks
+- <Action to perform and expected observation.>
+```
 
 `docs/flows.md` has one `## Title` per independently triggered flow, a one-to-two-line description naming its trigger, and exactly one closed Mermaid block. Use `sequenceDiagram` for cross-owner flows, `flowchart` for branching within one owner, and `stateDiagram-v2` for lifecycle transitions.
 
@@ -87,3 +121,16 @@ Every declaration the plan introduces needs a documentation comment directly abo
 Call `plan_status` to see each proposal classified as an addition, modification, deletion, or unchanged, and whether the directory differs from the last submission. Call `plan_submit` with the active plan ID, without an expected version. Harness snapshots the directory, validates the captured contents, and publishes an immutable revision. Repair reported file and line diagnostics in place and submit again; failed submissions do not reset your draft.
 
 Further edits require resubmission before acceptance. Submission is not implementation authority; wait for Harness execution instructions.
+
+## Design guidelines
+
+- Explain the central objects, their responsibilities, and how they cooperate.
+- Describe behavior, important failure cases, and compatibility. Explain why significant changes are needed and what observable result they produce.
+- Resolve decisions that affect correctness; leave incidental implementation details open.
+- Show a concrete usage example and expected result when caller-facing behavior changes.
+- Trace important flows across ownership boundaries, keeping independent lifecycles separate.
+- Keep the overview consistent with the proposed files.
+- Check that ownership is cohesive and interfaces expose only what callers need.
+- Describe test scenarios and expected results at the boundary that owns the behavior. Choose isolated or integration tests according to the behavior being verified.
+- Include manual verification only when automated checks cannot establish the result.
+- Keep the design proportional to the request and reuse existing interfaces where they fit.

@@ -96,7 +96,6 @@ impl ProviderRequest {
             return Task::Plan(PlanTask {
                 plan_id: scope.plan_id().to_owned(),
                 directory: scope.directory().display().to_string(),
-                authoring_guide: scope.authoring_guide().display().to_string(),
                 request,
                 contract: crate::plan::PlanPrompt::planning_contract().to_owned(),
             });

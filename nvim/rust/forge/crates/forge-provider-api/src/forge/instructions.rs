@@ -8,7 +8,7 @@ use crate::input::QuestionReplyResponse;
 
 const PLAN_DISCUSSION: &str = "Continue discussing the active plan in the Harness Plan task. Answer the user's message without editing or resubmitting the plan. When the user asks for changes, revise the existing planning directory with your file-editing tool, then call plan_submit with its plan ID and no expected version. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The Harness task instructions apply only when the user asks for a revision.";
 
-const CHECKS_SETUP: &str = "The user asked for a plan, but the project's checks are missing or invalid. Configure them with the harness-checks skill before planning. Do not design or implement the requested feature yet, and use the planning request in the user's message only to identify the tooling it needs. Harness resumes the planning request after the configuration is saved.";
+const CHECKS_SETUP: &str = "The user asked for a plan, but the project's checks are missing or invalid. Configure them with the forge-checks skill before planning. Do not design or implement the requested feature yet, and use the planning request in the user's message only to identify the tooling it needs. Harness resumes the planning request after the configuration is saved.";
 
 const PENDING_QUESTIONS: &str = "The user is replying while Harness questions are still pending. The pending questions are open decisions that can change, not a lock on the conversation. The permission for this turn controls repository access. Answer the user's reply directly, using the repository when it helps.";
 

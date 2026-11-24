@@ -183,14 +183,12 @@ pub enum Task {
     Paused(PausedTask),
 }
 
-/// A Plan task's editable directory, its guide, the user's request, and the planning contract.
+/// A Plan task's editable directory, the user's request, and the planning contract.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanTask {
     pub plan_id: String,
     /// Absolute path of the editable planning directory.
     pub directory: String,
-    /// Absolute path of the read-only authoring guide.
-    pub authoring_guide: String,
     /// The user's original planning request.
     pub request: String,
     /// The planning workflow contract.
@@ -273,8 +271,8 @@ impl Task {
                     &[("kind", "plan".into()), ("plan_id", plan.plan_id.clone())],
                 );
                 writer.text(&format!(
-                    "Planning directory: {}\nAuthoring guide: {}\n{PLAN_INPUT_RULE}",
-                    plan.directory, plan.authoring_guide
+                    "Planning directory: {}\n{PLAN_INPUT_RULE}",
+                    plan.directory
                 ));
                 writer.element("request", &[], &plan.request);
                 writer.text(&plan.contract);

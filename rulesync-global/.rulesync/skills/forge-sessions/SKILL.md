@@ -1,15 +1,15 @@
 ---
-name: harness-sessions
+name: forge-sessions
 description: >-
   Recall previous work and diagnose Forge Harness sessions, tool results, permissions,
-  configuration, and logs with harness_config and harness_session tools. Use when
-  searching prior conversations, explaining Harness behavior, or locating Harness
+  configuration, and logs with harness_config and harness_session tools. Use only inside Forge Harness
+  when searching prior conversations, explaining Harness behavior, or locating Harness
   source and settings. Do not use for ordinary application debugging unrelated to Harness.
 targets:
   - '*'
 ---
 
-# Harness Sessions
+# Forge Sessions
 
 Forge Harness owns durable sessions, exchanges, tasks, permissions, checks, and provider coordination. Neovim Lua owns editor integration. The shared Rust host owns canonical state and native services. Provider CLIs execute model turns, but do not own Harness task transitions or its access policy.
 

@@ -27,7 +27,7 @@ work through `harness_session_list`, `harness_session_search`,
 `harness_session_exchange_list`, `harness_session_exchange`, `harness_session_tool`,
 `harness_session_status`, and `harness_session_log`. These are model tools, not
 editor commands. `/config` → **Tools** → **Session history** toggles all seven
-history tools. Configuration inspection and the `harness-sessions` skill remain
+history tools. Configuration inspection and the `forge-sessions` skill remain
 available when history is off. Session-specific reads default to the current
 session. Unfiltered listing/search considers all accessible sessions.
 `harness_session_exchange_list` lists only the current conversation: exchanges an
@@ -1059,7 +1059,8 @@ name an existing directory. Failed saves retain the draft. Read and write lists
 are independent, and neither changes sandbox settings.
 After saving a question, its answer block shows
 `Generating response · <model> · Thinking: <effort>`. Leaving and returning to the
-block preserves the pending status and the eventual answer. Closing PlanReview
+block preserves the pending status and the eventual answer. Comments and
+questions inside a fenced example preserve its code formatting. Closing PlanReview
 while an answer, save, or review edit is running keeps the review open with the notice
 "Plan review stays open until its running answers and edits finish."
 If the buffer is forcibly closed, completed answers remain available after reopening.
@@ -1175,7 +1176,7 @@ it does not automatically duplicate an uncertain send.
 
 `/checks` opens project checks. `/checks edit on` and
 `/checks edit off` toggle check-editing permission without sending a prompt.
-Request configuration changes in chat after enabling editing. The `harness-checks`
+Request configuration changes in chat after enabling editing. The `forge-checks`
 skill supplies setup guidance. Bare `/checks edit` is not a command.
 The Harness winbar appends `ce` to the permissions code while editing is enabled.
 See [Project checks](checks.md) for
@@ -1257,6 +1258,7 @@ Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)
 struct or variant, or `CombatEntity()` for a marker. Keep construction separate from the
 operation that queues or inserts it. Name the fields and types a function uses inside its
 Algorithm or Change; plans have no Calls, Constructs, or Accesses sections to fill in.
+New plans start with an empty `docs/overview.md`. Submission requires only non-whitespace text in the overview. The global `forge-planning` skill provides a suggested template.
 Submission checks statement syntax and indentation, including branch and loop structure, and
 reports every violation in one response, each with the callable, the Algorithm line, and the
 rejected text. Drafts can remain incomplete while edited. If a captured repository file changed, the planning agent receives the refreshed baseline diff and can revise or resubmit the same draft. Forge reports body-only edits even when the declarations are identical. The next successful submission creates the review revision.

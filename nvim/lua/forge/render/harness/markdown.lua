@@ -88,7 +88,7 @@ end
 
 --- Tests whether a zero-based row index is enclosed by any range in the list.
 ---@param row integer Zero-based row index.
----@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
+---@param range_list ForgeMarkdownRange[] Array of range boundaries.
 ---@return boolean in_range True if row falls inside any range.
 local function row_in_range(row, range_list)
   for _, range in ipairs(range_list) do
@@ -97,22 +97,32 @@ local function row_in_range(row, range_list)
   return false
 end
 
---- Formats line ranges into Tree-sitter parser region bounding rectangles.
----@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
+---@class ForgeMarkdownRange
+---@field first0 integer First physical row, zero-based.
+---@field after0 integer Exclusive end row.
+---@field indent? integer Display indentation.
+---@field source_indent? integer Prefix bytes to skip on each row.
+---@field continues_region? boolean Parse with the previous range while skipping intervening rows.
+
+--- Format line ranges as Tree-sitter parser regions.
+---@param range_list ForgeMarkdownRange[] Array of range boundaries.
 ---@return table[] regions Nested parser region coordinates.
 local function parser_region_list(range_list)
   local region_list = {}
   for _, range in ipairs(range_list) do
     if range.after0 > range.first0 then
-      local region = {}
+      local region = range.continues_region and region_list[#region_list]
+      if not region then
+        region = {}
+        region_list[#region_list + 1] = region
+      end
       if (range.source_indent or 0) > 0 then
         for row = range.first0, range.after0 - 1 do
           region[#region + 1] = { row, range.source_indent, row + 1, 0 }
         end
       else
-        region = { { range.first0, 0, range.after0, 0 } }
+        region[#region + 1] = { range.first0, 0, range.after0, 0 }
       end
-      region_list[#region_list + 1] = region
     end
   end
   return region_list
@@ -127,7 +137,7 @@ end
 --- have moved them, so comparing them with the message ranges detects that case exactly. A render
 --- that is still in flight, or that finished against an older buffer, is never current.
 ---@param buf integer
----@param range_list { first0: integer, after0: integer, source_indent?: integer }[]
+---@param range_list ForgeMarkdownRange[]
 ---@return boolean
 function M.current(buf, range_list)
   local pending = render_pending[buf]
@@ -335,7 +345,7 @@ end
 
 --- Removes render-markdown extmarks that fall outside designated markdown ranges.
 ---@param buf integer Target buffer number.
----@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of range boundaries.
+---@param range_list ForgeMarkdownRange[] Array of range boundaries.
 local function prune_extmarks(buf, range_list)
   local ok, ui = pcall(require, "render-markdown.core.ui")
   if not ok or not ui.ns then return end
@@ -419,7 +429,7 @@ end
 --- Configures Tree-sitter regions and triggers markdown rendering for specified buffer ranges.
 ---@param buf integer Target buffer number.
 ---@param win integer? Target window handle.
----@param range_list { first0: integer, after0: integer, source_indent?: integer }[] Array of zero-based line ranges.
+---@param range_list ForgeMarkdownRange[] Array of zero-based line ranges.
 function M.render(buf, win, range_list)
   if #range_list == 0 then
     M.clear(buf)
@@ -436,6 +446,9 @@ function M.render(buf, win, range_list)
     -- Preserve source coordinates while excluding non-Markdown and folded transcript content.
     ---@diagnostic disable-next-line: invisible
     pcall(parser.set_included_regions, parser, parser_region_list(range_list))
+    -- An annotation edit can shift included ranges without invalidating the Markdown tree.
+    -- Recompute injections in case the edit interrupted parsing before their trees were built.
+    if vim.iter(range_list):any(function(range) return range.continues_region end) then parser:invalidate() end
   end)
   local epoch = (render_epoch[buf] or 0) + 1
   render_epoch[buf] = epoch

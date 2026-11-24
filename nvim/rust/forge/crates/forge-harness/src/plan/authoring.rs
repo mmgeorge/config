@@ -38,13 +38,6 @@ impl PlanAuthoringScope {
         &self.plan_id
     }
 
-    /// Get the read-only authoring guide that defines the planning directory's layout.
-    pub(crate) fn authoring_guide(&self) -> PathBuf {
-        self.files
-            .plan_dir(&self.session_id, &self.plan_id)
-            .join("authoring-guide.md")
-    }
-
     /// Get read-only comparison resources without granting writes to host storage.
     pub(crate) fn readable_directory(&self) -> PathBuf {
         self.files.plan_dir(&self.session_id, &self.plan_id)
@@ -449,12 +442,6 @@ impl PlanFileStore {
                 &super::design_artifact_text(artifact, &document.title, design)?,
             )?;
         }
-        super::write_text_atomically(
-            &self
-                .plan_dir(session_id, &document.plan_id)
-                .join("authoring-guide.md"),
-            include_str!("prompts/authoring.md"),
-        )?;
         for (path, text) in &design.proposed_source {
             let destination = checked_destination(&directory.join("files"), path)?;
             fs::create_dir_all(destination.parent().context("proposal has no parent")?)?;
@@ -1086,6 +1073,45 @@ impl PlanFileStore {
 mod tests {
     use super::*;
 
+    /// Submission accepts arbitrary overview Markdown and rejects a whitespace-only draft.
+    #[tokio::test]
+    async fn overview_needs_only_non_whitespace_text() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::checks::configure_fixture(root.path());
+        let files = PlanFileStore::new(root.path().join("storage"), root.path())?;
+        let plan = files
+            .prepare_entry("session", "Write a plan.".into(), None, 1)?
+            .record;
+        let overview = files
+            .authoring_directory("session", &plan.id)
+            .join("docs/overview.md");
+        let original = files.read_working_document("session", &plan.id)?;
+        for text in [
+            " \t\n",
+            "Free-form text.",
+            "## Anything\nNotes.\n## Anything\nMore notes.\n## Decisions\n- Unstructured choice.",
+        ] {
+            fs::write(&overview, text)?;
+            let document = files.authoring_import("session", &original)?;
+            let design = document.design.unwrap();
+            let result = design.validated(root.path(), &document.title).await;
+            if text.trim().is_empty() {
+                assert!(
+                    result
+                        .err()
+                        .context("blank overview passed")?
+                        .to_string()
+                        .contains("non-whitespace")
+                );
+            } else {
+                let mut submitted = original.clone();
+                submitted.design = Some(result?.into_design());
+                submitted.validate_for_submission()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Reassess source evidence for a new plan without discarding the seeded proposal.
     #[test]
     fn replanned_files_capture_current_sources_without_overwriting_proposals() -> Result<()> {
@@ -1097,6 +1123,12 @@ mod tests {
         )?;
         let files = PlanFileStore::new(temporary.path().join("storage"), temporary.path())?;
         let first = files.prepare_entry("session", "Revise source.".into(), None, 1)?;
+        let overview = files
+            .authoring_directory("session", &first.record.id)
+            .join("docs/overview.md");
+        assert_eq!(fs::read(&overview)?, b"");
+        let authored = "# Source revision\n\n## Objective\nPreserve the caller contract.\n";
+        fs::write(overview, authored)?;
         files.authoring_capture("session", &first.record.id, "source.rs")?;
         let proposed = "pub fn source();\nChange\n  Preserve the caller contract.\n";
         fs::write(
@@ -1114,6 +1146,14 @@ mod tests {
         let current = "pub fn source() { current(); }\n";
         fs::write(temporary.path().join("source.rs"), current)?;
         files.prepare_entry("session", "Reassess source.".into(), Some(seed), 2)?;
+        assert_eq!(
+            fs::read_to_string(
+                files
+                    .authoring_directory("session", "replanned")
+                    .join("docs/overview.md")
+            )?,
+            authored
+        );
         let replanned = files.authoring_import(
             "session",
             &files.read_working_document("session", "replanned")?,

@@ -1114,29 +1114,6 @@ mod test {
             .await
             .unwrap();
 
-        let submit = call("plan_submit", json!({"plan_id":"plan"}));
-        let error = runtime.invoke(submit.clone()).await.unwrap_err();
-        let failure =
-            crate::tools::control_tool_failure_text(&submit, &error, runtime.plan_document(), None);
-        assert!(
-            failure.starts_with("plan_submit rejected version 4 with "),
-            "{failure}"
-        );
-        for expected in [
-            "error[invalid_plan_artifact]: `## Goals`: unknown section",
-            "error[invalid_plan_content]: `## Background`: the section is required",
-            "Fix them and call plan_submit again.",
-        ] {
-            assert!(
-                failure.contains(expected),
-                "missing {expected:?} in {failure}"
-            );
-        }
-        assert!(
-            !failure.contains("plan:checks.md"),
-            "an unlisted prerequisite is added, not reported: {failure}"
-        );
-
         let status = runtime
             .invoke(call("plan_status", json!({"plan_id":"plan"})))
             .await
@@ -1149,6 +1126,16 @@ mod test {
         assert!(status.message.contains("plan:overview.md  written"));
         assert!(status.message.contains("unit selected"));
         assert!(status.message.contains("M Foo.rs"));
+        let rejection = runtime
+            .invoke(call("plan_submit", json!({"plan_id":"plan"})))
+            .await
+            .unwrap_err();
+        assert!(
+            rejection
+                .to_string()
+                .contains("New declaration has no documentation comment")
+        );
+        assert!(!rejection.to_string().contains("plan:overview.md"));
 
         runtime
             .invoke(edit(

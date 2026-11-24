@@ -1,15 +1,15 @@
 ---
-name: harness-checks
+name: forge-checks
 description: >-
   Configure Forge Harness project checks, category adapters, automatic triggers,
-  and custom command inputs through check_definition_edit. Use when adding,
-  editing, or repairing .forge.json checks or managed .forge/checks/ helpers.
+  and custom command inputs through check_definition_edit. Use only inside Forge Harness
+  when adding, editing, or repairing .forge.json checks or managed .forge/checks/ helpers.
   Do not use for merely running checks or changing task-specific selection.
 targets:
   - '*'
 ---
 
-# Harness Checks
+# Forge Checks
 
 Configure checks through `check_definition_edit` when check editing is enabled. Preserve unrelated definitions and settings. Every submission requires review outside YOLO. Configuration publication does not execute checks or validate helper-language syntax.
 

@@ -253,45 +253,15 @@ impl DesignDocument {
             "plan check cannot be enabled and disabled"
         );
         super::design_tests::validate(&self.tests)?;
-        for action in &self.manual_checks {
-            ensure!(
-                !action.trim().is_empty(),
-                "manual verification actions cannot be empty"
-            );
-        }
-        for requirement in &self.requirements {
-            ensure!(
-                !requirement.trim().is_empty(),
-                "plan requirement must not be empty"
-            );
-        }
-        for decision in &self.decisions {
-            ensure!(
-                !decision.decision.trim().is_empty() && !decision.rationale.trim().is_empty(),
-                "plan decision requires a choice and rationale"
-            );
-        }
-        for section in self.sections() {
+        for section in self
+            .sections()
+            .into_iter()
+            .filter(|section| matches!(section.path, "flows" | "tests" | "checks"))
+        {
             ensure!(
                 !section.text.contains('\0'),
                 "plan {} contains a NUL byte",
                 section.path
-            );
-        }
-        Ok(())
-    }
-
-    /// Requires an actionable specification before it can enter review.
-    pub(crate) fn validate_for_submission(&self) -> Result<()> {
-        self.validate()?;
-        for (name, text) in [
-            ("Objective", &self.objective),
-            ("Background", &self.background),
-            ("Design", &self.design),
-        ] {
-            ensure!(
-                !text.trim().is_empty(),
-                "plan:overview.md `## {name}` is required before submission"
             );
         }
         Ok(())

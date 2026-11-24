@@ -623,4 +623,49 @@ T["plan_test_delete"] = function()
   assert(opened == 1 and closed == 0, "subsequent deletion reopened the native document")
 end
 
+T["question_preserves_fenced_code_rendering"] = function()
+  vim.opt.runtimepath:append(vim.fn.stdpath("data") .. "/lazy/render-markdown.nvim")
+  require("render-markdown").setup({})
+  local plan_review_host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua")
+  local question = "Why is this a local?"
+  local plan_host = plan_review_host.start({ markdown = true, lines = {
+    "```lua", "local before = 1", "local after = 2", "```", "", "See usage below.",
+    "", "```text", "application command", "```",
+  } })
+  plan_host.annotation = {
+    { id = "question", kind = "question", source = { start_line = 2, end_line = 2, body = question },
+      reply = { question_body = question, body = "The function owns it.", duration_ms = 1000 } },
+  }
+  local review = plan_host.open()
+  local rendered
+  require("forge.render.harness.markdown").after_render(review.buf, function(success) rendered = success end)
+  wait_until(function() return rendered ~= nil end, "plan Markdown did not finish rendering")
+  MiniTest.expect.equality(rendered, true)
+
+  local parser = vim.treesitter.get_parser(review.buf, "markdown")
+  local lua = assert(parser:children().lua, "the code fence did not inject Lua")
+  local rows = {}
+  for _, tree in pairs(lua:trees()) do
+    for _, range in ipairs(tree:included_ranges(true)) do
+      for row = range[1], range[4] - (range[5] == 0 and 1 or 0) do
+        rows[#rows + 1] = buffer.line(review.buf, row + 1)
+      end
+    end
+  end
+  MiniTest.expect.equality(rows, { "local before = 1", "local after = 2" })
+
+  local namespace = vim.api.nvim_get_namespaces()["render-markdown.nvim"]
+  local closing_row = assert(buffer.find_row(review.buf, "local after = 2"))
+  local next_fence_row = assert(buffer.find_row(review.buf, "```text")) - 1
+  local before_row = assert(buffer.find_row(review.buf, "local before = 1")) - 1
+  local after_row = closing_row - 1
+  local concealed = {}
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, namespace, 0, -1, { details = true })) do
+    MiniTest.expect.equality(mark[2] > before_row and mark[2] < after_row, false)
+    if mark[4].conceal == "" then concealed[mark[2]] = true end
+  end
+  MiniTest.expect.equality(concealed[closing_row], true)
+  MiniTest.expect.equality(concealed[next_fence_row], true)
+end
+
 return T

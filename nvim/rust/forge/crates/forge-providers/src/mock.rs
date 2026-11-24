@@ -3526,8 +3526,7 @@ fn planning_steps(request: &PromptRequest, prompt: &str) -> Vec<TestPromptStep> 
         objective
     };
     let overview = format!(
-        "# Implement the requested change\n\n## Objective\n{objective}\n\n## Requirements\n\
-         - Preserve the requested behavior at its owning boundary.\n\n## Background\n\
+        "# Implement the requested change\n\n## Objective\n{objective}\n\n## Background\n\
          The mock provider drafted this overview from declaration version {}.\n\n## Design\n\
          Apply the requested behavior at its owning boundary.\n\n## Verification\n\
          - Confirm the requested interface behaves as designed.\n",
@@ -4086,7 +4085,7 @@ async fn run_tool_call(
 /// checks unconfigured or invalid.
 ///
 /// Planning needs a saved check configuration before it can select coverage. Harness asks for that
-/// configuration in a Chat-mode turn that directs the provider to the harness-checks skill, so the
+/// configuration in a Chat-mode turn that directs the provider to the forge-checks skill, so the
 /// mock treats a Plan turn or a turn naming that skill as setup. It reads the catalog, then submits
 /// its valid definitions through check_definition_edit, which follows the session's tool-approval
 /// mode like any other edit. An invalid configuration lists no definitions and reports its parse
@@ -4106,7 +4105,7 @@ async fn configure_unset_checks(
     .iter()
     .all(|name| request.tools.iter().any(|tool| tool.name == *name));
     let requests_setup =
-        request.execution == ExecutionMode::Planning || prompt.contains("harness-checks");
+        request.execution == ExecutionMode::Planning || prompt.contains("forge-checks");
     if !requests_setup || !has_check_tools {
         return Ok(());
     }

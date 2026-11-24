@@ -33,7 +33,7 @@ impl PlanFileStore {
         });
         if document.design.is_none() {
             if checks_ready {
-                document.design = Some(DeclarationDesign::open(&self.workspace)?);
+                document.design = Some(DeclarationDesign::open_draft(&self.workspace)?);
             }
             document.title = request.lines().next().unwrap_or_default().into();
             document.overview = request.clone();

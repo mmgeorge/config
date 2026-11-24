@@ -545,13 +545,14 @@ fn tasks_render_their_typed_fields() {
     Task::Plan(PlanTask {
         plan_id: "p-1".into(),
         directory: "D:/plan".into(),
-        authoring_guide: "D:/guide.md".into(),
         request: "Add retries.".into(),
         contract: "Plan carefully.".into(),
     })
     .write(&mut writer);
     let plan = writer.finish();
-    assert!(plan.starts_with("<task kind=\"plan\" plan_id=\"p-1\">\nPlanning directory: D:/plan\nAuthoring guide: D:/guide.md\nTreat each user message"));
+    assert!(plan.starts_with(
+        "<task kind=\"plan\" plan_id=\"p-1\">\nPlanning directory: D:/plan\nTreat each user message"
+    ));
     assert!(plan.contains("<request>\nAdd retries.\n</request>\nPlan carefully.\n</task>"));
     let mut writer = Writer::default();
     Task::Execute(ExecuteTask {
