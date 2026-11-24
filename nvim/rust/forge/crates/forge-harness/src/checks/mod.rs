@@ -46,7 +46,6 @@ pub(crate) use model::PreparedCheckRun;
 pub use model::{
     CheckEvent, CheckEventKind, CheckPurpose, CheckRun, CheckSetupState, CheckState, CommandCheck,
 };
-pub(crate) use planned::SubmissionWarningStatus;
 pub use planned::{PlannedTestExecution, SubmissionWarnings};
 pub use preview::CheckPreview;
 pub(crate) use preview::plan as preview_plan;

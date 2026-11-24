@@ -1832,9 +1832,9 @@ impl TimelineRenderer<'_> {
             })
             .collect();
         let heading = format!(
-            "Checks · {} · {:.1}s",
+            "Checks · {} · {}",
             checks::check_summary(&combined),
-            runs.iter().map(|run| run.duration_ms()).sum::<u64>() as f64 / 1000.0
+            super::duration::duration_label(runs.iter().map(|run| run.duration_ms()).sum())
         );
         self.checks(&combined, false, Some(&heading))
     }
@@ -3774,15 +3774,22 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
         / 1_000;
     let lifecycle = match run.state {
         AgentState::Starting => format!(
-            "Starting {}s",
-            now_ms.saturating_sub(run.created_at_ms).max(0) / 1_000
+            "Starting {}",
+            super::duration::elapsed_label(
+                now_ms.saturating_sub(run.created_at_ms).max(0) as u64 / 1_000
+            )
         ),
         AgentState::Ready => "Ready".into(),
         AgentState::Closing => format!(
-            "Closing {}s",
-            now_ms.saturating_sub(run.updated_at_ms).max(0) / 1_000
+            "Closing {}",
+            super::duration::elapsed_label(
+                now_ms.saturating_sub(run.updated_at_ms).max(0) as u64 / 1_000
+            )
         ),
-        AgentState::Closed => format!("Closed {elapsed_seconds}s"),
+        AgentState::Closed => format!(
+            "Closed {}",
+            super::duration::elapsed_label(elapsed_seconds as u64)
+        ),
     };
     format!("● {lifecycle} · {}", run.label())
 }
@@ -3925,8 +3932,9 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         }
     };
     let summary = format!(
-        "● {}{activity} {duration}s",
-        history_prefix(interaction.disposition())
+        "● {}{activity} {}",
+        history_prefix(interaction.disposition()),
+        super::duration::elapsed_label(duration)
     );
     exchange_metrics_summary(interaction, now_ms, summary)
 }

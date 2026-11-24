@@ -1408,6 +1408,96 @@ async fn edits_a_discussion_delivered_retire_with_the_revision_it_led_to() -> Re
     fixture.finish().await
 }
 
+/// Submission refreshes stale captures and lets the planner retry in the same task.
+#[tokio::test]
+async fn submission_refreshes_changed_sources_before_resubmission() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{
+        TestInputAcceptance, TestPromptScript, TestPromptStep, TestPromptTerminal,
+    };
+    let fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    let files =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?;
+    let source = fixture.root.path().join("existing.rs");
+    std::fs::write(&source, "pub fn existing() { configure_color(); }\n")?;
+    files.authoring_capture(&fixture.session_id, &plan.id, "existing.rs")?;
+    let proposal = files
+        .authoring_directory(&fixture.session_id, &plan.id)
+        .join("files/existing.rs");
+    let proposed = "/// Existing callable.\npub fn existing();\n/// Add a callable.\npub fn added();\nAlgorithm\n  return true\n";
+    std::fs::write(&proposal, proposed)?;
+    std::fs::write(&source, "pub fn existing() {}\n")?;
+    let config = fixture.root.path().join("settings.toml");
+    std::fs::write(&config, "size = 1\n")?;
+    files.authoring_capture(&fixture.session_id, &plan.id, "settings.toml")?;
+    let deleted_proposal = files
+        .authoring_directory(&fixture.session_id, &plan.id)
+        .join("files/settings.toml");
+    std::fs::remove_file(&deleted_proposal)?;
+    std::fs::write(&config, "size = 2\n")?;
+    let obsolete = fixture.root.path().join("obsolete.rs");
+    std::fs::write(&obsolete, "pub fn obsolete() {}\n")?;
+    files.authoring_capture(&fixture.session_id, &plan.id, "obsolete.rs")?;
+    std::fs::remove_file(proposal.with_file_name("obsolete.rs"))?;
+    std::fs::remove_file(obsolete)?;
+    fixture
+        .controller
+        .provider_handle()
+        .mock_response_control()
+        .context("mock controls missing")?
+        .dispatch(
+            &fixture.session_id,
+            MockResponseCommand::Script {
+                script: TestPromptScript {
+                    acceptance: TestInputAcceptance::BeforeResponse,
+                    steps: vec![
+                        TestPromptStep::ToolCall {
+                            name: "plan_submit".into(),
+                            arguments: json!({"plan_id":plan.id}),
+                        },
+                        TestPromptStep::ToolCall {
+                            name: "plan_submit".into(),
+                            arguments: json!({"plan_id":plan.id}),
+                        },
+                    ],
+                    terminal: TestPromptTerminal::Completed,
+                },
+            },
+        )
+        .await?;
+    fixture.dispatch(20, "session.command.apply", json!({"action":"request_changes","operation_id":"resubmit","plan_id":plan.id,"comment":"Resubmit the draft."})).await?;
+    fixture
+        .settled("resubmission", |fixture| {
+            Ok(fixture.plan()?.is_some_and(|plan| plan.model_revision == 2))
+        })
+        .await?;
+    let design = files
+        .read_submitted_document(&fixture.session_id, &plan.id, 2)?
+        .design
+        .unwrap();
+    design.check_workspace(fixture.root.path())?;
+    assert_eq!(design.proposed_source["existing.rs"], proposed);
+    assert!(!deleted_proposal.exists());
+    assert!(!design.proposed_source.contains_key("settings.toml"));
+    assert!(!design.baseline.contains_key("obsolete.rs"));
+    let transcript = serde_json::to_string(&fixture.store()?.list_exchange(&fixture.session_id)?)?;
+    for message in [
+        "Draft not submitted",
+        "No changes to captured declarations",
+        "-size = 1",
+        "+size = 2",
+        "-pub fn obsolete();",
+        "resubmit it as is",
+    ] {
+        assert!(
+            transcript.contains(message),
+            "missing submission feedback: {message}"
+        );
+    }
+    fixture.finish().await
+}
+
 /// A package omitted from the plan leaves its dependencies unverified without recursively
 /// qualifying the same missing name through a wildcard in the proposed crate root.
 #[tokio::test]
@@ -1736,11 +1826,17 @@ async fn rolling_back_an_accepted_plan_start_removes_its_artifact() -> Result<()
     let plan = fixture.plan_in_review().await?;
     fixture.accept_and_answer(20).await?;
     fixture
-        .settled("acceptance", |fixture| {
-            Ok(fixture
-                .store()?
+        .settled("accepted plan execution settled", |fixture| {
+            // Acceptance starts another exchange. Its history must settle before undo captures
+            // the latest exchange and the rollback authority.
+            let store = fixture.store()?;
+            Ok(store
                 .load_plan(&plan.id)?
-                .is_some_and(|plan| plan.state == crate::plan::PlanState::Accepted))
+                .is_some_and(|plan| plan.state == crate::plan::PlanState::Accepted)
+                && fixture.entered_execution_rows()? == 1
+                && store
+                    .latest_exchange(&fixture.session_id)?
+                    .is_some_and(|exchange| exchange.ordinal > 1 && exchange.is_finished()))
         })
         .await?;
     let start = fixture

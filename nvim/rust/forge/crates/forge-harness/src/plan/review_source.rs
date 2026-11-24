@@ -18,7 +18,7 @@ pub(crate) enum PlanReviewSource {
 }
 
 pub(crate) struct ReviewSourceData {
-    pub warning_status: Option<crate::checks::SubmissionWarningStatus>,
+    pub files: Option<super::review_files::ReviewFiles>,
     pub execution_review: Option<String>,
     pub trace: Option<ReviewTrace>,
     pub resolver: std::sync::Arc<
@@ -30,13 +30,14 @@ pub(crate) struct ReviewSourceData {
         >,
     >,
     pub public_only: bool,
+    /// File heading identities marked viewed for this exact review revision.
+    pub viewed_files: std::collections::BTreeSet<String>,
     /// Keeps selected reference context visible without changing the public filter.
     pub revealed: std::collections::HashSet<(String, String, u32)>,
     pub collapse: std::collections::HashMap<forge_buffer::identity::FoldId, bool>,
     pub path: std::path::PathBuf,
     pub workspace: std::path::PathBuf,
     pub(crate) revision: PlanReviewRevision,
-    pub saved_navigation: Option<super::PlanNavigationIndex>,
     pub syntax: Option<forge_diff::syntax::SyntaxHandle>,
     pub declaration_syntax: std::collections::HashMap<(String, String), ReviewSyntax>,
 }
@@ -153,7 +154,6 @@ impl PlanFileStore {
             .join(format!("submitted-{revision:04}.json"));
         let submitted = read_source(&path)?;
         let document: PlanDocument = super::codec::from_slice(&submitted)?;
-        self.review_cache.validate(&document, true)?;
         anyhow::ensure!(
             document.plan_id == plan_id,
             "submitted plan identity changed"
@@ -164,23 +164,18 @@ impl PlanFileStore {
                 &path.with_extension("index.json"),
             )?)?,
         };
-        let (rendered, saved_navigation) = if document.design.is_some() {
-            (self.render_review(&document)?, Some(saved.navigation))
-        } else {
-            (saved, None)
-        };
         Ok(PlanReviewSource::Historical(ReviewSourceData {
-            warning_status: None,
+            files: None,
             trace: None,
             execution_review: None,
             resolver: Default::default(),
             public_only: true,
+            viewed_files: Default::default(),
             collapse: Default::default(),
             revealed: Default::default(),
             path: path.with_extension("md"),
             workspace: self.workspace.clone(),
-            revision: PlanReviewRevision::from_saved(document, rendered, digest(&submitted))?,
-            saved_navigation,
+            revision: PlanReviewRevision::from_saved(document, saved, digest(&submitted))?,
             syntax: None,
             declaration_syntax: Default::default(),
         }))
@@ -197,7 +192,6 @@ impl PlanFileStore {
         let directory = self.plan_dir(session_id, plan_id);
         let working = read_source(&directory.join("working.json"))?;
         let document: PlanDocument = super::codec::from_slice(&working)?;
-        self.review_cache.validate(&document, true)?;
         anyhow::ensure!(
             document.plan_id == plan_id,
             "reviewed plan identity changed"
@@ -207,63 +201,44 @@ impl PlanFileStore {
             digest(&canonical) == expected_digest,
             "working plan changed after review"
         );
-        let rendered = self.render_review(&document)?;
         let physical = read_source(&directory.join("working.md"))?;
-        let saved_navigation = match revision {
-            Some(revision) => {
-                let submitted_path = directory
-                    .join("revisions")
-                    .join(format!("submitted-{revision:04}.json"));
-                let submitted: PlanDocument =
-                    super::codec::from_slice(&read_source(&submitted_path)?)?;
+        let navigation_path = if let Some(revision) = revision {
+            let submitted_path = directory
+                .join("revisions")
+                .join(format!("submitted-{revision:04}.json"));
+            let submitted = read_source(&submitted_path)?;
+            if submitted != working {
+                let submitted: PlanDocument = super::codec::from_slice(&submitted)?;
                 anyhow::ensure!(
                     super::codec::to_vec(&submitted)? == canonical,
                     "submitted plan bytes changed after review"
                 );
-                if document.design.is_some() {
-                    anyhow::ensure!(
-                        physical == read_source(&submitted_path.with_extension("md"))?,
-                        "physical plan review changed after the submitted revision"
-                    );
-                    Some(super::codec::from_slice(&read_source(
-                        &submitted_path.with_extension("index.json"),
-                    )?)?)
-                } else {
-                    anyhow::ensure!(
-                        physical == rendered.markdown.as_bytes(),
-                        "physical plan review changed after review"
-                    );
-                    None
-                }
             }
-            None => {
-                anyhow::ensure!(
-                    physical == rendered.markdown.as_bytes(),
-                    "physical plan draft changed after review"
-                );
-                let navigation: super::PlanNavigationIndex =
-                    super::codec::from_slice(&read_source(&directory.join("working.index.json"))?)?;
-                anyhow::ensure!(
-                    super::codec::to_vec(&navigation)?
-                        == super::codec::to_vec(&rendered.navigation)?,
-                    "plan draft navigation changed after review"
-                );
-                document.design.is_some().then_some(navigation)
-            }
+            anyhow::ensure!(
+                physical == read_source(&submitted_path.with_extension("md"))?,
+                "physical plan review changed after the submitted revision"
+            );
+            submitted_path.with_extension("index.json")
+        } else {
+            directory.join("working.index.json")
+        };
+        let rendered = RenderedPlan {
+            markdown: String::from_utf8(physical)?,
+            navigation: super::codec::from_slice(&read_source(&navigation_path)?)?,
         };
         Ok(PlanReviewSource::Working(EditableReviewSource(
             ReviewSourceData {
-                warning_status: None,
+                files: None,
                 trace: None,
                 execution_review: None,
                 resolver: Default::default(),
                 public_only: true,
+                viewed_files: Default::default(),
                 collapse: Default::default(),
                 revealed: Default::default(),
                 path: directory.join("working.md"),
                 workspace: self.workspace.clone(),
                 revision: PlanReviewRevision::from_saved(document, rendered, digest(&working))?,
-                saved_navigation,
                 syntax: None,
                 declaration_syntax: Default::default(),
             },
@@ -279,4 +254,45 @@ pub(super) fn read_source(path: &Path) -> Result<Vec<u8>> {
         "plan source is not a regular file"
     );
     std::fs::read(path).with_context(|| format!("read physical plan source {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_reads_the_submitted_rendering_and_rejects_a_divergent_working_copy() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let files = PlanFileStore::new(temporary.path().join("data"), temporary.path())?;
+        let document = crate::plan::document::test_fixture("plan", "Read the saved revision.");
+        files.write_working_document("session", "plan", &document)?;
+        let (_, rendered, checksum) = files.submit_document_revision("session", "plan", 1, 1)?;
+        let directory = files.plan_dir("session", "plan");
+        // A previous renderer can leave different trailing whitespace at the same anchors.
+        let saved = format!("{}\n", rendered.markdown);
+        let working = directory.join("working.md");
+        std::fs::write(directory.join("revisions/submitted-0001.md"), &saved)?;
+        std::fs::write(&working, &saved)?;
+        assert_eq!(
+            files
+                .capture_revision_source("session", "plan", 1)?
+                .rendered
+                .markdown,
+            saved
+        );
+        assert_eq!(
+            files
+                .capture_review_source("session", "plan", Some(1), &checksum)?
+                .rendered
+                .markdown,
+            saved
+        );
+        std::fs::write(&working, "changed")?;
+        assert!(
+            files
+                .capture_review_source("session", "plan", Some(1), &checksum)
+                .is_err()
+        );
+        Ok(())
+    }
 }

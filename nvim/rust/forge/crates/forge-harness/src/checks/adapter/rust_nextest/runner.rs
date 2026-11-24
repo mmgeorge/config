@@ -21,6 +21,9 @@ const OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RustNextestOptions {
+    /// Literal command prefix for Nextest operations. Defaults to `cargo nextest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nextest_command: Option<Vec<String>>,
     /// Cargo compilation profile, shared by exact listing and execution.
     #[serde(default = "dev")]
     pub cargo_profile: String,
@@ -45,6 +48,7 @@ impl Default for RustNextestOptions {
     /// Create default profiles without adding target or feature restrictions.
     fn default() -> Self {
         Self {
+            nextest_command: None,
             cargo_profile: dev(),
             nextest_profile: default_profile(),
             locked: false,
@@ -98,15 +102,47 @@ impl RustNextestAdapter {
                 "nextest features must be nonempty individual feature names".into(),
             ));
         }
+        if let Some(command) = &options.nextest_command {
+            super::super::contract::validate_command("nextest_command", command)?;
+        }
         let build = BuildArguments::parse(&options.cargo_args)?;
         Ok(Self { options, build })
     }
 
+    /// Append a Nextest operation to the validated launcher prefix.
+    fn nextest_command(&self, operation: &str) -> Vec<String> {
+        let mut command = self
+            .options
+            .nextest_command
+            .clone()
+            .unwrap_or_else(|| vec!["cargo".into(), "nextest".into()]);
+        command.push(operation.into());
+        command
+    }
+
+    /// Verify the executable once per exact operation without adding work to static discovery.
+    async fn installed_version(
+        &self,
+        context: &AdapterContext<'_>,
+    ) -> Result<NextestVersion, AdapterError> {
+        let command = self.nextest_command("--version");
+        let (stdout, output) = capture(context, &command).await?;
+        if !output.exit.success {
+            return Err(command_failure(
+                format!(
+                    "{}; install nextest with `cargo install cargo-nextest --locked`",
+                    command.join(" ")
+                ),
+                &output,
+            ));
+        }
+        NextestVersion::parse(&stdout)
+    }
+
     /// Construct matching list/run options, including explicit workspace selection.
     fn arguments(&self, operation: &str, filter: &str) -> Vec<String> {
-        let mut args = vec![
-            "nextest".into(),
-            operation.into(),
+        let mut args = self.nextest_command(operation);
+        args.extend([
             "--workspace".into(),
             "--cargo-profile".into(),
             self.options.cargo_profile.clone(),
@@ -116,7 +152,7 @@ impl RustNextestAdapter {
             filter.into(),
             "--cargo-message-format".into(),
             "json,json-render-diagnostics".into(),
-        ];
+        ]);
         if self.options.locked {
             args.push("--locked".into());
         }
@@ -136,6 +172,7 @@ impl RustNextestAdapter {
         context: &AdapterContext<'_>,
     ) -> Result<WorkspaceModel, AdapterError> {
         let mut args = vec![
+            "cargo".into(),
             "metadata".into(),
             "--format-version".into(),
             "1".into(),
@@ -370,7 +407,7 @@ impl TestAdapter for RustNextestAdapter {
                 workspace.tree(cases)?
             }
             DiscoverMode::Exact => {
-                let version = installed_version(context).await?;
+                let version = self.installed_version(context).await?;
                 let selection = TestSelection {
                     ids: request.within.clone(),
                     affected: Vec::new(),
@@ -397,7 +434,7 @@ impl TestAdapter for RustNextestAdapter {
             message: None,
         })?;
         let workspace = self.workspace(context).await?;
-        let version = installed_version(context).await?;
+        let version = self.installed_version(context).await?;
         let filter = filter::compile(selection, &workspace, context.workspace)?;
         let ExactPlan { items, groups } = self
             .exact(context, &version, &workspace, &filter, Some(events))
@@ -439,15 +476,15 @@ impl TestAdapter for RustNextestAdapter {
             let mut process = context
                 .processes
                 .spawn(ProcessSpec {
-                    program: "cargo",
-                    args: &args,
+                    program: &args[0],
+                    args: &args[1..],
                     directory: context.directory,
                     env: &env,
                     stdin: None,
                     log_stdout: true,
                 })
                 .await
-                .map_err(cargo_launch_error)?;
+                .map_err(|error| launch_error(&args[0], error))?;
             let translated = async {
                 let mut running = false;
                 while let Some(line) = process.next_line().await? {
@@ -523,15 +560,15 @@ async fn capture_filtered(
     let mut process = context
         .processes
         .spawn(ProcessSpec {
-            program: "cargo",
-            args,
+            program: &args[0],
+            args: &args[1..],
             directory: context.directory,
             env: &[],
             stdin: None,
             log_stdout: true,
         })
         .await
-        .map_err(cargo_launch_error)?;
+        .map_err(|error| launch_error(&args[0], error))?;
     let mut output = String::new();
     let read = async {
         while let Some(line) = process.next_line().await? {
@@ -557,18 +594,6 @@ async fn capture_filtered(
     Ok((output, process.collect().await?))
 }
 
-/// Verify the executable once per exact operation without adding work to static discovery.
-async fn installed_version(context: &AdapterContext<'_>) -> Result<NextestVersion, AdapterError> {
-    let (stdout, output) = capture(context, &["nextest".into(), "--version".into()]).await?;
-    if !output.exit.success {
-        return Err(command_failure(
-            "cargo nextest --version; install with `cargo install cargo-nextest --locked`".into(),
-            &output,
-        ));
-    }
-    NextestVersion::parse(&stdout)
-}
-
 /// Preserve a failed invocation's own diagnostics rather than referring only to a mixed log.
 fn command_failure(command: String, output: &ProcessOutput) -> AdapterError {
     let stderr = output.stderr();
@@ -584,9 +609,9 @@ fn command_failure(command: String, output: &ProcessOutput) -> AdapterError {
 }
 
 /// Keep the launch cause while identifying Cargo and its installation command.
-fn cargo_launch_error(error: AdapterError) -> AdapterError {
+fn launch_error(program: &str, error: AdapterError) -> AdapterError {
     match error {
-        AdapterError::Launch(source) => AdapterError::ToolLaunch {
+        AdapterError::Launch(source) if program == "cargo" => AdapterError::ToolLaunch {
             tool: "cargo",
             install: "rustup toolchain install stable",
             source,
@@ -630,9 +655,10 @@ mod tests {
     /// Retain the operating-system launch cause and actionable Cargo installation guidance.
     #[test]
     fn missing_cargo_preserves_launch_cause() {
-        let error = cargo_launch_error(AdapterError::Launch(std::io::Error::from(
-            std::io::ErrorKind::NotFound,
-        )));
+        let error = launch_error(
+            "cargo",
+            AdapterError::Launch(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        );
         assert!(
             error
                 .to_string()
@@ -643,6 +669,29 @@ mod tests {
         };
         assert_eq!(tool, "cargo");
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Route version, list, and run through exactly the configured argument prefix.
+    #[test]
+    fn nextest_launcher_preserves_literal_arguments() {
+        let options = |parts: &[&str]| RustNextestOptions {
+            nextest_command: Some(parts.iter().map(|part| (*part).to_owned()).collect()),
+            ..Default::default()
+        };
+        for invalid in [&[][..], &[" "], &["cargo", "bad\0option"]] {
+            assert!(RustNextestAdapter::new(options(invalid)).is_err());
+        }
+        let prefix = ["path with spaces/cargo", "tasks", "test"];
+        let adapter = RustNextestAdapter::new(options(&prefix)).unwrap();
+        assert_eq!(
+            adapter.nextest_command("--version"),
+            [prefix.as_slice(), &["--version"]].concat()
+        );
+        for operation in ["list", "run"] {
+            let command = adapter.arguments(operation, "all()");
+            assert_eq!(&command[..3], prefix);
+            assert_eq!(command[3], operation);
+        }
     }
 
     /// Reject argument injection and configuration that would desynchronize list and run.
@@ -679,6 +728,8 @@ mod tests {
         .unwrap();
         let list = adapter.arguments("list", "all()");
         let run = adapter.arguments("run", "all()");
-        assert_eq!(&list[2..], &run[2..]);
+        assert_eq!(&list[..3], ["cargo", "nextest", "list"]);
+        assert_eq!(&run[..3], ["cargo", "nextest", "run"]);
+        assert_eq!(&list[3..], &run[3..]);
     }
 }

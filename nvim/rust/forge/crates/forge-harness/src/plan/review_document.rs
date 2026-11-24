@@ -7,19 +7,21 @@ use anyhow::{Context, Result, ensure};
 use forge_buffer::admission::{DocumentAdmission, DocumentAdmissionStore};
 use forge_buffer::block::TextPosition;
 use forge_buffer::document::BufferDocument;
-use forge_buffer::identity::{DocumentId, InputSequence, TargetId, ViewId};
+use forge_buffer::identity::{BlockId, DocumentId, InputSequence, TargetId, ViewId};
 use forge_buffer::input::DocumentInput;
 use forge_buffer::patch::BufferSnapshot;
 use forge_buffer::view::DocumentViews;
 use forge_buffer::width::WidthProfile;
 use forge_diff::view::{DiffCapabilities, DiffViewAction, DiffViewState, DiffVisibility};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(crate) struct PlanReviewStore {
     admission: Arc<DocumentAdmissionStore>,
     document: Mutex<HashMap<DocumentId, (ReadOnlyPlanReview, DocumentAdmission)>>,
+    viewed_by_digest: Mutex<HashMap<String, BTreeSet<String>>>,
+    recent_symbols: Mutex<Option<(String, super::review_files::ReviewSymbolCache)>>,
 }
 
 /// Captures one unanswered question and the immutable design context used to answer it.
@@ -53,6 +55,144 @@ impl TestChangeCounts {
 }
 
 impl PlanReviewStore {
+    /// An unfold names the saved revision and file, independently of its current section.
+    /// Release the store during syntax analysis and publish against the latest file location.
+    pub(crate) async fn load_body(
+        &self,
+        id: &DocumentId,
+        digest: &str,
+        file: &str,
+        syntax: &Arc<forge_diff::syntax::SyntaxEngine>,
+    ) -> Result<serde_json::Value> {
+        let started = std::time::Instant::now();
+        let sides = {
+            let store = self
+                .document
+                .lock()
+                .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+            let (document, admission) = store.get(id).context("plan review document is closed")?;
+            admission.check()?;
+            ensure!(
+                document.saved_digest() == digest,
+                "plan file revision changed"
+            );
+            let inventory = document
+                .source
+                .files
+                .as_ref()
+                .context("plan has no file inventory")?;
+            if inventory.loaded.contains(file) {
+                return Ok(serde_json::json!({}));
+            }
+            let heading = inventory.files.iter().find(|heading| heading.id == file);
+            let paths = heading
+                .map(|heading| (&heading.before, &heading.after))
+                .or_else(|| {
+                    document.source.revealed.iter().find_map(|(path, _, _)| {
+                        (file == format!("plan:design:file:{}", super::digest(path.as_bytes())))
+                            .then_some((path, path))
+                    })
+                });
+            let design = document
+                .source
+                .document
+                .design
+                .as_ref()
+                .context("plan has no design")?;
+            let parsed = design.parsed()?;
+            let mut sides = Vec::new();
+            if let Some((before, after)) = paths {
+                for (side, path, text, calls) in [
+                    (
+                        "baseline",
+                        before,
+                        design.baseline.get(before).map(|file| &file.text),
+                        &design.baseline_calls,
+                    ),
+                    (
+                        "proposed",
+                        after,
+                        parsed.proposed.get(after),
+                        &parsed.proposed_calls,
+                    ),
+                ] {
+                    if let Some(text) = text {
+                        let presentation = super::calls::present(
+                            path,
+                            text,
+                            calls.get(path).map(Vec::as_slice).unwrap_or_default(),
+                        )?;
+                        sides.push((side, path.clone(), presentation));
+                    }
+                }
+            } else {
+                ensure!(
+                    design.document.tests.iter().any(|test| file
+                        == format!("plan:tests:file:{}", super::digest(test.file.as_bytes()))),
+                    "plan file is missing"
+                );
+            }
+            sides
+        };
+        let mut handles = Vec::new();
+        for (side, path, presentation) in sides {
+            if let Some(handle) =
+                crate::service::analyze_review_side(&path, &presentation, syntax, || Ok(())).await?
+            {
+                handles.push(((path, side.to_owned()), handle));
+            }
+        }
+        let mut store = self
+            .document
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store
+            .get_mut(id)
+            .context("plan review document is closed")?;
+        admission.check()?;
+        ensure!(
+            document.saved_digest() == digest,
+            "plan file revision changed"
+        );
+        if document
+            .document
+            .block_index(&BlockId(file.to_owned()))
+            .is_none()
+        {
+            // A visibility toggle can dismiss an unchanged contextual destination during analysis.
+            return Ok(serde_json::json!({}));
+        }
+        document.source.declaration_syntax.extend(handles);
+        let result = document.materialize_file(file)?;
+        if let Some(trace) = &document.source.trace {
+            trace.record("plan.review.file_body", started.elapsed(), 1);
+        }
+        Ok(result)
+    }
+
+    /// Restore review progress and reuse the visible prose index for an unchanged revision.
+    pub(crate) fn restore_presentation(&self, source: &mut PlanReviewSource) -> Result<()> {
+        let viewed = self
+            .viewed_by_digest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan file review lock poisoned"))?;
+        if let Some(files) = viewed.get(&source.saved_digest) {
+            source.viewed_files.clone_from(files);
+        }
+        let digest = source.saved_digest.clone();
+        if let Some(files) = source.files.as_mut() {
+            let mut recent = self
+                .recent_symbols
+                .lock()
+                .map_err(|_| anyhow::anyhow!("plan symbol cache lock poisoned"))?;
+            match recent.as_ref() {
+                Some((previous, symbols)) if previous == &digest => files.symbols = symbols.clone(),
+                _ => *recent = Some((digest, files.symbols.clone())),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn save_annotations(
         &self,
         id: &DocumentId,
@@ -172,7 +312,7 @@ impl PlanReviewStore {
             "annotation":document.annotation.annotation(), "source_edit":source_edit,
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
-            "submission_warning_status":document.source.warning_status});
+            "submission_warning_status":null});
         store.insert(document.id.clone(), (document, admission));
         Ok(opened)
     }
@@ -400,6 +540,40 @@ impl PlanReviewStore {
             .context("plan review document is closed")?;
         admission.check()?;
         let action = input.action.clone();
+        if matches!(action.as_str(), "viewed" | "unviewed") {
+            let block = input.block.clone();
+            document.validate_input(input)?;
+            let Some(file) = super::review_projection::change_file(&block) else {
+                return Ok(serde_json::json!({}));
+            };
+            let mut progress = self
+                .viewed_by_digest
+                .lock()
+                .map_err(|_| anyhow::anyhow!("plan file review lock poisoned"))?;
+            let mut files = progress
+                .get(&document.source.saved_digest)
+                .cloned()
+                .unwrap_or_default();
+            let changed = forge_diff::presentation::file_review::set_viewed(
+                &mut files,
+                file,
+                action == "viewed",
+            );
+            let result = if files == document.source.viewed_files {
+                serde_json::json!({})
+            } else {
+                document.move_review_file(file, &files)?
+            };
+            if changed {
+                if files.is_empty() {
+                    progress.remove(&document.source.saved_digest);
+                } else {
+                    progress.insert(document.source.saved_digest.clone(), files.clone());
+                }
+            }
+            document.source.viewed_files = files;
+            return Ok(result);
+        }
         if action == "references" || action == "rename_entity" {
             let column = input.position.column;
             let row = document
@@ -687,6 +861,13 @@ impl EditablePlanReview<'_> {
     ) -> Result<u64> {
         let document = self.0;
         let source: &mut super::review_source::ReviewSourceData = source;
+        if let (Some(files), Some(design)) = (&document.source.files, &source.document.design) {
+            source.files = Some(super::review_files::ReviewFiles::new(
+                design,
+                &source.rendered,
+                &files.loaded,
+            )?);
+        }
         ensure!(
             source.document.plan_id == document.source.document.plan_id
                 && source.document.version > document.source.document.version,
@@ -784,7 +965,7 @@ impl EditablePlanReview<'_> {
             source.path.with_extension("json"),
             source.saved_digest.clone(),
         )?;
-        if source.saved_navigation.is_some() {
+        if source.document.design.is_some() {
             annotation.reanchor(&source.rendered.navigation)?;
         }
         document.retain_annotation_revision();
@@ -906,7 +1087,7 @@ impl EditablePlanReview<'_> {
             "saved_source_digest":document.saved_digest(), "version":document.source.document.version,
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
-            "submission_warning_status":document.source.warning_status});
+            "submission_warning_status":null});
         if let Some(stage) = response {
             stage.complete(serde_json::json!({}));
         }
@@ -1342,7 +1523,6 @@ impl ReadOnlyPlanReview {
                 &self.source.document,
                 &self.width,
                 crate::plan::design_review::ReviewAnnotationView {
-                    warning_status: self.source.warning_status.as_ref(),
                     annotation: &[],
                     revision: &self.annotation_revision,
                     focused: None,
@@ -1351,6 +1531,8 @@ impl ReadOnlyPlanReview {
                 self.source.public_only,
                 self.source.trace.as_ref(),
                 &self.source.revealed,
+                self.source.files.as_ref(),
+                None,
             )?;
             let (selected, jump) = locate(&blocks, &targets)
                 .context("reference no longer has a display occurrence")?;
@@ -1368,7 +1550,12 @@ impl ReadOnlyPlanReview {
                     }
                 }
             }
-            let blocks = forge_buffer::collapse::project(blocks, &self.source.collapse)?;
+            let mut blocks = forge_buffer::collapse::project(blocks, &self.source.collapse)?;
+            super::review_projection::group_changes(
+                &mut blocks,
+                &targets,
+                &self.source.viewed_files,
+            )?;
             let visible: std::collections::HashSet<_> = blocks
                 .iter()
                 .flat_map(|block| &block.metadata.target)
@@ -1392,8 +1579,14 @@ impl ReadOnlyPlanReview {
         self.target = targets;
         self.focused_annotation = None;
         let source_edit = self.source_edit();
+        let demand_file = super::review_projection::change_file(&jump.block).filter(|file| {
+            self.source
+                .files
+                .as_ref()
+                .is_some_and(|inventory| !inventory.loaded.contains(*file))
+        });
         Ok(
-            serde_json::json!({"patch":patch,"source_edit":source_edit,"annotation":self.annotation.annotation(),"jump":jump}),
+            serde_json::json!({"patch":patch,"source_edit":source_edit,"annotation":self.annotation.annotation(),"jump":jump,"demand_file":demand_file}),
         )
     }
 
@@ -2052,7 +2245,7 @@ impl ReadOnlyPlanReview {
         };
         let mut annotation =
             ReviewAnnotationStore::open(annotation_path, source.saved_digest.clone())?;
-        if source.saved_navigation.is_some() {
+        if source.document.design.is_some() {
             annotation.reanchor(&source.rendered.navigation)?;
         }
         let (block, target) = super::review_projection::project(
@@ -2122,7 +2315,13 @@ impl ReadOnlyPlanReview {
                 let line = target
                     .and_then(|target| self.target.get(&target.id))
                     .map(|anchor| anchor.line)
-                    .unwrap_or(row_count + 1);
+                    .unwrap_or_else(|| {
+                        if self.source.document.design.is_some() {
+                            0
+                        } else {
+                            row_count + 1
+                        }
+                    });
                 let test = target
                     .and_then(|target| self.target.get(&target.id))
                     .and_then(|anchor| match &anchor.target {
@@ -2299,6 +2498,130 @@ impl ReadOnlyPlanReview {
         )
     }
 
+    /// Splice the requested body while preserving every other cached subtree.
+    fn materialize_file(&mut self, file: &str) -> Result<serde_json::Value> {
+        let inventory = self
+            .source
+            .files
+            .as_ref()
+            .context("plan has no deferred files")?;
+        if inventory.loaded.contains(file) {
+            return Ok(serde_json::json!({}));
+        }
+        let heading = self
+            .document
+            .block(&BlockId(file.to_owned()))
+            .context("plan file heading is missing")?;
+        let anchor = heading
+            .metadata
+            .target
+            .iter()
+            .find_map(|range| self.target.get(&range.id))
+            .context("plan file anchor is missing")?;
+        let path = anchor
+            .path
+            .as_deref()
+            .context("plan file path is missing")?;
+        let (body, targets) = super::design_review::project(
+            &self.source.document,
+            &self.width,
+            super::design_review::ReviewAnnotationView {
+                annotation: &[],
+                revision: &self.annotation_revision,
+                focused: None,
+            },
+            &self.source.declaration_syntax,
+            self.source.public_only,
+            self.source.trace.as_ref(),
+            &self.source.revealed,
+            self.source.files.as_ref(),
+            Some(super::design_review::FileBody {
+                id: file,
+                path,
+                first_line: anchor.line,
+            }),
+        )?;
+        let body = forge_buffer::collapse::project(body, &self.source.collapse)?;
+        let owns = |id: &str| {
+            id == file
+                || id
+                    .strip_prefix(file)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
+        };
+        ensure!(!body.is_empty(), "expanded plan file is missing");
+        let start = self
+            .document
+            .block_index(&BlockId(file.to_owned()))
+            .context("plan file heading is missing")?;
+        let mut removed = Vec::new();
+        let mut end = start;
+        for block in self
+            .document
+            .blocks(self.document.revision(), start..self.document.block_count())?
+            .take_while(|block| owns(&block.id.0))
+        {
+            removed.extend(block.metadata.target.iter().map(|range| range.id.clone()));
+            end += 1;
+        }
+        let mut added = Vec::new();
+        for range in body.iter().flat_map(|block| &block.metadata.target) {
+            if let Some(anchor) = targets.get(&range.id) {
+                added.push((range.id.clone(), anchor.clone()));
+            }
+        }
+        // BufferDocument rebases enclosing section folds when their endpoint is replaced.
+        let patch = self.document.splice(start..end, body)?;
+        for id in removed {
+            self.target.remove(&id);
+        }
+        self.target.extend(added);
+        self.source
+            .files
+            .as_mut()
+            .unwrap()
+            .loaded
+            .insert(file.to_owned());
+        Ok(
+            serde_json::json!({"patch":patch, "source_edit":self.source_edit(), "annotation":self.annotation.annotation()}),
+        )
+    }
+
+    /// Move the cached whole-file subtree, including an unloaded heading.
+    fn move_review_file(
+        &mut self,
+        file: &str,
+        viewed: &BTreeSet<String>,
+    ) -> Result<serde_json::Value> {
+        let mut blocks = self.document.snapshot().block;
+        let headings: Vec<_> = blocks
+            .iter()
+            .filter(|block| {
+                super::review_projection::change_file(&block.id) == Some(block.id.0.as_str())
+                    && self.source.viewed_files.contains(&block.id.0)
+                        == self.source.viewed_files.contains(file)
+            })
+            .map(|block| &block.id)
+            .collect();
+        let index = headings
+            .iter()
+            .position(|id| id.0 == file)
+            .context("plan change file heading is missing")?;
+        let next = headings
+            .get(index + 1)
+            .or_else(|| index.checked_sub(1).and_then(|i| headings.get(i)))
+            .unwrap_or(&headings[index])
+            .0
+            .clone();
+        super::review_projection::group_changes(&mut blocks, &self.target, viewed)?;
+        let patch = self
+            .document
+            .splice(0..self.document.block_count(), blocks)?;
+        Ok(
+            serde_json::json!({"patch":patch, "source_edit":self.source_edit(), "annotation":self.annotation.annotation(),
+            "jump":{"block":next, "position":{"row":0,"column":0}}}),
+        )
+    }
+
     fn toggle_declaration(
         &mut self,
         owner: &forge_buffer::identity::BlockId,
@@ -2399,6 +2722,165 @@ impl ReadOnlyPlanReview {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn moving_the_first_file_advances_to_the_second_and_restores_proposal_order() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path())?;
+        crate::checks::configure_fixture(&file.workspace);
+        let mut plan = crate::plan::references::tests::scoring_plan();
+        let design = plan.design.as_mut().unwrap();
+        design.proposed_source.insert(
+            "State.rs".into(),
+            "/// Tracks a round.\npub struct State;\n".into(),
+        );
+        design.parsed =
+            crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())?.parsed;
+        file.write_working_document("session", "plan", &plan)?;
+        let (_, _, checksum) = file.submit_document_revision("session", "plan", 1, 1)?;
+        let source = file.capture_review_source("session", "plan", None, &checksum)?;
+        let mut review = ReadOnlyPlanReview::new(
+            DocumentId("review".into()),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )?;
+        let original = review.snapshot().block;
+        let files: Vec<_> = original
+            .iter()
+            .filter(|block| {
+                super::super::review_projection::change_file(&block.id) == Some(&block.id.0)
+            })
+            .map(|block| block.id.0.clone())
+            .collect();
+        assert_eq!(files.len(), 2);
+        let viewed = BTreeSet::from([files[0].clone()]);
+        let result = review.move_review_file(&files[0], &viewed)?;
+        assert_eq!(result["jump"]["block"], files[1]);
+        let moved = review.snapshot().block;
+        let position = |id: &str| moved.iter().position(|block| block.id.0 == id).unwrap();
+        let separator = &moved[position("plan:section:changes:viewed") - 1];
+        assert_eq!(separator.id.0, "plan:section:changes:unviewed:separator");
+        assert_eq!(separator.text.row(0), Some(""));
+        assert!(position(&files[1]) < position("plan:section:changes:viewed"));
+        assert!(position("plan:section:changes:viewed") < position(&files[0]));
+        review.source.viewed_files = viewed;
+        review.move_review_file(&files[0], &BTreeSet::new())?;
+        assert_eq!(review.snapshot().block, original);
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_files_preserve_empty_public_headings_and_canonical_comment_lines() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path())?;
+        crate::checks::configure_fixture(&store.workspace);
+        let mut plan = crate::plan::references::tests::scoring_plan();
+        let design = plan.design.as_mut().unwrap();
+        design
+            .proposed_source
+            .insert("private.rs".into(), "fn private_change();\n".into());
+        design.parsed =
+            crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())?.parsed;
+        store.write_working_document("session", "plan", &plan)?;
+        let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1)?;
+        let open = |lazy| -> Result<_> {
+            let mut source = store.capture_review_source("session", "plan", None, &digest)?;
+            if lazy {
+                source.files = Some(crate::plan::review_files::ReviewFiles::new(
+                    source.document.design.as_ref().unwrap(),
+                    &source.rendered,
+                    &BTreeSet::new(),
+                )?);
+            }
+            ReadOnlyPlanReview::new(
+                DocumentId("review".into()),
+                ViewId("view".into()),
+                source,
+                WidthProfile::default(),
+                None,
+            )
+        };
+        let mut review = open(true)?;
+        let full = open(false)?;
+        let file_id =
+            |path: &str| format!("plan:design:file:{}", crate::plan::digest(path.as_bytes()));
+        let private = file_id("private.rs");
+        let public = file_id("Rounds.rs");
+        let tests = format!("plan:tests:file:{}", crate::plan::digest(b"tests.rs"));
+        let deferred = |review: &ReadOnlyPlanReview, file: &str| {
+            (&review.document)
+                .into_iter()
+                .any(|row| row.id.0 == format!("{file}:hunk:deferred"))
+        };
+        for file in [&private, &public, &tests] {
+            assert!(deferred(&review, file));
+            let id = BlockId(file.clone());
+            assert_eq!(
+                review.document.block(&id).unwrap().text,
+                full.document.block(&id).unwrap().text
+            );
+        }
+        let mut jumped = open(true)?;
+        let destination = crate::declaration::DeclarationDestination {
+            path: jumped
+                .source
+                .workspace
+                .join("Rounds.rs")
+                .to_string_lossy()
+                .into_owned(),
+            name: "score".into(),
+            line: 2,
+            column: 7,
+            proposed: true,
+            module_file: false,
+        };
+        let result = jumped.declaration_destination("proposed", destination)?;
+        assert_eq!(result["demand_file"], public);
+        jumped.materialize_file(&public)?;
+        let destination = BlockId(
+            result["jump"]["block"]
+                .as_str()
+                .context("missing jump")?
+                .to_owned(),
+        );
+        assert!(jumped.document.block(&destination).is_some());
+        assert!(deferred(&jumped, &private));
+        assert!(deferred(&jumped, &tests));
+        for file in [&tests, &private, &public] {
+            review.materialize_file(file)?;
+            assert!(!deferred(&review, file));
+            for (id, anchor) in &review.target {
+                if let Some(expected) = full.target.get(id) {
+                    assert_eq!(anchor.line, expected.line, "{id:?}");
+                }
+            }
+            if file != &public {
+                assert!(deferred(&review, &public));
+            }
+            assert_eq!(review.materialize_file(file)?, serde_json::json!({}));
+        }
+        assert_eq!(review.snapshot().block, full.snapshot().block);
+        assert!(
+            (&review.document)
+                .into_iter()
+                .any(|row| row.id.0 == private)
+        );
+        assert!(
+            !(&review.document)
+                .into_iter()
+                .any(|row| row.id.0.starts_with(&format!("{private}:")))
+        );
+        review.toggle_visibility()?;
+        assert!((&review.document).into_iter().any(|row| {
+            row.text
+                .wire_rows()
+                .iter()
+                .any(|text| text.contains("fn private_change"))
+        }));
+        Ok(())
+    }
 
     /// A comment on prose rows, which share their section's navigation target, keeps its rows
     /// by their rendered text when a review edit moves later rows.

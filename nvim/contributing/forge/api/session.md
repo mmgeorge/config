@@ -379,6 +379,7 @@ The `operation` discriminator selects a [PresentationRequest](operation-schemas.
 | `recap`, `session_name` | `{ "text": ... }` after generation using the requested model and captured conversation history. This can invoke the provider. |
 | `background_terminals` | Provider terminal inventory, or `{ "supported": false, "reason": ..., "terminal": [] }`. |
 | `terminate_terminal` | Empty object after provider termination completes, with an eight-second deadline. |
+| `plan_body` | Returns the file body as a document patch with source anchors and annotations. A cached body returns an empty object. |
 | `plan_open` | Review snapshot, `saved_source_digest`, `plan_id`, `version`, `path`, `public_only`, annotations, source-edit metadata, and check options. Requested digest/version and optional saved-source digest must match. |
 | `plan_view` | Updated plan review presentation for the captured document/view and optional width. |
 | `plan_action`, `plan_definition` | The selected review action/navigation result, such as a source target, reference/rename result, projection update, or schema snapshot. These actions retain their captured review identity and do not authorize a later mutation against a different version. |

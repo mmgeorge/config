@@ -144,7 +144,8 @@ impl PlanFileStore {
         self.authoring_require_current(&prior.session_id, &reviewed.document)?;
         let captured = self.capture_review_source(&prior.session_id, &prior.id, None, &checksum)?;
         anyhow::ensure!(
-            captured.document == reviewed.document
+            captured.rendered == self.render_review(&captured.document)?
+                && captured.document == reviewed.document
                 && captured.saved_digest == reviewed.saved_digest,
             "working plan changed before artifact restoration"
         );
@@ -206,7 +207,9 @@ impl PlanFileStore {
         self.authoring_require_current(&prior.session_id, &reviewed.document)?;
         let current = self.capture_review_source(&prior.session_id, &prior.id, None, &checksum)?;
         anyhow::ensure!(
-            current.document == reviewed.document && current.saved_digest == reviewed.saved_digest,
+            current.rendered == self.render_review(&current.document)?
+                && current.document == reviewed.document
+                && current.saved_digest == reviewed.saved_digest,
             "working plan changed before the review decision"
         );
         self.journal_revision_locked(

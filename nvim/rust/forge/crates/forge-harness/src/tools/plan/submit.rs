@@ -84,7 +84,7 @@ pub(super) async fn execute(
             .workspace_root
             .as_deref()
             .context("submission requires a workspace")?;
-        let validated = deadline
+        let validation = deadline
             .wait(
                 document
                     .design
@@ -92,7 +92,15 @@ pub(super) async fn execute(
                     .context("submission requires semantic structure")?
                     .validated(workspace, &document.title),
             )
-            .await?;
+            .await;
+        let validated = match validation {
+            Ok(validated) => validated,
+            Err(error) => {
+                let stale = error.downcast::<crate::plan::CapturedSourceChanged>()?;
+                return refresh_baselines(runtime, authoring, document, stale.paths, deadline)
+                    .await;
+            }
+        };
         let mut warnings = validated.warnings();
         let mut design = validated.into_design();
         warnings.extend(
@@ -245,6 +253,61 @@ pub(super) async fn execute(
     Ok(crate::tools::ControlToolResult {
         invocation: Some(invocation),
         message: runtime.plan_version_message("Plan passed canonical submission validation"),
+    })
+}
+
+/// Refresh stale baselines and return differences to the planner before publishing a revision.
+async fn refresh_baselines(
+    runtime: &crate::tools::runtime::ControlToolRuntime,
+    authoring: crate::plan::PlanAuthoringScope,
+    document: crate::plan::PlanDocument,
+    paths: Vec<String>,
+    deadline: ResolutionDeadline,
+) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
+    let targets = paths
+        .iter()
+        .map(|path| {
+            Ok(forge_provider_api::permissions::PermissionTarget::Read {
+                path: authoring.source_path(path)?.to_string_lossy().into_owned(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let remaining = deadline.remaining()?;
+    super::capture::authorize(
+        runtime,
+        targets,
+        "Show changed workspace sources in the plan submission",
+    )
+    .await?;
+    let deadline = ResolutionDeadline::new(remaining);
+    let scope = authoring.clone();
+    let (document, changes) = deadline
+        .process(move || {
+            let design = document
+                .design
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing declaration design"))?;
+            let changes = scope.baseline_changes(design, &paths)?;
+            Ok((document, changes))
+        })
+        .await?;
+    let message = if changes.report.is_empty() {
+        "The workspace changed again during submission and the captured sources now match. Call plan_submit again.".into()
+    } else {
+        let publish = || deadline.scope(|| authoring.baseline_refresh(&document, &changes));
+        if let Some(authority) = crate::tools::TaskAuthority::capture(&runtime.context) {
+            authority.commit(publish)?;
+        } else {
+            publish()?;
+        }
+        format!(
+            "Draft not submitted. Forge refreshed the following baselines.{}\nReview these changes against your proposals. Revise affected proposals if needed, then call plan_submit again. If the draft still expresses the intended changes, resubmit it as is.",
+            changes.report
+        )
+    };
+    Ok(crate::tools::ControlToolResult {
+        invocation: None,
+        message,
     })
 }
 

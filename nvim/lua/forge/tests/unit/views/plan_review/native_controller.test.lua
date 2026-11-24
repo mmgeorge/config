@@ -52,7 +52,10 @@ T["controller"] = function()
         block = {
         { id = "overview", text = { "Plan overview", "" }, metadata = { decoration = {}, editable_region = {}, target = {} } },
         { id = "file", text = { "file src/plan.rs", "child entity" }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
-          { id = "plan:file-tree:1", start = { row = 0, column = 0 }, ["end"] = { block = "file", position = { row = 2, column = 0 } }, closed = true },
+          { id = "plan:design:file:abc", start = { row = 0, column = 0 }, ["end"] = { block = "file", position = { row = 2, column = 0 } }, closed = true },
+        } } },
+        { id = "tests", text = { "tests src/plan.rs", "planned test" }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
+          { id = "plan:tests:file:abc", start = { row = 0, column = 0 }, ["end"] = { block = "tests", position = { row = 2, column = 0 } }, closed = true },
         } } },
         { id = "stage", text = { "1. Establish shared foundations" }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
           { id = "plan:section:foundation", start = { row = 0, column = 0 }, ["end"] = { block = "wrapped_task", position = { row = 4, column = 0 } }, closed = false },
@@ -82,7 +85,7 @@ T["controller"] = function()
       end
       callback(opened)
     elseif params.operation == "plan_action" and params.input.action == "jump_entity" then
-      callback({ jump = { block = "overview", position = { row = 0, column = 5 } } })
+      callback({ jump = { block = "file", position = { row = 1, column = 5 } } })
     elseif params.operation == "plan_action" and params.input.action == "toggle_visibility" then
       public_only = not public_only
       callback({ public_only = public_only })
@@ -114,7 +117,7 @@ T["controller"] = function()
     if mapping.buffer == 1 and mapping.callback then mapping.callback() return end
     error("missing decision mapping " .. key)
   end
-  assert(closed("plan:file-tree:1"), "file tree did not start closed")
+  assert(closed("plan:design:file:abc") and closed("plan:tests:file:abc"), "files did not start closed")
   assert(not closed("plan:section:foundation"), "stage hid task headings")
   assert(closed("plan:design:1"), "task did not start closed")
   vim.api.nvim_win_set_cursor(review.win, { row("task") + 1, 0 })
@@ -162,10 +165,11 @@ T["controller"] = function()
   vim.cmd("clearjumps")
   local origin = vim.api.nvim_win_get_cursor(review.win)
   keymap.invoke(".")
-  eq(vim.api.nvim_win_get_cursor(review.win), { 1, 5 }, { fail_reason = "plan jump did not reach declaration" })
+  eq(vim.api.nvim_get_current_line(), "child entity", { fail_reason = "plan jump did not reveal the folded file" })
+  eq(vim.api.nvim_win_get_cursor(review.win)[2], 5)
   vim.keymap.set("n", ",", "<C-o>", { buffer = review.buf })
   keymap.feed(",")
-  eq(vim.api.nvim_win_get_cursor(review.win), origin, { fail_reason = "comma did not return to jump origin" })
+  eq(vim.api.nvim_win_get_cursor(review.win), { row("task") + 1, origin[2] }, { fail_reason = "comma did not return to jump origin" })
   local hidden_tab = review.tab
   vim.cmd("tabclose")
   require("forge.views.plan_review.native_controller").open({ id = "plan", state = "awaiting_review", working_path = path, review_digest = "canonical" })
@@ -177,9 +181,17 @@ T["controller"] = function()
   assert(not detached.attached(), "closed review remained reusable")
   vim.cmd("tabclose")
   require("forge.views.plan_review.native_controller").open({ id = "plan", state = "awaiting_review", working_path = path, review_digest = "canonical" })
-  review = state.plan_review
+  review = assert(state.plan_review)
   assert(detached.closed and review.owner ~= detached and review.owner.attached(),
     "reopening detached review did not establish a fresh native attachment")
+  eq({ closed("plan:design:file:abc"), closed("plan:tests:file:abc") }, { false, true })
+  vim.api.nvim_win_set_cursor(review.win, { row("tests") + 1, 0 })
+  keymap.invoke("<Tab>", { buffer = review.buf })
+  eq(vim.api.nvim_buf_get_lines(review.buf, row("tests") + 1, row("tests") + 2, false), { "planned test" })
+  keymap.invoke("q", { buffer = review.buf })
+  require("forge.views.plan_review.native_controller").open(review.plan)
+  review = assert(state.plan_review)
+  eq(closed("plan:tests:file:abc"), false)
   review.command_set.action_by_id.accept.run({})
   answer_decision("", "<Esc>")
   assert(not pending and not require("forge.views.harness.activity").busy(state), "cancelling the decision sent an RPC")

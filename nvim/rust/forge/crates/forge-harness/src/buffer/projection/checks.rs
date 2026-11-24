@@ -1,4 +1,5 @@
 use super::*;
+use crate::buffer::duration::duration_label;
 use crate::checks::adapter::{
     TestItem, TestItemId,
     events::{CaseResult, CaseStatus},
@@ -298,16 +299,16 @@ impl TimelineRenderer<'_> {
                     .unwrap_or_else(|| "Check configuration saved".into())
             } else {
                 format!(
-                    "Checks · {} · {:.1}s",
+                    "Checks · {} · {}",
                     check_summary(run),
-                    run.duration_ms() as f64 / 1000.0
+                    duration_label(run.duration_ms())
                 )
             }
         } else {
             format!(
-                "Checks · {} · {:.1}s",
+                "Checks · {} · {}",
                 check_summary(run),
-                run.duration_ms() as f64 / 1000.0
+                duration_label(run.duration_ms())
             )
         };
         self.literal(&format!("{}:checks", run.id), &heading, None)?;
@@ -374,7 +375,7 @@ impl TimelineRenderer<'_> {
             self.literal(
                 &category_id,
                 &format!(
-                    "{} · {} · {:.1}s",
+                    "{} · {} · {}",
                     category_label(category),
                     summarize_checks(run.commands.iter().filter(|command| {
                         command
@@ -385,7 +386,7 @@ impl TimelineRenderer<'_> {
                     }))
                     // Only selected checks that never started reach this fallback.
                     .unwrap_or_else(|| "not started".into()),
-                    duration as f64 / 1000.0
+                    duration_label(duration)
                 ),
                 None,
             )?;
@@ -452,7 +453,7 @@ impl TimelineRenderer<'_> {
                         Some(total.saturating_add(leaf.elapsed_ms(self.now_ms)?))
                     });
                     let duration = elapsed
-                        .map(|elapsed| format!(" · {:.1}s", elapsed as f64 / 1000.0))
+                        .map(|elapsed| format!(" · {}", duration_label(elapsed)))
                         .unwrap_or_default();
                     self.literal(&scope_id, &format!("{scope} · {outcomes}{duration}"), None)?;
                     let scope_section = self.begin_section(2);
@@ -1695,16 +1696,19 @@ mod tests {
         }
         assert!(text.contains("Run 1") && text.contains("Run 2"));
         assert!(
-            text.contains("src/main.rs · 1 passed · 1 failed · 0.3s"),
+            text.contains("src/main.rs · 1 passed · 1 failed · 300ms"),
             "{text}"
         );
         assert!(text.contains("Run 1 · Passed · 100ms"), "{text}");
         assert!(text.contains("Run 2 · Failed · 200ms"), "{text}");
         assert!(
-            text.contains("Formatting · 0/1 passed · 2 runs · 0.3s"),
+            text.contains("Formatting · 0/1 passed · 2 runs · 300ms"),
             "{text}"
         );
-        assert!(text.contains("Tests · 1/1 passed · 1 run · 0.3s"), "{text}");
+        assert!(
+            text.contains("Tests · 1/1 passed · 1 run · 300ms"),
+            "{text}"
+        );
         assert!(!text.contains("format check"), "{text}");
         assert!(text.contains("Failed"));
         for category in ["format", "lint", "test", "build"] {

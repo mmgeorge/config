@@ -404,9 +404,6 @@ end
 T["status_agents_branch_coexists_with_question_branch"] = function()
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   stub(vim.uv, "now", function() return 0 end)
-  stub(vim.uv, "new_timer", function()
-    return { start = function() end, stop = function() end, close = function() end }
-  end)
   vim.o.columns = 200
   local snapshot = vim.json.decode(table.concat(vim.fn.readfile("nvim/lua/forge/tests/fixtures/protocol/status-agents.json"), "\n"))
   local commands = require("forge.shared.view_command_set").new()
@@ -429,8 +426,8 @@ T["status_agents_branch_coexists_with_question_branch"] = function()
   local lines = status.content.lines
   eq(lines[1]:find(" │ Waiting on the explorers", 1, true) ~= nil, true)
   eq(lines[2], "  ├─ Agents · 3 running")
-  eq(lines[3], "  │  ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4s │ Tracing reservation admission")
-  eq(lines[4], "  │  └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4s")
+  eq(lines[3], "  │  ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2s │ Tracing reservation admission")
+  eq(lines[4], "  │  └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2s")
   eq(lines[5], "  │     └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +")
   eq(lines[#lines], "  └─ Should this apply to all sessions?")
   local thought = vim.iter(status.content.highlights):find(function(highlight)

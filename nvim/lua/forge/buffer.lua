@@ -419,7 +419,10 @@ local function install_metadata(session, prepared, replace_all)
       session.layout_marks = session.layout_marks or {}
       session.layout_marks[id] = layout_marks
       vim.list_extend(mark, layout_marks)
-      for _, decoration in ipairs(entry.metadata.decoration) do
+      -- A source renderer that paints its visible rows owns their highlights and conceal marks.
+      -- Hidden rows have no physical byte columns at which canonical marks could be installed.
+      local row_marks = prepared.source_projected and session.projection_owns_row_marks and {} or entry.metadata
+      for _, decoration in ipairs(row_marks.decoration or {}) do
         local range = decoration.range
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
           physical_row and physical_row(start_row + range.start.row) or start_row + range.start.row, range.start.column, {
@@ -428,7 +431,7 @@ local function install_metadata(session, prepared, replace_all)
             priority = decoration.priority, strict = true,
           })
       end
-      for _, conceal in ipairs(entry.metadata.conceal or {}) do
+      for _, conceal in ipairs(row_marks.conceal or {}) do
         local range = conceal.range
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
           physical_row and physical_row(start_row + range.start.row) or start_row + range.start.row, range.start.column, {
@@ -650,7 +653,8 @@ function M.apply_projected_patch(session, patch)
 end
 
 ---@param render_source? fun() Synchronously renders projected text after snapshot validation.
-function M.apply_projected_snapshot(session, snapshot, render_source)
+---@param mark_phase? fun(field: string) Record completed phases of a timed snapshot.
+function M.apply_projected_snapshot(session, snapshot, render_source, mark_phase)
   assert(not render_source or session.source_projected, "source rendering requires a projected document")
   if session.status == "Closed" then return { kind = "Closed" } end
   if session.expected_changedtick ~= nil and vim.api.nvim_buf_is_valid(session.buffer)
@@ -697,11 +701,13 @@ function M.apply_projected_snapshot(session, snapshot, render_source)
       position = position, region_owner = region_owner, retired = {} }
   end)
   if not ok then return M.fail_apply(session, prepared) end
+  if mark_phase then mark_phase("preflight_ms") end
   return cooperative.atomic(function()
     if session.before_commit then session.before_commit() end
     local retained_view = buffer_view.capture(session, function(id)
       return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
     end)
+    if mark_phase then mark_phase("view_capture_ms") end
     local readonly = vim.bo[session.buffer].readonly
     ok, prepared.failure = pcall(function()
       assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
@@ -711,11 +717,15 @@ function M.apply_projected_snapshot(session, snapshot, render_source)
         vim.bo[session.buffer].buftype = "nofile"
         vim.bo[session.buffer].bufhidden = "hide"
         vim.bo[session.buffer].swapfile = false
-        vim.bo[session.buffer].filetype = session.generated_filetype
+        if vim.bo[session.buffer].filetype ~= session.generated_filetype then
+          vim.bo[session.buffer].filetype = session.generated_filetype
+        end
         session.generated_owned = true
       end
+      if mark_phase then mark_phase("buffer_setup_ms") end
       session.sequence, session.block, session.region_owner = prepared.sequence, prepared.block, prepared.region_owner
       nodes.update(session, prepared, true)
+      if mark_phase then mark_phase("sequence_and_folds_ms") end
       if not session.physical then
         vim.bo[session.buffer].readonly = false
         vim.bo[session.buffer].modifiable = true
@@ -727,6 +737,7 @@ function M.apply_projected_snapshot(session, snapshot, render_source)
       install_metadata(session, prepared, true)
       if not session.physical then vim.bo[session.buffer].modifiable = false end
       attach_regions(session, prepared)
+      if mark_phase then mark_phase("metadata_ms") end
     end)
     session.applying = nil
     pcall(function() vim.bo[session.buffer].readonly = readonly end)
@@ -1011,8 +1022,9 @@ local function publish_projection(session)
 end
 
 ---@param render_source? fun() Synchronously renders a source-projected snapshot without replacing the full buffer.
-function M.apply_snapshot(session, snapshot, render_source)
-  if session.physical or session.source_projected then return M.apply_projected_snapshot(session, snapshot, render_source) end
+---@param mark_phase? fun(field: string)
+function M.apply_snapshot(session, snapshot, render_source, mark_phase)
+  if session.physical or session.source_projected then return M.apply_projected_snapshot(session, snapshot, render_source, mark_phase) end
   if editable.suspend_generated_text(session.editable) then return {kind="Deferred"} end
   local nested = session.projection ~= nil
   for _, block in ipairs(snapshot.block) do nested = nested or #(block.metadata.fold or {}) > 0 end

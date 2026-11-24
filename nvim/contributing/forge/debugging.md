@@ -81,6 +81,22 @@ and missing-entry draft recovery. These editor-local records use the same
 to show the host log. The loop watcher runs only while a Harness transcript is
 displayed. Changing `/log` updates both detailed and sparse recording.
 
+For a slow plan open, look for `plan.review.open_ready` in `harness-perf.log`.
+Info records opens taking at least 100 ms. Trace records every completed attachment.
+`elapsed_ms` runs from opening the review through installing its commands.
+`retained_buffer` identifies reopens that reuse a loaded review. Compare records
+for the same session and row count. `open_setup_ms` covers setup before the request,
+`response_ms` measures the host round trip, and `response_setup_ms` includes draft
+recovery before rendering. `render_ms` covers applying the first projection in
+Neovim. Its phase timings measure delivery, snapshot validation, fold projection,
+comment layout, the text diff (`text_diff_ms`), buffer writes and their synchronous
+callbacks (`text_ms`), comment marks (`comment_buffer_ms`), painting, and view
+restoration. `commands_ms` measures the final setup after rendering.
+
+At Trace, the host session log breaks
+preparation down into `plan.review.capture`, `plan.review.syntax`, and
+`plan.review.projection` for declaration designs. Capture measures loading the saved revision and checking its identity. `plan.review.syntax` counts the analyzed sides of expanded files. Within projection, `plan.review.narrative_symbols` measures the declaration lookup used to color visible references. `plan.review.file_body` measures the host response to a file unfold.
+
 The host reports its own scheduling delay. `src/runtime_lag.rs` asks the Tokio
 runtime for a wakeup every 100 ms and logs `runtime.scheduling_lag` at Warn, at most
 once per second, when a wakeup arrives 50 ms or more late. A record means a worker
@@ -88,7 +104,7 @@ thread blocked on a disk, a lock, or a long computation while other tasks waited
 The alarm is coarse: another worker can run the timer on time, so a short stall of
 one worker passes unseen.
 
-Each of the five fixed event categories emits immediately, then at most once per
+At Info, each fixed event category emits immediately, then at most once per
 ten seconds per editor. The next emitted record includes the suppressed count
 and maximum duration from the preceding interval; a final quiet interval has no
 forced summary. Suppressed counts can span sessions; the emitted record's IDs

@@ -6,7 +6,15 @@ A review that drifts from the submitted revision, or loses comments when a reque
 
 ## Document
 
-PlanReview opens with one compact block snapshot. Modified files contribute changed chunks and enclosing declaration boundaries through the shared diff presentation, and later revisions send disjoint block patches compared by stable block identity. Sections appear in order: proposed declaration changes, Tests, Checks, and Verification. Rust test attributes and test-only `cfg` gates are masked in both views.
+Submission validates the plan and saves its Markdown and navigation index. PlanReview loads these artifacts for the selected revision, verifies their identity, and projects the review into one compact block snapshot. Modified files contribute changed chunks and enclosing declaration boundaries through the shared diff presentation, and later revisions send disjoint block patches compared by stable block identity. Sections appear in order: proposed declaration changes, Tests, Checks, and Verification. Rust test attributes and test-only `cfg` gates are masked in both views.
+
+Plan Review reads changed-file headings, counts, and canonical line offsets from the submitted plan. Public and All show every changed file heading. Expanding a private-only file in Public leaves its body empty. The host renders complete change and test bodies on demand and reuses them across folds and section moves in the open document. Reopening requests the remembered expanded files with the initial projection.
+
+The host marks file folds closed in the initial projection. The Lua review document keeps file fold choices in editor memory by Harness session, plan, and file fold ID. A reopened review applies those choices before rendering its first frame, including when a new revision moves a file heading.
+
+When a clean review reopens, the controller keeps the loaded buffer's text and filetype while the winbar shows the loading state. The comment renderer compares the new projection with those rows and writes only changed ranges. An unchanged reopen therefore avoids triggering text-change and filetype callbacks.
+
+PlanReview and batched pull-request review share the whole-file partition, section headings, and membership updates in `forge_diff::presentation::file_review`, plus the editor's viewed and unviewed command specs. PlanReview groups the projected file blocks after assigning canonical source anchors. Moving a file rebuilds the section folds from those blocks and carries local drafts through the shared comment editor. The session's `PlanReviewStore` keeps viewed files by saved plan digest for its lifetime.
 
 Every parser and projection splits plan text into rows on LF, and a decoration computed from text that kept a CR would extend one byte past its row. Authored artifact text therefore enters a plan with LF line endings: `design_artifact::lf_line_endings` converts CRLF and bare CR both when `plan_edit` stores an artifact and when `authoring_import` reads the planning directory, whose fingerprint still binds the raw bytes. Plans stored before that conversion still open, because the review renders the Flows section's Markdown from the same rows it displays.
 

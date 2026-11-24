@@ -1470,11 +1470,7 @@ The containing plan revision owns the record; `plan_inputs` binds its locations
 to the submitted test artifact and reviewer selections.
 
 The plan-open and plan-update responses expose this record as
-`submission_warnings`, alongside `submission_warning_status`. The transient status
-has `kind: matched`, `kind: stale` with a `reason`, or `kind: unavailable` with a
-`reason`; null means no comparison is available. A matched status describes the
-comparison at review opening or update. It is not execution evidence. Rendering
-also detects edited artifacts before attaching retained line locations.
+`submission_warnings`. These are the observations recorded at submission. The optional comparison field `submission_warning_status` is null. Rendering uses the saved test-artifact fingerprint to attach line locations only while the authored tests and reviewer selections match.
 
 The submission-warning addition first used disposable state version 40 and plan
 schema version 19; it is also present in the newer versions described above.

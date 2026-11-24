@@ -512,11 +512,7 @@ impl ReviewDocument {
             "viewed state requires batched review mode"
         );
         RepositoryPath::new(path.as_bytes().to_vec())?;
-        if viewed {
-            self.viewed_file.insert(path);
-        } else {
-            self.viewed_file.remove(&path);
-        }
+        forge_diff::presentation::file_review::set_viewed(&mut self.viewed_file, &path, viewed);
         Ok(())
     }
 }

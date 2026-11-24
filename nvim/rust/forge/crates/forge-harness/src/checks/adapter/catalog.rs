@@ -59,12 +59,14 @@ impl AdapterConfig {
 
     /// Get the fixed invocation shown during admission and check review.
     pub fn display(&self) -> String {
-        match self {
-            Self::RustNextest(_) => "cargo nextest".into(),
-            Self::Script(options) => {
-                crate::checks::invocation::display(&options.command[0], &options.command[1..])
-            }
-        }
+        let command = match self {
+            Self::RustNextest(options) => match &options.nextest_command {
+                Some(command) => command,
+                None => return "cargo nextest".into(),
+            },
+            Self::Script(options) => &options.command,
+        };
+        crate::checks::invocation::display(&command[0], &command[1..])
     }
 }
 
@@ -158,6 +160,19 @@ pub fn catalog() -> Vec<AdapterCatalogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Show the actual executable and fixed arguments during check review.
+    #[test]
+    fn nextest_preview_uses_the_configured_launcher() {
+        let options = RustNextestOptions {
+            nextest_command: Some(vec!["cargo".into(), "tasks".into(), "test".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            AdapterConfig::RustNextest(options).display(),
+            "cargo tasks test"
+        );
+    }
 
     /// Keep configuration validation, runtime construction, and published categories in agreement.
     #[test]

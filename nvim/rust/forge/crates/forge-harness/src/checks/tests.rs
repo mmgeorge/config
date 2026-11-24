@@ -822,43 +822,6 @@ fn discovery_inputs_reject_changed_task_preferences_and_missing_retained_setting
     Ok(())
 }
 
-/// Compare saved warning inputs against their original task, independently of conversation edits.
-#[tokio::test]
-async fn submission_warnings_compare_the_captured_preference_namespace() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    crate::storage::layout::prepare(data.path())?;
-    save(workspace.path(), vec![definition("check", "unused")]);
-    let runner = make_runner(workspace.path(), data.path());
-    let mut design = crate::plan::DeclarationDesign::default();
-    let snapshot = runner.changes.capture(&runner.session_id).await?;
-    design.submission_warnings = Some(SubmissionWarnings::new(
-        &design,
-        1,
-        snapshot.id,
-        discovery::DiscoveryInputs::capture(&runner, Some("planned-task"))?,
-        Vec::new(),
-    )?);
-    let restored = serde_json::from_slice(&serde_json::to_vec(&design)?)?;
-    assert!(matches!(
-        runner.submission_warning_status(&restored).await,
-        Some(SubmissionWarningStatus::Matched)
-    ));
-    let mut preferences = CheckOverrides::default();
-    preferences.auto.insert("check".into(), false);
-    runner.set_overrides(None, preferences.clone())?;
-    assert!(matches!(
-        runner.submission_warning_status(&restored).await,
-        Some(SubmissionWarningStatus::Matched)
-    ));
-    runner.set_overrides(Some("planned-task"), preferences)?;
-    assert!(
-        matches!(runner.submission_warning_status(&restored).await, Some(SubmissionWarningStatus::Stale { reason }) if reason.contains("task settings changed"))
-    );
-    assert!(runner.history()?.is_empty());
-    Ok(())
-}
-
 /// Restore enablement without losing the tool identity captured by an earlier fix.
 #[test]
 fn verification_identity_survives_policy_changes_but_rejects_tool_changes() -> Result<()> {

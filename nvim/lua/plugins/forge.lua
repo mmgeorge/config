@@ -3,6 +3,9 @@ return {
     "forge-local",
     dir = vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(debug.getinfo(1, "S").source:sub(2)))),
     dependencies = { "folke/snacks.nvim" },
+    keys = {
+      { "oa", "<cmd>ForgeHarness<cr>", desc = "Open the Forge AI Harness" },
+    },
     cmd = {
       "ForgeBranchDiff", "ForgeBranchDiffFile", "ForgeFileRevision", "ForgeDiffCompactPreview",
       "ForgeHarness", "ForgeHarnessNew", "ForgeHarnessLog", "ForgeConfig", "ForgeHistoryClear", "ForgePermissions", "ForgeStartupLog",

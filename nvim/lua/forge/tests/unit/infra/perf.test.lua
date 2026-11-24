@@ -49,6 +49,22 @@ T["info_filters_aggregates_and_redacts"] = function()
   eq(#perf.queue.harness, 2)
 end
 
+T["slow_plan_open_records_host_round_trip_and_editor_render_at_info"] = function()
+  local perf = require("forge.infra.perf")
+  perf.setup({ harness = { info = true } })
+  perf.flush_pending.harness = true
+  perf.diagnostic("plan.review.open_ready", { elapsed_ms = 99 })
+  eq(perf.queue.harness, nil)
+  local timing = { retained_buffer = true, elapsed_ms = 100, open_setup_ms = 2, response_ms = 75,
+    response_setup_ms = 1, render_ms = 20, delivery_ms = 4, preflight_ms = 3, fold_projection_ms = 2,
+    comment_layout_ms = 2, text_diff_ms = 1, text_ms = 0, comment_buffer_ms = 1, comment_guard_ms = 2,
+    source_paint_ms = 5, commands_ms = 2 }
+  perf.diagnostic("plan.review.open_ready", timing)
+  local record = vim.json.decode(perf.queue.harness[1])
+  eq(record.level, "info")
+  for field, expected in pairs(timing) do eq(record[field], expected) end
+end
+
 T["watcher_follows_view_and_level_lifecycle"] = function()
   local perf = require("forge.infra.perf")
   local active, callback = 0, nil

@@ -1,9 +1,11 @@
+pub mod file_review;
+
 use std::ops::Range;
 
 use forge_buffer::ContractError;
 use forge_buffer::block::{
-    BlockAnchor, BufferBlock, ContentLayout, Decoration, FoldRange, TextChunk, TextPosition,
-    TextRange,
+    BlockAnchor, BlockMetadata, BufferBlock, ContentLayout, Decoration, FoldRange, TextChunk,
+    TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId};
 use forge_buffer::text::BufferText;
@@ -13,6 +15,31 @@ use crate::file_header::FileChange;
 use crate::patch::PatchHunk;
 
 use crate::syntax::SyntaxHandle;
+
+/// Render a review heading as a full status-header row, including its trailing cells.
+pub fn title_block(identity: String, title: &str) -> Result<BufferBlock, ContractError> {
+    let text = BufferText::from_rows([title])?;
+    Ok(BufferBlock {
+        id: BlockId(identity),
+        text,
+        metadata: BlockMetadata {
+            decoration: vec![Decoration {
+                range: TextRange {
+                    start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition { row: 1, column: 0 },
+                },
+                capture: if title == "Loading..." {
+                    "ForgeLoading"
+                } else {
+                    "ForgeStatusHeader"
+                }
+                .into(),
+                priority: 100,
+            }],
+            ..BlockMetadata::default()
+        },
+    })
+}
 
 /// Hunk heading content, independent of the consumer's navigation actions.
 pub enum HunkHeading<'source> {

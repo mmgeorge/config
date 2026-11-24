@@ -229,6 +229,8 @@ pub enum PresentationRequest {
         document: DocumentId,
     },
     PlanOpen {
+        #[serde(default)]
+        expanded_files: std::collections::BTreeSet<String>,
         document: DocumentId,
         view: ViewId,
         plan_id: String,
@@ -240,6 +242,11 @@ pub enum PresentationRequest {
     },
     PlanAction {
         input: DocumentInput,
+    },
+    PlanBody {
+        document: DocumentId,
+        saved_source_digest: String,
+        file: String,
     },
     /// Complete an on-demand project-LSP lookup against the originating review action.
     PlanDefinition {
@@ -469,6 +476,7 @@ impl SessionPresentation {
                 anyhow::bail!("syntax requires the asynchronous service owner")
             }
             PresentationRequest::PlanOpen { .. }
+            | PresentationRequest::PlanBody { .. }
             | PresentationRequest::PlanAction { .. }
             | PresentationRequest::PlanDefinition { .. }
             | PresentationRequest::PlanSaveAnnotations { .. }

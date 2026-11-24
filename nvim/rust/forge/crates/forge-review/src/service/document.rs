@@ -11,6 +11,7 @@ use forge_buffer::identity::{
 use forge_buffer::patch::{BufferPatch, BufferSnapshot};
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
+use forge_diff::presentation::title_block;
 use forge_diff::workers::{WorkBudget, WorkPriority};
 use serde::Serialize;
 
@@ -320,21 +321,15 @@ impl ReviewService {
                     if kind == super::ReviewSectionKind::Files
                         && mode == crate::review::ReviewMode::Batched
                     {
-                        let (unviewed, viewed) = state.partition_files(&viewed_file);
-                        projected_section.push((
-                            kind,
-                            unviewed,
-                            "section:Files:Unviewed".to_owned(),
-                            Some("Unviewed Changes"),
-                            true,
-                        ));
-                        projected_section.push((
-                            kind,
-                            viewed,
-                            "section:Files:Viewed".to_owned(),
-                            Some("Viewed Changes"),
-                            true,
-                        ));
+                        for (section, files) in state.partition_files(&viewed_file) {
+                            projected_section.push((
+                                kind,
+                                files,
+                                format!("section:Files:{}", section.name()),
+                                Some(section),
+                                true,
+                            ));
+                        }
                     } else {
                         projected_section.push((
                             kind,
@@ -414,7 +409,7 @@ impl ReviewService {
                         block.push(title_block(
                             format!("{prefix}:heading"),
                             &if let Some(heading) = heading {
-                                format!("{heading} ({}):", state.item.len())
+                                heading.heading(state.item.len())
                             } else if kind == super::ReviewSectionKind::Files {
                                 format!("Changes ({}):", state.item.len())
                             } else if kind == super::ReviewSectionKind::Reviews {
@@ -1596,30 +1591,6 @@ fn comment_boundary() -> Result<BufferBlock> {
         id: BlockId("comments:end".into()),
         text: BufferText::default(),
         metadata: BlockMetadata::default(),
-    })
-}
-
-fn title_block(identity: String, title: &str) -> Result<BufferBlock> {
-    let text = BufferText::from_rows([title])?;
-    Ok(BufferBlock {
-        id: BlockId(identity),
-        text,
-        metadata: BlockMetadata {
-            decoration: vec![forge_buffer::block::Decoration {
-                range: TextRange {
-                    start: TextPosition { row: 0, column: 0 },
-                    end: TextPosition { row: 1, column: 0 },
-                },
-                capture: if title == "Loading..." {
-                    "ForgeLoading"
-                } else {
-                    "ForgeStatusHeader"
-                }
-                .into(),
-                priority: 100,
-            }],
-            ..BlockMetadata::default()
-        },
     })
 }
 

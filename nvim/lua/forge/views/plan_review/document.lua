@@ -5,6 +5,10 @@ local input = require("forge.input")
 local comments = require("forge.draft_comments")
 local decorations = require("forge.decorations")
 local perf = require("forge.infra.perf")
+local node_projection = require("forge.node_projection")
+
+---@type table<string, table<string, boolean>>
+local file_fold_choices = {}
 
 ---@class ForgePlanReviewUpdate
 ---@field snapshot? {document: string, revision: integer, block: table[]}
@@ -25,6 +29,8 @@ local perf = require("forge.infra.perf")
 ---@param callback fun(owner: table?, failure: string?)
 ---@return table
 function M.attach(options, callback)
+  local open_started = options.open_started or perf.now()
+  local plan_key = options.session_id .. "\0" .. options.plan.id
   local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_get_generation(), views = {}, pending_operation = {} }
   local symbol_namespace = vim.api.nvim_create_namespace("forge.plan_review.symbols")
   local delivery = {}
@@ -32,13 +38,39 @@ function M.attach(options, callback)
     return not owner.closed and owner.generation == client.host_get_generation() and client.host_is_accepting()
       and vim.api.nvim_buf_is_valid(options.buffer)
   end
-  local function request(params, receive)
-    if not alive() then receive(nil, "Plan host is unavailable. The local draft remains in its buffer.") return end
-    client.request({ session_id = options.session_id, method = "session.document", params = params }, function(result, failure)
+  -- Let independent view inputs supersede one another. A file body advances their shared
+  -- document revision, so finish earlier inputs before loading it and later inputs afterward.
+  local queued, active, loading_body = {}, 0, false
+  local dispatch_next
+  local function dispatch(pending)
+    local params, receive = pending.params, pending.receive
+    local captured = params.input
+    if captured and (captured.action == "viewed" or captured.action == "unviewed" or captured.action == "toggle_visibility")
+      and pending.digest == owner.saved_source_digest and owner.replica.block[captured.block] then
+      captured.revision = owner.replica.revision
+    end
+    active = active + 1
+    if params.operation == "plan_body" then loading_body = true end
+    local function complete(result, failure)
       if owner.closed or not vim.api.nvim_buf_is_valid(options.buffer) then return end
-      if not alive() then receive(nil, "Plan host was collected. The local draft remains in its buffer.")
+      if not alive() then receive(nil, "Plan host is unavailable. The local draft remains in its buffer.")
       else receive(result, failure) end
-    end)
+      active = active - 1
+      if params.operation == "plan_body" then loading_body = false end
+      dispatch_next()
+    end
+    if not alive() then complete(nil) return end
+    client.request({ session_id = options.session_id, method = "session.document", params = params }, complete)
+  end
+  dispatch_next = function()
+    while queued[1] and not loading_body and not owner.closed do
+      if active > 0 and queued[1].params.operation == "plan_body" then return end
+      dispatch(table.remove(queued, 1))
+    end
+  end
+  local function request(params, receive)
+    queued[#queued + 1] = { params = params, receive = receive, digest = owner.saved_source_digest }
+    dispatch_next()
   end
   function owner.attached() return alive() and owner.ready == true end
   function owner.current_view(window)
@@ -101,11 +133,20 @@ function M.attach(options, callback)
   end
   function owner.recovery()
     if not owner.ready then return nil, "Plan review is not ready" end
-    local source_text = {}
+    local annotation = comments.capture(options.buffer)
+    local anchored = {}
+    for _, item in ipairs(annotation) do
+      anchored[item.source.start_line], anchored[item.source.end_line] = true, true
+    end
+    local source_text, files = {}, {}
     for _, row in ipairs(owner.source or {}) do
       if row.source_line > 0 then source_text[row.source_line] = row.text end
+      if anchored[row.source_line] then
+        local file = row.block:match("^(plan:design:file:[^:]+)") or row.block:match("^(plan:tests:file:[^:]+)")
+        if file then files[file] = true end
+      end
     end
-    return { annotation = comments.capture(options.buffer), saved_source_digest = owner.saved_source_digest,
+    return { annotation = annotation, files = files, saved_source_digest = owner.saved_source_digest,
       source_text = source_text, pending_operation = owner.pending_operation and vim.deepcopy(owner.pending_operation) }
   end
   ---Closes the review. A buffer with unsaved drafts stays attached so reopening the same revision
@@ -114,6 +155,22 @@ function M.attach(options, callback)
   function owner.close(drafts_recovered)
     if owner.closed then return true end
     if owner.saving or owner.submission_pending then return false end
+    local projection = owner.replica.projection
+    if projection then
+      local choices = file_fold_choices[plan_key] or {}
+      for id, closed in pairs(projection.choice) do
+        if id:match("^plan:design:file:[^:]+$") or id:match("^plan:tests:file:[^:]+$")
+          or vim.startswith(id, "plan:file-tree:") then
+          choices[id] = closed
+        end
+      end
+      for id, record in pairs(projection.source.fold.record) do
+        if not record.fold.closed and projection.choice[id] == nil and id:match("^plan:design:file:[^:]+$") then
+          choices[id] = false
+        end
+      end
+      file_fold_choices[plan_key] = next(choices) and choices or nil
+    end
     if not drafts_recovered and vim.api.nvim_buf_is_valid(options.buffer) and vim.bo[options.buffer].modified then return true end
     owner.closed = true
     comments.detach(options.buffer, false)
@@ -319,7 +376,7 @@ function M.attach(options, callback)
     comments.discard_empty(options.buffer)
     enqueue_operation({ capture = comments.capture(options.buffer) })
   end
-  local function attach_projection(opened, source_document, focused_id)
+  local function attach_projection(opened, source_document, focused_id, mark_phase)
     owner.optimistic_source = nil
     if options.rebase and options.recovery then
       local dropped
@@ -347,20 +404,24 @@ function M.attach(options, callback)
     owner.comment_state = nil
     local source = assert(opened.source_row, "Plan review source rows are missing")
     owner.source = source
-    local projection = require("forge.node_projection")
     source_document = source_document or buffer.fragment(opened.snapshot, true)
-    local node_owner = owner.replica.projection or projection.new(source_document)
+    local node_owner = owner.replica.projection
+    if not node_owner then
+      node_owner = node_projection.new(source_document)
+      node_owner.choice = vim.tbl_extend("force", {}, file_fold_choices[plan_key] or {})
+    end
     node_owner.source = source_document
     owner.replica.projection = node_owner
     local function project_source()
-      local _, mapping = projection.render(node_owner)
+      local _, mapping = node_projection.render(node_owner)
       node_owner.mapping = mapping
-      for _, row in ipairs(source) do row.hidden = not projection.contains(node_owner, row.block, row.position.row) end
+      for _, row in ipairs(source) do row.hidden = not node_projection.contains(node_owner, row.block, row.position.row) end
       if owner.comment_state then comments.update(options.buffer, {}) end
       return true
     end
     owner.replica.project_source = project_source
     project_source()
+    if mark_phase then mark_phase("fold_projection_ms") end
     local source_lines = {}
     for _, row in ipairs(source) do
       local node = source_document.sequence.node[row.block]
@@ -382,6 +443,20 @@ function M.attach(options, callback)
             vim.api.nvim_buf_set_extmark(options.buffer, namespace, record.row, projected.column, projected.options)
           end
         end
+        for _, conceal in ipairs(metadata.conceal or {}) do
+          local first, last = conceal.range.start, conceal.range["end"]
+          local relative = row.position.row
+          if relative >= first.row and (relative < last.row or relative == last.row and last.column > 0) then
+            local column = relative == first.row and first.column or 0
+            local finish = relative == last.row and math.min(last.column, #row.text) or #row.text
+            if column <= finish then
+              vim.api.nvim_buf_set_extmark(options.buffer, namespace, record.row, row.display_indent + column, {
+                end_row = record.row, end_col = row.display_indent + finish,
+                conceal = conceal.replacement, conceal_lines = conceal.line and "" or nil, priority = conceal.priority,
+              })
+            end
+          end
+        end
       end
       if owner.comment_state and options.configure_view then options.configure_view(owner.view, owner) end
       local ranges = require("forge.views.plan_review.markdown").ranges(source, projection)
@@ -392,15 +467,18 @@ function M.attach(options, callback)
     owner.comment_state = nil
     owner.replica.materialized_prefix = true
     owner.replica.physical_row = nil
+    if mark_phase then mark_phase("source_layout_ms") end
     owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
       source_provider = function() return owner.optimistic_source or source end, after_render = paint,
       baseline = recovered and baseline or nil,
       focused_id = focused_id,
       readonly = options.plan.historical_revision ~= nil,
       guard_source = true,
-    })
+    }, mark_phase)
+    if mark_phase then mark_phase("source_paint_ms") end
     require("forge.draft_source").attach(owner.replica, owner.comment_state, source)
     show_answers(opened.annotation)
+    if mark_phase then mark_phase("answer_layout_ms") end
   end
   ---@param selected ForgePlanTestSelection[]
   ---@param operation_id string
@@ -432,13 +510,14 @@ function M.attach(options, callback)
       revision = owner.version, count = #selected, duration_ms = perf.elapsed_ms(started) })
     return settle
   end
-  local function apply_projection(opened, source)
+  local function apply_projection(opened, source, mark_phase)
     vim.api.nvim_buf_clear_namespace(options.buffer, symbol_namespace, 0, -1)
     if not source then
       local snapshot, rows, fragment = require("forge.views.plan_review.delivery").apply(delivery, opened)
       opened = vim.tbl_extend("force", opened, { snapshot = snapshot, source_row = rows })
       source = fragment
     end
+    if mark_phase then mark_phase("delivery_ms") end
     local applied = buffer.apply_snapshot(owner.replica, opened.snapshot, function()
       local focused_id
       for _, annotation in ipairs(owner.comment_state and owner.comment_state.annotation_list or {}) do
@@ -448,8 +527,9 @@ function M.attach(options, callback)
       owner.replica.locate, owner.replica.physical_row, owner.replica.physical_column = nil, nil, nil
       owner.replica.source_layout_row = nil
       owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
-      attach_projection(opened, source, focused_id)
-    end)
+      if mark_phase then mark_phase("source_reset_ms") end
+      attach_projection(opened, source, focused_id, mark_phase)
+    end, mark_phase)
     if applied.kind == "Applied" then
       local options = wrapping()
       for _, view in pairs(owner.views) do input.set_wrapping(view, options) end
@@ -531,6 +611,29 @@ function M.attach(options, callback)
   end
   owner.replica = buffer.open(owner.document, { buffer = options.buffer, filetype = "ForgePlan", generated = true, preserve_view = true, source_projected = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
+  owner.replica.projection_owns_row_marks = true
+  local loading_files = {}
+  local function demand_file(id)
+    if loading_files[id] then return end
+    local digest = owner.saved_source_digest
+    loading_files[id] = digest
+    request({ operation = "plan_body", document = owner.document, saved_source_digest = digest, file = id }, function(result, failure)
+      if loading_files[id] == digest then loading_files[id] = nil end
+      if not alive() or owner.saved_source_digest ~= digest then return end
+      if not failure and result.patch and result.patch ~= vim.NIL then
+        if vim.bo[options.buffer].modified then options.recovery = { annotation = comments.capture(options.buffer) } end
+        local applied = apply_projection(result)
+        if applied.kind ~= "Applied" then failure = applied.reason or applied.kind end
+        owner.sync_editability()
+      end
+      if failure and options.notice then options.notice(failure) end
+    end)
+  end
+  owner.replica.node_action = function(id, expanded)
+    local changed = buffer.set_expansion(owner.replica, id, expanded)
+    if changed and expanded and owner.replica.block[id .. ":hunk:deferred"] then demand_file(id) end
+    return changed
+  end
   local function open_view(window)
     local columns = require("forge.window_presentation").capture(window)
     columns.number, columns.relativenumber, columns.statuscolumn = false, false, ""
@@ -560,11 +663,19 @@ function M.attach(options, callback)
   -- Drafts rebased onto a new revision were written against another saved source, so only a
   -- same-revision recovery asks the host to confirm the saved source digest.
   local recovered_digest = options.recovery and not options.rebase and options.recovery.saved_source_digest or nil
+  local expanded_files = vim.tbl_extend("force", {}, options.rebase and options.recovery and options.recovery.files or {})
+  for id, closed in pairs(file_fold_choices[plan_key] or {}) do
+    if not closed then expanded_files[id] = true end
+  end
   request({ operation = "plan_open", document = owner.document, view = owner.view.id,
+    expanded_files = vim.tbl_keys(expanded_files),
     plan_id = options.plan.id, digest = options.plan.review_digest, revision = options.plan.historical_revision,
     saved_source_digest = recovered_digest,
     width = owner.source_width }, function(opened, failure)
-    perf.event("harness", "plan.review.open_response", { elapsed_ms = perf.elapsed_ms(started), status = failure and "error" or "ok" })
+    local received = perf.now()
+    local response_ms = perf.elapsed_ms(started, received)
+    perf.event("harness", "plan.review.open_response", { document = owner.document, session_id = options.session_id,
+      elapsed_ms = response_ms, status = failure and "error" or "ok" })
     if failure then callback(nil, failure) return end
     if options.rebase and options.recovery and options.recovery.pending_operation
       and #options.recovery.pending_operation > 0 then
@@ -582,7 +693,19 @@ function M.attach(options, callback)
       owner.replica.expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
     end
     local pending = options.recovery and options.recovery.pending_operation
-    local adopted = apply_projection(opened)
+    local render_started = perf.now()
+    local phases, previous = {
+      open_setup_ms = perf.elapsed_ms(open_started, started),
+      response_setup_ms = perf.elapsed_ms(received, render_started),
+    }, render_started
+    local function mark_phase(field)
+      local now = perf.now()
+      phases[field] = perf.elapsed_ms(previous, now)
+      previous = now
+    end
+    local adopted = apply_projection(opened, nil, mark_phase)
+    mark_phase("view_restore_ms")
+    local render_ms = perf.elapsed_ms(render_started)
     if adopted.kind ~= "Applied" then callback(nil, adopted.kind) return end
     owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
     owner.checks = opened.checks or {}
@@ -598,6 +721,12 @@ function M.attach(options, callback)
       if not owner.views[window] then open_view(window) end
     end })
     callback(owner)
+    mark_phase("commands_ms")
+    local timing = vim.tbl_extend("force", phases, { buf = options.buffer, retained_buffer = options.retained_buffer == true,
+      document = owner.document, session_id = options.session_id, rows = #owner.source,
+      elapsed_ms = perf.elapsed_ms(open_started), response_ms = response_ms, render_ms = render_ms })
+    if perf.enabled("harness") then perf.event("harness", "plan.review.open_ready", timing)
+    else perf.diagnostic("plan.review.open_ready", timing) end
     for _, operation in ipairs(pending or {}) do
       if operation.method then
         local captured = operation.params.review
@@ -624,14 +753,26 @@ function M.attach(options, callback)
   ---@param view table?
   ---@return ForgeDocumentInput?, string?
   local function apply_action_projection(result, captured, view)
-    if not result.patch or result.patch == vim.NIL then return captured end
-    local applied = apply_projection(result)
-    if applied.kind ~= "Applied" then return nil, applied.kind end
-    captured = vim.tbl_extend("force", captured, { revision = owner.replica.revision })
+    if result.patch and result.patch ~= vim.NIL then
+      -- The same canonical lines own the drafts after a presentation-only patch, including
+      -- comments typed while a file move was in flight.
+      if vim.bo[options.buffer].modified then
+        options.recovery = { annotation = comments.capture(options.buffer) }
+      end
+      local applied = apply_projection(result)
+      if applied.kind ~= "Applied" then options.recovery = nil return nil, applied.kind end
+      captured = vim.tbl_extend("force", captured, { revision = owner.replica.revision })
+    end
     if view and view.id == captured.view then
+      local jump = result.jump
+      local projection = owner.replica.projection
+      if type(jump) == "table" and node_projection.reveal(projection, jump.block, jump.position.row) then
+        owner.replica.project_source()
+      end
       view.cursor = vim.api.nvim_win_get_cursor(view.window)
       view.changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
     end
+    if type(result.demand_file) == "string" then demand_file(result.demand_file) end
     return captured
   end
 
@@ -705,7 +846,8 @@ function M.attach(options, callback)
       -- older revision than the host's. Staleness suppresses only the cursor effect and callback.
       local patched = not error and result.patch and result.patch ~= vim.NIL
       if not error and not patched and result.public_only ~= nil then owner.public_only = result.public_only end
-      if patched and alive() and captured.document == owner.document and captured.revision == owner.replica.revision then
+      if (patched or current and not error and type(result.jump) == "table") and alive()
+        and captured.document == owner.document and (patched and result.patch.base or captured.revision) == owner.replica.revision then
         if current and action == "toggle_declaration" then
           local node = owner.replica.sequence.node[captured.block]
           local collapse = node and node.entry.metadata.collapse and node.entry.metadata.collapse[1]

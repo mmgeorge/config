@@ -29,50 +29,25 @@ pub(super) async fn execute(
         .plan_authoring
         .as_ref()
         .context("file capture requires an active filesystem planning task")?;
-    if let Some(permissions) = &runtime.context.file_permissions {
-        use forge_provider_api::permissions::{
-            PermissionRequest, PermissionResponse, PermissionTarget,
-        };
-        let invocation_scope = runtime
-            .context
-            .question_invocation
-            .as_ref()
-            .context("capture has no original invocation")?;
-        let request = PermissionRequest {
-            id: uuid::Uuid::new_v4().to_string(),
-            provider: forge_provider_api::ProviderId::new("harness")
-                .expect("static provider identity is valid"),
-            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
-            reason: Some("Capture source declarations into the planning directory".into()),
-            target_list: vec![
-                PermissionTarget::Read {
-                    path: scope.source_path(path)?.to_string_lossy().into_owned(),
-                },
-                PermissionTarget::Write {
-                    path: scope
-                        .directory()
-                        .join("files")
-                        .join(path)
-                        .to_string_lossy()
-                        .into_owned(),
-                },
-            ],
-        };
-        match permissions.authorize(invocation_scope, request).await {
-            PermissionResponse::Allow => {}
-            PermissionResponse::Deny { reason } => {
-                return Err(crate::tools::ToolError::Rejected(
-                    reason.unwrap_or_else(|| "Capture file access was denied".into()),
-                ));
-            }
-            PermissionResponse::Cancelled => return Err(crate::broker::TurnCancelled.into()),
-        }
-    } else {
-        crate::tools::error::ensure!(
-            !runtime.context.permission_required,
-            "capture file permission authority is unavailable"
-        );
-    }
+    use forge_provider_api::permissions::PermissionTarget;
+    authorize(
+        runtime,
+        vec![
+            PermissionTarget::Read {
+                path: scope.source_path(path)?.to_string_lossy().into_owned(),
+            },
+            PermissionTarget::Write {
+                path: scope
+                    .directory()
+                    .join("files")
+                    .join(path)
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        ],
+        "Capture source declarations into the planning directory",
+    )
+    .await?;
     let capture = || scope.capture(path);
     let destination =
         if let Some(authority) = crate::tools::TaskAuthority::capture(&runtime.context) {
@@ -93,4 +68,43 @@ pub(super) async fn execute(
             scope.baseline_path(path).display()
         ),
     })
+}
+
+/// Authorize the files a planning tool reads or writes under the active invocation.
+pub(super) async fn authorize(
+    runtime: &ControlToolRuntime,
+    target_list: Vec<forge_provider_api::permissions::PermissionTarget>,
+    reason: &str,
+) -> ToolResult<()> {
+    if let Some(permissions) = &runtime.context.file_permissions {
+        use forge_provider_api::permissions::{PermissionRequest, PermissionResponse};
+        let invocation_scope = runtime
+            .context
+            .question_invocation
+            .as_ref()
+            .context("capture has no original invocation")?;
+        let request = PermissionRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            provider: forge_provider_api::ProviderId::new("harness")
+                .expect("static provider identity is valid"),
+            subject: forge_provider_api::permissions::PermissionSubject::Unattached,
+            reason: Some(reason.into()),
+            target_list,
+        };
+        match permissions.authorize(invocation_scope, request).await {
+            PermissionResponse::Allow => {}
+            PermissionResponse::Deny { reason } => {
+                return Err(crate::tools::ToolError::Rejected(
+                    reason.unwrap_or_else(|| "Capture file access was denied".into()),
+                ));
+            }
+            PermissionResponse::Cancelled => return Err(crate::broker::TurnCancelled.into()),
+        }
+    } else {
+        crate::tools::error::ensure!(
+            !runtime.context.permission_required,
+            "capture file permission authority is unavailable"
+        );
+    }
+    Ok(())
 }

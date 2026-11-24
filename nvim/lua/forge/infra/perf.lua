@@ -25,13 +25,17 @@ local ROTATED_LOG_FILES = 10
 local MAX_QUEUE_RECORDS = 4096
 local MAX_QUEUE_BYTES = 1024 * 1024
 local INFO_EVENTS = { ["ui.render"] = 100, ["ui.buffer.patch"] = 100, ["ui.loop_lag"] = 250,
-  ["ui.queue.rejected"] = 0, ["ui.queue.recovered"] = 0 }
+  ["plan.review.open_ready"] = 100, ["ui.queue.rejected"] = 0, ["ui.queue.recovered"] = 0 }
 local info_windows = {}
 local views = {}
 local METADATA_FIELD = {
   buf = true, view_kind = true, line_count = true, cursor_row = true, cursor_col = true,
   viewport_top = true, viewport_total = true, viewport_logical_total = true, viewport_render_count = true,
   ms = true, elapsed_ms = true, duration_ms = true, count = true, rows = true, bytes = true, spans = true,
+  retained_buffer = true, open_setup_ms = true, response_setup_ms = true, response_ms = true,
+  render_ms = true, delivery_ms = true, buffer_setup_ms = true, source_reset_ms = true,
+  fold_projection_ms = true, source_layout_ms = true, comment_layout_ms = true, comment_buffer_ms = true,
+  comment_guard_ms = true, source_paint_ms = true, answer_layout_ms = true, commands_ms = true,
   source_bytes = true, result_bytes = true, file_count = true, hunk_count = true, changed_lines = true,
   added = true, deleted = true, phase = true, source = true, operation = true, operation_id = true,
   request_id = true, session_id = true, provider = true, method = true, event_type = true,
@@ -43,7 +47,7 @@ local METADATA_FIELD = {
   span_id = true,
   document = true, text_edits = true, metadata_edits = true,
   preflight_ms = true, view_capture_ms = true, fold_capture_ms = true,
-  sequence_and_folds_ms = true, text_ms = true, metadata_ms = true,
+  sequence_and_folds_ms = true, text_diff_ms = true, text_ms = true, metadata_ms = true,
   regions_ms = true, decorations_ms = true, fold_refresh_ms = true, view_restore_ms = true,
   buffer_api_ms = true, editable_callback_ms = true, editable_callback_count = true,
   slices = true, maximum_ms = true, maximum_prepare_ms = true, maximum_commit_ms = true,
@@ -102,9 +106,10 @@ function M.now()
 end
 
 ---@param started integer
+---@param finished? integer
 ---@return number
-function M.elapsed_ms(started)
-  local elapsed = M.now() - started
+function M.elapsed_ms(started, finished)
+  local elapsed = (finished or M.now()) - started
   return math.floor((elapsed / 1000000) * 1000 + 0.5) / 1000
 end
 

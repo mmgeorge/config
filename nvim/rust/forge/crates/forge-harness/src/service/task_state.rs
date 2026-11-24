@@ -841,9 +841,6 @@ async fn refresh_edited_review(
             .context("edited plan has no review digest")?,
     )?;
     let mut source = crate::plan::review_source::EditableReviewSource::try_from(source)?;
-    if let Some(design) = &source.document.design {
-        source.warning_status = controller.checks.submission_warning_status(design).await;
-    }
     let expected_version = controller
         .plan_review
         .prepare_update(document, &mut source)?;

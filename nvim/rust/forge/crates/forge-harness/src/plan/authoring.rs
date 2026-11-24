@@ -105,6 +105,101 @@ impl PlanAuthoringScope {
         Ok((original, document))
     }
 
+    /// Extract all changed captures from the workspace snapshot for a submission retry.
+    pub(crate) fn baseline_changes(
+        &self,
+        design: &super::DeclarationDesign,
+        paths: &[String],
+    ) -> Result<BaselineChanges> {
+        let mut changes = BaselineChanges::default();
+        for path in paths {
+            let previous = design
+                .baseline
+                .get(path)
+                .context("missing captured baseline")?;
+            super::resolution_deadline::ResolutionDeadline::check()?;
+            self.source_path(path)?;
+            let source = super::workspace_source(&self.files.workspace, path)?;
+            if source
+                .as_ref()
+                .is_some_and(|source| super::digest(source.as_bytes()) == previous.source_digest)
+            {
+                continue;
+            }
+            let current = source
+                .map(|source| design.capture_baseline(path, &source).map(|(file, _)| file))
+                .transpose()?;
+            let text = current
+                .as_ref()
+                .map_or("", |file| file.editable_text.as_str());
+            let diff = similar::TextDiff::from_lines(&previous.editable_text, text)
+                .unified_diff()
+                .header("previous baseline", "current baseline")
+                .to_string();
+            changes.report.push_str(&format!("\n{path}\n"));
+            if current.is_none() {
+                changes
+                    .report
+                    .push_str("The captured file was removed from the workspace. Keeping its proposal will plan to create it again.\n");
+            }
+            if diff.is_empty() {
+                changes.report.push_str("Source changed. No changes to captured declarations or configuration values.\n");
+            } else {
+                changes.report.push_str(&diff);
+            }
+            changes.files.insert(path.clone(), current);
+        }
+        Ok(changes)
+    }
+
+    /// Publish the refreshed capture ledger while preserving every editable proposal.
+    pub(crate) fn baseline_refresh(
+        &self,
+        document: &PlanDocument,
+        changes: &BaselineChanges,
+    ) -> Result<()> {
+        let gate = self
+            .files
+            .working_document_gate(&self.session_id, &self.plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        self.files
+            .authoring_require_current(&self.session_id, document)?;
+        let directory = self.readable_directory();
+        let original = self
+            .files
+            .authoring_ledger(&self.session_id, &self.plan_id)?;
+        let mut ledger = original.clone();
+        for (path, file) in &changes.files {
+            match file {
+                Some(file) => {
+                    ledger.baseline.insert(path.clone(), file.clone());
+                }
+                None => {
+                    ledger.baseline.remove(path);
+                }
+            }
+        }
+        // The ledger is the commit point. A retry can rebuild the read-only copies from it.
+        let publish = || -> Result<()> {
+            for path in changes.files.keys() {
+                ledger.write_baseline_copy(&directory, path)?;
+            }
+            super::resolution_deadline::ResolutionDeadline::check()?;
+            super::write_json_atomically(&directory.join("capture-ledger.json"), &ledger)
+        };
+        if let Err(error) = publish() {
+            for path in changes.files.keys() {
+                original
+                    .write_baseline_copy(&directory, path)
+                    .with_context(|| format!("restore baseline copy after {error:#}"))?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Save a validated submission's exact authored inputs outside the editable directory.
     pub(crate) fn snapshot_save(&self, document: &PlanDocument) -> Result<String> {
         self.files
@@ -170,6 +265,26 @@ struct CaptureLedger {
     baseline: BTreeMap<String, DeclarationFile>,
 }
 
+impl CaptureLedger {
+    fn write_baseline_copy(&self, directory: &Path, path: &str) -> Result<()> {
+        let destination = checked_destination(&directory.join("baseline"), path)?;
+        if let Some(file) = self.baseline.get(path) {
+            fs::create_dir_all(destination.parent().context("baseline has no parent")?)?;
+            super::write_text_atomically(&destination, &file.editable_text)?;
+        } else if destination.try_exists()? {
+            fs::remove_file(destination)?;
+        }
+        Ok(())
+    }
+}
+
+/// Hold replacement capture evidence and the corresponding old-to-new diff until publication.
+#[derive(Default)]
+pub(crate) struct BaselineChanges {
+    files: BTreeMap<String, Option<DeclarationFile>>,
+    pub(crate) report: String,
+}
+
 /// Recover a capture interrupted between copying its file and recording its baseline.
 #[derive(Deserialize, Serialize)]
 struct CaptureJournal {
@@ -192,6 +307,30 @@ impl AuthoringFileImage {
 }
 
 impl PlanFileStore {
+    /// Rebuild read-only baseline copies from the committed ledger after an interrupted refresh.
+    pub(crate) fn restore_baseline_copies(&self, session_id: &str, plan_id: &str) -> Result<()> {
+        if !self.authoring_directory(session_id, plan_id).try_exists()? {
+            return Ok(());
+        }
+        let gate = self.working_document_gate(session_id, plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        let ledger = self.authoring_ledger(session_id, plan_id)?;
+        let directory = self.plan_dir(session_id, plan_id);
+        for (path, file) in &ledger.baseline {
+            let destination = checked_destination(&directory.join("baseline"), path)?;
+            match fs::read(&destination) {
+                Ok(bytes) if bytes == file.editable_text.as_bytes() => continue,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| format!("read baseline {path}")),
+            }
+            ledger.write_baseline_copy(&directory, path)?;
+        }
+        Ok(())
+    }
+
     /// Copy unfinished authoring inputs and capture evidence without linking writable files.
     pub(super) fn authoring_copy(
         &self,
@@ -916,7 +1055,7 @@ impl PlanFileStore {
             reviewed.path.with_extension("json"),
             reviewed.saved_digest.clone(),
         )?;
-        if reviewed.saved_navigation.is_some() {
+        if reviewed.document.design.is_some() {
             store.reanchor(&reviewed.rendered.navigation)?;
         }
         store
@@ -1033,6 +1172,32 @@ mod tests {
                 .baseline
                 .contains_key("source.rs")
         );
+        Ok(())
+    }
+
+    /// Restore the committed baseline after a refresh is interrupted before ledger publication.
+    #[test]
+    fn interrupted_refresh_restores_copies_without_recreating_deleted_proposals() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::checks::configure_fixture(root.path());
+        fs::write(root.path().join("source.rs"), "pub fn existing() {}\n")?;
+        let files = PlanFileStore::new(root.path().join("storage"), root.path())?;
+        let plan = files
+            .prepare_entry("session", "Revise the callable.".into(), None, 1)?
+            .record;
+        files.authoring_capture("session", &plan.id, "source.rs")?;
+        let baseline = files
+            .plan_dir("session", &plan.id)
+            .join("baseline/source.rs");
+        let committed = fs::read(&baseline)?;
+        let proposal = files
+            .authoring_directory("session", &plan.id)
+            .join("files/source.rs");
+        fs::remove_file(&proposal)?;
+        fs::write(&baseline, "pub fn newer();\n")?;
+        files.restore_baseline_copies("session", &plan.id)?;
+        assert_eq!(fs::read(&baseline)?, committed);
+        assert!(!proposal.exists());
         Ok(())
     }
 

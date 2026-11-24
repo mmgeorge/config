@@ -86,6 +86,8 @@ These summaries omit separate failed counts and attempt labels.
 Expand an execution to inspect its diagnostics. Its output action opens the full
 command log.
 
+A Rust workspace that prepares SDKs before running tests can set `rust_nextest.nextest_command` to a command prefix such as `["cargo", "tasks", "test"]`. Forge forwards Nextest’s version, listing, and execution arguments to that command. Static test discovery reads Cargo metadata and Rust source directly.
+
 Test checks configured with an adapter report individual cases. Their live status
 shows the finished and planned case counts, failed cases, and the current phase.
 Completed cases are grouped by the parent labels supplied by the adapter; Harness

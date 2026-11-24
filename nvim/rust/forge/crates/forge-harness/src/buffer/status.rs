@@ -8,6 +8,7 @@ use forge_buffer::patch::BufferSnapshot;
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
+use super::duration::elapsed_label;
 use super::projection::TranscriptAction;
 use super::transcript::TranscriptRenderer;
 use crate::checks::{CheckActivity, CheckState};
@@ -233,7 +234,10 @@ impl StatusView<'_> {
         // agents heading takes the primary row, as the check heading does for idle checks.
         let delegating = idle && checks.is_none();
         let mut text = if let Some(checks) = standalone_checks {
-            format!("Working · {}s", checks.elapsed_ms(now_ms) / 1000)
+            format!(
+                "Working · {}",
+                elapsed_label(checks.elapsed_ms(now_ms) / 1000)
+            )
         } else if delegating {
             agents_heading(agents)
         } else {
@@ -385,7 +389,7 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
         SessionPhase::Stopping { collection } => collection.label().into(),
         SessionPhase::Compacting { .. } => {
             let elapsed_seconds = status.elapsed_ms(now_ms) / 1_000;
-            format!("Compacting · {elapsed_seconds}s")
+            format!("Compacting · {}", elapsed_label(elapsed_seconds))
         }
         SessionPhase::Finalizing { outcome, error, .. } => {
             let label = finalization_label(*outcome);
@@ -413,7 +417,7 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
         }
         SessionPhase::RetryingPlanGeneration { activity, .. } => {
             let elapsed = status.elapsed_ms(now_ms) / 1_000;
-            format!("{} · {elapsed}s", activity.active_label())
+            format!("{} · {}", activity.active_label(), elapsed_label(elapsed))
         }
         SessionPhase::RetryingProvider { retry, activity } => {
             let label = format!(
@@ -536,7 +540,9 @@ fn append_checks(
         };
         let elapsed = command
             .elapsed_ms(now_ms)
-            .map_or_else(String::new, |elapsed| format!(" · {}s", elapsed / 1000));
+            .map_or_else(String::new, |elapsed| {
+                format!(" · {}", elapsed_label(elapsed / 1000))
+            });
         if command.state == CheckState::Running {
             running_rows.push(lines.len());
         }
@@ -707,7 +713,7 @@ fn append_agents(
         let elapsed = if agent.starting {
             "starting".to_owned()
         } else {
-            format!("{}s", agent.elapsed_ms(now_ms) / 1000)
+            elapsed_label(agent.elapsed_ms(now_ms) / 1000)
         };
         let prefix = format!("{root}{indent}{branch} ");
         let mut row = format!(
@@ -861,9 +867,9 @@ fn working_status_text(
         } else {
             "all files matched".into()
         };
-        return format!("{phase} · {elapsed_seconds}s · {attention}");
+        return format!("{phase} · {} · {attention}", elapsed_label(elapsed_seconds));
     }
-    format!("{phase} · {elapsed_seconds}s")
+    format!("{phase} · {}", elapsed_label(elapsed_seconds))
 }
 
 #[cfg(test)]
@@ -1371,8 +1377,8 @@ mod tests {
             &[
                 "Working · 44s",
                 "└─ Agents · 3 running",
-                "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2.4s │ Tracing reservation admission",
-                "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2.4s",
+                "   ├─ ⠋ 43s code-explorer-1 · codex · gpt-6-luna + │ 6/6 tools · 2s │ Tracing reservation admission",
+                "   └─ ⠋ 43s code-explorer-2 · codex · gpt-6-luna + │ 12/13 tools · 2s",
                 "      └─ ⠋ 43s nested-reviewer · codex · gpt-6-luna +",
             ]
         );
@@ -1453,7 +1459,7 @@ mod tests {
                 "Working · 3s · 0/1 checks finished",
                 "├─ ⠋ format · running · 3s",
                 "└─ Agents · 1 running",
-                "   └─ ⠋ 2s explorer · codex · gpt-6-luna + │ 1/1 tools · 2.4s",
+                "   └─ ⠋ 2s explorer · codex · gpt-6-luna + │ 1/1 tools · 2s",
             ]
         );
         Ok(())

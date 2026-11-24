@@ -198,7 +198,7 @@ impl ControlToolRegistry {
                     && context.is_some_and(|context| context.plan_authoring.is_some())
                 {
                     definition.input_schema["properties"].as_object_mut().expect("plan submit properties are an object").remove("reason");
-                    definition.description = "Submit the active planning directory for review. Supply plan_id without an expected version. Harness snapshots docs/ and files/, reports parsing and reference diagnostics by file and line, and preserves the editable draft on failure. Later ordinary edits require resubmission. Wait for Harness execution instructions; submission alone never authorizes implementation.";
+                    definition.description = "Submit the active planning directory for review. Supply plan_id without an expected version. Harness snapshots docs/ and files/, reports parsing and reference diagnostics by file and line, and preserves the editable draft on failure. When captured sources changed, this call refreshes their baselines, reports the differences, and asks you to revise or resubmit. Later ordinary edits require resubmission. Wait for Harness execution instructions; submission alone never authorizes implementation.";
                 }
                 if definition.name == "plan_status" && context.is_some_and(|context| context.plan_authoring.is_some()) {
                     definition.description = "Show the active plan ID, its planning directory, proposal inventory, and whether authored files differ from the saved submission. Supply plan_id. Read docs/ and files/ with your usual read tools and edit them with your file-editing tool, not virtual plan tools or shell commands.";

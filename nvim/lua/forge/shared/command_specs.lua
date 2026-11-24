@@ -209,6 +209,13 @@ M.view_specs = {
   },
 }
 
+-- Plan and pull-request review share the file actions and their configured review bindings.
+for _, spec in ipairs(M.specs) do
+  if spec.id == "viewed" or spec.id == "unviewed" then
+    table.insert(M.view_specs.plan_review, vim.tbl_extend("force", spec, { pinned = false }))
+  end
+end
+
 M.view_spec_by_id = {}
 for group, spec_list in pairs(M.view_specs) do
   M.view_spec_by_id[group] = {}

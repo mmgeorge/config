@@ -49,6 +49,20 @@ pub enum AdapterError {
     Cancelled,
 }
 
+/// Validate a literal executable and argument prefix before admitting an adapter.
+pub(super) fn validate_command(name: &str, command: &[String]) -> Result<(), AdapterError> {
+    if command
+        .first()
+        .is_none_or(|program| program.trim().is_empty())
+        || command.iter().any(|argument| argument.contains('\0'))
+    {
+        return Err(AdapterError::Protocol(format!(
+            "{name} requires a nonempty executable and NUL-free arguments"
+        )));
+    }
+    Ok(())
+}
+
 /// Identify an adapter-owned test item without exposing ID syntax to Harness.
 #[derive(
     Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,

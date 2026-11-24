@@ -5,6 +5,21 @@ local buffer_support = dofile("nvim/lua/forge/tests/support/buffer.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["a deferred file keeps its comment at its canonical line"] = function()
+  local comments = require("forge.draft_comments")
+  local buffer = buffer_support.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, buffer)
+  local source = { { id = "heading", text = "File", source_line = 5 } }
+  comments.attach(buffer, window, { "File" }, { { id = "draft", source_line = 42, end_source_line = 44, body = "Check both lines" } },
+    { source_provider = function() return source end })
+  MiniTest.expect.equality(comments.capture(buffer)[1].source, { start_line = 42, end_line = 44, body = "Check both lines" })
+  MiniTest.expect.equality(buffer_support.find_row(buffer, "Check both lines"), nil)
+  source[#source + 1] = { id = "declaration", text = "Declaration", source_line = 44 }
+  comments.update(buffer, {})
+  MiniTest.expect.equality(buffer_support.find_row(buffer, "Check both lines") ~= nil, true)
+end
+
 T["draft_comment_threads"] = function()
   local comments = require("forge.draft_comments")
   local buffer = buffer_support.scratch()

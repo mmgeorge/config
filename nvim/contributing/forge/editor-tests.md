@@ -4,7 +4,7 @@ A Rust test cannot show that a keystroke reaches the right buffer, and a Lua moc
 
 Tests that launch the Forge host assume a current executable. Run `rust-build` after Rust changes and before the Lua tests; see [Building and testing](building-and-testing.md).
 
-The PlanReview integration case `directory_planning` starts a fresh host with the mock provider. It verifies ordinary draft-file submission, separate review storage, an untouched repository, and read-only review and schema contents that survive later draft edits.
+The PlanReview integration case `directory_planning` starts a fresh host with the mock provider. It verifies ordinary draft-file submission, separate review storage, an untouched repository, and read-only review and schema contents that survive later draft edits. The case moves a file between review sections with a draft comment and question, then holds the provider response to verify that both remain anchored while the file moves again. It checks that the answer renders below the question and survives reopening.
 
 ## Test layout
 

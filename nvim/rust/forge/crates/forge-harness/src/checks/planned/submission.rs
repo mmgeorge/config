@@ -6,28 +6,6 @@ use anyhow::{Result, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Describe the last review-time comparison without turning an observation into evidence.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum SubmissionWarningStatus {
-    Matched,
-    Stale { reason: String },
-    Unavailable { reason: String },
-}
-
-impl SubmissionWarningStatus {
-    /// Label the comparison time and preserve failures shown to the reviewer.
-    pub(crate) fn label(&self) -> String {
-        match self {
-            Self::Matched => "Submission warnings — inputs matched when review opened".into(),
-            Self::Stale { reason } => format!("Stale submission warnings — {reason}"),
-            Self::Unavailable { reason } => {
-                format!("Submission warnings — inputs not revalidated: {reason}")
-            }
-        }
-    }
-}
-
 /// Identify one warning within the exact submitted test artifact.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct PlannedTestWarning {
@@ -87,58 +65,6 @@ impl SubmissionWarnings {
     /// Check the authored artifact and reviewer choices before attaching saved line locations.
     pub(crate) fn matches_plan(&self, design: &DeclarationDesign) -> Result<bool> {
         Ok(self.plan_inputs == fingerprint(design)?)
-    }
-}
-
-impl super::super::CheckSupervisor {
-    /// Compare retained advisory inputs at review opening without repeating discovery.
-    pub(crate) async fn submission_warning_status(
-        &self,
-        design: &DeclarationDesign,
-    ) -> Option<SubmissionWarningStatus> {
-        let report = design.submission_warnings.as_ref()?;
-        let validate = || -> Result<()> {
-            ensure!(
-                report.matches_plan(design)?,
-                "authored tests or reviewer choices changed; resubmit to replace these warnings"
-            );
-            report.inputs.validate(self)
-        };
-        if let Err(error) = validate() {
-            return Some(SubmissionWarningStatus::Stale {
-                reason: format!("{error:#}"),
-            });
-        }
-        let capture = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.changes.capture(&self.session_id),
-        )
-        .await;
-        let snapshot = match capture {
-            Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(error)) => {
-                return Some(SubmissionWarningStatus::Unavailable {
-                    reason: format!("{error:#}"),
-                });
-            }
-            Err(_) => {
-                return Some(SubmissionWarningStatus::Unavailable {
-                    reason: "source comparison timed out".into(),
-                });
-            }
-        };
-        if let Err(error) = validate() {
-            return Some(SubmissionWarningStatus::Stale {
-                reason: format!("{error:#}"),
-            });
-        }
-        Some(if snapshot.id == report.source_snapshot {
-            SubmissionWarningStatus::Matched
-        } else {
-            SubmissionWarningStatus::Stale {
-                reason: "workspace source changed since submission".into(),
-            }
-        })
     }
 }
 

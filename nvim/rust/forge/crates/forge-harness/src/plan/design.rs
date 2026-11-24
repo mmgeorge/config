@@ -7,6 +7,14 @@ use forge_diff::syntax::DeclarationOverview;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Identify captured workspace evidence that submission can refresh before a retry.
+#[derive(Debug, thiserror::Error)]
+#[error("{}: {origin} changed since extraction.", paths.join(", "))]
+pub(crate) struct CapturedSourceChanged {
+    pub(crate) paths: Vec<String>,
+    origin: String,
+}
+
 /// Retains the immutable declaration source and workspace content identity.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationFile {
@@ -648,22 +656,39 @@ impl DeclarationDesign {
         } else {
             self.changed_paths().into_iter().collect()
         };
+        let mut changed = Vec::new();
+        let mut occupied = Vec::new();
         for path in paths {
             super::resolution_deadline::ResolutionDeadline::check()?;
             let source = read(&path)?;
             match self.baseline.get(&path) {
-                Some(before) => ensure!(
-                    source
+                Some(before) => {
+                    if source
                         .as_ref()
-                        .is_some_and(|source| super::digest(source) == before.source_digest),
-                    "{path}: {origin} changed since extraction. Start a fresh design baseline."
-                ),
-                None => ensure!(
-                    source.is_none(),
-                    "{path}: proposed destination already exists in the {origin}. Start a fresh design baseline."
-                ),
+                        .is_none_or(|source| super::digest(source) != before.source_digest)
+                    {
+                        changed.push(path);
+                    }
+                }
+                None => {
+                    if source.is_some() {
+                        occupied.push(path);
+                    }
+                }
             }
         }
+        if !changed.is_empty() {
+            return Err(CapturedSourceChanged {
+                paths: changed,
+                origin: origin.into(),
+            }
+            .into());
+        }
+        ensure!(
+            occupied.is_empty(),
+            "{}: proposed destination already exists in the {origin}. Start a fresh design baseline.",
+            occupied.join(", ")
+        );
         Ok(())
     }
 

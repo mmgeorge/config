@@ -101,16 +101,7 @@ pub struct ScriptAdapter {
 impl ScriptAdapter {
     /// Validate a fixed argv before permitting execution or catalog publication.
     pub fn new(config: ScriptAdapterConfig) -> Result<Self, AdapterError> {
-        if config
-            .command
-            .first()
-            .is_none_or(|program| program.trim().is_empty())
-            || config.command.iter().any(|arg| arg.contains('\0'))
-        {
-            return Err(AdapterError::Protocol(
-                "script command requires a nonempty executable and NUL-free arguments".into(),
-            ));
-        }
+        super::contract::validate_command("script command", &config.command)?;
         Ok(Self { config })
     }
 

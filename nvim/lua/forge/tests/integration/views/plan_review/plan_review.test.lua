@@ -55,12 +55,111 @@ T["directory_planning"] = function()
   assert(not plan.working_path:find(directory, 1, true), "review storage aliases the editable draft")
   assert(vim.fn.filereadable(workspace .. "/src/change.rs") == 0, "planning wrote repository implementation")
 
-  require("forge.views.plan_review.native_controller").open(plan)
+  local function open_review()
+    require("forge.views.plan_review.native_controller").open(plan)
+    wait_until(function() return state.plan_review and state.plan_review.owner.ready end,
+      "submitted plan did not open", { errors = errors })
+    return state.plan_review
+  end
+  local review = open_review()
+  local function expect_section_spacing()
+    local heading = assert(buffer.find_row(review.buf, "Viewed Changes ("), "viewed heading is missing")
+    MiniTest.expect.equality(buffer.line(review.buf, heading - 1), "")
+  end
+  expect_section_spacing()
+  local function file_section()
+    local section
+    for _, line in ipairs(buffer.lines(review.buf)) do
+      local heading = vim.trim(line):match("^(.-) %(%d+%):$")
+      if heading == "Unviewed Changes" or heading == "Viewed Changes" then section = heading end
+      if line:find("src/change.rs", 1, true) and line:find("New", 1, true) then return section end
+    end
+  end
+  MiniTest.expect.equality(file_section(), "Unviewed Changes")
+  local function toggle_file()
+    assert(vim.fn.search([[^.*src/change\.rs]], "cw") > 0, "file heading is missing")
+    keymap.invoke("<Tab>", { buffer = review.buf })
+  end
+  local function declaration_visible()
+    return buffer.text(review.buf):find("pub fn requested_change", 1, true) ~= nil
+  end
+  MiniTest.expect.equality(declaration_visible(), false)
+  local function deferred()
+    for _, row in ipairs(review.owner.source) do
+      if row.block:match("^plan:design:file:.*:hunk:deferred$") then return row.block end
+    end
+  end
+  local placeholder = assert(deferred(), "folded open eagerly delivered the file body")
+  toggle_file()
+  keymap.invoke("S", { buffer = review.buf })
+  wait_until(declaration_visible, "unfold did not load the file body", { errors = errors })
+  MiniTest.expect.equality(deferred(), nil)
+  wait_until(function() return file_section() == "Viewed Changes" end, "S did not move the expanded file", { errors = errors })
+  expect_section_spacing()
+  local retained_buffer = review.buf
+  keymap.invoke("q", { buffer = retained_buffer })
+  local retained_tick = vim.api.nvim_buf_get_changedtick(retained_buffer)
+  local filetype_events = 0
+  vim.api.nvim_create_autocmd("FileType", { buffer = retained_buffer, callback = function()
+    filetype_events = filetype_events + 1
+  end })
+  review = open_review()
+  MiniTest.expect.equality(review.buf, retained_buffer)
+  MiniTest.expect.equality(filetype_events, 0)
+  MiniTest.expect.equality(vim.api.nvim_buf_get_changedtick(retained_buffer), retained_tick)
+  MiniTest.expect.equality(file_section(), "Viewed Changes")
+  MiniTest.expect.equality(declaration_visible(), true)
+  local comments = require("forge.draft_comments")
+  local function add_message(key, source, message)
+    assert(vim.fn.search(source, "cw") > 0, "annotation source is missing")
+    keymap.invoke(key, { buffer = review.buf })
+    vim.cmd("stopinsert")
+    local draft = comments.capture(review.buf)
+    local id = draft[#draft].id
+    assert(comments.focus(review.buf, id))
+    local body = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+    vim.api.nvim_buf_set_lines(review.buf, body, body + 1, false, { message })
+    vim.api.nvim_exec_autocmds("TextChanged", { buffer = review.buf })
+    return id
+  end
+  local question_body = "Why does this declaration need its own file?"
+  local question_id = add_message("A", "/// Apply the requested behavior", question_body)
+  add_message("C", "pub fn requested_change", "Keep this declaration.")
+  local draft = comments.capture(review.buf)
+  assert(vim.fn.search([[src/change\.rs]], "cw") > 0)
+  keymap.invoke("U", { buffer = review.buf })
+  wait_until(function() return file_section() == "Unviewed Changes" end, "U did not return the file", { errors = errors })
+  MiniTest.expect.equality(comments.capture(review.buf), draft)
+  MiniTest.expect.equality(vim.bo[review.buf].modified, true)
+  local answer = require("forge.tests.support.mock_provider").hold(state.session.id, nil, true)
+  vim.cmd("write")
+  local request = answer:wait()
+  assert(request.prompt:find(question_body, 1, true), "mock provider held a different request")
+  for _, move in ipairs({ { "S", "Viewed Changes" }, { "U", "Unviewed Changes" } }) do
+    assert(vim.fn.search([[src/change\.rs]], "cw") > 0)
+    keymap.invoke(move[1], { buffer = review.buf })
+    wait_until(function() return file_section() == move[2] end, "file did not move while the answer was pending", { errors = errors })
+    assert(review.owner.pending_reply_by_id[question_id], "moving the file dropped the pending question")
+    assert(buffer.find_row(review.buf, "Generating response"), "the moved question lost its progress row")
+    MiniTest.expect.equality(comments.capture(review.buf), draft)
+  end
+  answer:release()
   wait_until(function()
-    local review = state.plan_review
-    return review and buffer.text(review.buf):find("requested_change", 1, true)
-  end, "submitted declarations did not render", { errors = errors })
-  local review = state.plan_review
+    local reply = review.owner.reply_by_id[question_id]
+    return not review.owner.saving and not vim.bo[review.buf].modified and reply and #reply.body > 0
+  end, "moved file's comment and question did not save and receive an answer", { errors = errors })
+  local reply = review.owner.reply_by_id[question_id]
+  MiniTest.expect.equality(reply.question_body, question_body)
+  local question_row = assert(buffer.find_row(review.buf, question_body), "moved question is missing")
+  assert(buffer.find_row(review.buf, "Mock response:", { first_row = question_row + 1 }),
+    "answer did not render below the moved question")
+  toggle_file()
+  keymap.invoke("q", { buffer = review.buf })
+  review = open_review()
+  MiniTest.expect.equality(declaration_visible(), false)
+  MiniTest.expect.equality(deferred(), placeholder)
+  MiniTest.expect.equality(comments.capture(review.buf), draft)
+  MiniTest.expect.equality(review.owner.reply_by_id[question_id], reply)
   assert(not vim.bo[review.buf].modifiable, "reviewed declarations became an editable proposal")
   local function schema()
     local result, failure, done

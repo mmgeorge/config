@@ -347,6 +347,7 @@ impl HarnessService {
                 return Ok(json!({}));
             }
             crate::buffer::session::PresentationRequest::PlanOpen {
+                expanded_files,
                 document,
                 view,
                 plan_id,
@@ -379,16 +380,13 @@ impl HarnessService {
                     }
                 };
                 if source.document.design.is_some() {
-                    source.warning_status = controller
-                        .checks
-                        .submission_warning_status(source.document.design.as_ref().unwrap())
-                        .await;
                     let trace = registry.runtime.trace();
                     if trace.is_enabled() {
-                        source.trace = Some(crate::plan::review_source::ReviewTrace {
+                        let trace = crate::plan::review_source::ReviewTrace {
                             store: trace,
                             session_id: session_id.clone(),
-                        });
+                        };
+                        source.trace = Some(trace);
                     }
                 }
                 if let Some(trace) = &source.trace {
@@ -409,6 +407,13 @@ impl HarnessService {
                         "saved plan source changed before recovering annotations"
                     );
                 }
+                if let Some(design) = &source.document.design {
+                    source.files = Some(crate::plan::review_files::ReviewFiles::new(
+                        design,
+                        &source.rendered,
+                        expanded_files,
+                    )?);
+                }
                 let syntax_started = Instant::now();
                 analyze_plan_source(&mut source, &self.syntax, || Ok(admission.check()?), None)
                     .await?;
@@ -420,6 +425,7 @@ impl HarnessService {
                     );
                 }
                 admission.check()?;
+                controller.plan_review.restore_presentation(&mut source)?;
                 let document = crate::plan::review_document::ReadOnlyPlanReview::new(
                     document.clone(),
                     view.clone(),
@@ -428,6 +434,16 @@ impl HarnessService {
                     focused_annotation.clone(),
                 )?;
                 return controller.plan_review.insert(document, admission);
+            }
+            crate::buffer::session::PresentationRequest::PlanBody {
+                document,
+                saved_source_digest,
+                file,
+            } => {
+                return controller
+                    .plan_review
+                    .load_body(document, saved_source_digest, file, &self.syntax)
+                    .await;
             }
             crate::buffer::session::PresentationRequest::PlanAction { input } => {
                 let preview_trace = (input.action == "rename_entity").then(|| crate::plan::edit_trace::PlanEditTrace::new(
@@ -1537,6 +1553,17 @@ impl SessionController {
         let store = crate::storage::HistoryReader::current(&broker.data_root)?;
         for plan in store.list_plan(observer.session_id())? {
             observer.plan_file.reconcile_plan_artifacts(&plan)?;
+            if matches!(
+                plan.state,
+                crate::plan::PlanState::Generating
+                    | crate::plan::PlanState::Revising
+                    | crate::plan::PlanState::AwaitingInput
+                    | crate::plan::PlanState::AwaitingReview
+            ) {
+                observer
+                    .plan_file
+                    .restore_baseline_copies(&plan.session_id, &plan.id)?;
+            }
         }
 
         let input = observer.input.clone();
@@ -2498,7 +2525,17 @@ async fn analyze_plan_source(
 ) -> Result<()> {
     if let Some(design) = &source.revision.document.design {
         let parsed = design.parsed()?;
-        for path in design.changed_paths() {
+        let paths = match &source.files {
+            Some(inventory) => inventory
+                .files
+                .iter()
+                .filter(|file| inventory.loaded.contains(&file.id))
+                .flat_map(|file| [&file.before, &file.after])
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            None => design.changed_paths().into_iter().collect(),
+        };
+        for path in paths {
             for (side, text) in [
                 (
                     "baseline",
@@ -2528,56 +2565,18 @@ async fn analyze_plan_source(
                     calls.get(&path).map(Vec::as_slice).unwrap_or_default(),
                 )?;
                 check()?;
-                let Some(language) = forge_diff::syntax::DeclarationOverview::language(&path)
-                else {
+                if let Some(handle) =
+                    analyze_review_side(&path, &presentation, syntax, &check).await?
+                {
+                    source
+                        .declaration_syntax
+                        .insert((path.clone(), side.into()), handle);
+                } else {
                     if let Some(stage) = stage {
                         stage.complete(json!({"status":"unsupported"}));
                     }
                     continue;
-                };
-                let handle = syntax
-                    .analyze(SyntaxRequest {
-                        source: forge_diff::source::SourceVersion::new(
-                            presentation.plain.as_bytes().to_vec(),
-                            forge_diff::source::Representation::DisplayOnly,
-                        )?,
-                        language,
-                        priority: forge_diff::workers::WorkPriority::Visible,
-                        deadline: Some(Instant::now() + Duration::from_secs(10)),
-                    })
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("Declaration syntax analysis failed: {error:?}")
-                    })?;
-                check()?;
-                let algorithm = if let Some(algorithm) = presentation.algorithm_source() {
-                    Some(
-                        syntax
-                            .analyze(SyntaxRequest {
-                                source: forge_diff::source::SourceVersion::new(
-                                    algorithm.into_bytes(),
-                                    forge_diff::source::Representation::DisplayOnly,
-                                )?,
-                                language: SyntaxLanguage::Algorithm,
-                                priority: forge_diff::workers::WorkPriority::Visible,
-                                deadline: Some(Instant::now() + Duration::from_secs(10)),
-                            })
-                            .await
-                            .map_err(|error| {
-                                anyhow::anyhow!("Algorithm syntax analysis failed: {error:?}")
-                            })?,
-                    )
-                } else {
-                    None
-                };
-                check()?;
-                source.declaration_syntax.insert(
-                    (path.clone(), side.into()),
-                    crate::plan::review_source::ReviewSyntax {
-                        declaration: handle,
-                        algorithm,
-                    },
-                );
+                }
                 if let Some(stage) = stage {
                     stage.complete(json!({"cached":false,"source_bytes":text.len()}));
                 }
@@ -2600,6 +2599,53 @@ async fn analyze_plan_source(
         );
     }
     Ok(())
+}
+
+pub(crate) async fn analyze_review_side(
+    path: &str,
+    presentation: &crate::plan::calls::CallPresentation,
+    syntax: &Arc<SyntaxEngine>,
+    check: impl Fn() -> Result<()> + Send + Sync,
+) -> Result<Option<crate::plan::review_source::ReviewSyntax>> {
+    let Some(language) = forge_diff::syntax::DeclarationOverview::language(path) else {
+        return Ok(None);
+    };
+    let handle = syntax
+        .analyze(SyntaxRequest {
+            source: forge_diff::source::SourceVersion::new(
+                presentation.plain.as_bytes().to_vec(),
+                forge_diff::source::Representation::DisplayOnly,
+            )?,
+            language,
+            priority: forge_diff::workers::WorkPriority::Visible,
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("Declaration syntax analysis failed: {error:?}"))?;
+    check()?;
+    let algorithm = if let Some(algorithm) = presentation.algorithm_source() {
+        Some(
+            syntax
+                .analyze(SyntaxRequest {
+                    source: forge_diff::source::SourceVersion::new(
+                        algorithm.into_bytes(),
+                        forge_diff::source::Representation::DisplayOnly,
+                    )?,
+                    language: SyntaxLanguage::Algorithm,
+                    priority: forge_diff::workers::WorkPriority::Visible,
+                    deadline: Some(Instant::now() + Duration::from_secs(10)),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("Algorithm syntax analysis failed: {error:?}"))?,
+        )
+    } else {
+        None
+    };
+    check()?;
+    Ok(Some(crate::plan::review_source::ReviewSyntax {
+        declaration: handle,
+        algorithm,
+    }))
 }
 
 struct RequestAdmission<'request> {
@@ -3577,12 +3623,9 @@ async fn route_control_request(
             let (context, configured) = provider.configured_resources(&catalog_request).await?;
             let skills = match configured {
                 Some(resources) => resources.skill.clone(),
-                None => tokio::time::timeout(
-                    Duration::from_secs(30),
-                    provider.skill_list(context),
-                )
-                .await
-                .context("skill discovery exceeded 30 seconds")??,
+                None => tokio::time::timeout(Duration::from_secs(30), provider.skill_list(context))
+                    .await
+                    .context("skill discovery exceeded 30 seconds")??,
             };
             Some(Response::success(request.id, skills)?)
         }

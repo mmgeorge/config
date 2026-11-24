@@ -732,6 +732,7 @@ Select `operation = "plan_open"`. The native declaration is in [PresentationRequ
 | Field | Native type / JSON value | Presence |
 | --- | --- | --- |
 | `operation` | `"plan_open"` | Required discriminator |
+| `expanded_files` | Array of file fold IDs | Defaults to empty. Requests complete bodies in the initial projection. |
 | `document` | `DocumentId` | Required |
 | `view` | `ViewId` | Required |
 | `plan_id` | `String` | Required |
@@ -742,6 +743,17 @@ Select `operation = "plan_open"`. The native declaration is in [PresentationRequ
 | `focused_annotation` | `Option<String>` | Optional, null or omitted |
 
 Producer: [nvim/lua/forge/views/plan_review/document.lua:490](../../../../nvim/lua/forge/views/plan_review/document.lua).
+
+## session.document / PresentationRequest / plan_body
+
+A file unfold requests the complete body from the review's saved revision.
+
+| Field | Native type / JSON value | Presence |
+| --- | --- | --- |
+| `operation` | `"plan_body"` | Required discriminator |
+| `document` | `DocumentId` | Required |
+| `saved_source_digest` | `String` | Required |
+| `file` | `String` | Required file fold ID |
 
 ## session.document / PresentationRequest / plan_action
 

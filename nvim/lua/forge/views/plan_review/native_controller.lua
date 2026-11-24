@@ -5,6 +5,7 @@ local command_set = require("forge.shared.view_command_set")
 local keymaps = require("forge.shared.keymaps")
 local notifications = require("forge.infra.notifications")
 local popup = require("forge.infra.popup_window")
+local perf = require("forge.infra.perf")
 local buffer = require("forge.buffer")
 
 local function notice(message) notifications.error(message, "ForgePlanReview") end
@@ -191,6 +192,8 @@ local function toggle_visibility(review)
 end
 
 local function action(review, name)
+  local file_review = name == "viewed" or name == "unviewed"
+  if file_review and vim.fn.mode():match("^[vV\22]") then vim.cmd("normal! " .. vim.keycode("<Esc>")) end
   if review.cancel_definition then review.cancel_definition() review.cancel_definition = nil end
   if name == "toggle_visibility" then toggle_visibility(review) return end
   if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
@@ -203,8 +206,10 @@ local function action(review, name)
         or not vim.api.nvim_win_is_valid(review.win)
         or vim.api.nvim_win_get_buf(review.win) ~= review.buf) then return end
     if failure then notice(failure) return end
-    if name == "toggle_declaration" then
-      effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
+    if name == "toggle_declaration" or file_review then
+      if result.jump then
+        effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
+      end
     elseif name == "comment" or name == "question" then
       if result.local_draft then
         edit_message()
@@ -405,7 +410,7 @@ local function commands(review)
   command_set.register(set, "checks", function()
     require("forge.views.plan_review.checks").open(review, function(changes, receive) update_checks(review, changes.enabled or {}, nil, receive, changes.test_scopes) end)
   end)
-  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility", "viewed", "unviewed" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function()
     prompt_decision(review, "session.plan.accept", "Approval comment (optional)")
@@ -428,8 +433,11 @@ end
 ---@param options? { window?: integer }
 ---@return boolean? opened false when the review could not be replaced
 function M.open(plan, options)
+  local open_started = perf.now()
   assert(type(plan) == "table" and type(plan.working_path) == "string", "PlanReview requires a physical plan path")
   local previous = session.harness.plan_review
+  local same_plan = previous and previous.plan.id == plan.id
+    and (previous.session_id == session.harness.session.id or previous.plan.working_path == plan.working_path)
   local recovery, rebase
   local window = options and options.window
   local key = revision_key(plan)
@@ -437,7 +445,7 @@ function M.open(plan, options)
     revision_seen[key] = math.max(revision_seen[key] or 0, plan.model_revision)
   end
   if window then
-    assert(previous and previous.plan.id == plan.id and vim.api.nvim_win_get_buf(window) == previous.buf,
+    assert(previous and same_plan and vim.api.nvim_win_get_buf(window) == previous.buf,
       "an in-place reload replaces the open review of the same plan")
     if vim.bo[previous.buf].modified then
       local failure
@@ -446,7 +454,7 @@ function M.open(plan, options)
       if not previous.owner.close(true) then return false end
       rebase = true
     elseif not previous.owner.close() then return false end
-  elseif previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest
+  elseif previous and same_plan and previous.plan.review_digest == plan.review_digest
     and previous.plan.historical_revision == plan.historical_revision and vim.api.nvim_buf_is_valid(previous.buf) then
     local refresh_execution = plan.state == "accepted" and not vim.bo[previous.buf].modified
     if refresh_execution and previous.owner.generation == client.host_get_generation() and previous.owner.attached() then
@@ -466,7 +474,7 @@ function M.open(plan, options)
       if not recovery then notice(failure) return end
       previous.owner.close()
     end
-  elseif previous and previous.plan.id == plan.id and not plan.historical_revision and not previous.plan.historical_revision
+  elseif previous and same_plan and not plan.historical_revision and not previous.plan.historical_revision
     and vim.api.nvim_buf_is_valid(previous.buf) and vim.bo[previous.buf].modified
     and previous.owner.generation == client.host_get_generation() and not previous.owner.closed and previous.owner.attached() then
     -- A newer revision replaces the reviewed one. Its unsaved drafts move onto the new revision
@@ -490,18 +498,21 @@ function M.open(plan, options)
   if native_buffer >= 0 and vim.api.nvim_buf_is_loaded(native_buffer) and vim.bo[native_buffer].modified and not recovery then
     notice("The physical plan buffer has unsaved changes") return
   end
+  local retained = native_buffer >= 0 and vim.api.nvim_buf_is_loaded(native_buffer)
+    and vim.bo[native_buffer].filetype == "ForgePlan"
   if native_buffer < 0 then
     native_buffer = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_name(native_buffer, plan.working_path)
   end
-  if not recovery then
+  -- The winbar announces loading while the next projection diffs against the retained text.
+  if not recovery and not retained then
     vim.bo[native_buffer].buftype = "nofile"
     vim.bo[native_buffer].filetype = "ForgePlan"
     vim.bo[native_buffer].modifiable = true
     vim.api.nvim_buf_set_lines(native_buffer, 0, -1, false, { "Loading plan review…" })
     vim.bo[native_buffer].modified = false
-    vim.bo[native_buffer].modifiable = false
   end
+  if not recovery then vim.bo[native_buffer].modifiable = false end
   if window then
     if vim.api.nvim_win_get_buf(window) ~= native_buffer then vim.api.nvim_win_set_buf(window, native_buffer) end
   else
@@ -517,6 +528,7 @@ function M.open(plan, options)
   keymaps.setup_view_keymaps(native_buffer, "plan_review", loading_commands)
   keymaps.apply_view_winbar(window, "PlanReview", "plan_review", loading_commands, "Loading review")
   review.owner = require("forge.views.plan_review.document").attach({ plan = plan, session_id = review.session_id,
+    open_started = open_started, retained_buffer = retained,
     buffer = native_buffer, window = window, recovery = recovery, rebase = rebase, notice = notice,
     recovery_provider = recovery and not rebase and function() return assert(previous).owner.recovery() end or nil }, function(owner, failure)
     if failure then

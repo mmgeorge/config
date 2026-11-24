@@ -23,6 +23,7 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 
 ---@class ForgeDraftCommentCapture
 ---@field id string
+---@field parent_id string? Parent message when the captured draft is a follow-up.
 ---@field source {start_line: integer, end_line: integer, body: string}
 ---@field kind string?
 
@@ -299,6 +300,10 @@ local function build_projection(state, width)
   local source_row_list = {}
   if state.source_provider then
     source_row_list = state.source_provider(width) or {}
+    -- Projected sources can omit a folded file, including the final annotated rows.
+    for _, annotation in ipairs(state.annotation_list) do
+      source_count = math.max(source_count, tonumber(annotation.end_source_line) or 1)
+    end
     for _, source_row in ipairs(source_row_list) do
       source_count = math.max(source_count, tonumber(source_row.source_line) or 1)
     end
@@ -463,10 +468,12 @@ end
 
 ---@param state ForgeDraftCommentState
 ---@param projection ForgeDraftCommentProjection
-local function apply_projection(state, projection)
+---@param mark_phase? fun(field: string)
+local function apply_projection(state, projection, mark_phase)
   local previous = vim.api.nvim_buf_get_lines(state.buf, 0, -1, false)
   local change_list = assert(vim.text.diff(table.concat(previous, "\n") .. "\n",
     table.concat(projection.line_list, "\n") .. "\n", { result_type = "indices", algorithm = "histogram" }))
+  if mark_phase then mark_phase("text_diff_ms") end
   for index = #change_list, 1, -1 do
     local change = change_list[index]
     local start = change[2] == 0 and change[1] or change[1] - 1
@@ -474,6 +481,7 @@ local function apply_projection(state, projection)
     for row = change[3], change[3] + change[4] - 1 do replacement[#replacement + 1] = projection.line_list[row] end
     vim.api.nvim_buf_set_lines(state.buf, start, start + change[2], false, replacement)
   end
+  if mark_phase then mark_phase("text_ms") end
   state.source_mark = {}
   state.range_list = projection.range_list
   for _, record in ipairs(projection.source_record_list) do
@@ -561,7 +569,8 @@ end
 
 ---@param state ForgeDraftCommentState
 ---@param target ForgeDraftCommentRenderTarget?
-local function render(state, target)
+---@param mark_phase? fun(field: string)
+local function render(state, target, mark_phase)
   if not vim.api.nvim_buf_is_valid(state.buf) then return end
   state.rendering = true
   if state.guard and state.guard.native then editable.applying(state.guard, true) end
@@ -571,7 +580,9 @@ local function render(state, target)
   vim.api.nvim_buf_clear_namespace(state.buf, namespace, 0, -1)
   local width = comment_editor.display_width(win, state.buf)
   local projection = build_projection(state, width)
-  apply_projection(state, projection)
+  if mark_phase then mark_phase("comment_layout_ms") end
+  apply_projection(state, projection, mark_phase)
+  if mark_phase then mark_phase("comment_buffer_ms") end
   if state.guard_source then
     state.guard = state.guard or editable.new("plan-comment:" .. state.buf)
     local anchor = {}
@@ -594,6 +605,7 @@ local function render(state, target)
       end,
     }) end
   end
+  if mark_phase then mark_phase("comment_guard_ms") end
   if state.after_render then state.after_render(state.buf, win, projection) end
   local requested_row = target_row(state, projection, target)
   if win and requested_row then vim.api.nvim_win_set_cursor(win, { requested_row + 1, 0 }) end
@@ -698,7 +710,8 @@ end
 ---@param annotation_list ForgeDraftComment[]
 ---@param opts? ForgeDraftCommentOptions
 ---@return ForgeDraftCommentState
-function M.attach(buf, win, source_lines, annotation_list, opts)
+---@param mark_phase? fun(field: string) Time the initial render only.
+function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
   opts = opts or {}
   local previous = state_by_buf[buf]
   if previous then
@@ -736,7 +749,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts)
     state.baseline[#state.baseline + 1] = capture_annotation(annotation)
   end
   install_autocmd(state)
-  render(state)
+  render(state, nil, mark_phase)
   return state
 end
 

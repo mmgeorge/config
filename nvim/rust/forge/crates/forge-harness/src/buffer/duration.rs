@@ -1,45 +1,37 @@
-/// Keeps a five-cell column by switching units when rounded values reach 100.
+/// Right-align a tool duration in the transcript's five-cell column.
 pub(super) fn tool_duration(milliseconds: Option<u64>) -> String {
     let Some(milliseconds) = milliseconds else {
         return "    —".into();
     };
-    // Sub-second times read in milliseconds, as `duration_label` shows them in headings.
-    if milliseconds < 1000 {
-        return format!("{:>5}", format!("{milliseconds}ms"));
-    }
-    for (unit, divisor) in [("s", 100), ("m", 6000), ("h", 360_000), ("d", 8_640_000)] {
-        let tenths = milliseconds / divisor + u64::from(milliseconds % divisor >= divisor / 2);
-        if tenths < 1000 {
-            let label = if tenths % 10 == 0 {
-                format!("{}{unit}", tenths / 10)
-            } else {
-                format!(
-                    "{}.{unit_fraction}{unit}",
-                    tenths / 10,
-                    unit_fraction = tenths % 10
-                )
-            };
-            return format!("{label:>5}");
-        }
+    let label = duration_label(milliseconds);
+    if label.len() <= 5 {
+        return format!("{label:>5}");
     }
     format!("{:>4.0e}d", milliseconds as f64 / 86_400_000.0)
 }
 
+/// Show sub-second tool durations in milliseconds.
 pub(super) fn duration_label(milliseconds: u64) -> String {
     if milliseconds < 1000 {
         return format!("{milliseconds}ms");
     }
-    seconds_label(milliseconds)
+    elapsed_label(milliseconds / 1000)
 }
 
-fn seconds_label(milliseconds: u64) -> String {
-    let tenths = milliseconds / 100 + u64::from(milliseconds % 100 >= 50);
-    let seconds = tenths / 10;
-    let fraction = tenths % 10;
-    if fraction == 0 {
-        format!("{seconds}s")
+/// Show completed seconds below one minute and tenths of larger units thereafter.
+pub(super) fn elapsed_label(seconds: u64) -> String {
+    let (divisor, unit) = match seconds {
+        0..60 => return format!("{seconds}s"),
+        60..3600 => (60, 'm'),
+        3600..86400 => (3600, 'h'),
+        _ => (86400, 'd'),
+    };
+    let whole = seconds / divisor;
+    let tenth = (seconds % divisor) * 10 / divisor;
+    if tenth == 0 {
+        format!("{whole}{unit}")
     } else {
-        format!("{seconds}.{fraction}s")
+        format!("{whole}.{tenth}{unit}")
     }
 }
 
@@ -79,20 +71,26 @@ impl LabelDue {
 
 #[cfg(test)]
 mod tests {
-    /// Rows show sub-second durations in milliseconds, as the Thought and Tools headings do.
-    ///
-    /// The row column rounded to tenths of a second, so one call read `0.1s` on its row and
-    /// `92ms` in both headings above it. Every label still fits the five-cell column.
+    /// Tool rows and headings agree on either side of each second boundary.
     #[test]
-    fn tool_rows_show_sub_second_durations_in_milliseconds() {
+    fn tool_rows_and_headings_show_completed_seconds() {
         for (milliseconds, row) in [
             (0, "  0ms"),
             (92, " 92ms"),
             (999, "999ms"),
             (1_000, "   1s"),
-            (14_300, "14.3s"),
+            (1_999, "   1s"),
+            (2_000, "   2s"),
+            (14_300, "  14s"),
+            (59_999, "  59s"),
+            (60_000, "   1m"),
+            (90_000, " 1.5m"),
+            (150_000, " 2.5m"),
+            (3_599_999, "59.9m"),
+            (3_600_000, "   1h"),
         ] {
             assert_eq!(super::tool_duration(Some(milliseconds)), row);
+            assert_eq!(super::duration_label(milliseconds), row.trim());
         }
         assert_eq!(super::tool_duration(None), "    —");
     }

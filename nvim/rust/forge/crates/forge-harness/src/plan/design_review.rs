@@ -11,6 +11,7 @@ use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 use forge_diff::display::RowKind;
 use forge_diff::file_header::FileChange;
+use forge_diff::presentation::FoldPolicy;
 use forge_diff::syntax::DeclarationVisibility;
 
 use super::review_annotation::ReviewAnnotation;
@@ -20,7 +21,6 @@ use super::{
 };
 
 pub(super) struct ReviewAnnotationView<'view> {
-    pub(super) warning_status: Option<&'view crate::checks::SubmissionWarningStatus>,
     pub(super) annotation: &'view [ReviewAnnotation],
     pub(super) revision: &'view HashMap<String, (RegionRevision, EditSequence)>,
     pub(super) focused: Option<&'view str>,
@@ -31,7 +31,14 @@ struct DesignReviewRows {
     navigation: PlanNavigationIndex,
     hidden: HashSet<BlockId>,
     contextual: HashSet<BlockId>,
+    skipped: HashMap<BlockId, i64>,
 }
+
+const FILE_FOLD: FoldPolicy = FoldPolicy {
+    closed: true,
+    collapse_children: false,
+    expand_children: false,
+};
 
 pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
     let DesignReviewRows {
@@ -43,6 +50,8 @@ pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
         false,
         None,
         &HashSet::new(),
+        None,
+        None,
     )?;
     let markdown = block
         .iter()
@@ -81,6 +90,14 @@ pub(super) fn test_source_range(rendered: &RenderedPlan) -> Result<(usize, usize
     Ok((start - 1, end.max(start + 1)))
 }
 
+/// The saved heading fixes the canonical source offset of a requested subtree.
+#[derive(Clone, Copy)]
+pub(super) struct FileBody<'a> {
+    pub id: &'a str,
+    pub path: &'a str,
+    pub first_line: u32,
+}
+
 pub(super) fn project(
     document: &PlanDocument,
     width: &WidthProfile,
@@ -89,22 +106,30 @@ pub(super) fn project(
     public_only: bool,
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
+    files: Option<&super::review_files::ReviewFiles>,
+    body: Option<FileBody<'_>>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     let ReviewAnnotationView {
-        warning_status,
         annotation,
         revision,
         focused,
     } = annotations;
     let DesignReviewRows {
-        block: mut source,
+        block: source,
         navigation,
         hidden,
         contextual,
-    } = rows(document, syntax, public_only, true, trace, revealed)?;
-    if let Some(design) = &document.design {
-        update_warning_status(&mut source, design, warning_status)?;
-    }
+        skipped,
+    } = rows(
+        document,
+        syntax,
+        public_only,
+        true,
+        trace,
+        revealed,
+        files,
+        body,
+    )?;
     // Render the complete flows section once so each row keeps its Mermaid fence context. The
     // text joins the flow rows themselves, so every decoration range fits the row it lands on.
     let flow_text = source
@@ -118,18 +143,45 @@ pub(super) fn project(
         &flow_text,
         width,
     )?;
-    let check_rows = review_checks(document.design.as_ref(), Some(width))?;
+    let check_rows = if body.is_none() {
+        review_checks(document.design.as_ref(), Some(width))?
+    } else {
+        Vec::new()
+    };
     let mut target = HashMap::new();
     let design = document
         .design
         .as_ref()
         .context("declaration review has no design")?;
-    let narrative_symbols =
-        super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""))?;
-    let narrative_spans = super::review_symbols::spans(design);
+    let narrative_spans = if body.is_none() {
+        super::review_symbols::spans(design)
+    } else {
+        HashMap::new()
+    };
+    let needs_symbols = !narrative_spans.is_empty()
+        || navigation.anchor.iter().any(|anchor| {
+            matches!(
+                anchor.target,
+                PlanReviewTarget::Call {
+                    kind: super::CallKind::Value | super::CallKind::Construct,
+                    ..
+                }
+            )
+        });
+    let uncached;
+    let narrative_symbols = if !needs_symbols {
+        uncached = super::review_symbols::NarrativeSymbols::default();
+        &uncached
+    } else if let Some(files) = files {
+        files.symbols(design, trace)?
+    } else {
+        uncached = super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""))?;
+        &uncached
+    };
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
     let mut omitted = 0;
+    let mut deferred_rows = body.map_or(0, |file| i64::from(file.first_line.saturating_sub(1)));
     for (index, mut row) in source.into_iter().enumerate() {
         if let Some(index) = row
             .id
@@ -172,16 +224,20 @@ pub(super) fn project(
                 }
             }
         }
+        deferred_rows += skipped.get(&row.id).copied().unwrap_or(0);
         let context = contextual.contains(&row.id);
         if context {
             omitted += 1;
         }
-        let line_anchor = navigation
+        let line = index as u32 + 1;
+        let first = navigation
             .anchor
-            .iter()
-            .filter(|anchor| anchor.line == index as u32 + 1)
-            .collect::<Vec<_>>();
-        if let Some(anchor) = line_anchor.last().copied() {
+            .partition_point(|anchor| anchor.line < line);
+        let line_anchor = &navigation.anchor[first
+            ..navigation
+                .anchor
+                .partition_point(|anchor| anchor.line <= line)];
+        if let Some(anchor) = line_anchor.last() {
             // An anchor with columns marks one of several targets on its row.
             let entry_span = line_anchor
                 .iter()
@@ -210,13 +266,10 @@ pub(super) fn project(
                     restyle_narrative_reference(
                         &mut row.metadata,
                         &anchor.target,
-                        &narrative_symbols,
+                        narrative_symbols,
                     );
                 } else {
-                    for (entry, start, end) in entry_span
-                        .iter()
-                        .filter(|(entry, _, _)| line_anchor.iter().any(|anchor| **anchor == *entry))
-                    {
+                    for (entry, start, end) in &entry_span {
                         super::review_projection::append_semantic_span(
                             &mut row.metadata,
                             &entry.target,
@@ -226,7 +279,7 @@ pub(super) fn project(
                         restyle_narrative_reference(
                             &mut row.metadata,
                             &entry.target,
-                            &narrative_symbols,
+                            narrative_symbols,
                         );
                     }
                 }
@@ -247,7 +300,11 @@ pub(super) fn project(
                     },
                 });
                 let mut entry = entry.clone();
-                entry.line = if context { 0 } else { entry.line - omitted };
+                entry.line = if context {
+                    0
+                } else {
+                    (i64::from(entry.line - omitted) + deferred_rows).try_into()?
+                };
                 target.insert(id, entry);
             }
             let id = TargetId(format!("plan:declaration:{}", row.id.0));
@@ -262,12 +319,16 @@ pub(super) fn project(
                 },
             });
             let mut anchor = anchor.clone();
-            anchor.line = if context { 0 } else { anchor.line - omitted };
+            anchor.line = if context {
+                0
+            } else {
+                (i64::from(anchor.line - omitted) + deferred_rows).try_into()?
+            };
             super::review_symbols::decorate(
                 &mut row,
                 &anchor,
                 &narrative_spans,
-                &narrative_symbols,
+                narrative_symbols,
                 &mut target,
             );
             target.insert(id, anchor);
@@ -284,10 +345,9 @@ pub(super) fn project(
             },
         );
         block.push(row);
-        for annotation in annotation
-            .iter()
-            .filter(|annotation| annotation.source.end_line == index as u32 + 1)
-        {
+        for annotation in annotation.iter().filter(|annotation| {
+            i64::from(annotation.source.end_line) == index as i64 + 1 + deferred_rows
+        }) {
             let comment = super::review_projection::annotation_block(
                 annotation,
                 width,
@@ -317,7 +377,7 @@ pub(super) fn project(
         }
     }
     if public_only || !hidden.is_empty() {
-        block = public_blocks(block, &hidden)?;
+        block = public_blocks(block, &hidden, body.is_none())?;
         let visible_target = block
             .iter()
             .flat_map(|block| &block.metadata.target)
@@ -335,13 +395,22 @@ fn rows(
     inspection: bool,
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
+    files: Option<&super::review_files::ReviewFiles>,
+    body: Option<FileBody<'_>>,
 ) -> Result<DesignReviewRows> {
     let design = document
         .design
         .as_ref()
         .context("declaration review has no design")?;
     let parsed = design.parsed()?;
-    let mut file_diff = Vec::new();
+    let mut block = Vec::new();
+    let mut display_row = HashMap::<(String, String, usize), usize>::new();
+    let mut navigation = PlanNavigationIndex {
+        plan_id: document.plan_id.clone(),
+        plan_version: document.version,
+        anchor: Vec::new(),
+    };
+    let mut skipped = HashMap::new();
     let mut hidden = HashSet::new();
     let mut contextual_path = HashSet::new();
     let mut contextual_block = HashSet::new();
@@ -349,8 +418,55 @@ fn rows(
     let mut presentation =
         HashMap::<(String, String), std::sync::Arc<super::calls::CallPresentation>>::new();
     let started = Instant::now();
-    let included = revealed.iter().map(|(path, _, _)| path.clone()).collect();
-    let ordered_files = super::review_file_layout::order(design, &included)?;
+    let included: HashSet<_> = revealed.iter().map(|(path, _, _)| path.clone()).collect();
+    if let Some(body) = body.filter(|body| body.id.starts_with("plan:tests:file:")) {
+        let (block, anchors) =
+            test_inventory(design, inspection, files, &mut skipped, Some(body.path))?;
+        navigation.anchor = anchors;
+        return Ok(DesignReviewRows {
+            block,
+            navigation,
+            hidden,
+            contextual: contextual_block,
+            skipped,
+        });
+    }
+    let ordered_files =
+        if let Some(body) = body {
+            let heading = files.and_then(|files| files.for_path(body.path));
+            vec![super::review_file_layout::ReviewFile {
+                baseline: heading
+                    .map_or(body.path, |heading| &heading.before)
+                    .to_owned(),
+                proposed: heading
+                    .map_or(body.path, |heading| &heading.after)
+                    .to_owned(),
+            }]
+        } else if let Some(inventory) = files {
+            let mut ordered: Vec<_> = inventory
+                .files
+                .iter()
+                .map(|file| super::review_file_layout::ReviewFile {
+                    baseline: file.before.clone(),
+                    proposed: file.after.clone(),
+                })
+                .collect();
+            // A jump may introduce unchanged context. Its lines have no canonical source offset.
+            let mut contextual: Vec<_> = included
+                .iter()
+                .filter(|path| inventory.for_path(path).is_none())
+                .collect();
+            contextual.sort();
+            ordered.extend(contextual.into_iter().map(|path| {
+                super::review_file_layout::ReviewFile {
+                    baseline: path.clone(),
+                    proposed: path.clone(),
+                }
+            }));
+            ordered
+        } else {
+            super::review_file_layout::order(design, &included)?
+        };
     if let Some(trace) = trace {
         trace.record(
             "plan.review.file_order",
@@ -361,6 +477,57 @@ fn rows(
     for file in ordered_files {
         let path = file.baseline;
         let destination = file.proposed;
+        if let Some((inventory, heading)) =
+            files.and_then(|inventory| Some((inventory, inventory.for_path(&destination)?)))
+            && body.is_none()
+            && !inventory.loaded.contains(&heading.id)
+            && !revealed
+                .iter()
+                .any(|(file, _, _)| file == &path || file == &destination)
+        {
+            let start = block.len();
+            let change = if path != destination {
+                FileChange::Renamed
+            } else if !design.baseline.contains_key(&path) {
+                FileChange::Added
+            } else if !parsed.proposed.contains_key(&destination) {
+                FileChange::Deleted
+            } else {
+                FileChange::Modified
+            };
+            let label = if path != destination {
+                format!("{path} → {destination}")
+            } else {
+                destination.clone()
+            };
+            block.push(
+                forge_diff::presentation::DiffPresenter::new(Default::default()).file(
+                    BlockId(heading.id.clone()),
+                    change,
+                    &label,
+                    heading.counts,
+                )?,
+            );
+            navigation.anchor.push(PlanNavigationAnchor {
+                columns: None,
+                line: block.len() as u32,
+                target: PlanReviewTarget::File {
+                    path: destination.clone(),
+                },
+                json_path: format!("/design/proposed/{}", pointer(&destination)),
+                path: Some(destination),
+                label,
+            });
+            let deferred = BlockId(format!("{}:hunk:deferred", heading.id));
+            skipped.insert(deferred.clone(), i64::from(heading.rows) - 2);
+            block.push(BufferBlock {
+                id: deferred,
+                text: BufferText::from_rows([""])?,
+                metadata: Default::default(),
+            });
+            fold(&mut block, start, &heading.id, FILE_FOLD)?;
+            continue;
+        }
         let before = design
             .baseline
             .get(&path)
@@ -428,7 +595,6 @@ fn rows(
         {
             contextual_path.insert(path.clone());
         }
-        file_diff.push(diff);
         if let Some(before) = before {
             if inspection {
                 visibility.insert(
@@ -461,15 +627,7 @@ fn rows(
             }
             presentation.insert((destination, "proposed".into()), after);
         }
-    }
-    let mut block = Vec::new();
-    let mut display_row = HashMap::<(String, String, usize), usize>::new();
-    let mut navigation = PlanNavigationIndex {
-        plan_id: document.plan_id.clone(),
-        plan_version: document.version,
-        anchor: Vec::new(),
-    };
-    for file in &file_diff {
+        let file = &diff;
         let hunks = &file.hunk;
         let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
         let start = block.len();
@@ -706,7 +864,7 @@ fn rows(
                     });
                 }
             }
-            fold(&mut block, hunk_start, &hunk_id)?;
+            fold(&mut block, hunk_start, &hunk_id, FoldPolicy::default())?;
             if file.hunk[hunk_index].contextual {
                 contextual_block.extend(block[hunk_start..].iter().map(|row| row.id.clone()));
             }
@@ -732,10 +890,20 @@ fn rows(
                 &display_row,
             );
         }
-        fold(&mut block, start, &id)?;
+        fold(&mut block, start, &id, FILE_FOLD)?;
         if contextual_path.contains(path) {
             contextual_block.extend(block[start..].iter().map(|row| row.id.clone()));
         }
+    }
+    if body.is_some() {
+        navigation.anchor.sort_by_key(|anchor| anchor.line);
+        return Ok(DesignReviewRows {
+            block,
+            navigation,
+            hidden,
+            contextual: contextual_block,
+            skipped,
+        });
     }
     if block.is_empty() {
         block.push(forge_diff::projection::header(
@@ -806,7 +974,12 @@ fn rows(
                     });
                 }
             }
-            fold(&mut overview, start, "plan:section:checks")?;
+            fold(
+                &mut overview,
+                start,
+                "plan:section:checks",
+                FoldPolicy::default(),
+            )?;
             overview.push(BufferBlock {
                 id: BlockId("plan:section:checks:separator".into()),
                 text: BufferText::from_rows([""])?,
@@ -839,14 +1012,20 @@ fn rows(
                 label: "Changes".into(),
             });
             overview.append(&mut block);
-            fold(&mut overview, changes_start, "plan:section:changes")?;
+            fold(
+                &mut overview,
+                changes_start,
+                "plan:section:changes",
+                FoldPolicy::default(),
+            )?;
             overview.push(BufferBlock {
                 id: BlockId("plan:section:changes:separator".into()),
                 text: BufferText::from_rows([""])?,
                 metadata: BlockMetadata::default(),
             });
             let offset = overview.len() as u32;
-            let (mut tests, mut anchors) = test_inventory(design)?;
+            let (mut tests, mut anchors) =
+                test_inventory(design, inspection, files, &mut skipped, None)?;
             for anchor in &mut anchors {
                 anchor.line += offset;
             }
@@ -880,7 +1059,7 @@ fn rows(
                 metadata: BlockMetadata::default(),
             });
         }
-        fold(&mut overview, start, &fold_id)?;
+        fold(&mut overview, start, &fold_id, FoldPolicy::default())?;
         for line in start as u32 + 1..=overview.len() as u32 {
             section_anchor.push(PlanNavigationAnchor {
                 columns: None,
@@ -905,6 +1084,7 @@ fn rows(
         navigation,
         hidden,
         contextual: contextual_block,
+        skipped,
     })
 }
 
@@ -1160,92 +1340,67 @@ fn test_file_change(
 
 pub(super) fn test_inventory(
     design: &super::DeclarationDesign,
+    inspection: bool,
+    files_loaded: Option<&super::review_files::ReviewFiles>,
+    skipped: &mut HashMap<BlockId, i64>,
+    only_file: Option<&str>,
 ) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
     let files = &design.document.tests;
     let parsed = design.parsed()?;
     let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
-    let mut heading = vec![
-        TextChunk {
-            text: " Tests ".into(),
-            capture: "RenderMarkdownH1".into(),
-        },
-        TextChunk {
-            text: "· ".into(),
-            capture: "Comment".into(),
-        },
-    ];
-    heading.extend(super::design_tests::summary(files));
-    heading.push(TextChunk {
-        text: " ".into(),
-        capture: "Normal".into(),
-    });
-    let mut block = vec![forge_diff::projection::header(
-        BlockId("plan:section:tests".into()),
-        heading,
-        0,
-    )?];
-    let mut anchors = vec![PlanNavigationAnchor {
-        columns: None,
-        line: 1,
-        target: PlanReviewTarget::Section {
-            section: super::PlanSection::Tests,
-        },
-        json_path: "/design/document/tests".into(),
-        path: None,
-        label: "Tests".into(),
-    }];
-    block.push(BufferBlock {
-        id: BlockId("plan:section:tests:spacing".into()),
-        text: BufferText::from_rows([""])?,
-        metadata: BlockMetadata::default(),
-    });
-    if let Some(report) = &design.submission_warnings
-        && !report.warnings().is_empty()
-    {
-        let warning_start = block.len();
-        block.push(BufferBlock {
-            id: BlockId("plan:tests:warnings:status".into()),
-            text: BufferText::from_rows([
-                "Submission warnings — captured observations; live inputs not revalidated",
-            ])?,
-            metadata: BlockMetadata::default(),
-        });
-        let matches = report.matches_plan(design)?;
-        for (index, warning) in report.warnings().iter().enumerate() {
-            let location = if matches {
-                format!("docs/tests.md:{}", warning.line)
-            } else {
-                "previous submission".into()
-            };
-            block.push(BufferBlock {
-                id: BlockId(format!("plan:tests:warnings:{index}")),
-                text: BufferText::from_rows([format!(
-                    "{location}: warning: {}",
-                    warning
-                        .message
-                        .lines()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .replace('\0', "�")
-                )])?,
-                metadata: BlockMetadata::default(),
-            });
-        }
-        update_warning_status(&mut block, design, None)?;
-        for line in warning_start + 1..=block.len() {
-            anchors.push(PlanNavigationAnchor {
-                columns: None,
-                line: u32::try_from(line)?,
-                target: PlanReviewTarget::Section {
-                    section: super::PlanSection::Tests,
-                },
-                json_path: "/design/submission_warnings".into(),
-                path: None,
-                label: "Submission warning".into(),
-            });
-        }
-    }
+    let (mut block, mut anchors) = match only_file {
+        Some(_) => (Vec::new(), Vec::new()),
+        None => test_section_heading(design, inspection)?,
+    };
     for (file_index, file) in files.iter().enumerate() {
+        if only_file.is_some_and(|path| path != file.file) {
+            continue;
+        }
+        let start = block.len();
+        let id = format!("plan:tests:file:{}", super::digest(file.file.as_bytes()));
+        let change = test_file_change(
+            design.baseline.contains_key(&file.file),
+            parsed.proposed.contains_key(&file.file),
+            &file.cases,
+        );
+        let counts = file.cases.iter().fold((0, 0), |(added, removed), case| {
+            (
+                added + u64::from(case.change == super::DesignTestChange::New),
+                removed + u64::from(case.change == super::DesignTestChange::Removed),
+            )
+        });
+        block.push(presenter.file(BlockId(id.clone()), change, &file.file, Some(counts))?);
+        anchors.push(PlanNavigationAnchor {
+            columns: None,
+            line: block.len() as u32,
+            target: PlanReviewTarget::Section {
+                section: super::PlanSection::Tests,
+            },
+            json_path: format!("/design/document/tests/{file_index}"),
+            path: Some(file.file.clone()),
+            label: file.file.clone(),
+        });
+        if file.cases.is_empty() {
+            continue;
+        }
+        if only_file.is_none()
+            && files_loaded.is_some_and(|inventory| !inventory.loaded.contains(&id))
+        {
+            let rows: usize = file
+                .cases
+                .iter()
+                .map(|case| 1 + case.description.lines().count())
+                .sum();
+            let deferred = BlockId(format!("{id}:hunk:deferred"));
+            skipped.insert(deferred.clone(), rows as i64 - 1);
+            block.push(BufferBlock {
+                id: deferred,
+                text: BufferText::from_rows([""])?,
+                metadata: Default::default(),
+            });
+            fold(&mut block, start, &id, FILE_FOLD)?;
+            continue;
+        }
         let original_path = design
             .moved
             .iter()
@@ -1279,30 +1434,6 @@ pub(super) fn test_inventory(
             .to_string()
             .len()
             .max(3);
-        let start = block.len();
-        let id = format!("plan:tests:file:{}", super::digest(file.file.as_bytes()));
-        let change = test_file_change(
-            design.baseline.contains_key(&file.file),
-            parsed.proposed.contains_key(&file.file),
-            &file.cases,
-        );
-        let counts = file.cases.iter().fold((0, 0), |(added, removed), case| {
-            (
-                added + u64::from(case.change == super::DesignTestChange::New),
-                removed + u64::from(case.change == super::DesignTestChange::Removed),
-            )
-        });
-        block.push(presenter.file(BlockId(id.clone()), change, &file.file, Some(counts))?);
-        anchors.push(PlanNavigationAnchor {
-            columns: None,
-            line: block.len() as u32,
-            target: PlanReviewTarget::Section {
-                section: super::PlanSection::Tests,
-            },
-            json_path: format!("/design/document/tests/{file_index}"),
-            path: Some(file.file.clone()),
-            label: file.file.clone(),
-        });
         for (case_index, case) in file.cases.iter().enumerate() {
             let case_start = block.len();
             let case_id = format!("{id}:{}", super::digest(case.name.as_bytes()));
@@ -1380,44 +1511,108 @@ pub(super) fn test_inventory(
                 });
             }
         }
-        fold(&mut block, start, &id)?;
+        fold(&mut block, start, &id, FILE_FOLD)?;
     }
-    fold(&mut block, 0, "plan:section:tests")?;
+    if only_file.is_none() {
+        fold(&mut block, 0, "plan:section:tests", FoldPolicy::default())?;
+    }
     Ok((block, anchors))
-}
-
-/// Keep retained warnings visible while distinguishing stale or unchecked input identities.
-pub(super) fn update_warning_status(
-    blocks: &mut [BufferBlock],
-    design: &super::DeclarationDesign,
-    status: Option<&crate::checks::SubmissionWarningStatus>,
-) -> Result<()> {
-    let Some(report) = &design.submission_warnings else {
-        return Ok(());
-    };
-    let Some(block) = blocks
-        .iter_mut()
-        .find(|block| block.id.0 == "plan:tests:warnings:status")
-    else {
-        return Ok(());
-    };
-    let label = if !report.matches_plan(design)? {
-        "Stale submission warnings — authored tests or reviewer choices changed; resubmit to replace them".into()
-    } else {
-        status.map(|status| status.label()).unwrap_or_else(|| {
-            "Submission warnings — captured observations; live inputs not revalidated".into()
-        })
-    };
-    block.text = BufferText::from_rows([label
-        .lines()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace('\0', "�")])?;
-    Ok(())
 }
 
 /// Recolor a value or construction reference by the narrative symbol it names, so types and
 /// factories keep the coloring their declarations use elsewhere in the review.
+fn test_section_heading(
+    design: &super::DeclarationDesign,
+    inspection: bool,
+) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
+    let mut heading = vec![
+        TextChunk {
+            text: " Tests ".into(),
+            capture: "RenderMarkdownH1".into(),
+        },
+        TextChunk {
+            text: "· ".into(),
+            capture: "Comment".into(),
+        },
+    ];
+    heading.extend(super::design_tests::summary(&design.document.tests));
+    heading.push(TextChunk {
+        text: " ".into(),
+        capture: "Normal".into(),
+    });
+    let mut block = vec![forge_diff::projection::header(
+        BlockId("plan:section:tests".into()),
+        heading,
+        0,
+    )?];
+    let mut anchors = vec![PlanNavigationAnchor {
+        columns: None,
+        line: 1,
+        target: PlanReviewTarget::Section {
+            section: super::PlanSection::Tests,
+        },
+        json_path: "/design/document/tests".into(),
+        path: None,
+        label: "Tests".into(),
+    }];
+    block.push(BufferBlock {
+        id: BlockId("plan:section:tests:spacing".into()),
+        text: BufferText::from_rows([""])?,
+        metadata: BlockMetadata::default(),
+    });
+    if let Some(report) = &design.submission_warnings
+        && !report.warnings().is_empty()
+    {
+        let warning_start = block.len();
+        let matches = report.matches_plan(design)?;
+        block.push(BufferBlock {
+            id: BlockId("plan:tests:warnings:status".into()),
+            // Decisions compare the canonical Markdown with its saved artifact.
+            // The editor can label the observations without changing those bytes.
+            text: BufferText::from_rows([match (inspection, matches) {
+                (true, true) => "Warnings recorded at plan submission",
+                (true, false) => "Warnings from a previous submission",
+                (false, true) => "Submission warnings — captured observations; live inputs not revalidated",
+                (false, false) => "Stale submission warnings — authored tests or reviewer choices changed; resubmit to replace them",
+            }])?,
+            metadata: BlockMetadata::default(),
+        });
+        for (index, warning) in report.warnings().iter().enumerate() {
+            let location = if matches {
+                format!("docs/tests.md:{}", warning.line)
+            } else {
+                "previous submission".into()
+            };
+            block.push(BufferBlock {
+                id: BlockId(format!("plan:tests:warnings:{index}")),
+                text: BufferText::from_rows([format!(
+                    "{location}: warning: {}",
+                    warning
+                        .message
+                        .lines()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .replace('\0', "�")
+                )])?,
+                metadata: BlockMetadata::default(),
+            });
+        }
+        for line in warning_start + 1..=block.len() {
+            anchors.push(PlanNavigationAnchor {
+                columns: None,
+                line: u32::try_from(line)?,
+                target: PlanReviewTarget::Section {
+                    section: super::PlanSection::Tests,
+                },
+                json_path: "/design/submission_warnings".into(),
+                path: None,
+                label: "Submission warning".into(),
+            });
+        }
+    }
+    Ok((block, anchors))
+}
+
 fn restyle_narrative_reference(
     metadata: &mut forge_buffer::block::BlockMetadata,
     anchor: &PlanReviewTarget,
@@ -1730,6 +1925,7 @@ fn call_folds(
 fn public_blocks(
     mut block: Vec<BufferBlock>,
     hidden: &HashSet<BlockId>,
+    whole_document: bool,
 ) -> Result<Vec<BufferBlock>> {
     let index: HashMap<_, _> = block
         .iter()
@@ -1763,7 +1959,14 @@ fn public_blocks(
         public_count.push(public_count.last().unwrap() + usize::from(declaration));
     }
     for (start, header) in block.iter().enumerate() {
-        if header.id.0.starts_with("plan:section:") {
+        if header.id.0.starts_with("plan:section:")
+            || super::review_projection::change_file(&header.id) == Some(header.id.0.as_str())
+            || header
+                .id
+                .0
+                .strip_prefix("plan:tests:file:")
+                .is_some_and(|key| !key.contains(':'))
+        {
             continue;
         }
         for fold in &header.metadata.fold {
@@ -1838,12 +2041,17 @@ fn public_blocks(
         // An empty declaration row cannot replace the unhighlighted section spacer.
         let section_separator =
             item.id.0.starts_with("plan:section:") && item.id.0.ends_with(":separator");
-        if empty && blank && !section_separator {
+        if empty && blank && !section_separator && !item.id.0.ends_with(":hunk:deferred") {
             retained[position] = false;
         }
         blank = empty;
     }
-    for (position, item) in block.iter().enumerate().rev() {
+    for (position, item) in block
+        .iter()
+        .enumerate()
+        .rev()
+        .take_while(|_| whole_document)
+    {
         if !retained[position] {
             continue;
         }
@@ -1852,6 +2060,7 @@ fn public_blocks(
             .wire_rows()
             .iter()
             .all(|row| row.trim().is_empty())
+            && !item.id.0.ends_with(":hunk:deferred")
         {
             retained[position] = false;
         } else {
@@ -1902,6 +2111,9 @@ fn public_blocks(
         .zip(retained)
         .filter_map(|(block, keep)| keep.then_some(block))
         .collect();
+    if !whole_document {
+        return Ok(output);
+    }
     let changes = output
         .iter()
         .position(|block| block.id.0 == "plan:section:changes")
@@ -1940,7 +2152,12 @@ fn public_blocks(
     }
     let mut trailing = output.split_off(changes_end);
     output[changes].metadata.fold.clear();
-    fold(&mut output, changes, "plan:section:changes")?;
+    fold(
+        &mut output,
+        changes,
+        "plan:section:changes",
+        FoldPolicy::default(),
+    )?;
     output.append(&mut trailing);
     Ok(output)
 }
@@ -1975,7 +2192,12 @@ fn declaration_anchor(
     }
 }
 
-fn fold(block: &mut [BufferBlock], start: usize, id: &str) -> Result<()> {
+pub(super) fn fold(
+    block: &mut [BufferBlock],
+    start: usize,
+    id: &str,
+    policy: FoldPolicy,
+) -> Result<()> {
     if block.len() <= start + 1 {
         return Ok(());
     }
@@ -1991,7 +2213,7 @@ fn fold(block: &mut [BufferBlock], start: usize, id: &str) -> Result<()> {
         &mut block[start],
         FoldId(id.into()),
         end,
-        Default::default(),
+        policy,
     );
     Ok(())
 }

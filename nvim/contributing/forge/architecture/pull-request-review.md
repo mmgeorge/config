@@ -44,6 +44,8 @@ Browser actions resolve an explicit comment occurrence or source anchor, so adja
 
 A `ReviewDocument` is in `Overview` or `Batched` mode. Batched mode adds an editable summary and a viewed-file set, both stored in the durable review draft. Lua changes these only through `github.review.document.batch.begin`, `github.review.document.file.viewed.set`, and `github.review.document.batch.submit`.
 
+Batched review uses the same whole-file grouping and counted headings as PlanReview through `forge_diff::presentation::file_review`. The pull-request service keeps pagination and loading state on the Unviewed section.
+
 A submission captures the summary and every inline draft and sends them in one review request. The operation ID and complete capture reach durable storage before dispatch. An unknown outcome survives reopen, blocks another submission, and requires explicit recovery through `gB`. A missing recovery journal cannot establish confirmation.
 
 ## Commit details

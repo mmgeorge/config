@@ -456,6 +456,7 @@ The agents picker (`og` or `/agents`) lists running children, then finished ones
 `/agents spawn` lets you choose a profile, access mode, and task. Use `/agents spawn --read <profile> <text>` for an inspection or `--write` to require write access from the session and profile. The model can make the same choice with the `access` field in `agent_spawn`. Omit the choice to use the profile's default. `/agents edit` saves each profile's Access setting as `inherit`, `read`, or `write`.
 
 Thoughts with activity start collapsed and preserve the assistant's text in their heading.
+Tool rows and tool summaries show milliseconds below one second. From one second, thought and tool durations show completed whole seconds. From one minute, they show tenths of a minute, such as `2.5m` for 150 seconds. Longer durations use hours or days.
 Expanding a thought shows its events first, then its tool summary, then its file changes,
 one indentation level deeper. Thoughts without activity keep the `○` marker. Your explicit
 expansion choice survives incoming activity. Tools and file writes accumulate into two entries,
@@ -1238,17 +1239,24 @@ documentation comment (`///` in Rust, `/** */` in TypeScript) directly above it.
 Assign with `←` or `<-`, compare with `=`, `≠`, `is`, or `is not` (as in `target is none`),
 compute remainders with `%` or `mod`, and loop with
 `for each item in items` or `for item in items`.
-Each Algorithm and Change heading in PlanReview folds its block, and the caret before the heading
-shows its state: `▾` open, `▸` closed. Function bodies start collapsed; once a body is expanded,
-its blocks start open and show their carets. Folding changes only the display, and reopening a
-review starts again from these defaults.
+PlanReview starts with each file folded in Changes and Tests. Press `Tab` on a file heading to
+load its complete changes or tests on first unfold. Public mode keeps each changed file heading,
+including files whose bodies are empty under the filter. Reopening the same plan in the same Neovim process restores each file's fold state,
+including across revisions. Changes and Tests remember their file folds independently.
+Under Changes, each file starts in **Unviewed Changes**. Press `S` on a file heading or any
+line inside it to move the whole file to **Viewed Changes**. Press `U` to move it back.
+The cursor advances to the next file in the section when one is available. Comments and
+questions stay on their original lines. Reopening the same revision in the running Harness
+session restores its viewed files. A new revision starts unviewed.
+Function bodies start collapsed. Expand a body to see its Algorithm or Change blocks, which
+start open. The caret on each block heading shows its state (`▾` open, `▸` closed).
 Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)` for a tuple
 struct or variant, or `CombatEntity()` for a marker. Keep construction separate from the
 operation that queues or inserts it. Name the fields and types a function uses inside its
 Algorithm or Change; plans have no Calls, Constructs, or Accesses sections to fill in.
 Submission checks statement syntax and indentation, including branch and loop structure, and
 reports every violation in one response, each with the callable, the Algorithm line, and the
-rejected text. Drafts can remain incomplete while edited.
+rejected text. Drafts can remain incomplete while edited. If a captured repository file changed, the planning agent receives the refreshed baseline diff and can revise or resubmit the same draft. Forge reports body-only edits even when the declarations are identical. The next successful submission creates the review revision.
 Modified functions use `Change` for behavioral deltas in one or two succinct
 sentences. Expand a function to read its behavior block.
 Collapsed signatures omit the `[changed]` suffix.
@@ -1334,7 +1342,7 @@ planned tests or disables selected checks after confirmation.
 Rust test-only modules and test functions are hidden from Changes in both Public and All views.
 Their saved declarations remain intact, and planned cases remain in Tests.
 The Tests section groups cases under New, Modified, Deleted, or Unchanged file headings.
-File groups expand by default and toggle with the usual fold action. Test names and descriptions
+Expand a file to see its test names and descriptions. These rows
 use shared diff gutters and full-line backgrounds, including orange `~` rows for modified cases.
 Select either a test name or its description to delete that planned case. Deleting the last
 case removes its empty file group without deleting project source files.

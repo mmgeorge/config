@@ -56,15 +56,35 @@ function M.visible_position(mapping, block, row)
   return previous
 end
 
+local function fold_rows(source, record)
+  local _, start = source.sequence:position(record.owner)
+  local finish = record.fold["end"]
+  local _, last = source.sequence:position(finish.block)
+  return start + record.fold.start.row, last + finish.position.row + (finish.position.column > 0 and 1 or 0)
+end
+
+---Open the ancestors of a hidden jump target. Render again when the choices changed.
+---@param owner table
+---@param block string
+---@param offset integer
+---@return boolean
+function M.reveal(owner, block, offset)
+  if M.contains(owner, block, offset) then return false end
+  local _, start = owner.source.sequence:position(block)
+  if not start then return false end
+  local row = start + offset
+  for id, record in pairs(owner.source.fold.record) do
+    local first, last = fold_rows(owner.source, record)
+    if first < row and row < last then owner.choice[id] = false end
+  end
+  return true
+end
+
 local function project(owner)
   local source = owner.source
   local hidden, ranges = {}, {}
   for id, record in pairs(source.fold.record) do
-    local _, start = source.sequence:position(record.owner)
-    local _, finish = source.sequence:position(record.fold["end"].block)
-    local first = start + record.fold.start.row
-    local last = finish + record.fold["end"].position.row
-      + (record.fold["end"].position.column > 0 and 1 or 0)
+    local first, last = fold_rows(source, record)
     local state = source.block[record.owner].metadata.node
     local closed = state and state ~= vim.NIL and state.id == id and state.display == "heading"
     if not state or state == vim.NIL or state.id ~= id then

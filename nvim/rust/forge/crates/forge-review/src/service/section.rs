@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::identity::DocumentId;
+use forge_diff::presentation::file_review::{self, FileReviewSection};
 use forge_github::review_api::{GithubReviewRemote, ReviewReadRequest, ReviewSection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -152,7 +153,7 @@ impl ReviewSectionState {
     pub(super) fn partition_files(
         self,
         viewed_file: &std::collections::BTreeSet<String>,
-    ) -> (Self, Self) {
+    ) -> [(FileReviewSection, Self); 2] {
         let Self {
             timing,
             item,
@@ -163,10 +164,11 @@ impl ReviewSectionState {
             bytes,
             charge,
         } = self;
-        let (viewed_item, unviewed_item): (Vec<_>, Vec<_>) = item.into_iter().partition(|item| {
-            item.source
-                .as_ref()
-                .is_some_and(|source| viewed_file.contains(&source.path))
+        let [
+            (unviewed_section, unviewed_item),
+            (viewed_section, viewed_item),
+        ] = file_review::partition(item, viewed_file, |item| {
+            item.source.as_ref().map(|source| source.path.as_str())
         });
         let viewed = Self {
             timing: timing.clone(),
@@ -188,7 +190,7 @@ impl ReviewSectionState {
             bytes,
             charge,
         };
-        (unviewed, viewed)
+        [(unviewed_section, unviewed), (viewed_section, viewed)]
     }
 }
 

@@ -13,6 +13,93 @@ use forge_buffer::width::WidthProfile;
 use std::collections::HashMap;
 use std::time::Instant;
 
+const UNVIEWED_GROUP: &str = "plan:section:changes:unviewed";
+const VIEWED_GROUP: &str = "plan:section:changes:viewed";
+const REVIEW_SEPARATOR: &str = "plan:section:changes:unviewed:separator";
+
+/// Resolve a Changes heading, hunk, or declaration row to its whole file.
+pub(super) fn change_file(id: &BlockId) -> Option<&str> {
+    id.0.starts_with("plan:design:file:").then(|| {
+        id.0.split_once(":hunk:")
+            .map_or(id.0.as_str(), |(file, _)| file)
+    })
+}
+
+/// Group whole file subtrees after source anchors and visibility have been resolved. Sorting
+/// by the canonical file heading restores proposal order when moving a file back to Unviewed.
+pub(super) fn group_changes(
+    blocks: &mut Vec<BufferBlock>,
+    targets: &HashMap<TargetId, PlanNavigationAnchor>,
+    viewed: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let Some(changes) = blocks
+        .iter()
+        .position(|block| block.id.0 == "plan:section:changes")
+    else {
+        return Ok(());
+    };
+    let end = blocks
+        .iter()
+        .position(|block| block.id.0 == "plan:section:changes:separator")
+        .context("plan Changes separator is missing")?;
+    let Some(first) = (changes + 1..end)
+        .find(|&i| change_file(&blocks[i].id).is_some() || blocks[i].id.0 == UNVIEWED_GROUP)
+    else {
+        return Ok(());
+    };
+    let trailing = blocks.split_off(end);
+    let mut files: Vec<Vec<BufferBlock>> = Vec::new();
+    for block in blocks.drain(first..) {
+        if matches!(
+            block.id.0.as_str(),
+            UNVIEWED_GROUP | REVIEW_SEPARATOR | VIEWED_GROUP
+        ) {
+            continue;
+        }
+        if change_file(&block.id) == Some(block.id.0.as_str()) {
+            files.push(Vec::new());
+        }
+        files
+            .last_mut()
+            .context("plan change row precedes its file heading")?
+            .push(block);
+    }
+    files.sort_by_key(|file| {
+        file[0]
+            .metadata
+            .target
+            .iter()
+            .find_map(|range| targets.get(&range.id))
+            .map(|anchor| anchor.line)
+    });
+    use forge_diff::presentation::file_review::{self, FileReviewSection};
+    for (section, files) in
+        file_review::partition(files, viewed, |file| Some(file[0].id.0.as_str()))
+    {
+        let id = match section {
+            FileReviewSection::Unviewed => UNVIEWED_GROUP,
+            FileReviewSection::Viewed => {
+                blocks.push(BufferBlock {
+                    id: BlockId(REVIEW_SEPARATOR.into()),
+                    text: BufferText::from_rows([""])?,
+                    metadata: BlockMetadata::default(),
+                });
+                VIEWED_GROUP
+            }
+        };
+        let start = blocks.len();
+        blocks.push(forge_diff::presentation::title_block(
+            id.into(),
+            &section.heading(files.len()),
+        )?);
+        blocks.extend(files.into_iter().flatten());
+        super::design_review::fold(blocks, start, id, Default::default())?;
+    }
+    super::design_review::fold(blocks, changes, "plan:section:changes", Default::default())?;
+    blocks.extend(trailing);
+    Ok(())
+}
+
 /// Reuses all non-test blocks after a test-only canonical revision.
 pub(super) fn update_tests(
     source: &PlanReviewSource,
@@ -46,13 +133,17 @@ pub(super) fn update_tests(
         .design
         .as_ref()
         .context("test edit has no design")?;
-    let (mut replacement, navigation) = super::design_review::test_inventory(design)?;
-    super::design_review::update_warning_status(
-        &mut replacement,
+    let mut skipped = HashMap::new();
+    let (mut replacement, navigation) = super::design_review::test_inventory(
         design,
-        source.warning_status.as_ref(),
+        true,
+        source.files.as_ref(),
+        &mut skipped,
+        None,
     )?;
+    let mut deferred_rows = 0;
     for (index, row) in replacement.iter_mut().enumerate() {
+        deferred_rows += skipped.get(&row.id).copied().unwrap_or(0);
         if let Some(anchor) = navigation
             .iter()
             .find(|anchor| anchor.line as usize == index + 1)
@@ -69,12 +160,13 @@ pub(super) fn update_tests(
                 },
             });
             let mut anchor = anchor.clone();
-            anchor.line += new_start as u32;
+            anchor.line = (i64::from(anchor.line) + new_start as i64 + deferred_rows).try_into()?;
             target.insert(id, anchor);
         }
     }
     block.splice(start..end, replacement);
-    let block = forge_buffer::collapse::project(block, &source.collapse)?;
+    let mut block = forge_buffer::collapse::project(block, &source.collapse)?;
+    group_changes(&mut block, &target, &source.viewed_files)?;
     let visible: std::collections::HashSet<_> = block
         .iter()
         .flat_map(|block| &block.metadata.target)
@@ -97,7 +189,6 @@ pub(crate) fn project(
             &source.document,
             width,
             crate::plan::design_review::ReviewAnnotationView {
-                warning_status: source.warning_status.as_ref(),
                 annotation,
                 revision,
                 focused,
@@ -106,6 +197,8 @@ pub(crate) fn project(
             source.public_only,
             source.trace.as_ref(),
             &source.revealed,
+            source.files.as_ref(),
+            None,
         )
         .and_then(|(mut block, mut target)| {
             if let Some(review) = &source.execution_review {
@@ -139,7 +232,8 @@ pub(crate) fn project(
                 block.push(heading);
                 block.push(report);
             }
-            let block = forge_buffer::collapse::project(block, &source.collapse)?;
+            let mut block = forge_buffer::collapse::project(block, &source.collapse)?;
+            group_changes(&mut block, &target, &source.viewed_files)?;
             let visible: std::collections::HashSet<_> = block
                 .iter()
                 .flat_map(|block| &block.metadata.target)
@@ -401,7 +495,7 @@ pub(crate) fn project(
                 closed,
             });
     }
-    for (source_start, source_end) in file_tree_ranges(
+    for (path, source_start, source_end) in file_tree_ranges(
         &source.rendered.navigation.anchor,
         source.rendered.markdown.lines().count() + 1,
     ) {
@@ -422,7 +516,7 @@ pub(crate) fn project(
         block[row_block[start]].metadata.fold.push(FoldRange {
             collapsed_suffix: None,
             heading_start: None,
-            id: FoldId(format!("plan:file-tree:{source_start}")),
+            id: FoldId(format!("plan:file-tree:{}", super::digest(path.as_bytes()))),
             collapse_children: false,
             expand_children: false,
             heading_marker: false,
@@ -814,26 +908,26 @@ fn append_range(metadata: &mut BlockMetadata, start: usize, end: usize, capture:
     });
 }
 
-fn file_tree_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize)> {
+fn file_tree_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(&str, usize, usize)> {
     let mut active = None;
     let mut ranges = Vec::new();
     for anchor in anchor {
         match &anchor.target {
-            PlanReviewTarget::FileTreeFile { .. } => {
-                if let Some(start) = active.replace(anchor.line as usize) {
-                    ranges.push((start, anchor.line as usize));
+            PlanReviewTarget::FileTreeFile { path } => {
+                if let Some((path, start)) = active.replace((path.as_str(), anchor.line as usize)) {
+                    ranges.push((path, start, anchor.line as usize));
                 }
             }
             PlanReviewTarget::FileTreeEntity { .. } | PlanReviewTarget::FileTreeTest { .. } => {}
             _ => {
-                if let Some(start) = active.take() {
-                    ranges.push((start, anchor.line as usize));
+                if let Some((path, start)) = active.take() {
+                    ranges.push((path, start, anchor.line as usize));
                 }
             }
         }
     }
-    if let Some(start) = active {
-        ranges.push((start, end));
+    if let Some((path, start)) = active {
+        ranges.push((path, start, end));
     }
     ranges
 }

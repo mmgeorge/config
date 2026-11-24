@@ -15,6 +15,7 @@ pub(super) struct Symbol {
     qualified: String,
 }
 
+#[derive(Default)]
 pub(super) struct NarrativeSymbols {
     pub proposed: Vec<Symbol>,
     baseline: Vec<Symbol>,

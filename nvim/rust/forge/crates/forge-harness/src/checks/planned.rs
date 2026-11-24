@@ -12,5 +12,4 @@ pub(super) use inventory::PlannedInventory;
 pub(super) use resolution::submission_warnings;
 pub(super) use runtime::{finish_run, resolve_run, validate_inputs};
 pub(crate) use submission::PlannedTestWarning;
-pub(crate) use submission::SubmissionWarningStatus;
 pub use submission::SubmissionWarnings;
