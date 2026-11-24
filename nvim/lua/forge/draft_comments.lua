@@ -62,6 +62,8 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 ---@field guard? table
 ---@field guard_source boolean
+---@field reposition_input? fun()
+---@field popup_input boolean
 ---@field markdown boolean
 
 ---@class ForgeDraftSourceRow
@@ -87,6 +89,7 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field before_render? fun(buf: integer, win: integer?)
 ---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 ---@field guard_source? boolean
+---@field popup_input? boolean Keep annotations boxed during navigation and composition.
 ---@field markdown? boolean Render Markdown in compact bodies and read-only replies.
 
 ---@type table<integer, ForgeDraftCommentState>
@@ -653,6 +656,7 @@ local function render(state, target, mark_phase)
   if win and requested_row then vim.api.nvim_win_set_cursor(win, { requested_row + 1, 0 }) end
   sync_cursor_modifiable(state, win)
   state.rendering = false
+  if state.reposition_input then state.reposition_input() end
   if state.guard and state.guard.native then editable.applying(state.guard, false) end
 end
 
@@ -667,7 +671,10 @@ local function handle_cursor_moved(state)
   local row = vim.api.nvim_win_get_cursor(win)[1] - 1
   local annotation, range, reply = annotation_at_row(state, row)
   if annotation and range then
-    if annotation.readonly then sync_cursor_modifiable(state, win) return end
+    if annotation.readonly or state.popup_input and range.compact then
+      sync_cursor_modifiable(state, win)
+      return
+    end
     if not annotation.focused then
       local reply_index = range.reply_index
       if reply then
@@ -785,6 +792,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
     before_render = opts.before_render,
     after_render = opts.after_render,
     markdown = opts.markdown == true,
+    popup_input = opts.popup_input == true,
     guard_source = opts.guard_source == true,
   }
   state_by_buf[buf] = state
@@ -917,11 +925,11 @@ function M.add(buf, annotation, start_insert)
   local win = displayed_window(state)
   if not win then return nil end
   for _, candidate in ipairs(state.annotation_list) do candidate.focused = false end
-  annotation.focused, annotation.new = true, true
+  annotation.focused, annotation.new = not state.popup_input, true
   state.annotation_list[#state.annotation_list + 1] = annotation
-  focus_thread(state, annotation)
+  if not state.popup_input then focus_thread(state, annotation) end
   render(state, { annotation_id = annotation.id })
-  if start_insert ~= false then start_insert_later(state) end
+  if not state.popup_input and start_insert ~= false then start_insert_later(state) end
   return annotation
 end
 
@@ -943,6 +951,23 @@ local function edit_annotation(state, annotation, win)
   render(state, { annotation_id = annotation.id })
 end
 
+local function comment_target(state, win)
+  local mode = vim.fn.mode(1)
+  local cursor_row = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local first_row = cursor_row
+  local last_row = cursor_row
+  if mode == "v" or mode == "V" or mode == "\22" then
+    first_row = vim.fn.getpos("v")[2] - 1
+  end
+  local source_line, end_source_line = source_range_at_rows(state, first_row, last_row)
+  local parent, range, on_answer
+  if first_row == last_row then
+    parent, range, on_answer = annotation_at_row(state, cursor_row)
+  end
+  if parent then source_line, end_source_line = parent.source_line, parent.end_source_line end
+  return source_line, end_source_line, parent, range, on_answer, math.max(first_row, last_row)
+end
+
 --- Add a comment on the selected rows; a refusal notifies and returns nil without other effects.
 ---
 --- On an answer row the comment follows up that answer in its thread. Inside a comment's own
@@ -957,19 +982,7 @@ function M.add_at_cursor(buf, start_insert, properties)
   sync_focused_body(state)
   local win = displayed_window(state)
   if not win then return nil end
-  local mode = vim.fn.mode(1)
-  local cursor_row = vim.api.nvim_win_get_cursor(win)[1] - 1
-  local first_row = cursor_row
-  local last_row = cursor_row
-  if mode == "v" or mode == "V" or mode == "\22" then
-    first_row = vim.fn.getpos("v")[2] - 1
-  end
-  local source_line, end_source_line = source_range_at_rows(state, first_row, last_row)
-  local parent, on_answer = nil, false
-  if first_row == last_row then
-    local _
-    parent, _, on_answer = annotation_at_row(state, cursor_row)
-  end
+  local source_line, end_source_line, parent, _, on_answer = comment_target(state, win)
   if parent and not on_answer then
     if parent.readonly then
       notifications.error("This comment cannot be edited", "Forge comments")
@@ -979,7 +992,6 @@ function M.add_at_cursor(buf, start_insert, properties)
     if start_insert ~= false then start_insert_later(state) end
     return parent
   end
-  if parent then source_line, end_source_line = parent.source_line, parent.end_source_line end
   if not source_line or not end_source_line then
     notifications.error("Selected rows have no source identity", "Forge comments")
     return nil
@@ -997,6 +1009,60 @@ function M.add_at_cursor(buf, start_insert, properties)
   }
   state.next_id = state.next_id + 1
   return M.add(buf, annotation, start_insert)
+end
+
+---@class ForgeCommentInputTarget
+---@field window integer
+---@field heading string
+---@field state ForgeDraftCommentState
+---@field placement fun(): integer?, integer?, integer? Footer row, left indent and interior width.
+---@field append fun(body: string, kind?: string, heading?: string): boolean
+
+--- Capture the selected source or message before moving the review viewport. A reply
+--- belongs to the selected message and appears after the last message in its thread.
+---@param buf integer
+---@return ForgeCommentInputTarget?
+function M.input_target(buf)
+  local state = state_by_buf[buf]
+  local win = state and displayed_window(state)
+  if not state or not win or state.readonly then return end
+  local first, last, parent, _, _, row = comment_target(state, win)
+  if not first or not last then
+    notifications.error("Selected rows have no source identity", "Forge comments")
+    return
+  end
+  local root = parent and thread_root(state, parent)
+  local function placement()
+    if state_by_buf[buf] ~= state or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then return end
+    local usable = comment_editor.display_width(win, buf) + 1
+    if root then
+      for index = #state.range_list, 1, -1 do
+        local range = state.range_list[index]
+        if thread_root(state, range.annotation) == root then
+          local footer = mark_row(state, range.footer_mark)
+          if not footer then return end
+          local line = vim.api.nvim_buf_get_lines(buf, footer, footer + 1, false)[1]
+          local indent = #line:match("^ *")
+          local width = vim.api.nvim_win_call(win, function() return vim.fn.strdisplaywidth(line) end) - indent - 2
+          return footer, indent, math.max(1, math.min(width, usable - indent - 2))
+        end
+      end
+      return
+    end
+    return row, 2, math.max(1, math.min(comment_box.inner_width(usable), usable - 4))
+  end
+  local function append(body, kind, heading)
+    if state_by_buf[buf] ~= state or not displayed_window(state) or parent and not find_annotation(state, parent.id) then
+      notifications.error("The plan changed. Copy your draft and reopen it on the current plan.", "Forge comments")
+      return false
+    end
+    local annotation = { id = state.next_id, body = body, source_line = first, end_source_line = last,
+      kind = kind, heading = heading, parent_id = parent and tostring(parent.id) or nil }
+    state.next_id = state.next_id + 1
+    M.add(buf, annotation, false)
+    return true
+  end
+  return { window = win, heading = state.heading, state = state, placement = placement, append = append }
 end
 
 --- Update thread presentation in one render without replacing local draft bodies.

@@ -1,3 +1,4 @@
+local finish_input = dofile("nvim/lua/forge/tests/support/plan_comment_input.lua")
 local MiniTest = require("mini.test")
 local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 local buffer = dofile("nvim/lua/forge/tests/support/buffer.lua")
@@ -113,14 +114,9 @@ T["directory_planning"] = function()
   local function add_message(key, source, message)
     assert(vim.fn.search(source, "cw") > 0, "annotation source is missing")
     keymap.invoke(key, { buffer = review.buf })
-    vim.cmd("stopinsert")
+    finish_input({ message })
     local draft = comments.capture(review.buf)
-    local id = draft[#draft].id
-    assert(comments.focus(review.buf, id))
-    local body = vim.api.nvim_win_get_cursor(review.win)[1] - 1
-    vim.api.nvim_buf_set_lines(review.buf, body, body + 1, false, { message })
-    vim.api.nvim_exec_autocmds("TextChanged", { buffer = review.buf })
-    return id
+    return draft[#draft].id
   end
   local question_body = "Why does this declaration need its own file?"
   local question_id = add_message("A", "/// Apply the requested behavior", question_body)
@@ -153,6 +149,15 @@ T["directory_planning"] = function()
   local question_row = assert(buffer.find_row(review.buf, question_body), "moved question is missing")
   assert(buffer.find_row(review.buf, "Mock response:", { first_row = question_row + 1 }),
     "answer did not render below the moved question")
+  local boxed_lines = buffer.lines(review.buf)
+  vim.api.nvim_win_set_cursor(review.win, { question_row, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = review.buf })
+  MiniTest.expect.equality(buffer.lines(review.buf), boxed_lines, { fail_reason = "hovering opened the saved question for editing" })
+  keymap.invoke("C", { buffer = review.buf })
+  local composer = vim.api.nvim_get_current_buf()
+  MiniTest.expect.equality(vim.bo[composer].filetype, "ForgePlanCommentInput")
+  keymap.invoke("<Esc>", { buffer = composer })
+  MiniTest.expect.equality(comments.capture(review.buf), draft)
   toggle_file()
   keymap.invoke("q", { buffer = review.buf })
   review = open_review()
@@ -332,11 +337,10 @@ T["recovery"] = function()
   vim.api.nvim_win_set_cursor(0, { 44, 0 })
   owner.action("comment", function() end)
 
-  vim.cmd("stopinsert")
+  finish_input({ "draft", "λ\r", "" })
   local comments = require("forge.draft_comments")
+  assert(comments.focus(native_buffer, comments.capture(native_buffer)[1].id))
   local body_row = vim.api.nvim_win_get_cursor(0)[1] - 1
-  vim.api.nvim_buf_set_lines(native_buffer, body_row, body_row + 1, false, { "draft", "λ\r", "" })
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = native_buffer })
   local plan = { id = "plan", review_digest = "canonical", working_path = vim.api.nvim_buf_get_name(native_buffer) }
   local harness = require("forge.session").harness
   harness.session = { id = "replacement-session" }
@@ -525,12 +529,13 @@ T["plan_test_delete"] = function()
   assert(review.owner.version == 1 and review.owner.source == original_source, "preview changed the canonical version")
   local comments = require("forge.draft_comments")
   comments.add(review.buf, { id = "rollback-feedback", source_line = 1, body = "Feedback typed while deleting" }, false)
-  vim.cmd("stopinsert")
+  vim.api.nvim_win_set_cursor(review.win, { assert(buffer.find_row(review.buf, "Feedback typed while deleting")), 0 })
+  local comment_line = vim.api.nvim_get_current_line()
   pending.callback(nil, "test deletion failed")
   pending = nil
   assert(not require("forge.views.harness.activity").busy(state) and review.owner.attached(), "failed deletion stranded the review")
   assert(comments.capture(review.buf)[1].source.body == "Feedback typed while deleting", "rollback lost newer feedback")
-  assert(vim.api.nvim_get_current_line() == "Feedback typed while deleting", "rollback moved the current comment cursor")
+  assert(vim.api.nvim_get_current_line() == comment_line, "rollback moved the current comment cursor")
   comments.delete_at_cursor(review.buf)
   assert(vim.deep_equal(buffer.lines(review.buf),
     vim.tbl_map(function(row) return row.text end, review.owner.source)), "failed deletion did not roll back")
@@ -604,19 +609,17 @@ T["plan_test_delete"] = function()
   vim.cmd("stopinsert")
   vim.cmd("write")
   assert(owner.pending_operation, "the save should queue behind deletion")
-  local focused_text = vim.api.nvim_get_current_line()
-  assert(focused_text == "Keep this new feedback", "comment fixture did not focus its editable body")
+  local card = owner.comment_state.range_list[1]
+  assert(card.compact and vim.api.nvim_win_get_cursor(window)[1] == card.first_row + 1,
+    "comment fixture did not select the boxed feedback")
   tests, version = {}, 4
   pending.callback({ plan = { id = "plan", state = "awaiting_review", document_version = version,
     working_path = path, review_digest = "digest:4" }, review = presentation(owner.document) })
   assert(owner.version == 4 and owner.attached(), table.concat(notices:messages(), "\n"))
   assert(comments.capture(review.buf)[1].source.body == "Keep this new feedback", "deletion lost newer typing")
-  -- The queued save then collapses the saved comment and returns the cursor to the source line it
-  -- annotates, outside its compact rows, so the next CursorMoved does not reopen it.
-  local cursor_row = vim.api.nvim_win_get_cursor(0)[1] - 1
   assert(vim.iter(owner.comment_state.range_list):any(function(range)
-    return tostring(range.annotation.id) == "late" and range.compact and cursor_row < range.first_row
-  end), "the queued save left the saved comment open or the cursor inside it")
+    return tostring(range.annotation.id) == "late" and range.compact
+  end), "the queued save lost the feedback card")
   MiniTest.expect.equality(comments.source_line_at_cursor(review.buf), 1,
     { fail_reason = "the queued save moved the cursor away from the comment's source line" })
   assert(not vim.bo[review.buf].modified, "the queued save did not settle")

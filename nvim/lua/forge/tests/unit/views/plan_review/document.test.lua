@@ -1,4 +1,5 @@
 -- Unit tests for `forge.views.plan_review.document` (document.lua).
+local finish_input = dofile("nvim/lua/forge/tests/support/plan_comment_input.lua")
 local MiniTest = require("mini.test")
 local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 local buffer_support = dofile("nvim/lua/forge/tests/support/buffer.lua")
@@ -198,17 +199,11 @@ T["drafts"] = function()
     } } })
   vim.api.nvim_win_set_cursor(0, { 44, 0 })
   owner.action("comment", function() end)
-  vim.wait(20, nil, 5)
-  vim.cmd("stopinsert")
+  finish_input({ "first", "", "λ\r", "" })
   eq(#pending, 1, { fail_reason = "creating a local plan annotation sent a request" })
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local body_row = cursor[1] - 1
-  local heading = buffer_support.line(native_buffer, body_row)
-  local usable = vim.api.nvim_win_get_width(0) - vim.fn.getwininfo(vim.api.nvim_get_current_win())[1].textoff
-  assert(vim.fn.strdisplaywidth(heading) < usable, "plan annotation heading exceeds the final gutter width")
-  vim.api.nvim_buf_set_lines(native_buffer, body_row, body_row + 1, false, { "first", "", "λ\r", "" })
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = native_buffer })
   local comments = require("forge.draft_comments")
+  assert(comments.focus(native_buffer, comments.capture(native_buffer)[1].id))
+  local body_row = vim.api.nvim_win_get_cursor(0)[1] - 1
   eq(comments.capture(native_buffer)[1].source.body, "first\n\nλ\r\n", { fail_reason = "capture changed raw draft bytes" })
   vim.cmd("write")
   assert(#pending == 2 and pending[2].params.operation == "plan_save_annotations")
@@ -262,6 +257,8 @@ T["drafts"] = function()
   end)
   eq(#pending, 6)
   vim.cmd("write")
+  assert(comments.focus(native_buffer, comments.capture(native_buffer)[1].id))
+  body_row = vim.api.nvim_win_get_cursor(0)[1] - 1
   vim.api.nvim_buf_set_lines(native_buffer, body_row, body_row + 1, false, { "callback capture" })
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = native_buffer })
   pending[6].callback({ submitted = true })
@@ -329,7 +326,7 @@ T["questions"] = function()
     assert(buffer_support.text(buffer):find(expected, 1, true), "returning to question lost " .. expected)
   end
   owner.action("question", function() end)
-  replace_body("Why own this state?")
+  finish_input({ "Why own this state?" })
   assert(buffer_support.text(buffer):find("Plan question", 1, true), "question used the ordinary comment heading")
   vim.cmd("write")
   eq(pending[2].method, "session.plan.question.answer", { fail_reason = "saving did not ask the LLM" })
@@ -390,11 +387,9 @@ T["questions"] = function()
     assert(not vim.bo[buffer].modifiable, "view adapter made the focused answer editable")
   end
   owner.action("question", function() end)
+  finish_input({ "Which getter should I use?" })
   local captured = comments.capture(buffer)
   assert(#captured == 2 and captured[2].parent_id == "1", "A on the answer did not create a linked follow-up")
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-  vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Which getter should I use?" })
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
   vim.cmd("write")
   assert(pending[7].method == "session.plan.question.answer" and saves[#saves].annotation[2].parent_id == "1" and pending[7].params.question_ids[1] == "2",
     "question request omitted the follow-up identity")
@@ -411,6 +406,7 @@ T["questions"] = function()
     vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
   end
   owner.action("comment", function() end)
+  finish_input({ "Retain that getter." })
   eq(comments.capture(buffer)[3].parent_id, "2", { fail_reason = "C on a follow-up answer lost the conversation" })
   owner.close()
   vim.api.nvim_buf_delete(buffer, { force = true })
@@ -549,20 +545,19 @@ T["saving_an_empty_comment_saves_nothing"] = function()
   local owner, buffer, saves = open_saving_review({})
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
   assert(owner.action("comment", function() end), "the comment was refused")
+  finish_input({ "" })
   vim.cmd("write")
   eq(saves[#saves].annotation, {}, { fail_reason = "an empty new comment was saved" })
   eq(comments.capture(buffer), {}, { fail_reason = "the empty comment stayed in the review" })
 
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
   owner.action("comment", function() end)
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-  vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Keep this row." })
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
+  finish_input({ "Keep this row." })
   vim.cmd("write")
   eq(#saves[#saves].annotation, 1, { fail_reason = "a comment with text was not saved" })
   local saved = comments.capture(buffer)[1]
   assert(comments.focus(buffer, saved.id))
-  row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
   vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "   " })
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
   vim.cmd("write")
@@ -571,26 +566,54 @@ T["saving_an_empty_comment_saves_nothing"] = function()
   assert(not vim.bo[buffer].modified, "removing the emptied comment left the review modified")
 end
 
--- `C` with the cursor inside an existing comment edits that comment. It used to start a second
--- comment on the same line, linked to the first as if it answered a reply; a follow-up belongs
--- only to a question's answer.
-T["comment_key_inside_a_comment_edits_it"] = function()
+T["every card row opens a follow-up at the footer"] = function()
   local comments = require("forge.draft_comments")
   local owner, buffer = open_saving_review({
-    { id = "1", source = { start_line = 1, end_line = 1, body = "Keep this row." } },
+    { id = "1", kind = "question", source = { start_line = 1, end_line = 1, body = "Why this row?" },
+      reply = { question_body = "Why this row?", body = "This is the answer.", duration_ms = 1000 } },
   })
-  local body_row = buffer_support.find_row(buffer, "Keep this row.")
-  vim.api.nvim_win_set_cursor(0, { body_row, 0 })
-  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
-  local received
-  assert(owner.action("comment", function(result) received = result end), "the comment key was refused")
+  local parent = vim.api.nvim_get_current_win()
+  local range = owner.comment_state.range_list[1]
+  local lines = buffer_support.lines(buffer)
+  local width = vim.fn.strdisplaywidth(lines[range.last_row + 1]) - 4
+  for row = range.first_row, range.last_row do
+    vim.api.nvim_win_set_cursor(parent, { row + 1, 0 })
+    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
+    eq(buffer_support.lines(buffer), lines)
+    assert(owner.action(row % 2 == 0 and "comment" or "question", function() end))
+    local window = vim.api.nvim_get_current_win()
+    local config = vim.api.nvim_win_get_config(window)
+    eq({ config.win, config.bufpos, config.width }, { parent, { range.last_row, 0 }, width })
+    eq(vim.api.nvim_win_get_cursor(parent)[1], range.last_row + 1)
+    vim.cmd("redraw")
+    local position = vim.fn.screenpos(parent, range.last_row + 1, 3)
+    eq(vim.api.nvim_win_get_position(window), { position.row, position.col - 1 })
+    finish_input({ "Discard this follow-up" }, "<Esc>")
+    eq(#comments.capture(buffer), 1)
+  end
+  assert(owner.action("comment", function() end))
+  finish_input({ "First line", "Second line" }, "<C-s>")
   local captured = comments.capture(buffer)
-  eq(#captured, 1, { fail_reason = "the comment key stacked a second comment inside the first" })
-  eq(received, { local_draft = true }, { fail_reason = "the comment key did not open the comment for editing" })
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-  eq(vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1], "Keep this row.",
-    { fail_reason = "the cursor left the edited comment's body" })
-  assert(vim.bo[buffer].modifiable, "the edited comment's body is not editable")
+  eq({ captured[1].source.body, captured[2].parent_id, captured[2].source.body },
+    { "Why this row?", "1", "First line\nSecond line" })
+  eq(vim.bo[buffer].modified, false)
+  -- Replying to the original message starts at the bottom of the whole thread.
+  vim.api.nvim_win_set_cursor(parent, { range.first_row + 1, 0 })
+  assert(owner.action("comment", function() end))
+  local window = vim.api.nvim_get_current_win()
+  local thread_footer = owner.comment_state.range_list[2].last_row
+  eq(vim.api.nvim_win_get_config(window).bufpos, { thread_footer, 0 })
+  local long_answer = vim.tbl_map(tostring, vim.fn.range(1, vim.api.nvim_win_get_height(parent) * 2))
+  comments.update(buffer, { { id = "1", replies = { { heading = "Answer", body_lines = long_answer } } } })
+  thread_footer = owner.comment_state.range_list[2].last_row
+  eq(vim.api.nvim_win_get_config(window).bufpos, { thread_footer, 0 })
+  vim.cmd("redraw")
+  local position = vim.fn.screenpos(parent, thread_footer + 1, 3)
+  assert(position.row > 0, "the expanded answer pushed the popup anchor off screen")
+  eq(vim.api.nvim_win_get_position(window), { position.row, position.col - 1 })
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "Another follow-up" })
+  vim.cmd("write")
+  eq(comments.capture(buffer)[3].parent_id, "1")
 end
 
 -- Every question-and-answer block draws in the same collapsed box after a save, including the
@@ -620,10 +643,7 @@ T["saved_follow_up_draws_its_block_like_the_others"] = function()
     vim.api.nvim_win_set_cursor(0, { buffer_support.find_row(buffer, answer), 0 })
     vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
     assert(owner.action("comment", function() end), "the follow-up comment was refused")
-    local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-    vim.api.nvim_buf_set_lines(buffer, row, row + 1, false, { "Follow up on: " .. answer })
-    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
-    vim.cmd("write")
+    finish_input({ "Follow up on: " .. answer }, "<C-s>")
     -- The editor reports the cursor the save placed; a block it rests on may not reopen.
     vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
     local headings = block_headings()

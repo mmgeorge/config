@@ -14,6 +14,7 @@ local view_group = vim.api.nvim_create_augroup("ForgePopupView", { clear = false
 ---@field win? integer
 ---@field row? integer
 ---@field col? integer
+---@field bufpos? integer[] Zero-based buffer position in the parent window.
 ---@field width integer
 ---@field height integer
 ---@field title string|table
@@ -132,6 +133,7 @@ function M.open(options)
   local relative = options.relative or (options.parent_win and "win" or "editor")
   local window_config = {
     relative = relative,
+    bufpos = options.bufpos,
     row = options.row or (relative == "cursor" and 1 or centered_row),
     col = options.col or (relative == "cursor" and 0 or centered_col),
     width = options.width,

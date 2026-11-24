@@ -1,4 +1,5 @@
 -- Unit tests for `forge.views.plan_review.native_controller` (native_controller.lua).
+local finish_input = dofile("nvim/lua/forge/tests/support/plan_comment_input.lua")
 local MiniTest = require("mini.test")
 local isolation = dofile("nvim/lua/forge/tests/support/isolation.lua")
 local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
@@ -392,15 +393,8 @@ local function add_message(scene, key, body)
   vim.api.nvim_set_current_win(scene.review.win)
   local visual = vim.api.nvim_get_mode().mode:match("^[vV\22]") ~= nil
   keymap.invoke(key, { buffer = scene.review.buf, mode = visual and "x" or "n" })
-  vim.cmd("stopinsert")
-  if vim.api.nvim_get_mode().mode:match("^[vV\22]") then keymap.feed("<Esc>", "nx") end
+  finish_input({ body })
   local message = scene.comments.capture(scene.review.buf)[count + 1]
-  assert(message, key .. " did not create a message")
-  assert(scene.comments.focus(scene.review.buf, message.id))
-  local row = vim.api.nvim_win_get_cursor(scene.review.win)[1] - 1
-  vim.api.nvim_buf_set_lines(scene.review.buf, row, row + 1, false, { body })
-  vim.api.nvim_exec_autocmds("TextChanged", { buffer = scene.review.buf })
-  message = scene.comments.capture(scene.review.buf)[count + 1]
   eq(message.source.body, body, { fail_reason = "editing did not populate the new message" })
   return message
 end
@@ -523,6 +517,7 @@ T["comment over a visual selection leaves Visual mode for the editor"] = functio
   keymap.invoke("C", { buffer = scene.review.buf, mode = "x" })
   vim.cmd = original_cmd
   eq({ vim.api.nvim_get_mode().mode, inserted }, { "n", 1 })
+  finish_input({ "Selected range" })
   local comment = scene.comments.capture(scene.review.buf)[1]
   assert(comment and comment.source.end_line > comment.source.start_line, "the comment lost its selected range")
 end

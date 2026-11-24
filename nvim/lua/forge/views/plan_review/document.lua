@@ -474,6 +474,7 @@ function M.attach(options, callback)
       focused_id = focused_id,
       readonly = options.plan.historical_revision ~= nil,
       markdown = true,
+      popup_input = true,
       guard_source = true,
     }, mark_phase)
     if mark_phase then mark_phase("source_paint_ms") end
@@ -810,11 +811,11 @@ function M.attach(options, callback)
   function owner.action(action, receive, window, settled)
     if not owner.attached() then return false end
     if action == "comment" or action == "question" then
-      -- A refused comment has already said why; opening the comment editor would act on nothing.
-      local added = comments.add_at_cursor(options.buffer, false, { kind = action == "question" and "question" or nil,
-        heading = action == "question" and "Plan question" or nil })
-      if not added then return false end
-      receive({ local_draft = true }, nil) return true
+      local target = comments.input_target(options.buffer)
+      if not target then return false end
+      require("forge.views.plan_review.comment_input").open(target, action == "question", save)
+      receive({}, nil)
+      return true
     end
     if action == "delete" then comments.delete_at_cursor(options.buffer) receive({}, nil) return true end
     if owner.optimistic_source then

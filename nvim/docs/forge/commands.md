@@ -1285,10 +1285,13 @@ Declaration navigation never opens a popup.
 While a planning response is running, follow-up instructions can revise and resubmit the plan
 in that same response. A later edit requires a new submission before review. Submission never
 authorizes implementation.
-An inline comment attaches to the plan line under the cursor. The comment key inside an
-existing comment edits that comment; on a question's answer it starts a follow-up in that
-thread. Saving a comment that holds no text saves nothing, and saving a comment emptied of
-its text deletes it.
+Press `A` to ask a question or `C` to add a comment on a plan line or selection.
+On any row of a comment card, either key starts a follow-up to the selected message.
+The card stays boxed as you move through it. Plan Review scrolls to the bottom of its
+thread and opens a multiline input aligned with the card's borders.
+In Insert mode, `Enter` adds a line. `Ctrl-S` or `:write` saves feedback and submits
+unanswered questions. In Normal mode, `Enter` keeps the draft in the review for a
+later save. `Ctrl-C` cancels the input.
 Approving a plan and requesting changes both open an optional-comment popup. Press
 `Enter` or `Ctrl-S` in normal or insert mode to submit. Approval accepts an empty
 comment. A change request needs an overall comment, a saved or unsaved inline comment, or

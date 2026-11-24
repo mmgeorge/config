@@ -162,14 +162,6 @@ local function adopt_revision(review, result)
   return true
 end
 
----Start typing the body of a new comment or question. A message added over a selection is created
----in Visual mode, where `startinsert` does nothing, so the selection ends first; it has already
----given the message its range.
-local function edit_message()
-  if vim.api.nvim_get_mode().mode:match("^[vVsS\22\19]") then vim.cmd("normal! " .. vim.keycode("<Esc>")) end
-  vim.cmd("startinsert")
-end
-
 ---Toggles All/Public visibility with at most one request in flight. Each request is captured at
 ---the revision the previous reply produced; presses made while one waits are counted, and an odd
 ---count sends one more toggle after the reply, so rapid presses end in the state their parity
@@ -210,19 +202,7 @@ local function action(review, name)
       if result.jump then
         effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
       end
-    elseif name == "comment" or name == "question" then
-      if result.local_draft then
-        edit_message()
-        return
-      end
-      local _, row = review.owner.replica.sequence:position(result.block)
-      local view = review.owner.current_view()
-      if row and view then
-        vim.api.nvim_set_current_win(view.window)
-        vim.api.nvim_win_set_cursor(view.window, { row + result.row + 1, 0 })
-        edit_message()
-      end
-    elseif name == "delete" then
+    elseif name == "comment" or name == "question" or name == "delete" then
       return
     elseif name == "rename_entity" and type(result.rename) == "table" then
       require("forge.views.plan_review.entity_rename").proposed(review, result.rename, captured, function(name, finish)

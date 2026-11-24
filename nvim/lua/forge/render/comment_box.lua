@@ -86,6 +86,12 @@ function M.wrap_body(lines, width, markdown)
   return wrapped
 end
 
+---@param window_width integer
+---@return integer
+function M.inner_width(window_width)
+  return math.max(4, math.min(M.box_max_inner_width, window_width - 8))
+end
+
 --- Builds styled row segment lists representing a framed comment box.
 --- Wraps content text to the computed inner column budget.
 ---@param desc ForgeCommentBoxContent Comment heading, body, and reply metadata.
@@ -97,7 +103,7 @@ function M.build_box_lines(desc, win_width, style)
   local pad = "  "
   local body_prefix = pad .. "│ "
   local body_column = desc.markdown and vim.fn.strdisplaywidth(body_prefix) or 0
-  local inner_width = math.max(4, math.min(M.box_max_inner_width, (tonumber(win_width) or 80) - 8))
+  local inner_width = M.inner_width(tonumber(win_width) or 80)
   local content_width = math.max(1, inner_width - 2)
 
   ---@type { text: string, hl: string, divider?: boolean, markdown?: boolean, starts_body?: boolean }[]
