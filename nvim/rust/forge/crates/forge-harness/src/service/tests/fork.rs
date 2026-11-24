@@ -29,7 +29,7 @@ async fn interrupted_fork(
         source_session_id,
         &json!({}),
         crate::broker::ForkOptions {
-            purpose: crate::session::SessionPurpose::Conversation,
+            target: crate::broker::ForkTarget::Conversation,
             source_is_executing: &|| source_is_executing,
         },
     )?;
@@ -52,7 +52,7 @@ async fn fork_of_a_first_turn_opens_fresh_provider_history() -> Result<()> {
         fixture.session.clone(),
         json!({"session_id": fixture.session}),
         None,
-        crate::session::SessionPurpose::Conversation,
+        crate::broker::ForkTarget::Conversation,
         &fixture.sink,
     )
     .await?;
@@ -269,7 +269,7 @@ impl RunningSourceFixture {
             self.session_id.clone(),
             params,
             None,
-            crate::session::SessionPurpose::Conversation,
+            crate::broker::ForkTarget::Conversation,
             &self.sink,
         )
         .await?;
@@ -411,7 +411,7 @@ async fn fork_of_a_fork_during_its_first_turn_creates_no_session() -> Result<()>
             child_id.clone(),
             json!({"session_id": child_id}),
             None,
-            crate::session::SessionPurpose::Conversation,
+            crate::broker::ForkTarget::Conversation,
             &fixture.sink,
         )
         .await;
@@ -727,7 +727,7 @@ async fn fork_of_an_unused_aside_keeps_its_origin_and_closes_cleanly() -> Result
             aside_id.clone(),
             json!({"session_id": aside_id}),
             None,
-            crate::session::SessionPurpose::Conversation,
+            crate::broker::ForkTarget::Conversation,
             &fixture.sink,
         )
         .await?;
@@ -775,7 +775,7 @@ async fn fork_of_a_session_that_ran_no_turn_opens_fresh_provider_history() -> Re
                 source_id.clone(),
                 json!({"session_id": source_id}),
                 None,
-                crate::session::SessionPurpose::Conversation,
+                crate::broker::ForkTarget::Conversation,
                 &sink,
             )
             .await?;

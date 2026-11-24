@@ -142,4 +142,19 @@ T["saved_comment_collapses_at_once"] = function()
   assert(not compact(), "a save of older text collapsed a comment that is still being edited")
 end
 
+T["reopening a review cannot recycle a deleted thread identity"] = function()
+  local comments = require("forge.draft_comments")
+  local buffer = buffer_support.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, buffer)
+  local function new_thread()
+    comments.attach(buffer, window, { "Plan line", "Next line" }, {}, { popup_input = true, markdown = true })
+    vim.api.nvim_win_set_cursor(window, { 1, 0 })
+    MiniTest.expect.equality(comments.input_target(buffer).append("Explain this.", "question"), true)
+    return comments.capture(buffer)[1].id
+  end
+  local first = new_thread()
+  MiniTest.expect.no_equality(new_thread(), first)
+end
+
 return T

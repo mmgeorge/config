@@ -30,10 +30,17 @@ enum ForkBoundary {
     Settled,
 }
 
+/// Identify the new conversation or the saved review chain that owns the fork.
+#[derive(Clone, Copy)]
+pub enum ForkTarget {
+    Conversation,
+    PlanReviewAnswer(Uuid),
+}
+
 /// Selects the role of one fork and reports the state of its source.
 #[derive(Clone, Copy)]
 pub struct ForkOptions<'source> {
-    pub purpose: SessionPurpose,
+    pub target: ForkTarget,
     /// Reports whether the source is executing a turn.
     ///
     /// `prepare_provider_fork` asks while it holds the history writer. A turn that starts later
@@ -266,15 +273,25 @@ pub fn prepare_provider_fork(
         ProviderForkPoint::default()
     };
 
-    let target_session_id = Uuid::new_v4().to_string();
+    let (purpose, id) = match options.target {
+        ForkTarget::Conversation => (SessionPurpose::Conversation, Uuid::new_v4()),
+        ForkTarget::PlanReviewAnswer(id) => {
+            anyhow::ensure!(
+                store.load_session(&id.to_string())?.is_none(),
+                "review answer session already exists"
+            );
+            (SessionPurpose::PlanReviewAnswer, id)
+        }
+    };
+    let target_session_id = id.to_string();
     let existing_name_set = store
         .list_session(Some(&source.workspace))?
         .into_iter()
         .map(|session| session.name)
         .collect::<HashSet<_>>();
     let mut child = source.clone();
-    child.purpose = options.purpose;
-    child.aside = match options.purpose {
+    child.purpose = purpose;
+    child.aside = match purpose {
         // `aside` opens an aside of the source. Without it the child keeps the source's own
         // marker, so a fork of an aside still reaches the aside's origin.
         SessionPurpose::Conversation

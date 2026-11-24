@@ -13,6 +13,7 @@ use forge_buffer::patch::BufferSnapshot;
 use forge_buffer::view::DocumentViews;
 use forge_buffer::width::WidthProfile;
 use forge_diff::view::{DiffCapabilities, DiffViewAction, DiffViewState, DiffVisibility};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -26,6 +27,8 @@ pub(crate) struct PlanReviewStore {
 
 /// Captures one unanswered question and the immutable design context used to answer it.
 pub(crate) struct PlanReviewQuestion {
+    /// Durable answer session shared by this annotation chain on this saved review.
+    pub answer_session: uuid::Uuid,
     /// Stable identity of the question's annotation.
     pub id: String,
     /// Exact editable text captured at submission.
@@ -223,7 +226,11 @@ impl PlanReviewStore {
     }
 
     /// Capture unanswered questions after validating their native document identity.
-    pub(crate) fn questions(&self, input: DocumentInput) -> Result<Vec<PlanReviewQuestion>> {
+    pub(crate) fn questions(
+        &self,
+        source_session: &str,
+        input: DocumentInput,
+    ) -> Result<Vec<PlanReviewQuestion>> {
         let mut store = self
             .document
             .lock()
@@ -232,32 +239,32 @@ impl PlanReviewStore {
             .get_mut(&input.document)
             .context("plan review document is closed")?;
         admission.check()?;
-        document.editable()?.questions(input)
+        document.editable()?.questions(source_session, input)
     }
 
     /// Validate the captured question against the current admitted review document.
-    pub(crate) fn check_question(
+    pub(crate) fn question_pending(
         &self,
         id: &DocumentId,
         question: &PlanReviewQuestion,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let store = self
             .document
             .lock()
             .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
         let (document, admission) = store.get(id).context("plan review document is closed")?;
         admission.check()?;
-        ensure!(
-            document
-                .annotation
-                .annotation()
-                .iter()
-                .any(|annotation| annotation.id == question.id
+        let annotation = document
+            .annotation
+            .annotation()
+            .iter()
+            .find(|annotation| {
+                annotation.id == question.id
                     && annotation.kind == ReviewAnnotationKind::Question
-                    && annotation.source.body == question.body),
-            "plan question changed before its answer arrived"
-        );
-        Ok(())
+                    && annotation.source.body == question.body
+            })
+            .context("plan question changed before its answer arrived")?;
+        Ok(annotation.reply.is_none())
     }
 
     /// Persist an answer only while its original question and source snapshot remain current.
@@ -762,7 +769,7 @@ impl EditablePlanReview<'_> {
                 .map(|annotation| {
                     let mut source = annotation.source.clone();
                     if annotation.parent_id.is_some() {
-                        let thread = document.annotation.thread_context(annotation)?;
+                        let (_, thread) = document.annotation.thread_context(annotation)?;
                         source.body = format!("Conversation context:\n{thread}Requested change:\n{}", source.body);
                     }
                     Ok::<_, anyhow::Error>(source)
@@ -771,7 +778,11 @@ impl EditablePlanReview<'_> {
     }
 
     /// Bind each question to exact numbered text from the captured review snapshot.
-    fn questions(self, input: DocumentInput) -> Result<Vec<PlanReviewQuestion>> {
+    fn questions(
+        self,
+        source_session: &str,
+        input: DocumentInput,
+    ) -> Result<Vec<PlanReviewQuestion>> {
         let document = self.0;
         // Independent answer forks read the same snapshot without consuming each other's input sequence.
         ensure!(
@@ -808,7 +819,17 @@ impl EditablePlanReview<'_> {
                 &document.source.rendered,
                 &annotation.source,
             )?;
-            let thread = document.annotation.thread_context(annotation)?;
+            let (root, thread) = document.annotation.thread_context(annotation)?;
+            // A saved review can reopen under a different editor document ID.
+            let key = serde_json::to_vec(&(
+                "plan-review-answer",
+                source_session,
+                &document.source.document.plan_id,
+                root,
+            ))?;
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&Sha256::digest(key)[..16]);
+            let answer_session = uuid::Builder::from_custom_bytes(bytes).into_uuid();
             let prompt = format!(
                 "Reviewed plan: {}\nReviewed plan version: {}\nSaved source digest: {}\n\
                  \nSaved declaration design:\n{context}\n\
@@ -822,6 +843,7 @@ impl EditablePlanReview<'_> {
                 annotation.source.body
             );
             question.push(PlanReviewQuestion {
+                answer_session,
                 id: annotation.id.clone(),
                 body: annotation.source.body.clone(),
                 prompt,
@@ -3434,7 +3456,7 @@ mod tests {
         store
             .save_annotations(&id, &digest, prose_questions)
             .unwrap();
-        let captured = store.questions(input.clone()).unwrap();
+        let captured = store.questions("session", input.clone()).unwrap();
         assert_eq!(captured.len(), 3);
         for (question, expected) in captured.iter().zip([
             format!("{prose_line}: Use a focused state owner.\n"),
@@ -3468,7 +3490,7 @@ mod tests {
         store
             .save_annotations(&id, &digest, vec![question.clone(), comment.clone()])
             .unwrap();
-        let questions = store.questions(input.clone()).unwrap();
+        let questions = store.questions("session", input.clone()).unwrap();
         assert_eq!(questions.len(), 1);
         assert!(
             questions[0].prompt.contains("pub struct State;")
@@ -3492,7 +3514,10 @@ mod tests {
             .unwrap();
         input.sequence = InputSequence(2);
         assert!(
-            store.questions(input.clone()).unwrap().is_empty(),
+            store
+                .questions("session", input.clone())
+                .unwrap()
+                .is_empty(),
             "answered questions were submitted twice"
         );
         input.sequence = InputSequence(3);
@@ -3542,7 +3567,7 @@ mod tests {
             )
             .unwrap();
         input.sequence = InputSequence(4);
-        let followup_question = store.questions(input.clone()).unwrap();
+        let followup_question = store.questions("session", input.clone()).unwrap();
         assert_eq!(followup_question.len(), 1);
         assert!(
             followup_question[0].prompt.contains("Why use this owner?")
@@ -3624,7 +3649,7 @@ mod tests {
         );
         input.sequence = InputSequence(6);
         assert_eq!(
-            store.questions(input).unwrap()[0].body,
+            store.questions("session", input).unwrap()[0].body,
             question.source.body
         );
         assert_eq!(

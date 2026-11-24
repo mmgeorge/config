@@ -83,10 +83,10 @@ pub(crate) mod plan_entry;
 mod project_checks;
 pub(crate) use check_admission::{AutomaticCheckAction, AutomaticCheckTransaction};
 mod host_settlement;
-mod review_question;
+pub(crate) mod review_question;
 pub(crate) use observation::BrokerObserver;
 
-pub use fork::{ForkOptions, ForkPreparation, prepare_provider_fork};
+pub use fork::{ForkOptions, ForkPreparation, ForkTarget, prepare_provider_fork};
 pub use new_session::prepare_new_session;
 
 use crate::agent::{Agent, AgentRegistry, AgentState};

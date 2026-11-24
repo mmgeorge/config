@@ -2614,7 +2614,7 @@ async fn forks_a_live_session_without_taking_its_lease() {
         &fork_controller.session.id,
         &json!({ "session_id": source_session_id, "name": "fork investigation" }),
         crate::broker::ForkOptions {
-            purpose: crate::session::SessionPurpose::Conversation,
+            target: crate::broker::ForkTarget::Conversation,
             source_is_executing: &|| false,
         },
     )
@@ -2712,7 +2712,7 @@ async fn forks_a_live_session_without_taking_its_lease() {
         &fork_controller.session.id,
         &json!({ "session_id": source_session_id }),
         crate::broker::ForkOptions {
-            purpose: crate::session::SessionPurpose::Conversation,
+            target: crate::broker::ForkTarget::Conversation,
             source_is_executing: &|| false,
         },
     )
@@ -2789,7 +2789,7 @@ async fn forks_a_live_session_without_taking_its_lease() {
         &child_session_id,
         &json!({ "session_id": child_session_id }),
         crate::broker::ForkOptions {
-            purpose: crate::session::SessionPurpose::Conversation,
+            target: crate::broker::ForkTarget::Conversation,
             source_is_executing: &|| false,
         },
     )

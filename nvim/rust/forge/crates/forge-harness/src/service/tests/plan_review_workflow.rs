@@ -1999,3 +1999,148 @@ impl ReviewFixture {
         Ok(turns)
     }
 }
+
+/// Follow an intervening comment on one chain and start another chain at the same plan line.
+#[tokio::test]
+async fn review_asks_reuse_the_comment_chain_session() -> Result<()> {
+    use crate::plan::review_document::ReadOnlyPlanReview;
+    use forge_buffer::identity::{DocumentId, ViewId};
+
+    let fixture = ReviewFixture::open(true).await?;
+    let files =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?;
+    let mut plan = crate::plan::test_fixture("review", "Explain ownership.");
+    let mut design = crate::plan::DeclarationDesign::scratch(
+        [(
+            "owner.rs".into(),
+            "/// Own state.\npub struct Owner;\n".into(),
+        )]
+        .into(),
+    )?;
+    design.document.objective = "Explain ownership.".into();
+    design.document.background = "The plan introduces an owner.".into();
+    design.document.requirements = vec!["Preserve state.".into()];
+    design.document.design = "Add an owner.".into();
+    plan.design = Some(design);
+    files.write_working_document(&fixture.session_id, "review", &plan)?;
+    let (_, _, digest) = files.submit_document_revision(&fixture.session_id, "review", 1, 1)?;
+    let store = &fixture.controller.plan_review;
+    let open_review = |id: &DocumentId| -> Result<_> {
+        let source =
+            files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?;
+        let saved_digest = source.saved_digest.clone();
+        let line = source.rendered.navigation.anchor[0].line;
+        let view = ViewId("plan".into());
+        let document =
+            ReadOnlyPlanReview::new(id.clone(), view.clone(), source, Default::default(), None)?;
+        let snapshot = document.snapshot();
+        let block = &snapshot.block[0];
+        let target = &block.metadata.target[0];
+        let review = json!({"document":id,"revision":snapshot.revision,"view":view,"sequence":1,
+            "action":"session.plan.question.answer","block":block.id,"position":target.range.start,"target":target.id});
+        store.insert(document, store.admit(id.clone())?)?;
+        Ok((review, saved_digest, line))
+    };
+    let id = DocumentId("review".into());
+    let (mut review, saved_digest, line) = open_review(&id)?;
+    let mut first_binding = None;
+    let mut annotations = Vec::new();
+    for (index, (name, parent, kind)) in [
+        ("first", None, "question"),
+        ("feedback", Some("first"), "comment"),
+        ("follow-up", Some("feedback"), "question"),
+        ("inherit", Some("follow-up"), "question"),
+        ("independent", None, "question"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let configuration = match name {
+            "first" => Some(json!({"model":"mock-model","effort":"low"})),
+            "follow-up" => Some(
+                json!({"ask_model":{"model":"mock-alternate","effort":"high","service_tier":"fast"}}),
+            ),
+            "inherit" => Some(json!({"ask_model":{}, "effort":"medium"})),
+            _ => None,
+        };
+        if let Some(configuration) = configuration {
+            let request = 20 + index as u64;
+            fixture
+                .dispatch(request, "session.configure", configuration)
+                .await?;
+            let response = fixture.response(request).await?;
+            assert_eq!(response["result"]["state"], "completed", "{response}");
+        }
+        if name == "follow-up" {
+            store.close(&id).await?;
+            (review, _, _) = open_review(&DocumentId("reopened".into()))?;
+        }
+        annotations.push(json!({"id":name, "parent_id":parent, "kind":kind,
+            "source":{"start_line":line,"end_line":line,"body":name}}));
+        let request = 10 + index as u64;
+        fixture.dispatch(request, "session.plan.question.answer", json!({"review":review,
+            "draft_source_digest":saved_digest,"draft_annotation":annotations,"question_ids":[name]})).await?;
+        let response = fixture.response(request).await?;
+        annotations = serde_json::from_value(response["result"]["annotation"].clone())
+            .with_context(|| format!("missing answered annotations: {response}"))?;
+        assert_eq!(
+            annotations.last().unwrap()["reply"]["body"].is_string(),
+            kind == "question"
+        );
+        let registry = fixture.service.registry().await?;
+        let children: Vec<_> = registry
+            .controller_by_id
+            .read()
+            .await
+            .iter()
+            .filter(|(child, _)| **child != fixture.session_id)
+            .map(|(child, _)| child.clone())
+            .collect();
+        assert_eq!(
+            children.len(),
+            if name == "independent" { 2 } else { 1 },
+            "{name}"
+        );
+        if matches!(name, "first" | "follow-up" | "inherit") {
+            use crate::session::SessionStore;
+            let history = fixture.store()?;
+            let session = history
+                .load_session(&children[0])?
+                .context("missing review session")?;
+            let exchange = history
+                .latest_exchange(&children[0])?
+                .context("missing review exchange")?;
+            let observed_model = exchange
+                .turn
+                .last()
+                .and_then(|turn| turn.resolved_model())
+                .context("mock provider did not report its invocation model")?;
+            let (model, effort, tier) = match name {
+                "follow-up" => ("mock-alternate", "high", crate::provider::ServiceTier::Fast),
+                "inherit" => (
+                    "mock-model",
+                    "medium",
+                    crate::provider::ServiceTier::Standard,
+                ),
+                _ => ("mock-model", "low", crate::provider::ServiceTier::Standard),
+            };
+            assert_eq!(observed_model.model_id.as_str(), model);
+            assert_eq!(
+                (session.effort.as_str(), session.service_tier),
+                (effort, tier)
+            );
+            let binding = session
+                .provider_session_id
+                .context("missing native conversation")?;
+            if name == "first" {
+                first_binding = Some(binding);
+            } else {
+                assert_eq!(Some(binding), first_binding);
+            }
+        }
+        if name == "follow-up" {
+            assert_eq!(fixture.store()?.list_exchange(&children[0])?.len(), 2);
+        }
+    }
+    fixture.finish().await
+}

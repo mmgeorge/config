@@ -4,12 +4,22 @@ use crate::plan::review_document::PlanReviewQuestion;
 use crate::settings::AskModel;
 use forge_buffer::identity::DocumentId;
 
+/// Capture the source session's model defaults before dispatch to a potentially reused fork.
+#[derive(Clone)]
+pub(crate) enum ReviewAnswerModel {
+    Inherited {
+        selection: AskModel,
+        context_window: Option<String>,
+    },
+    Override(AskModel),
+}
+
 impl HarnessBroker {
     /// Capture admitted review questions without appending an exchange to their source session.
     pub(crate) fn prepare_review_questions(
         &self,
         params: &Value,
-    ) -> Result<(DocumentId, Vec<PlanReviewQuestion>, AskModel)> {
+    ) -> Result<(DocumentId, Vec<PlanReviewQuestion>, ReviewAnswerModel)> {
         let input: forge_buffer::input::DocumentInput = serde_json::from_value(
             params
                 .get("review")
@@ -28,7 +38,7 @@ impl HarnessBroker {
                 serde_json::from_value(annotation.clone())?,
             )?;
         }
-        let mut questions = self.plan_review.questions(input)?;
+        let mut questions = self.plan_review.questions(&self.session.id, input)?;
         if let Some(selected) = params.get("question_ids") {
             let selected: Vec<String> = serde_json::from_value(selected.clone())?;
             questions.retain(|question| selected.contains(&question.id));
@@ -40,22 +50,36 @@ impl HarnessBroker {
                 &self.session.provider,
             )?
             .ask_model()?;
-        Ok((document, questions, settings))
+        let model = if settings.model.is_some() {
+            ReviewAnswerModel::Override(settings)
+        } else {
+            ReviewAnswerModel::Inherited {
+                selection: settings.resolve(&self.session, &[])?,
+                context_window: self.session.context_window.clone(),
+            }
+        };
+        Ok((document, questions, model))
     }
 
     /// Resolve the review model and capture its question before owned dispatch.
     pub(crate) fn prepare_review_question(
         &mut self,
         scope: &ReviewAnswerScope,
-        selection: &AskModel,
+        selection: &ReviewAnswerModel,
         catalog: &[crate::provider::ProviderModel],
         progress: Option<(&forge_protocol::outbound::MessageSender, u64)>,
     ) -> Result<String> {
         scope.check()?;
-        let selected = selection.resolve(&self.session, catalog)?;
-        if selection.model.is_some() {
-            self.session.context_window = None;
-        }
+        let (selected, context_window) = match selection {
+            ReviewAnswerModel::Inherited {
+                selection,
+                context_window,
+            } => (selection.clone(), context_window.clone()),
+            ReviewAnswerModel::Override(settings) => {
+                (settings.resolve(&self.session, catalog)?, None)
+            }
+        };
+        self.session.context_window = context_window;
         let model = selected.model.context("Ask model is unresolved")?;
         let model_label = crate::session::catalog_model_label(catalog, &model);
         self.session.select_model(model, model_label);

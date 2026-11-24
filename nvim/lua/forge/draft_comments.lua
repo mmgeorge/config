@@ -52,7 +52,6 @@ local blank_cursor_keys = vim.api.nvim_create_namespace("ForgeDraftCommentCursor
 ---@field source_mark { mark: integer, source_line: integer, source_index: integer, annotation_anchor?: boolean }[]
 ---@field range_list ForgeDraftCommentRange[]
 ---@field group integer
----@field next_id integer
 ---@field rendering boolean
 ---@field generation integer?
 ---@field namespace integer
@@ -906,10 +905,8 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
     pcall(vim.api.nvim_del_augroup_by_id, previous.group)
     if previous.guard then editable.detach(previous.guard) end
   end
-  local next_id = 1
   for _, annotation in ipairs(annotation_list) do
     annotation.focused = opts.focused_id ~= nil and tostring(annotation.id) == tostring(opts.focused_id)
-    next_id = math.max(next_id, (tonumber(annotation.id) or 0) + 1)
   end
   local state = {
     buf = buf,
@@ -919,7 +916,6 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
     source_mark = {},
     range_list = {},
     group = 0,
-    next_id = next_id,
     rendering = false,
     namespace = namespace,
     readonly = opts.readonly == true,
@@ -1195,7 +1191,7 @@ function M.add_at_cursor(buf, start_insert, properties)
     return nil
   end
   local annotation = {
-    id = state.next_id,
+    id = vim.text.hexencode(assert(vim.uv.random(16))),
     source_line = source_line,
     end_source_line = end_source_line,
     body = "",
@@ -1205,7 +1201,6 @@ function M.add_at_cursor(buf, start_insert, properties)
     parent_id = parent and tostring(parent.id) or nil,
     heading = properties and properties.heading,
   }
-  state.next_id = state.next_id + 1
   return M.add(buf, annotation, start_insert)
 end
 
@@ -1260,9 +1255,8 @@ function M.input_target(buf)
       notifications.error("The plan changed. Copy your draft and reopen it on the current plan.", "Forge comments")
       return false
     end
-    local annotation = { id = state.next_id, body = body, source_line = first, end_source_line = last,
+    local annotation = { id = vim.text.hexencode(assert(vim.uv.random(16))), body = body, source_line = first, end_source_line = last,
       kind = kind, heading = heading, parent_id = parent and tostring(parent.id) or nil }
-    state.next_id = state.next_id + 1
     M.add(buf, annotation, false)
     return true
   end

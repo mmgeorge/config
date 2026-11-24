@@ -6,7 +6,7 @@ use super::super::{prepare_new_session, prepare_provider_fork, start_session_for
 use super::bootstrap::{initialize, service};
 use super::owner_transition::finish_first_exchange;
 use super::response_for;
-use crate::session::{ProviderForkState, SessionPurpose, SessionStore};
+use crate::session::{ProviderForkState, SessionStore};
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result};
 use forge_protocol::message::Request;
@@ -229,7 +229,7 @@ async fn undelivered_fork_response_still_settles_the_child() -> Result<()> {
         source.clone(),
         json!({}),
         Some(2),
-        SessionPurpose::Conversation,
+        crate::broker::ForkTarget::Conversation,
         &closed_sink,
     )
     .await;
@@ -290,7 +290,7 @@ async fn resolving_an_interrupted_fork_records_its_failure() -> Result<()> {
         &source,
         &json!({}),
         crate::broker::ForkOptions {
-            purpose: SessionPurpose::Conversation,
+            target: crate::broker::ForkTarget::Conversation,
             source_is_executing: &|| false,
         },
     )?;

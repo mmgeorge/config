@@ -2142,7 +2142,7 @@ impl MockProvider {
         } else {
             (None, None)
         };
-        Ok(vec![ProviderModel {
+        let primary = ProviderModel {
             service_tiers: vec![
                 ServiceTier::Standard,
                 ServiceTier::Fast,
@@ -2162,7 +2162,15 @@ impl MockProvider {
             vision: false,
             description: Some("Deterministic provider-neutral test model.".into()),
             is_default: true,
-        }])
+        };
+        let alternate = ProviderModel {
+            id: "mock-alternate".into(),
+            is_default: false,
+            selected_reasoning: None,
+            selected_context_window: None,
+            ..primary.clone()
+        };
+        Ok(vec![primary, alternate])
     }
 
     async fn skill_list_native(
@@ -2829,7 +2837,7 @@ fn validate_model_selection(model: &session::ModelSelection) -> Result<(), Provi
     if model
         .model
         .as_deref()
-        .is_some_and(|model| model != "mock-model")
+        .is_some_and(|model| !matches!(model, "mock-model" | "mock-alternate"))
     {
         return Err(failure(
             ProviderOperation::ThreadConfigure,

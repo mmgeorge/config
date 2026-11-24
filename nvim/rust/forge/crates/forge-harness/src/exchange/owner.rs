@@ -340,7 +340,7 @@ impl ExchangeOwner {
     pub(crate) async fn review_question(
         &self,
         scope: Arc<crate::plan::review_answer::ReviewAnswerScope>,
-        selection: crate::settings::AskModel,
+        selection: crate::broker::review_question::ReviewAnswerModel,
         catalog: Option<crate::broker::ConfigurationCatalogResult>,
         sink: crate::broker::publication::SessionUpdateSink,
         messages: MessageSender,
@@ -514,7 +514,7 @@ pub(super) enum OwnerEvent {
     },
     ReviewQuestion {
         scope: Arc<crate::plan::review_answer::ReviewAnswerScope>,
-        selection: crate::settings::AskModel,
+        selection: crate::broker::review_question::ReviewAnswerModel,
         catalog: Option<crate::broker::ConfigurationCatalogResult>,
         sink: crate::broker::publication::SessionUpdateSink,
         messages: MessageSender,

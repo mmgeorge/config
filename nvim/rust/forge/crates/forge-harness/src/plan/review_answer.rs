@@ -29,7 +29,12 @@ impl ReviewAnswerScope {
 
     /// Reject stale annotations before spending another provider turn on their answer.
     pub(crate) fn check(&self) -> Result<()> {
-        self.store.check_question(&self.document, &self.question)
+        ensure!(
+            self.store
+                .question_pending(&self.document, &self.question)?,
+            "plan question already answered"
+        );
+        Ok(())
     }
 
     /// Accept only this question's nonempty answer while its captured annotation is still current.

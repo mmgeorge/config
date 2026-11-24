@@ -169,7 +169,7 @@ impl ReviewAnnotationStore {
     /// states the selected body once after this context, and every saved comment reaches the
     /// revising model once as its own requested change, so a thread entry repeated here would
     /// reach the model twice.
-    pub(crate) fn thread_context(&self, selected: &ReviewAnnotation) -> Result<String> {
+    pub(crate) fn thread_context(&self, selected: &ReviewAnnotation) -> Result<(&str, String)> {
         let by_id = self
             .annotation
             .iter()
@@ -187,6 +187,7 @@ impl ReviewAnnotationStore {
             ancestors.push(*parent);
             parent_id = parent.parent_id.as_deref();
         }
+        let root = ancestors.last().unwrap_or(selected).id.as_str();
         let mut context = String::new();
         for item in ancestors.into_iter().rev() {
             let heading = if item.kind == ReviewAnnotationKind::Question {
@@ -199,7 +200,7 @@ impl ReviewAnnotationStore {
                 context.push_str(&format!("Plan answer:\n{}\n\n", reply.body));
             }
         }
-        Ok(context)
+        Ok((root, context))
     }
 }
 
@@ -520,7 +521,7 @@ mod tests {
                 .iter()
                 .find(|item| item.id == id)
                 .unwrap();
-            store.thread_context(selected).unwrap()
+            store.thread_context(selected).unwrap().1
         };
         assert_eq!(
             context_of("followup"),

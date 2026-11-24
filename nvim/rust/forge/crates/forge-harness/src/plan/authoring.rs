@@ -1055,7 +1055,7 @@ impl PlanFileStore {
             .map(|annotation| {
                 let mut source = annotation.source.clone();
                 if annotation.parent_id.is_some() {
-                    let thread = store.thread_context(annotation)?;
+                    let (_, thread) = store.thread_context(annotation)?;
                     source.body = format!(
                         "Conversation context:
 {thread}Requested change:

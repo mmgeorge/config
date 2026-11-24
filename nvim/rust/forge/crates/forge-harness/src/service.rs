@@ -1450,6 +1450,8 @@ struct SessionController {
     parent_input: crate::provider::SteeringLane,
     session_event_task: Mutex<Option<provider_lifecycle::SessionObservationTask>>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
+    /// Serialize lookup, fork creation, and answer turns within each saved annotation chain.
+    review_answer_lane: Mutex<HashMap<uuid::Uuid, Arc<Mutex<()>>>>,
     revision_review: Arc<crate::plan::revision_review::RevisionReview>,
     broker: Arc<Mutex<HarnessBroker>>,
     exchange_owner: crate::exchange::ExchangeOwner,
@@ -1604,6 +1606,7 @@ impl SessionController {
             parent_input: broker.parent_input.clone(),
             session_event_task: Mutex::new(None),
             plan_review: Arc::clone(&broker.plan_review),
+            review_answer_lane: Mutex::default(),
             revision_review: Arc::clone(&broker.revision_review),
             presentation: broker.presentation(),
             cancellation: broker.turn_cancellation(),
@@ -2738,7 +2741,7 @@ async fn route_request(
             session_id,
             request.params,
             Some(request.id),
-            crate::session::SessionPurpose::Conversation,
+            crate::broker::ForkTarget::Conversation,
             message_sink,
         )
         .await?;
@@ -3201,7 +3204,7 @@ async fn start_session_fork(
     session_id: String,
     params: Value,
     response_id: Option<u64>,
-    purpose: crate::session::SessionPurpose,
+    target: crate::broker::ForkTarget,
     message_sink: &MessageSender,
 ) -> Result<(Arc<SessionController>, Arc<ProviderForkGate>)> {
     let mut task = registry.fork_task.lock().await;
@@ -3245,7 +3248,7 @@ async fn start_session_fork(
         &session_id,
         &params,
         ForkOptions {
-            purpose,
+            target,
             source_is_executing: &|| held_turn_before_preparation || source_holds_turn(),
         },
     )?;
