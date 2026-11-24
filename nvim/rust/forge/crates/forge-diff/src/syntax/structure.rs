@@ -34,25 +34,43 @@ pub struct SourceDeclaration {
 impl SyntaxHandle {
     /// Extract declaration ranges without changing source or plan projection semantics.
     pub fn declarations(&self) -> Vec<SourceDeclaration> {
-        let mut declaration = Vec::new();
         if let Some(tree) = self.0.tree.first() {
-            visit(
+            return declarations(
                 tree.root_node(),
                 self.source().text(),
                 self.language(),
-                None,
-                &mut declaration,
+                &self.0.line,
+                false,
             );
         }
-        for entry in &mut declaration {
-            if entry.start_line < entry.range_start_line {
-                let start = self.0.line[entry.start_line - 1];
-                entry.source_bytes.start = start;
-                entry.signature_bytes.start = start;
-            }
-        }
-        declaration
+        Vec::new()
     }
+}
+
+pub(super) fn declarations(
+    root: Node<'_>,
+    source: &str,
+    language: SyntaxLanguage,
+    lines: &[usize],
+    plan_signatures: bool,
+) -> Vec<SourceDeclaration> {
+    let mut declaration = Vec::new();
+    visit(
+        root,
+        source,
+        language,
+        None,
+        &mut declaration,
+        plan_signatures,
+    );
+    for entry in &mut declaration {
+        if entry.start_line < entry.range_start_line {
+            let start = lines[entry.start_line - 1];
+            entry.source_bytes.start = start;
+            entry.signature_bytes.start = start;
+        }
+    }
+    declaration
 }
 
 fn visit(
@@ -61,42 +79,52 @@ fn visit(
     language: SyntaxLanguage,
     parent: Option<usize>,
     result: &mut Vec<SourceDeclaration>,
+    plan_signatures: bool,
 ) {
     let kind = node.kind();
     let selected = match language {
-        SyntaxLanguage::Rust => matches!(
-            kind,
-            "function_item"
-                | "function_signature_item"
-                | "struct_item"
-                | "enum_item"
-                | "enum_variant"
-                | "trait_item"
-                | "impl_item"
-                | "mod_item"
-                | "type_item"
-                | "const_item"
-                | "static_item"
-                | "field_declaration"
-                | "macro_definition"
-        ),
-        SyntaxLanguage::Typescript | SyntaxLanguage::Tsx | SyntaxLanguage::Javascript => matches!(
-            kind,
-            "function_declaration"
-                | "generator_function_declaration"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-                | "type_alias_declaration"
-                | "enum_declaration"
-                | "method_definition"
-                | "method_signature"
-                | "abstract_method_signature"
-                | "public_field_definition"
-                | "property_signature"
-                | "variable_declarator"
-                | "internal_module"
-        ),
+        SyntaxLanguage::Rust => {
+            matches!(
+                kind,
+                "function_item"
+                    | "function_signature_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "enum_variant"
+                    | "trait_item"
+                    | "impl_item"
+                    | "mod_item"
+                    | "type_item"
+                    | "const_item"
+                    | "static_item"
+                    | "field_declaration"
+                    | "macro_definition"
+            ) || (plan_signatures && kind == "associated_type")
+        }
+        SyntaxLanguage::Typescript | SyntaxLanguage::Tsx | SyntaxLanguage::Javascript => {
+            matches!(
+                kind,
+                "function_declaration"
+                    | "generator_function_declaration"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+                    | "type_alias_declaration"
+                    | "enum_declaration"
+                    | "method_definition"
+                    | "method_signature"
+                    | "abstract_method_signature"
+                    | "public_field_definition"
+                    | "property_signature"
+                    | "variable_declarator"
+                    | "internal_module"
+            ) || (plan_signatures
+                && (matches!(kind, "function_signature" | "enum_assignment")
+                    || (kind == "property_identifier"
+                        && node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "enum_body"))))
+        }
         SyntaxLanguage::Lua => matches!(
             kind,
             "function_declaration" | "variable_declaration" | "assignment_statement" | "field"
@@ -112,7 +140,9 @@ fn visit(
                 .is_some_and(|parent| parent.kind() == "variable_declaration"))
     {
         let name_node = node.child_by_field_name("name").or_else(|| {
-            if kind == "impl_item" {
+            if kind == "property_identifier" {
+                Some(node)
+            } else if kind == "impl_item" {
                 node.child_by_field_name("type")
             } else if language == SyntaxLanguage::Lua && kind != "field" {
                 first_name(node)
@@ -215,6 +245,7 @@ fn visit(
                 kind,
                 "function_item"
                     | "function_signature_item"
+                    | "function_signature"
                     | "function_declaration"
                     | "generator_function_declaration"
                     | "method_definition"
@@ -249,7 +280,7 @@ fn visit(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        visit(child, source, language, owner, result);
+        visit(child, source, language, owner, result, plan_signatures);
     }
 }
 

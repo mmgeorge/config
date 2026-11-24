@@ -1244,11 +1244,13 @@ Assign with `←` or `<-`, compare with `=`, `≠`, `is`, or `is not` (as in `ta
 compute remainders with `%` or `mod`, and loop with
 `for each item in items` or `for item in items`.
 PlanReview starts with each file folded in Changes and Tests. Press `Tab` on a file heading to
-load its complete changes or tests on first unfold. Public mode keeps each changed file heading,
-including files whose bodies are empty under the filter. Reopening the same plan in the same Neovim process restores each file's fold state,
+load its complete changes or tests on first unfold. Changes shows a file when it has changed rows
+visible in the current mode. Switch to All to review private declarations and ordinary imports.
+Reopening the same plan in the same Neovim process restores each file's fold state,
 including across revisions. Changes and Tests remember their file folds independently.
 Under Changes, each file starts in **Unviewed Changes**. Press `S` on a file heading or any
 line inside it to move the whole file to **Viewed Changes**. Press `U` to move it back.
+In Visual mode, `S` and `U` move every file touched by the selected rows in one operation.
 As in Forge Status, the cursor and scroll position stay in place when the file moves.
 If the next file takes its row, you can press `S` again to mark that file viewed.
 Comments and questions stay on their original lines. Reopening the same revision restores its viewed
@@ -1256,6 +1258,11 @@ files, including after restarting Neovim or opening that revision from history. 
 revision starts unviewed.
 When a plan adds a behavior block to an existing function with the same signature, one
 `~` signature row shows both line numbers. Expand the function to read the behavior.
+A file heading such as `Modified src/app.rs +1 ~2 -5` counts added, modified, and
+removed declarations across the whole file. A signature change and a planned behavior
+change on the same declaration count once. Imports and comments contribute zero.
+Both Public and All show only nonzero counts. A file with zero or unavailable
+declaration counts shows just its status and path. Hunk headings count lines.
 Function bodies start collapsed. Expand a body to see its Algorithm or Change blocks, which
 start open. The caret on each block heading shows its state (`▾` open, `▸` closed).
 Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)` for a tuple

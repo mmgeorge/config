@@ -186,7 +186,6 @@ end
 
 local function action(review, name)
   local file_review = name == "viewed" or name == "unviewed"
-  if file_review and vim.fn.mode():match("^[vV\22]") then vim.cmd("normal! " .. vim.keycode("<Esc>")) end
   if review.cancel_definition then review.cancel_definition() review.cancel_definition = nil end
   if name == "toggle_visibility" then toggle_visibility(review) return end
   if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
@@ -203,7 +202,7 @@ local function action(review, name)
       if result.jump then
         effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
       end
-    elseif name == "comment" or name == "question" or name == "delete" then
+    elseif file_review or name == "comment" or name == "question" or name == "delete" then
       return
     elseif name == "rename_entity" and type(result.rename) == "table" then
       require("forge.views.plan_review.entity_rename").proposed(review, result.rename, captured, function(name, finish)

@@ -529,7 +529,11 @@ impl PlanReviewStore {
         Ok(serde_json::json!({"source":target}))
     }
 
-    pub(crate) fn action(&self, input: DocumentInput) -> Result<serde_json::Value> {
+    pub(crate) fn action(
+        &self,
+        input: DocumentInput,
+        selected_files: Option<&[BlockId]>,
+    ) -> Result<serde_json::Value> {
         let mut store = self
             .document
             .lock()
@@ -542,15 +546,32 @@ impl PlanReviewStore {
         if matches!(action.as_str(), "viewed" | "unviewed") {
             let block = input.block.clone();
             document.validate_input(input)?;
-            let Some(file) = super::review_projection::change_file(&block) else {
-                return Ok(serde_json::json!({}));
+            let cursor_file;
+            let selected = match selected_files {
+                Some(files) => files,
+                None => {
+                    let Some(file) = super::review_projection::change_file(&block) else {
+                        return Ok(serde_json::json!({}));
+                    };
+                    cursor_file = BlockId(file.to_owned());
+                    std::slice::from_ref(&cursor_file)
+                }
             };
             let mut files = document.source.read_viewed_files()?;
-            let changed = forge_diff::presentation::file_review::set_viewed(
-                &mut files,
-                file,
-                action == "viewed",
-            );
+            let mut changed = false;
+            for file in selected {
+                ensure!(
+                    super::review_projection::change_file(file) == Some(file.0.as_str())
+                        && document.document.block(file).is_some(),
+                    "selected plan file is no longer available: {}",
+                    file.0
+                );
+                changed |= forge_diff::presentation::file_review::set_viewed(
+                    &mut files,
+                    &file.0,
+                    action == "viewed",
+                );
+            }
             if changed {
                 super::write_json_atomically(&document.source.viewed_path()?, &files)?;
             }
@@ -2744,7 +2765,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_files_preserve_empty_public_headings_and_canonical_comment_lines() -> Result<()> {
+    fn lazy_files_hide_empty_headings_and_preserve_canonical_comment_lines() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path())?;
         crate::checks::configure_fixture(&store.workspace);
@@ -2757,12 +2778,16 @@ mod tests {
             crate::plan::DeclarationDesign::scratch(design.proposed_source.clone())?.parsed;
         store.write_working_document("session", "plan", &plan)?;
         let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1)?;
-        let open = |lazy| -> Result<_> {
+        let open = |lazy, legacy| -> Result<_> {
             let mut source = store.capture_review_source("session", "plan", None, &digest)?;
             if lazy {
+                let mut rendered = source.rendered.clone();
+                if legacy {
+                    rendered.navigation.file_visibility.clear();
+                }
                 source.files = Some(crate::plan::review_files::ReviewFiles::new(
                     source.document.design.as_ref().unwrap(),
-                    &source.rendered,
+                    &rendered,
                     &BTreeSet::new(),
                 )?);
             }
@@ -2774,8 +2799,9 @@ mod tests {
                 None,
             )
         };
-        let mut review = open(true)?;
-        let full = open(false)?;
+        let mut review = open(true, false)?;
+        let full = open(false, false)?;
+        assert_eq!(review.snapshot().block, open(true, true)?.snapshot().block);
         let file_id =
             |path: &str| format!("plan:design:file:{}", crate::plan::digest(path.as_bytes()));
         let private = file_id("private.rs");
@@ -2786,7 +2812,8 @@ mod tests {
                 .into_iter()
                 .any(|row| row.id.0 == format!("{file}:hunk:deferred"))
         };
-        for file in [&private, &public, &tests] {
+        assert!(review.document.block(&BlockId(private.clone())).is_none());
+        for file in [&public, &tests] {
             assert!(deferred(&review, file));
             let id = BlockId(file.clone());
             assert_eq!(
@@ -2794,7 +2821,7 @@ mod tests {
                 full.document.block(&id).unwrap().text
             );
         }
-        let mut jumped = open(true)?;
+        let mut jumped = open(true, false)?;
         let destination = crate::declaration::DeclarationDestination {
             path: jumped
                 .source
@@ -2818,9 +2845,9 @@ mod tests {
                 .to_owned(),
         );
         assert!(jumped.document.block(&destination).is_some());
-        assert!(deferred(&jumped, &private));
+        assert!(jumped.document.block(&BlockId(private.clone())).is_none());
         assert!(deferred(&jumped, &tests));
-        for file in [&tests, &private, &public] {
+        for file in [&tests, &public] {
             review.materialize_file(file)?;
             assert!(!deferred(&review, file));
             for (id, anchor) in &review.target {
@@ -2837,7 +2864,7 @@ mod tests {
         assert!(
             (&review.document)
                 .into_iter()
-                .any(|row| row.id.0 == private)
+                .all(|row| row.id.0 != private)
         );
         assert!(
             !(&review.document)
@@ -2845,6 +2872,8 @@ mod tests {
                 .any(|row| row.id.0.starts_with(&format!("{private}:")))
         );
         review.toggle_visibility()?;
+        assert!(deferred(&review, &private));
+        review.materialize_file(&private)?;
         assert!((&review.document).into_iter().any(|row| {
             row.text
                 .wire_rows()
@@ -3011,16 +3040,19 @@ mod tests {
         let admission = store.admit(id.clone()).unwrap();
         store.insert(document, admission).unwrap();
         let result = store
-            .action(DocumentInput {
-                document: id,
-                revision: snapshot.revision,
-                view: ViewId("view".into()),
-                sequence: InputSequence(1),
-                action: "rename_entity".into(),
-                block: block.id.clone(),
-                position: forge_buffer::block::TextPosition { row, column },
-                target: target.map(|target| target.id),
-            })
+            .action(
+                DocumentInput {
+                    document: id,
+                    revision: snapshot.revision,
+                    view: ViewId("view".into()),
+                    sequence: InputSequence(1),
+                    action: "rename_entity".into(),
+                    block: block.id.clone(),
+                    position: forge_buffer::block::TextPosition { row, column },
+                    target: target.map(|target| target.id),
+                },
+                None,
+            )
             .unwrap();
         (snapshot, result)
     }

@@ -2015,8 +2015,13 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
     let path = "tests/editor_ui_test.rs";
     let declaration = "#[testing::test]\nasync fn private_case();\n#[test]\npub fn public_case();\n#[cfg(test)]\nmod tests {\n  pub fn nested_case();\n}\n";
     let mut plan = crate::plan::test_fixture("review", "Review the editor tests.");
-    let mut design =
-        crate::plan::DeclarationDesign::scratch([(path.into(), declaration.into())].into())?;
+    let mut design = crate::plan::DeclarationDesign::scratch(
+        [
+            (path.into(), declaration.into()),
+            ("imports.rs".into(), "use std::path::Path;\n".into()),
+        ]
+        .into(),
+    )?;
     design.document.objective = "Review the editor tests.".into();
     design.document.background = "The editor has a test harness.".into();
     design.document.requirements = vec!["Exercise each visibility.".into()];
@@ -2043,8 +2048,40 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
             Default::default(),
             None,
         )?;
+        let import_heading = format!("plan:design:file:{}", crate::plan::digest(b"imports.rs"));
+        assert_eq!(
+            review
+                .snapshot()
+                .block
+                .iter()
+                .any(|block| block.id.0 == import_heading),
+            !public_only,
+            "import-only files should appear only in All"
+        );
         let store = &fixture.controller.plan_review;
         store.insert(review, store.admit(document.clone())?)?;
+        if !public_only {
+            let result = fixture
+                .service
+                .document(
+                    Some(fixture.session_id.clone()),
+                    PresentationRequest::PlanBody {
+                        document: document.clone(),
+                        saved_source_digest: saved_source_digest.clone(),
+                        file: import_heading,
+                    },
+                    &fixture.sink,
+                )
+                .await?;
+            let patch: BufferPatch = serde_json::from_value(result["patch"].clone())?;
+            assert!(
+                patch
+                    .text_edit
+                    .iter()
+                    .flat_map(|edit| edit.text.wire_rows())
+                    .any(|row| row.contains("use std::path::Path;"))
+            );
+        }
         let result = fixture
             .service
             .document(
@@ -2076,6 +2113,69 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
             );
         }
     }
+    fixture.finish().await
+}
+
+#[tokio::test]
+async fn visual_file_review_moves_only_selected_files_in_one_request() -> Result<()> {
+    use crate::plan::review_document::ReadOnlyPlanReview;
+    use forge_buffer::identity::{DocumentId, ViewId};
+
+    let fixture = ReviewFixture::open(true).await?;
+    let files =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?;
+    let mut plan = crate::plan::test_fixture("review", "Review multiple files.");
+    let mut design = crate::plan::DeclarationDesign::scratch(
+        ["a", "b", "c"]
+            .map(|name| (format!("{name}.rs"), format!("pub fn {name}();\n")))
+            .into(),
+    )?;
+    design.document.objective = "Review multiple files.".into();
+    design.document.background = "Three files change.".into();
+    design.document.requirements = vec!["Track each file.".into()];
+    design.document.design = "Add three functions.".into();
+    plan.design = Some(design);
+    files.write_working_document(&fixture.session_id, "review", &plan)?;
+    let (_, _, digest) = files.submit_document_revision(&fixture.session_id, "review", 1, 1)?;
+    let open = |name: &str| {
+        ReadOnlyPlanReview::new(
+            DocumentId(name.into()),
+            ViewId("view".into()),
+            files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?,
+            Default::default(),
+            None,
+        )
+    };
+    let review = open("batch")?;
+    let snapshot = review.snapshot();
+    let headings: Vec<_> = snapshot
+        .block
+        .iter()
+        .filter(|block| {
+            block.id.0.starts_with("plan:design:file:") && !block.id.0.contains(":hunk:")
+        })
+        .collect();
+    assert_eq!(headings.len(), 3);
+    let target = &headings[1].metadata.target[0];
+    let store = &fixture.controller.plan_review;
+    store.insert(review, store.admit(snapshot.document.clone())?)?;
+    let request = serde_json::from_value(json!({"operation":"plan_action",
+        "input":{"document":snapshot.document,"revision":snapshot.revision,"view":"view","sequence":1,
+            "action":"viewed","block":headings[1].id,"position":target.range.start,"target":target.id},
+        "selected_files":[headings[0].id,headings[1].id]}))?;
+    fixture
+        .service
+        .document(Some(fixture.session_id.clone()), request, &fixture.sink)
+        .await?;
+    let reopened = open("reopened")?.snapshot();
+    let viewed: Vec<_> = reopened
+        .block
+        .iter()
+        .skip_while(|block| block.id.0 != "plan:section:changes:viewed")
+        .filter(|block| headings.iter().any(|heading| heading.id == block.id))
+        .map(|block| &block.id)
+        .collect();
+    assert_eq!(viewed, [&headings[0].id, &headings[1].id]);
     fixture.finish().await
 }
 
@@ -2146,6 +2246,14 @@ async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
                 && !block.metadata.conceal.iter().any(|conceal| conceal.line)
         })
     };
+    // This revision predates precomputed declaration summaries.
+    let heading = snapshot
+        .block
+        .iter()
+        .filter_map(|block| block.text.row(0))
+        .find(|text| text.starts_with("Modified") && text.contains("app.rs"))
+        .unwrap();
+    assert_eq!(heading, "Modified app.rs");
     assert!(
         visible("pub fn app() -> App;").is_none(),
         "duplicate baseline signature"
@@ -2342,7 +2450,15 @@ async fn reopened_revision_restores_viewed_files_after_restart() -> Result<()> {
         digest: plan.review_digest.clone().unwrap(),
         revision,
         width: Default::default(),
-        expanded_files: Default::default(),
+        expanded_files: if revision.is_some() {
+            [format!(
+                "plan:design:file:{}",
+                crate::plan::digest(b"src/change.rs")
+            )]
+            .into()
+        } else {
+            Default::default()
+        },
         focused_annotation: None,
         saved_source_digest: None,
     };
@@ -2393,6 +2509,19 @@ async fn reopened_revision_restores_viewed_files_after_restart() -> Result<()> {
             .position(|block| block.id.0 == "plan:section:changes:viewed")
             .context("missing Viewed Changes")?;
         assert_eq!(file > viewed, expected, "{name}");
+        assert!(
+            snapshot.block[file].text.row(0).unwrap().ends_with(" +1"),
+            "{name}"
+        );
+        if revision.is_some() {
+            assert!(
+                snapshot
+                    .block
+                    .iter()
+                    .filter_map(|block| block.text.row(0))
+                    .any(|text| text.starts_with("@@ +") && text.split_whitespace().count() == 3)
+            );
+        }
         if let Some(action) = action {
             let heading = &snapshot.block[file];
             let target = &heading.metadata.target[0];
@@ -2404,7 +2533,10 @@ async fn reopened_revision_restores_viewed_files_after_restart() -> Result<()> {
                 .service
                 .document(
                     Some(fixture.session_id.clone()),
-                    PresentationRequest::PlanAction { input },
+                    PresentationRequest::PlanAction {
+                        input,
+                        selected_files: None,
+                    },
                     &fixture.sink,
                 )
                 .await?;

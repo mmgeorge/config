@@ -455,7 +455,7 @@ impl HarnessService {
                     .load_body(document, saved_source_digest, file, &self.syntax)
                     .await;
             }
-            crate::buffer::session::PresentationRequest::PlanAction { input } => {
+            crate::buffer::session::PresentationRequest::PlanAction { input, selected_files } => {
                 let preview_trace = (input.action == "rename_entity").then(|| crate::plan::edit_trace::PlanEditTrace::new(
                     registry.runtime.trace(), &session_id, "plan.rename.preview",
                     &json!({"operation_id":format!("preview:{}:{}", input.document.0, input.sequence.0),
@@ -480,7 +480,7 @@ impl HarnessService {
                         .await?;
                 }
                 let stage = trace.as_ref().map(|trace| trace.stage("action", None));
-                let result = controller.plan_review.action(input.clone())?;
+                let result = controller.plan_review.action(input.clone(), selected_files.as_deref())?;
                 if let Some(stage) = preview {
                     stage.complete(json!({"count":result.get("rename").and_then(|rename|rename.get("preview")).and_then(Value::as_array).map_or(0,Vec::len)}));
                 }

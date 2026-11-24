@@ -15,6 +15,7 @@ pub use declaration_contract::{ContractDeclaration, ContractDifference, Declarat
 mod declaration_calls;
 mod declaration_fold;
 mod declaration_index;
+mod declaration_summary;
 pub use declaration_calls::{
     DeclarationCall, DeclarationCallKind, DeclarationCallable, DeclarationCalls,
 };
@@ -24,6 +25,7 @@ pub use declaration_index::{
     DeclarationModule, DeclarationReference, DeclarationRole, DeclarationSymbol, FieldShape,
     SymbolVisibility,
 };
+pub use declaration_summary::ReviewDeclarationInventory;
 mod visibility;
 pub use configuration::ConfigurationFormat;
 pub use declaration::{

@@ -845,13 +845,29 @@ function M.attach(options, callback)
     end
     local view = owner.current_view(window)
     if not view then receive(nil, "Plan review window is no longer available") return false end
+    local selected_files
+    if (action == "viewed" or action == "unviewed") and vim.fn.mode():match("^[vV\22]") then
+      local first, last = require("forge.document_commands").visual_row_range(view.window)
+      selected_files = {}
+      local seen = {}
+      for row = first, last do
+        local location = buffer.locate(owner.replica, row, 0)
+        local file = location and location.block:match("^(plan:design:file:[^:]+)")
+        if file and not seen[file] then
+          selected_files[#selected_files + 1] = file
+          seen[file] = true
+        end
+      end
+      vim.cmd("normal! " .. vim.keycode("<Esc>"))
+      if #selected_files == 0 then return false end
+    end
     local captured, failure = input.capture(owner.replica, view, action)
     if not captured then receive(nil, failure) return false end
     local preview_started = action == "rename_entity" and perf.now() or nil
     if preview_started then perf.event("harness", "ui.plan.rename_preview", {
       phase = "request", document = owner.document, revision = owner.version, session_id = options.session_id,
     }) end
-    request({ operation = "plan_action", input = captured }, function(result, error)
+    request({ operation = "plan_action", input = captured, selected_files = selected_files }, function(result, error)
       ---@cast captured ForgeDocumentInput
       if preview_started then perf.event("harness", "ui.plan.rename_preview", {
         phase = "response", document = owner.document, revision = owner.version, session_id = options.session_id,
@@ -900,8 +916,7 @@ function M.attach(options, callback)
     if not view then return nil, nil, "Plan review window is no longer available" end
     local mode = vim.fn.mode(1)
     if mode ~= "v" and mode ~= "V" and mode ~= "\22" then return nil, nil, "Select the planned tests first" end
-    local first, last = vim.fn.getpos("v")[2] - 1, vim.api.nvim_win_get_cursor(view.window)[1] - 1
-    if first > last then first, last = last, first end
+    local first, last = require("forge.document_commands").visual_row_range(view.window)
     local selected, seen, checks = {}, {}, {}
     for row = first, last do
       local metadata = owner.projection.line_meta_list[row + 1]

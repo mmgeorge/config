@@ -456,7 +456,12 @@ impl DiffPresenter {
         header.metadata.fold[0].expand_children = policy.expand_children;
     }
 
-    fn heading(&self, id: BlockId, chunks: Vec<TextChunk>) -> Result<BufferBlock, ContractError> {
+    /// Present a heading with caller-supplied statistics using the current diff layout.
+    pub fn heading(
+        &self,
+        id: BlockId,
+        chunks: Vec<TextChunk>,
+    ) -> Result<BufferBlock, ContractError> {
         let mut block = crate::projection::header(id, chunks, self.options.indent)?;
         block.metadata.layout = self.options.layout.clone();
         Ok(block)

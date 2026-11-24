@@ -753,6 +753,25 @@ T["card navigation and native visual selection exclude the frame"] = function()
   MiniTest.expect.equality(placement, { "╰", 1, 0 })
 end
 
+T["visual S and U capture every selected file once"] = function()
+  local a, b, c = "plan:design:file:a", "plan:design:file:b", "plan:design:file:c"
+  local host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua").start({
+    lines = { "Unviewed", "A", "A body", "B", "Viewed", "C" },
+    block_id = { "plan:section:changes:unviewed", a, a .. ":hunk:1:row:1", b, "plan:section:changes:viewed", c },
+  })
+  local review = host.open()
+  vim.api.nvim_win_set_cursor(review.win, { 2, 0 })
+  vim.cmd("normal! V2j")
+  keymap.invoke("S", { buffer = review.buf, mode = "x" })
+  MiniTest.expect.equality(host.actions[1].selected_files, { a, b })
+  host.complete_move(1, { 1, 5, 2, 3, 4, 6 })
+  vim.api.nvim_win_set_cursor(review.win, { 5, 0 })
+  vim.cmd("normal! v2k")
+  keymap.invoke("U", { buffer = review.buf, mode = "x" })
+  MiniTest.expect.equality(host.actions[2].selected_files, { a, b })
+  MiniTest.expect.equality(#host.actions, 2)
+end
+
 T["marking a file viewed keeps the next file in place on screen"] = function()
   local lines = vim.tbl_map(function(row) return ("File %02d"):format(row) end, vim.fn.range(1, 75))
   local ids = vim.tbl_map(function(row) return "plan:design:file:" .. row end, vim.fn.range(1, #lines))

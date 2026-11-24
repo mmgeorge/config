@@ -6,6 +6,49 @@ use forge_diff::source::{Representation, SourceCoordinate, SourcePair, SourceSid
 use forge_diff::syntax::{HunkContext, SyntaxPoint, SyntaxRange};
 
 use super::calls::CallPresentation;
+use super::render::FileVisibility;
+
+pub(super) struct ReviewSides {
+    pub before: Option<std::sync::Arc<CallPresentation>>,
+    pub after: Option<std::sync::Arc<CallPresentation>>,
+}
+
+impl ReviewSides {
+    pub fn new(design: &super::DeclarationDesign, path: &str, destination: &str) -> Result<Self> {
+        let parsed = design.parsed()?;
+        let before = design
+            .baseline
+            .get(path)
+            .map(|file| {
+                super::calls::present(
+                    path,
+                    &file.text,
+                    design
+                        .baseline_calls
+                        .get(path)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+            })
+            .transpose()?;
+        let after = parsed
+            .proposed
+            .get(destination)
+            .map(|text| {
+                super::calls::present(
+                    destination,
+                    text,
+                    parsed
+                        .proposed_calls
+                        .get(destination)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+            })
+            .transpose()?;
+        Ok(Self { before, after })
+    }
+}
 
 /// Declaration comparison with source coordinates retained for review navigation.
 pub(super) struct FileDiff {
@@ -20,6 +63,51 @@ pub(super) struct FileDiff {
 }
 
 impl FileDiff {
+    /// Context and hunk boundaries do not make an otherwise hidden change reviewable.
+    pub fn visibility(&self, sides: &ReviewSides) -> Result<FileVisibility> {
+        let mut visibility = FileVisibility::Empty;
+        for (path, source, kind) in [
+            (
+                self.old_path.as_deref(),
+                sides.before.as_deref(),
+                RowKind::Removed,
+            ),
+            (
+                self.new_path.as_deref(),
+                sides.after.as_deref(),
+                RowKind::Added,
+            ),
+        ] {
+            let (Some(path), Some(source)) = (path, source) else {
+                continue;
+            };
+            let mut changed = self
+                .hunk
+                .iter()
+                .flat_map(|hunk| &hunk.row)
+                .filter(|row| row.kind() == kind && !row.text.trim().is_empty())
+                .filter_map(|row| row.new_coordinate().or_else(|| row.old_coordinate()))
+                .peekable();
+            if changed.peek().is_none() {
+                continue;
+            }
+            let public = super::calls::visibility(path, source, true)?;
+            if changed
+                .clone()
+                .any(|coordinate| public.rows.get(coordinate.line) == Some(&true))
+            {
+                return Ok(FileVisibility::Public);
+            }
+            if visibility == FileVisibility::Empty {
+                let all = super::calls::visibility(path, source, false)?;
+                if changed.any(|coordinate| all.rows.get(coordinate.line) == Some(&true)) {
+                    visibility = FileVisibility::All;
+                }
+            }
+        }
+        Ok(visibility)
+    }
+
     /// Compares declarations with regular diff context and bounded reference excerpts.
     pub fn new(
         path: &str,

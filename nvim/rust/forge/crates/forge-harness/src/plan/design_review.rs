@@ -40,6 +40,31 @@ const FILE_FOLD: FoldPolicy = FoldPolicy {
     expand_children: false,
 };
 
+fn file_heading(
+    presenter: &forge_diff::presentation::DiffPresenter,
+    id: BlockId,
+    change: FileChange,
+    label: &str,
+    delta: Option<super::design::DeclarationDelta>,
+) -> Result<BufferBlock> {
+    let mut chunks = change.header(label, None, false);
+    if let Some(delta) = delta {
+        for (count, marker, capture) in [
+            (delta.added, '+', "ForgeAddRange"),
+            (delta.modified, '~', "ForgeModifyRange"),
+            (delta.removed, '-', "ForgeDeleteRange"),
+        ] {
+            if count > 0 {
+                chunks.push(TextChunk {
+                    text: format!(" {marker}{count}"),
+                    capture: capture.into(),
+                });
+            }
+        }
+    }
+    Ok(presenter.heading(id, chunks)?)
+}
+
 pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
     let DesignReviewRows {
         block, navigation, ..
@@ -377,7 +402,7 @@ pub(super) fn project(
         }
     }
     if public_only || !hidden.is_empty() {
-        block = public_blocks(block, &hidden, body.is_none())?;
+        block = public_blocks(block, &hidden, body.is_none(), public_only)?;
         let visible_target = block
             .iter()
             .flat_map(|block| &block.metadata.target)
@@ -409,6 +434,7 @@ fn rows(
         plan_id: document.plan_id.clone(),
         plan_version: document.version,
         anchor: Vec::new(),
+        file_visibility: Default::default(),
     };
     let mut skipped = HashMap::new();
     let mut hidden = HashSet::new();
@@ -480,7 +506,7 @@ fn rows(
         if let Some((inventory, heading)) =
             files.and_then(|inventory| Some((inventory, inventory.for_path(&destination)?)))
             && body.is_none()
-            && !inventory.loaded.contains(&heading.id)
+            && (!inventory.loaded.contains(&heading.id) || !heading.visibility.visible(public_only))
             && !revealed
                 .iter()
                 .any(|(file, _, _)| file == &path || file == &destination)
@@ -500,14 +526,13 @@ fn rows(
             } else {
                 destination.clone()
             };
-            block.push(
-                forge_diff::presentation::DiffPresenter::new(Default::default()).file(
-                    BlockId(heading.id.clone()),
-                    change,
-                    &label,
-                    heading.counts,
-                )?,
-            );
+            block.push(file_heading(
+                &forge_diff::presentation::DiffPresenter::new(Default::default()),
+                BlockId(heading.id.clone()),
+                change,
+                &label,
+                heading.delta,
+            )?);
             navigation.anchor.push(PlanNavigationAnchor {
                 columns: None,
                 line: block.len() as u32,
@@ -519,6 +544,10 @@ fn rows(
                 label,
             });
             let deferred = BlockId(format!("{}:hunk:deferred", heading.id));
+            if !heading.visibility.visible(public_only) {
+                hidden.insert(BlockId(heading.id.clone()));
+                hidden.insert(deferred.clone());
+            }
             skipped.insert(deferred.clone(), i64::from(heading.rows) - 2);
             block.push(BufferBlock {
                 id: deferred,
@@ -528,38 +557,7 @@ fn rows(
             fold(&mut block, start, &heading.id, FILE_FOLD)?;
             continue;
         }
-        let before = design
-            .baseline
-            .get(&path)
-            .map(|file| {
-                super::calls::present(
-                    &path,
-                    &file.text,
-                    design
-                        .baseline_calls
-                        .get(&path)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default(),
-                )
-            })
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let after = parsed
-            .proposed
-            .get(&destination)
-            .map(|text| {
-                super::calls::present(
-                    &destination,
-                    text,
-                    parsed
-                        .proposed_calls
-                        .get(&destination)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default(),
-                )
-            })
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let sides = super::review_diff::ReviewSides::new(design, &path, &destination)?;
         let explicitly_revealed = revealed
             .iter()
             .any(|(file, side, _)| file == &path && side == "baseline")
@@ -581,13 +579,28 @@ fn rows(
         let diff = super::review_diff::FileDiff::new(
             &path,
             &destination,
-            before.as_deref(),
-            after.as_deref(),
+            sides.before.as_deref(),
+            sides.after.as_deref(),
             &reference_context,
         )?;
-        if diff.hunk.is_empty() && before.is_some() && after.is_some() && path == destination {
+        if diff.hunk.is_empty()
+            && sides.before.is_some()
+            && sides.after.is_some()
+            && path == destination
+        {
             continue;
         }
+        let file_visibility = match files.and_then(|inventory| inventory.for_path(&destination)) {
+            Some(heading) => heading.visibility,
+            None => diff.visibility(&sides)?,
+        };
+        if !inspection {
+            navigation
+                .file_visibility
+                .insert(destination.clone(), file_visibility);
+        }
+        let hide_file = inspection && !explicitly_revealed && !file_visibility.visible(public_only);
+        let super::review_diff::ReviewSides { before, after } = sides;
         let body_openings = if inspection {
             super::review_alignment::body_openings(
                 before.as_deref(),
@@ -659,23 +672,18 @@ fn rows(
         } else {
             path.clone()
         };
-        let added = hunks
-            .iter()
-            .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind() == RowKind::Added)
-            .count() as u64;
-        let removed = hunks
-            .iter()
-            .flat_map(|hunk| &hunk.row)
-            .filter(|row| row.kind() == RowKind::Removed)
-            .count() as u64;
         let identity = file.old_path.as_deref().unwrap_or(path);
         let id = format!("plan:design:file:{}", super::digest(identity.as_bytes()));
-        block.push(presenter.file(
+        let delta = match files.and_then(|inventory| inventory.for_path(path)) {
+            Some(heading) => heading.delta,
+            None => parsed.review_delta(design, identity, path),
+        };
+        block.push(file_heading(
+            &presenter,
             BlockId(id.clone()),
             status,
             &display,
-            Some((added, removed)),
+            delta,
         )?);
         navigation.anchor.push(PlanNavigationAnchor {
             columns: None,
@@ -689,13 +697,12 @@ fn rows(
             let hunk_start = block.len();
             let hunk_id = format!("{id}:hunk:{hunk_index}");
             let counts = forge_diff::presentation::counts(&hunk.row);
+            use forge_diff::presentation::HunkHeading;
+            let (added, removed) = (counts.0 as usize, counts.1 as usize);
             block.push(presenter.hunk(
                 BlockId(hunk_id.clone()),
                 &hunk.group,
-                forge_diff::presentation::HunkHeading::Counts {
-                    added: counts.0 as usize,
-                    removed: counts.1 as usize,
-                },
+                HunkHeading::Counts { added, removed },
             )?);
             for (row_index, row) in hunk.row.iter().enumerate() {
                 let id = BlockId(format!("{hunk_id}:row:{row_index}"));
@@ -935,6 +942,9 @@ fn rows(
             );
         }
         fold(&mut block, start, &id, FILE_FOLD)?;
+        if hide_file {
+            hidden.extend(block[start..].iter().map(|row| row.id.clone()));
+        }
         if contextual_path.contains(path) {
             contextual_block.extend(block[start..].iter().map(|row| row.id.clone()));
         }
@@ -1970,6 +1980,7 @@ fn public_blocks(
     mut block: Vec<BufferBlock>,
     hidden: &HashSet<BlockId>,
     whole_document: bool,
+    public_only: bool,
 ) -> Result<Vec<BufferBlock>> {
     let index: HashMap<_, _> = block
         .iter()
@@ -2179,7 +2190,12 @@ fn public_blocks(
             forge_diff::projection::header(
                 BlockId("plan:design:public:empty".into()),
                 vec![TextChunk {
-                    text: "No public declaration changes.".into(),
+                    text: if public_only {
+                        "No public declaration changes."
+                    } else {
+                        "No visible changes."
+                    }
+                    .into(),
                     capture: "Comment".into(),
                 }],
                 0,
@@ -2271,6 +2287,85 @@ mod tests {
     use super::{FileChange, test_file_change};
     use crate::plan::DesignTestChange;
     use crate::plan::design_tests::DesignTestCase;
+
+    #[test]
+    fn file_headings_show_only_declaration_deltas_and_read_legacy_summaries() -> anyhow::Result<()>
+    {
+        use crate::plan::design::{DeclarationDelta, PlanFileSummary};
+        use crate::plan::{DeclarationDesign, ParsedDeclarations};
+        let mut plan = crate::plan::references::tests::scoring_plan();
+        let mut design = DeclarationDesign::scratch(
+            [
+                ("app.rs".into(), "pub fn app();\n".into()),
+                ("legacy.rs".into(), "pub fn legacy();\n".into()),
+                ("missing.rs".into(), "pub fn missing();\n".into()),
+                ("imports.rs".into(), "use std::path::Path;\n".into()),
+                (
+                    "Cargo.toml".into(),
+                    "[package]\nname = \"example\"\nversion = \"0.1.0\"\n".into(),
+                ),
+            ]
+            .into(),
+        )?;
+        let saved = serde_json::to_value(design.parsed()?)?;
+        assert!(saved.get("file_summary").is_none());
+        design.parsed = Some(serde_json::from_value::<ParsedDeclarations>(saved)?);
+        plan.design = Some(design.clone());
+        let original = super::render(&plan)?.markdown;
+        assert!(original.contains("app.rs\n@@ +1 -0\n"));
+        let counts = &mut design.parsed_mut()?.file_summary;
+        counts.insert(
+            "app.rs".into(),
+            PlanFileSummary::Delta(DeclarationDelta {
+                added: 1,
+                modified: 0,
+                removed: 0,
+            }),
+        );
+        counts.insert("Cargo.toml".into(), PlanFileSummary::Lines);
+        counts.insert(
+            "legacy.rs".into(),
+            serde_json::from_str(r#"{"unit":"lines"}"#)?,
+        );
+        counts.insert(
+            "imports.rs".into(),
+            serde_json::from_str(r#"{"unit":"declarations","added":0,"modified":1,"removed":0}"#)?,
+        );
+        plan.design = Some(design);
+        let rendered = super::render(&plan)?.markdown;
+        assert!(rendered.contains("app.rs +1\n@@ +1 -0\n"));
+        assert!(rendered.contains("legacy.rs +1\n@@ +1 -0\n"));
+        assert!(rendered.contains("missing.rs\n@@ +1 -0\n"));
+        assert!(rendered.contains("imports.rs\n@@ +1 -0\n"));
+        assert!(rendered.contains("Cargo.toml\n@@ +3 -0\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn file_heading_omits_each_zero_count() -> anyhow::Result<()> {
+        use crate::plan::design::DeclarationDelta;
+        let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
+        for ([added, modified, removed], expected) in [
+            ([0, 1, 0], "Modified lib.rs ~1"),
+            ([0, 0, 2], "Modified lib.rs -2"),
+            ([3, 0, 2], "Modified lib.rs +3 -2"),
+            ([0, 0, 0], "Modified lib.rs"),
+        ] {
+            let heading = super::file_heading(
+                &presenter,
+                super::BlockId("file".into()),
+                FileChange::Modified,
+                "lib.rs",
+                Some(DeclarationDelta {
+                    added,
+                    modified,
+                    removed,
+                }),
+            )?;
+            assert_eq!(heading.text.row(0), Some(expected));
+        }
+        Ok(())
+    }
 
     fn case(change: DesignTestChange) -> DesignTestCase {
         DesignTestCase {

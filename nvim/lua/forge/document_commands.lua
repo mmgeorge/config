@@ -6,6 +6,16 @@ local gutter = require("forge.gutter")
 local M = {}
 local window_owner = {}
 
+---Inclusive zero-based rows touched by the active Visual selection.
+---@param window integer
+---@return integer first
+---@return integer last
+function M.visual_row_range(window)
+  local anchor = vim.fn.getpos("v")[2] - 1
+  local cursor = vim.api.nvim_win_get_cursor(window)[1] - 1
+  return math.min(anchor, cursor), math.max(anchor, cursor)
+end
+
 local function selected_rows(session)
   assert(session.status == "Applied" and not session.applying, "document changed during selection")
   assert(not require("forge.editable").suspend_generated_text(session.editable), "local edits require acknowledgement before copying gutters")

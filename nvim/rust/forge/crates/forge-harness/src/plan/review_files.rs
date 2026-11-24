@@ -19,7 +19,8 @@ pub(crate) struct FileHeading {
     pub id: String,
     pub before: String,
     pub after: String,
-    pub counts: Option<(u64, u64)>,
+    pub delta: Option<super::design::DeclarationDelta>,
+    pub visibility: super::render::FileVisibility,
     pub rows: u32,
 }
 
@@ -30,7 +31,8 @@ impl ReviewFiles {
         expanded: &BTreeSet<String>,
     ) -> Result<Self> {
         let mut result = Self::default();
-        let lines: Vec<_> = rendered.markdown.lines().collect();
+        let parsed = design.parsed()?;
+        let line_count = rendered.markdown.lines().count();
         let mut end = super::design_review::test_source_range(rendered)?.0 as u32;
         // The blank separator immediately before Tests belongs to the section, not its last file.
         for anchor in rendered.navigation.anchor.iter().rev() {
@@ -46,23 +48,31 @@ impl ReviewFiles {
                 .find(|(_, to)| *to == path)
                 .map_or(path, |(from, _)| from);
             let id = format!("plan:design:file:{}", super::digest(before.as_bytes()));
-            let text = lines
-                .get(
-                    anchor
-                        .line
-                        .checked_sub(1)
-                        .context("file has no source line")? as usize,
-                )
-                .context("file heading is outside the saved plan")?;
-            let counts = text
-                .rsplit_once(" +")
-                .and_then(|(_, counts)| counts.split_once(" -"))
-                .and_then(|(added, removed)| Some((added.parse().ok()?, removed.parse().ok()?)));
+            anyhow::ensure!(
+                (1..=line_count).contains(&(anchor.line as usize)),
+                "file heading is outside the saved plan"
+            );
+            let visibility = match rendered.navigation.file_visibility.get(path) {
+                Some(visibility) => *visibility,
+                None => {
+                    // Older indexes lack visibility. Derive it once for this review from its saved sides.
+                    let sides = super::review_diff::ReviewSides::new(design, before, path)?;
+                    super::review_diff::FileDiff::new(
+                        before,
+                        path,
+                        sides.before.as_deref(),
+                        sides.after.as_deref(),
+                        &[],
+                    )?
+                    .visibility(&sides)?
+                }
+            };
             result.files.push(FileHeading {
                 id,
                 before: before.clone(),
                 after: path.clone(),
-                counts,
+                delta: parsed.review_delta(design, before, path),
+                visibility,
                 rows: end
                     .checked_sub(anchor.line)
                     .context("invalid plan file range")?,

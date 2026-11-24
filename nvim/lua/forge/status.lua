@@ -675,9 +675,8 @@ function M.action(state, action, visual)
   local view = view_for(state, window)
   local selection
   if visual then
-    local anchor = vim.fn.getpos("v")[2] - 1
-    local cursor = vim.api.nvim_win_get_cursor(window)[1] - 1
-    local ok, result = pcall(buffer.selection, state.replica, math.min(anchor, cursor), math.max(anchor, cursor))
+    local first, last = require("forge.document_commands").visual_row_range(window)
+    local ok, result = pcall(buffer.selection, state.replica, first, last)
     if not ok then notice(tostring(result)) return end
     selection = result
   end

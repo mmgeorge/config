@@ -108,9 +108,104 @@ pub struct ParsedDeclarations {
     /// Function changes and reference relationships accompanying proposed declarations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub proposed_calls: BTreeMap<String, Vec<super::FunctionBody>>,
+    /// Whole-file statistics generated for this revision. Older revisions carry no entries.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub file_summary: BTreeMap<String, PlanFileSummary>,
     /// Reference evidence generated for exactly this structure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<crate::declaration::DeclarationValidation>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "unit", rename_all = "snake_case")]
+pub enum PlanFileSummary {
+    Delta(DeclarationDelta),
+    Unavailable,
+    /// Original summaries included documentation and fell back to lines for mixed changes.
+    Declarations(DeclarationDelta),
+    Lines,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct DeclarationDelta {
+    pub added: usize,
+    pub modified: usize,
+    pub removed: usize,
+}
+
+impl ParsedDeclarations {
+    /// Preserve missing entries and reclassify legacy summaries using the revision's saved sources.
+    pub(super) fn review_delta(
+        &self,
+        design: &DeclarationDesign,
+        before: &str,
+        after: &str,
+    ) -> Option<DeclarationDelta> {
+        match self.file_summary.get(after)? {
+            PlanFileSummary::Delta(delta) => Some(*delta),
+            PlanFileSummary::Unavailable => None,
+            PlanFileSummary::Declarations(_) | PlanFileSummary::Lines => {
+                DeclarationDelta::compare(design, self, before, after)
+            }
+        }
+    }
+}
+
+impl PlanFileSummary {
+    fn compare(
+        design: &DeclarationDesign,
+        parsed: &ParsedDeclarations,
+        before: &str,
+        after: &str,
+    ) -> Self {
+        DeclarationDelta::compare(design, parsed, before, after)
+            .map_or(Self::Unavailable, Self::Delta)
+    }
+}
+
+impl DeclarationDelta {
+    fn compare(
+        design: &DeclarationDesign,
+        parsed: &ParsedDeclarations,
+        before: &str,
+        after: &str,
+    ) -> Option<Self> {
+        use forge_diff::syntax::ReviewDeclarationInventory;
+        let inventory =
+            |path: &str, text: Option<&str>, bodies: Option<&Vec<super::FunctionBody>>| {
+                let Some(text) = text else {
+                    return Some(ReviewDeclarationInventory::default());
+                };
+                if forge_diff::syntax::ConfigurationFormat::for_path(path).is_some() {
+                    return None;
+                }
+                let behaviors = bodies
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|body| {
+                        let behavior = body.behavior.as_ref()?;
+                        Some((body.owner.as_str(), (behavior.label(), behavior.text())))
+                    })
+                    .collect();
+                ReviewDeclarationInventory::parse(path, text, behaviors)
+            };
+        let counts = inventory(
+            before,
+            design.baseline.get(before).map(|file| file.text.as_str()),
+            design.baseline_calls.get(before),
+        )
+        .zip(inventory(
+            after,
+            parsed.proposed.get(after).map(String::as_str),
+            parsed.proposed_calls.get(after),
+        ))
+        .and_then(|(old, new)| old.counts(&new));
+        counts.map(|[added, modified, removed]| Self {
+            added,
+            modified,
+            removed,
+        })
+    }
 }
 
 fn default_line_width() -> usize {
@@ -292,6 +387,21 @@ impl DeclarationDesign {
         crate::declaration::DeclarationValidationError::ensure_empty(
             report.diagnostic.iter().cloned().chain(authored).collect(),
         )?;
+        let destinations = design.moved.values().collect::<BTreeSet<_>>();
+        let parsed = design.parsed()?;
+        let mut summaries = BTreeMap::new();
+        for before in design.changed_paths() {
+            if destinations.contains(&before) {
+                continue;
+            }
+            super::resolution_deadline::ResolutionDeadline::check()?;
+            let after = design.moved.get(&before).unwrap_or(&before);
+            summaries.insert(
+                after.clone(),
+                PlanFileSummary::compare(&design, parsed, &before, after),
+            );
+        }
+        design.parsed_mut()?.file_summary = summaries;
         Ok(ValidatedDesign { design, report })
     }
 
@@ -542,6 +652,15 @@ impl DeclarationDesign {
             parsed.proposed_calls.insert(path.into(), calls);
         }
         parsed.validation = None;
+        if parsed.file_summary.contains_key(path) {
+            let before = self
+                .moved
+                .iter()
+                .find(|(_, after)| after.as_str() == path)
+                .map_or(path, |(before, _)| before);
+            let summary = PlanFileSummary::compare(self, &parsed, before, path);
+            parsed.file_summary.insert(path.to_owned(), summary);
+        }
         parsed.source_fingerprint = self.source_fingerprint()?;
         self.parsed = Some(parsed);
         Ok(())

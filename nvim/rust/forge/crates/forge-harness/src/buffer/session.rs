@@ -242,6 +242,9 @@ pub enum PresentationRequest {
     },
     PlanAction {
         input: DocumentInput,
+        /// Whole-file headings touched by a visual viewed-state action.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_files: Option<Vec<forge_buffer::identity::BlockId>>,
     },
     PlanBody {
         document: DocumentId,

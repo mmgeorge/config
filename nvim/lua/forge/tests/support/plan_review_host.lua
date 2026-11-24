@@ -84,7 +84,7 @@ function plan_review_host.start(options)
       if params.operation == "plan_action" then
         assert(params.input.action == "toggle_visibility" or params.input.action == "viewed"
           or params.input.action == "unviewed", "unexpected plan action " .. tostring(params.input.action))
-        host.actions[#host.actions + 1] = { input = params.input, callback = callback }
+        host.actions[#host.actions + 1] = { input = params.input, selected_files = params.selected_files, callback = callback }
         return
       end
       if params.operation == "plan_close" or params.operation == "plan_view" then callback({}) return end

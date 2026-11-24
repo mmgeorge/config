@@ -181,6 +181,23 @@ pub struct PlanNavigationIndex {
     pub plan_id: String,
     pub plan_version: u64,
     pub anchor: Vec<PlanNavigationAnchor>,
+    /// First inspection mode with visible changes, keyed by the proposed review path.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) file_visibility: std::collections::BTreeMap<String, FileVisibility>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileVisibility {
+    Empty,
+    All,
+    Public,
+}
+
+impl FileVisibility {
+    pub(super) fn visible(self, public_only: bool) -> bool {
+        self == Self::Public || (self == Self::All && !public_only)
+    }
 }
 
 impl PlanNavigationIndex {
@@ -236,6 +253,7 @@ impl PlanRenderer {
                 plan_id: document.plan_id.clone(),
                 plan_version: document.version,
                 anchor: Vec::new(),
+                file_visibility: Default::default(),
             },
         }
     }
