@@ -599,6 +599,33 @@ async fn symlinked_worktree_preserves_local_deleted_files_and_ignored_identity()
 }
 
 #[tokio::test]
+async fn ignored_changes_preserve_git_file_labels() {
+    let (directory, service, _, _) = fixture().await;
+    let root = directory.path();
+    std::fs::remove_file(root.join("sample.txt")).unwrap();
+    std::fs::write(root.join("new.txt"), "added\n").unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let paths = ["sample.txt", "new.txt"]
+        .map(|path| forge_git::RepositoryPath::new(path.as_bytes().to_vec()).unwrap());
+    crate::ignored::update(storage.path(), root, &Default::default(), &paths, true).unwrap();
+    service
+        .configure_ignored_directory(storage.path().to_owned())
+        .unwrap();
+    let snapshot = service
+        .open(DocumentId("ignored-labels".into()), root.to_owned())
+        .await
+        .unwrap();
+    for (path, change, label) in [
+        ("sample.txt", "deleted", "Deleted"),
+        ("new.txt", "added", "New"),
+    ] {
+        let record = file(&snapshot, path, Some(StatusSection::Ignored));
+        assert_eq!(record.change, change, "{path}");
+        assert_eq!(record.header[0].text, label, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn stale_ignore_rejects_changed_sources_and_does_not_relax_discard() {
     let (directory, service, _, _) = fixture().await;
     let storage = tempfile::tempdir().unwrap();

@@ -108,6 +108,9 @@ default, including historical source for deleted files. Set
 `status_open_target = "tab"` in `require("forge").setup({ ... })` to open files in
 a new tab. The default is `status_open_target = "buffer"`.
 
+In **Ignored changes**, ForgeStatus labels untracked files `New` and tracked files
+deleted from the worktree `Deleted`.
+
 ## Diff controls
 
 Status, branch comparisons, PR and commit reviews, walkthrough review excerpts,

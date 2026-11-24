@@ -145,10 +145,13 @@ impl FileTarget {
 
     pub fn semantic(&self) -> StatusFile {
         let record = &self.record;
-        let kind = match self.section {
-            StatusSection::Staged => record.staged,
-            StatusSection::Untracked => ChangeKind::Added,
-            _ => record.unstaged,
+        let untracked = matches!(record.state, PathState::Untracked);
+        let kind = if untracked {
+            ChangeKind::Added
+        } else if self.section == StatusSection::Staged {
+            record.staged
+        } else {
+            record.unstaged
         };
         use forge_diff::file_header::FileChange;
         let change = match kind {
@@ -178,7 +181,6 @@ impl FileTarget {
             _ => None,
         };
         let path = record.path.display_label().replace(['\n', '\r'], " ");
-        let untracked = matches!(record.state, PathState::Untracked);
         let counts = match stats {
             StatusStatistics::Exact { added, deleted } => Some((added, deleted)),
             _ => None,
