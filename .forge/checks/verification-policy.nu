@@ -1,21 +1,15 @@
-# Verify that policy changes preserve a fix's executable identity through the real owner.
+# Verify that a later scoped request uses its own check definition and coverage.
 use std/assert
-use adapter-integration.nu [host_start host_request host_stopped host_tool tool_snapshot]
+use adapter-integration.nu [host_start host_initialize host_request host_stopped host_tool tool_snapshot]
 const repository = path self | path dirname | path dirname | path dirname
 
-def --env run_check [apply: bool] {
-  let result = tool_snapshot (host_tool 'check_run' {check: 'format', all: true, apply: $apply})
+def --env run_check [apply: bool, expected_state: string = 'passed'] {
+  let result = tool_snapshot (host_tool 'check_run' {check: 'format', paths: ['fixture.txt'], apply: $apply})
   assert equal $result.outcome.kind 'succeeded' $result.output
   let run_id = $result.output | from json | get run_id
   let run = host_request 'session.check.status' {run_id: $run_id, wait_for_completion: true}
-  assert equal $run.state 'passed' ($run | to json)
+  assert equal $run.state $expected_state ($run | to json)
   $run
-}
-
-def requirements [scratch: path] {
-  let ledgers = glob ($scratch | path join 'data/**/verification/requirements.json' | str replace --all '\' '/')
-  assert equal ($ledgers | length) 1
-  open ($ledgers | first) | get requirements | values
 }
 
 def main [] {
@@ -32,27 +26,24 @@ def main [] {
   host_start $executable $scratch
   print $"Verification policy evidence: ($scratch)"
   try {
-    host_request 'host.initialize' {protocol_version: 41} | ignore
+    host_initialize
     let initialized = host_request 'session.initialize' {workspace: $workspace, data_root: ($scratch | path join 'data'), client_id: 'verification-policy', provider: {kind: 'mock', command: ['mock']}}
     $env.FORGE_ADAPTER_HOST.session = $initialized.session.id
     host_request 'session.permission.set' {change: {kind: 'enable_yolo'}} | ignore
     host_request 'session.check.override' {enabled: {format: true}} | ignore
     run_check true | ignore
     assert equal (open --raw ($workspace | path join 'fixture.txt')) 'formatted source'
-    assert equal (requirements $scratch | first | get state.state) 'pending'
-    # A successful manual run under task enablement cannot discharge a configured-disabled check.
-    run_check false | ignore
-    assert equal (requirements $scratch | first | get state.state) 'pending'
-    let enabled = $config | update checks.format.enabled true | insert checks.format.trigger.auto false | insert checks.format.action.label 'Formatter display label'
-    let replaced = $enabled | update checks.format.action.adapter.script.command ($prefix | append 'format_clean')
+    let replaced = $config | update checks.format.enabled true | update checks.format.action.adapter.script.command ($prefix | append 'format_clean')
     $replaced | to json | save --force ($workspace | path join '.forge.json')
-    run_check false | ignore
-    assert equal (requirements $scratch | first | get state.state) 'pending'
-    $enabled | to json | save --force ($workspace | path join '.forge.json')
-    host_request 'session.check.override' {enabled: {format: true}, auto: {format: false}, scopes: {format: 'all'}} | ignore
     let verified = run_check false
-    assert equal $verified.commands.0.context.selection.kind 'all'
-    assert equal (requirements $scratch | first | get state.state) 'satisfied'
+    assert equal $verified.commands.0.context.selection.kind 'paths'
+    assert equal $verified.commands.0.context.selection.paths.paths ['fixture.txt']
+    assert equal ($verified.commands | where selected == true | length) 1
+    let unsupported = $replaced | update checks.format.action.adapter.script.command ($prefix | append 'format_unsupported')
+    $unsupported | to json | save --force ($workspace | path join '.forge.json')
+    let rejected = run_check true 'configuration_error'
+    assert $rejected.commands.0.result.unsupported
+    assert equal ($rejected.commands | where selected == true | length) 1
     # Observe a native turn before collecting it, so shutdown cannot race its startup.
     let hold = host_request 'session.provider.mock_response' {operation: 'hold', any_session: true}
     host_request 'session.prompt.submit' {text: 'Hold for verification fixture cleanup'} | ignore
@@ -62,7 +53,7 @@ def main [] {
     touch ($env.FORGE_ADAPTER_HOST.input | path join 'eof')
     host_stopped
     rm -rf $scratch
-    print 'Verified configured-disabled obligations, changed-tool rejection, and policy recovery'
+    print 'Verified scoped checks after a formatter change'
   } catch {|failure|
     $failure | to json | save --force ($scratch | path join 'failure.json')
     try { host_request 'host.shutdown' | ignore } catch { null }

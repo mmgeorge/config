@@ -1419,11 +1419,6 @@ impl HarnessBroker {
                 "accepted plan revision changed during control validation"
             );
             if checks_current {
-                anyhow::ensure!(
-                    self.check_runner
-                        .verification_satisfied(workspace.checkpoint())?,
-                    "required whole-check verification changed before phase completion"
-                );
                 let design = document
                     .design
                     .as_ref()

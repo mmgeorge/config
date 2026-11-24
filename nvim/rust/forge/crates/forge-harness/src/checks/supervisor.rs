@@ -77,7 +77,7 @@ pub struct CheckSupervisor {
     pub(super) changes: super::changes::CheckChanges,
     presentation: Arc<Mutex<SessionPresentation>>,
     state: Mutex<CheckStateStore>,
-    pub(super) verification: Mutex<super::verification::VerificationRequirements>,
+
     notification: OnceLock<CheckNotification>,
     owner: OnceLock<super::owner::CheckOwnerSender>,
     trace: Arc<crate::trace::TraceStore>,
@@ -255,61 +255,6 @@ pub(crate) struct CheckAdmission {
 }
 
 impl CheckSupervisor {
-    /// Keep completion scheduling active until existing mutation obligations can be inspected.
-    pub(crate) fn has_verification_requirements(&self) -> Result<bool> {
-        Ok(self
-            .verification
-            .lock()
-            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-            .has_requirements())
-    }
-
-    /// Check mandatory verification against the same source capture used by completion.
-    pub(crate) fn verification_satisfied(
-        &self,
-        snapshot: &crate::checkpoint::CheckpointRecord,
-    ) -> Result<bool> {
-        Ok(self.pending_verification(snapshot)?.is_empty())
-    }
-
-    /// Get each check whose whole-check verification the source capture still needs, once.
-    ///
-    /// A definition comes from the mutation that created the obligation, so its name and ID
-    /// remain available when the current configuration changed or removed it.
-    pub(crate) fn pending_verification(
-        &self,
-        snapshot: &crate::checkpoint::CheckpointRecord,
-    ) -> Result<Vec<super::CheckDefinition>> {
-        if !self.has_verification_requirements()? {
-            return Ok(Vec::new());
-        }
-        let config = ConfigSnapshot::load(&self.workspace)?;
-        let pending = self
-            .verification
-            .lock()
-            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-            .pending_for_config(snapshot, &config)?;
-        let mut definitions: Vec<super::CheckDefinition> = Vec::new();
-        for requirement in pending {
-            if !definitions
-                .iter()
-                .any(|definition| definition.id == requirement.check)
-            {
-                definitions.push(requirement.definition);
-            }
-        }
-        Ok(definitions)
-    }
-
-    /// Recheck mutation obligations against fresh source after a completion check run.
-    pub(crate) async fn completion_verification_satisfied(&self) -> Result<bool> {
-        if !self.has_verification_requirements()? {
-            return Ok(true);
-        }
-        let snapshot = self.changes.capture(&self.session_id).await?;
-        self.verification_satisfied(&snapshot)
-    }
-
     pub(crate) fn session_owner(&self) -> crate::timeline::TimelineOwner {
         crate::timeline::TimelineOwner::session(&self.session_id)
     }
@@ -350,14 +295,8 @@ impl CheckSupervisor {
             &workspace,
             &data_root,
             &root,
-            objects.clone(),
-            repositories,
-        )?;
-        let verification = super::verification::VerificationRequirements::open(
-            &root,
-            &workspace,
-            &session_id,
             objects,
+            repositories,
         )?;
         let mut records = BTreeMap::new();
         for mut run in Self::saved_history(&root)? {
@@ -389,7 +328,6 @@ impl CheckSupervisor {
             workspace,
             root,
             changes,
-            verification: Mutex::new(verification),
             presentation,
             state: Mutex::new(CheckStateStore {
                 records,
@@ -661,6 +599,24 @@ impl CheckSupervisor {
         snapshot: ConfigSnapshot,
         admission: CheckAdmission,
     ) -> Result<PreparedCheckRun> {
+        self.prepare_selection(snapshot, admission, true)
+    }
+
+    /// Admit only plan selections and their declared dependencies, even for an empty plan.
+    pub(crate) fn prepare_plan(
+        &self,
+        snapshot: ConfigSnapshot,
+        admission: CheckAdmission,
+    ) -> Result<PreparedCheckRun> {
+        self.prepare_selection(snapshot, admission, false)
+    }
+
+    fn prepare_selection(
+        &self,
+        snapshot: ConfigSnapshot,
+        admission: CheckAdmission,
+        automatic: bool,
+    ) -> Result<PreparedCheckRun> {
         let CheckAdmission {
             owner,
             request,
@@ -746,7 +702,8 @@ impl CheckSupervisor {
             workspace_digest: BTreeMap::new(),
             commands: Vec::new(),
         };
-        let applicability = super::applicability::resolve(&request, &effective, &inventory)?;
+        let applicability =
+            super::applicability::resolve_selection(&request, &effective, &inventory, automatic)?;
         let requested: std::collections::BTreeSet<_> = applicability
             .iter()
             .filter(|item| item.selected)
@@ -944,14 +901,6 @@ impl CheckSupervisor {
 
     /// Freezes declared inputs before review, authorization, or process admission.
     pub(crate) async fn resolve(&self, mut run: PreparedCheckRun) -> Result<PreparedCheckRun> {
-        if run.context.automatic && self.has_verification_requirements()? {
-            let snapshot = self.changes.capture(&self.session_id).await?;
-            super::discovery::DiscoveryInputs::for_run(self, &run)?;
-            self.verification
-                .lock()
-                .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                .require_in_run(&mut run, &snapshot)?;
-        }
         let mut commands = Vec::new();
         for mut check in std::mem::take(&mut run.commands) {
             let context = check.context.clone();
@@ -1380,14 +1329,6 @@ impl CheckSupervisor {
                 run.state = CheckState::Failed;
                 return Ok(());
             }
-            // Mandatory verification takes precedence over the plan's case selections and exclusions.
-            if self.has_verification_requirements()? {
-                let snapshot = self.changes.capture(&self.session_id).await?;
-                self.verification
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                    .require_in_run(run, &snapshot)?;
-            }
         }
         let applying = run.commands.iter().any(|command| {
             command.selected
@@ -1487,11 +1428,6 @@ impl CheckSupervisor {
             if applying {
                 super::discovery::DiscoveryInputs::for_run(self, run)?;
             }
-            let verification_capture = self
-                .verification
-                .lock()
-                .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                .capture();
             let Some(before) = cancelled
                 .read(external_cancelled, async {
                     if preparing {
@@ -1567,7 +1503,6 @@ impl CheckSupervisor {
             if let Some(inputs) = planned_inputs {
                 super::planned::validate_inputs(self, run, inputs)?;
             }
-            let mut mutation = None;
             if preparing {
                 context.preparation = Some(super::model::PreparationSnapshot::Started {
                     before: Box::new(before.clone().context("preparation snapshot missing")?),
@@ -1580,41 +1515,13 @@ impl CheckSupervisor {
                     ));
                     return Err(error.context("persist source before preparation"));
                 }
-                if matches!(
-                    context.category,
-                    super::CheckCategory::Format | super::CheckCategory::Lint
-                ) {
-                    mutation = Some(
-                        self.verification
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                            .prepare(
-                                &run.clone().into_record(),
-                                &run.commands[index].clone().into_record(),
-                            )?,
-                    );
-                }
                 if cancelled.requested.load(Ordering::Acquire)
                     || external_cancelled.is_some_and(|value| *value.borrow())
                 {
-                    if let Some(preparation) = mutation.take() {
-                        self.verification
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                            .retire_unlaunched(preparation)?;
-                    }
                     run.interrupt();
                     return Ok(());
                 }
             }
-            let mutation = mutation
-                .map(|preparation| {
-                    self.verification
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                        .launch(preparation)
-                })
-                .transpose()?;
             run.commands[index].state = CheckState::Running;
             run.commands[index].started_at_ms = Some(now_ms());
             run.record(
@@ -1676,20 +1583,8 @@ impl CheckSupervisor {
             } else {
                 None
             };
-            if let Some(mutation) = mutation {
-                // Store the collected result and after-snapshot before retiring its obligation.
+            if preparing {
                 publication.persist(&run.clone().into_record()).await?;
-                self.verification
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                    .retire_unsupported(
-                        mutation,
-                        &run.commands[index].clone().into_record(),
-                        before.as_ref().context("preparation snapshot missing")?,
-                        preparation_after
-                            .as_ref()
-                            .context("preparation snapshot missing")?,
-                    )?;
             }
             if let Err(error) = execution_result
                 && error.is::<CommandTimeout>()
@@ -1731,19 +1626,6 @@ impl CheckSupervisor {
                         if let Some(deadline) = deadline {
                             deadline.check()?;
                         }
-                        if self.has_verification_requirements()? {
-                            super::discovery::DiscoveryInputs::for_run(self, run)?;
-                        }
-                        self.verification
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                            .observe(
-                                verification_capture,
-                                &run.clone().into_record(),
-                                &run.commands[index].clone().into_record(),
-                                &before,
-                                &after,
-                            )?;
                     }
                 }
             }

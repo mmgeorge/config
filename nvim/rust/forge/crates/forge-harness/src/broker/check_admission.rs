@@ -42,7 +42,6 @@ pub(crate) struct AutomaticCheckRun {
 pub(crate) struct AutomaticCheckResult {
     capture: AutomaticCheckRefresh,
     run: CheckRun,
-    verification_satisfied: bool,
 }
 
 /// Own one task verification process and the authority that admitted it.
@@ -317,7 +316,6 @@ impl HarnessBroker {
         {
             return Ok(AutomaticCheckAction::Revalidate);
         }
-        let verification_satisfied = result.verification_satisfied;
         let Some(run) = self.commit_automatic_check(&tx.interaction, result)? else {
             return Ok(AutomaticCheckAction::Revalidate);
         };
@@ -341,10 +339,7 @@ impl HarnessBroker {
             self.observer.completion_queue.finish()?;
             return Ok(AutomaticCheckAction::Finish(std::mem::take(&mut tx.result)));
         }
-        if run.state == CheckState::Stale
-            || matches!(run.state, CheckState::Passed | CheckState::Skipped)
-                && !verification_satisfied
-        {
+        if run.state == CheckState::Stale {
             return Ok(AutomaticCheckAction::Refresh(
                 self.capture_automatic_check(&tx.interaction)?,
             ));
@@ -531,7 +526,6 @@ impl HarnessBroker {
             .commands
             .iter()
             .any(|command| command.state != CheckState::Skipped)
-            && !capture.supervisor.has_verification_requirements()?
         {
             return Ok(AutomaticCheckAdmission::Empty);
         }
@@ -642,15 +636,9 @@ impl AutomaticCheckRun {
                 None,
             )
             .await?;
-        let verification_satisfied = self
-            .capture
-            .supervisor
-            .completion_verification_satisfied()
-            .await?;
         Ok(AutomaticCheckResult {
             capture: self.capture,
             run,
-            verification_satisfied,
         })
     }
 }
@@ -721,6 +709,7 @@ mod tests {
             .find(|definition| definition.id == "format")
             .unwrap();
         let root = broker.check_runner.root.clone();
+        std::fs::create_dir_all(root.join("verification"))?;
         std::fs::write(
             root.join("verification/requirements.json"),
             serde_json::to_vec(&json!({
@@ -745,7 +734,6 @@ mod tests {
             broker.repositories.clone(),
             broker.trace.clone(),
         )?;
-        assert!(broker.check_runner.has_verification_requirements()?);
         Ok((workspace, data, broker, exchange))
     }
 
@@ -764,7 +752,6 @@ mod tests {
         );
         assert!(matches!(action, AutomaticCheckAction::Finish(_)));
         assert!(broker.check_runner.history()?.is_empty());
-        assert!(broker.check_runner.has_verification_requirements()?);
         crate::settings::SettingsStore::open(&broker.data_root)?.patch(
             crate::settings::SettingTarget {
                 scope: crate::settings::SettingScope::Global,
@@ -804,7 +791,6 @@ mod tests {
             broker.check_runner.history()?.is_empty(),
             "read-only turn scheduled a check"
         );
-        assert!(broker.check_runner.has_verification_requirements()?);
         Ok(())
     }
 
@@ -851,11 +837,7 @@ mod tests {
             )?
             .into_record();
         run.state = CheckState::Passed;
-        let result = AutomaticCheckResult {
-            capture,
-            run,
-            verification_satisfied: false,
-        };
+        let result = AutomaticCheckResult { capture, run };
         let mut transaction = AutomaticCheckTransaction {
             automatic: AutomaticChecks::open(&broker.check_runner.root, &exchange.id)?,
             change_owner: exchange.id.clone(),

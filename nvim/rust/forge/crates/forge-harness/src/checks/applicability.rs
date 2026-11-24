@@ -128,6 +128,16 @@ pub(super) fn resolve(
     config: &CheckConfig,
     inventory: &ChangeInventory,
 ) -> Result<Vec<CheckApplicability>> {
+    resolve_selection(request, config, inventory, true)
+}
+
+/// Apply change triggers only when the caller requests automatic selection.
+pub(super) fn resolve_selection(
+    request: &RunRequest,
+    config: &CheckConfig,
+    inventory: &ChangeInventory,
+    automatic: bool,
+) -> Result<Vec<CheckApplicability>> {
     let known: BTreeSet<_> = config
         .definitions
         .iter()
@@ -174,7 +184,11 @@ pub(super) fn resolve(
                 || request.selections.contains_key(&check.id)
             {
                 (true, "Explicitly requested".into())
-            } else if !request.ids.is_empty() {
+            } else if !automatic
+                || !request.ids.is_empty()
+                || !request.include.is_empty()
+                || !request.selections.is_empty()
+            {
                 (false, "Not requested".into())
             } else if !check.auto {
                 (false, "Automatic execution disabled".into())

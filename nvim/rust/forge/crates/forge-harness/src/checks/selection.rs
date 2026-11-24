@@ -162,7 +162,7 @@ pub struct SelectedChecks {
     #[serde(default)]
     pub ids: Vec<String>,
     #[serde(default)]
-    /// Adds explicit suites without excluding automatically applicable suites.
+    /// Additional explicitly requested check IDs.
     pub include: Vec<String>,
     #[serde(default)]
     pub selections: BTreeMap<String, CheckSelection>,

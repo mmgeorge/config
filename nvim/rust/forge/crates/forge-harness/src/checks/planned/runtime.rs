@@ -5,7 +5,7 @@ use crate::checks::adapter::{CheckDiscoverRequest, DiscoverMode, Discovery};
 use crate::checks::discovery::DiscoveryInputs;
 use crate::checks::supervisor::{CheckCancellation, CheckDeadline};
 use crate::checks::{
-    CheckCategory, CheckSelection, CheckState, CheckSupervisor, ConfigSnapshot, PreparedCheckRun,
+    CheckSelection, CheckState, CheckSupervisor, ConfigSnapshot, PreparedCheckRun,
 };
 use anyhow::{Context, Result, ensure};
 
@@ -122,53 +122,67 @@ pub(in crate::checks) async fn resolve_run(
         return Ok(());
     }
     let selections = planned.selections();
-    for command in &mut run.commands {
-        if command.context.category != CheckCategory::Test {
-            continue;
-        }
-        let definition = expected
-            .config
-            .definitions
-            .iter()
-            .find(|definition| definition.id == command.context.definition_id)
-            .context("planned check has no captured definition")?;
+    if selections.is_empty()
+        && !planned
+            .test_scopes()
+            .values()
+            .any(|scope| *scope == crate::plan::PlanTestScope::WholeSuite)
+    {
+        return Ok(());
+    }
+    let mut requested = std::collections::BTreeSet::new();
+    for definition in &expected.config.definitions {
         let enabled = run
             .context
             .overrides
             .get(&definition.id)
             .copied()
             .unwrap_or(definition.enabled);
-        if !enabled {
-            command.selected = false;
-            command.state = CheckState::Skipped;
-            command.error = Some("Disabled for this plan".into());
-            continue;
-        }
-        if planned.scope(&definition.id) == crate::plan::PlanTestScope::WholeSuite {
-            command.selected = true;
-            command.state = CheckState::Pending;
-            command.error = None;
-            command.context.selection = CheckSelection::All;
-            command.context.resolved = None;
-            command.context.reason = "Reviewer requested the whole test suite".into();
-            continue;
-        }
-        if let Some(selection) = selections.get(&command.context.definition_id) {
-            command.selected = true;
-            command.state = CheckState::Pending;
-            command.error = None;
-            command.context.selection = CheckSelection::Tests {
-                tests: selection.clone(),
-            };
-            command.context.resolved = None;
-            command.context.reason = "Required planned tests".into();
-        } else {
-            command.selected = false;
-            command.state = CheckState::Skipped;
-            command.error = Some("The plan lists no tests to run for this check".into());
-            command.context.reason = "The plan lists no tests to run for this check".into();
+        if enabled
+            && run
+                .commands
+                .iter()
+                .any(|command| command.selected && command.context.definition_id == definition.id)
+        {
+            requested.insert(definition.id.clone());
         }
     }
+    requested.extend(selections.keys().cloned());
+    let mut scopes = std::collections::BTreeMap::new();
+    for id in &requested {
+        if planned.scope(id) == crate::plan::PlanTestScope::WholeSuite {
+            scopes.insert(id.clone(), CheckSelection::All);
+        } else if let Some(selection) = selections.get(id) {
+            scopes.insert(
+                id.clone(),
+                CheckSelection::Tests {
+                    tests: selection.clone(),
+                },
+            );
+        }
+    }
+    // Exact discovery identifies the owners of the requested cases. Admit their
+    // dependencies through the same resolver used for explicitly named checks.
+    let prepared = supervisor.prepare_plan(
+        expected,
+        crate::checks::CheckAdmission {
+            owner: (*run.owner).clone(),
+            request: crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
+                ids: requested.into_iter().collect(),
+                selections: scopes,
+                ..Default::default()
+            }),
+            overrides: run.context.overrides.clone(),
+            task_overrides: run.context.task_overrides.clone(),
+            inventory: crate::checks::ChangeInventory::Known(run.context.changed_files.clone()),
+            shell: run.shell,
+            trigger: run.context.trigger.clone(),
+            task_id: run.context.task_id.clone(),
+            revision: run.revision,
+        },
+    )?;
+    let prepared = supervisor.continue_attempt(&run.clone().into_record(), prepared)?;
+    run.commands = supervisor.resolve(prepared).await?.commands;
     Ok(())
 }
 

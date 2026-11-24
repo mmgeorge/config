@@ -37,8 +37,12 @@ export def --env host_request [method: string, params: record = {}] {
   }
 }
 
+export def --env host_initialize [] {
+  host_request 'host.initialize' {protocol_version: 43} | ignore
+}
+
 def --env host_tool_start [name: string, arguments: record] {
-  let previous = host_request 'session.exchange.list' | length
+  let previous = host_request 'session.exchange.list' | latest_tool | get -o item_id
   host_request 'session.provider.mock_response' {operation: 'script', script: {steps: [
     {kind: 'tool_call', name: $name, arguments: $arguments}
     {kind: 'message', content: 'response', text: 'adapter tool completed'}
@@ -47,11 +51,12 @@ def --env host_tool_start [name: string, arguments: record] {
   $previous
 }
 
-def --env host_tool_wait [previous: int] {
+def --env host_tool_wait [previous: any] {
   let deadline = (date now) + 30sec
   loop {
     let exchanges = host_request 'session.exchange.list'
-    if ($exchanges | length) > $previous and ($exchanges | last | get state) == 'complete' { return $exchanges }
+    let latest = $exchanges | latest_tool
+    if $latest.item_id? != $previous and $latest.final_snapshot? != null and ($exchanges | last | get state) == 'complete' { return $exchanges }
     if (date now) >= $deadline { error make {msg: 'Tool exchange did not complete'} }
     sleep 10ms
   }
@@ -63,7 +68,16 @@ export def --env host_tool [name: string, arguments: record] {
 }
 
 export def tool_snapshot [exchanges: list] {
-  $exchanges | last | get entry | where kind == 'commentary' | first | get commentary.tool | first | get store.execution | values | last | get final_snapshot
+  $exchanges | latest_tool | get final_snapshot
+}
+
+# A tool submitted while a result is arriving can join the existing exchange.
+def latest_tool [] {
+  let exchanges = $in
+  if ($exchanges | is-empty) { return null }
+  let tools = $exchanges | last | get entry | where kind == 'commentary' | get commentary.tool | flatten
+  if ($tools | is-empty) { return null }
+  $tools | last | get store.execution | values | last
 }
 
 def --env check_start [arguments: record] {
@@ -376,7 +390,7 @@ def main [probe_workspace?: path, probe_root?: path, --nextest-only, --measureme
     let executable = $repository | path join 'nvim/rust/forge/target/debug' (if $nu.os-info.name == 'windows' { 'forge.exe' } else { 'forge' })
     host_start $executable $probe_root
     try {
-      host_request 'host.initialize' {protocol_version: 41} | ignore
+      host_initialize
       let initialized = host_request 'session.initialize' {workspace: $probe_workspace, data_root: ($probe_root | path join 'data'), client_id: 'reservation-probe', provider: {kind: 'mock', command: ['mock']}}
       $env.FORGE_ADAPTER_HOST.session = $initialized.session.id
       for operation in ['check_run' 'check_discover'] {
@@ -616,7 +630,7 @@ test = false
   host_start $executable $scratch
   print $"Integration evidence: ($scratch)"
   try {
-    host_request 'host.initialize' {protocol_version: 41} | ignore
+    host_initialize
     let initialized = host_request 'session.initialize' {workspace: $workspace, data_root: ($scratch | path join 'data'), client_id: 'adapter-integration', provider: {kind: 'mock', command: ['mock']}}
     $env.FORGE_ADAPTER_HOST.session = $initialized.session.id
     verify_nextest $workspace $measurements
@@ -816,11 +830,8 @@ test = false
       | where {|command| $command.context.definition_id == 'format_unsupported' and $command.selected and $command.context.purpose == 'prepare' } | first
     assert equal $unsupported.state 'configuration_error'
     assert $unsupported.result.unsupported
-    let ledger_paths = glob ($scratch | path join 'data/**/verification/requirements.json' | str replace --all '\' '/')
-    assert (not ($ledger_paths | is-empty))
-    let requirements = $ledger_paths | each {|path| open $path | get requirements | values } | flatten
-    assert (not ($requirements | any {|requirement| $requirement.definition.id == 'format_unsupported' }))
-    print 'Verified unsupported apply retires its provisional verification requirement'
+    assert equal ($unsupported_run.commands | where selected == true | length) 1
+    print 'Verified unsupported apply reports its own result'
     for case in $formats {
       let recorded = check_wait {check: $case.name, paths: ['fixture.txt']}
       let command = $recorded.commands | where {|command| $command.context.definition_id == $case.name and $command.selected and $command.context.purpose == 'verify' } | first

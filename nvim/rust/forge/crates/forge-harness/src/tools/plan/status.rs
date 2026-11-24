@@ -24,7 +24,7 @@ pub(super) fn definition() -> ControlToolDefinition {
 /// Execute plan_status within the current turn authority.
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
-    invocation: crate::tools::ControlToolInvocation,
+    _invocation: crate::tools::ControlToolInvocation,
     output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
     runtime.require_readable_plan()?;
@@ -44,13 +44,13 @@ pub(super) async fn execute(
     }
     if let Some(authoring) = &runtime.context.plan_authoring {
         return Ok(crate::tools::ControlToolResult {
-            invocation: Some(invocation),
+            invocation: None,
             message: authoring.status()?,
         });
     }
     let execution = execution_state(runtime).await?;
     Ok(crate::tools::ControlToolResult {
-        invocation: Some(invocation),
+        invocation: None,
         message: status_text(&document, execution.as_ref())?,
     })
 }

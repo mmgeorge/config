@@ -1,33 +1,5 @@
 use super::*;
 
-/// Explain a completion refused because an adapter fix still awaits its whole-check verification.
-///
-/// The text names each check and the exact `check_run` request that satisfies it. Only a passing
-/// read-only run over the whole check counts: a run narrowed to the changed paths, which is what a
-/// request naming only the check ID selects, leaves the obligation pending.
-pub(crate) fn goal_verification_pending(pending: &[crate::checks::CheckDefinition]) -> String {
-    let checks = pending
-        .iter()
-        .map(|definition| format!("{} (`{}`)", definition.name, definition.id))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let ids = pending
-        .iter()
-        .map(|definition| definition.id.as_str())
-        .collect::<Vec<_>>();
-    let selections = ids
-        .iter()
-        .map(|id| (id.to_string(), json!({"kind":"all"})))
-        .collect::<serde_json::Map<_, _>>();
-    let request = json!({"ids":ids,"selections":selections});
-    format!(
-        "required whole-check verification remains pending for {checks}, because a fix changed \
-         source after their last whole-check pass; run check_run {request} without apply, wait for \
-         its result, and complete the goal only after those checks pass. A run limited to changed \
-         paths does not verify the fix."
-    )
-}
-
 /// Explain a completion refused because another owner held the workspace when the turn ended.
 pub(crate) const GOAL_WORKSPACE_BUSY: &str = "another operation, such as a check run this turn started, held the workspace when the turn ended, so Harness could not verify the source; review the check results, then request completion again";
 
@@ -284,8 +256,8 @@ mod tests {
         result
     }
 
-    /// Record one adapter fix whose whole-check verification has not run, then reload the ledger.
-    fn require_pending_verification(broker: &mut HarnessBroker) -> Result<()> {
+    /// Reopen a session that recorded a pending format requirement under the previous policy.
+    fn reopen_with_legacy_format_requirement(broker: &mut HarnessBroker) -> Result<()> {
         let workspace = PathBuf::from(&broker.session.workspace);
         let root = crate::storage::state::directory(&broker.data_root)
             .join(&broker.session.id)
@@ -324,6 +296,7 @@ mod tests {
                 }
             }
         });
+        std::fs::create_dir_all(root.join("verification"))?;
         std::fs::write(
             root.join("verification").join("requirements.json"),
             serde_json::to_vec(&ledger)?,
@@ -343,9 +316,9 @@ mod tests {
         Ok(())
     }
 
-    /// A refused completion keeps the goal running and tells the model why on its next turn.
+    /// A saved formatter mutation cannot add a check to goal completion.
     #[tokio::test]
-    async fn refused_goal_completion_continues_the_goal_with_its_reason() -> Result<()> {
+    async fn goal_completion_ignores_previous_format_mutation() -> Result<()> {
         let workspace = super::super::test::repository();
         let data = tempfile::tempdir()?;
         let mut broker =
@@ -360,47 +333,12 @@ mod tests {
             })
             .await;
         assert!(admitted.response.error().is_none());
-        require_pending_verification(&mut broker)?;
-        dispatch_task_input(&mut broker)
-            .await
-            .context("a refused completion failed the goal turn")?;
-        assert!(broker.host_settlement().is_none());
-        let task = broker
-            .task_controller
-            .current()?
-            .context("a refused completion removed the goal")?;
-        assert_eq!(task.status(), crate::task::TaskStatus::Running);
-        let continuation = task
-            .turn
-            .as_ref()
-            .and_then(|turn| turn.continuation.as_ref())
-            .context("a refused completion reserved no continuation")?;
-        let instruction = crate::provider::test_support::input_text(
-            continuation
-                .work
-                .instruction()
-                .context("continuation has no provider input")?,
-        );
-        assert!(
-            instruction.contains("required whole-check verification remains pending"),
-            "{instruction}"
-        );
-        // The refusal names the check and the exact whole-check request that satisfies it, since
-        // a run narrowed to the changed paths does not.
-        assert!(
-            instruction.contains("Formatting (`format`)"),
-            "{instruction}"
-        );
-        assert!(
-            instruction
-                .contains(r#"check_run {"ids":["format"],"selections":{"format":{"kind":"all"}}}"#),
-            "{instruction}"
-        );
-        let exchanges = broker.store.list_exchange(&broker.session.id)?;
-        assert_eq!(exchanges[0].state(), ExchangeState::Complete);
-        // The continuation runs: nothing from the refused request blocks the next turn.
+        reopen_with_legacy_format_requirement(&mut broker)?;
         dispatch_task_input(&mut broker).await?;
-        assert_eq!(turn_count.load(Ordering::SeqCst), 2);
+        assert!(broker.host_settlement().is_none());
+        assert!(broker.task_controller.current()?.is_none());
+        assert_eq!(turn_count.load(Ordering::SeqCst), 1);
+        assert!(broker.check_runner.history()?.is_empty());
         Ok(())
     }
 

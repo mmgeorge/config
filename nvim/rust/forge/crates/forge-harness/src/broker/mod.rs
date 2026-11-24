@@ -10035,13 +10035,7 @@ impl HarnessBroker {
             // A refused completion is an ordinary turn outcome: the goal stays active and its next
             // turn tells the model why, instead of failing the foreground that asked.
             let refusal = match workspace {
-                foreground_goal_effect::GoalWorkspace::Reserved(reserved) => {
-                    let pending = self
-                        .check_runner
-                        .pending_verification(reserved.checkpoint())?;
-                    (!pending.is_empty())
-                        .then(|| foreground_goal_effect::goal_verification_pending(&pending))
-                }
+                foreground_goal_effect::GoalWorkspace::Reserved(_) => None,
                 foreground_goal_effect::GoalWorkspace::Unprotected { .. } => {
                     Some(foreground_goal_effect::GOAL_WORKSPACE_BUSY.to_owned())
                 }

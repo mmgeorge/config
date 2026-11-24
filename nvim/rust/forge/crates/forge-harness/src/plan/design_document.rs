@@ -46,7 +46,7 @@ pub struct DesignDocument {
     /// Adds configured checks explicitly, independently of automatic triggers.
     pub checks: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    /// Suppresses configured checks for this plan, including automatic selection.
+    /// Exclude these checks from this plan, including planned test discovery.
     pub disabled_checks: Vec<String>,
     /// Retain reviewer-owned test coverage choices independently of project defaults.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -327,14 +327,14 @@ mod tests {
         test_check.auto = false;
         design.check_configuration = Some(snapshot);
         let option = design
-            .check_options()
+            .check_options()?
             .into_iter()
             .find(|option| option["id"] == "tests")
             .unwrap();
         assert_eq!(option["enabled"], true);
         design.document.disabled_checks.push("tests".into());
         let option = design
-            .check_options()
+            .check_options()?
             .into_iter()
             .find(|option| option["id"] == "tests")
             .unwrap();

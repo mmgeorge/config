@@ -502,6 +502,19 @@ impl BrokerObserver {
         Ok(!submitted.plans_same_work(&reviewed.document)?)
     }
 
+    /// Bind execution to the retained submission when a review edit leaves the work unchanged.
+    fn execution_digest(&self, plan: &PlanRecord, review_digest: String) -> Result<String> {
+        if plan.submitted_version == Some(plan.document_version) {
+            return Ok(review_digest);
+        }
+        let submitted = self.plan_file.read_submitted_document(
+            &self.session_id,
+            &plan.id,
+            plan.model_revision,
+        )?;
+        Ok(crate::plan::digest(&serde_json::to_vec(&submitted)?))
+    }
+
     fn prepare_review_revision(
         &self,
         plan: &mut PlanRecord,
@@ -1052,7 +1065,7 @@ impl BrokerObserver {
             };
             plan.user_revision += 1;
             plan.accepted_revision = Some(plan.model_revision);
-            plan.accepted_digest = plan.review_digest.clone();
+            plan.accepted_digest = Some(self.execution_digest(&plan, digest)?);
             plan.state = PlanState::Accepted;
             plan.review = None;
             execution.record.revision = plan.model_revision;
@@ -1177,7 +1190,7 @@ impl BrokerObserver {
             });
         }
         plan.user_revision += 1;
-        plan.accepted_digest = Some(digest);
+        plan.accepted_digest = Some(self.execution_digest(&plan, digest)?);
         plan.accepted_revision = Some(plan.model_revision);
         plan.review = None;
         if plan.state != PlanState::Accepted {

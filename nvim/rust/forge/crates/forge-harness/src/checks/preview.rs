@@ -44,7 +44,12 @@ pub(crate) async fn plan(
             && check.category == CheckCategory::Test
             && (design.document.test_scopes.get(&check.id)
                 == Some(&crate::plan::PlanTestScope::WholeSuite)
-                || !design.document.tests.is_empty())
+                || design
+                    .document
+                    .tests
+                    .iter()
+                    .flat_map(|file| &file.cases)
+                    .any(|case| case.change != crate::plan::DesignTestChange::Removed))
             && !included.contains(&check.id)
         {
             included.push(check.id.clone());
@@ -66,7 +71,8 @@ pub(super) async fn resolve(
         ..Default::default()
     });
     let inventory = super::ChangeInventory::Known(files.to_vec());
-    let applicability = super::applicability::resolve(&request, config, &inventory)?;
+    let applicability =
+        super::applicability::resolve_selection(&request, config, &inventory, plan.is_none())?;
     let request = crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
         ids: applicability
             .iter()
@@ -121,12 +127,14 @@ pub(super) async fn resolve(
                 .iter()
                 .flat_map(|file| &file.cases)
                 .any(|case| case.change != crate::plan::DesignTestChange::Removed);
-            preview.selected = definition.enabled && (whole || present);
-            preview.pending = preview.selected && !whole;
+            preview.selected = applicable.selected;
+            preview.pending = preview.selected && present && !whole;
             preview.reason = if !definition.enabled {
                 "Disabled for this plan"
             } else if whole {
                 "Reviewer requested the whole test suite"
+            } else if !present && applicable.selected {
+                &applicable.reason
             } else if plan.tests.is_empty() {
                 "No test execution requested by this plan"
             } else if !present {

@@ -27,6 +27,82 @@ fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
     std::fs::write(workspace.join(".forge.json"),serde_json::to_vec(&serde_json::json!({"branch_prefix":"feature","checks":CheckConfig { version: 2, definitions }})).unwrap()).unwrap();
 }
 
+/// Matching change triggers cannot add work to an empty or explicitly scoped plan.
+#[test]
+fn plan_runs_only_requested_checks_and_transitive_dependencies() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    crate::storage::layout::prepare(data.path())?;
+    let mut format = definition("format", "unused");
+    format.category = CheckCategory::Format;
+    format.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
+        adapter::ScriptAdapterConfig {
+            command: vec!["unused".into()],
+        },
+    ));
+    format.depends_on.push("build".into());
+    let mut build = definition("build", "unused");
+    build.depends_on.push("generate".into());
+    save(
+        workspace.path(),
+        vec![
+            format,
+            build,
+            definition("generate", "unused"),
+            definition("unrelated", "unused"),
+        ],
+    );
+    let runner = make_runner(workspace.path(), data.path());
+    let paths = CheckSelection::Paths {
+        paths: adapter::PathSelection {
+            paths: vec!["one.rs".into()],
+        },
+    };
+    for selected in [false, true] {
+        let request = if selected {
+            SelectedChecks {
+                ids: vec!["format".into()],
+                selections: [("format".into(), paths.clone())].into(),
+                ..Default::default()
+            }
+        } else {
+            SelectedChecks::default()
+        };
+        let run = runner.prepare_plan(
+            ConfigSnapshot::load(workspace.path())?,
+            CheckAdmission {
+                request: RunRequest::Selected(request),
+                owner: runner.session_owner(),
+                overrides: Default::default(),
+                task_overrides: Default::default(),
+                inventory: ChangeInventory::Known(vec!["one.rs".into(), "two.rs".into()]),
+                shell: Default::default(),
+                trigger: "Plan execution".into(),
+                task_id: None,
+                revision: 1,
+            },
+        )?;
+        let commands: Vec<_> = run
+            .commands
+            .iter()
+            .filter(|command| command.selected)
+            .collect();
+        if selected {
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|command| command.context.definition_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["generate", "build", "format"]
+            );
+            assert_eq!(commands[2].context.selection, paths);
+        } else {
+            assert!(commands.is_empty());
+        }
+    }
+    Ok(())
+}
+
 /// Reject invalid fix batches before admission, preserving read-only dependency purpose.
 #[test]
 fn apply_preflight_rejects_mixed_categories_and_implicit_mutations() -> Result<()> {
@@ -513,280 +589,6 @@ fn recovery_preserves_partial_results_and_committed_outcomes() -> Result<()> {
     Ok(())
 }
 
-/// Pending mutation obligations survive reopen and require a current whole-check pass.
-#[test]
-fn verification_requirements_survive_history_loss_and_reject_stale_passes() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    crate::storage::layout::prepare(data.path())?;
-    let mut check = definition("format", "unused");
-    check.category = CheckCategory::Format;
-    check.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
-        adapter::ScriptAdapterConfig {
-            command: vec!["nu".into(), "format.nu".into()],
-        },
-    ));
-    save(workspace.path(), vec![check]);
-    let runner = make_runner(workspace.path(), data.path());
-    let mut mutation = runner
-        .prepare(
-            ConfigSnapshot::load(workspace.path())?,
-            CheckAdmission {
-                owner: runner.session_owner(),
-                request: RunRequest::All,
-                overrides: Default::default(),
-                task_overrides: Default::default(),
-                inventory: super::ChangeInventory::Known(Vec::new()),
-                shell: Default::default(),
-                trigger: "fix".into(),
-                task_id: Some("task".into()),
-                revision: 0,
-            },
-        )?
-        .into_record();
-    let mut verification = mutation.clone();
-    mutation.commands[0].context.as_mut().unwrap().purpose = CheckPurpose::Prepare;
-    verification.commands[0].id = "verify-1".into();
-    verification.commands[0].state = CheckState::Passed;
-    let before = crate::checkpoint::CheckpointRecord {
-        id: "before".into(),
-        session_id: "checks-test".into(),
-        workspace: workspace.path().to_string_lossy().into_owned(),
-        head: "UNBORN".into(),
-        tree: None,
-        file: Vec::new(),
-        deleted: Vec::new(),
-        checkout: Default::default(),
-        excluded: Default::default(),
-        created_at_ms: 0,
-    };
-    let mut ledger = runner.verification.lock().unwrap();
-    ledger.prepare(&mutation, &mutation.commands[0])?;
-    assert_eq!(ledger.pending(Some(&before))?.len(), 1);
-    drop(ledger);
-    // No command history is needed to recover the frozen definition and original selection.
-    let mut ledger = verification::VerificationRequirements::open(
-        data.path(),
-        workspace.path(),
-        "checks-test",
-        crate::storage::objects::ObjectStore::open(data.path())?,
-    )?;
-    assert_eq!(ledger.pending(Some(&before))?[0].definition.id, "format");
-    let frozen = ledger.resolution_input(&before)?;
-    let frozen: verification::ResolutionRequirements =
-        serde_json::from_value(serde_json::to_value(frozen)?)?;
-    assert_eq!(
-        frozen
-            .pending(&verification.context.as_ref().unwrap().snapshot)
-            .len(),
-        1
-    );
-    frozen.validate(&ledger)?;
-    let mut scheduled: PreparedCheckRun = verification.clone().try_into()?;
-    scheduled.commands[0].selected = false;
-    scheduled.commands[0].state = CheckState::Skipped;
-    scheduled.commands[0].context.selection = CheckSelection::Files { files: Vec::new() };
-    ledger.require_in_run(&mut scheduled, &before)?;
-    assert!(scheduled.commands[0].selected);
-    assert_eq!(scheduled.commands[0].state, CheckState::Pending);
-    assert_eq!(scheduled.commands[0].context.selection, CheckSelection::All);
-    let mut disabled = scheduled.clone();
-    disabled.context.overrides.insert("format".into(), false);
-    assert!(
-        ledger
-            .require_in_run(&mut disabled, &before)
-            .unwrap_err()
-            .to_string()
-            .contains("disabled")
-    );
-    // Reviewer exclusions do not waive mutation obligations, but task disabling still blocks them.
-    disabled.planned_tests = Some(super::PlannedTestExecution::new(
-        Vec::new(),
-        Default::default(),
-    )?);
-    ledger.require_in_run(&mut disabled, &before)?;
-    assert!(disabled.commands[0].selected);
-    disabled
-        .context
-        .task_overrides
-        .enabled
-        .insert("format".into(), false);
-    assert!(ledger.require_in_run(&mut disabled, &before).is_err());
-    let mut altered = scheduled.clone();
-    altered.context.snapshot.config.definitions[0].directory = "changed-directory".into();
-    assert!(
-        ledger
-            .require_in_run(&mut altered, &before)
-            .unwrap_err()
-            .to_string()
-            .contains("changed")
-    );
-    let mut missing = scheduled.clone();
-    missing.context.snapshot.config.definitions.clear();
-    assert!(
-        ledger
-            .require_in_run(&mut missing, &before)
-            .unwrap_err()
-            .to_string()
-            .contains("missing")
-    );
-    let capture = ledger.capture();
-    verification.commands[0].context.as_mut().unwrap().selection = CheckSelection::Paths {
-        paths: adapter::PathSelection {
-            paths: vec!["one.rs".into()],
-        },
-    };
-    ledger.observe(
-        capture,
-        &verification,
-        &verification.commands[0],
-        &before,
-        &before,
-    )?;
-    assert_eq!(ledger.pending(Some(&before))?.len(), 1);
-    verification.commands[0].context.as_mut().unwrap().selection = CheckSelection::All;
-    let capture = ledger.capture();
-    ledger.observe(
-        capture,
-        &verification,
-        &verification.commands[0],
-        &before,
-        &before,
-    )?;
-    assert!(ledger.pending(Some(&before))?.is_empty());
-    frozen.validate(&ledger)?;
-    assert_eq!(
-        frozen
-            .pending(&verification.context.as_ref().unwrap().snapshot)
-            .len(),
-        1
-    );
-    // Never-launched and proven unsupported fixes restore earlier verification.
-    let mut unsupported = mutation.clone();
-    unsupported.commands[0].id = "not-launched".into();
-    let preparation = ledger.prepare(&unsupported, &unsupported.commands[0])?;
-    assert!(frozen.validate(&ledger).is_err());
-    assert_eq!(ledger.pending(Some(&before))?.len(), 2);
-    ledger.retire_unlaunched(preparation)?;
-    assert!(ledger.pending(Some(&before))?.is_empty());
-    unsupported.commands[0].id = "unsupported".into();
-    let preparation = ledger.prepare(&unsupported, &unsupported.commands[0])?;
-    let launched = ledger.launch(preparation)?;
-    let mut events = adapter::events::FormatSink::new(
-        adapter::events::FormatOperation::Apply,
-        adapter::PathSelection::default(),
-    )?;
-    events.accept_line(r#"{"event":"unsupported"}"#)?;
-    unsupported.commands[0].result = Some(adapter::AdapterResult::Format(events.finish(
-        Some(adapter::RunExit {
-            success: true,
-            code: Some(0),
-        }),
-        false,
-    )));
-    ledger.retire_unsupported(launched, &unsupported.commands[0], &before, &before)?;
-    assert!(ledger.pending(Some(&before))?.is_empty());
-    assert_eq!(
-        verification::VerificationRequirements::open(
-            data.path(),
-            workspace.path(),
-            "checks-test",
-            crate::storage::objects::ObjectStore::open(data.path())?
-        )?
-        .pending(Some(&before))?
-        .len(),
-        0
-    );
-    // Unsupported output does not excuse an actual source change.
-    unsupported.commands[0].id = "unsupported-with-edits".into();
-    let preparation = ledger.prepare(&unsupported, &unsupported.commands[0])?;
-    let launched = ledger.launch(preparation)?;
-    let mut edited = before.clone();
-    edited.file.push(crate::checkpoint::CheckpointFile {
-        path: "edited.rs".into(),
-        object_id: "changed".into(),
-        mode: 0o100644,
-    });
-    ledger.retire_unsupported(launched, &unsupported.commands[0], &before, &edited)?;
-    assert_eq!(ledger.pending(Some(&before))?.len(), 2);
-    let capture = ledger.capture();
-    ledger.observe(
-        capture,
-        &verification,
-        &verification.commands[0],
-        &before,
-        &before,
-    )?;
-    assert!(ledger.pending(Some(&before))?.is_empty());
-    let mut changed_config = scheduled.context.snapshot.clone();
-    changed_config
-        .helper_digest
-        .insert("ignored-helper.nu".into(), "replacement".into());
-    assert_eq!(
-        ledger.pending_for_config(&before, &changed_config)?.len(),
-        2
-    );
-    changed_config.helper_digest.clear();
-    changed_config.config.definitions.clear();
-    assert_eq!(
-        ledger.pending_for_config(&before, &changed_config)?.len(),
-        2
-    );
-    let mut changed = before.clone();
-    changed.file.push(crate::checkpoint::CheckpointFile {
-        path: "changed.rs".into(),
-        object_id: "new-content".into(),
-        mode: 0o100644,
-    });
-    assert_eq!(ledger.pending(Some(&changed))?.len(), 2);
-    // A fix admitted after verification captured its generation cannot be cleared by that run.
-    let capture = ledger.capture();
-    mutation.commands[0].id = "fix-2".into();
-    ledger.prepare(&mutation, &mutation.commands[0])?;
-    ledger.observe(
-        capture,
-        &verification,
-        &verification.commands[0],
-        &before,
-        &before,
-    )?;
-    assert_eq!(ledger.pending(Some(&before))?.len(), 1);
-    let capture = ledger.capture();
-    verification
-        .context
-        .as_mut()
-        .unwrap()
-        .snapshot
-        .helper_digest
-        .insert("format.nu".into(), "changed".into());
-    ledger.observe(
-        capture,
-        &verification,
-        &verification.commands[0],
-        &before,
-        &before,
-    )?;
-    assert_eq!(ledger.pending(Some(&before))?.len(), 1);
-    let path = data.path().join("verification/requirements.json");
-    let saved = std::fs::read(&path)?;
-    std::fs::remove_file(&path)?;
-    std::fs::create_dir(&path)?;
-    mutation.commands[0].id = "fix-storage-failure".into();
-    assert!(ledger.prepare(&mutation, &mutation.commands[0]).is_err());
-    assert_eq!(ledger.pending(Some(&before))?.len(), 1);
-    std::fs::remove_dir(&path)?;
-    std::fs::write(&path, saved)?;
-    drop(ledger);
-    let ledger = verification::VerificationRequirements::open(
-        data.path(),
-        workspace.path(),
-        "checks-test",
-        crate::storage::objects::ObjectStore::open(data.path())?,
-    )?;
-    assert_eq!(ledger.pending(Some(&before))?.len(), 1);
-    Ok(())
-}
-
 /// Freeze every task preference and reject stale discovery admission, including unchanged enablement.
 #[test]
 fn discovery_inputs_reject_changed_task_preferences_and_missing_retained_settings() -> Result<()> {
@@ -819,348 +621,6 @@ fn discovery_inputs_reject_changed_task_preferences_and_missing_retained_setting
     runner.set_overrides(Some("task"), overrides)?;
     assert!(captured.validate(&runner).is_err());
     assert!(super::discovery::DiscoveryInputs::for_run(&runner, &run).is_err());
-    Ok(())
-}
-
-/// Restore enablement without losing the tool identity captured by an earlier fix.
-#[test]
-fn verification_identity_survives_policy_changes_but_rejects_tool_changes() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    crate::storage::layout::prepare(data.path())?;
-    let mut check = definition("format", "unused");
-    check.category = CheckCategory::Format;
-    check.enabled = false;
-    check.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
-        adapter::ScriptAdapterConfig {
-            command: vec!["nu".into(), "format.nu".into()],
-        },
-    ));
-    save(workspace.path(), vec![check]);
-    let runner = make_runner(workspace.path(), data.path());
-    let mut run = runner.prepare(
-        ConfigSnapshot::load(workspace.path())?,
-        CheckAdmission {
-            owner: runner.session_owner(),
-            request: RunRequest::All,
-            overrides: [("format".into(), true)].into(),
-            task_overrides: CheckOverrides {
-                enabled: [("format".into(), true)].into(),
-                ..Default::default()
-            },
-            inventory: super::ChangeInventory::Known(Vec::new()),
-            shell: Default::default(),
-            trigger: "test".into(),
-            task_id: Some("task".into()),
-            revision: 0,
-        },
-    )?;
-    let mut mutation = run.clone().into_record();
-    mutation.commands[0].context.as_mut().unwrap().purpose = CheckPurpose::Prepare;
-    let snapshot = crate::checkpoint::CheckpointRecord {
-        id: "source".into(),
-        session_id: "checks-test".into(),
-        workspace: workspace.path().to_string_lossy().into_owned(),
-        head: "UNBORN".into(),
-        tree: None,
-        file: Vec::new(),
-        deleted: Vec::new(),
-        checkout: Default::default(),
-        excluded: Default::default(),
-        created_at_ms: 0,
-    };
-    // A baseline owner is source provenance, not the namespace of ad hoc preferences.
-    runner.changes.begin("baseline-owner".into(), &snapshot)?;
-    runner.set_overrides(None, run.context.task_overrides.clone())?;
-    let ad_hoc = runner.prepare_request(
-        runner.session_owner(),
-        RunRequest::All,
-        None,
-        Default::default(),
-        "ad hoc".into(),
-    )?;
-    assert!(ad_hoc.context.task_id.is_none());
-    assert_eq!(ad_hoc.context.task_overrides, run.context.task_overrides);
-    super::discovery::DiscoveryInputs::for_run(&runner, &ad_hoc)?;
-    let mut changed_preferences = run.context.task_overrides.clone();
-    changed_preferences.auto.insert("format".into(), false);
-    runner.set_overrides(None, changed_preferences)?;
-    assert!(super::discovery::DiscoveryInputs::for_run(&runner, &ad_hoc).is_err());
-    runner
-        .verification
-        .lock()
-        .unwrap()
-        .prepare(&mutation, &mutation.commands[0])?;
-    let mut ledger = verification::VerificationRequirements::open(
-        data.path(),
-        workspace.path(),
-        "checks-test",
-        crate::storage::objects::ObjectStore::open(data.path())?,
-    )?;
-    let mut verification = run.clone().into_record();
-    verification.commands[0].state = CheckState::Passed;
-    ledger.observe(
-        ledger.capture(),
-        &verification,
-        &verification.commands[0],
-        &snapshot,
-        &snapshot,
-    )?;
-    assert_eq!(ledger.pending(Some(&snapshot))?.len(), 1);
-    assert!(
-        ledger
-            .require_in_run(&mut run, &snapshot)
-            .unwrap_err()
-            .to_string()
-            .contains("disabled")
-    );
-
-    // Whole-check verification overrides these policies but still uses the original tool.
-    let definition = &mut run.context.snapshot.config.definitions[0];
-    definition.enabled = true;
-    definition.auto = false;
-    definition.scope = CheckScope::Paths;
-    definition.trigger = CheckTrigger::Manual;
-    definition.name = "Renamed display label".into();
-    definition.area = "Another display group".into();
-    ledger.require_in_run(&mut run, &snapshot)?;
-    assert_eq!(run.commands[0].context.selection, CheckSelection::All);
-    verification = run.clone().into_record();
-    verification.commands[0].state = CheckState::Passed;
-    // Every execution field participates even when a malformed restored run claims success.
-    let edits: [fn(&mut CheckDefinition); 5] = [
-        |definition| definition.id = "other".into(),
-        |definition| definition.category = CheckCategory::Lint,
-        |definition| definition.directory = "elsewhere".into(),
-        |definition| {
-            definition.runner = CheckRunner::Command(CheckOperation {
-                prepare: false,
-                command: "other".into(),
-                args: None,
-                inputs: None,
-            })
-        },
-        |definition| definition.depends_on = vec!["other".into()],
-    ];
-    for edit in edits {
-        let mut changed = verification.clone();
-        edit(
-            &mut changed
-                .context
-                .as_mut()
-                .unwrap()
-                .snapshot
-                .config
-                .definitions[0],
-        );
-        if changed
-            .context
-            .as_ref()
-            .unwrap()
-            .snapshot
-            .config
-            .definitions[0]
-            .id
-            == "other"
-        {
-            changed.commands[0].context.as_mut().unwrap().definition_id = "other".into();
-        }
-        ledger.observe(
-            ledger.capture(),
-            &changed,
-            &changed.commands[0],
-            &snapshot,
-            &snapshot,
-        )?;
-        assert_eq!(ledger.pending(Some(&snapshot))?.len(), 1);
-        assert!(
-            ledger
-                .require_in_run(&mut changed.try_into()?, &snapshot)
-                .is_err()
-        );
-    }
-    let mut disabled = verification.clone();
-    disabled
-        .context
-        .as_mut()
-        .unwrap()
-        .overrides
-        .insert("format".into(), false);
-    ledger.observe(
-        ledger.capture(),
-        &disabled,
-        &disabled.commands[0],
-        &snapshot,
-        &snapshot,
-    )?;
-    assert_eq!(ledger.pending(Some(&snapshot))?.len(), 1);
-    ledger.observe(
-        ledger.capture(),
-        &verification,
-        &verification.commands[0],
-        &snapshot,
-        &snapshot,
-    )?;
-    assert!(ledger.pending(Some(&snapshot))?.is_empty());
-    let mut config = run.context.snapshot.clone();
-    assert!(ledger.pending_for_config(&snapshot, &config)?.is_empty());
-    config.config.definitions[0].enabled = false;
-    assert_eq!(ledger.pending_for_config(&snapshot, &config)?.len(), 1);
-    Ok(())
-}
-
-/// Corrupt, missing, or mismatched ledgers cannot silently turn into empty requirements.
-#[test]
-fn verification_ledger_rejects_invalid_restore_without_resetting() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    crate::storage::layout::prepare(data.path())?;
-    let ledger = verification::VerificationRequirements::open(
-        data.path(),
-        workspace.path(),
-        "session",
-        crate::storage::objects::ObjectStore::open(data.path())?,
-    )?;
-    assert!(ledger.pending(None)?.is_empty());
-    let path = data.path().join("verification/requirements.json");
-    let original = std::fs::read(&path)?;
-    assert!(
-        verification::VerificationRequirements::open(
-            data.path(),
-            workspace.path(),
-            "different",
-            crate::storage::objects::ObjectStore::open(data.path())?
-        )
-        .is_err()
-    );
-    let mut wrong: serde_json::Value = serde_json::from_slice(&original)?;
-    let version = wrong["version"].as_u64().unwrap();
-    for incompatible in [version - 1, version + 1] {
-        wrong["version"] = incompatible.into();
-        std::fs::write(&path, serde_json::to_vec(&wrong)?)?;
-        assert!(
-            verification::VerificationRequirements::open(
-                data.path(),
-                workspace.path(),
-                "session",
-                crate::storage::objects::ObjectStore::open(data.path())?
-            )
-            .is_err()
-        );
-        assert_eq!(std::fs::read(&path)?, serde_json::to_vec(&wrong)?);
-    }
-    std::fs::write(&path, b"{")?;
-    assert!(
-        verification::VerificationRequirements::open(
-            data.path(),
-            workspace.path(),
-            "session",
-            crate::storage::objects::ObjectStore::open(data.path())?
-        )
-        .is_err()
-    );
-    std::fs::remove_file(&path)?;
-    assert!(
-        verification::VerificationRequirements::open(
-            data.path(),
-            workspace.path(),
-            "session",
-            crate::storage::objects::ObjectStore::open(data.path())?
-        )
-        .is_err()
-    );
-    std::fs::write(&path, &original)?;
-    assert!(
-        verification::VerificationRequirements::open(
-            data.path(),
-            workspace.path(),
-            "session",
-            crate::storage::objects::ObjectStore::open(data.path())?
-        )
-        .is_ok()
-    );
-    Ok(())
-}
-
-/// Mandatory checks include read-only prerequisites, but never launch a source-changing prerequisite.
-#[test]
-fn required_verification_selects_readonly_prerequisites() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    crate::storage::layout::prepare(data.path())?;
-    let mut build = definition("build", "build");
-    build.category = CheckCategory::Build;
-    build.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
-        adapter::ScriptAdapterConfig {
-            command: vec!["nu".into(), "build.nu".into()],
-        },
-    ));
-    let mut format = definition("format", "unused");
-    format.category = CheckCategory::Format;
-    format.depends_on = vec!["build".into()];
-    format.runner = CheckRunner::Adapter(adapter::AdapterConfig::Script(
-        adapter::ScriptAdapterConfig {
-            command: vec!["nu".into(), "format.nu".into()],
-        },
-    ));
-    save(workspace.path(), vec![build, format]);
-    let runner = make_runner(workspace.path(), data.path());
-    let mut run = runner.prepare(
-        ConfigSnapshot::load(workspace.path())?,
-        CheckAdmission {
-            owner: runner.session_owner(),
-            request: RunRequest::All,
-            overrides: Default::default(),
-            task_overrides: Default::default(),
-            inventory: super::ChangeInventory::Known(Vec::new()),
-            shell: Default::default(),
-            trigger: "test".into(),
-            task_id: None,
-            revision: 0,
-        },
-    )?;
-    let index = run
-        .commands
-        .iter()
-        .position(|command| command.context.definition_id == "format")
-        .unwrap();
-    let mut mutation = run.clone().into_record();
-    mutation.commands[index].context.as_mut().unwrap().purpose = CheckPurpose::Prepare;
-    let snapshot = crate::checkpoint::CheckpointRecord {
-        id: "source".into(),
-        session_id: "checks-test".into(),
-        workspace: workspace.path().to_string_lossy().into_owned(),
-        head: "UNBORN".into(),
-        tree: None,
-        file: Vec::new(),
-        deleted: Vec::new(),
-        checkout: Default::default(),
-        excluded: Default::default(),
-        created_at_ms: 0,
-    };
-    let mut ledger = runner.verification.lock().unwrap();
-    ledger.prepare(&mutation, &mutation.commands[index])?;
-    for command in &mut run.commands {
-        command.selected = false;
-        command.state = CheckState::Skipped;
-    }
-    ledger.require_in_run(&mut run, &snapshot)?;
-    assert!(run.commands.iter().all(|command| command.selected
-        && command.state == CheckState::Pending
-        && command.context.selection == CheckSelection::All));
-    let build = run
-        .commands
-        .iter_mut()
-        .find(|command| command.context.definition_id == "build")
-        .unwrap();
-    build.context.purpose = CheckPurpose::Prepare;
-    assert!(
-        ledger
-            .require_in_run(&mut run, &snapshot)
-            .unwrap_err()
-            .to_string()
-            .contains("changes source")
-    );
     Ok(())
 }
 

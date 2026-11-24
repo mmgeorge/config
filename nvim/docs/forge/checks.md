@@ -117,8 +117,7 @@ default nextest profile and disabled `all_features` option are omitted. Director
 and automatic selection remain in the main row. The expansion contains no run
 history, selection reasons, coverage, or output paths.
 The History page retains previous runs. Enable check editing and request
-changes in chat to edit project defaults. Plan review shows automatic selection reasons and checks
-explicitly requested by the plan.
+changes in chat to edit project defaults. Plan review shows the requested checks and their declared prerequisites.
 
 If the host returns an incompatible or malformed checks configuration, the picker
 shows the error and retains its last valid rows with editing disabled. A schema
@@ -161,12 +160,10 @@ The execution report in plan review shows each resolved check and case, its
 source provenance, and its result. Verified removals display “Removal verified.”
 
 During planning, agents select existing checks by listing their IDs, one per line,
-in the planning directory's `docs/checks.md` with their file-editing tool. A listed ID adds that check to the
-plan without changing repository settings or executing commands, and Harness
-adds each listed check's prerequisites itself. Non-test checks also follow their
-automatic triggers; test checks follow the planned inventory or Whole suite.
-`plan_submit` reports a listed ID that names no configured check at its line.
-An empty artifact clears additions while automatic non-test checks still apply.
+in the planning directory's `docs/checks.md`. Checking runs those checks, the
+checks that own requested test cases, any reviewer-selected whole test suites,
+and their declared prerequisites. An empty checks artifact requests no additional
+checks. `plan_submit` reports unknown IDs at their authored lines.
 Editing is available during plan authoring and
 Resolve; Resolve retains `plan:checks.md` and `plan_edit`.
 
@@ -474,30 +471,9 @@ for those checks. A batch containing any other category is rejected before launc
 Only named checks run fixes; adapter prerequisites run read-only. A failed
 prerequisite or fix stops later operations, retaining any partial edits and the
 results already recorded. Apply is available in ordinary chat and plan Resolve;
-plan Verify permits read-only checks. Apply records preparation rather than
-verification, and creates a whole-check verification requirement that survives
-restart. With automatic checks disabled, the requirement stays pending until
-an explicit verification run or plan Checking satisfies it; it never starts
-a background check by itself.
-While the requirement is pending, a goal's completion request is refused: the
-goal stays active, and its next turn names each pending check and the exact
-`check_run` request that verifies it, which selects the whole check, for example
-`{"ids":["format"],"selections":{"format":{"kind":"all"}}}`. A run that names only
-the check ID selects the changed paths and does not satisfy the requirement. A goal turn that ends while its own check run is still collecting
-also cannot complete the goal; the check result starts the next turn.
-Configured or task disabling leaves that requirement unresolved. Re-enable the
-check and run it again with whole-check coverage. Changes to automatic selection,
-scope, trigger, or display labels do not change the required tool identity;
-changes to the ID, category, directory, runner, prerequisite IDs, or
-helpers require restoring the original execution definition before verification
-can satisfy the obligation.
-Each admitted command records its own purpose. The fix prepares source; only a
-successful read-only verification command can satisfy its requirement. A custom
-command's configured `prepare` flag belongs to its runner and is retained across
-configuration and history round trips.
-An unsupported fix still reports an error. When Harness proves it left source
-unchanged, it removes that operation's provisional verification requirement;
-earlier verification keeps its original source identity.
+plan Verify permits read-only checks. Apply records the source before and after
+the operation. The agent chooses any follow-up check and its coverage. Goal
+completion waits for a check that still owns the workspace.
 
 `check_status` includes `state`, `completed`, `total`, `elapsed_ms`, `exit_code`,
 `latest_output`, `error`, and `executed`/`reused` counts. `latest_output` is one

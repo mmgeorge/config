@@ -842,13 +842,6 @@ impl CheckSupervisor {
             catalog["automatic"] =
                 serde_json::to_value(super::automatic::AutomaticChecks::open(&self.root, &owner)?)?;
         }
-        let checkpoint = self.changes.snapshot().await?;
-        catalog["pending_verification"] = serde_json::to_value(
-            self.verification
-                .lock()
-                .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-                .pending(checkpoint.as_ref())?,
-        )?;
         Ok(catalog)
     }
     /// Projects saved configuration, task controls, and history without inventing defaults.

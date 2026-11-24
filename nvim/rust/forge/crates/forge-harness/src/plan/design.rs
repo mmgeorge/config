@@ -417,6 +417,7 @@ impl DeclarationDesign {
             })
             .collect();
         Ok(super::digest(&super::codec::to_vec(&(
+            "named checks and declared prerequisites",
             &self.check_configuration,
             self.changed_paths(),
             &self.document.tests,
@@ -428,17 +429,22 @@ impl DeclarationDesign {
     }
 
     /// Projects plan choices independently of repository defaults and trigger applicability.
-    pub(crate) fn check_options(&self) -> Vec<serde_json::Value> {
-        self.check_configuration.as_ref().map(|snapshot| snapshot.config.definitions.iter().map(|check| {
+    pub(crate) fn check_options(&self) -> Result<Vec<serde_json::Value>> {
+        let preview = if self.check_preview_current()? {
+            self.check_preview.as_slice()
+        } else {
+            &[]
+        };
+        Ok(self.check_configuration.as_ref().map(|snapshot| snapshot.config.definitions.iter().map(|check| {
             let enabled = check.enabled && !self.document.disabled_checks.contains(&check.id)
-                && (check.auto || self.document.checks.contains(&check.id)
+                && (self.document.checks.contains(&check.id)
                     || self.document.test_scopes.get(&check.id) == Some(&super::PlanTestScope::WholeSuite)
-                    || self.check_preview.iter().any(|preview| preview.id == check.id && preview.selected));
+                    || preview.iter().any(|preview| preview.id == check.id && preview.selected));
             serde_json::json!({"id":check.id, "name":check.name, "stage":check.category,
                 "enabled":enabled, "available":check.enabled,
                 "test_scope": (check.category == crate::checks::CheckCategory::Test).then(|| self.document.test_scopes.get(&check.id).copied().unwrap_or_default()),
-                "reason":self.check_preview.iter().find(|preview| preview.id == check.id).map(|preview| &preview.reason)})
-        }).collect()).unwrap_or_default()
+                "reason":preview.iter().find(|preview| preview.id == check.id).map(|preview| &preview.reason)})
+        }).collect()).unwrap_or_default())
     }
 
     /// Rejects cached command previews after selection inputs change.

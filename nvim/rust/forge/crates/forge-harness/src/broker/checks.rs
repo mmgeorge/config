@@ -7,7 +7,6 @@ pub(super) enum ExecutionCheckEvidenceJob {
     Capture {
         workspace: super::execution::WorkspaceCaptureJob,
         expected: Option<String>,
-        supervisor: Arc<crate::checks::CheckSupervisor>,
     },
 }
 
@@ -19,7 +18,6 @@ impl ExecutionCheckEvidenceJob {
             Self::Capture {
                 workspace,
                 expected,
-                supervisor,
             } => {
                 let snapshot = workspace.run().await?;
                 let actual = crate::plan::digest(&serde_json::to_vec(&(
@@ -28,7 +26,7 @@ impl ExecutionCheckEvidenceJob {
                     &snapshot.deleted,
                     &snapshot.checkout,
                 ))?);
-                Ok(Some(actual) == expected && supervisor.verification_satisfied(&snapshot)?)
+                Ok(Some(actual) == expected)
             }
         }
     }
@@ -70,7 +68,6 @@ pub(crate) struct TaskCheckScan {
     conformance: super::execution::ExecutionConformanceJob,
     workspace: super::execution::WorkspaceCaptureJob,
     baseline: Option<crate::checkpoint::CheckpointRecord>,
-    supervisor: Arc<crate::checks::CheckSupervisor>,
     deadline: Option<crate::checks::CheckDeadline>,
 }
 
@@ -78,7 +75,6 @@ pub(crate) struct TaskCheckScanResult {
     progress: crate::plan::execution::SemanticProgress,
     workspace_identity: Option<String>,
     files: Option<Vec<String>>,
-    verification_satisfied: bool,
     workspace: super::execution::ReservedWorkspace,
 }
 
@@ -117,7 +113,6 @@ impl TaskCheckScan {
             progress,
             workspace_identity: Some(identity),
             files,
-            verification_satisfied: self.supervisor.verification_satisfied(snapshot)?,
             workspace,
         })
     }
@@ -129,7 +124,7 @@ pub(crate) struct TaskCheckFinalization {
     run: CheckRun,
     goal: crate::goal::GoalRecord,
     report: Option<super::execution::ImplementationReportJob>,
-    workspace: super::execution::ReservedWorkspace,
+    _workspace: super::execution::ReservedWorkspace,
 }
 
 pub(crate) struct TaskCheckReport(Option<super::execution::ImplementationReportResult>);
@@ -368,7 +363,6 @@ impl HarnessBroker {
         Ok(ExecutionCheckEvidenceJob::Capture {
             workspace: self.prepare_workspace_capture(),
             expected: run.workspace_identity.clone(),
-            supervisor: self.check_runner.clone(),
         })
     }
 
@@ -500,7 +494,6 @@ impl HarnessBroker {
             conformance: self.prepare_execution_conformance(&execution, &design)?,
             workspace: self.prepare_workspace_capture(),
             baseline,
-            supervisor: self.check_runner.clone(),
             deadline: Some(deadline),
         };
         let scope = interaction
@@ -600,12 +593,12 @@ impl HarnessBroker {
         included_checks.dedup();
         let mut run = self
             .check_runner
-            .prepare(
+            .prepare_plan(
                 snapshot,
                 crate::checks::CheckAdmission {
                     owner: crate::timeline::TimelineOwner::exchange(interaction),
                     request: crate::checks::RunRequest::Selected(crate::checks::SelectedChecks {
-                        include: included_checks,
+                        ids: included_checks,
                         ..Default::default()
                     }),
                     overrides: enabled,
@@ -638,7 +631,6 @@ impl HarnessBroker {
             conformance: self.prepare_execution_conformance(&state.execution, &state.design)?,
             workspace: self.prepare_workspace_capture(),
             baseline: None,
-            supervisor: self.check_runner.clone(),
             // Failed and timed-out commands still need final source collection and findings.
             deadline: None,
         })
@@ -662,11 +654,6 @@ impl HarnessBroker {
             .context("provider execution changed while checks ran")?;
         let mut execution = state.execution.clone();
         let mut goal = self.active_goal()?;
-        if !scan.verification_satisfied {
-            run.progress.unverified.push(
-                "Required whole-check verification after source mutation remains pending".into(),
-            );
-        }
         if scan.workspace_identity != run.workspace_identity
             && let Some(planned) = &mut run.planned_tests
         {
@@ -718,7 +705,7 @@ impl HarnessBroker {
             run,
             goal,
             report,
-            workspace: scan.workspace,
+            _workspace: scan.workspace,
         })
     }
 
@@ -790,11 +777,6 @@ impl HarnessBroker {
                     ExecutionCheckEvidenceJob::Invalid
                 ),
                 "check configuration changed before check result commit"
-            );
-            anyhow::ensure!(
-                self.check_runner
-                    .verification_satisfied(finalization.workspace.checkpoint())?,
-                "required whole-check verification changed before check result commit"
             );
         }
         if let Some(report) = report.0 {
@@ -1056,6 +1038,7 @@ mod tests {
         design.document.objective = "Check ownership".into();
         design.document.background = "A check fixture".into();
         design.document.design = "Keep state in its owner.".into();
+        design.document.checks.push("lint".into());
         design.proposed_source.insert(
             "src/owner.rs".into(),
             "/// Own application state.\npub struct Owner;\n".into(),

@@ -1,4 +1,4 @@
-//! Freeze planned ownership decisions independently of later configuration and ledger changes.
+//! Freeze planned ownership decisions independently of later configuration changes.
 
 use crate::checks::discovery::DiscoveryInputs;
 use crate::checks::model::CheckRunContext;
@@ -8,7 +8,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Bind source, configuration, task and reviewer choices, and verification obligations.
+/// Bind source, configuration, task and reviewer choices, and run ownership.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(try_from = "RawInputs")]
 pub(in crate::checks) struct ResolutionInputs {
@@ -28,11 +28,7 @@ impl ResolutionInputs {
         source: &crate::checkpoint::CheckpointRecord,
         test_scopes: BTreeMap<String, crate::plan::PlanTestScope>,
     ) -> Result<Self> {
-        let verification = supervisor
-            .verification
-            .lock()
-            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?
-            .resolution_input(source)?;
+        let verification = ResolutionRequirements::capture(&supervisor.session_id, source)?;
         RawInputs {
             source_snapshot: source.id.clone(),
             discovery,
@@ -68,24 +64,19 @@ impl ResolutionInputs {
             .collect()
     }
 
-    /// Get the captured ledger from which mandatory selections must be derived.
+    /// Get the retained source owner for this run.
     pub(in crate::checks) fn verification(&self) -> &ResolutionRequirements {
         &self.verification
     }
 
-    /// Reject changed run inputs or a new mutation before accepting more evidence.
+    /// Reject changed run inputs before accepting more evidence.
     pub(super) fn validate_live(
         &self,
         supervisor: &CheckSupervisor,
         context: &CheckRunContext,
     ) -> Result<()> {
         self.validate_context(context, &self.test_scopes)?;
-        self.discovery.validate(supervisor)?;
-        let current = supervisor
-            .verification
-            .lock()
-            .map_err(|_| anyhow::anyhow!("verification ledger lock poisoned"))?;
-        self.verification.validate(&current)
+        self.discovery.validate(supervisor)
     }
 
     /// Require the enclosing run and planned choices to describe this captured input.

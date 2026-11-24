@@ -901,11 +901,11 @@ fn checks_text(document: &DesignDocument) -> String {
     document.checks.iter().map(|id| format!("{id}\n")).collect()
 }
 
-/// Parse one check ID per line into the checks the plan adds to the automatic ones.
+/// Parse the checks requested by the plan and include their declared prerequisites.
 ///
 /// A line's presence selects its check. A leading `- ` is accepted. With a configuration, each ID
 /// must name an enabled check, and Harness adds every unlisted prerequisite after the listed IDs,
-/// so the agent never lists prerequisites itself. Listing an automatic check is harmless.
+/// so the agent can name just the checks it wants to run.
 fn parse_checks(
     text: &str,
     config: Option<&crate::checks::CheckConfig>,

@@ -93,7 +93,7 @@ pub(super) async fn execute(
             &invocation.arguments,
         )?;
         return Ok(crate::tools::ControlToolResult {
-            invocation: Some(invocation),
+            invocation: None,
             message,
         });
     }
@@ -108,7 +108,7 @@ pub(super) async fn execute(
         runtime.inspected.insert(path.into(), digest.into());
     }
     Ok(crate::tools::ControlToolResult {
-        invocation: Some(invocation),
+        invocation: None,
         message,
     })
 }

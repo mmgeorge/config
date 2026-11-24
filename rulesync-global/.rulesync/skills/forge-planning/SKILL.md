@@ -114,7 +114,7 @@ Write `docs/overview.md` using the template below. Replace the placeholders with
 - new `exact_test_name` [target: unit]: scenario and expected result.
 ```
 
-`docs/checks.md` lists one saved check ID per line to select checks beyond automatic selection. Discover IDs with `check_definition_list`; Harness adds prerequisites. This file does not configure or authorize checks.
+`docs/checks.md` lists one saved check ID per line to select checks for plan execution. Discover IDs with `check_definition_list`; Harness adds prerequisites. This file does not configure or authorize checks.
 
 ## Submission
 

@@ -1,6 +1,6 @@
 # Verify exact plan selection and per-case gates through the real Harness owner.
 use std/assert
-use adapter-integration.nu [host_start host_request host_stopped]
+use adapter-integration.nu [host_start host_initialize host_request host_stopped]
 const repository = path self | path dirname | path dirname | path dirname
 
 def --env wait_review [] {
@@ -33,8 +33,8 @@ def --env wait_checks [--after: string = ''] {
   }
 }
 
-# Keep completion suspended until the real fix has left a durable verification obligation.
-def --env prepare_verification [scratch: path] {
+# Collect a real formatter apply before starting the plan.
+def --env apply_formatter [] {
   host_request 'session.provider.mock_response' {operation: 'script', script: {steps: [
     {kind: 'tool_call', name: 'check_run', arguments: {check: 'format', all: true, apply: true}}
     {kind: 'barrier', id: 'mutation-ready'}
@@ -46,15 +46,7 @@ def --env prepare_verification [scratch: path] {
   assert equal $run.state 'passed'
   assert equal ($run.commands | where context.definition_id == 'format' | first | get context.purpose) 'prepare'
   assert equal (host_request 'session.turn.cancel' | get collected) true
-  assert equal (verification_requirement $scratch | get state.state) 'pending'
   $run
-}
-
-def verification_requirement [scratch: path] {
-  let ledgers = glob ($scratch | path join 'data/**/verification/requirements.json' | str replace --all '\' '/')
-  assert equal ($ledgers | length) 1
-  let entry = open $ledgers.0 | get requirements | transpose mutation_command requirement | first
-  $entry.requirement | insert mutation_command $entry.mutation_command
 }
 
 # Exercise the same expand action used by the plan review, then inspect its rendered rows.
@@ -77,8 +69,7 @@ def --env execution_report [plan_id: string] {
 
 def --env scenario [mode: string] {
   let retry = $mode in ['plan_retry' 'plan_restart']
-  let required = $mode | str starts-with 'plan_required_'
-  let disabled_requirement = $mode in ['plan_required_config_disabled' 'plan_required_task_disabled']
+  let prior_apply = $mode | str starts-with 'plan_required_'
   let scratch = mktemp -d
   let workspace = $scratch | path join 'workspace'
   mkdir ($workspace | path join '.forge/checks')
@@ -88,8 +79,8 @@ def --env scenario [mode: string] {
   let config = {checks: {
     planned: {trigger: {}, action: {category: 'test', adapter: {script: {command: ($prefix | append $mode)}}}}
     other: {trigger: {}, action: {category: 'test', adapter: {script: {command: ($prefix | append (if $mode in ['plan_ambiguous' 'plan_task_disabled' 'plan_review_disabled'] { 'plan_run' } else if $mode == 'plan_budget' { 'plan_other_budget' } else { 'plan_other' }))}}}}
-  }} | update checks.planned.action.adapter.script.command ($prefix | append (if $retry { 'plan_retry' } else if $required or $mode in ['plan_ambiguous' 'plan_folder' 'plan_task_enabled' 'plan_task_disabled' 'plan_review_disabled' 'plan_whole' 'plan_whole_empty' 'plan_whole_disabled' 'plan_empty' 'plan_removed'] { 'plan_run' } else if $mode == 'plan_whole_skipped' { 'plan_skipped' } else { $mode }))
-  let config = if $required {
+  }} | update checks.planned.action.adapter.script.command ($prefix | append (if $retry { 'plan_retry' } else if $prior_apply or $mode in ['plan_ambiguous' 'plan_folder' 'plan_task_enabled' 'plan_task_disabled' 'plan_review_disabled' 'plan_whole' 'plan_whole_empty' 'plan_whole_disabled' 'plan_empty' 'plan_removed'] { 'plan_run' } else if $mode == 'plan_whole_skipped' { 'plan_skipped' } else { $mode }))
+  let config = if $prior_apply {
     $config | upsert checks.format {trigger: {auto: false}, action: {category: 'format', adapter: {script: {command: ($prefix | append 'format_policy')}}}}
   } else { $config }
   let config = if $mode == 'plan_task_enabled' {
@@ -112,12 +103,12 @@ def --env scenario [mode: string] {
   host_start $executable $scratch
   print $"Planned execution ($mode) evidence: ($scratch)"
   try {
-    host_request 'host.initialize' {protocol_version: 41} | ignore
+    host_initialize
     let initialized = host_request 'session.initialize' {workspace: $workspace, data_root: ($scratch | path join 'data'), client_id: 'planned-execution', provider: {kind: 'mock', command: ['mock']}}
     $env.FORGE_ADAPTER_HOST.session = $initialized.session.id
     host_request 'host.trace.configure' {level: 'trace'} | ignore
     host_request 'session.permission.set' {change: {kind: 'enable_yolo'}} | ignore
-    let mutation = if $required { prepare_verification $scratch } else { null }
+    if $prior_apply { apply_formatter | ignore }
     if $mode == 'plan_required_config_disabled' {
       $config | upsert checks.format.enabled false | to json | save --force ($workspace | path join '.forge.json')
     }
@@ -136,7 +127,8 @@ def --env scenario [mode: string] {
 - reused `reused_case`: regression coverage
 - removed `removed_case`: obsolete coverage
 ' | save --force ($directories.0 | path join 'docs/tests.md')
-    let empty_inventory = ($mode in ['plan_whole_empty' 'plan_empty']) or ($required and $mode != 'plan_required_removed')
+    if $mode == 'plan_budget' { 'later' | save --force ($directories.0 | path join 'docs/checks.md') }
+    let empty_inventory = ($mode in ['plan_whole_empty' 'plan_empty']) or ($prior_apply and $mode != 'plan_required_removed')
     if $empty_inventory { '' | save --force ($directories.0 | path join 'docs/tests.md') }
     if $mode in ['plan_removed' 'plan_required_removed'] {
       '## fixture.txt
@@ -146,7 +138,8 @@ def --env scenario [mode: string] {
     host_request 'session.provider.mock_response' {operation: 'release', id: $hold.id} | ignore
     let plan = wait_review
     let review = host_request 'session.state.get' | get active_plan
-    if $required {
+    if $prior_apply {
+      # Excluding an already-unselected check retains the submitted revision.
       host_request 'session.plan.check.update' {plan_id: $plan.id, expected_version: $review.document_version, digest: $review.review_digest, enabled: {format: false}} | ignore
     }
     if $mode == 'plan_review_disabled' {
@@ -166,8 +159,7 @@ def --env scenario [mode: string] {
     }
     let review = host_request 'session.state.get' | get active_plan
     if $mode in ['plan_budget' 'plan_locations_budget'] { host_request 'session.configure' {tool_timeout: {amount: 8, unit: 's'}} | ignore }
-    # Accepting reviewer edits creates the next model revision before implementation starts.
-    let revision = $review.model_revision + (if $required or $mode in ['plan_review_disabled' 'plan_whole' 'plan_whole_empty' 'plan_whole_disabled' 'plan_whole_skipped'] { 1 } else { 0 })
+    let revision = $review.model_revision + (if $mode in ['plan_review_disabled' 'plan_whole' 'plan_whole_empty' 'plan_whole_disabled' 'plan_whole_skipped'] { 1 } else { 0 })
     host_request 'session.provider.mock_response' {operation: 'script', script: {steps: [
       {kind: 'barrier', id: 'implementation-ready'}
       {kind: 'file_write', path: ($workspace | path join 'src/change.rs'), text: "/// Apply the requested behavior.\npub fn requested_change() {}\n"}
@@ -179,36 +171,6 @@ def --env scenario [mode: string] {
     host_request 'session.provider.mock_response' {operation: 'wait', id: 'implementation-ready'} | ignore
     mut continuation = host_request 'session.provider.mock_response' {operation: 'hold', any_session: true}
     host_request 'session.provider.mock_response' {operation: 'release', id: 'implementation-ready'} | ignore
-    if $disabled_requirement {
-      let deadline = (date now) + 30sec
-      loop {
-        let snapshot = host_request 'session.state.get'
-        let execution = $snapshot.session.active_task.execution.record
-        if $execution.state == 'blocked' {
-          assert equal $execution.phase 'checking'
-          assert ($execution.findings | any {|finding| $finding | str contains 'Required verification format is disabled' })
-          assert equal ($execution.check_runs | length) 1 'Disabled verification must retain its admitted Check attempt'
-          assert ($execution.check_runs.0.commands | all {|command| $command.started_at_ms == null }) 'Disabled verification launched a command'
-          break
-        }
-        if (date now) >= $deadline { error make {msg: 'Disabled verification did not block plan completion'} }
-        sleep 20ms
-      }
-      let requirement = verification_requirement $scratch
-      assert equal $requirement.state.state 'pending'
-      assert equal $requirement.mutation_command ($mutation.commands | where context.definition_id == 'format' | first | get id)
-      let history = host_request 'session.check.list' | get history
-      assert equal ($history | length) 2 'The admitted Check failure was not retained'
-      assert equal $history.0.id $mutation.id
-      assert ($history.1.completed_at_ms != null) 'The blocked attempt was left running'
-      assert ($history.1.commands | all {|command| $command.started_at_ms == null }) 'Disabled verification launched a command'
-      host_request 'host.shutdown' | ignore
-      touch ($env.FORGE_ADAPTER_HOST.input | path join 'eof')
-      host_stopped
-      rm -rf $scratch
-      print $"Verified planned execution: ($mode)"
-      return
-    }
     let interrupted = if $retry {
       let ready_path = $scratch | path join 'retry-ready.json'
       let deadline = (date now) + 30sec
@@ -236,7 +198,7 @@ def --env scenario [mode: string] {
         touch ($env.FORGE_ADAPTER_HOST.input | path join 'eof')
         host_stopped
         host_start $executable ($scratch | path join 'restarted')
-        host_request 'host.initialize' {protocol_version: 41} | ignore
+        host_initialize
         let session_params = {workspace: $workspace, data_root: ($scratch | path join 'data'), client_id: 'planned-restart', session_id: $initialized.session.id, provider: {kind: 'mock', command: ['mock']}}
         let records = glob ($scratch | path join 'data/**/checks' $stopped.run.id 'record.json' | str replace --all '\' '/')
         assert equal ($records | length) 1
@@ -280,7 +242,7 @@ def --env scenario [mode: string] {
     assert equal $inputs.discovery.task_id $run.context.task_id
     assert equal $inputs.discovery.overrides $run.context.task_overrides
     assert equal $inputs.verification.record.session_id $initialized.session.id
-    assert equal $inputs.verification.record.generation (if $required { 1 } else { 0 })
+    assert equal $inputs.verification.record.generation 0
     if not $empty_inventory and $mode not-in ['plan_removed' 'plan_required_removed'] { assert equal $run.planned_tests.requested.0.cases.2.change 'reused' }
     let entries = $run.planned_tests.state.entries? | default []
     assert equal ($entries | length) (if $empty_inventory { 0 } else if $mode in ['plan_removed' 'plan_required_removed'] { 1 } else { 4 })
@@ -305,7 +267,7 @@ def --env scenario [mode: string] {
       assert equal $exact_count (if $empty_inventory { 0 } else if $retry { 4 } else if $mode in ['plan_task_disabled' 'plan_review_disabled' 'plan_whole_disabled'] { 1 } else { 2 })
     }
     assert ($requests | where op == 'discover' | where mode == 'exact' | all {|r| ($r.files | is-empty) and ($r.within | is-empty) })
-    if $required or $mode in ['plan_empty' 'plan_removed'] {
+    if $prior_apply or $mode in ['plan_empty' 'plan_removed'] {
       assert equal $run.state 'passed'
       assert equal ($requests | where op == 'run' | length) 0
       assert ($run.commands | where context.category == 'test' | all {|command|
@@ -315,18 +277,13 @@ def --env scenario [mode: string] {
         assert equal $entries.0.resolution.outcome 'Absent'
         assert equal $entries.0.result null
       }
-      if $required {
-        assert equal $run.context.overrides.format false
+      if $prior_apply {
+        if $mode == 'plan_required_task_disabled' { assert equal $run.context.overrides.format false }
         assert equal ($run.context.snapshot.config.format.trigger.auto? | default false) false
-        let requirement = verification_requirement $scratch
-        assert equal $requirement.mutation_command ($mutation.commands | where context.definition_id == 'format' | first | get id)
-        assert equal $requirement.state.state 'satisfied'
         let format = $run.commands | where context.definition_id == 'format' | first
-        assert equal $format.selected true
-        assert equal $format.state 'passed'
-        assert equal $format.context.purpose 'verify'
-        assert equal $format.context.selection.kind 'all'
-        assert equal $format.reused_from null
+        assert equal $format.selected false
+        assert equal $format.state 'skipped'
+        assert equal $format.started_at_ms null
       }
     } else if $mode in ['plan_ambiguous' 'plan_locations_changed' 'plan_locations_budget'] {
       assert equal $run.state 'failed'
@@ -414,8 +371,41 @@ def --env scenario [mode: string] {
     }
     # Observe the next native turn before cancellation, avoiding a startup/teardown race.
     host_request 'session.provider.mock_response' {operation: 'wait', id: $continuation.id} | ignore
-    let cancelled = host_request 'session.turn.cancel'
-    assert equal $cancelled.collected true
+    if $mode == 'plan_run' {
+      # Verify can retire the task before the same turn's read-only calls settle.
+      let command = $run.commands | where context.definition_id == 'planned' | first
+      let patch = $"*** Begin Patch\n*** Update File: plan:verification.md\n@@\n-1. pending []\n+1. passed [($command.id)] The planned cases exercised the requested behavior.\n@@\n ## Reuse reason\n+The accepted revision already ran these cases.\n*** End Patch"
+      host_request 'session.provider.mock_response' {operation: 'script', script: {steps: [
+        {kind: 'barrier', id: 'finish-verify'}
+        {kind: 'tool_call', name: 'plan_status', arguments: {plan_id: $plan.id}}
+        {kind: 'tool_call', name: 'plan_read', arguments: {plan_id: $plan.id, path: 'plan:verification.md'}}
+        {kind: 'tool_call', name: 'plan_edit', arguments: {plan_id: $plan.id, expected_version: $review.document_version, patch: $patch}}
+        {kind: 'tool_call', name: 'plan_phase_done', arguments: {phase: 'verify', revision: $revision, summary: 'Verified the requested behavior'}}
+      ], terminal: 'completed'}} | ignore
+      host_request 'session.provider.mock_response' {operation: 'release', id: $continuation.id} | ignore
+      host_request 'session.provider.mock_response' {operation: 'wait', id: 'finish-verify'} | ignore
+      let exchange = host_request 'session.exchange.list' | last | get id
+      host_request 'session.provider.mock_response' {operation: 'release', id: 'finish-verify'} | ignore
+      let deadline = (date now) + 10sec
+      loop {
+        let state = host_request 'session.exchange.list' | where id == $exchange | first | get state
+        if $state in ['complete' 'failed' 'cancelled'] {
+          assert equal (host_request 'session.state.get' | get session.active_task) null
+          assert equal $state 'complete' 'Reading the active plan must allow its final Verify turn to settle'
+          break
+        }
+        if (date now) >= $deadline { error make {msg: 'Final Verify exchange did not settle'} }
+      }
+      let logs = glob ($scratch | path join 'data/**/harness-trace.jsonl' | str replace --all '\' '/')
+      assert equal ($logs | length) 1
+      let trace = open --raw $logs.0 | lines | each { from json } | where session_id == $initialized.session.id
+      assert ($trace | any {|record| $record.event == 'model.completed' })
+      assert (not ($trace | any {|record| $record.event == 'provider.observation_failed' }))
+      assert (not ($trace | any {|record| $record.payload.phase? == 'engine_close_started' and $record.payload.exchange_id? == $exchange }))
+    } else {
+      let cancelled = host_request 'session.turn.cancel'
+      assert equal $cancelled.collected true
+    }
     host_request 'host.shutdown' | ignore
     touch ($env.FORGE_ADAPTER_HOST.input | path join 'eof')
     host_stopped

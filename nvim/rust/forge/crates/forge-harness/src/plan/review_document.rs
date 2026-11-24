@@ -309,7 +309,7 @@ impl PlanReviewStore {
             "path":document.source.path, "public_only":document.source.public_only,
             "diff_view":document.diff_view.committed(), "diff_capabilities":DiffCapabilities::SemanticOnly,
             "annotation":document.annotation.annotation(), "source_edit":source_edit,
-            "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default(),
+            "checks":document.source.document.design.as_ref().map(|design| design.check_options()).transpose()?.unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
             "submission_warning_status":null});
         store.insert(document.id.clone(), (document, admission));
@@ -1110,7 +1110,7 @@ impl EditablePlanReview<'_> {
         let result = serde_json::json!({"patch":patch, "source_edit":source_edit,
             "annotation":document.annotation.annotation(), "public_only":document.source.public_only,
             "saved_source_digest":document.saved_digest(), "version":document.source.document.version,
-            "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default(),
+            "checks":document.source.document.design.as_ref().map(|design| design.check_options()).transpose()?.unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
             "submission_warning_status":null});
         if let Some(stage) = response {
