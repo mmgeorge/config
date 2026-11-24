@@ -1249,9 +1249,13 @@ including files whose bodies are empty under the filter. Reopening the same plan
 including across revisions. Changes and Tests remember their file folds independently.
 Under Changes, each file starts in **Unviewed Changes**. Press `S` on a file heading or any
 line inside it to move the whole file to **Viewed Changes**. Press `U` to move it back.
-The cursor advances to the next file in the section when one is available. Comments and
-questions stay on their original lines. Reopening the same revision in the running Harness
-session restores its viewed files. A new revision starts unviewed.
+As in Forge Status, the cursor and scroll position stay in place when the file moves.
+If the next file takes its row, you can press `S` again to mark that file viewed.
+Comments and questions stay on their original lines. Reopening the same revision restores its viewed
+files, including after restarting Neovim or opening that revision from history. A new
+revision starts unviewed.
+When a plan adds a behavior block to an existing function with the same signature, one
+`~` signature row shows both line numbers. Expand the function to read the behavior.
 Function bodies start collapsed. Expand a body to see its Algorithm or Change blocks, which
 start open. The caret on each block heading shows its state (`▾` open, `▸` closed).
 Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)` for a tuple
@@ -1355,8 +1359,8 @@ popups. Configure them through `keymaps.plan_review.entity_info` and
 Inside PlanReview, `oc` opens plan-specific check selection. Space toggles a
 check, with `●` for enabled and `○` for disabled. Visual `j` deletes selected
 planned tests or disables selected checks after confirmation.
-Rust test-only modules and test functions are hidden from Changes in both Public and All views.
-Their saved declarations remain intact, and planned cases remain in Tests.
+Under Changes, Rust tests follow normal declaration visibility. Use `ov` to see private
+test functions and private `#[cfg(test)]` modules in All. Planned cases also appear in Tests.
 The Tests section groups cases under New, Modified, Deleted, or Unchanged file headings.
 Expand a file to see its test names and descriptions. These rows
 use shared diff gutters and full-line backgrounds, including orange `~` rows for modified cases.

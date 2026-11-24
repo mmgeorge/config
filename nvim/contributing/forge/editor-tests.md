@@ -151,6 +151,7 @@ Any change to a payload the host sends to Lua must keep its recordings current i
 | `status-semantic.json` | `forge-status` `tests::linked_status_diff_controls_publish_matching_bodies_and_protocol_fixture` | `integration/views/status/status.test.lua` |
 | `saved-diff-controls.json` | `forge-status` `source_document::tests::saved_diff_controls_preserve_unclassified_patch_and_independent_options` | `unit/source_document.test.lua` |
 | `review-semantic.json` | `forge-review` `file_diff_controls_share_visibility_and_preserve_lazy_source_actions` | `unit/review_document.test.lua` |
+| `plan-review-behavior-signature.json` | `forge-harness` `behavior_only_edits_show_one_modified_signature` | `integration/views/plan_review/plan_review.test.lua` |
 | `review-commit-semantic.json` | `forge-review` `commit_diff_controls_isolate_immutable_sources_and_preserve_them_on_refresh` | `unit/review_document.test.lua` |
 | `notification.json` | none | `unit/notifications.test.lua` |
 | `cancellation-progress.json` | `forge-harness` `cancellation_progress_is_durable_and_recorded` | `unit/views/harness/cleanup_progress.test.lua`, `unit/views/harness/snapshot.test.lua` |

@@ -24,7 +24,9 @@ local plan_review_host = {}
 
 ---@class PlanReviewHostOptions
 ---@field lines string[] the plan's source lines, one presentation row each
+---@field block_id? table<integer, string> canonical identity of a presentation row
 ---@field markdown? boolean mark the fixture's source rows as Markdown
+---@field metadata? table<integer, table> recorded host decorations by source line
 ---@field session_id? string defaults to "plan-session"
 ---@field rename? table the `rename` result of a `rename_entity` action
 
@@ -52,9 +54,12 @@ function plan_review_host.start(options)
   local function presentation(document)
     local source_row, block = {}, {}
     for index, text in ipairs(options.lines) do
-      local id = "plan:" .. index
+      local id = options.block_id and options.block_id[index] or "plan:" .. index
       local metadata = { decoration = {}, editable_region = {}, markdown = options.markdown, target = {
         { id = id, range = { start = { row = 0, column = 0 }, ["end"] = { row = 1, column = 0 } } } } }
+      if options.metadata and options.metadata[index] then
+        metadata = vim.tbl_extend("force", metadata, options.metadata[index])
+      end
       source_row[index] = { id = id, target = id, text = text, source_line = index, block = id,
         position = { row = 0, column = 0 }, metadata = metadata }
       block[index] = { id = id, text = { text }, metadata = metadata }
@@ -77,7 +82,8 @@ function plan_review_host.start(options)
         return
       end
       if params.operation == "plan_action" then
-        assert(params.input.action == "toggle_visibility", "unexpected plan action " .. tostring(params.input.action))
+        assert(params.input.action == "toggle_visibility" or params.input.action == "viewed"
+          or params.input.action == "unviewed", "unexpected plan action " .. tostring(params.input.action))
         host.actions[#host.actions + 1] = { input = params.input, callback = callback }
         return
       end
@@ -139,6 +145,16 @@ function plan_review_host.start(options)
     host.revision = host.revision + 1
     local result = presentation(pending.input.document)
     result.patch = {}
+    pending.callback(result)
+  end
+
+  ---Deliver a file move in the supplied block order, retaining canonical source lines.
+  function host.complete_move(index, order)
+    local pending = assert(host.actions[index])
+    host.revision = host.revision + 1
+    local result = presentation(pending.input.document)
+    local blocks = result.snapshot.block
+    result.snapshot.block = vim.tbl_map(function(row) return blocks[row] end, order)
     pending.callback(result)
   end
 

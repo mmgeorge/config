@@ -1995,6 +1995,25 @@ impl PlanFileStore {
     }
 }
 
+fn read_optional_review_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "plan review path is not a regular file: {}",
+                path.display()
+            );
+            Ok(Some(fs::read(path).with_context(|| {
+                format!("read plan review file {}", path.display())
+            })?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect plan review file {}", path.display()))
+        }
+    }
+}
+
 fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
     let content = crate::plan::codec::to_vec_pretty(value)?;
     write_bytes_atomically(path, &content)

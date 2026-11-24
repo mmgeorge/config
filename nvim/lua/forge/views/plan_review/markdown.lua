@@ -22,7 +22,8 @@ function M.ranges(source, projection)
   for _, region in ipairs(projection.markdown_regions or {}) do
     local first, after = region[1][1], region[#region][3]
     ranges[#ranges + 1] = { first0 = first, after0 = after, annotation = true,
-      frame = projection.line_meta_list[first + 1].comment_frame }
+      frame = projection.line_meta_list[first + 1].comment_frame,
+      footer = projection.line_meta_list[after].comment_footer }
   end
   return ranges
 end

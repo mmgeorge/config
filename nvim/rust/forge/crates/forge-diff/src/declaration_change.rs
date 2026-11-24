@@ -1,6 +1,6 @@
 //! Declaration identity matching shared by source comparisons and authored details.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::display::{DisplayRow, RowKind};
@@ -27,7 +27,7 @@ pub struct DeclarationPair {
 #[derive(Default)]
 pub struct DeclarationAlignment {
     pub anchors: Vec<LineAnchor>,
-    modified_signature: HashSet<usize>,
+    modified_signature: HashMap<usize, usize>,
     modified_body: Vec<Range<usize>>,
 }
 
@@ -69,11 +69,18 @@ impl DeclarationAlignment {
                 },
             ]);
             if old_lines[before.lines.clone()] != new_lines[after.lines.clone()] {
-                result.modified_signature.insert(after.signature);
+                result
+                    .modified_signature
+                    .insert(after.signature, before.signature);
                 result.modified_body.push(after.lines.clone());
             }
         }
         Ok(result)
+    }
+
+    /// Get the baseline heading paired with a modified proposed declaration.
+    pub fn baseline_signature(&self, proposed: usize) -> Option<usize> {
+        self.modified_signature.get(&proposed).copied()
     }
 
     /// Classify changed declaration headings and added rows inside matched revisions.
@@ -83,7 +90,7 @@ impl DeclarationAlignment {
             let next = self
                 .modified_body
                 .partition_point(|scope| scope.end <= coordinate.line);
-            self.modified_signature.contains(&coordinate.line)
+            self.modified_signature.contains_key(&coordinate.line)
                 || row.kind() == RowKind::Added
                     && self
                         .modified_body

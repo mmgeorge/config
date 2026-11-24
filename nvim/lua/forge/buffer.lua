@@ -654,7 +654,8 @@ end
 
 ---@param render_source? fun() Synchronously renders projected text after snapshot validation.
 ---@param mark_phase? fun(field: string) Record completed phases of a timed snapshot.
-function M.apply_projected_snapshot(session, snapshot, render_source, mark_phase)
+---@param displaced? fun(id: string, before: ForgeBlockSequence, after: ForgeBlockSequence): boolean Whether a retained block left its original section.
+function M.apply_projected_snapshot(session, snapshot, render_source, mark_phase, displaced)
   assert(not render_source or session.source_projected, "source rendering requires a projected document")
   if session.status == "Closed" then return { kind = "Closed" } end
   if session.expected_changedtick ~= nil and vim.api.nvim_buf_is_valid(session.buffer)
@@ -705,7 +706,8 @@ function M.apply_projected_snapshot(session, snapshot, render_source, mark_phase
   return cooperative.atomic(function()
     if session.before_commit then session.before_commit() end
     local retained_view = buffer_view.capture(session, function(id)
-      return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
+      local survives = prepared.block[id] ~= nil and prepared.block[id].row_count > 0
+      return survives, survives and displaced and displaced(id, session.sequence, prepared.sequence)
     end)
     if mark_phase then mark_phase("view_capture_ms") end
     local readonly = vim.bo[session.buffer].readonly

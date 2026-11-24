@@ -1,0 +1,55 @@
+{
+  "baseline": [
+    {
+      "range": {
+        "start": {
+          "row": 0,
+          "column": 0
+        },
+        "end": {
+          "row": 1,
+          "column": 0
+        }
+      },
+      "replacement": "",
+      "line": true,
+      "priority": 100
+    }
+  ],
+  "modified": [
+    {
+      "placement": "inline",
+      "position": {
+        "row": 0,
+        "column": 0
+      },
+      "chunk": [
+        {
+          "text": "  1",
+          "capture": "ForgeModifyLineNr"
+        },
+        {
+          "text": "  ",
+          "capture": "ForgeModifyBg"
+        },
+        {
+          "text": "  1",
+          "capture": "ForgeModifyLineNr"
+        },
+        {
+          "text": "  ",
+          "capture": "ForgeModifyBg"
+        },
+        {
+          "text": "~",
+          "capture": "ForgeModifyLineNr"
+        },
+        {
+          "text": " ",
+          "capture": "ForgeModifyBg"
+        }
+      ],
+      "priority": 100
+    }
+  ]
+}

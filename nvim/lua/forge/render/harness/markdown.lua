@@ -104,6 +104,7 @@ end
 ---@field source_indent? integer Prefix bytes to skip on each row.
 ---@field annotation? boolean An independently parsed Plan Review message.
 ---@field frame? {width: integer, indent: integer} Text area inside a Plan Review card.
+---@field footer? {namespace: integer, id: integer, anchor: integer, lines: table[]} Virtual bottom border on the last body row.
 ---@field continues_region? boolean Parse with the previous range while skipping intervening rows.
 
 --- Format line ranges as Tree-sitter parser regions.
@@ -358,6 +359,30 @@ local function prune_extmarks(buf, range_list)
   end)
 end
 
+--- Neovim hides a row's virtual lines together with its Markdown delimiter.
+--- Keep the border below the last visible body row when Markdown hides the end fence.
+local function align_card_footers(buf, ranges, markdown_namespace)
+  for _, range in ipairs(ranges) do
+    local footer = range.footer
+    if footer then
+      local row = range.after0 - 1
+      while row > 0 do
+        local marks = vim.api.nvim_buf_get_extmarks(buf, markdown_namespace, { row, 0 }, { row, -1 },
+          { details = true, overlap = true })
+        if not vim.iter(marks):any(function(mark)
+          local opts = mark[4]
+          return opts.conceal_lines and (mark[2] == row or opts.end_row > row or opts.end_col > 0)
+        end) then break end
+        row = row - 1
+      end
+      if row ~= footer.anchor then
+        vim.api.nvim_buf_set_extmark(buf, footer.namespace, row, 0, { id = footer.id, virt_lines = footer.lines })
+        footer.anchor = row
+      end
+    end
+  end
+end
+
 --- Compress conventional four-space Rust indentation without editing the fenced source.
 local function render_code_indent(buf, parser)
   vim.api.nvim_buf_clear_namespace(buf, code_indent_namespace, 0, -1)
@@ -502,12 +527,17 @@ function M.render(buf, win, range_list)
   local previous = render_pending[buf]
   render_pending[buf] = { epoch = epoch, window = win, tick = vim.api.nvim_buf_get_changedtick(buf),
     done = previous and previous.done }
+  layout_ranges[buf] = range_list
   if not render_observer_installed then
     local state = require("render-markdown.state")
     local on_render = state.on.render
     state.on.render = function(context)
       on_render(context)
       local pending = render_pending[context.buf]
+      if pending and pending.tick == vim.api.nvim_buf_get_changedtick(context.buf)
+        and vim.bo[context.buf].filetype == "ForgePlan" then
+        align_card_footers(context.buf, layout_ranges[context.buf], require("render-markdown.core.ui").ns)
+      end
       if not pending or pending.rendered ~= nil or pending.window ~= context.win then return end
       finish_render(context.buf, pending.epoch,
         vim.api.nvim_buf_get_changedtick(context.buf) == pending.tick)
@@ -590,7 +620,6 @@ function M.render(buf, win, range_list)
         end)
       end }
     end
-    layout_ranges[buf] = range_list
     if not cursor_attached[buf] then
       cursor_attached[buf] = true
       vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "ModeChanged", "BufEnter" }, {

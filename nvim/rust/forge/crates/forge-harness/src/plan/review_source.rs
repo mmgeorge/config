@@ -89,6 +89,35 @@ impl EditableReviewSource {
 }
 
 impl PlanReviewSource {
+    /// Locate review metadata shared by the working and archived copies of a revision.
+    pub(super) fn plan_directory(&self) -> Result<&Path> {
+        let parent = self
+            .path
+            .parent()
+            .context("physical plan parent is missing")?;
+        if self.is_historical() {
+            return parent.parent().context("plan revision parent is missing");
+        }
+        Ok(parent)
+    }
+
+    /// Locate the viewed file set for this plan's exact saved revision.
+    pub(super) fn viewed_path(&self) -> Result<std::path::PathBuf> {
+        Ok(self
+            .plan_directory()?
+            .join(format!("review-viewed-{}.json", self.saved_digest)))
+    }
+
+    /// Read the revision's viewed file headings, including changes from other open tabs.
+    pub(super) fn read_viewed_files(&self) -> Result<std::collections::BTreeSet<String>> {
+        let path = self.viewed_path()?;
+        let Some(bytes) = super::read_optional_review_file(&path)? else {
+            return Ok(Default::default());
+        };
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode viewed plan files {}", path.display()))
+    }
+
     pub(crate) fn into_data(self) -> ReviewSourceData {
         match self {
             Self::Working(source) => source.0,
@@ -259,6 +288,32 @@ pub(super) fn read_source(path: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_revision_has_its_own_viewed_files() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let files = PlanFileStore::new(temporary.path().join("data"), temporary.path())?;
+        let mut document = crate::plan::document::test_fixture("plan", "Review a file.");
+        files.write_working_document("session", "plan", &document)?;
+        let (_, _, digest) = files.submit_document_revision("session", "plan", 1, 1)?;
+        let first = files.capture_review_source("session", "plan", Some(1), &digest)?;
+        let viewed = std::collections::BTreeSet::from([String::from("plan:design:file:first")]);
+        super::super::write_json_atomically(&first.viewed_path()?, &viewed)?;
+
+        document.version += 1;
+        files.write_working_document("session", "plan", &document)?;
+        let (_, _, digest) =
+            files.submit_document_revision("session", "plan", 2, document.version)?;
+        let second = files.capture_review_source("session", "plan", Some(2), &digest)?;
+        assert!(second.read_viewed_files()?.is_empty());
+        assert_eq!(
+            files
+                .capture_revision_source("session", "plan", 1)?
+                .read_viewed_files()?,
+            viewed
+        );
+        Ok(())
+    }
 
     #[test]
     fn review_reads_the_submitted_rendering_and_rejects_a_divergent_working_copy() -> Result<()> {

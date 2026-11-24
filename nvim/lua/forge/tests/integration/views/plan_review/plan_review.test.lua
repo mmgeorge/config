@@ -139,8 +139,11 @@ T["directory_planning"] = function()
     "expanded comment displayed a literal Rust fence")
   local draft = comments.capture(review.buf)
   assert(vim.fn.search([[src/change\.rs]], "cw") > 0)
+  local file_row = vim.api.nvim_win_get_cursor(review.win)[1]
   keymap.invoke("U", { buffer = review.buf })
   wait_until(function() return file_section() == "Unviewed Changes" end, "U did not return the file", { errors = errors })
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win)[1], file_row,
+    { fail_reason = "moving the last expanded file scrolled to its new section" })
   MiniTest.expect.equality(comments.capture(review.buf), draft)
   MiniTest.expect.equality(vim.bo[review.buf].modified, true)
   local answer = require("forge.tests.support.mock_provider").hold(state.session.id, nil, true)
@@ -750,6 +753,55 @@ T["card navigation and native visual selection exclude the frame"] = function()
   MiniTest.expect.equality(placement, { "╰", 1, 0 })
 end
 
+T["marking a file viewed keeps the next file in place on screen"] = function()
+  local lines = vim.tbl_map(function(row) return ("File %02d"):format(row) end, vim.fn.range(1, 75))
+  local ids = vim.tbl_map(function(row) return "plan:design:file:" .. row end, vim.fn.range(1, #lines))
+  lines[65], ids[65] = "Viewed Changes", "plan:section:changes:viewed"
+  local host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua").start({ lines = lines, block_id = ids })
+  local review = host.open()
+  vim.wo[review.win].scrolloff = 0
+  vim.fn.winrestview({ lnum = 23, col = 2, topline = 18 })
+  keymap.invoke("S", { buffer = review.buf })
+  -- The user can scroll while the host is moving the file.
+  vim.fn.winrestview({ lnum = 23, topline = 20 })
+  local before = vim.fn.winsaveview().topline
+  local order = vim.fn.range(1, #lines)
+  table.insert(order, 70, table.remove(order, 23))
+  host.complete_move(1, order)
+  vim.cmd("redraw!")
+  MiniTest.expect.equality(vim.api.nvim_get_current_line(), "File 24")
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win), { 23, 2 })
+  MiniTest.expect.equality(vim.fn.winsaveview().topline, before)
+
+  -- If the moved file is the top row, anchoring the viewport to its identity would follow it.
+  vim.fn.winrestview({ lnum = 70, topline = 70 })
+  keymap.invoke("U", { buffer = review.buf })
+  host.complete_move(2, vim.fn.range(1, #lines))
+  vim.cmd("redraw!")
+  MiniTest.expect.equality(vim.api.nvim_get_current_line(), "File 70")
+  MiniTest.expect.equality(vim.fn.winsaveview().topline, 70)
+end
+
+T["behavior-only signature occupies one display row and keeps baseline comments"] = function()
+  local marks = vim.json.decode(table.concat(vim.fn.readfile(
+    "nvim/lua/forge/tests/fixtures/protocol/plan-review-behavior-signature.json"), "\n"))
+  local host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua").start({
+    lines = { "Changed file", "pub fn app() -> App;", "pub fn app() -> App {", "  Change" },
+    metadata = { [2] = { conceal = marks.baseline }, [3] = { gutter = marks.modified } },
+  })
+  host.annotation = { { id = "original", kind = "comment",
+    source = { start_line = 2, end_line = 2, body = "Keep this entry point." } } }
+  local review = host.open()
+  vim.api.nvim_win_set_cursor(review.win, { 1, 0 })
+  vim.cmd("redraw!")
+  MiniTest.expect.equality(buffer.find_row(review.buf, "pub fn app() -> App;"), nil)
+  local proposed = assert(buffer.find_row(review.buf, "pub fn app() -> App {")) - 1
+  MiniTest.expect.equality(vim.api.nvim_win_text_height(review.win, { start_row = proposed, end_row = proposed }).all, 1)
+  MiniTest.expect.equality(review.owner.comment_state.range_list[1].annotation.body, "Keep this entry point.")
+  vim.api.nvim_win_call(review.win, function() vim.cmd("normal! j") end)
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win)[1], review.owner.comment_state.range_list[1].first_row + 1)
+end
+
 T["expanded answer paints fenced Rust inside the card borders"] = function()
   local child = MiniTest.new_child_neovim()
   child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
@@ -810,6 +862,16 @@ T["expanded answer paints fenced Rust inside the card borders"] = function()
   ]])
   MiniTest.expect.equality(cells, { 0xffcc22, 0xffcc22, 0x1199ff, 0xffcc22, 0x1199ff, 0x1199ff, 0x22cc44,
     { "│", true, true, "│" }, { "│", true, true, "│" }, { "╰", "╯" } })
+  local popup_offset = child.lua([[
+    local parent = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(parent, { 12, 0 })
+    local target = assert(require("forge.draft_comments").input_target(vim.api.nvim_get_current_buf()))
+    require("forge.views.plan_review.comment_input").open(target, true, function() end)
+    vim.cmd("redraw!")
+    local code = vim.fn.screenpos(parent, 12, 1)
+    return vim.api.nvim_win_get_position(0)[1] - code.row
+  ]])
+  MiniTest.expect.equality(popup_offset, 1)
 end
 
 T["question_preserves_fenced_code_rendering"] = function()

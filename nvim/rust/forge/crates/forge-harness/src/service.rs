@@ -427,7 +427,7 @@ impl HarnessService {
                     );
                 }
                 admission.check()?;
-                controller.plan_review.restore_presentation(&mut source)?;
+                controller.plan_review.reuse_symbols(&mut source)?;
                 let warm = !source.is_historical() && source.document.design.is_some();
                 let review_id = document.clone();
                 let document = crate::plan::review_document::ReadOnlyPlanReview::new(

@@ -2000,6 +2000,187 @@ impl ReviewFixture {
     }
 }
 
+/// Unfold changed test declarations through the same file-body request the editor sends.
+#[tokio::test]
+async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
+    use crate::buffer::session::PresentationRequest;
+    use crate::plan::review_document::ReadOnlyPlanReview;
+    use crate::plan::review_files::ReviewFiles;
+    use forge_buffer::identity::{DocumentId, ViewId};
+    use forge_buffer::patch::BufferPatch;
+
+    let fixture = ReviewFixture::open(true).await?;
+    let files =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?;
+    let path = "tests/editor_ui_test.rs";
+    let declaration = "#[testing::test]\nasync fn private_case();\n#[test]\npub fn public_case();\n#[cfg(test)]\nmod tests {\n  pub fn nested_case();\n}\n";
+    let mut plan = crate::plan::test_fixture("review", "Review the editor tests.");
+    let mut design =
+        crate::plan::DeclarationDesign::scratch([(path.into(), declaration.into())].into())?;
+    design.document.objective = "Review the editor tests.".into();
+    design.document.background = "The editor has a test harness.".into();
+    design.document.requirements = vec!["Exercise each visibility.".into()];
+    design.document.design = "Add editor test cases.".into();
+    plan.design = Some(design);
+    files.write_working_document(&fixture.session_id, "review", &plan)?;
+    let (_, _, digest) = files.submit_document_revision(&fixture.session_id, "review", 1, 1)?;
+
+    for public_only in [false, true] {
+        let mut source =
+            files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?;
+        source.public_only = public_only;
+        source.files = Some(ReviewFiles::new(
+            source.document.design.as_ref().unwrap(),
+            &source.rendered,
+            &Default::default(),
+        )?);
+        let saved_source_digest = source.saved_digest.clone();
+        let document = DocumentId(format!("review-{public_only}"));
+        let review = ReadOnlyPlanReview::new(
+            document.clone(),
+            ViewId("plan".into()),
+            source,
+            Default::default(),
+            None,
+        )?;
+        let store = &fixture.controller.plan_review;
+        store.insert(review, store.admit(document.clone())?)?;
+        let result = fixture
+            .service
+            .document(
+                Some(fixture.session_id.clone()),
+                PresentationRequest::PlanBody {
+                    document,
+                    saved_source_digest,
+                    file: format!("plan:design:file:{}", crate::plan::digest(path.as_bytes())),
+                },
+                &fixture.sink,
+            )
+            .await?;
+        let patch: BufferPatch = serde_json::from_value(result["patch"].clone())?;
+        let body = patch
+            .text_edit
+            .iter()
+            .flat_map(|edit| edit.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (name, visible) in [
+            ("public_case", true),
+            ("private_case", !public_only),
+            ("nested_case", !public_only),
+        ] {
+            assert_eq!(
+                body.contains(name),
+                visible,
+                "public_only={public_only}, {name}: {body}"
+            );
+        }
+    }
+    fixture.finish().await
+}
+
+/// Review a behavior addition alongside a real change of signature and a removed callable.
+#[tokio::test]
+async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
+    use crate::plan::review_document::ReadOnlyPlanReview;
+    use crate::plan::{DeclarationDesign, DeclarationFile, FunctionBehavior, FunctionBody};
+    use forge_buffer::identity::{DocumentId, ViewId};
+    use forge_buffer::patch::BufferSnapshot;
+
+    let fixture = ReviewFixture::open(true).await?;
+    let files =
+        crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?;
+    let path = "app.rs";
+    let old = "pub fn app() -> App;\npub fn changed() -> u32;\npub fn removed();\n";
+    std::fs::write(fixture.root.path().join(path), old)?;
+    let new = "pub fn app() -> App;\npub fn changed() -> u64;\n";
+    let mut design = DeclarationDesign::default();
+    design.baseline.insert(
+        path.into(),
+        DeclarationFile::new(path, old.into(), crate::plan::digest(old.as_bytes()), &[])?,
+    );
+    design.parsed_insert(
+        path,
+        new.into(),
+        ["app", "changed"]
+            .map(|owner| FunctionBody {
+                owner: owner.into(),
+                behavior: Some(FunctionBehavior::Change("Install the plugin.".into())),
+            })
+            .into(),
+    )?;
+    design.document.objective = "Update the application.".into();
+    design.document.requirements = vec!["Install the plugin.".into()];
+    design.document.background = "The application has an existing entry point.".into();
+    design.document.design = "Update its behavior and change the counter type.".into();
+    let mut plan = crate::plan::test_fixture("review", "Update the application.");
+    plan.design = Some(design);
+    files.write_working_document(&fixture.session_id, "review", &plan)?;
+    let (_, _, digest) = files.submit_document_revision(&fixture.session_id, "review", 1, 1)?;
+    let mut source =
+        files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?;
+    for name in ["app", "changed"] {
+        let fold = format!(
+            "plan:calls:{}:proposed:{}",
+            crate::plan::digest(path.as_bytes()),
+            crate::plan::digest(name.as_bytes())
+        );
+        source
+            .collapse
+            .insert(forge_buffer::identity::FoldId(fold), false);
+    }
+    let id = DocumentId("review".into());
+    let review = ReadOnlyPlanReview::new(
+        id.clone(),
+        ViewId("plan".into()),
+        source,
+        Default::default(),
+        None,
+    )?;
+    let store = &fixture.controller.plan_review;
+    let result = store.insert(review, store.admit(id)?)?;
+    let snapshot: BufferSnapshot = serde_json::from_value(result["snapshot"].clone())?;
+    let visible = |text| {
+        snapshot.block.iter().find(|block| {
+            block.text.row(0) == Some(text)
+                && !block.metadata.conceal.iter().any(|conceal| conceal.line)
+        })
+    };
+    assert!(
+        visible("pub fn app() -> App;").is_none(),
+        "duplicate baseline signature"
+    );
+    let app = visible("pub fn app() -> App {").context("missing modified heading")?;
+    let gutter = app
+        .metadata
+        .gutter
+        .iter()
+        .flat_map(|mark| &mark.chunk)
+        .map(|chunk| chunk.text.as_str())
+        .collect::<String>();
+    assert_eq!(
+        gutter.split_whitespace().collect::<Vec<_>>(),
+        ["1", "1", "~"]
+    );
+    assert!(visible("  Change").is_some());
+    assert!(visible("pub fn changed() -> u32;").is_some());
+    assert!(visible("pub fn changed() -> u64 {").is_some());
+    assert!(visible("pub fn removed();").is_some());
+    let baseline = snapshot
+        .block
+        .iter()
+        .find(|block| block.text.row(0) == Some("pub fn app() -> App;"))
+        .context("missing baseline comment anchor")?;
+    forge_recorded_fixtures::assert_matches_recording(
+        "plan-review-behavior-signature.json",
+        &json!({
+            "baseline": baseline.metadata.conceal,
+            "modified": app.metadata.gutter,
+        }),
+    );
+    fixture.finish().await
+}
+
 /// Follow an intervening comment on one chain and start another chain at the same plan line.
 #[tokio::test]
 async fn review_asks_reuse_the_comment_chain_session() -> Result<()> {
@@ -2141,6 +2322,103 @@ async fn review_asks_reuse_the_comment_chain_session() -> Result<()> {
         if name == "follow-up" {
             assert_eq!(fixture.store()?.list_exchange(&children[0])?.len(), 2);
         }
+    }
+    fixture.finish().await
+}
+
+/// Read file review progress from the opening snapshot after replacing the session owner.
+#[tokio::test]
+async fn reopened_revision_restores_viewed_files_after_restart() -> Result<()> {
+    use crate::buffer::session::PresentationRequest;
+    use forge_buffer::identity::{DocumentId, ViewId};
+    use forge_buffer::patch::BufferSnapshot;
+
+    let mut fixture = ReviewFixture::open(true).await?;
+    let plan = fixture.plan_in_review().await?;
+    let open = |name: &str, revision| PresentationRequest::PlanOpen {
+        document: DocumentId(name.into()),
+        view: ViewId("plan".into()),
+        plan_id: plan.id.clone(),
+        digest: plan.review_digest.clone().unwrap(),
+        revision,
+        width: Default::default(),
+        expanded_files: Default::default(),
+        focused_annotation: None,
+        saved_source_digest: None,
+    };
+    for (index, (name, revision, expected, action)) in [
+        ("first", None, false, Some("viewed")),
+        ("history", Some(1), true, Some("unviewed")),
+        ("reopened", None, false, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 1 {
+            fixture.service.shutdown(Duration::from_secs(2)).await?;
+            drop(fixture.controller);
+            fixture.service = service();
+            let mut options = initialize(&fixture.root, "mock");
+            options.session_id = Some(fixture.session_id.clone());
+            fixture
+                .service
+                .open_session(2, options)
+                .await?
+                .result()
+                .context("session restart failed")?;
+            fixture.controller = fixture
+                .service
+                .registry()
+                .await?
+                .resolve(&fixture.session_id)
+                .await?;
+        }
+        let opened = fixture
+            .service
+            .document(
+                Some(fixture.session_id.clone()),
+                open(name, revision),
+                &fixture.sink,
+            )
+            .await?;
+        let snapshot: BufferSnapshot = serde_json::from_value(opened["snapshot"].clone())?;
+        let file = snapshot
+            .block
+            .iter()
+            .position(|block| block.id.0.starts_with("plan:design:file:"))
+            .context("missing changed file")?;
+        let viewed = snapshot
+            .block
+            .iter()
+            .position(|block| block.id.0 == "plan:section:changes:viewed")
+            .context("missing Viewed Changes")?;
+        assert_eq!(file > viewed, expected, "{name}");
+        if let Some(action) = action {
+            let heading = &snapshot.block[file];
+            let target = &heading.metadata.target[0];
+            let input = serde_json::from_value(
+                json!({"document":name,"view":"plan","revision":snapshot.revision,
+                "sequence":1,"action":action,"block":heading.id,"position":target.range.start,"target":target.id}),
+            )?;
+            fixture
+                .service
+                .document(
+                    Some(fixture.session_id.clone()),
+                    PresentationRequest::PlanAction { input },
+                    &fixture.sink,
+                )
+                .await?;
+        }
+        fixture
+            .service
+            .document(
+                Some(fixture.session_id.clone()),
+                PresentationRequest::PlanClose {
+                    document: DocumentId(name.into()),
+                },
+                &fixture.sink,
+            )
+            .await?;
     }
     fixture.finish().await
 }

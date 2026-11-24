@@ -588,6 +588,15 @@ fn rows(
         if diff.hunk.is_empty() && before.is_some() && after.is_some() && path == destination {
             continue;
         }
+        let body_openings = if inspection {
+            super::review_alignment::body_openings(
+                before.as_deref(),
+                after.as_deref(),
+                &diff.alignment,
+            )
+        } else {
+            HashMap::new()
+        };
         if before.as_ref().map(|source| &source.declaration.text)
             == after.as_ref().map(|source| &source.declaration.text)
             && path == destination
@@ -690,11 +699,28 @@ fn rows(
             )?);
             for (row_index, row) in hunk.row.iter().enumerate() {
                 let id = BlockId(format!("{hunk_id}:row:{row_index}"));
+                let mut paired_row;
+                let painted = if inspection
+                    && row.kind() == RowKind::Added
+                    && let Some(new) = row.new_coordinate()
+                    && let Some(&old_line) = body_openings.get(&(new.side, new.line))
+                {
+                    paired_row = row.clone();
+                    paired_row.source = forge_diff::display::DisplaySource::Diff(
+                        forge_diff::display::RowCoordinates::Context {
+                            old_line,
+                            new_line: new.line,
+                        },
+                    );
+                    &paired_row
+                } else {
+                    row
+                };
                 let mut metadata = if file.alignment.modified(row) {
                     presenter
                         .row(
                             id,
-                            row,
+                            painted,
                             &hunk.group,
                             forge_diff::presentation::RowChange::Modified,
                         )?
@@ -722,6 +748,24 @@ fn rows(
                     forge_diff::source::SourceSide::New => ("proposed", path),
                 };
                 let line = coordinate.line;
+                if inspection
+                    && row.kind() == RowKind::Removed
+                    && let Some(&opening) = body_openings.get(&(coordinate.side, line))
+                    && visibility
+                        .get(&(path.clone(), "proposed".into()))
+                        .is_some_and(|visible| visible.rows[opening])
+                {
+                    // Keep the saved baseline row addressable for existing review comments.
+                    metadata.conceal.push(forge_buffer::block::Conceal {
+                        range: TextRange {
+                            start: TextPosition { row: 0, column: 0 },
+                            end: TextPosition { row: 1, column: 0 },
+                        },
+                        replacement: String::new(),
+                        line: true,
+                        priority: 100,
+                    });
+                }
                 let row_text = visibility
                     .get(&(source_path.clone(), side.into()))
                     .and_then(|visibility| visibility.replacement.get(&line))

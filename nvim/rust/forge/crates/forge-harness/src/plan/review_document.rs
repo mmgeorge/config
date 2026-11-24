@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct PlanReviewStore {
     admission: Arc<DocumentAdmissionStore>,
     document: Mutex<HashMap<DocumentId, (ReadOnlyPlanReview, DocumentAdmission)>>,
-    viewed_by_digest: Mutex<HashMap<String, BTreeSet<String>>>,
     recent_symbols: Mutex<Option<(String, super::review_files::ReviewSymbolCache)>>,
 }
 
@@ -173,15 +172,8 @@ impl PlanReviewStore {
         Ok(result)
     }
 
-    /// Restore review progress and reuse the visible prose index for an unchanged revision.
-    pub(crate) fn restore_presentation(&self, source: &mut PlanReviewSource) -> Result<()> {
-        let viewed = self
-            .viewed_by_digest
-            .lock()
-            .map_err(|_| anyhow::anyhow!("plan file review lock poisoned"))?;
-        if let Some(files) = viewed.get(&source.saved_digest) {
-            source.viewed_files.clone_from(files);
-        }
+    /// Reuse the visible prose index for an unchanged revision.
+    pub(crate) fn reuse_symbols(&self, source: &mut PlanReviewSource) -> Result<()> {
         let digest = source.saved_digest.clone();
         if let Some(files) = source.files.as_mut() {
             let mut recent = self
@@ -553,31 +545,20 @@ impl PlanReviewStore {
             let Some(file) = super::review_projection::change_file(&block) else {
                 return Ok(serde_json::json!({}));
             };
-            let mut progress = self
-                .viewed_by_digest
-                .lock()
-                .map_err(|_| anyhow::anyhow!("plan file review lock poisoned"))?;
-            let mut files = progress
-                .get(&document.source.saved_digest)
-                .cloned()
-                .unwrap_or_default();
+            let mut files = document.source.read_viewed_files()?;
             let changed = forge_diff::presentation::file_review::set_viewed(
                 &mut files,
                 file,
                 action == "viewed",
             );
+            if changed {
+                super::write_json_atomically(&document.source.viewed_path()?, &files)?;
+            }
             let result = if files == document.source.viewed_files {
                 serde_json::json!({})
             } else {
-                document.move_review_file(file, &files)?
+                document.group_review_files(&files)?
             };
-            if changed {
-                if files.is_empty() {
-                    progress.remove(&document.source.saved_digest);
-                } else {
-                    progress.insert(document.source.saved_digest.clone(), files.clone());
-                }
-            }
             document.source.viewed_files = files;
             return Ok(result);
         }
@@ -948,6 +929,7 @@ impl EditablePlanReview<'_> {
     ) -> Result<serde_json::Value> {
         let document = self.0;
         let mut source = source.into_source();
+        source.viewed_files = source.read_viewed_files()?;
         let total = trace.map(|trace| trace.stage("review.update"));
         ensure!(
             source.document.plan_id == document.source.document.plan_id
@@ -2250,21 +2232,13 @@ impl ReadOnlyPlanReview {
     pub(crate) fn new(
         id: DocumentId,
         view: ViewId,
-        source: PlanReviewSource,
+        mut source: PlanReviewSource,
         width: WidthProfile,
         focused_annotation: Option<String>,
     ) -> Result<Self> {
         view.validate()?;
-        let annotation_path = if source.is_historical() {
-            source
-                .path
-                .parent()
-                .and_then(|directory| directory.parent())
-                .context("plan revision parent is missing")?
-                .join("working.json")
-        } else {
-            source.path.with_extension("json")
-        };
+        source.viewed_files = source.read_viewed_files()?;
+        let annotation_path = source.plan_directory()?.join("working.json");
         let mut annotation =
             ReviewAnnotationStore::open(annotation_path, source.saved_digest.clone())?;
         if source.document.design.is_some() {
@@ -2609,38 +2583,14 @@ impl ReadOnlyPlanReview {
     }
 
     /// Move the cached whole-file subtree, including an unloaded heading.
-    fn move_review_file(
-        &mut self,
-        file: &str,
-        viewed: &BTreeSet<String>,
-    ) -> Result<serde_json::Value> {
+    fn group_review_files(&mut self, viewed: &BTreeSet<String>) -> Result<serde_json::Value> {
         let mut blocks = self.document.snapshot().block;
-        let headings: Vec<_> = blocks
-            .iter()
-            .filter(|block| {
-                super::review_projection::change_file(&block.id) == Some(block.id.0.as_str())
-                    && self.source.viewed_files.contains(&block.id.0)
-                        == self.source.viewed_files.contains(file)
-            })
-            .map(|block| &block.id)
-            .collect();
-        let index = headings
-            .iter()
-            .position(|id| id.0 == file)
-            .context("plan change file heading is missing")?;
-        let next = headings
-            .get(index + 1)
-            .or_else(|| index.checked_sub(1).and_then(|i| headings.get(i)))
-            .unwrap_or(&headings[index])
-            .0
-            .clone();
         super::review_projection::group_changes(&mut blocks, &self.target, viewed)?;
         let patch = self
             .document
             .splice(0..self.document.block_count(), blocks)?;
         Ok(
-            serde_json::json!({"patch":patch, "source_edit":self.source_edit(), "annotation":self.annotation.annotation(),
-            "jump":{"block":next, "position":{"row":0,"column":0}}}),
+            serde_json::json!({"patch":patch, "source_edit":self.source_edit(), "annotation":self.annotation.annotation()}),
         )
     }
 
@@ -2746,7 +2696,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn moving_the_first_file_advances_to_the_second_and_restores_proposal_order() -> Result<()> {
+    fn moving_a_file_preserves_proposal_order_without_requesting_navigation() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let file = PlanFileStore::new(temporary.path().join("data"), temporary.path())?;
         crate::checks::configure_fixture(&file.workspace);
@@ -2778,8 +2728,8 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 2);
         let viewed = BTreeSet::from([files[0].clone()]);
-        let result = review.move_review_file(&files[0], &viewed)?;
-        assert_eq!(result["jump"]["block"], files[1]);
+        let result = review.group_review_files(&viewed)?;
+        assert!(result.get("jump").is_none());
         let moved = review.snapshot().block;
         let position = |id: &str| moved.iter().position(|block| block.id.0 == id).unwrap();
         let separator = &moved[position("plan:section:changes:viewed") - 1];
@@ -2788,7 +2738,7 @@ mod tests {
         assert!(position(&files[1]) < position("plan:section:changes:viewed"));
         assert!(position("plan:section:changes:viewed") < position(&files[0]));
         review.source.viewed_files = viewed;
-        review.move_review_file(&files[0], &BTreeSet::new())?;
+        review.group_review_files(&BTreeSet::new())?;
         assert_eq!(review.snapshot().block, original);
         Ok(())
     }

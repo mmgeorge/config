@@ -199,7 +199,7 @@ local function action(review, name)
         or not vim.api.nvim_win_is_valid(review.win)
         or vim.api.nvim_win_get_buf(review.win) ~= review.buf) then return end
     if failure then notice(failure) return end
-    if name == "toggle_declaration" or file_review then
+    if name == "toggle_declaration" then
       if result.jump then
         effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
       end

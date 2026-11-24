@@ -39,6 +39,7 @@ local blank_cursor_keys = vim.api.nvim_create_namespace("ForgeDraftCommentCursor
 ---@field last_row integer
 ---@field header_mark integer?
 ---@field footer_mark integer?
+---@field border_mark? integer Display anchor of the expanded thread's virtual footer.
 ---@field reply_mark integer?
 ---@field reply_start_row integer?
 ---@field readonly boolean?
@@ -81,6 +82,7 @@ local blank_cursor_keys = vim.api.nvim_create_namespace("ForgeDraftCommentCursor
 ---@field ancestor_ids? string[]
 ---@field annotation_anchor? boolean
 ---@field hidden? boolean
+---@field omit_text? boolean Omit the source text while retaining its anchored comment cards.
 
 ---@class ForgeDraftCommentOptions
 ---@field baseline? ForgeDraftCommentCapture[]
@@ -436,27 +438,29 @@ local function build_projection(state, width)
   for source_index, source_row in ipairs(source_row_list) do
     if not source_row.hidden then
     local source_line = math.max(1, math.min(tonumber(source_row.source_line) or 1, source_count))
-    local row = #projection.line_list
-    if projection.source_row_by_line[source_line] == nil then projection.source_row_by_line[source_line] = row end
-    projection.line_list[#projection.line_list + 1] = string.rep(" ", source_row.display_indent or 0) .. (source_row.display_text or source_row.text or "")
-    projection.line_meta_list[#projection.line_list] = vim.deepcopy(source_row)
-    projection.source_record_list[#projection.source_record_list + 1] = {
-      row = row,
-      source_line = source_line,
-      source_index = source_index,
-    }
-    local text_offset = 0
-    for _, segment in ipairs(source_row.segments or {}) do
-      local segment_text = segment[1] or ""
-      if segment[2] and segment_text ~= "" then
-        projection.source_highlight_list[#projection.source_highlight_list + 1] = {
-          row = row,
-          start_col = text_offset,
-          end_col = text_offset + #segment_text,
-          hl = segment[2],
-        }
+    if not source_row.omit_text then
+      local row = #projection.line_list
+      if projection.source_row_by_line[source_line] == nil then projection.source_row_by_line[source_line] = row end
+      projection.line_list[#projection.line_list + 1] = string.rep(" ", source_row.display_indent or 0) .. (source_row.display_text or source_row.text or "")
+      projection.line_meta_list[#projection.line_list] = vim.deepcopy(source_row)
+      projection.source_record_list[#projection.source_record_list + 1] = {
+        row = row,
+        source_line = source_line,
+        source_index = source_index,
+      }
+      local text_offset = 0
+      for _, segment in ipairs(source_row.segments or {}) do
+        local segment_text = segment[1] or ""
+        if segment[2] and segment_text ~= "" then
+          projection.source_highlight_list[#projection.source_highlight_list + 1] = {
+            row = row,
+            start_col = text_offset,
+            end_col = text_offset + #segment_text,
+            hl = segment[2],
+          }
+        end
+        text_offset = text_offset + #segment_text
       end
-      text_offset = text_offset + #segment_text
     end
     local anchors_annotation = annotation_row_by_source[source_line] == source_index
     if anchors_annotation then
@@ -620,7 +624,12 @@ local function apply_projection(state, projection, mark_phase)
     })
   end
   for _, mark in ipairs(projection.frame_mark) do
-    vim.api.nvim_buf_set_extmark(state.buf, namespace, mark.row, mark.col, mark.options)
+    local id = vim.api.nvim_buf_set_extmark(state.buf, namespace, mark.row, mark.col, mark.options)
+    if mark.options.virt_lines and not mark.options.virt_lines_above then
+      projection.line_meta_list[mark.row + 1].comment_footer = {
+        namespace = namespace, id = id, lines = mark.options.virt_lines, anchor = mark.row,
+      }
+    end
   end
   for _, highlight in ipairs(projection.compact_highlight_list) do
     local options = {
@@ -638,6 +647,8 @@ local function apply_projection(state, projection, mark_phase)
     vim.api.nvim_buf_set_extmark(state.buf, namespace, highlight.row, highlight.start_col, options)
   end
   for _, range in ipairs(projection.range_list) do
+    local border = projection.line_meta_list[range.last_row + 1].comment_footer
+    range.border_mark = border and border.id
     range.header_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.first_row, 0, { right_gravity = false })
     range.footer_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.last_row, 0, { right_gravity = true })
     if range.reply_start_row then range.reply_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.reply_start_row, 0, { right_gravity = false }) end
@@ -1233,7 +1244,7 @@ function M.input_target(buf)
       for index = #state.range_list, 1, -1 do
         local range = state.range_list[index]
         if thread_root(state, range.annotation) == root then
-          local footer = mark_row(state, range.footer_mark)
+          local footer = mark_row(state, range.border_mark or range.footer_mark)
           if not footer then return end
           if range.folded then return footer, 2, math.max(1, math.min(range.inner_width, usable - 4)), 1 end
           if range.inner_width then

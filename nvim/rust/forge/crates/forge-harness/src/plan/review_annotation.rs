@@ -1,4 +1,4 @@
-use super::{PlanAnnotationInput, digest, write_bytes_atomically};
+use super::{PlanAnnotationInput, digest, read_optional_review_file, write_bytes_atomically};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -99,7 +99,7 @@ impl ReviewAnnotationStore {
             .parent()
             .context("physical plan parent is missing")?
             .join(format!("review-annotations-{source_digest}.json"));
-        let saved = read_optional(&path)?;
+        let saved = read_optional_review_file(&path)?;
         let annotation = if let Some(saved) = &saved {
             let decoded: SavedAnnotation = serde_json::from_slice(saved)?;
             ensure!(
@@ -150,7 +150,7 @@ impl ReviewAnnotationStore {
             "physical plan source changed before saving annotations"
         );
         ensure!(
-            read_optional(&self.path)? == self.saved,
+            read_optional_review_file(&self.path)? == self.saved,
             "plan annotations changed in another review"
         );
         let replacement = serde_json::to_vec(&SavedAnnotation {
@@ -243,20 +243,6 @@ fn find_target(
         relocated = Some(anchor.line);
     }
     if ambiguous { None } else { relocated }
-}
-
-fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "plan annotation path is not a regular file"
-            );
-            Ok(Some(std::fs::read(path)?))
-        }
-        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(failure) => Err(failure.into()),
-    }
 }
 
 fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {

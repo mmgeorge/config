@@ -45,6 +45,7 @@ end
 ---@field block? string
 ---@field row integer Offset inside the retained block.
 ---@field original_row integer Zero-based native cursor row before the update.
+---@field physical? boolean Keep the editor row when the block leaves its section.
 ---@field column integer Zero-based byte column.
 ---@field source_column? boolean Column is canonical and requires projection on restore.
 ---@field projection_offset? integer Physical offset within an attached annotation.
@@ -54,7 +55,7 @@ end
 
 ---@param session table Native buffer replica.
 ---@param cursor integer[] One-based row and zero-based byte column.
----@param retained fun(id: string): boolean Accepts identities present after the update.
+---@param retained fun(id: string): boolean, boolean? Returns whether the identity survives and whether it moved out of its section.
 ---@return ForgeRetainedPosition
 local function capture_position(session, cursor, retained)
   local original_row = cursor[1] - 1
@@ -66,7 +67,8 @@ local function capture_position(session, cursor, retained)
     local block, offset = node.id, canonical_row - start
     local source_anchor
     local represented = node.entry.metadata.source_anchor
-    if not retained(block) and represented and represented ~= vim.NIL then
+    local survives, displaced = retained(block)
+    if not survives and represented and represented ~= vim.NIL then
       source_anchor = { owner = represented.owner }
       for _, side in ipairs({ "before", "after" }) do
         local range = represented[side]
@@ -77,9 +79,9 @@ local function capture_position(session, cursor, retained)
     end
     local projection_offset = source and session.physical_row
       and original_row - session.physical_row(canonical_row) or nil
-    if not retained(block) and session.retain_removed_position then
-      block, offset, projection_offset = nil, 0, nil
-    elseif not retained(block) then
+    if displaced or (not survives and session.retain_removed_position) then
+      return { physical = true, row = 0, original_row = original_row, column = cursor[2], source_anchor = source_anchor }
+    elseif not survives then
       projection_offset = nil
       block, offset = nil, 0
       local ancestor_size
@@ -131,7 +133,7 @@ end
 ---@field selection? {mode: string, anchor: ForgeRetainedPosition}
 
 ---@param session table Native buffer replica.
----@param retained fun(id: string): boolean Accepts identities present after the update.
+---@param retained fun(id: string): boolean, boolean? Returns whether the identity survives and whether it moved out of its section.
 ---@return ForgeRetainedView[]
 function M.capture(session, retained)
   if not session.preserve_view then return {} end
@@ -200,7 +202,11 @@ local function resolve_position(session, saved, allow_eol)
   local canonical_row = row
   if session.source_projected and session.physical_row then
     row_count = vim.api.nvim_buf_line_count(session.buffer)
-    row = math.min(row_count - 1, session.physical_row(row) + (saved.projection_offset or 0))
+    if saved.physical and not node then
+      row = math.min(row_count - 1, saved.original_row)
+    else
+      row = math.min(row_count - 1, session.physical_row(row) + (saved.projection_offset or 0))
+    end
   end
   local column = saved.source_column and require("forge.buffer").physical_column(session, canonical_row, saved.column) or saved.column
   local line = vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1] or ""

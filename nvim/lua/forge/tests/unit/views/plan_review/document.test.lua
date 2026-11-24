@@ -355,16 +355,17 @@ T["questions"] = function()
   vim.cmd("write")
   eq(pending[2].method, "session.plan.question.answer", { fail_reason = "saving did not ask the LLM" })
   eq(saves[1].annotation[1].kind, "question", { fail_reason = "question kind was lost in the saved annotation" })
-  eq(pending[2].params.question_ids[1], "1", { fail_reason = "answer request lost its saved question identity" })
+  local question_id = saves[1].annotation[1].id
+  eq(pending[2].params.question_ids[1], question_id, { fail_reason = "answer request lost its saved question identity" })
   assert(buffer_support.text(buffer):find("Generating response", 1, true), "request omitted persistent progress")
   pending[2].progress({ question_id = "other", model = "wrong-model", effort = "low" })
   assert(not buffer_support.text(buffer):find("wrong-model", 1, true), "another question changed this pending answer")
-  pending[2].progress({ question_id = "1", model = "test-ask-model", effort = "high" })
+  pending[2].progress({ question_id = question_id, model = "test-ask-model", effort = "high" })
   assert(buffer_support.text(buffer):find("Generating response · test-ask-model · Thinking: high", 1, true),
     "request did not display its resolved model and thinking")
   leave_and_return("Generating response · test-ask-model · Thinking: high")
   local function response(question, answer)
-    return { annotation = { { id = "1", kind = "question", source = { start_line = 1, end_line = 1, body = question },
+    return { annotation = { { id = question_id, kind = "question", source = { start_line = 1, end_line = 1, body = question },
       reply = { question_body = question, body = answer, duration_ms = 3210 } } } }
   end
   pending[2].callback(response("Why own this state?", "It gives one component ownership. Callers use its public interface."))
@@ -393,7 +394,7 @@ T["questions"] = function()
   vim.cmd("write")
   eq(pending[5].method, "session.plan.question.answer", { fail_reason = "retry did not resubmit the unanswered question" })
   pending[5].callback(response("Newer unsaved question?", "The interface establishes the ownership boundary."))
-  pending[4].progress({ question_id = "1", model = "obsolete-model", effort = "low" })
+  pending[4].progress({ question_id = question_id, model = "obsolete-model", effort = "low" })
   assert(not buffer_support.text(buffer):find("obsolete-model", 1, true), "retired request progress replaced the completed answer")
   assert(not vim.bo[buffer].modified and buffer_support.text(buffer):find("ownership boundary.", 1, true), "retry did not retain the answer")
   owner.action("toggle_visibility", function(_, failure) assert(not failure, failure) end)
@@ -413,12 +414,14 @@ T["questions"] = function()
   owner.action("question", function() end)
   finish_input({ "Which getter should I use?" })
   local captured = comments.capture(buffer)
-  assert(#captured == 2 and captured[2].parent_id == "1", "A on the answer did not create a linked follow-up")
+  assert(#captured == 2 and captured[2].parent_id == question_id, "A on the answer did not create a linked follow-up")
+  local follow_up_id = captured[2].id
+  assert(follow_up_id ~= question_id, "follow-up reused the parent question identity")
   vim.cmd("write")
-  assert(pending[7].method == "session.plan.question.answer" and saves[#saves].annotation[2].parent_id == "1" and pending[7].params.question_ids[1] == "2",
+  assert(pending[7].method == "session.plan.question.answer" and saves[#saves].annotation[2].parent_id == question_id and pending[7].params.question_ids[1] == follow_up_id,
     "question request omitted the follow-up identity")
   local threaded = response("Newer unsaved question?", "The interface establishes the ownership boundary.")
-  threaded.annotation[2] = { id = "2", kind = "question", parent_id = "1",
+  threaded.annotation[2] = { id = follow_up_id, kind = "question", parent_id = question_id,
     source = { start_line = 1, end_line = 1, body = "Which getter should I use?" },
     reply = { question_body = "Which getter should I use?", body = "Use the state getter.", duration_ms = 1000 } }
   pending[7].callback(threaded)
@@ -431,7 +434,7 @@ T["questions"] = function()
   end
   owner.action("comment", function() end)
   finish_input({ "Retain that getter." })
-  eq(comments.capture(buffer)[3].parent_id, "2", { fail_reason = "C on a follow-up answer lost the conversation" })
+  eq(comments.capture(buffer)[3].parent_id, follow_up_id, { fail_reason = "C on a follow-up answer lost the conversation" })
   owner.close()
   vim.api.nvim_buf_delete(buffer, { force = true })
 end

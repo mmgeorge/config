@@ -430,6 +430,15 @@ function M.attach(options, callback)
       row.display_indent = node and require("forge.content_layout").leading_width(node.entry, row.position.row) or 0
       source_lines[#source_lines + 1] = row.text
       row.annotation_anchor = row.target ~= nil and row.target ~= vim.NIL and row.source_line > 0
+      row.omit_text = false
+      for _, conceal in ipairs(row.metadata and row.metadata.conceal or {}) do
+        local first, last = conceal.range.start, conceal.range["end"]
+        if conceal.line and row.position.row >= first.row
+          and (row.position.row < last.row or row.position.row == last.row and last.column > 0) then
+          row.omit_text = true
+          break
+        end
+      end
     end
     local namespace = vim.api.nvim_create_namespace("ForgePlanDraftSource" .. options.buffer)
     local function paint(_, _, projection)
@@ -454,7 +463,7 @@ function M.attach(options, callback)
             if column <= finish then
               vim.api.nvim_buf_set_extmark(options.buffer, namespace, record.row, row.display_indent + column, {
                 end_row = record.row, end_col = row.display_indent + finish,
-                conceal = conceal.replacement, conceal_lines = conceal.line and "" or nil, priority = conceal.priority,
+                conceal = conceal.replacement, priority = conceal.priority,
               })
             end
           end
@@ -515,6 +524,12 @@ function M.attach(options, callback)
       revision = owner.version, count = #selected, duration_ms = perf.elapsed_ms(started) })
     return settle
   end
+  local function changed_file_section(id, before, after)
+    if not vim.startswith(id, "plan:design:file:") then return false end
+    local viewed = "plan:section:changes:viewed"
+    if not before.node[viewed] or not after.node[viewed] then return false end
+    return (before:position(id) > before:position(viewed)) ~= (after:position(id) > after:position(viewed))
+  end
   local function apply_projection(opened, source, mark_phase)
     vim.api.nvim_buf_clear_namespace(options.buffer, symbol_namespace, 0, -1)
     if not source then
@@ -523,7 +538,7 @@ function M.attach(options, callback)
       source = fragment
     end
     if mark_phase then mark_phase("delivery_ms") end
-    local applied = buffer.apply_snapshot(owner.replica, opened.snapshot, function()
+    local applied = buffer.apply_projected_snapshot(owner.replica, opened.snapshot, function()
       local focused_id
       for _, annotation in ipairs(owner.comment_state and owner.comment_state.annotation_list or {}) do
         if annotation.focused then focused_id = annotation.id break end
@@ -534,7 +549,7 @@ function M.attach(options, callback)
       owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
       if mark_phase then mark_phase("source_reset_ms") end
       attach_projection(opened, source, focused_id, mark_phase)
-    end, mark_phase)
+    end, mark_phase, changed_file_section)
     if applied.kind == "Applied" then
       local options = wrapping()
       for _, view in pairs(owner.views) do input.set_wrapping(view, options) end
