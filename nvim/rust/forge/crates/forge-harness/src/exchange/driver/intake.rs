@@ -14,6 +14,7 @@ impl ExchangeDriver {
         context: OwnerUpdateContext<'_>,
     ) {
         let OwnerIntake {
+            checks_pending,
             active,
             foreground_target,
             steering: steering_admission,
@@ -37,6 +38,7 @@ impl ExchangeDriver {
                     .prepare_candidate_offer(
                         &output,
                         active.is_some() || !pending.is_empty(),
+                        checks_pending,
                         steering_admission,
                         broker,
                         OwnerUpdateContext {
@@ -349,20 +351,20 @@ impl ExchangeDriver {
                     }
                     if !crate::input::input_purpose_is_current(&services.tasks, &services.questions, &message.purpose, &services.root, services.observer.session_id()).map_err(InputOfferError::Authority)? { return Ok(false); }
                     let ready = services.observer.input_readiness().map_err(InputOfferError::Queue)?;
-                    if ready.has_approval || ready.checks_running && !matches!(message.purpose, crate::input::InputPurpose::CheckResult { .. }) { return Ok(false); }
+                    if !ready.turn_offer_gates().admit(&message) { return Ok(false); }
                     let mut broker = broker.lock().await;
-                    if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &message.purpose {
-                        let current = crate::storage::HistoryReader::current(&services.root)
-                            .and_then(|reader| reader.latest_exchange(session))
-                            .map_err(InputOfferError::Queue)?;
-                        if current.is_none_or(|exchange| exchange.id != *exchange_id && matches!(exchange.state(), crate::exchange::ExchangeState::Running | crate::exchange::ExchangeState::Finalizing)) { return Ok(false); }
+                    let Some(parent) = broker.parent_input.capture().filter(crate::provider::SteeringTarget::is_open) else {
+                        return Ok(false);
+                    };
+                    if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &message.purpose
+                        && parent.exchange().is_none_or(|owner| owner.as_str() != exchange_id)
+                    {
+                        self.check_results.defer(session, &message, super::super::check_result::DeliveryDeferral::OtherExchange);
+                        return Ok(false);
                     }
                     let view = broker.owner_control_view().map_err(InputOfferError::Queue)?;
                     publish_input_events(view.events, Some(&output), services, trace, session, &input, step);
-                    let registry = broker.execution_registry();
-                    let target = if let Some(parent) = broker.parent_input.capture().filter(crate::provider::SteeringTarget::is_open) {
-                        SteeringDispatchTarget::parent(parent, registry, crate::provider::ThreadOwner::root(session))
-                    } else { return Ok(false); };
+                    let target = SteeringDispatchTarget::parent(parent, broker.execution_registry(), crate::provider::ThreadOwner::root(session));
                     let Some(message) = store.claim(input.id.as_str(), input.revision, crate::input::InputRoute::Steering).map_err(InputOfferError::Queue)? else { return Ok(false); };
                     let claimed_revision = message.revision;
                     self.check_results.dispatched(session, &message, crate::input::InputRoute::Steering);

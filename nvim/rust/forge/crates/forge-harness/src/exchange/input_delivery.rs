@@ -1270,21 +1270,6 @@ impl InputDeliveryRun {
             .map_err(OperationFailure::Domain)?
             .snapshot()
             .map_err(OperationFailure::Domain)?;
-        if let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &self.message.purpose {
-            let active = crate::storage::HistoryReader::current(&services.root)
-                .and_then(|reader| reader.latest_exchange(services.observer.session_id()))
-                .map_err(OperationFailure::Domain)?;
-            if active.is_none_or(|exchange| {
-                exchange.id != *exchange_id
-                    && matches!(
-                        exchange.state(),
-                        crate::exchange::ExchangeState::Running
-                            | crate::exchange::ExchangeState::Finalizing
-                    )
-            }) {
-                return Ok(Some(InputAbandonment::Paused));
-            }
-        }
         let ready = services
             .observer
             .input_readiness()
@@ -1295,12 +1280,7 @@ impl InputDeliveryRun {
                 crate::input::InputPurpose::Question { .. }
             )
             || *services.cancellation.subscribe().borrow()
-            || ready.has_approval
-            || ready.checks_running
-                && !matches!(
-                    self.message.purpose,
-                    crate::input::InputPurpose::CheckResult { .. }
-                )
+            || !ready.turn_offer_gates().admit(&self.message)
             || services.tasks.configuration_is_uncertain())
         .then_some(InputAbandonment::Paused))
     }

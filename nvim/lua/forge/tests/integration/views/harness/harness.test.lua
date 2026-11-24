@@ -91,7 +91,7 @@ T["check_completion_with_gitlink"] = function()
   require("forge.views.harness").open()
   local state = require("forge.session").harness
   wait_until(function() return state.ready and state.session and state.presentation and state.presentation.ready end,
-    "Harness did not start")
+    "Harness did not start", { timeout_ms = 4000 })
   local function request(method, params)
     local result, failure, done
     client.request({ session_id = state.session.id, method = method, params = params }, function(value, error)
@@ -354,6 +354,7 @@ T["status_thought_survives_empty_summary"] = function()
 end
 
 T["status_tree_preserves_controls_and_question_branch"] = function()
+  vim.o.columns = 120
   local stub = dofile("nvim/lua/forge/tests/support/stub.lua")
   local current_time, tick = 0, nil
   stub(vim.uv, "now", function() return current_time end)
@@ -378,10 +379,10 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   status:apply(snapshot, function(result) applied = result end)
   wait_until(function() return applied ~= nil end, "status snapshot did not apply")
   eq(applied, true)
+  eq(status.content.lines[1]:find("  Working · 18s · 2/4 checks finished", 1, true), 1)
   eq(status.content.lines[1]:find("<C-c> interrupt · oe answer questions │ ", 1, true) ~= nil, true)
-  eq(status.content.lines[2], "  ├─ Checking · 2/4 finished · 18s")
-  eq(status.content.lines[3], "  │  ├─ ✓ format · passed · 1s")
-  eq(status.content.lines[6], "  │  └─ ○ Lua host tests · queued · skill_marker_aligns_with_commentary")
+  eq(status.content.lines[2], "  ├─ ✓ format · passed · 1s")
+  eq(status.content.lines[5], "  ├─ ○ Lua host tests · queued · skill_marker_aligns_with_commentary")
   eq(table.concat(status.content.lines, "\n"):find("nvim/lua/forge/tests", 1, true), nil)
   eq(status.content.lines[#status.content.lines], "  └─ Should this apply to all sessions?")
   eq(table.concat(status.content.lines, "\n"):find("unknown field", 1, true) ~= nil, true)
@@ -390,8 +391,8 @@ T["status_tree_preserves_controls_and_question_branch"] = function()
   local marks = vim.api.nvim_buf_get_extmarks(status.buffer, status.animation_namespace, 0, -1, { details = true })
   eq(#marks, 2)
   local check_mark = marks[2]
-  eq(check_mark[2], 4)
-  local marker_column = status.content.lines[5]:find("⠋", 1, true) - 1
+  eq(check_mark[2], 3)
+  local marker_column = status.content.lines[4]:find("⠋", 1, true) - 1
   eq(check_mark[3], marker_column)
   current_time = 120
   tick()
@@ -934,10 +935,15 @@ require("forge").setup({ diff_logging = false, harness_logging = false,
 require("forge.views.harness").open()
 wait_until(function() return state.session ~= nil end, "startup timed out", { timeout_ms = 4000 })
 request("session.configure", { shell = "nushell" })
--- Each real check costs a shell start, so the case runs one live check through both shortcuts:
--- Ctrl-C starts a pause of the running check, and Ctrl-S during that pause interrupts the check
--- and runs the replacement.
+-- Send alongside a running check, then interrupt it explicitly and send during cleanup.
 local run_id = start_check()
+compose("Report progress without stopping the check")
+keymap.invoke("<C-s>", { window = state.composer_win })
+wait_until(function() return rows():find("Mock response: Report progress without stopping the check", 1, true) end,
+  "the provider did not answer alongside the check", { context = function()
+    return vim.inspect({ status = status_rows(), transcript = rows(), input = request("session.input.get"), errors = errors })
+  end })
+eq(request("session.check.status", { run_id = run_id }).state, "running")
 compose("")
 keymap.invoke("<C-c>", { window = state.composer_win })
 -- The interruption owns cleanup_operation_id from Ctrl-C until its host settlement.
@@ -956,12 +962,109 @@ wait_until(function() return settled() and rows():find(text, 1, true) end,
       steering = state.pending_steer, submitting = state.pending_submit, errors = errors,
       transcript = rows() })
   end })
-assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-S did not interrupt check history")
+assert(request("session.check.status", {run_id = run_id}).state == "interrupted", "Ctrl-C did not interrupt check history")
 assert(buffer.line(state.composer_buf, 1) == "", "Ctrl-S left the submitted draft")
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
 assert(host.stop(), "host did not stop")
 errors:assert_none()
+end
+-- requires-forge-host
+T["steer_during_checks_and_cancel_from_a_later_turn"] = function()
+  local workspace = temp.directory("checks")
+  vim.fn.writefile({ vim.json.encode({ checks = { slow = {
+    trigger = { auto = false }, action = { command = "sleep 30sec", category = "custom" },
+  } } }) }, workspace .. "/.forge.json")
+  local client = host.start({ config = true }).client
+  vim.fn.chdir(workspace)
+  require("forge").setup({ harness = { provider = "mock" } })
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation.ready end, "Harness did not start", { timeout_ms = 4000 })
+  local function request(method, params)
+    local done, value, failure
+    client.request({ session_id = state.session.id, method = method, params = params }, function(result, error)
+      done, value, failure = true, result, error
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return value
+  end
+  request("session.configure", { shell = "nushell" })
+  local run = dofile(check_tool_path).start(request, { check = "slow" }).run_id
+  local controller = require("forge.views.harness.controller")
+  local queued = "Follow up after the check"
+  buffer.set(state.composer_buf, { queued })
+  controller.queue_submit()
+  wait_until(function() return #state.queue > 0 end, "queued follow-up did not arrive")
+  request("session.provider.mock_response", { operation = "script", script = { steps = {
+    { kind = "tool_call", name = "check_cancel", arguments = { run_id = run } },
+    { kind = "message", content = "response", text = "Requested cancellation" },
+  }, terminal = "completed" } })
+  local hold = request("session.provider.mock_response", { operation = "hold" })
+  local prompt = "Inspect the running check"
+  buffer.set(state.composer_buf, { prompt })
+  controller.steer_submit()
+  eq(request("session.provider.mock_response", { operation = "wait", id = hold.id }).prompt, prompt)
+  local steer = "Stop that check"
+  buffer.set(state.composer_buf, { steer })
+  controller.steer_submit()
+  wait_until(function()
+    local status = state.presentation.status_view
+    local text = table.concat(status and status.content and status.content.lines or {}, "\n")
+    return text:find("Steering active turn", 1, true) and text:find(steer, 1, true)
+  end, "provider did not acknowledge the steer")
+  eq(request("session.check.status", { run_id = run }).state, "running")
+  eq(buffer.text(state.transcript_buf):find("Mock response: " .. queued, 1, true), nil)
+  request("session.provider.mock_response", { operation = "release", id = hold.id })
+  wait_until(function() return buffer.text(state.transcript_buf):find("Requested cancellation", 1, true) end,
+    "later turn did not answer")
+  wait_until(function() return request("session.check.status", { run_id = run }).state == "interrupted" end,
+    "agent cancellation did not collect the original run")
+  wait_until(function() return buffer.text(state.transcript_buf):find("Mock response: " .. queued, 1, true) end,
+    "queued follow-up did not run after the check")
+  eq(host.stop(), true)
+end
+-- requires-forge-host
+T["direct_prompt_during_automatic_completion_checks"] = function()
+  local repository = git_repository.create({ files = {
+    ["input.txt"] = { "before" },
+    [".forge.json"] = { vim.json.encode({ checks = { slow = {
+      trigger = { auto = true }, action = { command = "sleep 30sec", category = "custom" },
+    } } }) },
+  } })
+  local client = host.start({ config = true }).client
+  vim.fn.chdir(repository.path)
+  require("forge").setup({ harness = { provider = "mock" } })
+  require("forge.views.harness").open()
+  local state = require("forge.session").harness
+  wait_until(function() return state.ready and state.session and state.presentation.ready end, "Harness did not start", { timeout_ms = 4000 })
+  local function request(method, params)
+    local value, failure, done
+    client.request({ session_id = state.session.id, method = method, params = params }, function(result, error)
+      value, failure, done = result, error, true
+    end)
+    wait_until(function() return done end, method .. " did not finish")
+    eq(failure, nil)
+    return value
+  end
+  request("session.configure", { automatic_checks = true, check_timing = "between_work", shell = "nushell" })
+  local hold = request("session.provider.mock_response", { operation = "hold" })
+  request("session.prompt.submit", { text = "Update the file" })
+  request("session.provider.mock_response", { operation = "wait", id = hold.id })
+  buffer.set(state.composer_buf, { "Review after validation" })
+  require("forge.views.harness.controller").queue_submit()
+  wait_until(function() return #state.queue > 0 end, "follow-up did not enter the queue")
+  vim.fn.writefile({ "after" }, repository.path .. "/input.txt")
+  request("session.provider.mock_response", { operation = "release", id = hold.id })
+  wait_until(function() return state.checks_running and state.active_check_run end, "automatic check did not start")
+  local run = state.active_check_run
+  request("session.prompt.submit", { text = "Explain the edit" })
+  wait_until(function() return buffer.text(state.transcript_buf):find("Mock response: Explain the edit", 1, true) end,
+    "model did not answer during automatic checks")
+  eq(request("session.check.status", { run_id = run }).state, "running")
+  eq(buffer.text(state.transcript_buf):find("Mock response: Review after validation", 1, true), nil)
+  eq(host.stop(), true)
 end
 T["control_responsiveness"] = function()
 local controller = require("forge.views.harness.controller")

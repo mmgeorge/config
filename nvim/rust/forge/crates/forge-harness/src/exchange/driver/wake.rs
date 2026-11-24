@@ -87,15 +87,9 @@ impl ExchangeDriver {
                     .await
             }
             DriverWake::InputDelivery(field_0, field_1) => {
-                self.input_delivery_wake(
-                    env,
-                    state,
-                    step,
-                    foreground_status,
-                    closed,
-                    (field_0, field_1),
-                )
-                .await
+                let turn = self.turn_status(state);
+                self.input_delivery_wake(env, state, step, &turn, closed, (field_0, field_1))
+                    .await
             }
             DriverWake::InputReceipt(wake) => {
                 self.input_receipt_wake(env, state, step, foreground_status, closed, wake)
@@ -176,7 +170,8 @@ impl ExchangeDriver {
             ..
         } = env;
         let admission = self.admission(services, state, closed);
-        let foreground_status = self.turn_status(state);
+        let foreground_status = self.collection_status(state);
+        let input_status = self.turn_status(state);
         let DriverState {
             pending,
             foreground,
@@ -274,12 +269,12 @@ impl ExchangeDriver {
                         _ = services.publications.reconciliation_expiry() => {},
                     }
                 } => DriverWake::Publication,
-                observed = async { match steering_ready.take() { Some(observed) => observed, None => next_steering(&mut self.steering, foreground_status.clone()).await } } => {
+                observed = async { match steering_ready.take() { Some(observed) => observed, None => next_steering(&mut self.steering, input_status.clone()).await } } => {
                     DriverWake::InputDelivery(InputDeliveryTarget::Steering(observed.0), observed.1)
                 },
                 event = self.observation_recovery.next(), if self.observation_recovery.started() => DriverWake::ObservationRecovery(event),
                 event = async { match self.input_delivery.as_mut() {
-                    Some(run) => run.next(foreground_status.clone()).await,
+                    Some(run) => run.next(input_status.clone()).await,
                     None => std::future::pending().await,
                 }} => DriverWake::InputDelivery(InputDeliveryTarget::Foreground, event),
                 collected = input_cleanup.join_next(), if !input_cleanup.is_empty() => DriverWake::InputCollected(collected),
@@ -288,7 +283,7 @@ impl ExchangeDriver {
                 completed = check_runs.next(), if !check_runs.is_empty() => DriverWake::CheckCollected(completed),
                 event = async {
                     match task_verification.as_mut() {
-                        Some(checks) => checks.run.next().await,
+                        Some(checks) => checks.next().await,
                         None => std::future::pending().await,
                     }
                 }, if task_check_completion.is_none() => DriverWake::TaskCheck(event),
@@ -368,7 +363,8 @@ impl ExchangeDriver {
         event_budget: usize,
     ) -> (Option<DriverWake>, TurnStatus) {
         let task_delivery = self.admission(&env.services, state, closed).task_delivery;
-        let event_status = self.turn_status(state);
+        let event_status = self.collection_status(state);
+        let input_status = self.turn_status(state);
         let DriverState {
             foreground,
             command,
@@ -433,7 +429,7 @@ impl ExchangeDriver {
                 ready_wake = self
                     .input_delivery
                     .as_mut()
-                    .and_then(|run| run.next(event_status.clone()).now_or_never())
+                    .and_then(|run| run.next(input_status.clone()).now_or_never())
                     .map(|event| DriverWake::InputDelivery(InputDeliveryTarget::Foreground, event));
             }
             if ready_wake.is_none() {
@@ -452,8 +448,8 @@ impl ExchangeDriver {
             if ready_wake.is_none() && task_check_completion.is_none() {
                 ready_wake = task_verification
                     .as_mut()
-                    .filter(|checks| checks.run.has_worker())
-                    .and_then(|checks| checks.run.next().now_or_never())
+                    .filter(|checks| checks.has_worker())
+                    .and_then(|checks| checks.next().now_or_never())
                     .map(DriverWake::TaskCheck);
             }
             if ready_wake.is_none() {

@@ -377,6 +377,7 @@ impl ExchangeDriver {
         wake: Option<OwnerEvent>,
     ) -> WakeEnd {
         let DriverEnv { broker, .. } = env;
+        let checks_pending = state.checks_pending();
         let DriverState {
             pending,
             foreground,
@@ -390,6 +391,7 @@ impl ExchangeDriver {
                     event,
                     pending,
                     OwnerIntake {
+                        checks_pending,
                         active: command.as_mut(),
                         foreground_target: foreground.as_ref().map(|turn| {
                             crate::exchange::queue::StopTarget {

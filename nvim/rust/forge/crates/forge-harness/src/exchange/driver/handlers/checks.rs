@@ -93,20 +93,6 @@ impl ExchangeDriver {
                 reply,
             },
             Err(_) => {
-                let crate::input::InputPurpose::CheckResult { exchange_id, .. } = &message.purpose
-                else {
-                    anyhow::bail!("internal inbox contains non-check input");
-                };
-                let active = crate::storage::HistoryReader::current(&services.root)?
-                    .latest_exchange(&env.session_id)?;
-                if active.is_none_or(|active| active.id != *exchange_id) {
-                    self.check_results.defer(
-                        &env.session_id,
-                        &message,
-                        DeliveryDeferral::OtherExchange,
-                    );
-                    return Ok(());
-                }
                 if !services.observer.native_steer_supported()?
                     || self.steering.len() >= crate::provider::SteeringLane::CAPACITY
                 {
@@ -136,10 +122,12 @@ impl ExchangeDriver {
                 }
             }
         };
+        let checks_pending = state.checks_pending();
         self.receive(
             event,
             &mut state.pending,
             OwnerIntake {
+                checks_pending,
                 active: state.command.as_mut(),
                 foreground_target: state.foreground.as_ref().map(|turn| {
                     crate::exchange::queue::StopTarget {
@@ -178,10 +166,10 @@ impl ExchangeDriver {
             let progress = match task_verification.as_mut() {
                 Some(checks) => {
                     if self.commands.storage_unavailable() {
-                        let _ = checks.run.cancel();
+                        let _ = checks.cancel();
                     }
                     match result {
-                        Ok(event) => checks.run.update(&mut *broker.lock().await, event),
+                        Ok(event) => checks.update(&mut *broker.lock().await, event),
                         Err(error) => Err(error),
                     }
                 }
@@ -239,7 +227,7 @@ impl ExchangeDriver {
             Err(error) => {
                 *task_check_updates = None;
                 if let Some(checks) = task_verification.as_mut() {
-                    let _ = checks.run.cancel();
+                    let _ = checks.cancel();
                 }
                 trace.record(
                     session_id,
@@ -432,7 +420,6 @@ impl ExchangeDriver {
         wake: Option<crate::checks::owner::CheckOwnerEvent>,
     ) -> WakeEnd {
         let DriverState {
-            check_runs,
             pending_check_tools,
             tool_check_sink,
             pending_automatic_checks,
@@ -465,15 +452,22 @@ impl ExchangeDriver {
                 run_id,
                 reply,
             }) => {
-                let _ = reply.send(check_runs.cancel(&scope, &run_id));
+                let request = crate::checks::owner::PendingCheckTool::Cancel {
+                    scope,
+                    run_id,
+                    reply,
+                };
+                if pending_check_tools.len() < OWNER_QUEUE_CAPACITY {
+                    pending_check_tools.push_back(request);
+                } else {
+                    request.reject(crate::checks::owner::CheckOwnerFailure::Unavailable);
+                }
             }
             Some(crate::checks::owner::CheckOwnerEvent::CompleteAutomatic(request)) => {
                 if pending_automatic_checks.len() < OWNER_QUEUE_CAPACITY {
                     pending_automatic_checks.push_back(request);
                 } else {
-                    let _ = request
-                        .reply
-                        .send(Err(crate::checks::owner::CheckOwnerFailure::Unavailable));
+                    request.reject();
                 }
             }
             None => {}

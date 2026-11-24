@@ -47,7 +47,7 @@ T["unconfirmed_steering_never_anchors_the_reveal"] = function()
     vim.api.nvim_win_set_height(view_window, 5)
     vim.cmd("belowright new")
     vim.api.nvim_win_set_cursor(view_window, { 40, 0 })
-    Reveal.new():publish(document(transcript, blocks(steering_marker)), { [view_window] = true })
+    Reveal.new():publish(document(transcript, blocks(steering_marker)), { [view_window] = {} })
     return vim.api.nvim_win_get_cursor(view_window)[1]
   end
   -- The consumed steering row anchors the reveal, which proves the fixture reaches that path.
@@ -76,11 +76,11 @@ T["settlement_with_a_pending_successor_is_never_revealed"] = function()
   vim.cmd("belowright new")
   vim.api.nvim_win_set_cursor(view_window, { 40, 0 })
   local reveal = Reveal.new()
-  reveal:publish(document(transcript, blocks("open")), { [view_window] = true })
-  reveal:publish(document(transcript, blocks("settled")), { [view_window] = true }, false, true)
+  reveal:publish(document(transcript, blocks("open")), { [view_window] = {} })
+  reveal:publish(document(transcript, blocks("settled")), { [view_window] = {} }, false, true)
   eq(vim.api.nvim_win_get_cursor(view_window)[1], 40)
   -- The skipped reveal stays skipped once the hand-off flag clears.
-  reveal:publish(document(transcript, blocks("settled")), { [view_window] = true })
+  reveal:publish(document(transcript, blocks("settled")), { [view_window] = {} })
   eq(vim.api.nvim_win_get_cursor(view_window)[1], 40)
 end
 
@@ -106,20 +106,56 @@ T["completion_in_a_hidden_tab_is_revealed_when_the_tab_is_shown"] = function()
   local composer_window = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_cursor(view_window, { 40, 0 })
   local reveal = Reveal.new(composer_window)
-  reveal:publish(document(transcript, blocks("live")), { [view_window] = true })
+  reveal:publish(document(transcript, blocks("live")), { [view_window] = {} })
   vim.api.nvim_win_set_cursor(view_window, { 30, 0 })
   vim.cmd("tabnew")
-  reveal:publish(document(transcript, blocks("settled")), { [view_window] = true })
+  reveal:publish(document(transcript, blocks("settled")), { [view_window] = {} })
   eq(vim.api.nvim_win_get_cursor(view_window)[1], 30)
 
   vim.api.nvim_set_current_tabpage(transcript_tab)
   vim.api.nvim_set_current_win(composer_window)
-  reveal:publish(document(transcript, blocks("settled")), { [view_window] = true })
+  reveal:publish(document(transcript, blocks("settled")), { [view_window] = {} })
   eq(vim.api.nvim_win_call(view_window, function() return vim.fn.line("w0") end), 1)
   -- The deferred reveal runs once; a later publication keeps the reader's position.
   vim.api.nvim_win_set_cursor(view_window, { 30, 0 })
-  reveal:publish(document(transcript, blocks("settled")), { [view_window] = true })
+  reveal:publish(document(transcript, blocks("settled")), { [view_window] = {} })
   eq(vim.api.nvim_win_get_cursor(view_window)[1], 30)
+end
+
+T["composer_follows_an_older_resumed_exchange"] = function()
+  local Reveal = require("forge.views.harness.response_reveal")
+  local window = vim.api.nvim_get_current_win()
+  local transcript = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(transcript, 0, -1, false, vim.tbl_map(tostring, vim.fn.range(1, 20)))
+  vim.cmd("belowright new")
+  local blocks = {
+    { id = "a:prompt", node = { kind = "message" }, marker = "ForgeHarnessPrompt" },
+    { id = "a:summary", node = { kind = "exchange", id = "a:summary", lifecycle = "live" } },
+    { id = "a:activity", node = { kind = "thought" }, row_count = 12 },
+    { id = "b:separator", node = {} },
+    { id = "b:prompt", node = { kind = "message" }, marker = "ForgeHarnessPrompt" },
+    { id = "b:summary", node = { kind = "exchange", id = "b:summary", lifecycle = "settled" } },
+    { id = "b:answer", node = { kind = "message", display = "full" }, marker = "ForgeHarnessResponse", row_count = 3 },
+  }
+  local composer = vim.api.nvim_get_current_win()
+  local reveal = Reveal.new(composer)
+  reveal:publish(document(transcript, blocks), { [window] = {} })
+  eq(vim.api.nvim_win_get_cursor(window)[1], 14)
+  vim.api.nvim_set_current_win(window)
+  vim.api.nvim_win_set_cursor(window, { 3, 0 })
+  local updated = document(transcript, blocks)
+  updated.revision = 2
+  reveal:publish(updated, { [window] = {} })
+  eq(vim.api.nvim_win_get_cursor(window)[1], 3)
+  vim.api.nvim_set_current_win(composer)
+  blocks[2].node.lifecycle = "settled"
+  blocks[3].node = { kind = "message", display = "full" }
+  blocks[3].marker = "ForgeHarnessResponse"
+  updated = document(transcript, blocks)
+  updated.revision = 3
+  vim.api.nvim_win_set_height(window, 16)
+  reveal:publish(updated, { [window] = {} })
+  eq(vim.api.nvim_win_get_cursor(window)[1], 14)
 end
 
 return T

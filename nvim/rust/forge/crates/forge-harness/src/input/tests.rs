@@ -33,11 +33,9 @@ fn user_queue_rejects_check_results_without_changing_pause() -> Result<()> {
     Ok(())
 }
 
-/// Only input the user sends directly preempts a running check. A continuation Harness reserves
-/// when a task's turn ends must wait for the run instead: a model may end its turn while its own
-/// `check_run` is still running, and preempting would interrupt the very run it waits for.
+/// Identify direct prompts separately from queued and generated input.
 #[test]
-fn only_direct_user_input_preempts_running_checks() -> Result<()> {
+fn only_automatic_user_messages_are_direct_prompts() -> Result<()> {
     let message = |purpose: serde_json::Value, intent: InputIntent| -> Result<InputMessage> {
         Ok(InputMessage::queued(crate::input::InputDraft {
             id: "input".into(),
@@ -55,15 +53,15 @@ fn only_direct_user_input_preempts_running_checks() -> Result<()> {
     });
     let mut task_continuation = task_input.clone();
     task_continuation["kind"] = "task_continuation".into();
-    assert!(message(serde_json::json!({"kind":"user"}), InputIntent::Auto)?.preempts_checks());
-    assert!(!message(serde_json::json!({"kind":"user"}), InputIntent::Queue)?.preempts_checks());
+    assert!(message(serde_json::json!({"kind":"user"}), InputIntent::Auto)?.is_direct_prompt());
+    assert!(!message(serde_json::json!({"kind":"user"}), InputIntent::Queue)?.is_direct_prompt());
     for purpose in [
         task_continuation,
         serde_json::json!({"kind":"question_continuation","exchange_id":"exchange"}),
         serde_json::json!({"kind":"check_result","exchange_id":"exchange","run_id":"run"}),
     ] {
         assert!(
-            !message(purpose.clone(), InputIntent::Auto)?.preempts_checks(),
+            !message(purpose.clone(), InputIntent::Auto)?.is_direct_prompt(),
             "{purpose}"
         );
     }

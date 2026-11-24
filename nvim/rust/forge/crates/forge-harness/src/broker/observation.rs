@@ -129,9 +129,9 @@ impl BrokerObserver {
     /// stands well past zero, and publishes that clock itself once admitted. Its `HandingOff`
     /// activity tells the editor that the settled exchange is followed by another turn, so the
     /// editor does not reveal the finished exchange a moment before the successor replaces it at
-    /// the tail. Pending verification checks read `Checking · 0s` instead, and only over an idle
+    /// the tail. Pending verification checks read `Working · 0s` instead, and only over an idle
     /// phase: no exchange replaces the finished one, and once the run is recorded its own
-    /// `Checking` phase, timed by the run, follows. A `/compact` that waits for session control,
+    /// check progress and the run clock follow. A `/compact` that waits for session control,
     /// such as one requested while a task's checks run, is a hand-off too: the work it waits for
     /// settles to idle before the compaction starts and publishes its own `Compacting` phase. An
     /// owner that cannot execute is excluded, because it would never start the work and the row

@@ -1606,9 +1606,21 @@ impl HarnessBroker {
                 check_admission::AutomaticCheckAction::Finish((value, events)),
             )
         } else {
-            self.begin_automatic_checks((value, events), finalization.mode)?
+            self.begin_automatic_checks((value, events), finalization.mode, Some(&interaction.id))?
         };
-        finalization.checks = checks;
+        if finalization.pending_stale_continuation.is_some() {
+            finalization.checks = checks;
+        } else if let Some(mut checks) = checks {
+            let result = self.take_automatic_check_result(&mut checks);
+            admission.completion_checks = Some(
+                crate::checks::owner::AutomaticCheckRequest::Prepared(Box::new((checks, action))),
+            );
+            return self.apply_final_check_action(
+                finalization,
+                admission.request.id,
+                AutomaticCheckAction::Finish(result),
+            );
+        }
         self.apply_final_check_action(finalization, admission.request.id, action)
     }
 

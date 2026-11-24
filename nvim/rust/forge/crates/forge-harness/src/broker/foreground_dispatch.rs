@@ -57,6 +57,7 @@ pub(crate) struct ForegroundAdmission {
     task_compaction_failure: Option<anyhow::Error>,
     pub(crate) workspace_prepared: bool,
     pub(crate) automatic_check_owner: Option<String>,
+    pub(crate) completion_checks: Option<crate::checks::owner::AutomaticCheckRequest>,
     pub(crate) prior_finalization: Option<prior_finalization::PriorFinalization>,
     prior_checked: bool,
     pub(crate) question_catalog: Option<Vec<crate::provider::ProviderModel>>,
@@ -530,7 +531,8 @@ impl ForegroundAdmission {
             return Ok(false);
         }
         anyhow::ensure!(
-            broker.check_runner.active()?.is_none(),
+            matches!(self.purpose, crate::input::InputPurpose::User)
+                || broker.check_runner.active()?.is_none(),
             "wait for or cancel the active check run before starting source work"
         );
         if !matches!(
@@ -1304,6 +1306,7 @@ impl HarnessBroker {
             planning: None,
             reset_check_setup: false,
             automatic_check_owner: None,
+            completion_checks: None,
             events: Vec::new(),
             staged_interaction: None,
             local_interaction: None,

@@ -64,6 +64,7 @@ pub(super) const OWNER_QUEUE_CAPACITY: usize = forge_protocol::MAX_PENDING_FRAME
 
 /// Carry the current command and steering gate for one owner intake decision.
 struct OwnerIntake<'a> {
+    checks_pending: bool,
     active: Option<&'a mut ActiveCommand>,
     foreground_target: Option<super::queue::StopTarget>,
     steering: SteeringAdmission,
@@ -199,11 +200,20 @@ impl ExchangeDriver {
         }
     }
 
-    /// Get the active turn's status as stops and commands see it.
-    ///
-    /// This is the only definition of whether turn work exists, so every caller agrees on when
-    /// a stop may treat the owner as idle.
+    /// Commands that collect session work wait for check workers as well as foreground work.
+    fn collection_status(&self, state: &DriverState) -> TurnStatus {
+        self.work_status(
+            state,
+            !state.check_runs.is_empty() || state.task_verification.is_some(),
+        )
+    }
+
+    /// Prompt delivery fences only the previous foreground invocation.
     fn turn_status(&self, state: &DriverState) -> TurnStatus {
+        self.work_status(state, false)
+    }
+
+    fn work_status(&self, state: &DriverState, checks_active: bool) -> TurnStatus {
         let scope = match state
             .foreground
             .as_ref()
@@ -216,8 +226,7 @@ impl ExchangeDriver {
             || !state.pending.is_empty()
             || !self.steering.is_empty()
             || !state.tasks.input_stops.is_empty()
-            || !state.check_runs.is_empty()
-            || state.task_verification.is_some();
+            || checks_active;
         match self.execution_state {
             ExecutionState::Stopping
                 if matches!(state.command, Some(ActiveCommand::Cancel { .. })) =>
@@ -685,6 +694,7 @@ impl ExchangeDriver {
         &mut self,
         messages: &MessageSender,
         work_pending: bool,
+        checks_pending: bool,
         steering_admission: SteeringAdmission,
         broker: &Mutex<HarnessBroker>,
         context: OwnerUpdateContext<'_>,
@@ -739,7 +749,8 @@ impl ExchangeDriver {
             .parent_input
             .capture()
             .is_some_and(|parent| parent.is_open());
-        let policy = if services.execution.available_permits() == 0 && steerable {
+        let checks_running = checks_pending || ready.checks_running;
+        let policy = if checks_running || services.execution.available_permits() == 0 && steerable {
             InputQueuePolicy::AllowSteering
         } else {
             InputQueuePolicy::Ordered
@@ -757,13 +768,11 @@ impl ExchangeDriver {
                 message
             }
             PendingInput::Empty | PendingInput::Waiting => return Ok(CandidateAdmission::Waiting),
+            PendingInput::WaitExecution if checks_running => {
+                return Ok(CandidateAdmission::Waiting);
+            }
             PendingInput::WaitExecution => return Ok(CandidateAdmission::WaitExecution),
         };
-        if ready.checks_running {
-            // A running turn waiting on `check_run` keeps the owner busy, so the idle-path
-            // interruption cannot observe this prompt; request it here and wait for collection.
-            interrupt_checks_for_direct_input(&message, services, trace, session, step);
-        }
         if !crate::input::input_purpose_is_current(
             &services.tasks,
             &services.questions,
@@ -772,7 +781,7 @@ impl ExchangeDriver {
             services.observer.session_id(),
         )
         .map_err(InputOfferError::Authority)?
-            || ready.checks_running && !message.reports_check_failure()
+            || checks_running && !message.is_direct_prompt() && !message.reports_check_failure()
             || ready.has_approval
             || message.intent == crate::input::InputIntent::Queue && ready.has_elicitation
         {
@@ -981,13 +990,6 @@ impl AutomaticPublication {
             Self::Open { stream, .. } | Self::Draining(stream) => Self::Draining(stream),
         }
     }
-}
-
-/// Hold task-check resource gates until all detached work and its final publication have settled.
-struct TaskVerification {
-    run: crate::broker::OwnedTaskCheckRun,
-    _control: tokio::sync::OwnedSemaphorePermit,
-    _execution: crate::command::ExecutionPermit,
 }
 
 /// Retain actual input cleanup work until its owner has applied collection evidence.
@@ -1204,48 +1206,6 @@ fn publish_input_events(
 }
 
 /// Publish owner-committed receipt progress independently of the producer's response waiter.
-/// Interrupt the active check run on behalf of a current direct prompt.
-///
-/// A direct prompt preempts checks whether the owner is idle or a running turn is waiting on a
-/// `check_run` result; input readiness retries delivery once the cancelled run is collected.
-/// Explicitly queued input, Harness-generated continuations, and stale task input never
-/// interrupt checks (see `InputMessage::preempts_checks`). Returns whether a run was active and
-/// cancellation was requested.
-fn interrupt_checks_for_direct_input(
-    message: &crate::input::InputMessage,
-    services: &OwnerServices,
-    trace: &TraceStore,
-    session: &str,
-    step: u64,
-) -> bool {
-    if !message.preempts_checks()
-        || !crate::input::input_purpose_is_current(
-            &services.tasks,
-            &services.questions,
-            &message.purpose,
-            &services.root,
-            services.observer.session_id(),
-        )
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    let Ok(Some(run_id)) = services.checks.active() else {
-        return false;
-    };
-    if let Err(error) = services.checks.cancel_for_collection(&run_id) {
-        trace.record(
-            session,
-            "exchange.check.input_collection_failed",
-            serde_json::json!({
-                "input_id":message.id,"input_revision":message.revision,"run_id":run_id,
-                "reason":error.to_string(),"update_step":step,
-            }),
-        );
-    }
-    true
-}
-
 fn publish_input_observation(
     update: crate::input::InputUpdate,
     messages: Option<&MessageSender>,

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 use super::{
     Exchange, ExchangeState, HarnessBroker, SessionEvent, TurnCancellationSignal, TurnCancelled,
@@ -167,6 +167,7 @@ impl HarnessBroker {
         &mut self,
         mut result: (Value, Vec<SessionEvent>),
         mode: crate::provider::PromptMode,
+        exchange_id: Option<&str>,
     ) -> Result<(Option<AutomaticCheckTransaction>, AutomaticCheckAction)> {
         if !matches!(
             mode,
@@ -180,7 +181,11 @@ impl HarnessBroker {
         {
             return Ok((None, AutomaticCheckAction::Finish(result)));
         }
-        let Some(interaction) = self.store.latest_exchange(&self.session.id)? else {
+        let interaction = match exchange_id {
+            Some(id) => self.store.load_exchange(id)?,
+            None => self.store.latest_exchange(&self.session.id)?,
+        };
+        let Some(interaction) = interaction else {
             return Ok((None, AutomaticCheckAction::Finish(result)));
         };
         if interaction.state() != ExchangeState::Complete
@@ -394,12 +399,19 @@ impl HarnessBroker {
         tx: &mut AutomaticCheckTransaction,
         repaired: (Value, Vec<SessionEvent>),
     ) -> Result<AutomaticCheckAction> {
-        tx.result.0 = repaired.0;
-        tx.result.1.extend(repaired.1);
+        let repair_id = repaired.0["exchange"]["id"]
+            .as_str()
+            .context("automatic repair response is missing its exchange")?;
         let latest = self
             .store
-            .latest_exchange(&self.session.id)?
-            .ok_or_else(|| anyhow::anyhow!("repair exchange disappeared"))?;
+            .load_exchange(repair_id)?
+            .context("repair exchange disappeared")?;
+        ensure!(
+            latest.check_owner.as_deref() == Some(&tx.change_owner),
+            "automatic repair owner changed"
+        );
+        tx.result.0 = repaired.0;
+        tx.result.1.extend(repaired.1);
         tx.automatic.repair_exchange = Some(latest.id.clone());
         tx.automatic.save()?;
         if latest.state() != ExchangeState::Complete
@@ -552,13 +564,16 @@ impl HarnessBroker {
         capture: &AutomaticCheckRefresh,
         check_timeline: bool,
     ) -> Result<bool> {
-        Ok(interaction.id == capture.exchange_id
+        let Some(current) = self.store.load_exchange(&interaction.id)? else {
+            return Ok(false);
+        };
+        Ok(current.id == capture.exchange_id
             && (!check_timeline
                 || self
                     .store
                     .capture_timeline_owner(&self.session.id, &interaction.id)?
                     == capture.owner)
-            && interaction.turn.last().map(|turn| &turn.provider().scope) == capture.scope.as_ref()
+            && current.turn.last().map(|turn| &turn.provider().scope) == capture.scope.as_ref()
             && capture
                 .scope
                 .as_ref()
@@ -567,6 +582,11 @@ impl HarnessBroker {
 }
 
 impl AutomaticCheckRefresh {
+    /// Publish this captured exchange's check progress through the detached owner's stream.
+    pub(super) fn publish_to(&mut self, sink: SessionUpdateSink) {
+        self.sink = Some(sink);
+    }
+
     /// Wait for an existing run or refresh discovery without holding the broker.
     pub(crate) async fn run(self) -> Result<AutomaticCheckRefreshResult> {
         if self.cancelled.requested.load(Ordering::Acquire) {
@@ -733,8 +753,11 @@ mod tests {
     #[test]
     fn disabled_checks_skip_pending_format_verification() -> Result<()> {
         let (_workspace, _data, mut broker, _exchange) = pending_format_fixture()?;
-        let (transaction, action) = broker
-            .begin_automatic_checks((json!({}), Vec::new()), crate::provider::PromptMode::Chat)?;
+        let (transaction, action) = broker.begin_automatic_checks(
+            (json!({}), Vec::new()),
+            crate::provider::PromptMode::Chat,
+            None,
+        )?;
         assert!(
             transaction.is_none(),
             "disabled checks created a completion transaction"
@@ -753,8 +776,11 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        let (transaction, action) = broker
-            .begin_automatic_checks((json!({}), Vec::new()), crate::provider::PromptMode::Chat)?;
+        let (transaction, action) = broker.begin_automatic_checks(
+            (json!({}), Vec::new()),
+            crate::provider::PromptMode::Chat,
+            None,
+        )?;
         assert!(transaction.is_some());
         assert!(matches!(action, AutomaticCheckAction::Refresh(_)));
         Ok(())

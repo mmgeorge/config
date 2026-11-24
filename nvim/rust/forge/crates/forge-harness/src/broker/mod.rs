@@ -81,7 +81,7 @@ pub(crate) use owner_control::{ExchangeControlSelection, ExchangeControlView, in
 pub(crate) use prior_finalization::PriorFinalization;
 pub(crate) mod plan_entry;
 mod project_checks;
-pub(crate) use check_admission::AutomaticCheckAction;
+pub(crate) use check_admission::{AutomaticCheckAction, AutomaticCheckTransaction};
 mod host_settlement;
 mod review_question;
 pub(crate) use observation::BrokerObserver;

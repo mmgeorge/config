@@ -96,6 +96,7 @@ struct SteeringState {
 
 #[derive(Clone)]
 struct SteeringSender {
+    exchange: Option<super::ExchangeId>,
     sender: mpsc::Sender<SteerCommand>,
     ordinary: Arc<Semaphore>,
 }
@@ -107,6 +108,11 @@ pub(crate) struct SteeringTarget {
 }
 
 impl SteeringTarget {
+    /// Get the exchange that installed this receiver, including when a later prompt has finished.
+    pub(crate) fn exchange(&self) -> Option<&super::ExchangeId> {
+        self.sender.exchange.as_ref()
+    }
+
     /// Get whether the exact captured turn still accepts queued steering.
     pub(crate) fn is_open(&self) -> bool {
         !self.sender.sender.is_closed()
@@ -194,6 +200,10 @@ impl SteeringLane {
         state.generation += 1;
         let generation = state.generation;
         state.sender = Some(SteeringSender {
+            exchange: event_sink
+                .as_ref()
+                .and_then(|sink| sink.scope().invocation())
+                .map(|scope| scope.exchange_id.clone()),
             sender,
             ordinary: Arc::new(Semaphore::new(MAX_STEERING_REQUESTS)),
         });

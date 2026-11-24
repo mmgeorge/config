@@ -15,8 +15,8 @@ pub enum WorkflowActivity {
     /// and the editor reads the hand-off to leave the finished exchange where it is.
     HandingOff,
     /// A finished Implement turn's check run is reserved but has no record yet. Status keeps
-    /// reading like the finished turn until the run's rows exist, then becomes `Checking` with
-    /// those rows in one publication, so entering Check changes the status height once.
+    /// reading `Working` until the check count and rows are published together, so entering
+    /// Check changes the status height once.
     ChecksStarting,
     Planning,
     Revising,
@@ -31,11 +31,14 @@ impl WorkflowActivity {
     /// Label an active exchange and its live status with the same activity.
     pub fn active_label(self) -> &'static str {
         match self {
-            Self::Working | Self::HandingOff | Self::ChecksStarting | Self::Goal => "Working",
+            Self::Working
+            | Self::HandingOff
+            | Self::ChecksStarting
+            | Self::Checking
+            | Self::Goal => "Working",
             Self::Planning => "Planning",
             Self::Revising => "Revising plan",
             Self::Implementing => "Implementing",
-            Self::Checking => "Checking",
             Self::Verifying => "Verifying",
             Self::Resolving => "Resolving",
         }

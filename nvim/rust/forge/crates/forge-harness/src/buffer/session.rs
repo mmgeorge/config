@@ -3408,19 +3408,19 @@ mod tests {
             samples,
             [
                 (
-                    "Checking · 1/2 finished · 0s".to_owned(),
+                    "Working · 0s · 1/2 checks finished".to_owned(),
                     "└─ ⠋ ESLint · running · 0s".to_owned()
                 ),
                 (
-                    "Checking · 1/2 finished · 1s".to_owned(),
+                    "Working · 1s · 1/2 checks finished".to_owned(),
                     "└─ ⠋ ESLint · running · 0s".to_owned()
                 ),
                 (
-                    "Checking · 1/2 finished · 2s".to_owned(),
+                    "Working · 2s · 1/2 checks finished".to_owned(),
                     "└─ ⠋ ESLint · running · 1s".to_owned()
                 ),
                 (
-                    "Checking · 1/2 finished · 3s".to_owned(),
+                    "Working · 3s · 1/2 checks finished".to_owned(),
                     "└─ ⠋ ESLint · running · 2s".to_owned()
                 ),
             ]
@@ -3432,11 +3432,7 @@ mod tests {
         Ok(())
     }
 
-    /// Time a published `Checking` status by the check run it reports.
-    ///
-    /// Between an Implement turn and its check run the status reads `Checking` with no running
-    /// clock, because no run exists yet. The run's progress then reached only the check rows, so
-    /// the heading read `Checking · 0s` for the whole run while the row beneath it counted up.
+    /// Use the verification run's clock for the Working heading during the Checking phase.
     #[test]
     fn checking_status_timer_advances_with_its_run() -> Result<()> {
         use crate::session::state_machine::{SessionPhase, WorkflowActivity};
@@ -3491,20 +3487,16 @@ mod tests {
             );
         }
         assert!(
-            headings[0].starts_with("Checking · 0s")
-                && headings[1].starts_with("Checking · 1s")
-                && headings[2].starts_with("Checking · 3s"),
-            "the Checking heading did not follow its run: {headings:?}"
+            headings == ["Working · 0s", "Working · 1s", "Working · 3s"],
+            "the Working heading did not follow the check run: {headings:?}"
         );
         Ok(())
     }
 
     /// Enter Check with one change of the status height.
     ///
-    /// Between an Implement turn and its check run's first record the status had one row,
-    /// `Checking · 0s`, and the run's rows arrived about 220 ms later, so the split changed in
-    /// two steps. The pending run now reads like the finished turn's row until its record
-    /// attaches, and `Checking` arrives together with the rows it will run.
+    /// Keep the Working heading during the hand-off and publish the check count and command
+    /// rows together once the run starts.
     #[test]
     fn entering_check_changes_the_status_height_once() -> Result<()> {
         use crate::session::state_machine::{SessionPhase, WorkflowActivity};
@@ -3550,7 +3542,7 @@ mod tests {
         assert_eq!(
             pending,
             ["Working · 0s"],
-            "the pending run read as Checking"
+            "the pending run changed the status heading"
         );
         let command = |id: &str| {
             serde_json::json!({"id":id, "command":id, "state":"pending", "selected":true,
@@ -3569,8 +3561,8 @@ mod tests {
         owner.update_checks(&run)?;
         let checking = status_rows(&mut owner)?;
         assert!(
-            checking[0].starts_with("Checking · 0s") && checking.len() == 4,
-            "the run's first record did not bring Checking and its rows together: {checking:?}"
+            checking[0] == "Working · 0s · 0/2 checks finished" && checking.len() == 3,
+            "the run's first record did not publish its count with its rows: {checking:?}"
         );
         Ok(())
     }

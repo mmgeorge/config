@@ -61,6 +61,11 @@ pub(crate) struct ToolDiscoveryRequest {
 pub(crate) enum PendingCheckTool {
     Run(Box<ToolCheckRequest>),
     Discover(Box<ToolDiscoveryRequest>),
+    Cancel {
+        scope: InvocationScope,
+        run_id: String,
+        reply: oneshot::Sender<Result<(), CheckOwnerFailure>>,
+    },
 }
 
 impl PendingCheckTool {
@@ -69,6 +74,7 @@ impl PendingCheckTool {
         match self {
             Self::Run(request) => &request.scope,
             Self::Discover(request) => &request.scope,
+            Self::Cancel { scope, .. } => scope,
         }
     }
 
@@ -78,6 +84,9 @@ impl PendingCheckTool {
             Self::Run(request) => {
                 let _ = request.reply.send(Err(error));
             }
+            Self::Cancel { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             Self::Discover(request) => {
                 let _ = request.reply.send(Err(error));
             }
@@ -86,8 +95,25 @@ impl PendingCheckTool {
 }
 
 /// Retain an automatic completion response independently of the transport request's lifetime.
-pub(crate) struct AutomaticCheckRequest {
-    pub(crate) reply: oneshot::Sender<Result<CheckCompletionOutcome, CheckOwnerFailure>>,
+pub(crate) enum AutomaticCheckRequest {
+    Requested(oneshot::Sender<Result<CheckCompletionOutcome, CheckOwnerFailure>>),
+    Prepared(
+        Box<(
+            crate::broker::AutomaticCheckTransaction,
+            crate::broker::AutomaticCheckAction,
+        )>,
+    ),
+}
+
+impl AutomaticCheckRequest {
+    pub(crate) fn reject(self) {
+        match self {
+            Self::Requested(reply) => {
+                let _ = reply.send(Err(CheckOwnerFailure::Unavailable));
+            }
+            Self::Prepared(_) => tracing::error!("Automatic check owner closed before admission"),
+        }
+    }
 }
 
 /// Preserve the existing completion projection while the owner retains its workflow transaction.
@@ -153,7 +179,7 @@ impl CheckOwnerSender {
         receiver.await.map_err(|_| CheckOwnerFailure::Unavailable)?
     }
 
-    /// Request cancellation only for work owned by the authenticated invocation.
+    /// Request cancellation of a session run on behalf of the authenticated invocation.
     pub(crate) async fn cancel(
         &self,
         scope: InvocationScope,
@@ -199,9 +225,9 @@ impl CheckOwnerSender {
     /// Ask the owner to drive automatic completion checks and any resulting repair work.
     pub(crate) async fn complete(&self) -> Result<CheckCompletionOutcome, CheckOwnerFailure> {
         let (reply, receiver) = oneshot::channel();
-        self.send(CheckOwnerEvent::CompleteAutomatic(AutomaticCheckRequest {
-            reply,
-        }))
+        self.send(CheckOwnerEvent::CompleteAutomatic(
+            AutomaticCheckRequest::Requested(reply),
+        ))
         .await?;
         receiver.await.map_err(|_| CheckOwnerFailure::Unavailable)?
     }
@@ -318,6 +344,14 @@ impl CheckOwnerRuns {
     /// Launch only after the owner has authenticated scope and revalidated its current resource gate.
     pub(crate) fn start(&mut self, request: PendingCheckTool) -> Result<(), CheckOwnerFailure> {
         match request {
+            PendingCheckTool::Cancel { run_id, reply, .. } => {
+                let _ = reply.send(
+                    self.runner
+                        .cancel(&run_id)
+                        .map_err(CheckOwnerFailure::Worker),
+                );
+                Ok(())
+            }
             PendingCheckTool::Run(request) => self.run_start(*request),
             PendingCheckTool::Discover(request) => self.discovery_start(*request),
         }
@@ -510,20 +544,6 @@ impl CheckOwnerRuns {
             .root
             .join("owner-receipts")
             .join(format!("{}.json", crate::plan::digest(&identity))))
-    }
-
-    /// Cancel a run only when its invocation matches the retained owner identity.
-    pub(crate) fn cancel(
-        &self,
-        scope: &InvocationScope,
-        run_id: &str,
-    ) -> Result<(), CheckOwnerFailure> {
-        if self.scopes.get(run_id) != Some(scope) {
-            return Err(CheckOwnerFailure::StaleScope);
-        }
-        self.runner
-            .cancel(run_id)
-            .map_err(CheckOwnerFailure::Worker)
     }
 
     /// Interrupt every retained run during owner shutdown without discarding collection futures.

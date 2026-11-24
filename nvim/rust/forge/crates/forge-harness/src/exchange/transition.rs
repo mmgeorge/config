@@ -374,6 +374,19 @@ impl ExchangeStop {
         )
     }
 
+    /// Prompt preparation collects the previous provider invocation. Commands and shutdown
+    /// also collect the session's independently owned check process.
+    fn collect_check(services: &OwnerServices, collect: bool) -> anyhow::Result<Option<String>> {
+        if !collect {
+            return Ok(None);
+        }
+        let check = services.checks.active()?;
+        if let Some(id) = &check {
+            services.checks.cancel_for_collection(id)?;
+        }
+        Ok(check)
+    }
+
     /// Collect for an identified internal input without manufacturing a public command.
     pub(super) fn for_input(
         input: InputRevision,
@@ -606,13 +619,9 @@ impl ExchangeStop {
                     }
                     StopIntent::Reconfigure { .. } => None,
                 };
-                let check = services.checks.active().map_err(transition_failure)?;
-                if let Some(id) = check.as_ref() {
-                    services
-                        .checks
-                        .cancel_for_collection(id)
+                let check =
+                    Self::collect_check(services, !matches!(self.id, TransitionIdentity::Input(_)))
                         .map_err(transition_failure)?;
-                }
                 let TransitionStage::Preparing { ownership } =
                     std::mem::replace(&mut self.stage, TransitionStage::Consumed)
                 else {
@@ -997,6 +1006,7 @@ impl ExchangeStop {
         RetainedTransition {
             stage: self.stage,
             intent: self.intent,
+            collect_checks: !matches!(self.id, TransitionIdentity::Input(_)),
             child_operation: matches!(self.intent, StopIntent::Cancel(_)).then_some(self.id),
             jobs: Vec::new(),
             compaction_jobs: Vec::new(),
@@ -1034,6 +1044,7 @@ impl TransitionIdentity {
 pub(super) struct RetainedTransition {
     stage: TransitionStage,
     intent: StopIntent,
+    collect_checks: bool,
     child_operation: Option<TransitionIdentity>,
     jobs: Vec<tokio::task::JoinHandle<Result<(), ProviderError>>>,
     generation: Option<ProviderGenerationPermit>,
@@ -1060,6 +1071,7 @@ impl RetainedTransition {
             intent: StopIntent::Reconfigure {
                 children: ChildCollectionPolicy::Preserve,
             },
+            collect_checks: true,
             child_operation: None,
             jobs: Vec::new(),
             compaction_jobs: Vec::new(),
@@ -1253,13 +1265,8 @@ impl RetainedTransition {
             | TransitionStage::Preparing { .. }
             | TransitionStage::Settling { .. }
             | TransitionStage::Consumed => {
-                let check = services.checks.active().map_err(collection_failure)?;
-                if let Some(id) = check.as_ref() {
-                    services
-                        .checks
-                        .cancel_for_collection(id)
-                        .map_err(collection_failure)?;
-                }
+                let check = ExchangeStop::collect_check(services, self.collect_checks)
+                    .map_err(collection_failure)?;
                 collect_resources(
                     services,
                     self.child_operation.as_ref(),

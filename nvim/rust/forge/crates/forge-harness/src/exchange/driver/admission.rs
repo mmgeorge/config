@@ -103,8 +103,6 @@ pub(super) struct Admission {
     pub(super) cancel_automatic_checks: bool,
     /// Automatic checks may start or continue.
     pub(super) run_automatic_checks: bool,
-    /// Running checks may be interrupted for direct input.
-    pub(super) interrupt_checks_for_input: bool,
     /// A deferred approval timeout may start its turn.
     pub(super) start_approval_timeout: bool,
     /// A running task check must stop.
@@ -210,11 +208,6 @@ impl Admission {
                 && !facts.command_closes_tools,
             cancel_automatic_checks: facts.command_closes_tools || !ready,
             run_automatic_checks: automatic_idle,
-            interrupt_checks_for_input: !facts.owner_closed
-                && !facts.command_active
-                && !commands_waiting
-                && !facts.storage_failed
-                && ready,
             start_approval_timeout: automatic_idle
                 && background_idle
                 && !facts.automatic_publication_active

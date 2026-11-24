@@ -32,6 +32,12 @@ impl ExchangeDriver {
             automatic_repair,
             ..
         } = state;
+        if let Some(runtime) = state.foreground.as_mut()
+            && let TurnTransaction::Finalizing { admission, .. } = &mut runtime.transaction
+            && let Some(checks) = admission.completion_checks.take()
+        {
+            pending_automatic_checks.push_back(checks);
+        }
         // Advance automatic work only after caller-command admission and under the same resource gates.
         // A Ready outcome is a finished run still publishing its updates, so closing tool
         // admission leaves it to complete below rather than reporting the run as interrupted.
@@ -157,10 +163,11 @@ impl ExchangeDriver {
             && automatic_repair.is_none()
             && let Some(checks) = automatic_checks.as_mut()
         {
-            match checks.advance() {
+            match checks.advance(session_id) {
                 Ok(crate::broker::OwnedCheckProgress::Pending) => {}
                 Ok(crate::broker::OwnedCheckProgress::Finished) => {
                     *automatic_checks = None;
+                    services.input.changed.notify_one();
                     *automatic_publication = automatic_publication
                         .take()
                         .map(AutomaticPublication::close);
@@ -217,6 +224,7 @@ impl ExchangeDriver {
                     }
                 }
                 *automatic_checks = None;
+                services.input.changed.notify_one();
                 *automatic_publication = automatic_publication
                     .take()
                     .map(AutomaticPublication::close);
@@ -300,7 +308,7 @@ impl ExchangeDriver {
         }
     }
 
-    /// Interrupt checks for direct input, then admit task verification and tool checks.
+    /// Admit task verification and tool checks.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn checks_admit(
         &mut self,
@@ -325,45 +333,15 @@ impl ExchangeDriver {
             check_runs,
             check_scope,
             pending_check_tools,
-            automatic_checks,
             task_verification,
             task_check_updates,
             task_check_completion,
             ..
         } = state;
-        // Let the next admitted immediate input collect checks through the owner before delivery is retried.
-        // An in-flight input delivery does not exclude this: a delivery whose turn waits on
-        // `check_run` stays open while the run is active, and the run's collection is what
-        // lets that turn and the direct prompt proceed.
-        if admission.interrupt_checks_for_input {
-            let interrupt = services
-                .input
-                .snapshot()
-                .map_err(InputOfferError::Queue)
-                .and_then(|snapshot| {
-                    // A direct prompt interrupts checks even behind explicitly queued
-                    // drafts, which wait for completion and must not hide it.
-                    crate::exchange::input_readiness::select_pending_input(
-                        snapshot,
-                        &services.questions,
-                        crate::exchange::input_readiness::InputQueuePolicy::AllowSteering,
-                    )
-                });
-            if let Ok(crate::exchange::input_readiness::PendingInput::Ready(selection)) = interrupt
-            {
-                let (input, directive) = selection.into_parts();
-                if directive.is_none()
-                    && interrupt_checks_for_direct_input(&input, services, trace, session_id, step)
-                    && let Some(checks) = automatic_checks.as_mut()
-                {
-                    let _ = checks.cancel();
-                }
-            }
-        }
         if admission.cancel_task_checks
             && let Some(checks) = task_verification.as_mut()
         {
-            let _ = checks.run.cancel();
+            let _ = checks.cancel();
         }
         // Admit task verification from durable task/input authority only after caller-command admission.
         if !self.task_check_requests.is_empty() {
@@ -376,7 +354,7 @@ impl ExchangeDriver {
                 .is_some_and(|task| task.next_action() == crate::task::TaskNextAction::Checks);
             if task_verification.is_none() && !relevant {
                 readiness = None;
-            } else if admission.start_task_verification {
+            } else {
                 let allowed = services
                     .input
                     .snapshot()
@@ -402,10 +380,10 @@ impl ExchangeDriver {
                         )
                     });
                 match allowed {
-                    Ok(true) => {
-                        if let Ok(control) = services.control.clone().try_acquire_owned() {
+                    Ok(true) if admission.start_task_verification => {
+                        if let Ok(_control) = services.control.clone().try_acquire_owned() {
                             match services.execution.clone().try_acquire_owned() {
-                                Ok(execution) => match broker.try_lock() {
+                                Ok(_execution) => match broker.try_lock() {
                                     Ok(mut broker) => {
                                         let (sink, updates) = crate::broker::publication::channel();
                                         match crate::broker::OwnedTaskCheckRun::prepare(
@@ -413,11 +391,7 @@ impl ExchangeDriver {
                                             sink,
                                         ) {
                                             Ok(Some(run)) => {
-                                                *task_verification = Some(TaskVerification {
-                                                    run,
-                                                    _control: control,
-                                                    _execution: execution,
-                                                });
+                                                *task_verification = Some(run);
                                                 *task_check_updates = Some(updates);
                                                 readiness = Some(InputReadiness::Started);
                                             }
@@ -433,6 +407,7 @@ impl ExchangeDriver {
                             }
                         }
                     }
+                    Ok(true) => {}
                     Ok(false) => readiness = None,
                     Err(error) => {
                         trace.record(

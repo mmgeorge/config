@@ -14,7 +14,7 @@ use super::super::shutdown::OwnerShutdown;
 use super::super::transition::RetainedTransition;
 use super::{
     ActiveCommand, ActiveTurn, AutomaticPublication, CollectedCancellation, CollectedInput,
-    DeferredPublications, DriverWake, FailedForeground, QueuedTurn, TaskVerification,
+    DeferredPublications, DriverWake, FailedForeground, QueuedTurn,
 };
 use crate::broker::DispatchResult;
 
@@ -79,7 +79,7 @@ pub(super) struct DriverState {
     /// The response of a repair turn that automatic checks started.
     pub(super) automatic_repair: Option<oneshot::Receiver<anyhow::Result<DispatchResult>>>,
     /// The task check run and the permits it holds.
-    pub(super) task_verification: Option<TaskVerification>,
+    pub(super) task_verification: Option<crate::broker::OwnedTaskCheckRun>,
     /// The output stream of the running task check.
     pub(super) task_check_updates: Option<crate::broker::publication::SessionUpdateStream>,
     /// A finished task check waiting to publish its events.
@@ -137,6 +137,13 @@ pub(super) enum FailedWork {
 }
 
 impl DriverState {
+    /// Keep queued source work behind verification through discovery, execution and publication.
+    pub(super) fn checks_pending(&self) -> bool {
+        self.task_verification.is_some()
+            || self.automatic_checks.is_some()
+            || !self.pending_automatic_checks.is_empty()
+    }
+
     /// Create empty loop state bound to the session's question and check owners.
     pub(super) fn new(
         services: &super::super::services::OwnerServices,

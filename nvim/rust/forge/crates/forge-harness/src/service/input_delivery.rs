@@ -216,7 +216,7 @@ impl SessionController {
             .is_some();
         let steering_available = self.coordinator.execution.available_permits() == 0
             && (self.parent_input.is_active() || snapshot.native_steer && native_active);
-        let policy = if steering_available {
+        let policy = if steering_available || snapshot.checks_running {
             crate::exchange::InputQueuePolicy::AllowSteering
         } else {
             crate::exchange::InputQueuePolicy::Ordered
@@ -231,6 +231,9 @@ impl SessionController {
                 return self.complete_input_checks(sink, jobs).await;
             }
             crate::exchange::PendingInput::Waiting => return Ok(InputProgress::Waiting),
+            crate::exchange::PendingInput::WaitExecution if snapshot.checks_running => {
+                return Ok(InputProgress::Waiting);
+            }
             crate::exchange::PendingInput::WaitExecution => {
                 return Ok(InputProgress::WaitExecution);
             }

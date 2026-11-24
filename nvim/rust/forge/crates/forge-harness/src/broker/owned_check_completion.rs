@@ -35,6 +35,7 @@ pub(crate) struct OwnedCheckCompletion {
     sink: publication::SessionUpdateSink,
     cancellation: Option<check_admission::AutomaticCheckCancellation>,
     stopping: bool,
+    failure: Option<anyhow::Error>,
 }
 
 impl OwnedCheckCompletion {
@@ -44,25 +45,45 @@ impl OwnedCheckCompletion {
         request: AutomaticCheckRequest,
         sink: publication::SessionUpdateSink,
     ) -> Result<Self> {
-        let (transaction, action) = broker.begin_check_completion(sink.clone())?;
+        let (transaction, action, reply) = match request {
+            AutomaticCheckRequest::Requested(reply) => {
+                let (transaction, action) = broker.begin_check_completion(sink.clone())?;
+                (transaction, action, Some(reply))
+            }
+            AutomaticCheckRequest::Prepared(work) => {
+                let (transaction, action) = *work;
+                (Some(transaction), action, None)
+            }
+        };
         Ok(Self {
             transaction,
             action: Some(action),
             worker: None,
-            reply: Some(request.reply),
+            reply,
             sink,
             cancellation: None,
             stopping: false,
+            failure: None,
         })
     }
 
     /// Start one detached stage or yield the exact transition that requires foreground ownership.
-    pub(crate) fn advance(&mut self) -> Result<OwnedCheckProgress> {
+    pub(crate) fn advance(&mut self, session_id: &str) -> Result<OwnedCheckProgress> {
         if self.worker.is_some() {
             return Ok(OwnedCheckProgress::Pending);
         }
         if self.stopping {
-            self.fail(anyhow::anyhow!("automatic checks were interrupted"));
+            if let Some(error) = self.failure.take() {
+                return Ok(OwnedCheckProgress::Ready(CheckCompletionOutcome {
+                    value: Value::Null,
+                    events: vec![SessionEvent {
+                        session_id: session_id.to_owned(),
+                        event: "provider_event".into(),
+                        payload: json!({"kind":"error","text":format!("Automatic checks failed: {error:#}")}),
+                    }],
+                }));
+            }
+            self.fail(TurnCancelled.into());
             return Ok(OwnedCheckProgress::Finished);
         }
         let Some(action) = self.action.take() else {
@@ -75,7 +96,8 @@ impl OwnedCheckCompletion {
                     events,
                 }))
             }
-            AutomaticCheckAction::Refresh(job) => {
+            AutomaticCheckAction::Refresh(mut job) => {
+                job.publish_to(self.sink.clone());
                 self.worker = Some(tokio::spawn(async move {
                     OwnedCheckResult::Refresh(job.run().await.map(Box::new))
                 }));
@@ -137,9 +159,10 @@ impl OwnedCheckCompletion {
             OwnedCheckResult::Refresh(result) => {
                 broker.apply_automatic_check_refresh(transaction, *result?)?
             }
-            OwnedCheckResult::Run(result) => {
-                broker.apply_automatic_check_result(transaction, *result?)?
-            }
+            OwnedCheckResult::Run(result) => broker
+                .with_publication_sink(&self.sink, |broker| {
+                    broker.apply_automatic_check_result(transaction, *result?)
+                })?,
             OwnedCheckResult::Published(result) => AutomaticCheckAction::Finish(result?),
         });
         Ok(())
@@ -194,6 +217,9 @@ impl OwnedCheckCompletion {
     pub(crate) fn fail(&mut self, error: anyhow::Error) {
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(Err(CheckOwnerFailure::Worker(error)));
+        } else if !error.is::<TurnCancelled>() {
+            tracing::error!(%error, "Detached automatic checks failed");
+            self.failure = Some(error);
         }
     }
 

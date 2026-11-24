@@ -55,7 +55,7 @@ impl InputOfferError {
 pub(crate) enum InputQueuePolicy {
     /// Preserve order when no active receiver can accept immediate steering.
     Ordered,
-    /// Allow immediate input to bypass queued drafts while a steering destination is active.
+    /// Allow immediate input to pass drafts waiting for the active turn or checks.
     AllowSteering,
 }
 
@@ -103,8 +103,9 @@ impl TurnOfferGates {
             has_approval,
             has_elicitation,
         } = self;
-        let held_for_checks =
-            checks_running && !matches!(message.purpose, InputPurpose::CheckResult { .. });
+        let held_for_checks = checks_running
+            && !message.is_direct_prompt()
+            && !matches!(message.purpose, InputPurpose::CheckResult { .. });
         let held_for_answer = message.intent == InputIntent::Queue && has_elicitation;
         !(held_for_checks || has_approval || held_for_answer)
     }
@@ -274,8 +275,15 @@ pub(crate) fn successor_turn_pending(
     if claimed {
         return Ok(true);
     }
-    let PendingInput::Ready(selection) =
-        select_pending_input(input, questions, InputQueuePolicy::Ordered)?
+    let PendingInput::Ready(selection) = select_pending_input(
+        input,
+        questions,
+        if gates.checks_running {
+            InputQueuePolicy::AllowSteering
+        } else {
+            InputQueuePolicy::Ordered
+        },
+    )?
     else {
         return Ok(false);
     };
@@ -394,7 +402,7 @@ mod tests {
         };
         assert!(pending(snapshot(InputIntent::Queue, false), open)?);
         assert!(!pending(snapshot(InputIntent::Queue, true), open)?);
-        assert!(!pending(
+        assert!(pending(
             snapshot(InputIntent::Auto, false),
             TurnOfferGates {
                 checks_running: true,

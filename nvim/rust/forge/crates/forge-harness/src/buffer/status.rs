@@ -228,17 +228,23 @@ impl StatusView<'_> {
                 action: None,
             });
         }
-        let checking = checks.is_some() && idle;
+        let standalone_checks = checks.filter(|_| idle);
         // An idle root with only running children has no phase of its own to report, so the
         // agents heading takes the primary row, as the check heading does for idle checks.
         let delegating = idle && checks.is_none();
-        let text = if checking {
-            check_heading(checks.expect("checking requires check activity"), now_ms)
+        let mut text = if let Some(checks) = standalone_checks {
+            format!("Working · {}s", checks.elapsed_ms(now_ms) / 1000)
         } else if delegating {
             agents_heading(agents)
         } else {
             primary_text(status, now_ms)
         };
+        if let Some(checks) = checks.filter(|checks| checks.total_count > 0) {
+            text = format!(
+                "{text} · {}/{} checks finished",
+                checks.completed_count, checks.total_count
+            );
+        }
         // Both phases read `Stopping` until the interrupted exchange settles.
         let stopping = matches!(
             status,
@@ -252,7 +258,7 @@ impl StatusView<'_> {
             TranscriptRenderer::new(width)?.literal(BlockId(id.to_owned()), &text, 0)?;
         block.metadata.status = Some(StatusPresentation {
             row: 0,
-            animated: checking || delegating || status.animated(),
+            animated: idle || status.animated(),
             handoff: matches!(
                 status,
                 SessionPhase::Working {
@@ -261,7 +267,7 @@ impl StatusView<'_> {
                 }
             ),
             stopping,
-            hint: if checking || delegating {
+            hint: if idle {
                 Some(StatusHint::Working)
             } else {
                 match status {
@@ -278,7 +284,7 @@ impl StatusView<'_> {
         });
         let action = bind_action(&mut block, id, status);
         if let Some(checks) = checks {
-            append_checks(&mut block, width, checks, status, agents.is_empty(), now_ms)?;
+            append_checks(&mut block, width, checks, agents.is_empty(), now_ms)?;
         }
         if !agents.is_empty() {
             // The primary row already names running agents when the root is idle or waiting for
@@ -309,7 +315,7 @@ impl StatusView<'_> {
     /// Record the next change of each running clock that `render` formats.
     ///
     /// Each clause names the clock of one label: the primary phase row, the provider retry
-    /// countdown, the check heading and running commands, and each child agent with its tools.
+    /// countdown, the standalone check clock and running commands, and each child agent with its tools.
     fn label_due(&self, now_ms: i64, due: &mut super::duration::LabelDue) {
         match self.status {
             SessionPhase::Working {
@@ -334,7 +340,7 @@ impl StatusView<'_> {
             _ => {}
         }
         if let Some(checks) = self.checks {
-            if checks.started_at_ms.is_some() {
+            if matches!(self.status, SessionPhase::Idle) && checks.started_at_ms.is_some() {
                 due.elapsed(now_ms, checks.elapsed_ms(now_ms));
             }
             for command in &checks.command_list {
@@ -493,16 +499,6 @@ fn bind_action(
     action
 }
 
-/// Describe the complete selected run independently of command progress.
-fn check_heading(checks: &CheckActivity, now_ms: i64) -> String {
-    format!(
-        "Checking · {}/{} finished · {}s",
-        checks.completed_count,
-        checks.total_count,
-        checks.elapsed_ms(now_ms) / 1000
-    )
-}
-
 /// Render one row per selected command, with live progress and failure causes on that row.
 ///
 /// The run selects its commands when it starts, so the check tree reaches its height in one
@@ -514,25 +510,16 @@ fn append_checks(
     block: &mut BufferBlock,
     width: &WidthProfile,
     checks: &CheckActivity,
-    status: &SessionPhase,
-    last_branch: bool,
+    last_group: bool,
     now_ms: i64,
 ) -> Result<()> {
-    let nested = !matches!(status, SessionPhase::Idle);
-    // A following agents branch keeps the stem open beside the check commands.
-    let root = match (nested, last_branch) {
-        (false, _) => "",
-        (true, true) => "   ",
-        (true, false) => "│  ",
-    };
+    if checks.command_list.is_empty() {
+        return Ok(());
+    }
     let mut lines = Vec::new();
     let mut running_rows = Vec::new();
-    if nested {
-        let branch = if last_branch { "└─" } else { "├─" };
-        lines.push(format!("{branch} {}", check_heading(checks, now_ms)));
-    }
     for (command_index, command) in checks.command_list.iter().enumerate() {
-        let last = command_index + 1 == checks.command_list.len();
+        let last = last_group && command_index + 1 == checks.command_list.len();
         let branch = if last { "└─" } else { "├─" };
         let (marker, outcome) = match command.state {
             CheckState::Pending => ("○", "queued"),
@@ -625,7 +612,7 @@ fn append_checks(
             .map(|detail| format!(" · {detail}"))
             .collect();
         lines.push(format!(
-            "{root}{branch} {marker} {} · {outcome}{elapsed}{details}",
+            "{branch} {marker} {} · {outcome}{elapsed}{details}",
             command.title
         ));
     }
@@ -667,7 +654,7 @@ fn append_checks(
     block.metadata.decoration.push(Decoration {
         range: TextRange {
             start: TextPosition {
-                row: if nested { start } else { 0 },
+                row: start,
                 column: 0,
             },
             end: TextPosition {
@@ -957,37 +944,34 @@ mod tests {
         let working = SessionPhase::Working {
             duration_ms: 0,
             started_at_ms: Some(0),
-            activity: WorkflowActivity::Checking,
+            activity: WorkflowActivity::Working,
             reasoning_summary: None,
             execution: None,
         };
-        for status in [&SessionPhase::Idle, &working] {
-            let mut heights = Vec::new();
-            for command_list in &stages {
-                let checks = CheckActivity {
-                    run_id: "run".into(),
-                    duration_ms: 0,
-                    started_at_ms: Some(0),
-                    completed_count: 0,
-                    total_count: command_list.len(),
-                    command_list: command_list.clone(),
-                };
-                let block = StatusView {
+        for command_list in &stages {
+            let checks = CheckActivity {
+                run_id: "run".into(),
+                duration_ms: 0,
+                started_at_ms: Some(0),
+                completed_count: 0,
+                total_count: command_list.len(),
+                command_list: command_list.clone(),
+            };
+            let render = |status| {
+                StatusView {
                     id: "status",
                     status,
                     agents: &[],
                     status_thoughts: false,
                     checks: Some(&checks),
                 }
-                .render(&WidthProfile::default(), 2_000)?
-                .block
-                .unwrap();
-                heights.push(block.text.row_count());
-            }
-            assert!(
-                heights.iter().all(|height| *height == heights[0]),
-                "the check tree changed height as its commands progressed: {heights:?}"
-            );
+                .render(&WidthProfile::default(), 2_000)
+                .map(|rendered| rendered.block.unwrap())
+            };
+            let idle = render(&SessionPhase::Idle)?;
+            let active = render(&working)?;
+            assert_eq!(idle.text.wire_rows(), active.text.wire_rows());
+            assert_eq!(active.text.row_count(), 1 + command_list.len());
         }
         Ok(())
     }
@@ -1091,7 +1075,7 @@ mod tests {
             assert_eq!(
                 block.text.wire_rows(),
                 [
-                    "Checking · 0/1 finished · 2s".to_owned(),
+                    "Working · 2s · 0/1 checks finished".to_owned(),
                     format!("└─ ⠋ Formatting · running · 2s{expected}"),
                 ]
             );
@@ -1164,7 +1148,7 @@ mod tests {
             assert_eq!(
                 rendered.block.unwrap().text.wire_rows(),
                 [
-                    "Checking · 0/1 finished · 27s".to_owned(),
+                    "Working · 27s · 0/1 checks finished".to_owned(),
                     format!("└─ ⠋ Run Rust tests · running · 27s{expected}"),
                 ]
             );
@@ -1249,14 +1233,13 @@ mod tests {
         .block
         .unwrap();
         assert_eq!(
-            &block.text.wire_rows()[..6],
+            &block.text.wire_rows()[..5],
             &[
-                "Working · 18s",
-                "└─ Checking · 2/4 finished · 18s",
-                "   ├─ ✓ format · passed · 1s",
-                "   ├─ ✗ lint · failed · 2s · unknown field",
-                "   ├─ ⠋ tests · running · 15s · Building · Built test targets · Running session tests",
-                "   └─ ○ Lua host tests · queued · skill_marker_aligns_with_commentary",
+                "Working · 18s · 2/4 checks finished",
+                "├─ ✓ format · passed · 1s",
+                "├─ ✗ lint · failed · 2s · unknown field",
+                "├─ ⠋ tests · running · 15s · Building · Built test targets · Running session tests",
+                "└─ ○ Lua host tests · queued · skill_marker_aligns_with_commentary",
             ]
         );
         let document = BufferDocument::new(DocumentId("status-layout:status".into()), vec![block])?;
@@ -1429,7 +1412,7 @@ mod tests {
 
     /// Keep the check stem open when an agents branch follows it.
     #[test]
-    fn agents_branch_follows_an_open_check_stem() -> Result<()> {
+    fn agents_branch_follows_checks_at_the_same_indent() -> Result<()> {
         let checks = CheckActivity {
             run_id: "run".into(),
             duration_ms: 0,
@@ -1467,9 +1450,8 @@ mod tests {
         assert_eq!(
             block.text.wire_rows(),
             [
-                "Working · 3s",
-                "├─ Checking · 0/1 finished · 3s",
-                "│  └─ ⠋ format · running · 3s",
+                "Working · 3s · 0/1 checks finished",
+                "├─ ⠋ format · running · 3s",
                 "└─ Agents · 1 running",
                 "   └─ ⠋ 2s explorer · codex · gpt-6-luna + │ 1/1 tools · 2.4s",
             ]

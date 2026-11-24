@@ -151,24 +151,9 @@ impl InputMessage {
             })
     }
 
-    /// Report whether this input interrupts a running check before it is delivered.
-    ///
-    /// Only what the user sends directly preempts: a prompt, an answer, or a task the user starts
-    /// or resumes. A continuation Harness reserves after a turn, and a check result, wait for the
-    /// run instead, because a model may end its turn while its own `check_run` is still running and
-    /// the continuation would otherwise interrupt the run that turn is waiting for.
-    pub(crate) fn preempts_checks(&self) -> bool {
-        self.intent == InputIntent::Auto
-            && match self.purpose {
-                InputPurpose::User
-                | InputPurpose::Clarification { .. }
-                | InputPurpose::Question { .. }
-                | InputPurpose::TaskEntry { .. } => true,
-                InputPurpose::CheckResult { .. }
-                | InputPurpose::WorkflowContinuation { .. }
-                | InputPurpose::QuestionContinuation { .. }
-                | InputPurpose::TaskContinuation { .. } => false,
-            }
+    /// Admit a direct user prompt alongside a running check.
+    pub(crate) fn is_direct_prompt(&self) -> bool {
+        self.intent == InputIntent::Auto && matches!(self.purpose, InputPurpose::User)
     }
 
     /// Create the first committed revision for input reserved in a workflow transaction.

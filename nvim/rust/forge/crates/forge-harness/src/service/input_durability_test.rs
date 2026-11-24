@@ -486,33 +486,8 @@ async fn check_result_continues_an_exchange_collected_after_its_turn_completed()
     control
         .dispatch(&session, completed_script("Reviewed the check result."))
         .await?;
-    let result: forge_provider_api::forge::CheckResult = serde_json::from_value(json!({
-        "run_id":"interrupted-run","exchange_id":started.id,"state":"failed","complete":true,"checks":[]
-    }))?;
-    let turn = forge_provider_api::forge::TurnInput::new(
-        forge_provider_api::forge::TurnKind::CheckResult { result },
-    );
-    let message = crate::input::InputMessage::queued(crate::input::InputDraft {
-        id: "check-result:interrupted-run".into(),
-        text: turn.label(),
-        purpose: crate::input::InputPurpose::CheckResult {
-            exchange_id: started.id.clone(),
-            run_id: "interrupted-run".into(),
-        },
-        attachments: Vec::new(),
-        config: None,
-        intent: crate::input::InputIntent::Auto,
-    })
-    .with_turn(turn);
     let inbox = &controller.observer.check_inbox;
-    inbox.apply(crate::input::InputOperation {
-        id: "check-result:interrupted-run".into(),
-        control_revision: 0,
-        after_control: None,
-        action: crate::input::InputAction::Submit {
-            message: Box::new(message),
-        },
-    })?;
+    submit_check_result(&controller, &started.id, "interrupted-run")?;
     controller.exchange_owner.input_ready(sink.clone()).await?;
     loop {
         let changed = inbox.changed.notified();
@@ -1750,7 +1725,7 @@ struct DelegatingSession {
     sink: MessageSender,
     reader: tokio::task::JoinHandle<Result<()>>,
     // Declared last: fields drop in order, and Windows cannot delete files still open.
-    root: tempfile::TempDir,
+    _root: tempfile::TempDir,
 }
 
 impl DelegatingSession {
@@ -1776,7 +1751,7 @@ impl DelegatingSession {
             session,
             sink,
             reader,
-            root,
+            _root: root,
         })
     }
 
@@ -1853,6 +1828,188 @@ impl DelegatingSession {
         self.reader.abort();
         Ok(())
     }
+}
+
+/// Commit a completed run at the same inbox boundary used by check collection.
+fn submit_check_result(controller: &SessionController, owner: &str, run: &str) -> Result<()> {
+    use crate::input::{
+        InputAction, InputDraft, InputIntent, InputMessage, InputOperation, InputPurpose,
+    };
+    use forge_provider_api::forge::{TurnInput, TurnKind};
+    let id = format!("check-result:{run}");
+    let result = serde_json::from_value(json!({
+        "run_id":run,"exchange_id":owner,"state":"failed","complete":true,"checks":[]
+    }))?;
+    let turn = TurnInput::new(TurnKind::CheckResult { result });
+    let message = InputMessage::queued(InputDraft {
+        id: id.clone(),
+        text: turn.label(),
+        purpose: InputPurpose::CheckResult {
+            exchange_id: owner.to_owned(),
+            run_id: run.to_owned(),
+        },
+        attachments: Vec::new(),
+        config: None,
+        intent: InputIntent::Auto,
+    })
+    .with_turn(turn);
+    controller.observer.check_inbox.apply(InputOperation {
+        id,
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Submit {
+            message: Box::new(message),
+        },
+    })?;
+    Ok(())
+}
+
+/// Late results steer their resumed owner even after a newer conversation exchange settled.
+#[tokio::test]
+async fn check_results_steer_resumed_exchange_below_newer_history() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    let fixture = DelegatingSession::start("resumed-check-owner").await?;
+    fixture.submit("original", "Set up the checks")?;
+    let owner = fixture.settled_exchanges(1).await?[0].id.clone();
+    fixture.submit("question", "Which command ran?")?;
+    fixture.settled_exchanges(2).await?;
+    let hold = fixture
+        .control(MockResponseCommand::Hold {
+            mode: None,
+            any_session: false,
+        })
+        .await?;
+    let barrier = hold["id"].as_str().context("mock hold")?.to_owned();
+    let inbox = &fixture.controller.observer.check_inbox;
+    submit_check_result(&fixture.controller, &owner, "first")?;
+    fixture
+        .controller
+        .exchange_owner
+        .input_ready(fixture.sink.clone())
+        .await?;
+    fixture
+        .control(MockResponseCommand::Wait {
+            id: barrier.clone(),
+        })
+        .await?;
+    submit_check_result(&fixture.controller, &owner, "second")?;
+    fixture
+        .controller
+        .exchange_owner
+        .input_ready(fixture.sink.clone())
+        .await?;
+    let steered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let changed = inbox.changed.notified();
+            if inbox.snapshot()?.messages.iter().all(|message| {
+                message.id != "check-result:second"
+                    || message.delivery() == crate::input::InputDelivery::Accepted
+            }) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            changed.await;
+        }
+    })
+    .await;
+    fixture
+        .control(MockResponseCommand::Release { id: barrier })
+        .await?;
+    steered.context("second result never reached the resumed turn")??;
+    let exchanges = fixture.settled_exchanges(2).await?;
+    assert_eq!(
+        exchanges
+            .iter()
+            .find(|exchange| exchange.id == owner)
+            .context("check owner")?
+            .turn
+            .len(),
+        2
+    );
+    assert_eq!(
+        exchanges
+            .iter()
+            .find(|exchange| exchange.id != owner)
+            .context("later exchange")?
+            .turn
+            .len(),
+        1
+    );
+    fixture.finish().await
+}
+
+/// A result for an older exchange waits while another exchange owns the provider receiver.
+#[tokio::test]
+async fn check_result_waits_for_its_own_exchange() -> Result<()> {
+    use crate::exchange::command::{InputId, InputRevision};
+    use crate::provider::mock_response::MockResponseCommand;
+    let fixture = DelegatingSession::start("other-check-owner").await?;
+    fixture.submit("original", "Start checks")?;
+    let origin = fixture.settled_exchanges(1).await?[0].id.clone();
+    let hold = fixture
+        .control(MockResponseCommand::Hold {
+            mode: None,
+            any_session: false,
+        })
+        .await?;
+    let barrier = hold["id"].as_str().context("mock hold")?.to_owned();
+    fixture.submit("question", "What command ran?")?;
+    fixture
+        .control(MockResponseCommand::Wait {
+            id: barrier.clone(),
+        })
+        .await?;
+    let controller = &fixture.controller;
+    let control = controller
+        .coordinator
+        .control
+        .clone()
+        .acquire_owned()
+        .await?;
+    submit_check_result(controller, &origin, "deferred")?;
+    let inbox = &controller.observer.check_inbox;
+    let message = inbox.snapshot()?.messages.remove(0);
+    let offered = controller
+        .exchange_owner
+        .offer_steering(
+            crate::exchange::SteeringDeliveryOffer {
+                input: InputRevision {
+                    id: InputId::new(message.id)?,
+                    revision: message.revision,
+                },
+                control,
+                order: Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await?,
+            },
+            fixture.sink.clone(),
+        )
+        .await?;
+    assert!(!offered, "another exchange accepted the result");
+    assert_eq!(
+        inbox.snapshot()?.messages[0].delivery(),
+        crate::input::InputDelivery::Queued
+    );
+    fixture
+        .control(MockResponseCommand::Release { id: barrier })
+        .await?;
+    loop {
+        let changed = inbox.changed.notified();
+        if inbox.snapshot()?.messages.is_empty() {
+            break;
+        }
+        changed.await;
+    }
+    let exchanges = fixture.settled_exchanges(2).await?;
+    assert_eq!(
+        exchanges
+            .iter()
+            .find(|exchange| exchange.id == origin)
+            .context("check owner")?
+            .turn
+            .len(),
+        2
+    );
+    fixture.finish().await
 }
 
 /// A prompt submitted while the parent continues after its children steers that continuation.
@@ -1954,25 +2111,18 @@ async fn prompt_during_the_continuation_after_children_steers_it() -> Result<()>
 /// exchange's first invocation, which the foreground once refused as crossing invocations.
 #[tokio::test]
 async fn prompt_while_the_parent_waits_for_children_reaches_the_parent() -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
     use forge_provider_api::testing::{
         TestInputAcceptance, TestMessageContent, TestPromptScript, TestPromptStep,
         TestPromptTerminal,
     };
     let fixture = DelegatingSession::start("parked-steer").await?;
-    // A shared reservation holds the writing child in repository admission, so the parent's own
-    // turn ends while its child still runs.
-    let reservation = crate::repository_access::RepositoryReservation::acquire(
-        &fixture.controller.data_root,
-        fixture.root.path(),
-        crate::repository_access::RepositoryAccess::Read,
-    )?;
     fixture
         .script(TestPromptScript {
             acceptance: TestInputAcceptance::BeforeResponse,
             steps: vec![
-                TestPromptStep::ToolCall {
-                    name: "agent_spawn".into(),
-                    arguments: json!({"profile":"worker","text":"Inspect the sources"}),
+                TestPromptStep::Barrier {
+                    id: forge_provider_api::testing::TestHoldId::new("before-spawn")?,
                 },
                 TestPromptStep::Message {
                     content: TestMessageContent::Response,
@@ -1993,8 +2143,62 @@ async fn prompt_while_the_parent_waits_for_children_reaches_the_parent() -> Resu
         })
         .await?;
     fixture.submit("delegate", "Delegate an inspection")?;
+    fixture
+        .control(MockResponseCommand::Wait {
+            id: "before-spawn".into(),
+        })
+        .await?;
+    // Reserve the child for this exchange, then hold its launch while the parent settles.
+    // Releasing the coordinator's hold admits the real mock child and its result.
+    let mut parent = crate::storage::HistoryReader::current(&fixture.controller.data_root)?
+        .latest_exchange(&fixture.session)?
+        .context("delegating exchange")?;
+    let coordinator = &fixture.controller.agent_coordinator;
+    let spawn = crate::agent::SpawnAgentRequest {
+        profile: Some("worker".into()),
+        access: None,
+        text: "Inspect the sources".into(),
+    };
+    let reservation = coordinator.reserve_spawn(
+        &crate::agent::AgentRequest {
+            operation_id: "inspect-sources".into(),
+            source: crate::agent::AgentSource::Model,
+            operation: crate::agent::AgentOperation::Spawn(spawn.clone()),
+        },
+        &spawn,
+        crate::agent::AgentSelection {
+            profile: "worker".into(),
+            instructions: String::new(),
+            provider: fixture.controller.provider_handle().descriptor().kind,
+            model: "default".into(),
+            reasoning_effort: "low".into(),
+            context_window: None,
+            service_tier: crate::provider::ServiceTier::Standard,
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+        },
+        &parent.id,
+        1,
+    )?;
+    parent.append_agent_task(&reservation.task)?;
+    crate::storage::SqliteStore::open(&fixture.controller.data_root)?.admit_agent_task(
+        &reservation.agent,
+        &reservation.task,
+        &parent,
+        reservation.continuation_authorization(),
+    )?;
+    let launch_hold = coordinator.hold_launches()?;
+    ensure!(
+        matches!(reservation.commit()?, crate::agent::AgentCommit::Admitted(work) if !work.launch),
+        "child must be queued"
+    );
+    fixture
+        .control(MockResponseCommand::Release {
+            id: "before-spawn".into(),
+        })
+        .await?;
     loop {
-        let parked = fixture.controller.agent_coordinator.active_count() == 1
+        let parked = coordinator.has_active_task(&parent.id)
             && crate::storage::HistoryReader::current(&fixture.controller.data_root)?
                 .list_exchange(&fixture.session)?
                 .first()
@@ -2008,7 +2212,7 @@ async fn prompt_while_the_parent_waits_for_children_reaches_the_parent() -> Resu
         tokio::task::yield_now().await;
     }
     fixture.submit("steer", "Also name the exported types")?;
-    drop(reservation);
+    drop(launch_hold);
     let exchanges = fixture.settled_exchanges(1).await?;
     ensure!(
         exchanges

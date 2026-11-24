@@ -14,7 +14,7 @@ impl HarnessBroker {
         self.require_restore_recovered()?;
         self.with_publication_sink(&sink, |broker| {
             let result = (serde_json::to_value(broker.snapshot()?)?, Vec::new());
-            broker.begin_automatic_checks(result, PromptMode::Chat)
+            broker.begin_automatic_checks(result, PromptMode::Chat, None)
         })
     }
 

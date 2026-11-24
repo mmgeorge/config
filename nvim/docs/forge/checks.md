@@ -570,14 +570,11 @@ shows the current check names, completion count, and elapsed time. It does not r
 Working or a waiting state. The timeline receives one expandable result when the run
 finishes or is interrupted. Open that result for command details and saved output.
 
-Submitting a prompt while checks run interrupts those checks and starts the prompt
-after their processes stop. Explicitly queueing a prompt leaves checks running and
-waits for completion. A directly submitted prompt takes precedence over queued
-prompts, and edits made to the composer during cancellation remain unsent.
-Only what you send interrupts checks: a prompt, an answer, or a task you start or
-resume. A continuation Harness schedules after a task's turn, such as the next goal
-turn, waits for running checks instead, so a model that ends its turn while its own
-`check_run` is still running receives that run's result rather than an interrupted one.
+Submitting a prompt while checks run steers the active turn or starts a new turn
+if the model is idle. The check continues and its result belongs to the exchange
+that requested it. If a result resumes an older exchange while the composer has focus, the transcript follows that exchange’s output. Explicitly queued prompts and automatic task continuations
+wait for checks. A direct prompt can pass those queued prompts. The agent can
+use `check_cancel` with the active run ID to stop the check from a later turn.
 `Ctrl-C` stops running checks and pauses work without submitting the composer or
 queued messages. `Ctrl-S`
 submits the composer even while that pause is pending, after cleanup finishes.
@@ -591,6 +588,5 @@ Cancelling a check stops its owned process tree. Automatic completion does not r
 the same cancelled checks against unchanged inputs. Run those checks explicitly to
 retry, or change their relevant inputs before automatic verification resumes.
 If cancellation precedes the first input snapshot, retry explicitly.
-Active check status names the run trigger, and an otherwise idle session shows
-Checking until the run settles. Result summaries include a single failure as well
+An otherwise idle session shows Working with the running checks beneath it. Result summaries include a single failure as well
 as interrupted and blocked checks.

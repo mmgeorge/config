@@ -745,11 +745,12 @@ even when its snapshot arrives after response text. Received-byte progress and
 tool-argument streaming do not count as reasoning text. Copilot remains active
 until its session becomes idle, including native background work.
 
-Active checks appear as a tree showing selected checks as queued, running, or completed.
-Each running check expands to show its progress and latest output; successful checks
-collapse to their result and elapsed time, while unsuccessful checks retain their reported
-cause. Concurrent checks each show their own progress. Pending questions appear after
-the check tree, with their answer control beside the phase label.
+The live status heading shows how many checks have finished. When checks are the only
+activity, the heading reads `Working` and shows the run's elapsed time. Each check
+stays at the same indentation as other activity starts or finishes. Running checks
+show progress and recent output, successful checks show the result and elapsed time,
+and unsuccessful checks retain their reported cause. Pending questions follow the
+checks, with their answer control beside the phase label.
 
 Formatting checks show file counts only when the formatter supplies a total or reports
 file outcomes. Otherwise, the running check shows its label and elapsed time.
@@ -899,7 +900,8 @@ opens **Unconfirmed input**. Choose **Reconcile delivery** to check receipt and 
 only if the provider confirms it never received the message. Choose **Discard queue
 entry** to let later prompts proceed. An unconfirmed editor
 submission stays in the queue until the host confirms it or you discard it.
-Explicitly queued messages do not interrupt the active response or checks.
+During checks, a direct message steers the active turn or starts a new one alongside the run.
+Explicitly queued messages wait for checks to finish.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
