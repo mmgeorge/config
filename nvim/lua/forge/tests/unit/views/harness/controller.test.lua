@@ -2582,6 +2582,39 @@ T["document_change_awaiting_an_unheld_question_reads_state"] = function()
   eq(requests[#requests].spec.method, "session.state.get")
 end
 
+T["artifacts_command_browses_previous_plans_while_review_is_pending"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local requests = mock_client.record()
+  local notices = notify.capture({ notifications = true })
+  state.session, state.status = { id = "reviewing" }, { kind = "awaiting_plan_review" }
+  state.composer_buf = buffer.scratch()
+  state.active_plan = { id = "current-plan", title = "Current plan", state = "awaiting_review" }
+  state.artifact = { { id = "older-plan", title = "Previous plan", state = "accepted" }, state.active_plan }
+  state.presentation = { status_action = function() error("opened the active review instead of the artifact list") end }
+  local picker
+  require("forge.views.picker").open = function(spec) picker = spec end
+
+  buffer.set(state.composer_buf, { "/artifacts extra" })
+  controller.submit()
+  eq(buffer.text(state.composer_buf), "/artifacts extra")
+  eq(#notices, 1)
+  eq(picker, nil)
+  eq(#requests, 0)
+
+  buffer.set(state.composer_buf, { "/artifacts" })
+  controller.submit()
+  eq(buffer.text(state.composer_buf), "")
+  eq(#requests, 0)
+  local page = picker.page_list[1]
+  eq(page.title, "Select Artifact")
+  eq(vim.tbl_map(function(option) return option.label end, page.option_list), { "Current plan", "Previous plan" })
+  picker.on_confirm({ option = page.option_list[2] })
+  eq(#requests, 1)
+  eq(requests[1].spec.method, "session.plan.get")
+  eq(requests[1].spec.params.plan_id, "older-plan")
+end
+
 T["artifact_picker_opens_a_paused_plan_awaiting_review"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")

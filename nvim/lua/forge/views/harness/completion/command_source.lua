@@ -34,6 +34,7 @@ local command_list = {
   { label = "/agents off", detail = "Disable subagent tools" },
   { label = "/agents edit", detail = "Edit global subagent profiles" },
   { label = "/agents spawn", detail = "Create a fresh child from a profile" },
+  { label = "/artifacts", detail = "Browse artifacts in the current session" },
   { label = "/plan", detail = "Browse plans, or create a planning task with a prompt" },
   { label = "/plan accept on", detail = "Automatically accept full submissions for the current task" },
   { label = "/plan accept off", detail = "Require review of full submissions for the current task" },
@@ -94,6 +95,9 @@ end
 ---@return string? failure
 function CommandSource.accepts_prompt(text)
   local trimmed = vim.trim(text)
+  if trimmed:match("^/artifacts%s") then
+    return false, "Use /artifacts to browse session artifacts."
+  end
   if trimmed == "/plan accept" or trimmed:match("^/plan%s+accept%s+") then
     if trimmed ~= "/plan accept on" and trimmed ~= "/plan accept off" then
       return false, "Use /plan accept on or /plan accept off."

@@ -910,7 +910,10 @@ The prompt inherits ordinary text-buffer editing and navigation mappings. Harnes
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
 question or approval, `op` for artifacts, `og` for agents, model selection, help,
-and closing Harness. A question popup closed on any of its pages, by its close key or the
+and closing Harness. Submit `/artifacts` in the composer to browse the current session's
+artifacts, including plans, even while a plan awaits review.
+
+A question popup closed on any of its pages, by its close key or the
 interrupt key, leaves the question pending with its answers, and `oe` reopens it; earlier
 questions that were already answered or withdrawn do not stand in its way. The artifact list
 omits cancelled plans; their transcript rows still

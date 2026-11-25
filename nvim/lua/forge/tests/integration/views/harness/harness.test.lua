@@ -1730,9 +1730,9 @@ do
   assert(planning_status:find("rxwpa · ", 1, true) and planning_status:find(" · plan", 1, true),
     "plan lost its task type or permission suffix")
   assert(planning_status:find("plan · draft", 1, true), "planning phase disappeared from the winbar")
-  assert(planning_status:find("2 artefacts", 1, true), "artifact count disappeared from the winbar")
+  assert(planning_status:find("2 artifacts", 1, true), "artifact count disappeared from the winbar")
   local planning_winbar = vim.wo[state.transcript_win].winbar
-  assert(planning_winbar:find("2 artefacts", 1, true) > planning_winbar:find("%=", 1, true),
+  assert(planning_winbar:find("2 artifacts", 1, true) > planning_winbar:find("%=", 1, true),
     "artifact count remained in the left-aligned status")
   state.artifact, state.session.active_task = previous_artifact, nil
   controller.refresh_winbar()

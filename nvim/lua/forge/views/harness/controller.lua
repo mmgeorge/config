@@ -387,7 +387,7 @@ local function write_winbar(state)
   if artifact_count > 0 then
     if #right_status > 0 then table.insert(right_status, 1, keymaps.winbar_separator) end
     table.insert(right_status, 1, {
-      text = ("%d %s"):format(artifact_count, artifact_count == 1 and "artefact" or "artefacts"),
+      text = ("%d %s"):format(artifact_count, artifact_count == 1 and "artifact" or "artifacts"),
       group = "ForgeStatusLabel",
     })
   end
@@ -1542,9 +1542,28 @@ function M.open_artifact(state, artifact, revision)
   end)
 end
 
+---@param state ForgeHarnessPresentationState
+local function browse_artifacts(state)
+  local session_id, generation = state.session.id, client.host_get_generation()
+  local artifact_list = vim.deepcopy(state.artifact or {})
+  local current_id = state.active_plan and state.active_plan.id
+  table.sort(artifact_list, function(left, right)
+    if (left.id == current_id) ~= (right.id == current_id) then return left.id == current_id end
+    return (left.updated_at_ms or 0) > (right.updated_at_ms or 0)
+  end)
+  local option_list = vim.tbl_map(function(artifact)
+    local title = artifact.title and artifact.title ~= "" and artifact.title or "[unnamed plan]"
+    return { label = title, detail = artifact.state or "unknown", value = artifact }
+  end, artifact_list)
+  open_choice_picker(state, "Select Artifact", nil, option_list, function(artifact)
+    if not artifact or not state.session or state.session.id ~= session_id
+      or client.host_get_generation() ~= generation then return end
+    M.open_artifact(state, artifact)
+  end, { empty_text = "This session has no artifacts." })
+end
+
 function M.open_artifact_picker()
   local state = harness_state()
-  local session_id, generation = state.session.id, client.host_get_generation()
   -- A plan awaiting review opens directly, also while its task is paused after a restart.
   local active = state.active_plan
   if active and active.state == "awaiting_review"
@@ -1553,6 +1572,7 @@ function M.open_artifact_picker()
     return
   end
   if state.presentation and state.status and state.status.kind == "awaiting_plan_review" then
+    local session_id, generation = state.session.id, client.host_get_generation()
     state.presentation.status_action(function(action)
       client.request({ session_id = session_id, method = "session.plan.get", params = { plan_id = action.plan_id, revision = action.revision } }, function(plan, failure)
         if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then return end
@@ -1562,23 +1582,7 @@ function M.open_artifact_picker()
     end)
     return
   end
-  local function current()
-    return state.session and state.session.id == session_id and client.host_get_generation() == generation
-  end
-  local artifact_list = vim.deepcopy(state.artifact or {})
-  local current_id = state.active_plan and state.active_plan.id
-  table.sort(artifact_list, function(left, right)
-    if (left.id == current_id) ~= (right.id == current_id) then return left.id == current_id end
-    return (left.updated_at_ms or 0) > (right.updated_at_ms or 0)
-  end)
-  local option_list = vim.tbl_map(function(artifact)
-      local title = artifact.title and artifact.title ~= "" and artifact.title or "[unnamed plan]"
-      return { label = title, detail = artifact.state or "unknown", value = artifact }
-    end, artifact_list)
-  open_choice_picker(state, "Select Artifact", nil, option_list, function(artifact)
-    if not artifact or not current() then return end
-    M.open_artifact(state, artifact)
-  end, { empty_text = "This session has no artifacts." })
+  browse_artifacts(state)
 end
 
 ---@class ForgeRollbackInteraction
@@ -2290,6 +2294,11 @@ function M.submit()
   if not accepted then notifications.warn(assert(admission_failure), "ForgeHarness") return end
   if require("forge.views.harness.completion.command_source").queues_execution(text)
     and not admit_execution(state) then return end
+  if text == "/artifacts" then
+    set_composer_text(state.composer_buf, "")
+    browse_artifacts(state)
+    return
+  end
   if text == "/task" or text == "/plan" or text == "/execute" then
     set_composer_text(state.composer_buf, "")
     if text == "/task" then task_control.open(state, picker_host(state), M.task_transition)
