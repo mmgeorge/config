@@ -668,12 +668,10 @@ impl PlanFileStore {
                 );
             }
         }
-        if let Some(title) = design.artifact_text[PlanArtifact::Overview.path()]
-            .lines()
-            .find_map(|line| line.strip_prefix("# "))
-            .filter(|title| !title.trim().is_empty())
-        {
-            document.title = title.trim().into();
+        if let Some(title) = super::design_artifact::overview_title(
+            &design.artifact_text[PlanArtifact::Overview.path()],
+        ) {
+            document.title = title.into();
         }
         let fingerprint = authoring_fingerprint(&inventory, &design.baseline)?;
         let unchanged = design.authoring_fingerprint.as_ref() == Some(&fingerprint);
@@ -1073,7 +1071,7 @@ impl PlanFileStore {
 mod tests {
     use super::*;
 
-    /// Submission accepts arbitrary overview Markdown and rejects a whitespace-only draft.
+    /// Preserve the uploaded Markdown in review and reject a whitespace-only draft.
     #[tokio::test]
     async fn overview_needs_only_non_whitespace_text() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -1089,7 +1087,7 @@ mod tests {
         for text in [
             " \t\n",
             "Free-form text.",
-            "## Anything\nNotes.\n## Anything\nMore notes.\n## Decisions\n- Unstructured choice.",
+            "# Authored title\n\n## Design\nDesign first.\n\n## Anything\nNotes.\n\n## Anything\nMore notes.\n\n```text\n## Objective\n```\n\n## Background\nBackground last.\n\n## Manual checks\n- Open the view.\n",
         ] {
             fs::write(&overview, text)?;
             let document = files.authoring_import("session", &original)?;
@@ -1105,8 +1103,75 @@ mod tests {
                 );
             } else {
                 let mut submitted = original.clone();
+                submitted.title = document.title;
                 submitted.design = Some(result?.into_design());
                 submitted.validate_for_submission()?;
+                let rendered = files.render_review(&submitted)?;
+                assert!(rendered.markdown.starts_with(text));
+                assert!(!rendered.markdown.contains("None specified."));
+                assert_eq!(
+                    rendered.markdown.matches("## Manual checks").count(),
+                    usize::from(text.contains("## Manual checks"))
+                );
+                assert!(
+                    rendered
+                        .markdown
+                        .lines()
+                        .any(|line| line.trim() == "Checks")
+                );
+                let (blocks, targets) = super::super::design_review::project(
+                    &submitted,
+                    &Default::default(),
+                    super::super::design_review::ReviewAnnotationView {
+                        annotation: &[],
+                        revision: &Default::default(),
+                        focused: None,
+                    },
+                    &Default::default(),
+                    false,
+                    None,
+                    &Default::default(),
+                    None,
+                    None,
+                )?;
+                for (index, line) in text.lines().enumerate() {
+                    let block = &blocks[index];
+                    assert_eq!(block.text.row(0), Some(line));
+                    assert!(block.metadata.markdown);
+                    assert!(
+                        block
+                            .metadata
+                            .target
+                            .iter()
+                            .any(|target| { targets[&target.id].line as usize == index + 1 })
+                    );
+                }
+                if let Some(fenced_heading) = blocks
+                    .iter()
+                    .find(|block| block.text.row(0) == Some("## Objective"))
+                {
+                    assert!(
+                        fenced_heading
+                            .metadata
+                            .decoration
+                            .iter()
+                            .any(|decoration| decoration.capture == "@markup.raw.block")
+                    );
+                }
+                let design = submitted
+                    .design
+                    .as_ref()
+                    .context("missing submitted design")?;
+                let (reverted, title) = design.patch(
+                    root.path(),
+                    &Default::default(),
+                    "*** Begin Patch\n*** Add File: plan:overview.md\n+Temporary text.\n*** Revert File: plan:overview.md\n*** End Patch",
+                    &submitted.title,
+                )?;
+                assert_eq!(
+                    super::super::design_artifact_text(PlanArtifact::Overview, &title, &reverted,)?,
+                    text
+                );
             }
         }
         Ok(())

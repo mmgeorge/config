@@ -92,6 +92,46 @@ local wait_until = dofile("nvim/lua/forge/tests/support/wait.lua")
 
 local T = MiniTest.new_set({ hooks = isolation.hooks() })
 
+T["outdated_renderer_warns_once_and_preserves_plain_markdown"] = function()
+  local child = MiniTest.new_child_neovim()
+  child.start({ "-u", "NONE" })
+  MiniTest.finally(function() pcall(child.stop) end)
+  local result = child.lua([[
+    vim.opt.runtimepath:prepend(...)
+    package.loaded["render-markdown"] = {
+      render = function() error("incompatible renderer was used") end,
+      setup = function() error("incompatible renderer was initialized") end,
+    }
+    package.preload["render-markdown.lib.replacements"] = function()
+      error("replacement resolver is unavailable")
+    end
+    local notifications = {}
+    vim.notify = function(message, level) notifications[#notifications + 1] = { message, level } end
+    local markdown = require("forge.render.harness.markdown")
+    local buffer, window = vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win()
+    vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "## Transcript text" })
+    local ranges = { { first0 = 0, after0 = 1 } }
+    markdown.render(buffer, window, ranges)
+    markdown.render(buffer, window, ranges)
+    local settled = false
+    markdown.after_render(buffer, function() settled = true end)
+    return {
+      notifications = notifications,
+      text = vim.api.nvim_buf_get_lines(buffer, 0, -1, false),
+      settled = settled,
+    }
+  ]], { config_path })
+  MiniTest.expect.equality(result, {
+    notifications = { {
+      "Harness needs a newer version of render-markdown.nvim.\n"
+        .. "Run :Lazy update render-markdown.nvim, then restart Neovim.",
+      vim.log.levels.WARN,
+    } },
+    text = { "## Transcript text" },
+    settled = true,
+  })
+end
+
 T["harness_markdown_layout"] = function()
   local child = MiniTest.new_child_neovim()
   child.start({ "-u", "NONE" })

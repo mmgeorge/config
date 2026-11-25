@@ -2,6 +2,7 @@ local M = {}
 local perf = require("forge.infra.perf")
 
 local failed = false
+local renderer_incompatible = false
 local language_registered = false
 local layout_ranges = {}
 local code_indent_namespace = vim.api.nvim_create_namespace("ForgeHarnessCodeIndent")
@@ -168,8 +169,7 @@ end
 --- visible row. When the concealed rows end the buffer, no such row exists: the anchor lands past the
 --- final line, where a window scrolled to the end cannot show it, so a response ending in a wrapped
 --- table loses its body rows and bottom border. Attach those lines below the last visible row instead.
-local function install_final_replacement_anchor()
-  local replacements = require("render-markdown.lib.replacements")
+local function install_final_replacement_anchor(replacements)
   local resolve = replacements.resolve
   replacements.resolve = function(visible, line_count)
     local groups = resolve(visible, line_count)
@@ -504,10 +504,25 @@ function M.render(buf, win, range_list)
     M.clear(buf)
     return
   end
-  if not ensure_language() then return end
-  if not (win and vim.api.nvim_win_is_valid(win)) then return end
+  if renderer_incompatible or not (win and vim.api.nvim_win_is_valid(win)) then return end
   local ok, render_markdown = pcall(require, "render-markdown")
   if not ok or type(render_markdown.render) ~= "function" then return end
+  local replacements
+  if not layout_handlers then
+    local loaded, module = pcall(require, "render-markdown.lib.replacements")
+    if not loaded or type(module) ~= "table" or type(module.resolve) ~= "function" then
+      renderer_incompatible = true
+      vim.notify(
+        "Harness needs a newer version of render-markdown.nvim.\n"
+          .. "Run :Lazy update render-markdown.nvim, then restart Neovim.",
+        vim.log.levels.WARN,
+        { title = "ForgeHarness" }
+      )
+      return
+    end
+    replacements = module
+  end
+  if not ensure_language() then return end
   render_markdown.setup()
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
   if not parser_ok or not parser then return end
@@ -636,7 +651,7 @@ function M.render(buf, win, range_list)
       })
     end
     if not layout_handlers then
-      install_final_replacement_anchor()
+      install_final_replacement_anchor(replacements)
       install_linear_sibling_count()
       install_complete_table_rows()
       install_cursor_independent_rows()

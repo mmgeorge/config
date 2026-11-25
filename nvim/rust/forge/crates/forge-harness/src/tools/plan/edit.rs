@@ -16,12 +16,9 @@ pub(super) fn definition() -> ControlToolDefinition {
                 omit displayed line numbers from patches. Revert File withdraws every proposal for a project \
                 file, or returns an artifact to its last submitted text.\n\
                 Artifacts are stored exactly as written; plan_submit reports every problem in them by line. \
-                plan:overview.md is `# Title` then `## Objective`, `## Usage`, `## Requirements`, \
-                `## Background`, `## Decisions`, `## Design`, and `## Manual checks`; Objective, Background, \
-                and Design are required. List sections use `- item` with two-space continuation lines, \
-                decisions use `- **Decision.** Rationale.`, and Manual checks lists what the agent must \
-                observe in Verify because automated checks cannot establish it; every item is a Verify \
-                action, so omit the section rather than listing \"None\". plan:flows.md has one \
+                plan:overview.md is free-form Markdown with an optional `# Title` and an optional \
+                `## Manual checks` dash list; every Manual checks item is a Verify action, so omit the \
+                section rather than listing \"None\". plan:flows.md has one \
                 `## Title` per independently triggered flow, then a one-to-two-line description that names \
                 its trigger, then one ```mermaid block: sequenceDiagram for a flow that crosses ownership \
                 boundaries, flowchart for branching control flow inside one owner, or stateDiagram-v2 for a \

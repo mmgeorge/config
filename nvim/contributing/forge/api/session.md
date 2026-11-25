@@ -880,7 +880,7 @@ Resolve a source declaration referenced by a plan.
 
 ### Contract
 
-Requires `plan_id`, `path`, and submitted `revision` (unsigned 32-bit integer). `baseline` defaults to false; `document` defaults to false. For declarations, selects the baseline or proposed source at that revision. With `document: true`, path selects an overview section by title. Returns `{ "text": ..., "path": ..., "revision": ..., "baseline": ... }`. This is read-only and does not select/resume the plan task. Wrong session, missing revision/design/path, or unknown overview section fails.
+Requires `plan_id`, `path`, and submitted `revision` (unsigned 32-bit integer). `baseline` and `document` default to false. For declarations, `path` selects the baseline or proposed source at that revision. With `document: true`, `path` selects a review section by title. Use `Overview` to read the full submitted overview Markdown. Older revisions expose their saved section titles. Returns `{ "text": ..., "path": ..., "revision": ..., "baseline": ... }`. The call is read-only and leaves the plan task's selection and execution state intact. The call fails for a wrong session, missing revision, missing design, or unknown path.
 
 ## `session.plan.entity.rename`
 

@@ -140,7 +140,7 @@ pub(super) fn project(
         focused,
     } = annotations;
     let DesignReviewRows {
-        block: source,
+        block: mut source,
         navigation,
         hidden,
         contextual,
@@ -155,19 +155,6 @@ pub(super) fn project(
         files,
         body,
     )?;
-    // Render the complete flows section once so each row keeps its Mermaid fence context. The
-    // text joins the flow rows themselves, so every decoration range fits the row it lands on.
-    let flow_text = source
-        .iter()
-        .filter(|row| row.id.0.starts_with("plan:metadata:flows:"))
-        .map(|row| row.text.wire_rows().join("\n"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let flow_markdown = forge_buffer::markdown::MarkdownRenderer::source(
-        BlockId("plan:flow-markdown".into()),
-        &flow_text,
-        width,
-    )?;
     let check_rows = if body.is_none() {
         review_checks(document.design.as_ref(), Some(width))?
     } else {
@@ -178,6 +165,25 @@ pub(super) fn project(
         .design
         .as_ref()
         .context("declaration review has no design")?;
+    // Decorate each full Markdown region so fences and multiline spans retain their context.
+    for markdown in source
+        .split_mut(|row| !row.metadata.markdown)
+        .filter(|rows| !rows.is_empty())
+    {
+        let text = markdown
+            .iter()
+            .map(|row| row.text.row(0).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered =
+            forge_buffer::markdown::MarkdownRenderer::source(markdown[0].id.clone(), &text, width)?;
+        for mut decoration in rendered.block.metadata.decoration {
+            let row = decoration.range.start.row;
+            decoration.range.start.row = 0;
+            decoration.range.end.row = 0;
+            markdown[row].metadata.decoration.push(decoration);
+        }
+    }
     let narrative_spans = if body.is_none() {
         super::review_symbols::spans(design)
     } else {
@@ -211,27 +217,13 @@ pub(super) fn project(
         if let Some(index) = row
             .id
             .0
-            .strip_prefix("plan:metadata:flows:")
-            .and_then(|index| index.parse::<usize>().ok())
-        {
-            row.metadata.markdown = true;
-            for decoration in &flow_markdown.block.metadata.decoration {
-                if decoration.range.start.row == index {
-                    let mut decoration = decoration.clone();
-                    decoration.range.start.row = 0;
-                    decoration.range.end.row = 0;
-                    row.metadata.decoration.push(decoration);
-                }
-            }
-        } else if let Some(index) = row
-            .id
-            .0
             .strip_prefix("plan:configured-checks:")
             .and_then(|index| index.parse::<usize>().ok())
         {
             row.text = check_rows[index].text.clone();
             row.metadata.decoration = check_rows[index].metadata.decoration.clone();
-        } else if row.id.0.starts_with("plan:metadata:")
+        } else if !row.metadata.markdown
+            && row.id.0.starts_with("plan:metadata:")
             && !row.id.0.starts_with("plan:metadata:checks:")
         {
             row = forge_buffer::markdown::MarkdownRenderer::source(
@@ -995,51 +987,6 @@ fn rows(
         {
             continue;
         }
-        if section == super::PlanSection::ManualVerification {
-            let start = overview.len();
-            overview.push(section_header(
-                BlockId("plan:section:checks".into()),
-                "Checks",
-            )?);
-            overview.push(BufferBlock {
-                id: BlockId("plan:section:checks:spacing".into()),
-                text: BufferText::from_rows([""])?,
-                metadata: BlockMetadata::default(),
-            });
-            let lines = review_checks(Some(design), None)?;
-            let check_ids = design
-                .check_preview
-                .iter()
-                .filter(|preview| preview.selected || preview.pending)
-                .map(|preview| &preview.id)
-                .collect::<Vec<_>>();
-            for (index, row) in lines.into_iter().enumerate() {
-                overview.push(row);
-                if design.check_preview_current()?
-                    && let Some(id) = index.checked_sub(2).and_then(|index| check_ids.get(index))
-                {
-                    section_anchor.push(PlanNavigationAnchor {
-                        columns: None,
-                        line: overview.len() as u32,
-                        target: PlanReviewTarget::Check { id: (*id).clone() },
-                        json_path: "/design/document/checks".into(),
-                        path: None,
-                        label: format!("Check: {id}"),
-                    });
-                }
-            }
-            fold(
-                &mut overview,
-                start,
-                "plan:section:checks",
-                FoldPolicy::default(),
-            )?;
-            overview.push(BufferBlock {
-                id: BlockId("plan:section:checks:separator".into()),
-                text: BufferText::from_rows([""])?,
-                metadata: BlockMetadata::default(),
-            });
-        }
         if section == super::PlanSection::Tests {
             let changes_start = overview.len();
             overview.push(section_header(
@@ -1090,18 +1037,21 @@ fn rows(
                 text: BufferText::from_rows([""])?,
                 metadata: BlockMetadata::default(),
             });
+            append_checks(&mut overview, &mut section_anchor, design)?;
             continue;
         }
         let start = overview.len();
         let fold_id = format!("plan:section:{name}");
-        let title = metadata.title;
-        overview.push(section_header(BlockId(fold_id.clone()), title)?);
-        overview.push(BufferBlock {
-            id: BlockId(format!("{fold_id}:spacing")),
-            text: BufferText::from_rows([""])?,
-            metadata: BlockMetadata::default(),
-        });
-        let text = if metadata.text.trim().is_empty() {
+        let authored_overview = section == super::PlanSection::Overview;
+        if !authored_overview {
+            overview.push(section_header(BlockId(fold_id.clone()), metadata.title)?);
+            overview.push(BufferBlock {
+                id: BlockId(format!("{fold_id}:spacing")),
+                text: BufferText::from_rows([""])?,
+                metadata: BlockMetadata::default(),
+            });
+        }
+        let text = if !authored_overview && metadata.text.trim().is_empty() {
             "None specified."
         } else {
             metadata.text.as_str()
@@ -1109,11 +1059,16 @@ fn rows(
         for (index, line) in text.lines().enumerate() {
             overview.push(BufferBlock {
                 id: BlockId(format!("plan:metadata:{name}:{index}")),
-                text: BufferText::from_rows([line.to_owned()])?,
-                metadata: BlockMetadata::default(),
+                text: BufferText::from_rows([line])?,
+                metadata: BlockMetadata {
+                    markdown: authored_overview || section == super::PlanSection::Flows,
+                    ..BlockMetadata::default()
+                },
             });
         }
-        fold(&mut overview, start, &fold_id, FoldPolicy::default())?;
+        if !authored_overview {
+            fold(&mut overview, start, &fold_id, FoldPolicy::default())?;
+        }
         for line in start as u32 + 1..=overview.len() as u32 {
             section_anchor.push(PlanNavigationAnchor {
                 columns: None,
@@ -1140,6 +1095,58 @@ fn rows(
         contextual: contextual_block,
         skipped,
     })
+}
+
+/// Append Harness's automated-check summary after the test inventory.
+fn append_checks(
+    overview: &mut Vec<BufferBlock>,
+    section_anchor: &mut Vec<PlanNavigationAnchor>,
+    design: &super::DeclarationDesign,
+) -> Result<()> {
+    let start = overview.len();
+    overview.push(section_header(
+        BlockId("plan:section:checks".into()),
+        "Checks",
+    )?);
+    overview.push(BufferBlock {
+        id: BlockId("plan:section:checks:spacing".into()),
+        text: BufferText::from_rows([""])?,
+        metadata: BlockMetadata::default(),
+    });
+    let lines = review_checks(Some(design), None)?;
+    let check_ids = design
+        .check_preview
+        .iter()
+        .filter(|preview| preview.selected || preview.pending)
+        .map(|preview| &preview.id)
+        .collect::<Vec<_>>();
+    for (index, row) in lines.into_iter().enumerate() {
+        overview.push(row);
+        if design.check_preview_current()?
+            && let Some(id) = index.checked_sub(2).and_then(|index| check_ids.get(index))
+        {
+            section_anchor.push(PlanNavigationAnchor {
+                columns: None,
+                line: overview.len() as u32,
+                target: PlanReviewTarget::Check { id: (*id).clone() },
+                json_path: "/design/document/checks".into(),
+                path: None,
+                label: format!("Check: {id}"),
+            });
+        }
+    }
+    fold(
+        overview,
+        start,
+        "plan:section:checks",
+        FoldPolicy::default(),
+    )?;
+    overview.push(BufferBlock {
+        id: BlockId("plan:section:checks:separator".into()),
+        text: BufferText::from_rows([""])?,
+        metadata: BlockMetadata::default(),
+    });
+    Ok(())
 }
 
 fn review_checks(

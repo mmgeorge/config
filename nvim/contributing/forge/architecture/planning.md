@@ -35,11 +35,11 @@ Turn settlement fingerprints the editable tree and records the last observed inp
 
 ### Artifacts
 
-A new filesystem draft starts with an empty `docs/overview.md`. Submission requires only non-whitespace overview text. Forge extracts familiar sections for review and manual verification and retains free-form narrative. The `forge-planning` skill supplies a suggested template, and seeded drafts retain their authored overview. Planning artifacts are ordinary Markdown files in `docs/`, so the agent can use its existing readers and editors. The internal artifact model retains virtual names for parsing and existing execution tools; planning diagnostics identify the physical relative paths.
+A new filesystem draft starts with an empty `docs/overview.md`. Submission requires only non-whitespace overview text, and PlanReview displays the submitted Markdown in its authored order. Forge reads an optional `# Title` as the plan title and uses dash-list items under `## Manual checks` as Verify actions. The `forge-planning` skill supplies a suggested template, and seeded drafts retain their authored overview. Planning artifacts are ordinary Markdown files in `docs/`, so the agent can use its existing readers and editors. The internal artifact model retains virtual names for execution tools. Planning diagnostics identify the physical relative paths.
 
 | Path | Contents |
 | --- | --- |
-| `docs/overview.md` | `# Title`, then the Objective, Usage, Requirements, Background, Decisions, Design, and Manual checks sections. |
+| `docs/overview.md` | Free-form Markdown with an optional `# Title` and an optional `## Manual checks` checklist. |
 | `docs/flows.md` | One `## Title` per independently triggered flow, a one-to-two-line description naming its trigger, and one `mermaid` block that opens with `sequenceDiagram`, `flowchart`, or `stateDiagram-v2`. |
 | `docs/tests.md` | One `## path` per file with `- change \`name\` [target: t]: scenario` items. |
 | `docs/checks.md` | One saved check ID per line, each selecting a check to run during Checking. `parse_checks` appends every unlisted prerequisite after the listed IDs, and listing an automatic check is harmless. |

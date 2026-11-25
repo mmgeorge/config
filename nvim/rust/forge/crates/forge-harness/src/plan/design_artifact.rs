@@ -1,17 +1,19 @@
-//! Holds the plan's authored Markdown artifacts and parses them into `DesignDocument` at submission.
+//! Holds authored plan artifacts and derives execution inputs at submission.
 //!
 //! An artifact edit stores the agent's text verbatim, so every submission diagnostic names a line
-//! the agent actually wrote. Submission is the only path from artifact text to `DesignDocument`.
+//! the agent actually wrote. Submission retains the overview as Markdown and extracts Verify actions.
 //! An artifact without stored text renders from the document, which keeps Harness-side writers
 //! consistent: the review check toggle and test removal change the document and drop the stored
 //! text, and the next read renders the result in the same grammar the agent edits.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ops::Range;
 
 use anyhow::{Context, Result, bail};
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
 
 use super::design::DeclarationDesign;
-use super::design_document::{DesignDecision, DesignDocument};
+use super::design_document::DesignDocument;
 use super::design_tests::{DesignTestCase, DesignTestChange, DesignTestFile};
 use crate::declaration::{DeclarationDiagnostic, DeclarationDiagnosticKind};
 
@@ -163,7 +165,10 @@ pub(crate) fn authored_text(
 /// Render an authored artifact from the document in the grammar the agent edits.
 fn render(artifact: PlanArtifact, title: &str, document: &DesignDocument) -> Result<String> {
     Ok(match artifact {
-        PlanArtifact::Overview => overview_text(title, document),
+        PlanArtifact::Overview => document
+            .overview_markdown
+            .clone()
+            .unwrap_or_else(|| legacy_overview_text(title, document)),
         PlanArtifact::Flows => document.flows.clone(),
         PlanArtifact::Tests => tests_text(&document.tests),
         PlanArtifact::Checks => checks_text(document),
@@ -195,11 +200,7 @@ pub(crate) fn store_authored(
 ) -> Result<()> {
     let text = lf_line_endings(&text);
     if artifact == PlanArtifact::Overview
-        && let Some(heading) = text
-            .lines()
-            .find_map(|line| line.strip_prefix("# "))
-            .map(str::trim)
-            .filter(|heading| !heading.is_empty())
+        && let Some(heading) = overview_title(&text)
     {
         *title = heading.to_owned();
     }
@@ -236,6 +237,7 @@ pub(crate) fn changed_artifacts(
                 || old.decisions != new.decisions
                 || old.design != new.design
                 || old.manual_checks != new.manual_checks
+                || old.overview_markdown != new.overview_markdown
         }
         PlanArtifact::Flows => old.flows != new.flows,
         PlanArtifact::Tests => old.tests != new.tests,
@@ -256,9 +258,6 @@ pub(crate) fn changed_artifacts(
 }
 
 /// Holds the result of parsing every authored artifact for one submission.
-///
-/// An authored `# Title` updates the plan title. A headingless overview retains the
-/// title already attached to the plan.
 pub(crate) struct ParsedArtifacts {
     /// Document assembled from the artifacts, complete only when `diagnostic` has no errors.
     pub(crate) document: DesignDocument,
@@ -272,14 +271,8 @@ pub(crate) fn parse_authored(
     design: &DeclarationDesign,
     config: &crate::checks::CheckConfig,
 ) -> Result<ParsedArtifacts> {
-    let text = |artifact: PlanArtifact| -> Result<String> {
-        match design.artifact_text.get(artifact.path()) {
-            Some(text) => Ok(text.clone()),
-            None => render(artifact, title, &design.document),
-        }
-    };
+    let text = |artifact| authored_text(artifact, title, design);
     let mut diagnostic = Vec::new();
-    let mut document = DesignDocument::default();
     let overview = text(PlanArtifact::Overview)?;
     if overview.trim().is_empty() {
         ArtifactReport {
@@ -292,7 +285,18 @@ pub(crate) fn parse_authored(
             "the overview must contain non-whitespace text".into(),
         );
     }
-    parse_overview(&overview, &mut document);
+    let mut document = if design
+        .artifact_text
+        .contains_key(PlanArtifact::Overview.path())
+    {
+        DesignDocument {
+            manual_checks: manual_checks(&overview),
+            overview_markdown: Some(overview),
+            ..DesignDocument::default()
+        }
+    } else {
+        design.document.clone()
+    };
     document.flows = parse_flows(
         &text(PlanArtifact::Flows)?,
         &mut ArtifactReport {
@@ -356,15 +360,8 @@ pub(crate) fn preview_authored(design: &DeclarationDesign) -> DesignDocument {
             .get(artifact.path())
             .map(|text| (text.clone(), artifact.path()))
     };
-    if let Some((text, _)) = parse(PlanArtifact::Overview) {
-        let mut overview = DesignDocument::default();
-        parse_overview(&text, &mut overview);
-        overview.flows = std::mem::take(&mut document.flows);
-        overview.tests = std::mem::take(&mut document.tests);
-        overview.checks = std::mem::take(&mut document.checks);
-        overview.disabled_checks = std::mem::take(&mut document.disabled_checks);
-        overview.test_scopes = std::mem::take(&mut document.test_scopes);
-        document = overview;
+    if let Some(text) = design.artifact_text.get(PlanArtifact::Overview.path()) {
+        document.manual_checks = manual_checks(text);
     }
     if let Some((text, path)) = parse(PlanArtifact::Flows) {
         document.flows = parse_flows(
@@ -412,12 +409,9 @@ pub(crate) fn model_artifacts(
         if artifact == PlanArtifact::Checks && !include_verification {
             continue;
         }
-        let text = match design.artifact_text.get(artifact.path()) {
-            Some(text) => text.clone(),
-            None => render(artifact, title, &design.document)?,
-        };
+        let text = authored_text(artifact, title, design)?;
         let text = if artifact == PlanArtifact::Overview && !include_verification {
-            without_section(&text, MANUAL_CHECKS)
+            without_manual_checks(text)
         } else {
             text
         };
@@ -426,38 +420,20 @@ pub(crate) fn model_artifacts(
     Ok(artifacts)
 }
 
-/// Remove one `##` section and its body, leaving every other line untouched.
-fn without_section(text: &str, heading: &str) -> String {
-    let mut kept = Vec::new();
-    let mut skipping = false;
-    for line in text.lines() {
-        if let Some(name) = line.strip_prefix("## ") {
-            skipping = name.trim().eq_ignore_ascii_case(heading);
-        }
-        if !skipping {
-            kept.push(line);
-        }
-    }
-    let mut result = kept.join("\n");
-    result.push('\n');
-    result
+/// Get the first authored top-level `# Title` heading.
+pub(super) fn overview_title(text: &str) -> Option<&str> {
+    overview_headings(text)
+        .filter(|(level, _)| *level == HeadingLevel::H1)
+        .filter_map(|(_, range)| text[range].lines().next()?.strip_prefix("# "))
+        .map(str::trim)
+        .find(|heading| !heading.is_empty())
 }
 
 /// Names the overview section that lists the manual checks Verify performs.
 const MANUAL_CHECKS: &str = "Manual checks";
 
-const OVERVIEW_SECTIONS: [&str; 7] = [
-    "Objective",
-    "Usage",
-    "Requirements",
-    "Background",
-    "Decisions",
-    "Design",
-    MANUAL_CHECKS,
-];
-
-/// Render the title and every overview section, including empty ones, in a fixed order.
-fn overview_text(title: &str, document: &DesignDocument) -> String {
+/// Recreate the overview artifact of a revision that predates stored overview Markdown.
+fn legacy_overview_text(title: &str, document: &DesignDocument) -> String {
     let mut text = format!("# {title}\n");
     for (heading, body) in [
         ("Objective", document.objective.clone()),
@@ -499,92 +475,94 @@ fn list_text(items: &[String]) -> String {
         .join("\n")
 }
 
-/// Project familiar headings for review and execution. Carry other narrative into Design.
-fn parse_overview(text: &str, document: &mut DesignDocument) {
-    let mut section = "";
-    let mut fenced = false;
-    let mut sections = BTreeMap::<&str, Vec<&str>>::new();
-    let mut narrative = Vec::new();
-    for line in text.lines() {
-        if !fenced {
-            if let Some(heading) = line.strip_prefix("## ") {
-                section = OVERVIEW_SECTIONS
-                    .iter()
-                    .copied()
-                    .find(|name| name.eq_ignore_ascii_case(heading.trim()))
-                    .unwrap_or("");
-                if !section.is_empty() {
-                    continue;
+/// Locate top-level headings with the Markdown parser so code and quotes stay narrative.
+fn overview_headings(text: &str) -> impl Iterator<Item = (HeadingLevel, Range<usize>)> + '_ {
+    let mut depth = 0usize;
+    Parser::new(text)
+        .into_offset_iter()
+        .filter_map(move |(event, range)| match event {
+            Event::Start(tag) => {
+                let top_level = depth == 0;
+                depth += 1;
+                match tag {
+                    Tag::Heading { level, .. } if top_level => Some((level, range)),
+                    _ => None,
                 }
-            } else if line.starts_with("# ")
-                && section.is_empty()
-                && narrative.iter().all(|line: &&str| line.trim().is_empty())
-            {
-                continue;
             }
+            Event::End(_) => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        })
+}
+
+/// Locate each Manual checks heading and its body up to the next peer or parent heading.
+fn manual_check_sections(text: &str) -> Vec<Range<usize>> {
+    let mut sections = Vec::new();
+    let mut start = None;
+    for (level, heading) in overview_headings(text) {
+        if !matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+            continue;
         }
-        if line.trim_start().starts_with("```") {
-            fenced = !fenced;
+        if let Some(previous) = start.take() {
+            sections.push(previous..heading.start);
         }
-        if section.is_empty() {
-            narrative.push(line);
-        } else {
-            sections.entry(section).or_default().push(line);
+        if level == HeadingLevel::H2
+            && text[heading.clone()]
+                .lines()
+                .next()
+                .and_then(|line| line.trim_start().strip_prefix("## "))
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(MANUAL_CHECKS))
+        {
+            start = Some(heading.start);
         }
     }
-    for (name, lines) in sections {
-        let body = lines.join("\n").trim_matches('\n').to_owned();
-        match name {
-            "Objective" => document.objective = body,
-            "Usage" => document.usage = Some(body).filter(|s| !s.trim().is_empty()),
-            "Background" => document.background = body,
-            "Design" => document.design = body,
-            _ => {
-                let mut items = Vec::<String>::new();
-                for line in lines {
-                    if let Some(item) = line.strip_prefix("- ") {
-                        items.push(item.to_owned());
-                    } else if let Some(rest) = line.strip_prefix("  ")
-                        && let Some(item) = items.last_mut()
+    if let Some(start) = start {
+        sections.push(start..text.len());
+    }
+    sections
+}
+
+/// Extract top-level dash-list items as Verify actions, preserving indented continuations.
+pub(super) fn manual_checks(text: &str) -> Vec<String> {
+    let mut checks = Vec::new();
+    for section in manual_check_sections(text) {
+        let mut depth = 0usize;
+        let section = &text[section];
+        for (event, range) in Parser::new(section).into_offset_iter() {
+            match event {
+                Event::Start(tag) => {
+                    if depth == 1
+                        && matches!(tag, Tag::Item)
+                        && let Some(item) = section[range].strip_prefix("- ")
                     {
-                        item.push('\n');
-                        item.push_str(rest);
-                    } else if !line.trim().is_empty() {
-                        narrative.push(line);
-                    }
-                }
-                for item in items.into_iter().filter(|s| !s.trim().is_empty()) {
-                    match name {
-                        "Requirements" => document.requirements.push(item),
-                        "Decisions" => {
-                            if let Some((choice, rationale)) =
-                                item.strip_prefix("**").and_then(|s| s.split_once("**"))
-                            {
-                                document.decisions.push(DesignDecision {
-                                    decision: choice.trim().into(),
-                                    rationale: rationale.trim().into(),
-                                });
-                            } else {
-                                document.decisions.push(DesignDecision {
-                                    decision: item,
-                                    rationale: String::new(),
-                                });
-                            }
+                        let mut lines = item.lines();
+                        let mut action = lines.next().unwrap_or_default().to_owned();
+                        for line in lines.filter_map(|line| line.strip_prefix("  ")) {
+                            action.push('\n');
+                            action.push_str(line);
                         }
-                        MANUAL_CHECKS => document.manual_checks.push(item),
-                        _ => unreachable!(),
+                        if !action.trim().is_empty() {
+                            checks.push(action);
+                        }
                     }
+                    depth += 1;
                 }
+                Event::End(_) => depth -= 1,
+                _ => {}
             }
         }
     }
-    let extra = narrative.join("\n");
-    if !extra.trim().is_empty() {
-        if !document.design.is_empty() {
-            document.design.push_str("\n\n");
-        }
-        document.design.push_str(extra.trim_matches('\n'));
+    checks
+}
+
+/// Remove Verify instructions while preserving every other byte of the overview.
+fn without_manual_checks(mut text: String) -> String {
+    for section in manual_check_sections(&text).into_iter().rev() {
+        text.replace_range(section, "");
     }
+    text
 }
 
 /// Join section lines verbatim after removing blank lines at either edge.
@@ -986,26 +964,6 @@ fn parse_checks(
 mod test {
     use super::*;
 
-    fn sample_document() -> DesignDocument {
-        DesignDocument {
-            objective: "Expand the prototype.".into(),
-            usage: Some("```sh\ncargo run\n```".into()),
-            requirements: vec!["Use four systems.".into(), "Keep it\nsmall.".into()],
-            background: "A minimal Bevy app.".into(),
-            decisions: vec![DesignDecision {
-                decision: "Keep one file.".into(),
-                rationale: "The prototype is small.".into(),
-            }],
-            design: "Plain prose.\n\n```text\n## Not a section inside a fence\n```".into(),
-            flows: String::new(),
-            manual_checks: vec!["Run the game.".into()],
-            tests: Vec::new(),
-            checks: Vec::new(),
-            disabled_checks: Vec::new(),
-            test_scopes: BTreeMap::new(),
-        }
-    }
-
     fn report(diagnostic: &mut Vec<DeclarationDiagnostic>) -> ArtifactReport<'_> {
         ArtifactReport {
             path: "plan:test.md",
@@ -1020,29 +978,20 @@ mod test {
             .collect()
     }
 
-    /// A rendered overview parses back to the same document without diagnostics.
+    /// Keep headings and list items in examples out of the Verify checklist.
     #[test]
-    fn overview_round_trips() {
-        let document = sample_document();
-        let text = overview_text("Neon Salvager", &document);
-        assert!(text.contains("## Manual checks\n- Run the game."));
-        let mut parsed = DesignDocument::default();
-        parse_overview(&text, &mut parsed);
-        assert_eq!(parsed, document);
-    }
-
-    #[test]
-    fn freeform_overview_keeps_narrative_and_manual_actions() {
-        let mut document = DesignDocument::default();
-        parse_overview(
-            "A free-form plan.\n## Notes\nKeep this section.\n## Manual checks\n- Open the view.",
-            &mut document,
-        );
+    fn overview_extracts_only_authored_manual_actions() {
+        let example = "~~~markdown\n# Example title\n## Manual checks\n- Sample item.\n~~~\n\n";
+        let narrative = "# Plan title\n\nA free-form plan.\n";
+        let checks = "## Manual checks\n- Open the view.\n  Confirm the title.\n\n```text\n- Sample item.\n```\n\n";
+        let following = "## Notes\nKeep this section.";
+        let text = format!("{example}{narrative}{checks}{following}");
+        assert_eq!(overview_title(&text), Some("Plan title"));
+        assert_eq!(manual_checks(&text), ["Open the view.\nConfirm the title."]);
         assert_eq!(
-            document.design,
-            "A free-form plan.\n## Notes\nKeep this section."
+            without_manual_checks(text),
+            format!("{example}{narrative}{following}")
         );
-        assert_eq!(document.manual_checks, ["Open the view."]);
     }
 
     /// Flow Markdown is kept exactly as written, with no diagnostics for a well-formed flow.

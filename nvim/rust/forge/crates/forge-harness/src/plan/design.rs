@@ -76,8 +76,8 @@ pub struct DeclarationDesign {
     #[serde(default)]
     pub document: DesignDocument,
     /// Holds the agent's text for each authored `plan:` artifact it has edited, keyed by
-    /// artifact path. Submission parses this text into `document`; an artifact without an
-    /// entry renders from `document`.
+    /// artifact path. Submission saves the accepted overview and derives execution inputs in
+    /// `document`. An artifact without an entry renders from `document`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub artifact_text: BTreeMap<String, String>,
     #[serde(default = "default_line_width")]

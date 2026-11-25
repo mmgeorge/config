@@ -22,6 +22,7 @@ hex = { workspace = true }
 jsonschema = { workspace = true }
 nextest-metadata = { workspace = true }
 process-wrap = { workspace = true, features = ["tokio1", "job-object", "kill-on-drop", "process-group", "creation-flags"] }
+pulldown-cmark = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled"] }
 schemars = { workspace = true }

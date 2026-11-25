@@ -1006,6 +1006,7 @@ dependencies = [
  "junction",
  "nextest-metadata",
  "process-wrap",
+ "pulldown-cmark",
  "regex",
  "reqwest",
  "rusqlite",

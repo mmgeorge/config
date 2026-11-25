@@ -991,7 +991,19 @@ impl PlanReferenceIndex {
             }
         };
         let rename = |text: &mut String| rewrite(text, NarrativeText::Prose);
+        if let Some(markdown) = design
+            .artifact_text
+            .get_mut(super::design_artifact::PlanArtifact::Overview.path())
+        {
+            rename(markdown);
+        }
         let narrative = &mut design.document;
+        if let Some(markdown) = &mut narrative.overview_markdown {
+            rename(markdown);
+            narrative.manual_checks = super::design_artifact::manual_checks(markdown);
+        } else {
+            narrative.manual_checks.iter_mut().for_each(rename);
+        }
         rename(&mut narrative.objective);
         narrative.usage.iter_mut().for_each(rename);
         narrative.requirements.iter_mut().for_each(rename);
@@ -1002,7 +1014,6 @@ impl PlanReferenceIndex {
         }
         rename(&mut narrative.design);
         rename(&mut narrative.flows);
-        narrative.manual_checks.iter_mut().for_each(rename);
         narrative
             .tests
             .iter_mut()
@@ -1017,8 +1028,7 @@ impl PlanReferenceIndex {
         ) {
             if matches!(
                 artifact,
-                super::design_artifact::PlanArtifact::Overview
-                    | super::design_artifact::PlanArtifact::Flows
+                super::design_artifact::PlanArtifact::Flows
                     | super::design_artifact::PlanArtifact::Tests
             ) {
                 super::design_artifact::revert_authored(artifact, &mut design);

@@ -76,7 +76,6 @@ fn status_text(document: &PlanDocument, execution: Option<&Value>) -> Result<Str
         .as_ref()
         .context("plan has no semantic structure")?;
     let preview = crate::plan::preview_authored(design);
-    let overview = &preview;
     let mut text = match execution {
         Some(state) => format!(
             "Plan {} · {} · revision {}\n",
@@ -89,33 +88,42 @@ fn status_text(document: &PlanDocument, execution: Option<&Value>) -> Result<Str
             document.plan_id, document.version
         ),
     };
-    let overview_state = if [&overview.objective, &overview.background, &overview.design]
-        .iter()
-        .all(|text| text.trim().is_empty())
-        && overview.usage.is_none()
-        && overview.requirements.is_empty()
-        && overview.decisions.is_empty()
-        && overview.manual_checks.is_empty()
-    {
+    let overview_written = design
+        .artifact_text
+        .get(PlanArtifact::Overview.path())
+        .or(preview.overview_markdown.as_ref())
+        .map_or_else(
+            || {
+                [&preview.objective, &preview.background, &preview.design]
+                    .iter()
+                    .any(|text| !text.trim().is_empty())
+                    || preview.usage.is_some()
+                    || !preview.requirements.is_empty()
+                    || !preview.decisions.is_empty()
+                    || !preview.manual_checks.is_empty()
+            },
+            |markdown| !markdown.trim().is_empty(),
+        );
+    let overview_state = if !overview_written {
         "empty".to_owned()
     } else {
         "written".to_owned()
     };
-    let flows_state = count(crate::plan::flow_count(&overview.flows), "flow", "flows");
-    let test_count = overview.tests.iter().map(|file| file.cases.len()).sum();
+    let flows_state = count(crate::plan::flow_count(&preview.flows), "flow", "flows");
+    let test_count = preview.tests.iter().map(|file| file.cases.len()).sum();
     let tests_state = if test_count == 0 {
         "empty".to_owned()
     } else {
         format!(
             "{} in {}",
             count(test_count, "test", "tests"),
-            count(overview.tests.len(), "file", "files")
+            count(preview.tests.len(), "file", "files")
         )
     };
-    let checks_state = if overview.checks.is_empty() {
+    let checks_state = if preview.checks.is_empty() {
         "no additional checks selected".to_owned()
     } else {
-        format!("{} selected", overview.checks.join(", "))
+        format!("{} selected", preview.checks.join(", "))
     };
     let mut rows = vec![
         (PlanArtifact::Overview, overview_state),
@@ -156,11 +164,7 @@ fn status_text(document: &PlanDocument, execution: Option<&Value>) -> Result<Str
             PlanArtifact::Verification,
             format!(
                 "{access} · {draft} · {}",
-                count(
-                    overview.manual_checks.len(),
-                    "manual check",
-                    "manual checks"
-                )
+                count(preview.manual_checks.len(), "manual check", "manual checks")
             ),
         ));
     }

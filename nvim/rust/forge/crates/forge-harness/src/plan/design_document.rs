@@ -20,6 +20,9 @@ pub enum PlanTestScope {
 #[serde(deny_unknown_fields)]
 /// Owns the reviewed intent and implementation guidance that the `plan:` artifacts project.
 pub struct DesignDocument {
+    /// Submitted overview Markdown. Older revisions carry their narrative in the fields below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview_markdown: Option<String>,
     /// States the requested outcome and scope.
     pub objective: String,
     /// Illustrates successful use when an observable interaction clarifies the change.
@@ -145,6 +148,47 @@ impl DesignDocument {
 
     /// Projects metadata into one shared order for review, revision diffs, and section reads.
     pub(crate) fn sections(&self) -> Vec<DesignSection> {
+        let mut sections = match &self.overview_markdown {
+            Some(markdown) => vec![DesignSection {
+                path: "overview_markdown",
+                title: "Overview",
+                section: PlanSection::Overview,
+                text: markdown.clone(),
+            }],
+            None => self.legacy_overview_sections(),
+        };
+        sections.extend([
+            DesignSection {
+                path: "flows",
+                title: "Flows",
+                section: PlanSection::Flows,
+                text: self.flows.trim_end_matches('\n').to_owned(),
+            },
+            DesignSection {
+                path: "tests",
+                title: "Tests",
+                section: PlanSection::Tests,
+                text: super::design_tests::text(&self.tests),
+            },
+        ]);
+        if self.overview_markdown.is_none() {
+            sections.push(DesignSection {
+                path: "verification",
+                title: "Verification",
+                section: PlanSection::ManualVerification,
+                text: self
+                    .manual_checks
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            });
+        }
+        sections
+    }
+
+    /// Project the fixed narrative fields of a revision saved before authored overview rendering.
+    fn legacy_overview_sections(&self) -> Vec<DesignSection> {
         vec![
             DesignSection {
                 path: "objective",
@@ -205,29 +249,6 @@ impl DesignDocument {
                 title: "Design",
                 section: PlanSection::Design,
                 text: self.design.clone(),
-            },
-            DesignSection {
-                path: "flows",
-                title: "Flows",
-                section: PlanSection::Flows,
-                text: self.flows.trim_end_matches('\n').to_owned(),
-            },
-            DesignSection {
-                path: "tests",
-                title: "Tests",
-                section: PlanSection::Tests,
-                text: super::design_tests::text(&self.tests),
-            },
-            DesignSection {
-                path: "verification",
-                title: "Verification",
-                section: PlanSection::ManualVerification,
-                text: self
-                    .manual_checks
-                    .iter()
-                    .map(|item| format!("- {item}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
             },
         ]
     }

@@ -1,6 +1,8 @@
 return {
   {
     'MeanderingProgrammer/render-markdown.nvim',
+    -- Forge's wrapped-table layout depends on render-markdown internals at this revision.
+    commit = 'a67f826164c38c836fc6060f32b275c4c43317a7',
     build = function()
       local dependency = require('markdown_math.dependency')
       local result = vim.system(dependency.install_command(), { text = true, stdout = true, stderr = true }):wait()
