@@ -11,6 +11,7 @@ import {
 
 const altLayer = 'kanata_alt'
 const numpadLayer = 'kanata_numpad'
+const caretNumpadLayer = 'kanata_caret_numpad'
 
 const terminalBundleIdentifiers = [
   '^com\\.github\\.wez\\.wezterm$',
@@ -86,23 +87,24 @@ function controlShortcuts(
 }
 
 const symbolMapping: ReadonlyArray<readonly [FromKeyParam, ToKeyParam, ModifierParam?]> = [
-  ['w', 'page_up'], ['e', 'page_down'], ['r', 'grave_accent_and_tilde', 'left_shift'],
+  ['1', 'f1'], ['2', 'f2'], ['3', 'f3'], ['4', 'f4'], ['5', 'f5'],
+  ['9', ',', 'left_shift'], ['0', '.', 'left_shift'],
+  ['q', 'home'], ['w', 'page_up'], ['e', 'page_down'], ['r', 'end'],
   ['a', 'left_arrow'], ['s', 'up_arrow'], ['d', 'down_arrow'], ['f', 'right_arrow'],
   ['y', '5', 'left_shift'], ['u', '7', 'left_shift'], ['i', '-'],
   ['o', '8', 'left_shift'], ['p', '=', 'left_shift'],
   ['h', '1', 'left_shift'], ['j', 'tab'], ['k', 'delete_or_backspace'],
   ['l', '9', 'left_shift'], [';', '0', 'left_shift'],
-  ['z', '2', 'left_shift'], ['x', '3', 'left_shift'],
-  ['c', 'grave_accent_and_tilde'], ['v', 'grave_accent_and_tilde'],
-  ['b', '6', 'left_shift'], ['n', '4', 'left_shift'], ['m', '-', 'left_shift'],
+  ['z', '2', 'left_shift'], ['x', 'grave_accent_and_tilde'], ['v', '3', 'left_shift'],
+  ['b', 'grave_accent_and_tilde', 'left_shift'], ['n', '4', 'left_shift'], ['m', '-', 'left_shift'],
   [',', '='], ['.', '[', 'left_shift'], ['/', ']', 'left_shift'],
 ]
 
-const numpadMapping: ReadonlyArray<readonly [FromKeyParam, ToKeyParam, ModifierParam?]> = [
-  ['y', '='], ['u', '7'], ['i', '8'], ['o', '9'], ['p', '-'],
-  ['h', ','], ['j', '4'], ['k', '5'], ['l', '6'], [';', '=', 'left_shift'],
-  ['n', '.'], ['m', '1'], [',', '2'], ['.', '3'], ['/', '/'],
-  ['spacebar', '0'],
+const numpadMapping: ReadonlyArray<readonly [FromKeyParam, ToKeyParam]> = [
+  ['y', '='], ['u', '7'], ['i', '8'], ['o', '9'], ['p', '='],
+  ['h', ','], ['j', '4'], ['k', '5'], ['l', '6'], [';', ','],
+  ['n', '.'], ['m', '1'], [',', '2'], ['.', '3'], ['/', '.'],
+  ['spacebar', '0'], ['return_or_enter', 'spacebar'],
 ]
 
 export const karabinerRules = [
@@ -113,6 +115,7 @@ export const karabinerRules = [
         .toAfterKeyUp([
           { set_variable: { name: altLayer, value: 0 } },
           { set_variable: { name: numpadLayer, value: 0 } },
+          { set_variable: { name: caretNumpadLayer, value: 0 } },
         ]),
     ]),
   ]),
@@ -133,11 +136,27 @@ export const karabinerRules = [
     ]),
   ]),
 
+  rule('Laptop Command + C - tap caret, hold numpad').manipulators([
+    laptopCondition([
+      withCondition(ifVar(altLayer, 1))([
+        // Activate on key-down so a fast chord uses the numpad. A chord cancels the caret tap.
+        map('c', '', 'any')
+          .toVar(caretNumpadLayer, 1)
+          .toIfAlone('6', 'left_shift')
+          .toAfterKeyUp({ set_variable: { name: caretNumpadLayer, value: 0 } })
+          .parameters({ 'basic.to_if_alone_timeout_milliseconds': 150 }),
+      ]),
+    ]),
+  ]),
+
   rule('Laptop numpad').manipulators([
     laptopCondition([
-      withCondition(ifVar(altLayer, 1), ifVar(numpadLayer, 1))(
-        numpadMapping.map(([physicalKey, outputKey, modifiers]) =>
-          map(physicalKey, '', 'any').to(outputKey, modifiers),
+      // Each trigger owns its state so releasing one leaves the other active.
+      ...[numpadLayer, caretNumpadLayer].flatMap(triggerLayer =>
+        withCondition(ifVar(altLayer, 1), ifVar(triggerLayer, 1))(
+          numpadMapping.map(([physicalKey, outputKey]) =>
+            map(physicalKey, '', 'any').to(outputKey),
+          ),
         ),
       ),
     ]),
@@ -148,9 +167,6 @@ export const karabinerRules = [
       withCondition(ifVar(altLayer, 1))([
         map('s', 'shift', 'any').to('s', ['left_option', 'left_shift']),
         map('d', 'shift', 'any').to('t', ['left_option', 'left_shift']),
-        ...(['q', 't', 'g'] as const).map(physicalKey =>
-          map(physicalKey, '', 'any').toNone(),
-        ),
         ...symbolMapping.map(([physicalKey, outputKey, modifiers]) =>
           map(physicalKey, '', 'any').to(outputKey, modifiers),
         ),

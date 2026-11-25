@@ -146,13 +146,14 @@ test('Left Option provides native Command chords without activating the symbol l
   assert.deepEqual(optionMappings, [selected])
 })
 
-test('Command and Caps Lock set held layers and release their state', () => {
+test('Command and both numpad triggers release their own state', () => {
   const command = mapping('Laptop left Command - symbol/navigation layer', 'left_command')
   assertJsonEqual(command.from.modifiers, { optional: ['any'] })
   assertJsonEqual(command.to, [{ set_variable: { name: 'kanata_alt', value: 1 } }])
   assertJsonEqual(command.to_after_key_up, [
     { set_variable: { name: 'kanata_alt', value: 0 } },
     { set_variable: { name: 'kanata_numpad', value: 0 } },
+    { set_variable: { name: 'kanata_caret_numpad', value: 0 } },
   ])
   const numpad = mapping('Laptop Command + Caps Lock - numpad layer', 'caps_lock')
   assertJsonEqual(numpad.to, [{ set_variable: { name: 'kanata_numpad', value: 1 } }])
@@ -162,20 +163,30 @@ test('Command and Caps Lock set held layers and release their state', () => {
   assert.ok(numpad.conditions?.some(condition =>
     condition.type === 'variable_if' && condition.name === 'kanata_alt' && condition.value === 1,
   ))
+  const caret = mapping('Laptop Command + C - tap caret, hold numpad', 'c')
+  assertJsonEqual(caret.to, [{ set_variable: { name: 'kanata_caret_numpad', value: 1 } }])
+  assertJsonEqual(caret.to_if_alone, [{ key_code: '6', modifiers: ['left_shift'] }])
+  assertJsonEqual(caret.to_after_key_up, [
+    { set_variable: { name: 'kanata_caret_numpad', value: 0 } },
+  ])
+  assertJsonEqual(caret.parameters, { 'basic.to_if_alone_timeout_milliseconds': 150 })
+  assert.ok(caret.conditions?.some(condition =>
+    condition.type === 'variable_if' && condition.name === 'kanata_alt' && condition.value === 1,
+  ))
 })
 
 test('Symbol and navigation outputs match Kanata, with macOS application switching', () => {
   const expected: Array<[string, string, string?]> = [
-    ['q', 'vk_none'], ['w', 'page_up'], ['e', 'page_down'],
-    ['r', 'grave_accent_and_tilde', 'left_shift'], ['t', 'vk_none'],
+    ['1', 'f1'], ['2', 'f2'], ['3', 'f3'], ['4', 'f4'], ['5', 'f5'],
+    ['9', 'comma', 'left_shift'], ['0', 'period', 'left_shift'],
+    ['q', 'home'], ['w', 'page_up'], ['e', 'page_down'], ['r', 'end'],
     ['y', '5', 'left_shift'], ['u', '7', 'left_shift'], ['i', 'hyphen'],
     ['o', '8', 'left_shift'], ['p', 'equal_sign', 'left_shift'],
     ['a', 'left_arrow'], ['s', 'up_arrow'], ['d', 'down_arrow'], ['f', 'right_arrow'],
-    ['g', 'vk_none'], ['h', '1', 'left_shift'], ['j', 'tab'], ['k', 'delete_or_backspace'],
+    ['h', '1', 'left_shift'], ['j', 'tab'], ['k', 'delete_or_backspace'],
     ['l', '9', 'left_shift'], ['semicolon', '0', 'left_shift'],
-    ['z', '2', 'left_shift'], ['x', '3', 'left_shift'],
-    ['c', 'grave_accent_and_tilde'], ['v', 'grave_accent_and_tilde'],
-    ['b', '6', 'left_shift'], ['n', '4', 'left_shift'], ['m', 'hyphen', 'left_shift'],
+    ['z', '2', 'left_shift'], ['x', 'grave_accent_and_tilde'], ['v', '3', 'left_shift'],
+    ['b', 'grave_accent_and_tilde', 'left_shift'], ['n', '4', 'left_shift'], ['m', 'hyphen', 'left_shift'],
     ['comma', 'equal_sign'], ['period', 'open_bracket', 'left_shift'],
     ['slash', 'close_bracket', 'left_shift'], ['tab', 'tab', 'left_command'],
   ]
@@ -195,27 +206,36 @@ test('Symbol and navigation outputs match Kanata, with macOS application switchi
       [{ key_code: outputKey, modifiers: ['left_option', 'left_shift'] }],
     )
   }
+  const symbols = modifications.rules.find(candidate => candidate.description === 'Laptop symbols and navigation')
+  assert.ok(symbols)
+  assert.ok(symbols.manipulators.every(candidate =>
+    candidate.type === 'basic' && 'key_code' in candidate.from
+    && !['t', 'g'].includes(String(candidate.from.key_code)),
+  ))
 })
 
-test('Numpad overrides symbols only while both layer keys are held', () => {
-  const expected: Array<[string, string, string?]> = [
-    ['y', 'equal_sign'], ['u', '7'], ['i', '8'], ['o', '9'], ['p', 'hyphen'],
-    ['h', 'comma'], ['j', '4'], ['k', '5'], ['l', '6'], ['semicolon', 'equal_sign', 'left_shift'],
-    ['n', 'period'], ['m', '1'], ['comma', '2'], ['period', '3'], ['slash', 'slash'],
-    ['spacebar', '0'],
+test('Numpad overrides symbols with Command and either trigger held', () => {
+  const expected = [
+    ['y', 'equal_sign'], ['u', '7'], ['i', '8'], ['o', '9'], ['p', 'equal_sign'],
+    ['h', 'comma'], ['j', '4'], ['k', '5'], ['l', '6'], ['semicolon', 'comma'],
+    ['n', 'period'], ['m', '1'], ['comma', '2'], ['period', '3'], ['slash', 'period'],
+    ['spacebar', '0'], ['return_or_enter', 'spacebar'],
   ]
-  for (const [physicalKey, outputKey, modifier] of expected) {
-    const selected = mapping('Laptop numpad', physicalKey)
-    assertJsonEqual(
-      selected.to,
-      [{ key_code: outputKey, ...(modifier ? { modifiers: [modifier] } : {}) }],
+  const numpad = modifications.rules.find(candidate => candidate.description === 'Laptop numpad')
+  assert.ok(numpad)
+  for (const [physicalKey, outputKey] of expected) {
+    const selected = numpad.manipulators.filter((candidate): candidate is BasicManipulator =>
+      candidate.type === 'basic' && 'key_code' in candidate.from && candidate.from.key_code === physicalKey,
     )
+    assertJsonEqual(selected.map(candidate => candidate.to), [
+      [{ key_code: outputKey }], [{ key_code: outputKey }],
+    ])
     assertJsonEqual(
-      selected.conditions?.filter(condition => condition.type === 'variable_if'),
-      [
+      selected.map(candidate => candidate.conditions?.filter(condition => condition.type === 'variable_if')),
+      ['kanata_numpad', 'kanata_caret_numpad'].map(trigger => [
         { type: 'variable_if', name: 'kanata_alt', value: 1 },
-        { type: 'variable_if', name: 'kanata_numpad', value: 1 },
-      ],
+        { type: 'variable_if', name: trigger, value: 1 },
+      ]),
     )
   }
   const descriptions = modifications.rules.map(selectedRule => selectedRule.description)
