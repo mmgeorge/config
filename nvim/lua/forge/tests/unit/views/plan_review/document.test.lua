@@ -32,6 +32,79 @@ local function expand_saved_threads(owner, buffer)
   end
 end
 
+T["file expansion waits for the body and a second toggle cancels it"] = function()
+  local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
+  local client = require("forge.client")
+  local nodes = require("forge.nodes")
+  client.host_get_generation = function() return 1 end
+  client.host_is_accepting = function() return true end
+
+  for _, cancel_expansion in ipairs({ false, true }) do
+    local requests = {}
+    client.request = function(specification, callback)
+      if specification.method ~= "session.document" then return end
+      requests[#requests + 1] = { params = specification.params, callback = encode_delivery(callback) }
+    end
+    local buffer = buffer_support.scratch(nil, { name = vim.fn.tempname() .. ".md" })
+    vim.api.nvim_win_set_buf(0, buffer)
+    local window = vim.api.nvim_get_current_win()
+    local owner = require("forge.views.plan_review.document").attach({
+      session_id = "session", buffer = buffer, window = window,
+      plan = { id = "expansion-" .. tostring(cancel_expansion), review_digest = "canonical" }, notice = error,
+    }, function(_, failure) assert(not failure, failure) end)
+    MiniTest.finally(function()
+      owner.close(true)
+      pcall(vim.api.nvim_buf_delete, buffer, { force = true })
+    end)
+
+    local file = "plan:design:file:example"
+    local deferred = file .. ":hunk:deferred"
+    local body = file .. ":hunk:body"
+    local function delivery(revision, body_block, body_text)
+      local heading = { id = file, text = { "example.rs" }, metadata = { target = {}, decoration = {}, editable_region = {}, fold = {
+        { id = file, closed = true, start = { row = 0, column = 0 },
+          ["end"] = { block = body_block, position = { row = 1, column = 0 } } },
+      } } }
+      local blocks = { heading,
+        { id = body_block, text = { body_text }, metadata = { target = {}, decoration = {}, editable_region = {} } },
+        { id = "plan:next", text = { "Next file" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
+      }
+      local source_row = {}
+      for index, block in ipairs(blocks) do
+        source_row[index] = { block = block.id, position = { row = 0 }, source_line = index }
+      end
+      return { saved_source_digest = "saved", annotation = {}, source_row = source_row,
+        snapshot = { document = owner.document, revision = revision, block = blocks } }
+    end
+    requests[1].callback(delivery(0, deferred, ""))
+    local collapsed = { "example.rs", "Next file" }
+    local expanded = { "example.rs", "fn example() {}", "Next file" }
+    eq(buffer_support.lines(buffer), collapsed)
+
+    assert(nodes.toggle_heading(owner.replica, window))
+    eq(requests[2].params.operation, "plan_body")
+    eq(requests[2].params.file, file)
+    eq(buffer_support.lines(buffer), collapsed)
+    if cancel_expansion then
+      assert(nodes.toggle_heading(owner.replica, window))
+      eq(#requests, 2)
+      eq(buffer_support.lines(buffer), collapsed)
+    end
+
+    vim.api.nvim_win_set_cursor(window, { 2, 3 })
+    requests[2].callback(delivery(1, body, "fn example() {}"))
+    eq(buffer_support.lines(buffer), cancel_expansion and collapsed or expanded)
+    eq(vim.api.nvim_win_get_cursor(window), { cancel_expansion and 2 or 3, 3 })
+    if cancel_expansion then
+      vim.api.nvim_win_set_cursor(window, { 1, 0 })
+      assert(nodes.toggle_heading(owner.replica, window))
+      eq(buffer_support.lines(buffer), expanded)
+      eq(#requests, 2)
+    end
+    owner.close(true)
+  end
+end
+
 T["document"] = function()
   local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
   local client = require("forge.client")

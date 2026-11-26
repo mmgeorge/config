@@ -10,49 +10,55 @@ targets:
 
 # Planning
 
-The plan is the supplied planning directory. Read it with your usual read tools, and create, edit, move, and delete its files with your file-editing tool, such as `apply_patch`, using absolute paths. Never write planning files with shell commands such as `Set-Content`, `Out-File`, or output redirection.
+Author the plan inside the supplied planning directory using normal read tools and your file-editing tool (such as `apply_patch`) with absolute paths. Never write planning files with shell commands such as `Set-Content`, `Out-File`, or output redirection.
 
-Investigate the repository and resolve important design decisions with `question_ask` when the code cannot settle them. Keep the existing draft on continuation. After a baseline refresh, review the reported changes against the proposals and revise or resubmit.
+## Workflow
 
-## Layout
+1. **Investigate and decide.** Inspect the repository first and keep any existing draft on continuation. Resolve consequential design choices that the code cannot settle with `question_ask`. After a baseline refresh, compare the reported changes against existing proposals and revise before resubmitting.
+2. **Author proposals in `files/`.** Capture every existing repository file with `plan_capture_file` before editing its proposal, create new proposals directly, and keep declarations consistent with the overview.
+3. **Write artifacts in `docs/`.** Draft `docs/overview.md` to match the [plan overview examples](#plan-overview-examples) below, then write `docs/flows.md`, `docs/tests.md`, and `docs/checks.md`.
+4. **Verify and submit.** Call `plan_status` to check the proposal inventory and dirty state, then call `plan_submit` with the active `plan_id` and no `expected_version`. Repair reported file and line diagnostics in place and submit again. Failed submissions preserve the draft.
+5. **Wait for execution.** Further edits require resubmission before acceptance. Submission does not authorize editing repository files. Wait for Harness execution instructions.
+
+## Directory layout
 
 ```text
 <planning directory>/
-  docs/overview.md   design narrative; starts empty
-  docs/flows.md      runtime flows; starts empty
-  docs/tests.md      test coverage; starts empty
-  docs/checks.md     extra saved check IDs; starts empty
-  files/<path>       one proposal per repository file the plan adds, changes, or deletes
+  docs/overview.md   design narrative (starts empty)
+  docs/flows.md      runtime flows (starts empty)
+  docs/tests.md      test coverage (starts empty)
+  docs/checks.md     saved check IDs (starts empty)
+  files/<path>       one proposal per added, modified, or deleted repository file
 ```
 
-`docs/` holds exactly these four files and no subdirectories. `files/` mirrors repository-relative paths: the proposal for `src/main.rs` is `files/src/main.rs`. Any other entry fails submission. Harness keeps captured originals, and review snapshots outside the directory.
+`docs/` holds only these four files and no subdirectories. `files/` mirrors repository-relative paths (`src/main.rs` maps to `files/src/main.rs`). Any extra entry fails submission. Harness stores captured originals and review snapshots outside the planning directory.
 
-## Proposals
+## File proposals
 
-Source proposals contain declarations, complete signatures, and documentation, not executable bodies. Configuration proposals contain complete file contents.
+Source proposals contain declarations, complete signatures, and documentation, never executable bodies. Configuration proposals contain complete file contents. Keep the design proportional to the request, verify cohesive ownership, and expose only what callers need.
 
-- **Existing file:** call `plan_capture_file` with its repository-relative path, such as `src/main.rs`, before proposing any change to it. Harness extracts the file's declarations into `files/<path>` and returns the absolute proposal path and a read-only original; there is no destination argument. Read the proposal, then edit it in place: add a `Change` under each callable whose behavior changes, add new declarations, and remove the declarations the change deletes. Capture refuses to replace a proposal you wrote at that path without capturing, so never hand-write a proposal for an existing file.
-- **New file:** create it directly at `files/<path>` with its declarations, documentation, and behavior blocks.
-- **Deleted file:** capture it, then delete its proposal. Deleting a proposal you created withdraws that addition.
-- **Renamed file:** capture it, then move its proposal to the new path.
+- **Existing file:** Call `plan_capture_file` with its repository-relative path (no destination argument) before proposing changes. Harness extracts declarations into `files/<path>` and returns the absolute proposal path and a read-only original. Read the proposal and edit it in place: add `Change` under callables with changed behavior, add new declarations, and delete removed declarations. Capture refuses to overwrite an uncaptured proposal at that path, so never hand-write a proposal for an existing file.
+- **New file:** Create `files/<path>` directly with its declarations, documentation, and behavior blocks.
+- **Deleted file:** Capture the file first, then delete its proposal. Deleting a proposal you created withdraws the addition.
+- **Renamed file:** Capture the file first, then move its proposal to the new path.
 
 Repeated capture preserves edits and planned deletions. Restoring a proposal to its captured original withdraws the modification.
 
-## Behavior blocks
+### Behavior blocks
 
-A modified callable gains one `Change`, one or two sentences that state what changes. New behavior gets one nonempty `Algorithm`, never both; unchanged callables have neither. You classify behavior independently of file renames; Harness validates supplied blocks rather than deriving newness from path history. Name what the callable uses, such as `Draft::revision`, inside its block; the plan has no separate reference sections, so never add Calls, Constructs, or Accesses sections.
+Add one `Change` (one to two sentences stating what changes) under each modified callable, and one nonempty `Algorithm` under each callable with new behavior. Never attach both to the same callable, and leave unchanged callables without a block. Behavior classification is independent of file renames. Harness validates supplied blocks rather than deriving newness from path history. Name used symbols such as `Draft::revision` inside the block itself, and never add `Calls`, `Constructs`, or `Accesses` sections.
 
-Place the standalone heading directly below the signature, indent its content, and leave a blank line after the block.
+Place the standalone `Change` or `Algorithm` heading directly below the signature, indent its body, and leave a blank line after the block.
 
-An `Algorithm` is compact academic pseudocode, one complete statement per line:
+Write each `Algorithm` as compact academic pseudocode, one complete statement per line:
 
-- Assign with `←` or `<-` and compare with `=`, `≠`, `<`, `≤`, `is`, or `is not`, as in `if target is none`. Combine conditions with `and`, `or`, and `not`, and compute remainders with `%` or `mod`.
-- Write each operation as a call such as `spawn_square(position)`. Lowercase abstract operations need no repository declaration; name real functions, types, and fields directly when you know them.
+- Assign with `←` or `<-` and compare with `=`, `≠`, `<`, `≤`, `is`, or `is not` (for example, `if target is none`). Combine conditions with `and`, `or`, and `not`, and compute remainders with `%` or `mod`.
+- Express each operation as a call such as `spawn_square(position)`. Lowercase abstract operations need no repository declaration. Name real functions, types, and fields directly when known.
 - Indent the bodies of `if`, `otherwise`, `for each item in items`, and `while`. Use `return`, and use `break` and `continue` only inside loops.
-- Construct values explicitly as `Type(field = value)`, `Velocity(direction)` for a tuple type, or `Marker()`, separately from the call that spawns or inserts them.
-- Write explanations only in `#` comments. Prose statements and prose conditions are rejected.
+- Construct values explicitly as `Type(field = value)`, `Velocity(direction)` for a tuple type, or `Marker()`, separate from calls that spawn or insert them.
+- Put explanations only in `#` comments. Prose statements and prose conditions fail grammar validation.
 
-Harness checks grammar, not expression types or algorithm correctness.
+Harness checks syntax, not expression types or algorithm correctness.
 
 ```text
 /// Persist a draft and publish it to readers.
@@ -75,18 +81,27 @@ Algorithm
   return stored.number > draft.revision
 ```
 
-## Documentation
+### Documentation comments
 
-Every declaration the plan introduces needs a documentation comment directly above it and above its attributes, including each struct field and enum variant. Use the language's doc-comment syntax, such as `///` in Rust and `/** */` in TypeScript, and do not start a comment with "Returns".
+Document every declaration the plan introduces—including struct fields and enum variants—directly above the declaration and above its attributes. Use the language's doc-comment syntax (`///` in Rust, `/** */` in TypeScript) and never start a doc comment with `"Returns"`.
 
-## Design artifacts
+## Design files
 
-Before drafting `docs/overview.md`, read the [plan overview examples](#plan-overview-examples) below and match their section depth, subsectioning, and declarative tone. Write `docs/overview.md` as a standalone specification without referring to the user, prompt, or conversation. Use `# <Plan title>`, `Objective`, `Background`, and `Design` as the default structure, and adapt headings to the plan; submission requires only non-whitespace text. `Usage`, `Decisions`, and `Manual checks` are optional.
+### `docs/overview.md`
 
-Keep prose plain, concise, and non-redundant: describe current behavior and the specific problems it causes in `Background`, show caller-facing APIs or commands with short fenced snippets in `Usage`, and limit `Decisions` to real tradeoffs that name the rejected alternative. Open multi-part `Design` sections with a brief architectural lead-in and break them into `###` subheadings by component or ownership boundary, written declaratively in active voice rather than as an imperative checklist. Leave file-by-file module layouts and per-callable mechanics to `files/`. Indent list continuation lines by two spaces. Each `Manual checks` item is an action Verify performs, so include that section only for observations automated checks cannot establish, and omit it rather than writing "None".
+Match the section depth, subsectioning, and plain declarative tone of the [plan overview examples](#plan-overview-examples) below. Write the overview as a standalone specification without referring to the user, prompt, or conversation, and keep it consistent with `files/`.
+
+Submission requires only non-whitespace text, and PlanReview renders the submitted Markdown in authored order. Use `# <Short plan title>`, `## Objective`, `## Background`, and `## Design` as the default structure, adapting headings only when the change warrants it:
+
+- **`## Objective`:** State what the change accomplishes and what remains unchanged. Leave verification and test strategy to `docs/tests.md`.
+- **`## Background`:** Describe current behavior and the concrete problems or coupling it causes. When several distinct failures exist, list them as bold-lead bullets (see Examples 1, 2, and 4).
+- **`## Usage`:** Include whenever user- or caller-facing behavior changes. Describe UI or workflow interactions and their observable results in prose (see Example 1). For APIs, commands, config entries, or shortcuts, include a short fenced snippet with expected results (see Examples 2–4). Omit this section for purely internal changes (see Example 5).
+- **`## Decisions`:** Include whenever the plan chooses between real alternatives. Frame each bullet as `- **<Choice> instead of <alternative>.** <Why the alternative fails or costs more.>`, and place external protocol or documentation links here where they justify a constraint rather than appending citations to every paragraph.
+- **`## Design`:** Open with a one-sentence architectural lead-in explaining how the central objects cooperate. Break multi-part designs into `###` subheadings by component, ownership boundary, or capability boundary, keeping each paragraph focused on one concern. Write declaratively in active voice rather than as an imperative checklist, describe important failure cases and compatibility boundaries, and leave file-by-file module layouts, per-callable mechanics, and incidental wire keys to `files/`.
+- **`## Manual checks`:** Include only for observations automated checks cannot establish. Every dash-list item under this heading becomes a Verify action, so omit the section rather than writing `"None"`. Indent list continuation lines by two spaces.
 
 ```markdown
-# <Plan title>
+# <Short plan title>
 
 ## Objective
 <What the change must accomplish and what stays unchanged.>
@@ -95,101 +110,104 @@ Keep prose plain, concise, and non-redundant: describe current behavior and the 
 <Current behavior and the specific problems it causes.>
 
 ## Usage
-<Short fenced code or command snippet showing caller-facing use and expected result.>
+<How a user or caller invokes the change and what they observe: plain prose for UI workflows, or a short fenced snippet for APIs, commands, or config.>
 
 ## Decisions
 - **<Choice> instead of <alternative>.** <Why the alternative fails or costs more.>
 
 ## Design
-<Brief architectural lead-in, followed by `###` component subheadings for multi-part changes.>
+<One-sentence architectural lead-in, followed by `###` subheadings by component or boundary for multi-part changes.>
 
 ## Manual checks
 - <Action to perform and expected observation.>
 ```
 
-`docs/flows.md` has one `## Title` per independently triggered flow, a one-to-two-line description naming its trigger, and exactly one closed Mermaid block. Use `sequenceDiagram` for cross-owner flows, `flowchart` for branching within one owner, and `stateDiagram-v2` for lifecycle transitions.
+### `docs/flows.md`
 
-`docs/tests.md` has one `## path/to/file` per file and items in the following form. Changes are new, modified, removed, or reused. Name a test by the title its source declares, optionally preceded by its enclosing group titles. Omit the target unless the same name matches cases in several test checks; a target is a test check's ID or label from `check_definition_list`, never a runner or tool name.
+Write one `## Title` per independently triggered flow, a one-to-two-line description naming its trigger, and one closed ```` ```mermaid ```` block. Keep independent lifecycles separate. Use `sequenceDiagram` for cross-owner flows, `flowchart` for branching within one owner, and `stateDiagram-v2` for lifecycle transitions.
+
+### `docs/tests.md`
+
+Write one `## path/to/file` heading per file with test entries in the format below, using `new`, `modified`, `removed`, or `reused`. Name each test by the title its source declares, optionally preceded by its enclosing group titles. Describe the scenario and expected result at the owning boundary, choosing isolated or integration tests to match the behavior verified. Omit `[target: ...]` unless the same test name matches cases across multiple test checks. A target is a test check's ID or label from `check_definition_list`, never a runner or tool name.
 
 ```text
 - new `exact_test_name`: scenario and expected result.
 - new `exact_test_name` [target: unit]: scenario and expected result.
 ```
 
-`docs/checks.md` lists one saved check ID per line to select checks for plan execution. Discover IDs with `check_definition_list`; Harness adds prerequisites. This file does not configure or authorize checks.
+### `docs/checks.md`
 
-## Submission
+List one saved check ID per line to select checks for plan execution. Discover IDs with `check_definition_list`. Harness adds prerequisites automatically. This file does not configure or authorize checks.
 
-Call `plan_status` to see each proposal classified as an addition, modification, deletion, or unchanged, and whether the directory differs from the last submission. Call `plan_submit` with the active plan ID, without an expected version. Harness snapshots the directory, validates the captured contents, and publishes an immutable revision. Repair reported file and line diagnostics in place and submit again; failed submissions do not reset your draft.
+## Prose
 
-Further edits require resubmission before acceptance. Submission is not implementation authority; wait for Harness execution instructions.
+Write for an engineer who is new to this codebase. Build intuition for how the system works: ground every claim in proposed implementation, explain what the system does and why its boundaries exist, and connect paragraphs by cause and consequence.
 
-## Design guidelines
+- **Write in a calm, developer-to-developer voice.** Explain constraints matter-of-factly as operational realities.
+- **Keep paragraphs focused and prose-first.** Split heavy clauses into short sentences, and explain related components in subsequent paragraphs—using bullets or tables for parallel items, ordered steps, or comparisons.
+- **Prefer active voice.** Name the acting component (*"The draft store invalidates the cache on save"*) rather than hiding ownership in passive voice (*"The cache is invalidated on save"*).
+- **Prefer present indicative for the design, and conditional mood for counterfactuals.** Describe implemented and target architecture with definite subjects in the present indicative (`The scheduler runs...`). Use conditional mood (`would`, `could`) for rejected alternatives or unmitigated failure scenarios.
 
-- Explain the central objects, their responsibilities, and how they cooperate.
-- Describe behavior, important failure cases, and compatibility. Explain why significant changes are needed and what observable result they produce.
-- Resolve decisions that affect correctness; leave incidental implementation details open.
-- Show a concrete usage example and expected result when caller-facing behavior changes.
-- Trace important flows across ownership boundaries, keeping independent lifecycles separate.
-- Keep the overview consistent with the proposed files.
-- Check that ownership is cohesive and interfaces expose only what callers need.
-- Describe test scenarios and expected results at the boundary that owns the behavior. Choose isolated or integration tests according to the behavior being verified.
-- Include manual verification only when automated checks cannot establish the result.
-- Keep the design proportional to the request and reuse existing interfaces where they fit.
+**Choppy (disconnected facts):**
+
+> `BuildRunner` compiles into `StagingDir`. Then it calls `Path::rename`. `DevHost` loads the binary from `ActiveDir`.
+
+**Readable (causal flow in plain terms):**
+
+> The build runner compiles each update into a staging directory and moves only finished binaries into the active directory. That keeps the running host from loading an incomplete or failed build.
+
 
 ## Plan overview examples
 
 Reference examples of concise `docs/overview.md` files. Match this plain, causal tone and keep section depth proportional to the change.
 
-### Example 1: UI interaction feature (TypeScript, with manual check)
+### Example 1: UI feature
 
 ````markdown
-# Add pinned actions and keyboard reordering to the command palette
+# Parquet price history export
 
 ## Objective
 
-Let users pin frequently used actions to the top of the command palette and navigate or reorder pinned items from the keyboard. Unpinned fuzzy search ranking and existing shortcut bindings remain unchanged.
+Add Parquet as a selectable format in Tickline's historical price export menu, letting analysts download typed, compressed OHLCV bar histories for backtesting notebooks. Existing CSV exports, chart intervals, and price-adjustment calculations remain unchanged.
 
 ## Background
 
-Today, the command palette ranks every action solely by recency and fuzzy match score. Opening the palette with an empty query shows a shifting list of recent commands, which breaks muscle memory for repetitive workflows such as toggling themes or running the active workspace task.
+Today, Tickline exports historical stock bars only as CSV.
+
+Downloading multi-year histories or watchlists in CSV causes two problems:
+
+- **Slow downloads and notebook loads.** Text encoding inflates multi-year minute-bar series into large files that transfer slowly over HTTP and spend seconds in text parsing when loaded into DuckDB, Polars, or Pandas.
+- **Schema and precision drift.** CSV flattens UTC timestamps, fixed-scale prices, and integer share volumes into untyped strings, so analysts must specify column types manually or risk binary floating-point rounding on prices.
 
 ## Usage
 
-Users toggle pins from the palette row action or shortcut, and applications can supply initial defaults when mounting the palette:
-
-```ts
-<CommandPalette
-  actions={workspaceActions}
-  defaultPinnedIds={["task.run-active", "view.toggle-terminal"]}
-/>
-```
-
-```text
-Mod+Shift+P          // toggle pin on highlighted action
-Alt+ArrowUp / Down   // move highlighted pinned action up or down
-```
+In Tickline, select a ticker or watchlist, set the date range and bar interval, open the **Export** menu, and choose **Parquet**. The browser downloads a `.parquet` file containing typed UTC timestamps, exact fixed-scale prices, and share volumes ready to query directly without schema hints. If the market-data cursor fails mid-export, the browser reports an interrupted download and the toolbar displays an inline export error rather than saving a truncated file.
 
 ## Decisions
 
-- **Store pinned IDs in local UI preferences instead of project config.** Pins reflect personal workflow habits rather than shared repository settings, and unknown IDs from another workspace can be ignored silently at render time.
-- **Keep pinned items grouped above search results only on empty queries.** Pinning results above strong fuzzy matches during typing forces extra arrow presses when searching for an unpinned command.
+- **Stream row groups directly to the HTTP response instead of spooling a full `.parquet` file on server disk.** Spooling multi-year minute-bar exports would add disk pressure under concurrent downloads and delay first-byte delivery. A single-pass writer tracks row-group byte offsets in memory and appends the Parquet footer once the bar cursor drains.
+- **Store prices as fixed-precision decimals (`DECIMAL(18, 4)`) instead of 64-bit floats.** Binary floats would introduce rounding drift during split adjustments and cumulative return calculations, whereas fixed-scale decimals preserve exact exchange tick values across Parquet readers.
+- **Compress row groups with Zstd instead of Snappy or uncompressed pages.** Monotonic timestamps, repeated ticker symbols, and clustered price values compress tightly under Zstd at low CPU cost, reducing download size while remaining compatible with DuckDB, Polars, and PyArrow.
 
 ## Design
 
-The palette splits its list model into two sections when the query is empty: pinned actions in stored order, followed by recent unpinned actions. When the user types a query, both groups merge into the normal fuzzy-ranked list while keeping a pin icon on pinned rows so users can still unpin them.
+The export service plugs a Parquet encoder into the existing format dispatcher, reading the same paginated OHLCV bar cursor used by CSV exports without buffering the full date range in memory.
 
-Keyboard reordering applies only while focus sits in the pinned section on an empty query. Moving an item swaps its index in the preference store and keeps focus attached to the moved row so repeated keypresses walk it up or down the list.
+### Bar Schema
 
-## Manual checks
+Before writing rows, the export handler initializes a fixed Parquet schema covering `symbol` (dictionary-encoded UTF-8), `timestamp` (UTC millisecond timestamp), `open`, `high`, `low`, `close`, and nullable `adjusted_close` (`DECIMAL(18, 4)`), and `volume` (`INT64`). Dictionary encoding `symbol` keeps multi-ticker watchlist exports compact without changing how downstream tools query the column.
 
-- Open the command palette in a desktop browser, pin three actions, and reorder the bottom item to the top with `Alt+ArrowUp`. Confirm the focus ring follows the moved row and the scroll container keeps it visible without jumping.
+### Streaming Writer
+
+The streaming writer pulls fixed-size batches from the market-data cursor, encodes each batch into a Zstd-compressed row group, and flushes the bytes directly to the chunked HTTP response. Once the cursor drains, the writer emits the Parquet footer and closes the response cleanly.
+
+Because HTTP response headers go out before the first row group, a mid-stream cursor failure cannot rewrite the status code to `500`. On error, the writer aborts the response stream without emitting the Parquet footer so the browser flags the transfer as incomplete rather than writing a silently truncated file.
 ````
 
-### Example 2: Backend reliability refactor (bottom-up design)
+### Example 2: Backend refactor
 
 ````markdown
-# Move webhook delivery to a transactional outbox
+# Transactional webhook outbox
 
 ## Objective
 
@@ -237,10 +255,10 @@ Worker loops claim batches of due `pending` rows using `FOR UPDATE SKIP LOCKED` 
 HTTP `2xx` responses mark the row `delivered`. Network errors, timeouts, and `5xx` responses increment the attempt count and schedule exponential backoff up to eight attempts before marking the row `dead`. HTTP `4xx` responses (other than `429`) mark the row `dead` immediately because retrying a rejected payload will not succeed.
 ````
 
-### Example 3: New feature addition (HTTP auth capability)
+### Example 3: HTTP auth
 
 ````markdown
-# Add scoped API tokens for automation
+# Scoped API tokens
 
 ## Objective
 
@@ -283,10 +301,10 @@ Each token consists of a visible prefix (`app_live_` plus 8 random characters fo
 When an incoming request carries a `Bearer` header, the auth middleware hashes the token, looks up the matching active row, and verifies that the token is neither revoked nor expired. It builds a `Principal` carrying the owning user ID intersected with the token's scope set. Route guards check required scopes against that `Principal`, rejecting missing scopes with `403 Forbidden` and unknown or expired tokens with `401 Unauthorized`.
 ````
 
-### Example 4: Multi-layer plugin extraction (bottom-up design, with manual check)
+### Example 4: Plugin extraction
 
 ````markdown
-# Separate scene loading and application snapshots
+# Scene and snapshot plugins
 
 ## Objective
 
@@ -366,4 +384,40 @@ On save, it archives the ECS world with the runtime's keyed payloads. On restore
 ## Manual checks
 
 - In a managed native Browser session with keep-state enabled, switch to Particle Drop through the picker, inspect its scene tags and live entity IDs, then reload the app library in place. Confirm the host PID stays fixed, the library generation changes, and the selected demo and unchanged live IDs survive. Switch back to the landing scene and confirm the outgoing root-owned rows are removed.
+````
+
+### Example 5: Internal optimization
+
+````markdown
+# Coalesce concurrent cache misses
+
+## Objective
+
+Deduplicate concurrent upstream fetches for the same cache key inside the metadata cache so only one request runs per missing key. Public cache methods, return types, TTL configuration, and eviction policy remain unchanged.
+
+## Background
+
+Today, `MetadataCache::get` checks the in-memory map under a read lock and immediately issues an upstream RPC on a miss.
+
+When a hot key expires under load, that behavior causes two problems:
+
+- **Upstream request storms.** Every concurrent caller misses simultaneously and fires an identical RPC, spiking upstream latency and rate-limit errors.
+- **Redundant cache writes.** Each returning RPC overwrites the same entry with the same payload after doing duplicate deserialization work.
+
+## Decisions
+
+- **Track in-flight keys in a sharded wait map instead of holding the cache write lock across the RPC.** Holding the cache lock during network I/O blocks reads and writes for unrelated keys, whereas a separate wait map serializes only callers requesting the same key.
+- **Propagate leader cancellation independently of followers instead of tying the fetch to the first caller.** If the first caller drops its future while followers are still waiting, detaching the fetch into a shared task lets the remaining callers finish without restarting the RPC. The task cancels only once the last waiter drops.
+
+## Design
+
+`MetadataCache` inserts a per-key single-flight coordinator between a cache miss and the upstream client, leaving cache hits on the existing read-only fast path.
+
+### Flight Table
+
+On a miss, the cache looks up the key in an in-flight map keyed by cache key. If no fetch is active, it spawns a shared fetch task, inserts a broadcast channel handle into the map, and awaits the result. Subsequent callers for the same key subscribe to the existing handle instead of calling the upstream client.
+
+### Settlement and Cleanup
+
+When the fetch completes, the task writes successful values into the cache, removes the key from the in-flight map, and broadcasts the cloned result or error to all waiters. Removing the entry before broadcasting ensures any new caller arriving after a transient failure starts a fresh fetch rather than observing the stale error. If every waiter drops before completion, the drop guard cancels the task and removes its map entry.
 ````

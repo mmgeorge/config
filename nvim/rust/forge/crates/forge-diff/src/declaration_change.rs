@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::display::{DisplayRow, RowKind};
 use crate::raw::LineAnchor;
 use crate::source::SourceError;
 
@@ -28,7 +27,6 @@ pub struct DeclarationPair {
 pub struct DeclarationAlignment {
     pub anchors: Vec<LineAnchor>,
     modified_signature: HashMap<usize, usize>,
-    modified_body: Vec<Range<usize>>,
 }
 
 impl DeclarationAlignment {
@@ -72,7 +70,6 @@ impl DeclarationAlignment {
                 result
                     .modified_signature
                     .insert(after.signature, before.signature);
-                result.modified_body.push(after.lines.clone());
             }
         }
         Ok(result)
@@ -81,22 +78,6 @@ impl DeclarationAlignment {
     /// Get the baseline heading paired with a modified proposed declaration.
     pub fn baseline_signature(&self, proposed: usize) -> Option<usize> {
         self.modified_signature.get(&proposed).copied()
-    }
-
-    /// Classify changed declaration headings and added rows inside matched revisions.
-    /// Source coordinates and raw edit categories remain unchanged.
-    pub fn modified(&self, row: &DisplayRow) -> bool {
-        row.new_coordinate().is_some_and(|coordinate| {
-            let next = self
-                .modified_body
-                .partition_point(|scope| scope.end <= coordinate.line);
-            self.modified_signature.contains_key(&coordinate.line)
-                || row.kind() == RowKind::Added
-                    && self
-                        .modified_body
-                        .get(next)
-                        .is_some_and(|scope| scope.contains(&coordinate.line))
-        })
     }
 }
 

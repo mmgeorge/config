@@ -98,6 +98,9 @@ T["directory_planning"] = function()
   MiniTest.expect.equality(deferred(), nil)
   wait_until(function() return file_section() == "Viewed Changes" end, "S did not move the expanded file", { errors = errors })
   expect_section_spacing()
+  assert(buffer.find_row(review.buf, "pub fn requested_change();"), "review lost the declaration terminator")
+  MiniTest.expect.equality(buffer.find_row(review.buf, "Algorithm"), nil)
+  assert(buffer.find_row(review.buf, "return none"), "short algorithm should be fully visible")
   local retained_buffer = review.buf
   keymap.invoke("q", { buffer = retained_buffer })
   local retained_tick = vim.api.nvim_buf_get_changedtick(retained_buffer)
@@ -805,16 +808,17 @@ T["behavior-only signature occupies one display row and keeps baseline comments"
   local marks = vim.json.decode(table.concat(vim.fn.readfile(
     "nvim/lua/forge/tests/fixtures/protocol/plan-review-behavior-signature.json"), "\n"))
   local host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua").start({
-    lines = { "Changed file", "pub fn app() -> App;", "pub fn app() -> App {", "  Change" },
-    metadata = { [2] = { conceal = marks.baseline }, [3] = { gutter = marks.modified } },
+    lines = { "Changed file", "pub fn app() -> App;", "pub fn app() -> App;", "Install the plugin." },
+    metadata = { [2] = { conceal = marks.baseline }, [3] = { gutter = marks.signature } },
   })
   host.annotation = { { id = "original", kind = "comment",
     source = { start_line = 2, end_line = 2, body = "Keep this entry point." } } }
   local review = host.open()
   vim.api.nvim_win_set_cursor(review.win, { 1, 0 })
   vim.cmd("redraw!")
-  MiniTest.expect.equality(buffer.find_row(review.buf, "pub fn app() -> App;"), nil)
-  local proposed = assert(buffer.find_row(review.buf, "pub fn app() -> App {")) - 1
+  local rows = vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)
+  MiniTest.expect.equality(#vim.tbl_filter(function(text) return text:find("pub fn app() -> App;", 1, true) end, rows), 1)
+  local proposed = assert(buffer.find_row(review.buf, "pub fn app() -> App;")) - 1
   MiniTest.expect.equality(vim.api.nvim_win_text_height(review.win, { start_row = proposed, end_row = proposed }).all, 1)
   MiniTest.expect.equality(review.owner.comment_state.range_list[1].annotation.body, "Keep this entry point.")
   vim.api.nvim_win_call(review.win, function() vim.cmd("normal! j") end)

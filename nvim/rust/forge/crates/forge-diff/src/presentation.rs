@@ -118,7 +118,12 @@ impl RowChange {
                 "ForgeContextBg",
             ),
             Self::Added => ("+", "ForgeAddBg", "ForgeAddLineNr", "ForgeInlineAddBg"),
-            Self::Modified => ("~", "ForgeModifyBg", "ForgeModifyLineNr", "ForgeModifyBg"),
+            Self::Modified => (
+                "~",
+                "ForgeModifyBg",
+                "ForgeModifyLineNr",
+                "ForgeModifyRange",
+            ),
             Self::Removed => (
                 "-",
                 "ForgeDeleteBg",

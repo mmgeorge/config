@@ -9,9 +9,10 @@ use forge_buffer::block::{
 use forge_buffer::identity::{BlockId, EditSequence, FoldId, RegionRevision, TargetId};
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
-use forge_diff::display::RowKind;
+use forge_diff::display::{DisplayRow, DisplaySource, RowCoordinates, RowKind};
 use forge_diff::file_header::FileChange;
-use forge_diff::presentation::FoldPolicy;
+use forge_diff::intraline::{IntralineResult, compare_replacement};
+use forge_diff::presentation::{FoldPolicy, RowChange};
 use forge_diff::syntax::DeclarationVisibility;
 
 use super::review_annotation::ReviewAnnotation;
@@ -593,12 +594,12 @@ fn rows(
         }
         let hide_file = inspection && !explicitly_revealed && !file_visibility.visible(public_only);
         let super::review_diff::ReviewSides { before, after } = sides;
-        let body_openings = if inspection {
-            super::review_alignment::body_openings(
+        let signature_replacements = if inspection {
+            super::review_alignment::signature_replacements(
                 before.as_deref(),
                 after.as_deref(),
-                &diff.alignment,
-            )
+                &diff,
+            )?
         } else {
             HashMap::new()
         };
@@ -698,38 +699,10 @@ fn rows(
             )?);
             for (row_index, row) in hunk.row.iter().enumerate() {
                 let id = BlockId(format!("{hunk_id}:row:{row_index}"));
-                let mut paired_row;
-                let painted = if inspection
-                    && row.kind() == RowKind::Added
-                    && let Some(new) = row.new_coordinate()
-                    && let Some(&old_line) = body_openings.get(&(new.side, new.line))
-                {
-                    paired_row = row.clone();
-                    paired_row.source = forge_diff::display::DisplaySource::Diff(
-                        forge_diff::display::RowCoordinates::Context {
-                            old_line,
-                            new_line: new.line,
-                        },
-                    );
-                    &paired_row
-                } else {
-                    row
-                };
-                let mut metadata = if file.alignment.modified(row) {
-                    presenter
-                        .row(
-                            id,
-                            painted,
-                            &hunk.group,
-                            forge_diff::presentation::RowChange::Modified,
-                        )?
-                        .metadata
-                } else {
-                    presenter
-                        .rows(id, std::slice::from_ref(row), &hunk.group, None, None)?
-                        .metadata
-                };
                 let Some(coordinate) = row.new_coordinate().or_else(|| row.old_coordinate()) else {
+                    let metadata = presenter
+                        .rows(id, std::slice::from_ref(row), &hunk.group, None, None)?
+                        .metadata;
                     block.push(BufferBlock {
                         id: BlockId(format!("{hunk_id}:row:{row_index}")),
                         text: BufferText::from_rows([row.text.as_str()])?,
@@ -747,14 +720,64 @@ fn rows(
                     forge_diff::source::SourceSide::New => ("proposed", path),
                 };
                 let line = coordinate.line;
-                if inspection
-                    && row.kind() == RowKind::Removed
-                    && let Some(&opening) = body_openings.get(&(coordinate.side, line))
-                    && visibility
-                        .get(&(path.clone(), "proposed".into()))
-                        .is_some_and(|visible| visible.rows[opening])
+                let source = &presentation[&(source_path.clone(), side.into())];
+                let syntax_row = source
+                    .plain_row
+                    .get(line)
+                    .copied()
+                    .filter(|original| source.declaration_row.get(original) == Some(&line));
+                let behavior = source.behavior_row.get(&line);
+                let display = if inspection {
+                    inspection_row(row, source, line)
+                } else {
+                    std::borrow::Cow::Borrowed(row)
+                };
+                let baseline = signature_replacements.get(&(coordinate.side, line));
+                let mut metadata = if let Some(old) = baseline.filter(|_| side == "proposed") {
+                    let old_path = file
+                        .old_path
+                        .as_ref()
+                        .context("signature pair lacks baseline path")?;
+                    let old_source = &presentation[&(old_path.clone(), "baseline".into())];
+                    let old_line = old
+                        .old_coordinate()
+                        .context("signature pair lacks baseline row")?
+                        .line;
+                    let old = inspection_row(old, old_source, old_line);
+                    let change = if old.text == display.text {
+                        RowChange::Context
+                    } else {
+                        RowChange::Modified
+                    };
+                    let paired = paired_signature_row(&old, &display)
+                        .context("signature pair lacks coordinates")?;
+                    presenter.row(id, &paired, &hunk.group, change)?
+                } else if inspection && let Some((_, _, category)) = behavior {
+                    let change = match row.kind() {
+                        RowKind::Added if *category == "Change" => RowChange::Modified,
+                        RowKind::Added => RowChange::Added,
+                        RowKind::Removed => RowChange::Removed,
+                        RowKind::Context => RowChange::Context,
+                    };
+                    presenter.row(id, &display, &hunk.group, change)?
+                } else {
+                    presenter.rows(id, std::slice::from_ref(&display), &hunk.group, None, None)?
+                }
+                .metadata;
+                // Preserve saved comment positions on rows omitted from the inspection view.
+                let scaffold = inspection
+                    && syntax_row.is_none()
+                    && behavior.is_none_or(|(_, offset, _)| *offset == 0);
+                if scaffold
+                    || (row.kind() == RowKind::Removed
+                        && baseline
+                            .and_then(|row| row.new_coordinate())
+                            .is_some_and(|proposed| {
+                                visibility
+                                    .get(&(path.clone(), "proposed".into()))
+                                    .is_some_and(|visible| visible.rows[proposed.line])
+                            }))
                 {
-                    // Keep the saved baseline row addressable for existing review comments.
                     metadata.conceal.push(forge_buffer::block::Conceal {
                         range: TextRange {
                             start: TextPosition { row: 0, column: 0 },
@@ -765,17 +788,31 @@ fn rows(
                         priority: 100,
                     });
                 }
-                let row_text = visibility
+                let mut row_text = visibility
                     .get(&(source_path.clone(), side.into()))
                     .and_then(|visibility| visibility.replacement.get(&line))
                     .map(String::as_str)
-                    .unwrap_or(row.text.as_str());
-                let syntax_row = presentation
-                    .get(&(source_path.clone(), side.into()))
-                    .and_then(|file| {
-                        let original = *file.plain_row.get(line)?;
-                        (file.declaration_row.get(&original) == Some(&line)).then_some(original)
+                    .unwrap_or(&display.text);
+                let mut source_column = 0;
+                if inspection && behavior.is_some_and(|(_, offset, _)| *offset == 1) {
+                    // The saved body indents text four spaces beyond the declaration. Move
+                    // that prefix to the gutter so nested pseudocode keeps its own indentation.
+                    let signature = source.body.range(..line).next_back().map(|(_, body)| body);
+                    let indent = signature.map_or("", |body| {
+                        let line = body.declaration.as_str();
+                        &line[..line.len() - line.trim_start().len()]
                     });
+                    let label = row_text
+                        .strip_prefix(indent)
+                        .and_then(|label| label.strip_prefix("    "))
+                        .unwrap_or(row_text);
+                    source_column = row_text.len() - label.len();
+                    metadata.gutter[0].chunk.push(TextChunk {
+                        text: format!("{indent}  └ "),
+                        capture: "Comment".into(),
+                    });
+                    row_text = label;
+                }
                 if let Some(source_row) = syntax_row
                     && let Some(handle) = syntax.get(&(source_path.clone(), side.into()))
                 {
@@ -787,19 +824,20 @@ fn rows(
                         row_text,
                     )?;
                 }
-                if presentation
-                    .get(&(source_path.clone(), side.into()))
-                    .and_then(|file| file.behavior_row.get(&line))
-                    .is_some_and(|(_, _, category)| *category == "Algorithm")
+                if behavior
+                    .is_some_and(|(_, offset, category)| *category == "Algorithm" && *offset > 0)
                     && let Some(handle) = syntax
                         .get(&(source_path.clone(), side.into()))
                         .and_then(|syntax| syntax.algorithm.as_ref())
                 {
                     let algorithm_start = metadata.visible_decoration.len();
-                    forge_diff::projection::append_syntax_row(
+                    forge_diff::projection::append_syntax_fragment(
                         &mut metadata,
                         handle,
-                        line,
+                        forge_diff::syntax::SyntaxPoint {
+                            row: line,
+                            column: source_column,
+                        },
                         0,
                         row_text,
                     )?;
@@ -884,10 +922,7 @@ fn rows(
                         row_text,
                     ));
                 }
-                if let Some((owner, offset, category)) = presentation
-                    .get(&(source_path.clone(), side.into()))
-                    .and_then(|file| file.behavior_row.get(&line))
-                {
+                if let Some((owner, offset, category)) = behavior {
                     navigation.anchor.push(PlanNavigationAnchor {
                         columns: None,
                         line: block.len() as u32,
@@ -919,19 +954,12 @@ fn rows(
                 &presentation,
                 &display_row,
             )?;
-            call_folds(
+            behavior_folds(
                 &mut block,
                 [file.old_path.as_ref(), file.new_path.as_ref()],
                 &presentation,
                 &display_row,
-                &file.hunk,
             )?;
-            section_folds(
-                &mut block,
-                [file.old_path.as_ref(), file.new_path.as_ref()],
-                &presentation,
-                &display_row,
-            );
         }
         fold(&mut block, start, &id, FILE_FOLD)?;
         if hide_file {
@@ -1095,6 +1123,42 @@ fn rows(
         contextual: contextual_block,
         skipped,
     })
+}
+
+/// Compare declaration text and omit token emphasis from synthetic behavior rows.
+fn inspection_row<'row>(
+    row: &'row DisplayRow,
+    source: &super::calls::CallPresentation,
+    line: usize,
+) -> std::borrow::Cow<'row, DisplayRow> {
+    let mut display = std::borrow::Cow::Borrowed(row);
+    if let Some(body) = source.body.get(&line) {
+        let display = display.to_mut();
+        display.text.clone_from(&body.declaration);
+        display.emphasis.clear();
+    } else if !row.emphasis.is_empty() && source.behavior_row.contains_key(&line) {
+        display.to_mut().emphasis.clear();
+    }
+    display
+}
+
+/// Paint the proposed signature with both gutters and its own changed byte ranges.
+fn paired_signature_row(baseline: &DisplayRow, proposed: &DisplayRow) -> Option<DisplayRow> {
+    let old_line = baseline.old_coordinate()?.line;
+    let new_line = proposed.new_coordinate()?.line;
+    let mut row = proposed.clone();
+    row.source = DisplaySource::Diff(RowCoordinates::Context { old_line, new_line });
+    match compare_replacement(Default::default(), &[&baseline.text], &[&proposed.text]) {
+        IntralineResult::Emphasis(lines) => {
+            row.emphasis = lines.into_iter().flat_map(|line| line.new).collect();
+            row.emphasis_fallback = None;
+        }
+        IntralineResult::LineStyle(reason) => {
+            row.emphasis.clear();
+            row.emphasis_fallback = Some(reason);
+        }
+    }
+    Some(row)
 }
 
 /// Append Harness's automated-check summary after the test inventory.
@@ -1770,215 +1834,65 @@ fn declaration_folds(
     Ok(())
 }
 
-/// Fold each Algorithm or Change block below its heading, marking the heading with its open state.
-/// Every block starts open because it carries the callable's planned behavior.
-fn section_folds(
+/// Show up to three authored rows of each note before folding the remaining rows.
+fn behavior_folds(
     block: &mut [BufferBlock],
     paths: [Option<&String>; 2],
     presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>,
     display_row: &HashMap<(String, String, usize), usize>,
-) {
-    for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
-        let Some(path) = path else { continue };
-        let Some(source) = presentation.get(&(path.clone(), side.into())) else {
-            continue;
-        };
-        for (heading_row, (end, _)) in &source.section {
-            let Some(opening) = display_row
-                .get(&(path.clone(), side.into(), *heading_row))
-                .copied()
-            else {
-                continue;
-            };
-            let Some(closing) = end
-                .checked_sub(1)
-                .and_then(|last| display_row.get(&(path.clone(), side.into(), last)))
-                .copied()
-            else {
-                continue;
-            };
-            if closing <= opening
-                || block[opening]
-                    .metadata
-                    .fold
-                    .iter()
-                    .any(|fold| fold.id.0.starts_with("plan:section:"))
-            {
-                continue;
-            }
-            let end = BlockAnchor {
-                block: block[closing].id.clone(),
-                position: TextPosition {
-                    row: block[closing].text.row_count(),
-                    column: 0,
-                },
-            };
-            block[opening]
-                .metadata
-                .fold
-                .push(forge_buffer::block::FoldRange {
-                    collapsed_suffix: None,
-                    id: FoldId(format!(
-                        "plan:section:{}:{side}:{heading_row}",
-                        super::digest(path.as_bytes())
-                    )),
-                    heading_start: None,
-                    start: TextPosition { row: 0, column: 0 },
-                    end,
-                    closed: false,
-                    collapse_children: false,
-                    expand_children: false,
-                    heading_marker: true,
-                });
-        }
-    }
-}
-
-fn call_folds(
-    block: &mut [BufferBlock],
-    paths: [Option<&String>; 2],
-    presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>,
-    display_row: &HashMap<(String, String, usize), usize>,
-    hunk: &[super::review_diff::ReviewHunk],
 ) -> Result<()> {
-    let mut regions = HashMap::<(bool, usize), HashSet<forge_diff::raw::RawHunkId>>::new();
-    let mut owner = HashMap::<(bool, &str), Vec<usize>>::new();
-    let mut declaration_heading = Vec::<(usize, Option<&str>)>::new();
-    for (old_side, path, side) in [(true, paths[0], "baseline"), (false, paths[1], "proposed")] {
+    const PREVIEW_LINES: usize = 3;
+    let mut headings = std::collections::BTreeMap::new();
+    let mut ownership = HashMap::new();
+    for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
         let Some(path) = path else { continue };
         let Some(source) = presentation.get(&(path.clone(), side.into())) else {
             continue;
         };
-        for (line, body) in &source.body {
-            let identity = body
-                .owner
-                .rsplit_once('#')
-                .map_or(body.owner.as_str(), |(owner, _)| owner);
-            owner.entry((old_side, identity)).or_default().push(*line);
-            if let Some(position) = display_row.get(&(path.clone(), side.into(), body.heading)) {
-                declaration_heading.push((*position, Some(identity)));
+        for (heading, (end, category)) in &source.section {
+            let first = heading + 1;
+            let owner = source.behavior_row[heading].0.as_str();
+            let mapped = |line| display_row.get(&(path.clone(), side.into(), line)).copied();
+            for line in first..*end {
+                if let Some(position) = mapped(line) {
+                    ownership.entry(position).or_insert((owner, *category));
+                }
             }
-        }
-        let callable_heading = source
-            .body
-            .values()
-            .map(|body| body.heading)
-            .collect::<HashSet<_>>();
-        for declaration in source.folds(path)? {
-            if let Some(row) = source.declaration_row.get(&declaration.heading)
-                && !callable_heading.contains(row)
-                && let Some(position) = display_row.get(&(path.clone(), side.into(), *row))
+            if first < *end
+                && let Some(opening) = mapped(first)
             {
-                declaration_heading.push((*position, None));
-            }
-        }
-        for row in hunk.iter().flat_map(|hunk| &hunk.row) {
-            let Some(raw) = row.raw_id else { continue };
-            let coordinate = if old_side {
-                row.old_coordinate()
-            } else {
-                row.new_coordinate()
-            };
-            let Some(coordinate) = coordinate else {
-                continue;
-            };
-            if let Some((line, body)) = source.body.range(..coordinate.line).next_back()
-                && coordinate.line < body.end
-            {
-                regions.entry((old_side, *line)).or_default().insert(raw);
+                headings.entry(opening).or_insert_with(|| {
+                    FoldId(format!(
+                        "plan:calls:{}:{side}:{}",
+                        super::digest(path.as_bytes()),
+                        super::digest(owner.as_bytes())
+                    ))
+                });
             }
         }
     }
-    declaration_heading.sort_unstable();
-    declaration_heading.dedup();
-    let mut next_foreign = vec![declaration_heading.len(); declaration_heading.len()];
-    for index in (0..declaration_heading.len().saturating_sub(1)).rev() {
-        next_foreign[index] = if declaration_heading[index].1 == declaration_heading[index + 1].1 {
-            next_foreign[index + 1]
-        } else {
-            index + 1
-        };
-    }
-    let mut installed = HashSet::new();
-    for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
-        let Some(path) = path else { continue };
-        let Some(presentation) = presentation.get(&(path.clone(), side.into())) else {
+    for (&opening, id) in &headings {
+        // A revision can interleave removed and added lines under one shared Algorithm heading.
+        let owner = &ownership[&opening];
+        let mut closing = opening;
+        while !headings.contains_key(&(closing + 1)) && ownership.get(&(closing + 1)) == Some(owner)
+        {
+            closing += 1;
+        }
+        if closing - opening + 1 <= PREVIEW_LINES {
             continue;
-        };
-        for (line, body) in &presentation.body {
-            let line = *line;
-            let last = body.end;
-            let Some(opening) = display_row.get(&(path.clone(), side.into(), line)).copied() else {
-                continue;
-            };
-            let Some(mut closing) = display_row.get(&(path.clone(), side.into(), last)).copied()
-            else {
-                continue;
-            };
-            let identity = body
-                .owner
-                .rsplit_once('#')
-                .map_or(body.owner.as_str(), |(owner, _)| owner);
-            let mut boundary =
-                declaration_heading.partition_point(|(position, _)| *position <= opening);
-            if declaration_heading
-                .get(boundary)
-                .is_some_and(|(_, owner)| *owner == Some(identity))
-            {
-                boundary = next_foreign[boundary];
-            }
-            if let Some((position, _)) = declaration_heading
-                .get(boundary)
-                .filter(|(position, _)| *position <= closing)
-            {
-                closing = position - 1;
-            }
-            if closing <= opening {
-                continue;
-            }
-            if !installed.insert(opening) {
-                continue;
-            }
-            let heading = display_row
-                .get(&(path.clone(), side.into(), body.heading))
-                .copied()
-                .unwrap_or(opening);
-            let id = FoldId(format!(
-                "plan:calls:{}:{side}:{}",
-                super::digest(path.as_bytes()),
-                super::digest(body.owner.as_bytes())
-            ));
-            let old_side = side == "baseline";
-            let mut changed = regions.get(&(old_side, line)).cloned().unwrap_or_default();
-            if owner
-                .get(&(old_side, identity))
-                .is_some_and(|positions| positions.len() == 1)
-                && let Some(other) = owner
-                    .get(&(!old_side, identity))
-                    .filter(|positions| positions.len() == 1)
-                && let Some(other) = regions.get(&(!old_side, other[0]))
-            {
-                changed.extend(other);
-            }
-            forge_diff::presentation::DiffPresenter::declaration_fold(
-                block,
-                forge_diff::presentation::DeclarationFoldLayout {
-                    id,
-                    heading,
-                    opening,
-                    closing,
-                    closed: true,
-                    summary: forge_diff::presentation::declaration_body_summary(
-                        changed.len(),
-                        if body.collapsed_suffix.ends_with("end") {
-                            "end"
-                        } else {
-                            "}"
-                        },
-                    ),
-                },
-            )?;
         }
+        forge_diff::presentation::DiffPresenter::declaration_fold(
+            block,
+            forge_diff::presentation::DeclarationFoldLayout {
+                id: id.clone(),
+                heading: opening,
+                opening: opening + PREVIEW_LINES - 1,
+                closing,
+                closed: true,
+                summary: " …".into(),
+            },
+        )?;
     }
     Ok(())
 }
@@ -2036,7 +1950,9 @@ fn public_blocks(
                 .get(&fold.end.block)
                 .context("public fold endpoint is missing")?;
             let boundary = end + usize::from(fold.end.position.row > 0);
-            if public_count[boundary] == public_count[start + 1] {
+            if !fold.id.0.starts_with("plan:calls:")
+                && public_count[boundary] == public_count[start + 1]
+            {
                 retained[start] = false;
             }
         }

@@ -16,7 +16,7 @@
       "priority": 100
     }
   ],
-  "modified": [
+  "signature": [
     {
       "placement": "inline",
       "position": {
@@ -26,27 +26,27 @@
       "chunk": [
         {
           "text": "  1",
-          "capture": "ForgeModifyLineNr"
+          "capture": "ForgeContextLineNr"
         },
         {
           "text": "  ",
-          "capture": "ForgeModifyBg"
+          "capture": "ForgeContextBg"
         },
         {
           "text": "  1",
-          "capture": "ForgeModifyLineNr"
+          "capture": "ForgeContextLineNr"
         },
         {
           "text": "  ",
-          "capture": "ForgeModifyBg"
-        },
-        {
-          "text": "~",
-          "capture": "ForgeModifyLineNr"
+          "capture": "ForgeContextBg"
         },
         {
           "text": " ",
-          "capture": "ForgeModifyBg"
+          "capture": "ForgeContextLineNr"
+        },
+        {
+          "text": " ",
+          "capture": "ForgeContextBg"
         }
       ],
       "priority": 100

@@ -2179,9 +2179,10 @@ async fn visual_file_review_moves_only_selected_files_in_one_request() -> Result
     fixture.finish().await
 }
 
-/// Review a behavior addition alongside a real change of signature and a removed callable.
+/// Pair behavior openings and edited parameters while retaining genuine deletions.
 #[tokio::test]
-async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
+async fn behavior_notes_fold_below_declarations_and_only_changed_signature_lines_are_marked()
+-> Result<()> {
     use crate::plan::review_document::ReadOnlyPlanReview;
     use crate::plan::{DeclarationDesign, DeclarationFile, FunctionBehavior, FunctionBody};
     use forge_buffer::identity::{DocumentId, ViewId};
@@ -2191,23 +2192,59 @@ async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
     let files =
         crate::plan::PlanFileStore::new(&fixture.controller.data_root, fixture.root.path())?;
     let path = "app.rs";
-    let old = "pub fn app() -> App;\npub fn changed() -> u32;\npub fn removed();\n";
+    let old = concat!(
+        "pub fn app() -> App;\npub fn changed() -> u32;\npub fn removed();\n",
+        "pub fn initialize(\n",
+        "    transport: &AcpConnection,\n",
+        "    obsolete: bool,\n",
+        "    requirement: &RuntimeRequirement,\n",
+        "    operation: ProviderOperation,\n",
+        ") -> Result<Value, ProviderError>;\n",
+    );
     std::fs::write(fixture.root.path().join(path), old)?;
-    let new = "pub fn app() -> App;\npub fn changed() -> u64;\n";
+    let new = concat!(
+        "pub fn app() -> App;\npub fn changed() -> u64;\n",
+        "pub fn initialize(\n",
+        "    transport: &AcpConnection,\n",
+        "    requirement: Option<&RuntimeRequirement>,\n",
+        "    operation: ProviderOperation,\n",
+        ") -> Result<Value, ProviderError>;\n",
+        "pub fn added();\n",
+    );
     let mut design = DeclarationDesign::default();
     design.baseline.insert(
         path.into(),
         DeclarationFile::new(path, old.into(), crate::plan::digest(old.as_bytes()), &[])?,
     );
+    let change = "Install the plugin before opening the application and retain the configured runtime until the final request completes.";
     design.parsed_insert(
         path,
         new.into(),
-        ["app", "changed"]
-            .map(|owner| FunctionBody {
-                owner: owner.into(),
-                behavior: Some(FunctionBehavior::Change("Install the plugin.".into())),
-            })
-            .into(),
+        [
+            (
+                "app",
+                FunctionBehavior::Change(format!(
+                    "{change}\nKeep the handle alive.\nCollect the result.\nRelease the handle."
+                )),
+            ),
+            (
+                "changed",
+                FunctionBehavior::Change("Return the counter.".into()),
+            ),
+            (
+                "initialize",
+                FunctionBehavior::Change("Install the plugin.".into()),
+            ),
+            (
+                "added",
+                FunctionBehavior::Algorithm("if ready\n  return true\nreturn false".into()),
+            ),
+        ]
+        .map(|(owner, behavior)| FunctionBody {
+            owner: owner.into(),
+            behavior: Some(behavior),
+        })
+        .into(),
     )?;
     design.document.objective = "Update the application.".into();
     design.document.requirements = vec!["Install the plugin.".into()];
@@ -2219,7 +2256,47 @@ async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
     let (_, _, digest) = files.submit_document_revision(&fixture.session_id, "review", 1, 1)?;
     let mut source =
         files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?;
-    for name in ["app", "changed"] {
+    let folded = ReadOnlyPlanReview::new(
+        DocumentId("folded".into()),
+        ViewId("plan".into()),
+        files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?,
+        Default::default(),
+        None,
+    )?
+    .snapshot();
+    let visible_preview = |text| {
+        folded.block.iter().find(|block| {
+            block.text.row(0) == Some(text)
+                && !block.metadata.conceal.iter().any(|conceal| conceal.line)
+        })
+    };
+    for text in [
+        change,
+        "    Keep the handle alive.",
+        "    Collect the result. …",
+    ] {
+        assert!(
+            visible_preview(text)
+                .context("missing behavior preview row")?
+                .metadata
+                .collapse
+                .iter()
+                .any(|fold| fold.closed && fold.id.0.starts_with("plan:calls:"))
+        );
+    }
+    assert!(visible_preview("    Release the handle.").is_none());
+    assert!(visible_preview("  Algorithm").is_none());
+    for text in ["if ready", "      return true", "    return false"] {
+        assert!(
+            !visible_preview(text)
+                .context("missing pseudocode row")?
+                .metadata
+                .collapse
+                .iter()
+                .any(|fold| fold.id.0.starts_with("plan:calls:"))
+        );
+    }
+    for name in ["app", "changed", "initialize", "added"] {
         let fold = format!(
             "plan:calls:{}:proposed:{}",
             crate::plan::digest(path.as_bytes()),
@@ -2246,6 +2323,14 @@ async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
                 && !block.metadata.conceal.iter().any(|conceal| conceal.line)
         })
     };
+    let gutter = |row: &forge_buffer::block::BufferBlock| {
+        row.metadata
+            .gutter
+            .iter()
+            .flat_map(|mark| &mark.chunk)
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>()
+    };
     // This revision predates precomputed declaration summaries.
     let heading = snapshot
         .block
@@ -2254,26 +2339,53 @@ async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
         .find(|text| text.starts_with("Modified") && text.contains("app.rs"))
         .unwrap();
     assert_eq!(heading, "Modified app.rs");
-    assert!(
-        visible("pub fn app() -> App;").is_none(),
-        "duplicate baseline signature"
-    );
-    let app = visible("pub fn app() -> App {").context("missing modified heading")?;
-    let gutter = app
-        .metadata
-        .gutter
-        .iter()
-        .flat_map(|mark| &mark.chunk)
-        .map(|chunk| chunk.text.as_str())
-        .collect::<String>();
+    let app = visible("pub fn app() -> App;").context("missing declaration")?;
     assert_eq!(
-        gutter.split_whitespace().collect::<Vec<_>>(),
-        ["1", "1", "~"]
+        gutter(app).split_whitespace().collect::<Vec<_>>(),
+        ["1", "1"]
     );
-    assert!(visible("  Change").is_some());
-    assert!(visible("pub fn changed() -> u32;").is_some());
-    assert!(visible("pub fn changed() -> u64 {").is_some());
-    assert!(visible("pub fn removed();").is_some());
+    assert_eq!(
+        snapshot
+            .block
+            .iter()
+            .filter(
+                |block| block.text.row(0) == app.text.row(0) && block.metadata.conceal.is_empty()
+            )
+            .count(),
+        1
+    );
+    assert!(visible("pub fn changed() -> u32;").is_none());
+    assert!(gutter(visible("pub fn changed() -> u64;").unwrap()).ends_with("~ "));
+    assert!(
+        gutter(visible("pub fn initialize(").unwrap())
+            .trim_end()
+            .ends_with(char::is_numeric)
+    );
+    assert!(
+        gutter(visible(") -> Result<Value, ProviderError>;").unwrap())
+            .trim_end()
+            .ends_with(char::is_numeric)
+    );
+    assert!(gutter(visible("  obsolete: bool,").unwrap()).ends_with("- "));
+    assert!(visible("  requirement: &RuntimeRequirement,").is_none());
+    let parameter = visible("  requirement: Option<&RuntimeRequirement>,")
+        .context("missing modified parameter")?;
+    assert!(gutter(parameter).ends_with("~ "));
+    assert!(
+        parameter
+            .metadata
+            .visible_decoration
+            .iter()
+            .any(|span| span.capture == "ForgeModifyRange")
+    );
+    assert!(visible("  Change").is_none());
+    assert!(visible("}").is_none());
+    let note = visible(change).unwrap();
+    assert!(gutter(note).ends_with("~   └ "));
+    assert!(gutter(visible("    Keep the handle alive.").unwrap()).ends_with("~ "));
+    assert!(gutter(visible("if ready").unwrap()).ends_with("+   └ "));
+    assert!(gutter(visible("      return true").unwrap()).ends_with("+ "));
+    assert!(gutter(visible("    Release the handle.").unwrap()).ends_with("~ "));
     let baseline = snapshot
         .block
         .iter()
@@ -2283,7 +2395,7 @@ async fn behavior_only_edits_show_one_modified_signature() -> Result<()> {
         "plan-review-behavior-signature.json",
         &json!({
             "baseline": baseline.metadata.conceal,
-            "modified": app.metadata.gutter,
+            "signature": app.metadata.gutter,
         }),
     );
     fixture.finish().await

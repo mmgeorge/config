@@ -632,27 +632,42 @@ function M.attach(options, callback)
   owner.replica = buffer.open(owner.document, { buffer = options.buffer, filetype = "ForgePlan", generated = true, preserve_view = true, source_projected = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
   owner.replica.projection_owns_row_marks = true
+  ---@type table<string, {digest: string, open_on_arrival: boolean}>
   local loading_files = {}
-  local function demand_file(id)
-    if loading_files[id] then return end
+  local function demand_file(id, toggle_expansion)
     local digest = owner.saved_source_digest
-    loading_files[id] = digest
+    local pending = loading_files[id]
+    if pending and pending.digest == digest then
+      if toggle_expansion then pending.open_on_arrival = not pending.open_on_arrival end
+      return
+    end
+    pending = { digest = digest, open_on_arrival = toggle_expansion == true }
+    loading_files[id] = pending
     request({ operation = "plan_body", document = owner.document, saved_source_digest = digest, file = id }, function(result, failure)
-      if loading_files[id] == digest then loading_files[id] = nil end
+      if loading_files[id] ~= pending then return end
+      loading_files[id] = nil
       if not alive() or owner.saved_source_digest ~= digest then return end
-      if not failure and result.patch and result.patch ~= vim.NIL then
+      if not failure and result and result.patch and result.patch ~= vim.NIL then
         if vim.bo[options.buffer].modified then options.recovery = { annotation = comments.capture(options.buffer) } end
         local applied = apply_projection(result)
-        if applied.kind ~= "Applied" then failure = applied.reason or applied.kind end
+        if applied.kind ~= "Applied" then
+          failure = applied.reason or applied.kind
+        elseif pending.open_on_arrival and not owner.replica.block[id .. ":hunk:deferred"] then
+          buffer.set_expansion(owner.replica, id, true)
+        end
         owner.sync_editability()
       end
       if failure and options.notice then options.notice(failure) end
     end)
   end
   owner.replica.node_action = function(id, expanded)
-    local changed = buffer.set_expansion(owner.replica, id, expanded)
-    if changed and expanded and owner.replica.block[id .. ":hunk:deferred"] then demand_file(id) end
-    return changed
+    if expanded and owner.replica.block[id .. ":hunk:deferred"] then
+      demand_file(id, true)
+      return true
+    end
+    local pending = loading_files[id]
+    if pending and not expanded then pending.open_on_arrival = false end
+    return buffer.set_expansion(owner.replica, id, expanded)
   end
   local function open_view(window)
     local columns = require("forge.window_presentation").capture(window)

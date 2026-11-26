@@ -159,14 +159,12 @@ impl CallPresentation {
 
 /// A rendered function body, from its final signature row through its closing delimiter.
 pub(crate) struct CallBody {
-    /// Saved callable identity used to retain fold intent across rendering.
-    pub owner: String,
-    /// First signature row that can toggle this body.
+    /// First signature row included as context when the behavior changes.
     pub heading: usize,
     /// Closing delimiter row included in this body.
     pub end: usize,
-    /// Completes the visible signature when its body is collapsed.
-    pub collapsed_suffix: &'static str,
+    /// Final declaration line before the saved review format inserts a body.
+    pub declaration: String,
 }
 
 struct CachedPresentation {
@@ -208,16 +206,16 @@ pub(crate) fn algorithm_reference(
     else {
         return Ok(None);
     };
-    let Some(indent) = row
-        .len()
-        .checked_sub(source.len())
-        .filter(|_| row.ends_with(source))
+    // The gutter can own the first line's indent, and a folded line has a summary suffix.
+    let statement = source.trim_start();
+    let displayed = row.trim_start();
+    let Some(offset_in_statement) = column
+        .checked_sub(row.len() - displayed.len())
+        .filter(|column| *column < statement.len() && displayed.starts_with(statement))
     else {
         return Ok(None);
     };
-    let Some(column) = column.checked_sub(indent).map(|column| column + 1) else {
-        return Ok(None);
-    };
+    let column = source.len() - statement.len() + offset_in_statement + 1;
     let Some(reference) =
         forge_diff::syntax::algorithm_reference(algorithm, offset as usize, column)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?
@@ -345,7 +343,7 @@ pub(crate) fn present(
         + result
             .body
             .values()
-            .map(|body| body.owner.capacity() + 128)
+            .map(|body| body.declaration.capacity() + 128)
             .sum::<usize>();
     let result = Arc::new(result);
     if bytes <= PRESENTATION_CACHE_BYTES {
@@ -471,10 +469,9 @@ pub(crate) fn insert(
                     body.insert(
                         opening,
                         CallBody {
-                            owner: function.owner.clone(),
                             heading,
                             end: source.len(),
-                            collapsed_suffix: if lua { " ... end" } else { "...}" },
+                            declaration: line.into(),
                         },
                     );
                     output.push_str(&format!("{indent}{}\n", if lua { "end" } else { "}" }));

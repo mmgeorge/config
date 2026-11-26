@@ -9,6 +9,7 @@ description: >-
 # Technical Writing
 
 Write for an engineer who is new to this codebase. Build intuition for how the system works: ground every claim in the implementation, explain what the system does and why its boundaries exist, and connect paragraphs by cause and consequence.
+
 ## Support Claims with Evidence
 
 Replace vague self-praise (*"clean separation"*, *"seamless"*, *"robust"*) and unsupported claims about performance, simplicity, or tradeoffs with the concrete mechanism, evidence, and explicit limits. Treat words like `stable`, `persistent`, `durable`, `safely`, and `reliably` as guarantees, stating where each stops holding (for example, *"survives process restarts, resets on schema migration"*).
@@ -20,6 +21,8 @@ Replace vague self-praise (*"clean separation"*, *"seamless"*, *"robust"*) and u
 | *"The draft journal is robust."*            | *"Unconfirmed drafts survive tab crashes by replaying from local storage."*                                                       |
 | *"WebAssembly best fits plugins."*          | *"WebAssembly isolates plugin memory inside the server process without spawning an OS process per request."*                      |
 | *"The gateway offers a clean separation."*  | *"The gateway terminates TLS and enforces rate limits while forwarding decoded requests to stateless workers."*                   |
+
+
 ## Write Clear, Causal Prose
 
 - **Write in a calm, developer-to-developer voice.** Explain constraints matter-of-factly as operational realities; skip meta-signposting (*"This page documents..."*), slogans, and obvious payoffs.
@@ -33,7 +36,7 @@ Replace vague self-praise (*"clean separation"*, *"seamless"*, *"robust"*) and u
 
 **Readable (causal flow in plain terms):**
 
-> The build runner compiles each update into a staging directory and renames it into place once compilation finishes. That atomic swap keeps the running host from opening a half-written binary.
+> The build runner compiles each update into a staging directory and moves only finished binaries into the active directory. That keeps the running host from loading an incomplete or failed build.
 
 ## Workflow
 
