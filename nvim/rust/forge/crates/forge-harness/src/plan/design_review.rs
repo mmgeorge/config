@@ -13,7 +13,9 @@ use forge_diff::display::{DisplayRow, DisplaySource, RowCoordinates, RowKind};
 use forge_diff::file_header::FileChange;
 use forge_diff::intraline::{IntralineResult, compare_replacement};
 use forge_diff::presentation::{FoldPolicy, RowChange};
-use forge_diff::syntax::DeclarationVisibility;
+use forge_diff::syntax::{
+    AlgorithmDiffLineKind, DeclarationVisibility, classify_algorithm_diff_line,
+};
 
 use super::review_annotation::ReviewAnnotation;
 use super::review_source::ReviewTrace;
@@ -644,6 +646,7 @@ fn rows(
         }
         let file = &diff;
         let hunks = &file.hunk;
+        let mut declaration_rows = Vec::new();
         let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
         let start = block.len();
         let path = file
@@ -726,12 +729,26 @@ fn rows(
                     .get(line)
                     .copied()
                     .filter(|original| source.declaration_row.get(original) == Some(&line));
+                if inspection && syntax_row.is_some() {
+                    declaration_rows.push(block.len());
+                }
                 let behavior = source.behavior_row.get(&line);
-                let display = if inspection {
+                let change_line = behavior
+                    .filter(|_| inspection)
+                    .and_then(|behavior| behavior.change_line(&row.text))
+                    .map(classify_algorithm_diff_line);
+                let prefix_width = change_line.map_or(0, |line| line.prefix_width);
+                let mut display = if inspection {
                     inspection_row(row, source, line)
                 } else {
                     std::borrow::Cow::Borrowed(row)
                 };
+                if let Some(behavior) = behavior.filter(|_| prefix_width > 0) {
+                    display
+                        .to_mut()
+                        .text
+                        .replace_range(behavior.column..behavior.column + prefix_width, "");
+                }
                 let baseline = signature_replacements.get(&(coordinate.side, line));
                 let mut metadata = if let Some(old) = baseline.filter(|_| side == "proposed") {
                     let old_path = file
@@ -752,12 +769,21 @@ fn rows(
                     let paired = paired_signature_row(&old, &display)
                         .context("signature pair lacks coordinates")?;
                     presenter.row(id, &paired, &hunk.group, change)?
-                } else if inspection && let Some((_, _, category)) = behavior {
-                    let change = match row.kind() {
-                        RowKind::Added if *category == "Change" => RowChange::Modified,
-                        RowKind::Added => RowChange::Added,
-                        RowKind::Removed => RowChange::Removed,
-                        RowKind::Context => RowChange::Context,
+                } else if let Some(change_line) = change_line {
+                    let change = match (row.kind(), change_line.kind) {
+                        (RowKind::Removed, _) | (_, AlgorithmDiffLineKind::Removed) => {
+                            RowChange::Removed
+                        }
+                        (_, AlgorithmDiffLineKind::Added) => RowChange::Added,
+                        (RowKind::Added, AlgorithmDiffLineKind::Invalid) => RowChange::Modified,
+                        (
+                            _,
+                            AlgorithmDiffLineKind::Context
+                            | AlgorithmDiffLineKind::Separator
+                            | AlgorithmDiffLineKind::Comment
+                            | AlgorithmDiffLineKind::Blank
+                            | AlgorithmDiffLineKind::Invalid,
+                        ) => RowChange::Context,
                     };
                     presenter.row(id, &display, &hunk.group, change)?
                 } else {
@@ -767,7 +793,7 @@ fn rows(
                 // Preserve saved comment positions on rows omitted from the inspection view.
                 let scaffold = inspection
                     && syntax_row.is_none()
-                    && behavior.is_none_or(|(_, offset, _)| *offset == 0);
+                    && behavior.is_none_or(|behavior| behavior.offset == 0);
                 if scaffold
                     || (row.kind() == RowKind::Removed
                         && baseline
@@ -788,31 +814,11 @@ fn rows(
                         priority: 100,
                     });
                 }
-                let mut row_text = visibility
+                let row_text = visibility
                     .get(&(source_path.clone(), side.into()))
                     .and_then(|visibility| visibility.replacement.get(&line))
                     .map(String::as_str)
                     .unwrap_or(&display.text);
-                let mut source_column = 0;
-                if inspection && behavior.is_some_and(|(_, offset, _)| *offset == 1) {
-                    // The saved body indents text four spaces beyond the declaration. Move
-                    // that prefix to the gutter so nested pseudocode keeps its own indentation.
-                    let signature = source.body.range(..line).next_back().map(|(_, body)| body);
-                    let indent = signature.map_or("", |body| {
-                        let line = body.declaration.as_str();
-                        &line[..line.len() - line.trim_start().len()]
-                    });
-                    let label = row_text
-                        .strip_prefix(indent)
-                        .and_then(|label| label.strip_prefix("    "))
-                        .unwrap_or(row_text);
-                    source_column = row_text.len() - label.len();
-                    metadata.gutter[0].chunk.push(TextChunk {
-                        text: format!("{indent}  └ "),
-                        capture: "Comment".into(),
-                    });
-                    row_text = label;
-                }
                 if let Some(source_row) = syntax_row
                     && let Some(handle) = syntax.get(&(source_path.clone(), side.into()))
                 {
@@ -824,8 +830,7 @@ fn rows(
                         row_text,
                     )?;
                 }
-                if behavior
-                    .is_some_and(|(_, offset, category)| *category == "Algorithm" && *offset > 0)
+                if let Some(behavior) = behavior.filter(|behavior| behavior.offset > 0)
                     && let Some(handle) = syntax
                         .get(&(source_path.clone(), side.into()))
                         .and_then(|syntax| syntax.algorithm.as_ref())
@@ -836,17 +841,41 @@ fn rows(
                         handle,
                         forge_diff::syntax::SyntaxPoint {
                             row: line,
-                            column: source_column,
+                            // Syntax uses a space-masked prefix in the authored byte positions.
+                            column: prefix_width,
                         },
                         0,
                         row_text,
                     )?;
-                    // Plans record no references, so no Algorithm call names a known declaration
-                    // and none takes call coloring.
+                    // Abstract operations and repository calls share identifier coloring.
                     let mut index = 0;
                     metadata.visible_decoration.retain(|decoration| {
                         index += 1;
-                        index <= algorithm_start || decoration.capture != "@function.call.algorithm"
+                        index <= algorithm_start
+                            || decoration.capture != "@function.call.algorithm"
+                                && (behavior.category != "Change"
+                                    || decoration.capture != "@error.algorithm")
+                    });
+                }
+                if let Some(change_line) = change_line
+                    && let Some(behavior) = behavior
+                    && let Some(column) = change_line.elision_column
+                    && let Some(elision) = row_text.get(behavior.column + column - prefix_width..)
+                    && elision.starts_with("...")
+                {
+                    metadata.visible_decoration.push(Decoration {
+                        range: TextRange {
+                            start: TextPosition {
+                                row: 0,
+                                column: row_text.len() - elision.len(),
+                            },
+                            end: TextPosition {
+                                row: 0,
+                                column: row_text.len(),
+                            },
+                        },
+                        capture: "Comment".into(),
+                        priority: 100,
                     });
                 }
                 if inspection
@@ -922,7 +951,9 @@ fn rows(
                         row_text,
                     ));
                 }
-                if let Some((owner, offset, category)) = behavior {
+                if let Some(behavior) = behavior {
+                    let (owner, offset, category) =
+                        (&behavior.owner, behavior.offset, behavior.category);
                     navigation.anchor.push(PlanNavigationAnchor {
                         columns: None,
                         line: block.len() as u32,
@@ -930,7 +961,7 @@ fn rows(
                             path: source_path.clone(),
                             side: side.into(),
                             owner: owner.clone(),
-                            offset: *offset,
+                            offset,
                         },
                         json_path: format!(
                             "/design/{side}_calls/{}/{}/behavior/{offset}",
@@ -959,6 +990,7 @@ fn rows(
                 [file.old_path.as_ref(), file.new_path.as_ref()],
                 &presentation,
                 &display_row,
+                &declaration_rows,
             )?;
         }
         fold(&mut block, start, &id, FILE_FOLD)?;
@@ -1834,63 +1866,60 @@ fn declaration_folds(
     Ok(())
 }
 
-/// Show up to three authored rows of each note before folding the remaining rows.
+/// Attach an open fold to the signature of each rendered behavior body.
 fn behavior_folds(
     block: &mut [BufferBlock],
     paths: [Option<&String>; 2],
     presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>,
     display_row: &HashMap<(String, String, usize), usize>,
+    declaration_rows: &[usize],
 ) -> Result<()> {
-    const PREVIEW_LINES: usize = 3;
-    let mut headings = std::collections::BTreeMap::new();
-    let mut ownership = HashMap::new();
+    let mut folds = std::collections::BTreeMap::<usize, (usize, usize, FoldId)>::new();
     for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
         let Some(path) = path else { continue };
         let Some(source) = presentation.get(&(path.clone(), side.into())) else {
             continue;
         };
-        for (heading, (end, category)) in &source.section {
-            let first = heading + 1;
-            let owner = source.behavior_row[heading].0.as_str();
-            let mapped = |line| display_row.get(&(path.clone(), side.into(), line)).copied();
-            for line in first..*end {
-                if let Some(position) = mapped(line) {
-                    ownership.entry(position).or_insert((owner, *category));
-                }
-            }
-            if first < *end
-                && let Some(opening) = mapped(first)
-            {
-                headings.entry(opening).or_insert_with(|| {
-                    FoldId(format!(
+        let mapped = |line| display_row.get(&(path.clone(), side.into(), line)).copied();
+        for (&signature, body) in &source.body {
+            let (Some(opening), Some(behavior)) =
+                (mapped(signature), source.behavior_row.get(&(signature + 1)))
+            else {
+                continue;
+            };
+            // A revision can interleave old pseudocode with lines of the proposed signature.
+            let next = declaration_rows.partition_point(|row| *row <= opening);
+            let boundary = declaration_rows.get(next).copied().unwrap_or(block.len());
+            let Some(closing) = (signature + 2..body.end)
+                .rev()
+                .filter_map(mapped)
+                .find(|row| opening < *row && *row < boundary)
+            else {
+                continue;
+            };
+            folds
+                .entry(opening)
+                .and_modify(|(_, last, _)| *last = (*last).max(closing))
+                .or_insert_with(|| {
+                    let id = FoldId(format!(
                         "plan:calls:{}:{side}:{}",
                         super::digest(path.as_bytes()),
-                        super::digest(owner.as_bytes())
-                    ))
+                        super::digest(behavior.owner.as_bytes())
+                    ));
+                    (mapped(body.heading).unwrap_or(opening), closing, id)
                 });
-            }
         }
     }
-    for (&opening, id) in &headings {
-        // A revision can interleave removed and added lines under one shared Algorithm heading.
-        let owner = &ownership[&opening];
-        let mut closing = opening;
-        while !headings.contains_key(&(closing + 1)) && ownership.get(&(closing + 1)) == Some(owner)
-        {
-            closing += 1;
-        }
-        if closing - opening + 1 <= PREVIEW_LINES {
-            continue;
-        }
+    for (opening, (heading, closing, id)) in folds {
         forge_diff::presentation::DiffPresenter::declaration_fold(
             block,
             forge_diff::presentation::DeclarationFoldLayout {
-                id: id.clone(),
-                heading: opening,
-                opening: opening + PREVIEW_LINES - 1,
+                id,
+                heading,
+                opening,
                 closing,
-                closed: true,
-                summary: " …".into(),
+                closed: false,
+                summary: String::new(),
             },
         )?;
     }

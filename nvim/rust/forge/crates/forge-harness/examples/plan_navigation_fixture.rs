@@ -51,7 +51,7 @@ fn main() -> Result<()> {
             .map(|function| FunctionBody {
                 owner: function.owner,
                 behavior: Some(forge_harness::plan::FunctionBehavior::Change(
-                    "Preserve behavior while reviewing definition navigation.".into(),
+                    "+ record_definition_navigation()".into(),
                 )),
             })
             .collect::<Vec<_>>();

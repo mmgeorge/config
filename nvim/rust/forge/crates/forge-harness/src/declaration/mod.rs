@@ -109,10 +109,10 @@ impl DeclarationDiagnosticKind {
                 "Patch the declaration or its import, then submit the current version again."
             }
             Self::AlgorithmSyntax => {
-                "Rewrite the reported Algorithm text as assignments, calls, and control flow; keep explanations in # comments."
+                "Use assignments, calls, and control flow with explanations in # comments. In Change blocks, prefix removals with `- `, additions with `+ `, and context with two spaces. Separate hunks with `...`."
             }
             Self::BehaviorBlock => {
-                "Use at most one behavior block: Algorithm for new behavior, Change for modified behavior, and neither for unchanged behavior. Supplied Algorithms must be nonempty and syntactically valid."
+                "Use a nonempty Algorithm for new behavior or a nonempty elided Algorithm diff under Change for modified behavior. Leave unchanged callables without a behavior block."
             }
             Self::DeclarationStructure => {
                 "Patch the reported line: place the behavior block directly below its signature and give each callable at most one Algorithm or Change."

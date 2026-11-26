@@ -1475,7 +1475,7 @@ mod tests {
         let changed = patched(
             &design,
             workspace.path(),
-            "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n+Change\n+  Run the helper twice.\n*** End Patch",
+            "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n+Change\n+  # repeat the helper\n+    helper()\n+  + helper()\n*** End Patch",
         );
         let (parsed, diagnostic) = changed.derive_parsed().unwrap();
         assert!(diagnostic.is_empty());
@@ -1590,7 +1590,7 @@ mod tests {
             .patch(
                 workspace.path(),
                 &BTreeMap::new(),
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n+Change\n+  Run twice.\n*** Update File: Game.rs\n@@\n fn walk();\n+Change\n+  Walk twice.\n*** End Patch",
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n fn run();\n+Change\n+  + repeat_run()\n*** Update File: Game.rs\n@@\n fn walk();\n+Change\n+  + repeat_walk()\n*** End Patch",
                 "Rounds",
             )
             .unwrap_err();

@@ -112,6 +112,10 @@ pub(super) fn signature_replacements<'diff>(
         {
             let old = before.declaration_row[&(old as usize - 1)];
             let new = after.declaration_row[&(new as usize - 1)];
+            // A removed body needs its own visible final signature to anchor its fold.
+            if before.body.get(&old).is_some_and(|body| old + 2 < body.end) {
+                continue;
+            }
             let (Some(removed), Some(added)) = (old_rows.get(&old), new_rows.get(&new)) else {
                 continue;
             };

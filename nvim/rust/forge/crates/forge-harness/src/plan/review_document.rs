@@ -2026,10 +2026,10 @@ impl ReadOnlyPlanReview {
                 .into_iter()
                 .flatten()
                 .find(|body| body.owner == *owner)
-                .context("Algorithm callable is unavailable")?;
+                .context("Behavior callable is unavailable")?;
             let reference = match super::calls::algorithm_reference(
                 path,
-                declarations.context("Algorithm declarations are unavailable")?,
+                declarations.context("Behavior declarations are unavailable")?,
                 body,
                 *offset,
                 row,
@@ -2038,7 +2038,7 @@ impl ReadOnlyPlanReview {
                 Ok(Some(reference)) => reference,
                 Ok(None) => {
                     return Ok(
-                        serde_json::json!({"message":"Select a parsed identifier in the Algorithm."}),
+                        serde_json::json!({"message":"Select a parsed identifier in the behavior block."}),
                     );
                 }
                 Err(error) => return Ok(serde_json::json!({"message":error.to_string()})),

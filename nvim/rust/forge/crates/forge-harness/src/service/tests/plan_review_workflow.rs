@@ -2179,14 +2179,15 @@ async fn visual_file_review_moves_only_selected_files_in_one_request() -> Result
     fixture.finish().await
 }
 
-/// Pair behavior openings and edited parameters while retaining genuine deletions.
+/// Toggle complete behavior bodies and preserve signature diffs and navigation.
 #[tokio::test]
-async fn behavior_notes_fold_below_declarations_and_only_changed_signature_lines_are_marked()
--> Result<()> {
+async fn behavior_bodies_open_in_full_and_fold_at_their_signatures() -> Result<()> {
     use crate::plan::review_document::ReadOnlyPlanReview;
     use crate::plan::{DeclarationDesign, DeclarationFile, FunctionBehavior, FunctionBody};
-    use forge_buffer::identity::{DocumentId, ViewId};
-    use forge_buffer::patch::BufferSnapshot;
+    use forge_buffer::block::TextPosition;
+    use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
+    use forge_buffer::input::DocumentInput;
+    use forge_buffer::patch::{BufferPatch, BufferSnapshot};
 
     let fixture = ReviewFixture::open(true).await?;
     let files =
@@ -2216,7 +2217,7 @@ async fn behavior_notes_fold_below_declarations_and_only_changed_signature_lines
         path.into(),
         DeclarationFile::new(path, old.into(), crate::plan::digest(old.as_bytes()), &[])?,
     );
-    let change = "Install the plugin before opening the application and retain the configured runtime until the final request completes.";
+    let change = "- plugin ← Plugin::default()";
     design.parsed_insert(
         path,
         new.into(),
@@ -2224,7 +2225,7 @@ async fn behavior_notes_fold_below_declarations_and_only_changed_signature_lines
             (
                 "app",
                 FunctionBehavior::Change(format!(
-                    "{change}\nKeep the handle alive.\nCollect the result.\nRelease the handle."
+                    "...\n{change}\n+ plugin ← Plugin::configured()\n  open(plugin)\n... # handle result\n+ if plugin.ready\n    ... # existing request handling"
                 )),
             ),
             (
@@ -2233,11 +2234,13 @@ async fn behavior_notes_fold_below_declarations_and_only_changed_signature_lines
             ),
             (
                 "initialize",
-                FunctionBehavior::Change("Install the plugin.".into()),
+                FunctionBehavior::Change("+ configure(requirement)".into()),
             ),
             (
                 "added",
-                FunctionBehavior::Algorithm("if ready\n  return true\nreturn false".into()),
+                FunctionBehavior::Algorithm(
+                    "if ready\n  return true\nrecord_retry()\nreturn false".into(),
+                ),
             ),
         ]
         .map(|(owner, behavior)| FunctionBody {
@@ -2256,56 +2259,8 @@ async fn behavior_notes_fold_below_declarations_and_only_changed_signature_lines
     let (_, _, digest) = files.submit_document_revision(&fixture.session_id, "review", 1, 1)?;
     let mut source =
         files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?;
-    let folded = ReadOnlyPlanReview::new(
-        DocumentId("folded".into()),
-        ViewId("plan".into()),
-        files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?,
-        Default::default(),
-        None,
-    )?
-    .snapshot();
-    let visible_preview = |text| {
-        folded.block.iter().find(|block| {
-            block.text.row(0) == Some(text)
-                && !block.metadata.conceal.iter().any(|conceal| conceal.line)
-        })
-    };
-    for text in [
-        change,
-        "    Keep the handle alive.",
-        "    Collect the result. …",
-    ] {
-        assert!(
-            visible_preview(text)
-                .context("missing behavior preview row")?
-                .metadata
-                .collapse
-                .iter()
-                .any(|fold| fold.closed && fold.id.0.starts_with("plan:calls:"))
-        );
-    }
-    assert!(visible_preview("    Release the handle.").is_none());
-    assert!(visible_preview("  Algorithm").is_none());
-    for text in ["if ready", "      return true", "    return false"] {
-        assert!(
-            !visible_preview(text)
-                .context("missing pseudocode row")?
-                .metadata
-                .collapse
-                .iter()
-                .any(|fold| fold.id.0.starts_with("plan:calls:"))
-        );
-    }
-    for name in ["app", "changed", "initialize", "added"] {
-        let fold = format!(
-            "plan:calls:{}:proposed:{}",
-            crate::plan::digest(path.as_bytes()),
-            crate::plan::digest(name.as_bytes())
-        );
-        source
-            .collapse
-            .insert(forge_buffer::identity::FoldId(fold), false);
-    }
+    crate::service::analyze_plan_source(&mut source, &fixture.service.syntax, || Ok(()), None)
+        .await?;
     let id = DocumentId("review".into());
     let review = ReadOnlyPlanReview::new(
         id.clone(),
@@ -2379,13 +2334,172 @@ async fn behavior_notes_fold_below_declarations_and_only_changed_signature_lines
             .any(|span| span.capture == "ForgeModifyRange")
     );
     assert!(visible("  Change").is_none());
+    assert!(visible("  Algorithm").is_none());
     assert!(visible("}").is_none());
-    let note = visible(change).unwrap();
-    assert!(gutter(note).ends_with("~   └ "));
-    assert!(gutter(visible("    Keep the handle alive.").unwrap()).ends_with("~ "));
-    assert!(gutter(visible("if ready").unwrap()).ends_with("+   └ "));
+    let separator = visible("    ...").context("missing leading elision")?;
+    let marker = |row: &forge_buffer::block::BufferBlock, capture: &str| {
+        row.metadata
+            .gutter
+            .iter()
+            .flat_map(|gutter| &gutter.chunk)
+            .any(|chunk| chunk.capture == capture)
+    };
+    assert!(!gutter(separator).contains('└'));
+    assert!(marker(separator, "ForgeContextBg"));
+    let removal = visible("    plugin ← Plugin::default()").unwrap();
+    let addition = visible("    plugin ← Plugin::configured()").unwrap();
+    for (row, sign, number, background) in [
+        (removal, "- ", "ForgeDeleteLineNr", "ForgeDeleteBg"),
+        (addition, "+ ", "ForgeAddLineNr", "ForgeAddBg"),
+    ] {
+        assert!(gutter(row).ends_with(sign));
+        assert!(marker(row, number));
+        assert!(
+            row.metadata
+                .decoration
+                .iter()
+                .any(|span| span.capture == background)
+        );
+    }
+    let context = visible("    open(plugin)").unwrap();
+    assert!(marker(context, "ForgeContextBg"));
+    let addition_text = addition.text.row(0).unwrap();
+    assert!(addition.metadata.visible_decoration.iter().any(|span| {
+        span.capture == "@type.algorithm"
+            && addition_text.get(span.range.start.column..span.range.end.column) == Some("Plugin")
+    }));
+    assert!([removal, addition, context].into_iter().all(|row| {
+        row.metadata
+            .visible_decoration
+            .iter()
+            .all(|span| span.capture != "@function.call.algorithm")
+    }));
+    for (row, start) in [
+        (separator, 4),
+        (
+            visible("      ... # existing request handling").unwrap(),
+            6,
+        ),
+    ] {
+        assert!(row.metadata.visible_decoration.iter().any(|span| {
+            span.capture == "Comment"
+                && span.range.start.column == start
+                && span.range.end.column == row.text.row(0).unwrap().len()
+        }));
+    }
+    let legacy = visible("    Return the counter.").context("missing historical prose Change")?;
+    assert!(gutter(legacy).ends_with("~ "));
+    assert!(
+        legacy
+            .metadata
+            .visible_decoration
+            .iter()
+            .all(|span| !span.capture.ends_with(".algorithm"))
+    );
+    assert!(gutter(visible("    if ready").unwrap()).ends_with("+ "));
     assert!(gutter(visible("      return true").unwrap()).ends_with("+ "));
-    assert!(gutter(visible("    Release the handle.").unwrap()).ends_with("~ "));
+    assert!(visible("    return false").is_some());
+    let use_text = "    configure(requirement)";
+    let use_row = visible(use_text).unwrap();
+    assert!(gutter(use_row).ends_with("+ "));
+    let position = TextPosition {
+        row: 0,
+        column: use_text.find("requirement").unwrap(),
+    };
+    let target = use_row
+        .metadata
+        .target
+        .iter()
+        .find(|target| target.range.start <= position && position < target.range.end)
+        .context("missing Change navigation target")?;
+    let destination = store.action(
+        DocumentInput {
+            document: snapshot.document.clone(),
+            revision: snapshot.revision,
+            view: ViewId("plan".into()),
+            sequence: InputSequence(1),
+            action: "jump_entity".into(),
+            block: use_row.id.clone(),
+            position,
+            target: Some(target.id.clone()),
+        },
+        None,
+    )?;
+    assert_eq!(destination["jump"]["block"], parameter.id.0);
+    let mut revision = snapshot.revision;
+    let mut sequence = 1;
+    for (signature, rows) in [
+        (
+            "pub fn app() -> App;",
+            &[
+                "    ...",
+                "    plugin ← Plugin::default()",
+                "    plugin ← Plugin::configured()",
+                "    open(plugin)",
+                "    ... # handle result",
+                "    if plugin.ready",
+                "      ... # existing request handling",
+            ][..],
+        ),
+        (
+            "pub fn added();",
+            &[
+                "    if ready",
+                "      return true",
+                "    record_retry()",
+                "    return false",
+            ][..],
+        ),
+        ("pub fn changed() -> u64;", &["    Return the counter."][..]),
+    ] {
+        let signature = visible(signature).context("missing fold signature")?;
+        let fold = signature
+            .metadata
+            .collapse
+            .first()
+            .context("missing body fold")?;
+        assert!(!fold.closed);
+        assert_eq!(fold.opening.block, signature.id);
+        let body = rows
+            .iter()
+            .map(|row| visible(row).context("missing expanded body row"))
+            .collect::<Result<Vec<_>>>()?;
+        let mut toggle = |revision| -> Result<BufferPatch> {
+            sequence += 1;
+            let result = store.action(
+                DocumentInput {
+                    document: snapshot.document.clone(),
+                    revision,
+                    view: ViewId("plan".into()),
+                    sequence: InputSequence(sequence),
+                    action: "toggle_declaration".into(),
+                    block: signature.id.clone(),
+                    position: TextPosition { row: 0, column: 0 },
+                    target: signature
+                        .metadata
+                        .target
+                        .first()
+                        .map(|target| target.id.clone()),
+                },
+                None,
+            )?;
+            assert_eq!(result["jump"]["block"], signature.id.0);
+            Ok(serde_json::from_value(result["patch"].clone())?)
+        };
+        let closed = toggle(revision)?;
+        assert!(
+            body.iter()
+                .all(|row| closed.removed_block.contains(&row.id))
+        );
+        assert!(!closed.removed_block.contains(&signature.id));
+        let open = toggle(closed.next)?;
+        assert!(rows.iter().all(|row| {
+            open.text_edit
+                .iter()
+                .any(|edit| edit.text.wire_rows().contains(row))
+        }));
+        revision = open.next;
+    }
     let baseline = snapshot
         .block
         .iter()

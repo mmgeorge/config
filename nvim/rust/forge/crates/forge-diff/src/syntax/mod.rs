@@ -1,10 +1,15 @@
 //! Exact-source syntax trees share native parsing between highlights and structural context.
 
 mod algorithm;
+mod algorithm_diff;
 mod assets;
 pub use algorithm::{
     AlgorithmDiagnostic, AlgorithmInvocation, AlgorithmReference, AlgorithmValidationError,
     algorithm_reference, algorithm_references, validate_algorithm,
+};
+pub use algorithm_diff::{
+    AlgorithmDiffLine, AlgorithmDiffLineKind, algorithm_diff_reference, algorithm_diff_references,
+    algorithm_diff_source_for_highlighting, classify_algorithm_diff_line, validate_algorithm_diff,
 };
 mod configuration;
 mod context;

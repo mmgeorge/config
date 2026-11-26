@@ -1226,21 +1226,22 @@ reveal nearby context around a declaration outside the displayed changes.
 Regular diffs and PlanReview render enclosing declarations as syntax-highlighted
 source lines. An indented `...` marks omitted source between visible regions.
 New functions and methods contain an `Algorithm` block in academic pseudocode.
-Algorithm blocks highlight control keywords, assignment and comparison operators, literals,
-and identifiers. Plans contain no reference sections, so Algorithm calls, including
-abstract operations such as `delta(time)`, read as plain identifiers. Variables and named fields are white. Only `#` comments use comment coloring.
+Algorithm and Change blocks highlight control keywords, operators, literals, and identifiers.
+PlanReview displays Change additions and removals in the standard diff gutter.
+Calls such as `delta(time)` read as plain identifiers, and constructors retain type highlighting.
+`#` comments and `...` elisions use comment coloring.
 Write operations as calls such as `spawn_square(...)`. Prose statements, prose expressions,
 and adjacent operands without an operator are rejected at submission. Use comma-separated
 tuples and lists, and keep each complete statement on one line.
-Wrapped rows preserve source indentation after the diff gutter. Constructors retain type highlighting.
-Press `.` on an Algorithm parameter name to jump to that parameter in the function signature.
+Wrapped rows preserve source indentation after the diff gutter.
+Press `.` on a parameter name in either behavior block to jump to it in the function signature.
 Press it on a qualified name, a capitalized type or constructor, or a member of a typed
 parameter to jump to its declaration. Ambiguous matches report the candidate names without
-moving the cursor. Jump-back returns to the original Algorithm token.
+moving the cursor. Jump-back returns to the original token.
 Unqualified lowercase calls represent abstract operations and have no declaration
 navigation target, even when a function of that name exists. They do not require
 implementation functions, and a name that resolves to nothing is not an error.
-Reference search (`or`) lists usages in declarations and source, not in Algorithm text.
+Reference search (`or`) lists usages in declarations and source.
 Every declaration a plan introduces, including enum variants and struct fields, needs a
 documentation comment (`///` in Rust, `/** */` in TypeScript) directly above it.
 Assign with `←` or `<-`, compare with `=`, `≠`, `is`, or `is not` (as in `target is none`),
@@ -1266,21 +1267,23 @@ removed declarations across the whole file. A signature change and a planned beh
 change on the same declaration count once. Imports and comments contribute zero.
 Both Public and All show only nonzero counts. A file with zero or unavailable
 declaration counts shows just its status and path. Hunk headings count lines.
-Function bodies start collapsed. Expand a body to see its Algorithm or Change blocks, which
-start open. The caret on each block heading shows its state (`▾` open, `▸` closed).
+Algorithm and Change bodies open in full when you expand a file. Press `Tab` on the
+function signature or inside its body to fold all pseudocode. Press `Tab` on the folded
+signature to reopen the entire body.
 Write constructions explicitly as `Projectile(damage = 1)`, `Velocity(direction)` for a tuple
 struct or variant, or `CombatEntity()` for a marker. Keep construction separate from the
 operation that queues or inserts it. Name the fields and types a function uses inside its
 Algorithm or Change; plans have no Calls, Constructs, or Accesses sections to fill in.
 New plans start with an empty `docs/overview.md`. Submission requires only non-whitespace text in the overview. The global `forge-planning` skill provides a suggested template.
 Submission checks statement syntax and indentation, including branch and loop structure, and
-reports every violation in one response, each with the callable, the Algorithm line, and the
+reports every violation in one response, each with the callable, the behavior block line, and the
 rejected text. Drafts can remain incomplete while edited. If a captured repository file changed, the planning agent receives the refreshed baseline diff and can revise or resubmit the same draft. Forge reports body-only edits even when the declarations are identical. The next successful submission creates the review revision.
-Modified functions use `Change` for behavioral deltas in one or two succinct
-sentences. Expand a function to read its behavior block.
-Collapsed signatures omit the `[changed]` suffix.
-Old and new function versions expand independently. Collapsing an old function
-keeps added declarations outside its body visible.
+Modified functions use `Change` for elided pseudocode diffs. The review colors rows marked
+`-` as removed, rows marked `+` as added, and shared lines as context. A leading `...`
+marks earlier omitted statements. A hunk at the start of the function begins directly
+with its first row.
+Separate old and new signatures have separate folds. When a comparison shares one
+signature, its fold controls both versions of the pseudocode.
 
 Flows appear as the agent wrote them in `plan:flows.md`: one heading per
 independently triggered flow, a one-to-two-line description, and a fenced

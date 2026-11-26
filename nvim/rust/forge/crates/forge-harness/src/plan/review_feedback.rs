@@ -100,7 +100,7 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
                     presentation
                         .behavior_row
                         .iter()
-                        .find(|(_, target)| target.0 == *owner && target.1 == *offset)
+                        .find(|(_, target)| target.owner == *owner && target.offset == *offset)
                         .map(|(row, _)| *row as u32 + 1)
                         .context("reviewed behavior is absent from its saved snapshot")?
                 } else if line > 0 {

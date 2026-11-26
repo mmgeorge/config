@@ -1221,7 +1221,7 @@ mod test {
         let second_block = runtime
             .invoke(edit(
                 3,
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n     score(round)\n+Change\n+  Also record the round.\n*** End Patch",
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n     score(round)\n+Change\n+  + record(round)\n*** End Patch",
             ))
             .await
             .unwrap();
@@ -1243,7 +1243,7 @@ mod test {
         let another_block = runtime
             .invoke(edit(
                 4,
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n   Also record the round.\n+Change\n+  Record it twice.\n*** End Patch",
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n   + record(round)\n+Change\n+  + repeat_record(round)\n*** End Patch",
             ))
             .await
             .unwrap();
@@ -1278,7 +1278,7 @@ mod test {
         runtime
             .invoke(edit(
                 5,
-                "*** Begin Patch\n*** Update File: Game.rs\n@@\n-Change\n-  Also record the round.\n-Change\n-  Record it twice.\n*** End Patch",
+                "*** Begin Patch\n*** Update File: Game.rs\n@@\n-Change\n-  + record(round)\n-Change\n-  + repeat_record(round)\n*** End Patch",
             ))
             .await
             .unwrap();

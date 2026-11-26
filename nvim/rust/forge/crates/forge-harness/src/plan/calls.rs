@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::declaration::DeclarationDiagnosticKind;
 use anyhow::{Context, Result, ensure};
 use forge_diff::syntax::{
-    DeclarationCalls, DeclarationOverview, DeclarationPosition, DeclarationPresentation,
+    AlgorithmReference, DeclarationCalls, DeclarationOverview, DeclarationPosition,
+    DeclarationPresentation, SyntaxError, algorithm_diff_reference, algorithm_diff_references,
+    algorithm_diff_source_for_highlighting, classify_algorithm_diff_line, validate_algorithm,
+    validate_algorithm_diff,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -85,6 +88,53 @@ impl FunctionBehavior {
             Self::Algorithm(text) | Self::Change(text) => text,
         }
     }
+
+    /// Get the first visible token's byte column in an authored behavior row.
+    pub(super) fn statement_column(&self, row: &str) -> usize {
+        let payload = match self {
+            Self::Algorithm(_) => row,
+            Self::Change(_) => classify_algorithm_diff_line(row).payload,
+        };
+        row.len() - payload.trim_start().len()
+    }
+
+    /// Enumerate authored identifier segments using the behavior's source coordinates.
+    pub(super) fn references(&self) -> Result<Vec<AlgorithmReference>, SyntaxError> {
+        match self {
+            Self::Algorithm(text) => forge_diff::syntax::algorithm_references(text),
+            Self::Change(text) => algorithm_diff_references(text),
+        }
+    }
+
+    /// Get mutable access to the authored content for a token edit.
+    pub(super) fn text_mut(&mut self) -> &mut String {
+        match self {
+            Self::Algorithm(text) | Self::Change(text) => text,
+        }
+    }
+}
+
+/// Position of a rendered row within its authored behavior block.
+pub(super) struct BehaviorRow {
+    /// Identity of the callable that owns this row.
+    pub owner: String,
+    /// Zero for the heading and one-based within the authored body.
+    pub offset: u32,
+    /// Behavior heading text.
+    pub category: &'static str,
+    /// Byte column where the authored row starts in the rendered source.
+    pub column: usize,
+}
+
+impl BehaviorRow {
+    /// Get a Change body row at its authored prefix column.
+    pub(super) fn change_line<'row>(&self, text: &'row str) -> Option<&'row str> {
+        if self.category == "Change" && self.offset > 0 {
+            text.get(self.column..)
+        } else {
+            None
+        }
+    }
 }
 
 /// Maps display rows to saved declarations and behavior blocks.
@@ -95,9 +145,7 @@ pub(crate) struct CallPresentation {
     /// Signature-only text used by declaration analysis before synthetic bodies are rendered.
     pub plain: String,
     pub declaration: DeclarationPresentation,
-    pub behavior_row: BTreeMap<usize, (String, u32, &'static str)>,
-    /// Behavior sections keyed by heading row, with their exclusive end row and heading name.
-    pub section: BTreeMap<usize, (usize, &'static str)>,
+    pub(super) behavior_row: BTreeMap<usize, BehaviorRow>,
     /// Rendered body boundaries keyed by their final signature row.
     pub body: BTreeMap<usize, CallBody>,
     pub plain_row: Vec<usize>,
@@ -119,28 +167,32 @@ impl CallPresentation {
         Ok(self.callable.get_or_init(|| callable))
     }
 
-    /// Preserve displayed coordinates while isolating Algorithm rows from native declarations.
+    /// Isolate pseudocode from native declarations while preserving authored byte columns.
     pub(crate) fn algorithm_source(&self) -> Option<String> {
         self.behavior_row
             .values()
-            .any(|(_, _, category)| *category == "Algorithm")
+            .any(|row| row.offset > 0)
             .then(|| {
+                let mut source = String::new();
                 self.declaration
                     .text
                     .lines()
                     .enumerate()
-                    .map(|(row, text)| {
-                        if self
-                            .behavior_row
-                            .get(&row)
-                            .is_some_and(|(_, _, category)| *category == "Algorithm")
-                        {
-                            format!("{text}\n")
-                        } else {
-                            "\n".into()
+                    .for_each(|(row, text)| {
+                        if let Some(behavior) = self.behavior_row.get(&row) {
+                            if behavior.category == "Algorithm" {
+                                source.push_str(text);
+                            } else if let Some(change) = behavior
+                                .change_line(text)
+                                .and_then(algorithm_diff_source_for_highlighting)
+                            {
+                                source.push_str(&text[..behavior.column]);
+                                source.push_str(&change);
+                            }
                         }
-                    })
-                    .collect()
+                        source.push('\n');
+                    });
+                source
             })
     }
 }
@@ -178,7 +230,7 @@ pub(crate) fn combined(path: &str, text: &str, calls: &[FunctionBody]) -> Result
     Ok(insert(path, text, calls, false)?.declaration.text)
 }
 
-/// A signature binding or declaration name selected in an Algorithm.
+/// A signature binding or declaration name selected in a behavior block.
 pub(crate) enum AlgorithmTarget {
     Binding {
         name: String,
@@ -188,7 +240,7 @@ pub(crate) enum AlgorithmTarget {
     Reference { name: String, kind: CallKind },
 }
 
-/// Resolve a parsed Algorithm identifier using signature bindings before declaration names.
+/// Resolve a behavior identifier using signature bindings before declaration names.
 pub(crate) fn algorithm_reference(
     path: &str,
     declarations: &str,
@@ -197,17 +249,17 @@ pub(crate) fn algorithm_reference(
     row: &str,
     column: usize,
 ) -> Result<Option<AlgorithmTarget>> {
-    let Some(FunctionBehavior::Algorithm(algorithm)) = &body.behavior else {
+    let Some(behavior) = &body.behavior else {
         return Ok(None);
     };
     let Some(source) = offset
         .checked_sub(1)
-        .and_then(|offset| algorithm.lines().nth(offset as usize))
+        .and_then(|offset| behavior.text().lines().nth(offset as usize))
     else {
         return Ok(None);
     };
-    // The gutter can own the first line's indent, and a folded line has a summary suffix.
-    let statement = source.trim_start();
+    let statement_column = behavior.statement_column(source);
+    let statement = &source[statement_column..];
     let displayed = row.trim_start();
     let Some(offset_in_statement) = column
         .checked_sub(row.len() - displayed.len())
@@ -215,18 +267,23 @@ pub(crate) fn algorithm_reference(
     else {
         return Ok(None);
     };
-    let column = source.len() - statement.len() + offset_in_statement + 1;
-    let Some(reference) =
-        forge_diff::syntax::algorithm_reference(algorithm, offset as usize, column)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?
-    else {
+    let column = statement_column + offset_in_statement + 1;
+    let reference = match behavior {
+        FunctionBehavior::Algorithm(algorithm) => {
+            forge_diff::syntax::algorithm_reference(algorithm, offset as usize, column)
+        }
+        FunctionBehavior::Change(change) => {
+            algorithm_diff_reference(change, offset as usize, column)
+        }
+    };
+    let Some(reference) = reference.map_err(|error| anyhow::anyhow!("{error:?}"))? else {
         return Ok(None);
     };
     let function = DeclarationCalls::extract(path, declarations, true)
         .map_err(|error| anyhow::anyhow!("{error:?}"))?
         .into_iter()
         .find(|function| function.owner == body.owner)
-        .context("Algorithm callable signature is unavailable")?;
+        .context("Behavior callable signature is unavailable")?;
     Ok(resolve_algorithm_reference(path, &function, reference))
 }
 
@@ -338,7 +395,7 @@ pub(crate) fn present(
         + result
             .behavior_row
             .values()
-            .map(|(owner, _, _)| owner.capacity() + 96)
+            .map(|row| row.owner.capacity() + 104)
             .sum::<usize>()
         + result
             .body
@@ -391,7 +448,6 @@ pub(crate) fn insert(
                     .collect(),
             },
             behavior_row: BTreeMap::new(),
-            section: BTreeMap::new(),
             body: BTreeMap::new(),
             plain_row: (0..text.lines().count()).collect(),
             declaration_row: (0..text.lines().count()).map(|row| (row, row)).collect(),
@@ -414,7 +470,6 @@ pub(crate) fn insert(
     let mut output = String::new();
     let mut source = Vec::new();
     let mut behavior_row = BTreeMap::new();
-    let mut section = BTreeMap::new();
     let mut body = BTreeMap::new();
     let mut declaration_row = BTreeMap::new();
     let lua = path.ends_with(".lua");
@@ -441,16 +496,24 @@ pub(crate) fn insert(
                 let heading = declaration_row[&(function.line as usize - 1)];
                 let body_indent = if review { "  " } else { "" };
                 if let Some(behavior) = &calls.behavior {
-                    let behavior_heading = source.len();
                     for (offset, summary) in std::iter::once(behavior.label())
                         .chain(behavior.text().lines())
                         .enumerate()
                     {
+                        let summary_indent = if offset == 0 { "" } else { "  " };
                         behavior_row.insert(
                             source.len(),
-                            (function.owner.clone(), offset as u32, behavior.label()),
+                            BehaviorRow {
+                                owner: function.owner.clone(),
+                                offset: offset as u32,
+                                category: behavior.label(),
+                                column: if summary.is_empty() {
+                                    0
+                                } else {
+                                    indent.len() + body_indent.len() + summary_indent.len()
+                                },
+                            },
                         );
-                        let summary_indent = if offset == 0 { "" } else { "  " };
                         if summary.is_empty() {
                             output.push('\n');
                         } else {
@@ -463,7 +526,6 @@ pub(crate) fn insert(
                             column: function.column,
                         });
                     }
-                    section.insert(behavior_heading, (source.len(), behavior.label()));
                 }
                 if review {
                     body.insert(
@@ -497,7 +559,6 @@ pub(crate) fn insert(
             source: source.into_iter().map(Some).collect(),
         },
         behavior_row,
-        section,
         body,
         plain_row,
         declaration_row,
@@ -568,42 +629,45 @@ pub(super) fn validate_behaviors(
                 .into_iter()
                 .flatten()
                 .find(|body| body.owner == function.owner);
-            let behavior = body.and_then(|body| body.behavior.as_ref());
-            if let Some(FunctionBehavior::Change(change)) = behavior
-                && change.trim().is_empty()
-            {
-                callable.push(
-                    DeclarationDiagnosticKind::BehaviorBlock,
-                    &function.owner,
-                    format!(
-                        "Change for {} must describe its intended behavior",
-                        function.owner
-                    ),
-                );
-                continue;
-            }
-            let Some(FunctionBehavior::Algorithm(algorithm)) = behavior else {
+            let Some(behavior) = body.and_then(|body| body.behavior.as_ref()) else {
                 continue;
             };
-            if algorithm.trim().is_empty() {
-                callable.push(
-                    DeclarationDiagnosticKind::BehaviorBlock,
-                    &function.owner,
-                    format!(
+            if behavior.text().trim().is_empty() {
+                let reason = match behavior {
+                    FunctionBehavior::Algorithm(_) => format!(
                         "new callable {} requires a nonempty Algorithm block",
                         function.owner
                     ),
+                    FunctionBehavior::Change(_) => format!(
+                        "Change for {} requires a nonempty Algorithm diff",
+                        function.owner
+                    ),
+                };
+                callable.push(
+                    DeclarationDiagnosticKind::BehaviorBlock,
+                    &function.owner,
+                    reason,
                 );
                 continue;
             }
-            match forge_diff::syntax::validate_algorithm(algorithm) {
+            let validation = match behavior {
+                FunctionBehavior::Algorithm(algorithm) => validate_algorithm(algorithm),
+                FunctionBehavior::Change(change) => validate_algorithm_diff(change),
+            };
+            match validation {
                 Ok(_) => {}
                 Err(forge_diff::syntax::AlgorithmValidationError::Invalid(violations)) => {
                     for violation in violations {
                         callable.push(
                             DeclarationDiagnosticKind::AlgorithmSyntax,
                             &function.owner,
-                            violation.to_string(),
+                            match behavior {
+                                FunctionBehavior::Algorithm(_) => violation.to_string(),
+                                FunctionBehavior::Change(_) => format!(
+                                    "Change line {}, column {}: {}",
+                                    violation.line, violation.column, violation.message
+                                ),
+                            },
                         );
                     }
                 }
@@ -614,8 +678,7 @@ pub(super) fn validate_behaviors(
     Ok(diagnostics)
 }
 
-/// Collects one callable's diagnostics at its signature, the closest file position an
-/// Algorithm-relative location has.
+/// Collects one callable's behavior diagnostics at its signature.
 struct CallableDiagnostics<'context> {
     path: &'context str,
     function: &'context forge_diff::syntax::DeclarationCallable,
@@ -978,7 +1041,7 @@ fn report_score(session: &RunSession);
                 FunctionBody {
                     owner: "modified".into(),
                     behavior: Some(FunctionBehavior::Change(
-                        "Preserve the caller contract.".into(),
+                        "- return old\n+ return new".into(),
                     )),
                 },
             ],
@@ -1022,6 +1085,89 @@ fn report_score(session: &RunSession);
                 .iter()
                 .all(|diagnostic| diagnostic.kind == DeclarationDiagnosticKind::AlgorithmSyntax)
         );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.reference == "modified"
+                && diagnostic.reason.contains("Change line 1, column 1")
+        }));
+    }
+
+    #[test]
+    fn change_syntax_preserves_authored_columns_and_omits_legacy_prose() {
+        let bodies = [
+            FunctionBody {
+                owner: "S::save".into(),
+                behavior: Some(FunctionBehavior::Change(
+                    "...\n- if old\n+ if new\n    ... # existing body\n  return value".into(),
+                )),
+            },
+            FunctionBody {
+                owner: "S::load".into(),
+                behavior: Some(FunctionBehavior::Change("Keep the old value.".into())),
+            },
+        ];
+        let presentation = super::insert(
+            "src/lib.rs",
+            "impl S {\n  fn save(&self, value: u32);\n  fn load(&self);\n}\n",
+            &bodies,
+            true,
+        )
+        .unwrap();
+        let syntax = presentation.algorithm_source().unwrap();
+        assert_eq!(
+            syntax
+                .lines()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>(),
+            ["        if old", "        if new", "        return value"]
+        );
+        assert_eq!(
+            syntax.lines().count(),
+            presentation.declaration.text.lines().count()
+        );
+    }
+
+    #[test]
+    fn parsed_change_preserves_the_diff_column_after_a_leading_elision() {
+        let authored = concat!(
+            "fn save(value: u32);\n",
+            "Change\n",
+            "  ...\n",
+            "  - if old\n",
+            "  + if new\n",
+            "      record(value)\n",
+        );
+        let (_, bodies) = super::parse("src/lib.rs", authored).unwrap();
+        let behavior = bodies[0].behavior.as_ref().unwrap();
+        assert_eq!(
+            behavior.text(),
+            "...\n- if old\n+ if new\n    record(value)"
+        );
+        assert!(super::validate_algorithm_diff(behavior.text()).is_ok());
+    }
+
+    #[test]
+    fn change_navigation_maps_displayed_columns_to_a_signature_binding() {
+        let body = FunctionBody {
+            owner: "save".into(),
+            behavior: Some(FunctionBehavior::Change(
+                "- return value\n+ return replace(value)".into(),
+            )),
+        };
+        for (offset, row) in [(1, "    return value"), (2, "    return replace(value)")] {
+            let target = super::algorithm_reference(
+                "src/lib.rs",
+                "fn save(value: u32);\n",
+                &body,
+                offset,
+                row,
+                row.find("value").unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(target, super::AlgorithmTarget::Binding { name, .. } if name == "value")
+            );
+        }
     }
 
     #[test]

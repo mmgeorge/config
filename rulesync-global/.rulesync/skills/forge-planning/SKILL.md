@@ -46,11 +46,11 @@ Repeated capture preserves edits and planned deletions. Restoring a proposal to 
 
 ### Behavior blocks
 
-Add one `Change` (one to two sentences stating what changes) under each modified callable, and one nonempty `Algorithm` under each callable with new behavior. Never attach both to the same callable, and leave unchanged callables without a block. Behavior classification is independent of file renames. Harness validates supplied blocks rather than deriving newness from path history. Name used symbols such as `Draft::revision` inside the block itself, and never add `Calls`, `Constructs`, or `Accesses` sections.
+Add one `Change` under the exact callable whose body changes. Use a full `Algorithm` for new behavior or a rewrite of most of a callable's control flow. Give each callable at most one behavior block and leave unchanged callables without one. Harness validates supplied blocks independently of file renames. Name used symbols such as `Draft::revision` inside the block itself, and omit `Calls`, `Constructs`, and `Accesses` sections.
 
 Place the standalone `Change` or `Algorithm` heading directly below the signature, indent its body, and leave a blank line after the block.
 
-Write each `Algorithm` as compact academic pseudocode, one complete statement per line:
+Write compact academic pseudocode in both block types, with one complete statement per line.
 
 - Assign with `←` or `<-` and compare with `=`, `≠`, `<`, `≤`, `is`, or `is not` (for example, `if target is none`). Combine conditions with `and`, `or`, and `not`, and compute remainders with `%` or `mod`.
 - Express each operation as a call such as `spawn_square(position)`. Lowercase abstract operations need no repository declaration. Name real functions, types, and fields directly when known.
@@ -58,13 +58,21 @@ Write each `Algorithm` as compact academic pseudocode, one complete statement pe
 - Construct values explicitly as `Type(field = value)`, `Velocity(direction)` for a tuple type, or `Marker()`, separate from calls that spawn or insert them.
 - Put explanations only in `#` comments. Prose statements and prose conditions fail grammar validation.
 
-Harness checks syntax, not expression types or algorithm correctness.
+Write `Change` as an elided diff. Use `- ` for a removed statement, `+ ` for an added statement, and two spaces for shared context. Add the statement's own indentation after the prefix. Use `...` at the prefix column between disconnected hunks and before the first hunk when it omits earlier statements. Start directly with the hunk when it begins at the first statement. Omit trailing `...`. Inside a control body, use a prefixed, indented `...` for the omitted statements.
+
+Keep each side of a hunk structurally complete. Give a self-anchoring swap zero lines of context. Include a context statement or unprefixed `#` anchor for an insertion or changed control header. Build a large struct value from its default with field-by-field assignments where the fields clarify the change. For a parameter threaded through repeated calls, show one representative swap and name the remaining scope in a `#` anchor.
+
+Harness checks statement syntax and control structure.
 
 ```text
 /// Persist a draft and publish it to readers.
 pub fn save(&mut self, draft: Draft) -> Result<()>;
 Change
-  Reject drafts whose Draft::revision is older than the stored revision.
+  ...
+  # before storing the draft
+  + if self.is_stale(draft)
+  +   return stale_revision(draft.revision)
+    self.database.store(draft)
 
 /// Revision recorded when a draft is stored.
 pub struct StoredRevision {

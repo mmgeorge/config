@@ -36,7 +36,7 @@ struct AlgorithmLocation {
 struct ResolvedAlgorithmReference {
     symbol: String,
     length: usize,
-    line_width: usize,
+    statement_column: usize,
 }
 
 struct ReferenceSite<'site> {
@@ -356,14 +356,15 @@ impl PlanReferenceIndex {
                 .map(|function| (function.owner.as_str(), function))
                 .collect::<BTreeMap<_, _>>();
             for body in calls.get(path).into_iter().flatten() {
-                let Some(super::FunctionBehavior::Algorithm(source)) = &body.behavior else {
+                let Some(behavior) = &body.behavior else {
                     continue;
                 };
                 let Some(function) = callable.get(body.owner.as_str()) else {
                     continue;
                 };
-                let lines = source.lines().collect::<Vec<_>>();
-                for reference in forge_diff::syntax::algorithm_references(source)
+                let lines = behavior.text().lines().collect::<Vec<_>>();
+                for reference in behavior
+                    .references()
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?
                 {
                     let key = AlgorithmLocation {
@@ -373,7 +374,7 @@ impl PlanReferenceIndex {
                         column: reference.column as u32 - 1,
                     };
                     let length = reference.segment.len();
-                    let width = lines[reference.line - 1].len();
+                    let row = lines[reference.line - 1];
                     let Some(super::calls::AlgorithmTarget::Reference { name, kind }) =
                         super::calls::resolve_algorithm_reference(path, function, reference)
                     else {
@@ -393,7 +394,7 @@ impl PlanReferenceIndex {
                             ResolvedAlgorithmReference {
                                 symbol,
                                 length,
-                                line_width: width,
+                                statement_column: behavior.statement_column(row),
                             },
                         );
                     }
@@ -844,13 +845,14 @@ impl PlanReferenceIndex {
                 .into_iter()
                 .flatten()
                 .find(|body| body.owner == owner)
-                .ok_or_else(|| anyhow::anyhow!("Algorithm owner is unavailable"))?;
-            let Some(super::FunctionBehavior::Algorithm(source)) = &mut body.behavior else {
+                .ok_or_else(|| anyhow::anyhow!("Behavior owner is unavailable"))?;
+            let Some(behavior) = &mut body.behavior else {
                 continue;
             };
+            let source = behavior.text_mut();
             *source = super::source_edit::SourceRevision::new(source)
                 .prepare_tokens(positions, &symbol.name, name)
-                .map_err(|error| anyhow::anyhow!("Algorithm rename token changed: {error:#}"))?
+                .map_err(|error| anyhow::anyhow!("Behavior rename token changed: {error:#}"))?
                 .apply();
         }
         ensure!(
@@ -1073,7 +1075,7 @@ impl PlanReferenceIndex {
         }
     }
 
-    /// Select an Algorithm token after removing its presentation indentation.
+    /// Select a behavior token using the authored indentation and displayed byte column.
     pub(crate) fn selected_algorithm(
         &self,
         anchor: &PlanNavigationAnchor,
@@ -1092,6 +1094,7 @@ impl PlanReferenceIndex {
         if side != "proposed" {
             return None;
         }
+        let column = column.checked_sub(row.len() - row.trim_start().len())?;
         self.algorithm
             .range(
                 AlgorithmLocation {
@@ -1107,7 +1110,7 @@ impl PlanReferenceIndex {
                 },
             )
             .find_map(|(location, reference)| {
-                let selected = column.checked_sub(row.len().checked_sub(reference.line_width)?)?;
+                let selected = column + reference.statement_column;
                 (location.column as usize <= selected
                     && selected < location.column as usize + reference.length)
                     .then_some(reference.symbol.as_str())
@@ -1611,6 +1614,46 @@ const shares = moneyPortion(total, 3);
                 && !parsed.proposed["src/index.ts"].contains("moneyAllocate"),
             "{}",
             parsed.proposed["src/index.ts"]
+        );
+    }
+
+    #[test]
+    fn rename_rewrites_both_sides_and_shared_context_in_change_blocks() {
+        use crate::plan::{FunctionBehavior, FunctionBody};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = scoring_plan();
+        let design = document.design.as_mut().unwrap();
+        let declarations = "pub struct Counter;\nimpl Counter {\n  pub fn tally(&self);\n}\npub fn play(counter: Counter);\n";
+        design.parsed_insert(
+            "counters.rs",
+            declarations.into(),
+            vec![FunctionBody {
+                owner: "play".into(),
+                behavior: Some(FunctionBehavior::Change(
+                    "# Counter::tally\n- counter.tally()\n+ Counter::tally(counter)\n  counter.tally()".into(),
+                )),
+            }],
+        ).unwrap();
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let identity = index
+            .definition
+            .iter()
+            .find(|((path, line, _), _)| path == "counters.rs" && *line == 3)
+            .map(|(_, (identity, _))| identity.clone())
+            .unwrap();
+        let renamed = index
+            .renamed(&document, &identity, "count")
+            .unwrap()
+            .design
+            .unwrap();
+        let parsed = renamed.parsed().unwrap();
+        assert_eq!(
+            parsed.proposed_calls["counters.rs"][0].behavior,
+            Some(FunctionBehavior::Change(
+                "# Counter::tally\n- counter.count()\n+ Counter::count(counter)\n  counter.count()"
+                    .into(),
+            )),
         );
     }
 

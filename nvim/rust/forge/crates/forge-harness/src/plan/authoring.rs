@@ -1195,7 +1195,7 @@ mod tests {
         let authored = "# Source revision\n\n## Objective\nPreserve the caller contract.\n";
         fs::write(overview, authored)?;
         files.authoring_capture("session", &first.record.id, "source.rs")?;
-        let proposed = "pub fn source();\nChange\n  Preserve the caller contract.\n";
+        let proposed = "pub fn source();\nChange\n  + record_source()\n";
         fs::write(
             files
                 .authoring_directory("session", &first.record.id)
@@ -1555,7 +1555,7 @@ mod tests {
         let path = directory.join("files/src/original.rs");
         fs::write(
             &path,
-            "/// Original callable.\npub fn original();\nChange\n  Retain the source identity.\n",
+            "/// Original callable.\npub fn original();\nChange\n  + record_source_identity()\n",
         )?;
         files.authoring_capture("session", &plan_id, "src/original.rs")?;
         assert!(fs::read_to_string(&path)?.contains("Change"));

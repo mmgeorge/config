@@ -10,6 +10,8 @@ Submission validates the plan and saves its Markdown and navigation index. PlanR
 
 Modified files contribute changed chunks and enclosing declaration boundaries through the shared diff presentation. Later revisions send disjoint block patches compared by stable block identity. Rust test declarations follow the visibility of the declaration and its enclosing module. All includes private tests and test-only modules.
 
+PlanReview hides behavior headings and opens `Algorithm` and `Change` bodies in full. A callable's fold hides every pseudocode row and leaves its signature visible. The review highlights pseudocode in both block types, using identifier coloring for abstract operations and repository calls. It parses `Change` prefixes into standard diff gutter signs and row highlights, then displays the statement with its pseudocode indentation. Shared rows use context styling, and elisions use comment highlighting. A row deleted from a previous plan revision uses the removal gutter and tint. Saved prose `Change` blocks remain readable with best-effort styling.
+
 Plan Review reads changed-file headings, counts, and canonical line offsets from the submitted plan. The navigation index records which visibility mode exposes a changed row in each file. Public skips files with only private changes or ordinary imports. All shows files with changes visible under full inspection. Explicit reference jumps can reveal hidden context. For older indexes the host derives visibility from the saved declaration diff when opening the review. The host renders complete change and test bodies on demand and reuses them across folds and section moves in the open document. Reopening requests the remembered expanded files with the initial projection.
 
 Submission stores per-file declaration deltas in the revision's parsed design under `file_summary`, keyed by review path. Classification compares declaration tokens and saved behavior blocks, ignoring imports and comments. Folded and expanded file headings share the delta. Zero, unavailable, and missing deltas produce a bare file heading. When a submitted revision has a summary from the earlier counting rules, opening the review recalculates its delta from the saved sides and keeps it in the open file inventory.
@@ -40,6 +42,8 @@ commands in the help popup; do not add shortcut lists to the winbar or its statu
 text. The help popup reads the registered commands and configured bindings.
 
 `.` and `open` resolve the selected token through saved Tree-sitter coordinates. A target inside the plan is revealed in PlanReview, opening folds and restoring omitted context. A target outside the plan opens its real source buffer.
+
+Go to definition and reviewer rename resolve identifiers in both `Algorithm` and `Change` rows. An authored removal in the current proposal still belongs to that proposal. The rename edits its identifier at the saved byte column, preserving the diff marker.
 
 Source-backed definitions use an already-running project language server on demand. Rust supplies the real path, digest, position, and filetype, Lua loads the file into a hidden buffer and requests `textDocument/definition` without autostarting a server, and Rust validates the document, revision, view, and digest before mapping the result. Requests have a five-second deadline, discard superseded results, and are never cached. No generated source, stub project, or dependency download is involved.
 

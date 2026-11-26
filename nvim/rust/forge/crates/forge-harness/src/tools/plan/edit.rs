@@ -39,16 +39,20 @@ pub(super) fn definition() -> ControlToolDefinition {
                 Project files: paths are project-relative. Source files contain semantic structure: \
                 signatures and comments, never executable bodies. Each callable \
                 carries at most one behavior block: a nonempty Algorithm classifies new behavior, a \
-                one-to-two-sentence Change classifies modified behavior, and no block claims unchanged \
+                Change with an elided Algorithm diff classifies modified behavior, and no block claims unchanged \
                 behavior. Harness validates supplied blocks, not their historical classification. Algorithm statements are one per line: assignments \
                 with ←, calls such as process(item), comparisons such as `target is none`, if/otherwise, \
                 for each item in items, while, and return; explanations belong \
-                only in # comments, and statements inside a control block are indented under it. Place \
+                only in # comments, and statements inside a control block are indented under it. In Change, \
+                use `- ` for removals, `+ ` for additions, and two spaces for context, followed by the statement's \
+                own indentation. Use `...` at the prefix column between hunks and before the first hunk only \
+                if earlier statements are omitted. Use indented `...` after a diff prefix to elide a control body. \
+                Use unprefixed # comments as optional anchors. Place \
                 the behavior block directly below the signature under a standalone Algorithm or Change \
                 heading; plan_read shows its content indented, and content written flush with its heading \
                 ends at the next blank line. Write what the callable uses inside the block itself; source \
                 files have no Calls, Constructs, or Accesses sections. For example:\n\
-                pub fn existing();\nChange\n  Preserve the existing result while recording the update.\n\
+                pub fn existing(result: Result);\nChange\n  - return result\n  + return record_update(result)\n\
                 pub fn added();\nAlgorithm\n  return none\n\
                 Document every new declaration, including enum variants and fields, with a doc comment \
                 (/// in Rust), without starting comments with Returns. Source file edits are \
