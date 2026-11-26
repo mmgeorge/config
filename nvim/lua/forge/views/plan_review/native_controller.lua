@@ -258,7 +258,9 @@ local function action(review, name)
       and result.anchor.target.target_type == "dependency" then
       require("forge.views.plan_review.dependency_browser").open(result.anchor.target.name)
     elseif type(result.source) == "table" then
-      effect(review, captured, { kind = "open_file", path = result.source.path, row = result.source.line - 1, column = result.source.column or 0 })
+      local file_heading = name == "open" and captured.block:match("^plan:design:file:[^:]+$") ~= nil
+      effect(review, captured, { kind = "open_file", path = result.source.path, row = result.source.line - 1,
+        column = result.source.column or 0, layout = file_heading and "tab" or nil })
     else notifications.info("This target has no captured source definition", "ForgePlanReview") end
   end
   review.owner.action(name, receive)

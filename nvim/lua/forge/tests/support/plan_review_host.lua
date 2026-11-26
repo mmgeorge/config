@@ -29,6 +29,7 @@ local plan_review_host = {}
 ---@field metadata? table<integer, table> recorded host decorations by source line
 ---@field session_id? string defaults to "plan-session"
 ---@field rename? table the `rename` result of a `rename_entity` action
+---@field open_path? table<string, string> workspace files by their heading block ID
 
 ---@class PendingPlanAnswer
 ---@field question_id string
@@ -79,6 +80,11 @@ function plan_review_host.start(options)
       end
       if params.operation == "plan_action" and params.input.action == "rename_entity" and options.rename then
         callback({ rename = vim.tbl_extend("force", options.rename, { expected_version = host.version }) })
+        return
+      end
+      if params.operation == "plan_action" and params.input.action == "open" and options.open_path then
+        local path = assert(options.open_path[params.input.block], "unexpected file heading")
+        callback({ source = { path = path, line = 1, column = 0 } })
         return
       end
       if params.operation == "plan_action" then

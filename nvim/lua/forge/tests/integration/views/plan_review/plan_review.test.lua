@@ -813,6 +813,27 @@ T["marking a file viewed keeps the next file in place on screen"] = function()
   MiniTest.expect.equality(vim.fn.winsaveview().topline, 70)
 end
 
+T["Enter opens modified and deleted files from their plan headings"] = function()
+  local modified = temp.file("modified.rs", { "pub fn modified() {}" })
+  local deleted = temp.file("deleted.rs", { "pub fn deleted() {}" })
+  local first, second = "plan:design:file:modified", "plan:design:file:deleted"
+  local host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua").start({
+    lines = { "Modified modified.rs", "Deleted deleted.rs" }, block_id = { first, second },
+    open_path = { [first] = modified, [second] = deleted },
+  })
+  local review = host.open()
+  for row, path in ipairs({ modified, deleted }) do
+    vim.api.nvim_set_current_win(review.win)
+    vim.api.nvim_win_set_cursor(review.win, { row, 0 })
+    keymap.invoke("<CR>", { buffer = review.buf })
+    local destination = vim.api.nvim_get_current_buf()
+    MiniTest.expect.equality(vim.fs.normalize(vim.api.nvim_buf_get_name(destination)), vim.fs.normalize(path))
+    MiniTest.expect.equality(vim.api.nvim_win_get_cursor(0), { 1, 0 })
+    MiniTest.expect.equality(vim.api.nvim_win_get_buf(review.win), review.buf)
+    vim.cmd("tabclose")
+  end
+end
+
 T["behavior-only signature occupies one display row and keeps baseline comments"] = function()
   local marks = vim.json.decode(table.concat(vim.fn.readfile(
     "nvim/lua/forge/tests/fixtures/protocol/plan-review-behavior-signature.json"), "\n"))

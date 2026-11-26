@@ -1250,6 +1250,7 @@ compute remainders with `%` or `mod`, and loop with
 PlanReview starts with each file folded in Changes and Tests. Press `Tab` on a file heading to
 load its complete changes or tests on first unfold. Changes shows a file when it has changed rows
 visible in the current mode. Switch to All to review private declarations and ordinary imports.
+Press `Enter` on a modified or deleted file heading to open its workspace file in a new tab.
 Reopening the same plan in the same Neovim process restores each file's fold state,
 including across revisions. Changes and Tests remember their file folds independently.
 Under Changes, each file starts in **Unviewed Changes**. Press `S` on a file heading or any

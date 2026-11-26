@@ -374,12 +374,15 @@ impl PlanReviewStore {
             .get(&input.document)
             .context("plan review document is closed")?;
         admission.check()?;
-        document.check_input(input)?;
         if document
-            .input_target(input)?
+            .check_input(input)?
             .and_then(|id| document.target.get(&id))
             .is_some_and(|anchor| {
-                matches!(anchor.target, super::PlanReviewTarget::InlineSymbol { .. })
+                matches!(
+                    anchor.target,
+                    super::PlanReviewTarget::File { .. }
+                        | super::PlanReviewTarget::InlineSymbol { .. }
+                )
             })
         {
             return Ok(());
@@ -1670,14 +1673,18 @@ impl ReadOnlyPlanReview {
                 serde_json::json!({"message":"Use go to definition on this inline reference"}),
             );
         }
-        if self.source.document.design.is_some() {
+        if let Some(design) = &self.source.document.design {
             ensure!(
                 matches!(action, "jump_entity" | "open"),
                 "this design action is unavailable"
             );
             if let PlanReviewTarget::File { path } = &anchor.target {
+                let source = self.source.workspace.join(path);
+                if design.baseline.contains_key(path) && !source.is_file() {
+                    return Ok(serde_json::json!({"message":format!("Workspace file is no longer available: {path}")}));
+                }
                 return Ok(
-                    serde_json::json!({"source":{"path":self.source.workspace.join(path),"line":1,"column":0}}),
+                    serde_json::json!({"source":{"path":source,"line":1,"column":0}}),
                 );
             }
             return self.jump_declaration(&anchor, row, column);
