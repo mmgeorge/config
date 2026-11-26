@@ -5,7 +5,41 @@ use tree_sitter::{Node, Parser};
 use super::declaration::{DeclarationOverview, declaration_surrogate};
 use crate::syntax::{ConfigurationFormat, SyntaxError, SyntaxLanguage};
 
+/// Independent declaration review filters. The default shows all declarations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeclarationFilter {
+    pub public_only: bool,
+    pub show_imports: bool,
+    pub show_tests: bool,
+}
+
+impl DeclarationFilter {
+    /// Include all categories when resolving a reference outside the current view.
+    pub const ALL: Self = Self {
+        public_only: false,
+        show_imports: true,
+        show_tests: true,
+    };
+
+    /// Enumerate filter combinations in their cache index order.
+    pub fn modes() -> [Self; 8] {
+        std::array::from_fn(|index| Self {
+            public_only: index & 1 != 0,
+            show_imports: index & 2 != 0,
+            show_tests: index & 4 != 0,
+        })
+    }
+
+    /// Locate this filter's result in a cache of all combinations.
+    pub fn index(self) -> usize {
+        usize::from(self.public_only)
+            | (usize::from(self.show_imports) << 1)
+            | (usize::from(self.show_tests) << 2)
+    }
+}
+
 /// Classifies formatted declaration rows without changing saved declaration coordinates.
+#[derive(Clone)]
 pub struct DeclarationVisibility {
     /// Row admission flags in the original formatted declaration document.
     pub rows: Vec<bool>,
@@ -68,13 +102,13 @@ impl DeclarationVisibility {
     /// Trait members and enum variants inherit
     /// their owner's visibility. TypeScript exports expose members except private and
     /// protected members. Lua exposes nonlocal bindings and the returned table.
-    pub fn analyze(path: &str, text: &str, public_only: bool) -> Result<Self, SyntaxError> {
+    pub fn analyze_modes(path: &str, text: &str) -> Result<[Self; 8], SyntaxError> {
         if ConfigurationFormat::for_path(path).is_some() {
             DeclarationOverview::parse(path, text)?;
-            return Ok(Self {
+            return Ok(std::array::from_fn(|_| Self {
                 rows: vec![true; text.lines().count()],
                 replacement: HashMap::new(),
-            });
+            }));
         }
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
@@ -91,11 +125,24 @@ impl DeclarationVisibility {
                 "invalid declaration visibility syntax".into(),
             ));
         }
+        Ok(DeclarationFilter::modes().map(|filter| {
+            Self::inspection(path, text, &surrogate, language, tree.root_node(), filter)
+        }))
+    }
+
+    fn inspection(
+        path: &str,
+        text: &str,
+        surrogate: &str,
+        language: SyntaxLanguage,
+        root: Node<'_>,
+        filter: DeclarationFilter,
+    ) -> Self {
         let mut visibility = Visibility {
             language,
             source: false,
-            text: &surrogate,
-            rows: vec![!public_only; text.lines().count()],
+            text: surrogate,
+            rows: vec![!filter.public_only; text.lines().count()],
             types: HashMap::new(),
             replacement: HashMap::new(),
             lines: text.lines().collect(),
@@ -103,9 +150,24 @@ impl DeclarationVisibility {
                 .lines()
                 .find_map(|line| line.trim().strip_prefix("return ").map(str::to_owned)),
         };
-        if public_only {
-            visibility.collect_types(tree.root_node());
-            visibility.group(tree.root_node(), Scope::Top);
+        if filter.public_only {
+            visibility.collect_types(root);
+            visibility.group(root, Scope::Top);
+        }
+        if !filter.show_tests
+            && language == SyntaxLanguage::Rust
+            && (path.split('/').any(|part| part == "tests")
+                || root.named_children(&mut root.walk()).any(|item| {
+                    item.kind() == "inner_attribute_item"
+                        && surrogate[item.byte_range()]
+                            .chars()
+                            .filter(|character| !character.is_whitespace())
+                            .eq("#![cfg(test)]".chars())
+                }))
+        {
+            visibility.rows.fill(false);
+        } else if filter != DeclarationFilter::ALL {
+            visibility.filter_items(root, filter);
         }
         let lines: Vec<_> = text.lines().collect();
         let mut preceding = false;
@@ -124,11 +186,11 @@ impl DeclarationVisibility {
                 following |= visibility.rows[row];
             }
         }
-        visibility.elide_trait_implementation(tree.root_node());
-        Ok(Self {
+        visibility.elide_trait_implementation(root);
+        Self {
             rows: visibility.rows,
             replacement: visibility.replacement,
-        })
+        }
     }
 }
 
@@ -153,6 +215,67 @@ struct Visibility<'text> {
 }
 
 impl Visibility<'_> {
+    fn filter_items(&mut self, node: Node<'_>, filter: DeclarationFilter) {
+        let mut attached = None;
+        let mut test = false;
+        let mut preceding_end = None;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let kind = child.kind();
+            let start_row = child.start_position().row;
+            if !test && preceding_end.is_some_and(|end| start_row > end + 1) {
+                attached = None;
+            }
+            preceding_end = Some(child.end_position().row);
+            if matches!(
+                kind,
+                "attribute_item" | "line_comment" | "block_comment" | "comment"
+            ) {
+                attached.get_or_insert(start_row);
+                if kind == "attribute_item" && self.language == SyntaxLanguage::Rust {
+                    let attribute: String = self.text[child.byte_range()]
+                        .chars()
+                        .filter(|character| !character.is_whitespace())
+                        .collect();
+                    test |= attribute == "#[cfg(test)]"
+                        || attribute
+                            .strip_prefix("#[")
+                            .and_then(|name| name.split(['(', ']']).next())
+                            .and_then(|name| name.rsplit("::").next())
+                            .is_some_and(|name| matches!(name, "test" | "rstest"));
+                }
+                continue;
+            }
+            let start = attached.take().unwrap_or(start_row);
+            let tested = std::mem::take(&mut test);
+            let import = matches!(
+                kind,
+                "use_declaration" | "extern_crate_declaration" | "import_statement"
+            ) || self.language == SyntaxLanguage::Lua
+                && is_lua_import(child, self.text);
+            let show = if tested && !filter.show_tests {
+                Some(false)
+            } else if import {
+                Some(
+                    filter.show_imports
+                        && (node.parent().is_none()
+                            || self.rows.get(node.start_position().row) == Some(&true)),
+                )
+            } else {
+                None
+            };
+            if let Some(show) = show {
+                let end = child.end_position();
+                let boundary = (end.row + usize::from(end.column > 0)).min(self.rows.len());
+                if start < boundary {
+                    self.rows[start..boundary].fill(show);
+                }
+            } else {
+                self.filter_items(child, filter);
+            }
+        }
+    }
+
     fn elide_trait_implementation(&mut self, node: Node<'_>) {
         if self.language == SyntaxLanguage::Rust
             && node.kind() == "impl_item"
@@ -457,4 +580,38 @@ impl Visibility<'_> {
         self.mark(node);
         true
     }
+}
+
+fn is_lua_import(node: Node<'_>, source: &str) -> bool {
+    let require_call = |node: Node<'_>| {
+        node.kind() == "function_call"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| &source[name.byte_range()] == "require")
+    };
+    if require_call(node)
+        && node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), "chunk" | "block"))
+    {
+        return true;
+    }
+    let assignment = match node.kind() {
+        "assignment_statement" => Some(node),
+        "variable_declaration" => node
+            .named_child(0)
+            .filter(|child| child.kind() == "assignment_statement"),
+        _ => None,
+    };
+    let Some(assignment) = assignment else {
+        return false;
+    };
+    let mut cursor = assignment.walk();
+    assignment
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "expression_list")
+        .any(|values| {
+            values.named_child_count() > 0
+                && values.named_children(&mut values.walk()).all(require_call)
+        })
 }

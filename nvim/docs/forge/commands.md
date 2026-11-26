@@ -129,8 +129,8 @@ the composer available for editing.
 Semantic presentation shows declaration signatures. A `~` marker also identifies
 body-only edits when the signature remains unchanged. A collapsed body shows its
 change count, such as `pub fn update() { … 2 changes }`. Unfold the declaration to
-read its source diff. PlanReview starts in Public visibility and supports Semantic
-presentation only, so it binds `ov` without `ox`. Its unfolded declarations contain
+read its source diff. PlanReview starts with All declarations and hides tests and imports.
+It supports Semantic presentation only. Its unfolded declarations contain
 the saved Change or Algorithm. Plans store no Calls, Constructs, or Accesses, so
 unchanged functions show only their signatures.
 
@@ -1249,7 +1249,7 @@ compute remainders with `%` or `mod`, and loop with
 `for each item in items` or `for item in items`.
 PlanReview starts with each file folded in Changes and Tests. Press `Tab` on a file heading to
 load its complete changes or tests on first unfold. Changes shows a file when it has changed rows
-visible in the current mode. Switch to All to review private declarations and ordinary imports.
+visible under the current filters.
 Press `Enter` on a modified or deleted file heading to open its workspace file in a new tab.
 Reopening the same plan in the same Neovim process restores each file's fold state,
 including across revisions. Changes and Tests remember their file folds independently.
@@ -1361,9 +1361,10 @@ Names absent from the plan fall back to exact workspace symbol lookup through
 running project language servers. Removed declarations do not fall back to old
 source definitions.
 
-Inside PlanReview, `ov` toggles All/Public declaration visibility. Plan review
-supports Semantic presentation only and does not bind `ox`. Configure visibility
-through `keymaps.diff.toggle_visibility`.
+PlanReview has three independent filters. `ov` switches between All and Public declarations.
+`ot` shows or hides the Tests section and Rust test declarations. `oi` shows or hides imports.
+Configure the keys through `keymaps.diff.toggle_visibility`, `keymaps.plan_review.toggle_tests`,
+and `keymaps.plan_review.toggle_imports`.
 
 Inside PlanReview, `ol` shows the captured definition of the entity under the
 cursor, and `os` shows the canonical plan document as JSON. Both open read-only

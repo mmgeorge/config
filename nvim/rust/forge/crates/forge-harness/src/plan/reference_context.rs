@@ -112,7 +112,7 @@ impl ReferenceContext {
                     focused: None,
                 },
                 &source.declaration_syntax,
-                false,
+                forge_diff::syntax::DeclarationFilter::ALL,
                 None,
                 &HashSet::new(),
                 None,

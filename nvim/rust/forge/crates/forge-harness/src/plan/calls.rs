@@ -139,7 +139,7 @@ impl BehaviorRow {
 
 /// Maps display rows to saved declarations and behavior blocks.
 pub(crate) struct CallPresentation {
-    visibility: [OnceLock<forge_diff::syntax::DeclarationVisibility>; 2],
+    visibility: OnceLock<[forge_diff::syntax::DeclarationVisibility; 8]>,
     folding: OnceLock<Vec<forge_diff::syntax::DeclarationFold>>,
     callable: OnceLock<Vec<forge_diff::syntax::DeclarationCallable>>,
     /// Signature-only text used by declaration analysis before synthetic bodies are rendered.
@@ -566,22 +566,19 @@ pub(crate) fn insert(
 }
 
 /// Apply declaration visibility to synthetic call rows through their owning signature.
-pub(crate) fn visibility(
+pub(crate) fn visibility<'source>(
     path: &str,
-    presentation: &CallPresentation,
-    public_only: bool,
-) -> Result<forge_diff::syntax::DeclarationVisibility> {
-    let cached = &presentation.visibility[usize::from(public_only)];
+    presentation: &'source CallPresentation,
+    filter: forge_diff::syntax::DeclarationFilter,
+) -> Result<&'source forge_diff::syntax::DeclarationVisibility> {
+    let cached = &presentation.visibility;
     if let Some(visibility) = cached.get() {
-        return Ok(forge_diff::syntax::DeclarationVisibility {
-            rows: visibility.rows.clone(),
-            replacement: visibility.replacement.clone(),
-        });
+        return Ok(&visibility[filter.index()]);
     }
-    let visibility =
-        forge_diff::syntax::DeclarationVisibility::analyze(path, &presentation.plain, public_only)
+    let modes =
+        forge_diff::syntax::DeclarationVisibility::analyze_modes(path, &presentation.plain)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let result = forge_diff::syntax::DeclarationVisibility {
+    let modes = modes.map(|visibility| forge_diff::syntax::DeclarationVisibility {
         rows: presentation
             .plain_row
             .iter()
@@ -597,12 +594,8 @@ pub(crate) fn visibility(
                     .map(|row| (*row, text.clone()))
             })
             .collect(),
-    };
-    let _ = cached.set(forge_diff::syntax::DeclarationVisibility {
-        rows: result.rows.clone(),
-        replacement: result.replacement.clone(),
     });
-    Ok(result)
+    Ok(&cached.get_or_init(|| modes)[filter.index()])
 }
 
 /// Check every behavior section at submission and return all violations together, so one

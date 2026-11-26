@@ -39,7 +39,8 @@ local plan_review_host = {}
 ---@param options PlanReviewHostOptions
 function plan_review_host.start(options)
   local session_id = options.session_id or "plan-session"
-  local host = { annotation = {}, answers = {}, actions = {}, requests = {}, saves = 0, revision = 0, public_only = true,
+  local host = { annotation = {}, answers = {}, actions = {}, requests = {}, saves = 0, revision = 0,
+    public_only = false, show_tests = false, show_imports = false,
     version = 1 }
   local client = require("forge.client")
   stub(client, "host_get_generation", function() return 1 end)
@@ -66,7 +67,7 @@ function plan_review_host.start(options)
       block[index] = { id = id, text = { text }, metadata = metadata }
     end
     return { version = host.version, saved_source_digest = "saved:" .. host.version, annotation = vim.deepcopy(host.annotation),
-      public_only = host.public_only, source_row = source_row,
+      public_only = host.public_only, show_tests = host.show_tests, show_imports = host.show_imports, source_row = source_row,
       snapshot = { document = document, revision = host.revision, block = block } }
   end
 
@@ -88,7 +89,8 @@ function plan_review_host.start(options)
         return
       end
       if params.operation == "plan_action" then
-        assert(params.input.action == "toggle_visibility" or params.input.action == "viewed"
+        assert(params.input.action == "toggle_visibility" or params.input.action == "toggle_tests"
+          or params.input.action == "toggle_imports" or params.input.action == "viewed"
           or params.input.action == "unviewed", "unexpected plan action " .. tostring(params.input.action))
         host.actions[#host.actions + 1] = { input = params.input, selected_files = params.selected_files, callback = callback }
         return
@@ -147,7 +149,8 @@ function plan_review_host.start(options)
       pending.callback(nil, "plan review input revision changed")
       return
     end
-    host.public_only = not host.public_only
+    local field = ({ toggle_visibility = "public_only", toggle_tests = "show_tests", toggle_imports = "show_imports" })[pending.input.action]
+    host[field] = not host[field]
     host.revision = host.revision + 1
     local result = presentation(pending.input.document)
     result.patch = {}

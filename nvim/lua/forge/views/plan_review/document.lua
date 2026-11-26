@@ -9,6 +9,7 @@ local node_projection = require("forge.node_projection")
 
 ---@type table<string, table<string, boolean>>
 local file_fold_choices = {}
+local visibility_action = { toggle_visibility = true, toggle_tests = true, toggle_imports = true }
 
 ---@class ForgePlanReviewUpdate
 ---@field snapshot? {document: string, revision: integer, block: table[]}
@@ -16,6 +17,8 @@ local file_fold_choices = {}
 ---@field source_edit {upsert: {id: string, source_line: integer, test_change?: string, test_file?: string, test_summary?: table<string, integer>}[], remove: string[]}
 ---@field annotation {id: string, source: {start_line: integer, end_line: integer, body: string}, kind?: string, parent_id?: string}[]
 ---@field public_only boolean
+---@field show_tests boolean
+---@field show_imports boolean
 ---@field saved_source_digest string
 ---@field version integer
 ---@field checks {id: string, name: string, stage: string, enabled: boolean, available: boolean, reason?: string}[]
@@ -31,7 +34,13 @@ local file_fold_choices = {}
 function M.attach(options, callback)
   local open_started = options.open_started or perf.now()
   local plan_key = options.session_id .. "\0" .. options.plan.id
-  local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_get_generation(), views = {}, pending_operation = {} }
+  local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_get_generation(), views = {}, pending_operation = {},
+    public_only = false, show_tests = false, show_imports = false }
+  local function update_filters(result)
+    for _, field in ipairs({ "public_only", "show_tests", "show_imports" }) do
+      if type(result[field]) == "boolean" then owner[field] = result[field] end
+    end
+  end
   local folded_thread
   local symbol_namespace = vim.api.nvim_create_namespace("forge.plan_review.symbols")
   local delivery = {}
@@ -46,7 +55,7 @@ function M.attach(options, callback)
   local function dispatch(pending)
     local params, receive = pending.params, pending.receive
     local captured = params.input
-    if captured and (captured.action == "viewed" or captured.action == "unviewed" or captured.action == "toggle_visibility")
+    if captured and (captured.action == "viewed" or captured.action == "unviewed" or visibility_action[captured.action])
       and pending.digest == owner.saved_source_digest and owner.replica.block[captured.block] then
       captured.revision = owner.replica.revision
     end
@@ -603,7 +612,8 @@ function M.attach(options, callback)
     }, function() return apply_projection(opened, source) end)
     if applied.kind ~= "Applied" then options.recovery = nil return nil, applied.reason or applied.kind end
     options.plan = plan
-    owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
+    update_filters(opened)
+    owner.saved_source_digest, owner.version = opened.saved_source_digest, opened.version
     owner.checks = opened.checks or {}
     sync_view_capture()
     owner.sync_editability()
@@ -742,7 +752,8 @@ function M.attach(options, callback)
     mark_phase("view_restore_ms")
     local render_ms = perf.elapsed_ms(render_started)
     if adopted.kind ~= "Applied" then callback(nil, adopted.kind) return end
-    owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
+    update_filters(opened)
+    owner.saved_source_digest, owner.version = opened.saved_source_digest, opened.version
     owner.checks = opened.checks or {}
     owner.ready = true
     if options.configure_view then options.configure_view(owner.view, owner) end
@@ -854,7 +865,7 @@ function M.attach(options, callback)
       if options.notice then options.notice("Wait for the planned test deletion to finish") end
       return false
     end
-    if (action == "toggle_visibility" or action == "toggle_declaration" or action == "jump_entity" or action == "open" or action:find("jump_symbol:", 1, true) == 1 or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
+    if (visibility_action[action] or action == "toggle_declaration" or action == "jump_entity" or action == "open" or action:find("jump_symbol:", 1, true) == 1 or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
       if options.notice then options.notice("Save plan annotations before changing the source projection") end
       return false
     end
@@ -896,7 +907,7 @@ function M.attach(options, callback)
       -- cursor move made this capture stale. Dropping it would leave every later input on an
       -- older revision than the host's. Staleness suppresses only the cursor effect and callback.
       local patched = not error and result.patch and result.patch ~= vim.NIL
-      if not error and not patched and result.public_only ~= nil then owner.public_only = result.public_only end
+      if not error and not patched then update_filters(result) end
       if (patched or current and not error and type(result.jump) == "table") and alive()
         and captured.document == owner.document and (patched and result.patch.base or captured.revision) == owner.replica.revision then
         if current and action == "toggle_declaration" then
@@ -913,7 +924,7 @@ function M.attach(options, callback)
           return
         end
         captured = applied
-        if result.public_only ~= nil then owner.public_only = result.public_only end
+        update_filters(result)
       end
       if settled then settled(result, error) return end
       if not current then

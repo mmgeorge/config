@@ -36,7 +36,7 @@ pub use configuration::ConfigurationFormat;
 pub use declaration::{
     DeclarationComment, DeclarationOverview, DeclarationPosition, DeclarationPresentation,
 };
-pub use visibility::DeclarationVisibility;
+pub use visibility::{DeclarationFilter, DeclarationVisibility};
 mod outline;
 mod service;
 mod structure;

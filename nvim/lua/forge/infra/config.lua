@@ -112,6 +112,8 @@
 
 ---@class ForgePlanReviewKeymapConfig
 ---@field checks ForgeKeymap
+---@field toggle_tests ForgeKeymap
+---@field toggle_imports ForgeKeymap
 ---@field delete_tests ForgeKeymap
 ---@field open ForgeKeymap
 ---@field jump_entity ForgeKeymap
@@ -340,6 +342,8 @@ M.defaults = {
     },
     plan_review = {
       checks = "oc",
+      toggle_tests = "ot",
+      toggle_imports = "oi",
       delete_tests = "j",
       references = { "or", "of" },
       visual_line_with_gutter = "W",

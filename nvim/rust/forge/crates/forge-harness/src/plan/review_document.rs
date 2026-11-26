@@ -12,7 +12,7 @@ use forge_buffer::input::DocumentInput;
 use forge_buffer::patch::BufferSnapshot;
 use forge_buffer::view::DocumentViews;
 use forge_buffer::width::WidthProfile;
-use forge_diff::view::{DiffCapabilities, DiffViewAction, DiffViewState, DiffVisibility};
+use forge_diff::view::{DiffCapabilities, DiffPresentation, DiffViewOptions, DiffVisibility};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -306,8 +306,9 @@ impl PlanReviewStore {
         let source_edit = document.source_edit();
         let opened = serde_json::json!({"snapshot":document.snapshot(), "saved_source_digest":document.saved_digest(),
             "plan_id":document.source.document.plan_id, "version":document.source.document.version,
-            "path":document.source.path, "public_only":document.source.public_only,
-            "diff_view":document.diff_view.committed(), "diff_capabilities":DiffCapabilities::SemanticOnly,
+            "path":document.source.path, "public_only":document.source.filter.public_only,
+            "show_tests":document.source.filter.show_tests, "show_imports":document.source.filter.show_imports,
+            "diff_view":document.diff_view(), "diff_capabilities":DiffCapabilities::SemanticOnly,
             "annotation":document.annotation.annotation(), "source_edit":source_edit,
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).transpose()?.unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
@@ -622,9 +623,15 @@ impl PlanReviewStore {
             .snapshot();
             return Ok(serde_json::json!({"schema":snapshot}));
         }
-        if action == "toggle_visibility" {
+        let filter_toggle = match action.as_str() {
+            "toggle_visibility" => Some(FilterToggle::Public),
+            "toggle_tests" => Some(FilterToggle::Tests),
+            "toggle_imports" => Some(FilterToggle::Imports),
+            _ => None,
+        };
+        if let Some(toggle) = filter_toggle {
             document.validate_input(input)?;
-            return document.toggle_visibility();
+            return document.toggle_visibility(toggle);
         }
         if action == "toggle_declaration" {
             let owner = input.block.clone();
@@ -679,8 +686,13 @@ impl PlanReviewStore {
     }
 }
 
+enum FilterToggle {
+    Public,
+    Tests,
+    Imports,
+}
+
 pub(crate) struct ReadOnlyPlanReview {
-    diff_view: DiffViewState,
     reference: Mutex<HashMap<bool, super::references::PlanReferenceIndex>>,
     reference_context: Mutex<HashMap<bool, super::reference_context::ReferenceContext>>,
     focused_annotation: Option<String>,
@@ -960,7 +972,7 @@ impl EditablePlanReview<'_> {
                 && source.document.version > document.source.document.version,
             "plan revision is stale"
         );
-        source.public_only = document.source.public_only;
+        source.filter = document.source.filter;
         source.revealed = document
             .source
             .revealed
@@ -1010,7 +1022,7 @@ impl EditablePlanReview<'_> {
             }
             _ => false,
         };
-        let (block, target) = if tests_only {
+        let (block, target) = if tests_only && source.filter.show_tests {
             super::review_projection::update_tests(
                 &source,
                 &document.source.rendered,
@@ -1111,7 +1123,8 @@ impl EditablePlanReview<'_> {
         let response = trace.map(|trace| trace.stage("review.build_delivery"));
         let source_edit = document.source_edit();
         let result = serde_json::json!({"patch":patch, "source_edit":source_edit,
-            "annotation":document.annotation.annotation(), "public_only":document.source.public_only,
+            "annotation":document.annotation.annotation(), "public_only":document.source.filter.public_only,
+            "show_tests":document.source.filter.show_tests, "show_imports":document.source.filter.show_imports,
             "saved_source_digest":document.saved_digest(), "version":document.source.document.version,
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).transpose()?.unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
@@ -1556,7 +1569,7 @@ impl ReadOnlyPlanReview {
                     focused: None,
                 },
                 &self.source.declaration_syntax,
-                self.source.public_only,
+                self.source.filter,
                 self.source.trace.as_ref(),
                 &self.source.revealed,
                 self.source.files.as_ref(),
@@ -2283,14 +2296,6 @@ impl ReadOnlyPlanReview {
         let mut view_width = DocumentViews::default();
         view_width.open(view.clone(), width.clone())?;
         Ok(Self {
-            diff_view: DiffViewState::new(
-                DiffCapabilities::SemanticOnly,
-                if source.public_only {
-                    DiffVisibility::Public
-                } else {
-                    DiffVisibility::All
-                },
-            ),
             reference: Default::default(),
             reference_context: Default::default(),
             focused_annotation,
@@ -2474,20 +2479,27 @@ impl ReadOnlyPlanReview {
         Ok(target)
     }
 
-    fn toggle_visibility(&mut self) -> Result<serde_json::Value> {
+    fn diff_view(&self) -> DiffViewOptions {
+        DiffViewOptions {
+            presentation: DiffPresentation::Semantic,
+            visibility: if self.source.filter.public_only { DiffVisibility::Public } else { DiffVisibility::All },
+        }
+    }
+
+    fn toggle_visibility(&mut self, toggle: FilterToggle) -> Result<serde_json::Value> {
         ensure!(
             self.source.document.design.is_some(),
-            "public visibility requires a declaration design"
+            "visibility filters require a declaration design"
         );
         self.retain_annotation_revision();
-        let request = self
-            .diff_view
-            .request(DiffViewAction::ToggleVisibility)
-            .map_err(|error| anyhow::anyhow!("plan visibility request failed: {error:?}"))?;
-        let public_only = request.options.visibility == DiffVisibility::Public;
-        self.source.public_only = public_only;
-        // Revealing a hidden declaration lifts Public filtering for its file side. An explicit
-        // visibility toggle supersedes that per-navigation override in both directions.
+        let previous_filter = self.source.filter;
+        let enabled = match toggle {
+            FilterToggle::Public => &mut self.source.filter.public_only,
+            FilterToggle::Tests => &mut self.source.filter.show_tests,
+            FilterToggle::Imports => &mut self.source.filter.show_imports,
+        };
+        *enabled = !*enabled;
+        // Explicit visibility changes supersede per-navigation reveals.
         let previous_revealed = std::mem::take(&mut self.source.revealed);
         let projection = super::review_projection::project(
             &self.source,
@@ -2503,22 +2515,15 @@ impl ReadOnlyPlanReview {
             Ok((patch, target))
         });
         if projection.is_err() {
-            self.diff_view.fail(request);
             self.source.revealed = previous_revealed;
-            self.source.public_only =
-                self.diff_view.committed().visibility == DiffVisibility::Public;
+            self.source.filter = previous_filter;
         }
         let (patch, target) = projection?;
-        ensure!(
-            self.diff_view.commit(request),
-            "plan visibility request was superseded"
-        );
-        self.source.public_only = public_only;
         self.focused_annotation = None;
         self.target = target;
         let source_edit = self.source_edit();
         Ok(
-            serde_json::json!({"patch":patch, "source_edit":source_edit, "annotation":self.annotation.annotation(), "public_only":public_only, "diff_view": self.diff_view.committed(), "diff_capabilities": DiffCapabilities::SemanticOnly}),
+            serde_json::json!({"patch":patch, "source_edit":source_edit, "annotation":self.annotation.annotation(), "public_only":self.source.filter.public_only, "show_tests":self.source.filter.show_tests, "show_imports":self.source.filter.show_imports, "diff_view": self.diff_view(), "diff_capabilities": DiffCapabilities::SemanticOnly}),
         )
     }
 
@@ -2555,7 +2560,7 @@ impl ReadOnlyPlanReview {
                 focused: None,
             },
             &self.source.declaration_syntax,
-            self.source.public_only,
+            self.source.filter,
             self.source.trace.as_ref(),
             &self.source.revealed,
             self.source.files.as_ref(),
@@ -2787,6 +2792,8 @@ mod tests {
         let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1)?;
         let open = |lazy, legacy| -> Result<_> {
             let mut source = store.capture_review_source("session", "plan", None, &digest)?;
+            source.filter.public_only = true;
+            source.filter.show_tests = true;
             if lazy {
                 let mut rendered = source.rendered.clone();
                 if legacy {
@@ -2878,7 +2885,7 @@ mod tests {
                 .into_iter()
                 .any(|row| row.id.0.starts_with(&format!("{private}:")))
         );
-        review.toggle_visibility()?;
+        review.toggle_visibility(super::FilterToggle::Public)?;
         assert!(deferred(&review, &private));
         review.materialize_file(&private)?;
         assert!((&review.document).into_iter().any(|row| {

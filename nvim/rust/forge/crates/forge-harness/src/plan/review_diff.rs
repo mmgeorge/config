@@ -3,7 +3,7 @@ use forge_diff::cache::{AnalysisBytes, AnalysisCache, AnalysisKey, CacheLimits};
 use forge_diff::display::DisplayHunk;
 use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayRow, DisplayState, RowKind};
 use forge_diff::source::{Representation, SourceCoordinate, SourcePair, SourceSide, SourceVersion};
-use forge_diff::syntax::{HunkContext, SyntaxPoint, SyntaxRange};
+use forge_diff::syntax::{DeclarationFilter, HunkContext, SyntaxPoint, SyntaxRange};
 
 use super::calls::CallPresentation;
 use super::render::FileVisibility;
@@ -65,7 +65,7 @@ pub(super) struct FileDiff {
 impl FileDiff {
     /// Context and hunk boundaries do not make an otherwise hidden change reviewable.
     pub fn visibility(&self, sides: &ReviewSides) -> Result<FileVisibility> {
-        let mut visibility = FileVisibility::Empty;
+        let mut modes = [false; 8];
         for (path, source, kind) in [
             (
                 self.old_path.as_deref(),
@@ -91,21 +91,17 @@ impl FileDiff {
             if changed.peek().is_none() {
                 continue;
             }
-            let public = super::calls::visibility(path, source, true)?;
-            if changed
-                .clone()
-                .any(|coordinate| public.rows.get(coordinate.line) == Some(&true))
-            {
-                return Ok(FileVisibility::Public);
-            }
-            if visibility == FileVisibility::Empty {
-                let all = super::calls::visibility(path, source, false)?;
-                if changed.any(|coordinate| all.rows.get(coordinate.line) == Some(&true)) {
-                    visibility = FileVisibility::All;
+            for filter in DeclarationFilter::modes() {
+                let visible = &mut modes[filter.index()];
+                if !*visible {
+                    let rows = &super::calls::visibility(path, source, filter)?.rows;
+                    *visible = changed
+                        .clone()
+                        .any(|coordinate| rows.get(coordinate.line) == Some(&true));
                 }
             }
         }
-        Ok(visibility)
+        Ok(FileVisibility::Modes(modes))
     }
 
     /// Compares declarations with regular diff context and bounded reference excerpts.

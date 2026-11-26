@@ -64,6 +64,22 @@ T["directory_planning"] = function()
     return state.plan_review
   end
   local review = open_review()
+  local function tests_visible()
+    return vim.iter(review.owner.source):any(function(row) return row.block == "plan:section:tests" end)
+  end
+  MiniTest.expect.equality({ review.public_only, review.owner.show_tests, review.owner.show_imports }, { false, false, false })
+  MiniTest.expect.equality(tests_visible(), false)
+  keymap.invoke("ot", { buffer = review.buf })
+  wait_until(tests_visible, "ot did not show the Tests section", { errors = errors })
+  keymap.invoke("oi", { buffer = review.buf })
+  keymap.invoke("ov", { buffer = review.buf })
+  wait_until(function() return review.public_only and review.owner.show_imports end,
+    "oi and ov did not update their independent filters", { errors = errors })
+  MiniTest.expect.equality(tests_visible(), true)
+  for _, key in ipairs({ "ot", "oi", "ov" }) do keymap.invoke(key, { buffer = review.buf }) end
+  wait_until(function()
+    return not review.public_only and not review.owner.show_imports and not tests_visible()
+  end, "visibility filters did not return to their defaults", { errors = errors })
   local function expect_section_spacing()
     local heading = assert(buffer.find_row(review.buf, "Viewed Changes ("), "viewed heading is missing")
     MiniTest.expect.equality(buffer.line(review.buf, heading - 1), "")

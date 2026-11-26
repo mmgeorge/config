@@ -2019,6 +2019,10 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
         [
             (path.into(), declaration.into()),
             ("imports.rs".into(), "use std::path::Path;\n".into()),
+            (
+                "mixed.rs".into(),
+                "use std::path::Path;\npub fn production();\nfn private_helper();\n#[cfg(test)]\nmod mixed_tests {\n  pub fn inline_case();\n}\n".into(),
+            ),
         ]
         .into(),
     )?;
@@ -2030,17 +2034,18 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
     files.write_working_document(&fixture.session_id, "review", &plan)?;
     let (_, _, digest) = files.submit_document_revision(&fixture.session_id, "review", 1, 1)?;
 
-    for public_only in [false, true] {
+    for filter in forge_diff::syntax::DeclarationFilter::modes() {
+        let public_only = filter.public_only;
         let mut source =
             files.capture_review_source(&fixture.session_id, "review", Some(1), &digest)?;
-        source.public_only = public_only;
+        source.filter = filter;
         source.files = Some(ReviewFiles::new(
             source.document.design.as_ref().unwrap(),
             &source.rendered,
             &Default::default(),
         )?);
         let saved_source_digest = source.saved_digest.clone();
-        let document = DocumentId(format!("review-{public_only}"));
+        let document = DocumentId(format!("review-{}", filter.index()));
         let review = ReadOnlyPlanReview::new(
             document.clone(),
             ViewId("plan".into()),
@@ -2055,12 +2060,31 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
                 .block
                 .iter()
                 .any(|block| block.id.0 == import_heading),
-            !public_only,
-            "import-only files should appear only in All"
+            filter.show_imports,
+            "import-only files follow import visibility"
         );
+        let test_heading = format!("plan:design:file:{}", crate::plan::digest(path.as_bytes()));
+        let snapshot = review.snapshot();
+        assert_eq!(snapshot.block.iter().any(|block| block.id.0 == test_heading), filter.show_tests);
+        assert_eq!(snapshot.block.iter().any(|block| block.id.0 == "plan:section:tests"), filter.show_tests);
         let store = &fixture.controller.plan_review;
         store.insert(review, store.admit(document.clone())?)?;
-        if !public_only {
+        let mixed = fixture.service.document(
+            Some(fixture.session_id.clone()),
+            PresentationRequest::PlanBody {
+                document: document.clone(),
+                saved_source_digest: saved_source_digest.clone(),
+                file: format!("plan:design:file:{}", crate::plan::digest(b"mixed.rs")),
+            },
+            &fixture.sink,
+        ).await?;
+        let mixed: BufferPatch = serde_json::from_value(mixed["patch"].clone())?;
+        let mixed = mixed.text_edit.iter().flat_map(|edit| edit.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(mixed.contains("pub fn production"));
+        assert_eq!(mixed.contains("fn private_helper"), !public_only);
+        assert_eq!(mixed.contains("use std::path::Path;"), filter.show_imports);
+        assert_eq!(mixed.contains("fn inline_case"), filter.show_tests && !public_only);
+        if filter.show_imports {
             let result = fixture
                 .service
                 .document(
@@ -2082,6 +2106,9 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
                     .any(|row| row.contains("use std::path::Path;"))
             );
         }
+        if !filter.show_tests {
+            continue;
+        }
         let result = fixture
             .service
             .document(
@@ -2089,7 +2116,7 @@ async fn unfolded_rust_tests_follow_declaration_visibility() -> Result<()> {
                 PresentationRequest::PlanBody {
                     document,
                     saved_source_digest,
-                    file: format!("plan:design:file:{}", crate::plan::digest(path.as_bytes())),
+                    file: test_heading,
                 },
                 &fixture.sink,
             )

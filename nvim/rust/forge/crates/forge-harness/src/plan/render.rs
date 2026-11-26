@@ -181,7 +181,7 @@ pub struct PlanNavigationIndex {
     pub plan_id: String,
     pub plan_version: u64,
     pub anchor: Vec<PlanNavigationAnchor>,
-    /// First inspection mode with visible changes, keyed by the proposed review path.
+    /// Inspection modes with visible changes, keyed by the proposed review path.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) file_visibility: std::collections::BTreeMap<String, FileVisibility>,
 }
@@ -192,11 +192,17 @@ pub(crate) enum FileVisibility {
     Empty,
     All,
     Public,
+    Modes([bool; 8]),
 }
 
 impl FileVisibility {
-    pub(super) fn visible(self, public_only: bool) -> bool {
-        self == Self::Public || (self == Self::All && !public_only)
+    pub(super) fn visible(self, filter: forge_diff::syntax::DeclarationFilter) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::All => !filter.public_only,
+            Self::Public => true,
+            Self::Modes(modes) => modes[filter.index()],
+        }
     }
 }
 

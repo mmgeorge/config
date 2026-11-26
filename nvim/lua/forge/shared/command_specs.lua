@@ -168,6 +168,8 @@ M.view_specs = {
   },
   plan_review = {
     { id = "checks", label = "checks", desc = "Enable or disable checks for this plan", modes = "n", pinned = false },
+    { id = "toggle_tests", label = "tests", desc = "Show or hide planned tests", modes = "n", pinned = false },
+    { id = "toggle_imports", label = "imports", desc = "Show or hide imports", modes = "n", pinned = false },
     { id = "rename_entity", label = "rename", desc = "Rename a symbol introduced by the plan and its uses", modes = "n", pinned = false },
     { id = "references", label = "references", desc = "Find symbol usages in this plan snapshot", modes = "n", pinned = false },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },

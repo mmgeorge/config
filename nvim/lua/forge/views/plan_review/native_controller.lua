@@ -141,6 +141,8 @@ local function refresh_winbar(review)
       .. tostring(plan.state or "unavailable"):gsub("_", " ") .. " • decisions unavailable")
     or "Awaiting review"
   detail = detail .. " • Showing: " .. (review.public_only and "Public" or "All")
+  if review.owner.show_tests then detail = detail .. " • Tests" end
+  if review.owner.show_imports then detail = detail .. " • Imports" end
   keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
 end
 
@@ -163,31 +165,35 @@ local function adopt_revision(review, result)
   return true
 end
 
----Toggles All/Public visibility with at most one request in flight. Each request is captured at
----the revision the previous reply produced; presses made while one waits are counted, and an odd
----count sends one more toggle after the reply, so rapid presses end in the state their parity
----selects.
-local function toggle_visibility(review)
-  local toggle = review.visibility_toggle
-  if toggle then toggle.queued = toggle.queued + 1 return end
-  toggle = { queued = 0 }
-  review.visibility_toggle = toggle
-  local requested = review.owner.action("toggle_visibility", function(_, failure)
-    if failure then notice(failure) end
-  end, nil, function(_, failure)
-    if review.visibility_toggle == toggle then review.visibility_toggle = nil end
-    if failure then notice(failure) return end
-    review.public_only = review.owner.public_only
-    refresh_winbar(review)
-    if toggle.queued % 2 == 1 and not review.owner.closed then toggle_visibility(review) end
-  end)
-  if not requested then review.visibility_toggle = nil end
+---Send one visibility action at a time and coalesce queued presses by action.
+local function toggle_visibility(review, name)
+  local pending = review.visibility_toggle or {}
+  pending[name] = not pending[name] or nil
+  if review.visibility_toggle then return end
+  review.visibility_toggle = pending
+  local function advance()
+    local action = next(pending)
+    if not action or review.owner.closed then review.visibility_toggle = nil return end
+    pending[action] = nil
+    local requested = review.owner.action(action, function(_, failure)
+      if failure then notice(failure) end
+    end, nil, function(_, failure)
+      if failure then review.visibility_toggle = nil notice(failure) return end
+      review.public_only = review.owner.public_only
+      refresh_winbar(review)
+      advance()
+    end)
+    if not requested then review.visibility_toggle = nil end
+  end
+  advance()
 end
 
 local function action(review, name)
   local file_review = name == "viewed" or name == "unviewed"
   if review.cancel_definition then review.cancel_definition() review.cancel_definition = nil end
-  if name == "toggle_visibility" then toggle_visibility(review) return end
+  if name == "toggle_visibility" or name == "toggle_tests" or name == "toggle_imports" then
+    toggle_visibility(review, name) return
+  end
   if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
     notice("Only plans awaiting review can be renamed") return
   end
@@ -392,7 +398,7 @@ local function commands(review)
   command_set.register(set, "checks", function()
     require("forge.views.plan_review.checks").open(review, function(changes, receive) update_checks(review, changes.enabled or {}, nil, receive, changes.test_scopes) end)
   end)
-  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility", "viewed", "unviewed" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility", "toggle_tests", "toggle_imports", "viewed", "unviewed" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function()
     prompt_decision(review, "session.plan.accept", "Approval comment (optional)")

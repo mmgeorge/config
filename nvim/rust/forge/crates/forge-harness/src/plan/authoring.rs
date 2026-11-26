@@ -1128,7 +1128,7 @@ mod tests {
                         focused: None,
                     },
                     &Default::default(),
-                    false,
+                    Default::default(),
                     None,
                     &Default::default(),
                     None,

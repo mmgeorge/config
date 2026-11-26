@@ -36,7 +36,7 @@ T["controller"] = function()
     task_transition = function(action) execution = action end }
   local path = temp.file("plan.md", { "# Physical plan" })
   local pending
-  local public_only = true
+  local public_only = false
   client.request = function(request_specification, callback)
     local session_id = request_specification.session_id
     local method = request_specification.method
@@ -156,11 +156,11 @@ T["controller"] = function()
   assert(visibility.buffer == 1 and visibility.desc == "Toggle All/Public diff visibility", "PlanReview did not bind shared ov")
   assert(not review.command_set.action_by_id.toggle_presentation, "Semantic-only PlanReview exposed a presentation toggle")
   assert(vim.fn.maparg("ox", "n", false, true).buffer ~= 1, "Semantic-only PlanReview bound ox")
-  eq(review.public_only, true)
+  eq(review.public_only, false)
   keymap.feed("ov")
-  wait_until(function() return review.public_only == false end, "ov did not select All")
+  wait_until(function() return review.public_only == true end, "ov did not select Public")
   keymap.feed("ov")
-  wait_until(function() return review.public_only == true end, "ov did not restore Public")
+  wait_until(function() return review.public_only == false end, "ov did not restore All")
   eq(keymap.get("J").buffer, 1, { fail_reason = "PlanReview did not bind J to comment deletion" })
   vim.api.nvim_win_set_cursor(review.win, { task_row + 1, 3 })
   vim.cmd("clearjumps")
@@ -742,14 +742,20 @@ T["rapid visibility toggles converge on the parity of the presses"] = function()
   end
   press(10)
   eq(notices:messages(), {})
-  eq({ host = plan_host.public_only, review = review.public_only }, { host = true, review = true })
+  eq({ host = plan_host.public_only, review = review.public_only }, { host = false, review = false })
   eq(review.owner.replica.revision, plan_host.revision)
   press(11)
   eq(notices:messages(), {})
-  eq({ host = plan_host.public_only, review = review.public_only }, { host = false, review = false })
+  eq({ host = plan_host.public_only, review = review.public_only }, { host = true, review = true })
   eq(review.owner.replica.revision, plan_host.revision)
   press(1)
-  eq({ host = plan_host.public_only, review = review.public_only }, { host = true, review = true })
+  eq({ host = plan_host.public_only, review = review.public_only }, { host = false, review = false })
+  keymap.invoke("ot", { buffer = review.buf })
+  keymap.invoke("oi", { buffer = review.buf })
+  keymap.invoke("ot", { buffer = review.buf })
+  press(0)
+  eq({ review.public_only, review.owner.show_tests, review.owner.show_imports }, { false, false, true })
+  eq(review.owner.replica.revision, plan_host.revision)
 end
 
 -- The revision a model submits after the review opened, with one line inserted above the

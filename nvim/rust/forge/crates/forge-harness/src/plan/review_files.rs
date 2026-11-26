@@ -53,9 +53,12 @@ impl ReviewFiles {
                 "file heading is outside the saved plan"
             );
             let visibility = match rendered.navigation.file_visibility.get(path) {
-                Some(visibility) => *visibility,
-                None => {
-                    // Older indexes lack visibility. Derive it once for this review from its saved sides.
+                Some(
+                    visibility @ (super::render::FileVisibility::Empty
+                    | super::render::FileVisibility::Modes(_)),
+                ) => *visibility,
+                _ => {
+                    // Derive independent filters for revisions saved before they were recorded.
                     let sides = super::review_diff::ReviewSides::new(design, before, path)?;
                     super::review_diff::FileDiff::new(
                         before,

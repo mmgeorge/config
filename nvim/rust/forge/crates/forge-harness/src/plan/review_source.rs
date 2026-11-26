@@ -29,7 +29,7 @@ pub(crate) struct ReviewSourceData {
             )>,
         >,
     >,
-    pub public_only: bool,
+    pub filter: forge_diff::syntax::DeclarationFilter,
     /// File heading identities marked viewed for this exact review revision.
     pub viewed_files: std::collections::BTreeSet<String>,
     /// Keeps selected reference context visible without changing the public filter.
@@ -198,7 +198,7 @@ impl PlanFileStore {
             trace: None,
             execution_review: None,
             resolver: Default::default(),
-            public_only: true,
+            filter: Default::default(),
             viewed_files: Default::default(),
             collapse: Default::default(),
             revealed: Default::default(),
@@ -261,7 +261,7 @@ impl PlanFileStore {
                 trace: None,
                 execution_review: None,
                 resolver: Default::default(),
-                public_only: true,
+                filter: Default::default(),
                 viewed_files: Default::default(),
                 collapse: Default::default(),
                 revealed: Default::default(),

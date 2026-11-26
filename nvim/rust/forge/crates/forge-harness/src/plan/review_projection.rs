@@ -194,7 +194,7 @@ pub(crate) fn project(
                 focused,
             },
             &source.declaration_syntax,
-            source.public_only,
+            source.filter,
             source.trace.as_ref(),
             &source.revealed,
             source.files.as_ref(),

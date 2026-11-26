@@ -14,7 +14,7 @@ use forge_diff::file_header::FileChange;
 use forge_diff::intraline::{IntralineResult, compare_replacement};
 use forge_diff::presentation::{FoldPolicy, RowChange};
 use forge_diff::syntax::{
-    AlgorithmDiffLineKind, DeclarationVisibility, classify_algorithm_diff_line,
+    AlgorithmDiffLineKind, DeclarationFilter, DeclarationVisibility, classify_algorithm_diff_line,
 };
 
 use super::review_annotation::ReviewAnnotation;
@@ -74,7 +74,7 @@ pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
     } = rows(
         document,
         &HashMap::new(),
-        false,
+        DeclarationFilter::default(),
         false,
         None,
         &HashSet::new(),
@@ -131,7 +131,7 @@ pub(super) fn project(
     width: &WidthProfile,
     annotations: ReviewAnnotationView<'_>,
     syntax: &HashMap<(String, String), super::review_source::ReviewSyntax>,
-    public_only: bool,
+    filter: DeclarationFilter,
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
     files: Option<&super::review_files::ReviewFiles>,
@@ -151,7 +151,7 @@ pub(super) fn project(
     } = rows(
         document,
         syntax,
-        public_only,
+        filter,
         true,
         trace,
         revealed,
@@ -396,8 +396,8 @@ pub(super) fn project(
             }
         }
     }
-    if public_only || !hidden.is_empty() {
-        block = public_blocks(block, &hidden, body.is_none(), public_only)?;
+    if filter.public_only || !hidden.is_empty() {
+        block = filtered_blocks(block, &hidden, body.is_none(), filter.public_only)?;
         let visible_target = block
             .iter()
             .flat_map(|block| &block.metadata.target)
@@ -411,7 +411,7 @@ pub(super) fn project(
 fn rows(
     document: &PlanDocument,
     syntax: &HashMap<(String, String), super::review_source::ReviewSyntax>,
-    public_only: bool,
+    filter: DeclarationFilter,
     inspection: bool,
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
@@ -501,7 +501,7 @@ fn rows(
         if let Some((inventory, heading)) =
             files.and_then(|inventory| Some((inventory, inventory.for_path(&destination)?)))
             && body.is_none()
-            && (!inventory.loaded.contains(&heading.id) || !heading.visibility.visible(public_only))
+            && (!inventory.loaded.contains(&heading.id) || !heading.visibility.visible(filter))
             && !revealed
                 .iter()
                 .any(|(file, _, _)| file == &path || file == &destination)
@@ -539,7 +539,7 @@ fn rows(
                 label,
             });
             let deferred = BlockId(format!("{}:hunk:deferred", heading.id));
-            if !heading.visibility.visible(public_only) {
+            if !heading.visibility.visible(filter) {
                 hidden.insert(BlockId(heading.id.clone()));
                 hidden.insert(deferred.clone());
             }
@@ -594,7 +594,7 @@ fn rows(
                 .file_visibility
                 .insert(destination.clone(), file_visibility);
         }
-        let hide_file = inspection && !explicitly_revealed && !file_visibility.visible(public_only);
+        let hide_file = inspection && !explicitly_revealed && !file_visibility.visible(filter);
         let super::review_diff::ReviewSides { before, after } = sides;
         let signature_replacements = if inspection {
             super::review_alignment::signature_replacements(
@@ -619,11 +619,13 @@ fn rows(
                     super::calls::visibility(
                         &path,
                         &before,
-                        public_only
-                            && !revealed
-                                .iter()
-                                .any(|(file, side, _)| file == &path && side == "baseline"),
-                    )?,
+                        if revealed.iter().any(|(file, side, _)| file == &path && side == "baseline") {
+                            DeclarationFilter::ALL
+                        } else {
+                            filter
+                        },
+                    )?
+                    .clone(),
                 );
             }
             presentation.insert((path.clone(), "baseline".into()), before);
@@ -635,11 +637,13 @@ fn rows(
                     super::calls::visibility(
                         &destination,
                         &after,
-                        public_only
-                            && !revealed
-                                .iter()
-                                .any(|(file, side, _)| file == &destination && side == "proposed"),
-                    )?,
+                        if revealed.iter().any(|(file, side, _)| file == &destination && side == "proposed") {
+                            DeclarationFilter::ALL
+                        } else {
+                            filter
+                        },
+                    )?
+                    .clone(),
                 );
             }
             presentation.insert((destination, "proposed".into()), after);
@@ -1087,6 +1091,10 @@ fn rows(
             let offset = overview.len() as u32;
             let (mut tests, mut anchors) =
                 test_inventory(design, inspection, files, &mut skipped, None)?;
+            if inspection && !filter.show_tests {
+                hidden.extend(tests.iter().map(|row| row.id.clone()));
+                hidden.insert(BlockId("plan:section:tests:separator".into()));
+            }
             for anchor in &mut anchors {
                 anchor.line += offset;
             }
@@ -1926,7 +1934,7 @@ fn behavior_folds(
     Ok(())
 }
 
-fn public_blocks(
+fn filtered_blocks(
     mut block: Vec<BufferBlock>,
     hidden: &HashSet<BlockId>,
     whole_document: bool,
@@ -1941,7 +1949,7 @@ fn public_blocks(
         .iter()
         .map(|block| !hidden.contains(&block.id))
         .collect();
-    let mut public_count = vec![0usize];
+    let mut visible_count = vec![0usize];
     for (index, block) in block.iter().enumerate() {
         let declaration = retained[index]
             && !block
@@ -1961,7 +1969,7 @@ fn public_blocks(
                 .wire_rows()
                 .into_iter()
                 .any(|row| !row.trim().is_empty());
-        public_count.push(public_count.last().unwrap() + usize::from(declaration));
+        visible_count.push(visible_count.last().unwrap() + usize::from(declaration));
     }
     for (start, header) in block.iter().enumerate() {
         if header.id.0.starts_with("plan:section:")
@@ -1977,10 +1985,10 @@ fn public_blocks(
         for fold in &header.metadata.fold {
             let end = *index
                 .get(&fold.end.block)
-                .context("public fold endpoint is missing")?;
+                .context("filtered fold endpoint is missing")?;
             let boundary = end + usize::from(fold.end.position.row > 0);
             if !fold.id.0.starts_with("plan:calls:")
-                && public_count[boundary] == public_count[start + 1]
+                && visible_count[boundary] == visible_count[start + 1]
             {
                 retained[start] = false;
             }
@@ -2109,7 +2117,7 @@ fn public_blocks(
             let last = boundary
                 .checked_sub(1)
                 .and_then(|end| previous[end])
-                .context("public fold has no retained endpoint")?;
+                .context("filtered fold has no retained endpoint")?;
             fold.end = endpoint[last].clone();
         }
     }
@@ -2125,11 +2133,11 @@ fn public_blocks(
         .iter()
         .position(|block| block.id.0 == "plan:section:changes")
         .context("changes section is missing")?;
-    let mut tests = output
+    let mut changes_end = output
         .iter()
-        .position(|block| block.id.0 == "plan:section:tests")
-        .context("tests section is missing")?;
-    if output[changes + 1..tests].iter().all(|block| {
+        .position(|block| block.id.0 == "plan:section:changes:separator")
+        .context("changes section separator is missing")?;
+    if output[changes + 1..changes_end].iter().all(|block| {
         block.id.0.starts_with("plan:annotation:")
             || block
                 .text
@@ -2153,14 +2161,7 @@ fn public_blocks(
                 0,
             )?,
         );
-        tests += 1;
-    }
-    // Section spacing must remain visible when the preceding Changes fold is closed.
-    let mut changes_end = tests;
-    while changes_end > changes + 1
-        && output[changes_end - 1].id.0 == "plan:section:changes:separator"
-    {
-        changes_end -= 1;
+        changes_end += 1;
     }
     let mut trailing = output.split_off(changes_end);
     output[changes].metadata.fold.clear();
