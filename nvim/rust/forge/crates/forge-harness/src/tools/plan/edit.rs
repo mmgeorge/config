@@ -30,7 +30,7 @@ pub(super) fn definition() -> ControlToolDefinition {
                 the target is a test check's ID or label from check_definition_list. plan:checks.md lists one check ID per line, each a saved check from \
                 check_definition_list to run during Checking; a line's presence alone \
                 selects its check, and Harness adds prerequisites itself. plan:walkthrough.json holds an ordered JSON array of \
-                comments with a changed repository-relative path, optional declaration symbol, and nonblank Markdown comment. Add File on an \
+                comments with a changed repository-relative path, required declaration symbol, optional plain-text title, and nonblank Markdown comment. Add File on an \
                 artifact replaces its whole text, and Delete File clears it. Operations on one artifact \
                 apply in patch order; a project file appears at most once per patch.\n\
                 Verify: plan_edit accepts only a patch of plan:verification.md. Replace each \

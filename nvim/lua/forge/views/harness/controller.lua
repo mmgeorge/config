@@ -2299,6 +2299,11 @@ function M.submit()
     browse_artifacts(state)
     return
   end
+  if text == "/queue clear" then
+    set_composer_text(state.composer_buf, "")
+    input_state.clear_queue(state)
+    return
+  end
   if text == "/task" or text == "/plan" or text == "/execute" then
     set_composer_text(state.composer_buf, "")
     if text == "/task" then task_control.open(state, picker_host(state), M.task_transition)

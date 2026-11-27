@@ -159,19 +159,19 @@ impl PlanSubmissionJob {
                 }
                 ResultEffectAdmission::Apply(guard) => guard,
             };
-        let mut document = match &request.authoring_snapshot {
-            Some(snapshot) => store.authoring_snapshot_read(&session_id, &plan.id, snapshot)?,
-            None => original.clone(),
-        };
-        let warnings = if let Some(design) = &mut document.design {
-            let validated = deadline
-                .wait(design.validated(&workspace, &document.title))
-                .await?;
-            let warnings = validated.warnings();
-            *design = validated.into_design();
-            warnings
-        } else {
-            Vec::new()
+        // Keep the tool's validation evidence when it submitted a sealed authoring snapshot.
+        let source = match request.authoring_snapshot {
+            Some(snapshot) => crate::plan::PlanSubmissionSource::AuthoringSnapshot(snapshot),
+            None => {
+                let mut document = original.clone();
+                if let Some(design) = &mut document.design {
+                    *design = deadline
+                        .wait(design.validated(&workspace, &document.title))
+                        .await?
+                        .into_design();
+                }
+                crate::plan::PlanSubmissionSource::Document(Box::new(document))
+            }
         };
         let previous = if plan.model_revision == 0 {
             None
@@ -187,16 +187,17 @@ impl PlanSubmissionJob {
         let prepare_plan = plan.id.clone();
         let prepared = deadline
             .process(move || {
-                prepare_store.prepare_validated_submission(
+                prepare_store.prepare_submission(
                     &prepare_session,
                     &prepare_plan,
                     revision,
                     request.expected_version,
                     &original,
-                    document,
+                    source,
                 )
             })
             .await?;
+        let warnings = prepared.warnings();
         let review_comments = store.review_comment_snapshot(&session_id, &plan.id)?;
         deadline.remaining()?;
         guard.begin_mutation();

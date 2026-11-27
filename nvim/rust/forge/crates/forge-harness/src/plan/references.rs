@@ -1135,7 +1135,7 @@ fn sync_walkthrough_symbols(
     let mut names = walkthrough
         .iter_mut()
         .filter(|entry| entry.path == path)
-        .filter_map(|entry| entry.symbol.as_mut())
+        .map(|entry| &mut entry.symbol)
         .peekable();
     if names.peek().is_none() {
         return Ok(());
@@ -1510,7 +1510,7 @@ pub(super) mod tests {
         design.document.walkthrough = ["Worker", "Worker::start"]
             .map(|name| crate::plan::DesignWalkthroughComment {
                 path: "worker.rs".into(),
-                symbol: Some(name.into()),
+                symbol: name.into(),
                 title: Some("Acquire the lease".into()),
                 comment: "Describe the lease.".into(),
             })
@@ -1546,7 +1546,7 @@ pub(super) mod tests {
             assert_eq!(
                 steps
                     .iter()
-                    .map(|step| step.symbol.as_deref().unwrap())
+                    .map(|step| step.symbol.as_str())
                     .collect::<Vec<_>>(),
                 expected
             );

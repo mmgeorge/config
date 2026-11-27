@@ -762,7 +762,6 @@ enum FilterToggle {
 struct WalkthroughStep {
     file: String,
     block: BlockId,
-    declaration: bool,
 }
 
 impl WalkthroughStep {
@@ -786,7 +785,6 @@ impl WalkthroughStep {
                 Self {
                     file: format!("plan:design:file:{}", super::digest(identity.as_bytes())),
                     block: super::design_review::walkthrough_block(index),
-                    declaration: step.symbol.is_some(),
                 }
             })
             .collect()
@@ -2459,21 +2457,18 @@ impl ReadOnlyPlanReview {
             .document
             .block_index(&step.block)
             .context("walkthrough step has no visible block")?;
-        let reveal = if step.declaration {
-            self.document
-                .blocks(
-                    self.document.revision(),
-                    start + 1..self.document.block_count(),
-                )?
-                .take_while(|block| self.change_file(&block.id) == Some(step.file.as_str()))
-                .find(|block| block.id.0.contains(":row:"))
-                .map(|block| BlockAnchor {
-                    block: block.id.clone(),
-                    position,
-                })
-        } else {
-            None
-        };
+        let reveal = self
+            .document
+            .blocks(
+                self.document.revision(),
+                start + 1..self.document.block_count(),
+            )?
+            .take_while(|block| self.change_file(&block.id) == Some(step.file.as_str()))
+            .find(|block| block.id.0.contains(":row:"))
+            .map(|block| BlockAnchor {
+                block: block.id.clone(),
+                position,
+            });
         result["jump"] = serde_json::to_value(BlockAnchor {
             block: step.block.clone(),
             position,
@@ -2923,7 +2918,7 @@ mod tests {
         let worker = concat!(
             "/// Owns pending jobs.\nstruct Worker;\n\n",
             "/// Tracks worker activity.\nenum State {\n    /// Waits for a job.\n    Idle,\n}\n\n",
-            "impl Worker {\n    fn start(&self);\n}\n\nfn publish();\n\nfn private_helper();\n",
+            "impl Worker {\n    fn start(&self);\n}\n\nfn configure();\n\nfn publish();\n\nfn private_helper();\n",
         );
         let mut design =
             crate::plan::DeclarationDesign::scratch(std::collections::BTreeMap::from([
@@ -2951,22 +2946,22 @@ mod tests {
             ["lib.rs", "helpers.rs"]
         );
         design.document.walkthrough = [
-            ("worker.rs", None, "Introduce the worker."),
-            ("entry.rs", Some("register"), "Register the worker."),
+            ("worker.rs", "configure", "Introduce the worker."),
+            ("entry.rs", "register", "Register the worker."),
             (
                 "worker.rs",
-                Some("Worker::start"),
+                "Worker::start",
                 "Acquire a `lease` before delivering pending jobs.\n\n```text\n  acquire_worker_and_persist_the_lease()\n```",
             ),
-            ("worker.rs", Some("Worker"), "Own the worker."),
-            ("worker.rs", Some("State"), "Represent the idle phase."),
-            ("worker.rs", Some("publish"), "Deliver the job."),
+            ("worker.rs", "Worker", "Own the worker."),
+            ("worker.rs", "State", "Represent the idle phase."),
+            ("worker.rs", "publish", "Deliver the job."),
         ]
         .map(
             |(path, symbol, comment)| crate::plan::DesignWalkthroughComment {
                 path: path.into(),
-                symbol: symbol.map(str::to_owned),
-                title: (symbol == Some("Worker::start")).then(|| "Acquire the lease".into()),
+                symbol: symbol.into(),
+                title: (symbol == "Worker::start").then(|| "Acquire the lease".into()),
                 comment: comment.into(),
             },
         )
@@ -3057,28 +3052,26 @@ mod tests {
             assert_eq!(result["jump"]["block"], steps[destination].0);
             assert_eq!(result["walkthrough"]["step"], destination + 1);
             assert_eq!(result.get("patch").is_some(), loads);
-            if destination > 0 {
-                let reviews = review_store.document.lock().unwrap();
-                let reveal = BlockId(result["reveal"]["block"].as_str().unwrap().into());
-                let row = reviews[&id]
-                    .0
-                    .document
-                    .block(&reveal)
-                    .unwrap()
-                    .text
-                    .row(0)
-                    .unwrap();
-                assert!(row.contains(
-                    [
-                        "",
-                        "fn register",
-                        "fn start",
-                        "/// Owns pending jobs.",
-                        "/// Tracks worker activity.",
-                        "fn publish"
-                    ][destination]
-                ));
-            }
+            let reviews = review_store.document.lock().unwrap();
+            let reveal = BlockId(result["reveal"]["block"].as_str().unwrap().into());
+            let row = reviews[&id]
+                .0
+                .document
+                .block(&reveal)
+                .unwrap()
+                .text
+                .row(0)
+                .unwrap();
+            assert!(row.contains(
+                [
+                    "fn configure",
+                    "fn register",
+                    "fn start",
+                    "/// Owns pending jobs.",
+                    "/// Tracks worker activity.",
+                    "fn publish"
+                ][destination]
+            ));
         }
         let viewed = review_store.action(action(8, "viewed", &steps[2], 0)?, None)?;
         assert!(viewed.get("patch").is_some());
@@ -3094,7 +3087,7 @@ mod tests {
         let blocks = review.snapshot().block;
         let index = |id: &BlockId| blocks.iter().position(|block| &block.id == id).unwrap();
         let heading = index(&BlockId(worker_id.clone()));
-        assert_eq!(heading + 1, index(&steps[0]));
+        assert!(heading < index(&steps[0]));
         assert_eq!(
             blocks[index(&steps[1]) - 1].id.0,
             format!("{entry_id}:hunk:0")

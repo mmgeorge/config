@@ -41,7 +41,15 @@ function M.normalize(session, selection)
     offset = 0
   end
   if column ~= position[3] - 1 or offset ~= position[4] then
+    local window, virtualedit
+    if not selection and session.materialized_prefix and column == #text then
+      -- A blank source row ends at its gutter. Position the cursor one cell past the prefix.
+      window = vim.api.nvim_get_current_win()
+      virtualedit = vim.wo[window].virtualedit
+      vim.wo[window].virtualedit = "onemore"
+    end
     vim.fn.setpos(".", { 0, position[2], column + 1, offset })
+    if window then vim.wo[window].virtualedit = virtualedit end
   end
 end
 

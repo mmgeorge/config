@@ -30,6 +30,8 @@ T["walkthrough keys reveal deferred files and show the active step"] = function(
   state.transcript_win = vim.api.nvim_get_current_win()
   local path = temp.file("walkthrough.md", { "# Review" })
   local file_a, file_b = "plan:design:file:a", "plan:design:file:b"
+  local hunk_a = file_a .. ":hunk:0"
+  local first_declaration, last_declaration = hunk_a .. ":row:0", hunk_a .. ":row:1"
   local hunk = file_b .. ":hunk:0"
   local declaration = hunk .. ":row:0"
   local function step(index) return "plan:walkthrough:" .. index end
@@ -44,11 +46,18 @@ T["walkthrough keys reveal deferred files and show the active step"] = function(
     return { id = id, text = rows, metadata = metadata }
   end
   local function delivery(document, reviewed)
-    local tail_a = reviewed and step(3) or file_a .. ":hunk:deferred"
+    local tail_a = reviewed and last_declaration or file_a .. ":hunk:deferred"
     local tail_b = reviewed and declaration or file_b .. ":hunk:deferred"
     local blocks = { block("overview", { "Plan overview" }), block(file_a, { "First file" }, tail_a) }
-    if reviewed then blocks[#blocks + 1] = block(step(1), { "╭─ 1/3 Walkthrough ─╮", "│ Open the review. │" }) end
-    blocks[#blocks + 1] = block(tail_a, { reviewed and "╭─ 3/3 Finish ─╮" or "" })
+    if reviewed then
+      blocks[#blocks + 1] = block(hunk_a, { "@@" }, last_declaration)
+      blocks[#blocks + 1] = block(step(1), { "╭─ 1/3 Walkthrough ─╮", "│ Open the review. │" })
+      blocks[#blocks + 1] = block(first_declaration, { "fn open()" })
+      blocks[#blocks + 1] = block(step(3), { "╭─ 3/3 Finish ─╮" })
+      blocks[#blocks + 1] = block(last_declaration, { "fn finish()" })
+    else
+      blocks[#blocks + 1] = block(tail_a, { "" })
+    end
     blocks[#blocks + 1] = block(file_b, { "Second file" }, tail_b)
     if reviewed then
       blocks[#blocks + 1] = block(hunk, { "@@" }, declaration)
@@ -96,6 +105,7 @@ T["walkthrough keys reveal deferred files and show the active step"] = function(
   eq(pending.input.action, "walkthrough_next")
   local loaded = delivery(pending.input.document, true)
   loaded.jump, loaded.walkthrough = { block = step(1), position = position }, { step = 1, total = 3 }
+  loaded.reveal = { block = first_declaration, position = position }
   pending.callback(loaded)
   eq(vim.api.nvim_get_current_line(), "╭─ 1/3 Walkthrough ─╮")
   winbar(1)

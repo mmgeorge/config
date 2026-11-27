@@ -1813,10 +1813,8 @@ impl Worker {
             .await?;
         document.design = Some(validated.into_design());
         assert_eq!(
-            document.design.as_ref().unwrap().document.walkthrough[0]
-                .symbol
-                .as_deref(),
-            Some("Worker::start")
+            document.design.as_ref().unwrap().document.walkthrough[0].symbol,
+            "Worker::start"
         );
         let snapshot = files.authoring_snapshot_save("session", &document)?;
         assert_eq!(

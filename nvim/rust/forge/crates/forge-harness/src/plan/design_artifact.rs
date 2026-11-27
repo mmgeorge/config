@@ -529,46 +529,43 @@ fn validate_walkthrough(
             );
             continue;
         }
-        if let Some(name) = &mut entry.symbol {
-            let symbols = inventory.entry(entry.path.clone()).or_insert_with(|| {
-                let source = if design.proposed_source.contains_key(&entry.path) {
-                    parsed.proposed.get(&entry.path).map(String::as_str)
-                } else {
-                    design
-                        .baseline
-                        .get(&entry.path)
-                        .map(|file| file.text.as_str())
-                };
-                source
-                    .and_then(|source| DeclarationOverview::review_symbols(&entry.path, source))
-                    .unwrap_or_default()
-            });
-            if let Some(symbol) = resolve_walkthrough_symbol(symbols, name) {
-                name.clone_from(&symbol.name);
+        let symbols = inventory.entry(entry.path.clone()).or_insert_with(|| {
+            let source = if design.proposed_source.contains_key(&entry.path) {
+                parsed.proposed.get(&entry.path).map(String::as_str)
             } else {
-                let candidates = symbols
-                    .iter()
-                    .map(|symbol| symbol.name.as_str())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let candidates = if candidates.is_empty() {
-                    "(none)"
-                } else {
-                    &candidates
-                };
-                report.content(
-                    line,
-                    name,
-                    format!(
-                        "unknown or ambiguous symbol in {}. Valid symbols: {candidates}",
-                        entry.path
-                    ),
-                );
-                continue;
-            }
-        }
+                design
+                    .baseline
+                    .get(&entry.path)
+                    .map(|file| file.text.as_str())
+            };
+            source
+                .and_then(|source| DeclarationOverview::review_symbols(&entry.path, source))
+                .unwrap_or_default()
+        });
+        let Some(symbol) = resolve_walkthrough_symbol(symbols, &entry.symbol) else {
+            let candidates = symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let candidates = if candidates.is_empty() {
+                "(none)"
+            } else {
+                &candidates
+            };
+            report.content(
+                line,
+                &entry.symbol,
+                format!(
+                    "unknown or ambiguous symbol in {}. Valid symbols: {candidates}",
+                    entry.path
+                ),
+            );
+            continue;
+        };
+        entry.symbol.clone_from(&symbol.name);
         if !anchors.insert((entry.path.clone(), entry.symbol.clone())) {
             report.content(line, &entry.path, "duplicate walkthrough anchor".into());
         }
@@ -1204,7 +1201,7 @@ mod test {
         }
         design.moved.insert("old.rs".into(), "src/worker.rs".into());
         let input = r#"[
-  {"path":"src/worker.rs","comment":"Register the new worker."},
+  {"path":"src/worker.rs","symbol":"Worker","comment":"Register the new worker."},
   {"path":"deleted.rs","symbol":"Old","comment":"Retire the old job type."},
   {"path":"src/worker.rs","symbol":"start","title":"Acquire the lease","comment":"Acquire the `lease` first."}
 ]"#;
@@ -1215,10 +1212,10 @@ mod test {
             &mut report(&mut diagnostic),
         )?;
         assert!(diagnostic.is_empty());
-        assert_eq!(comments[0].symbol, None);
+        assert_eq!(comments[0].symbol, "Worker");
         assert_eq!(comments[0].title, None);
-        assert_eq!(comments[1].symbol.as_deref(), Some("Old"));
-        assert_eq!(comments[2].symbol.as_deref(), Some("Worker::start"));
+        assert_eq!(comments[1].symbol, "Old");
+        assert_eq!(comments[2].symbol, "Worker::start");
         assert_eq!(comments[2].title.as_deref(), Some("Acquire the lease"));
         design.document.walkthrough = comments;
         let rendered = authored_text(PlanArtifact::Walkthrough, "", &design)?;
@@ -1255,32 +1252,32 @@ mod test {
   {"path":"worker.rs","symbol":"run","comment":"Missing."},
   {"path":"worker.rs","symbol":"First::start","comment":"Valid."},
   {"path":"worker.rs","symbol":"First::start","comment":"Duplicate."},
-  {"path":"same.rs","comment":"Unchanged."},
-  {"path":"missing.rs","comment":"Missing."},
+  {"path":"same.rs","symbol":"Unchanged","comment":"Unchanged."},
+  {"path":"missing.rs","symbol":"Missing","comment":"Missing."},
   {"path":"worker.rs","symbol":"First","comment":"  "},
   {"path":"worker.rs","symbol":"Second","comment":"\u0000"},
-  {"path":"worker.rs","comment":"Unknown field.","caption":"No"},
+  {"path":"worker.rs","symbol":"First","comment":"Unknown field.","caption":"No"},
   ["worker.rs", null, "Array entry"],
   {"path":"worker.rs","comment":"Wrong type.","symbol":null},
-  {"path":"worker.rs","title":"\u0000","comment":"Invalid title."}
+  {"path":"worker.rs","symbol":"Second::start","title":"\u0000","comment":"Invalid title."},
+  {"path":"worker.rs","comment":"Missing symbol."},
+  {"path":"worker.rs","symbol":"","comment":"Empty symbol."}
 ]"#;
         let valid_json = parse_walkthrough(invalid, &mut report(&mut diagnostic));
         assert_eq!(
             diagnostic.iter().map(|item| item.line).collect::<Vec<_>>(),
-            [10, 11, 12]
+            [10, 11, 12, 14]
         );
         assert!(diagnostic[0].reason.contains("unknown field `caption`"));
         assert!(diagnostic[0].column > 2);
+        assert!(diagnostic[3].reason.contains("missing field `symbol`"));
         diagnostic.clear();
         validate_walkthrough(&design, valid_json, &mut report(&mut diagnostic))?;
         assert_eq!(
             diagnostic.iter().map(|item| item.line).collect::<Vec<_>>(),
-            [2, 3, 5, 6, 7, 8, 9, 13]
+            [2, 3, 5, 6, 7, 8, 9, 13, 15]
         );
-        assert_eq!(
-            diagnostic.last().unwrap().reason,
-            "title must contain no NUL bytes"
-        );
+        assert_eq!(diagnostic[7].reason, "title must contain no NUL bytes");
         for item in &diagnostic[..2] {
             assert!(item.reason.contains("First::start"));
             assert!(item.reason.contains("Second::start"));

@@ -65,24 +65,13 @@ pub struct DesignDocument {
 pub struct DesignWalkthroughComment {
     /// Repository-relative review path.
     pub path: String,
-    /// Qualified declaration name, absent for a file-level comment.
-    #[serde(
-        default,
-        deserialize_with = "walkthrough_symbol",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub symbol: Option<String>,
+    /// Qualified declaration name that anchors the comment.
+    pub symbol: String,
     /// Plain-text label displayed in the walkthrough frame's top border.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Markdown displayed above the anchor.
     pub comment: String,
-}
-
-fn walkthrough_symbol<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    String::deserialize(deserializer).map(Some)
 }
 
 impl DesignDocument {
@@ -313,8 +302,8 @@ impl DesignDocument {
                 "walkthrough comment must contain text and no NUL bytes"
             );
             ensure!(
-                step.symbol.as_ref().is_none_or(|name| !name.contains('\0')),
-                "walkthrough symbol contains a NUL byte"
+                !step.symbol.trim().is_empty() && !step.symbol.contains('\0'),
+                "walkthrough symbol must contain text and no NUL bytes"
             );
         }
         for section in self

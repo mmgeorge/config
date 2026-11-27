@@ -1072,6 +1072,14 @@ pub struct PlanFileStore {
     workspace: PathBuf,
 }
 
+/// Select the submission input the broker received from Harness.
+pub(crate) enum PlanSubmissionSource {
+    /// Load a snapshot sealed by the submission tool after validation.
+    AuthoringSnapshot(String),
+    /// Prepare a canonical document that did not pass through a sealed snapshot.
+    Document(Box<PlanDocument>),
+}
+
 /// Retain a validated and rendered plan until its captured baseline can be committed.
 pub(crate) struct PreparedPlanSubmission {
     session_id: String,
@@ -1080,6 +1088,21 @@ pub(crate) struct PreparedPlanSubmission {
     expected: PlanDocument,
     document: PlanDocument,
     rendered: RenderedPlan,
+}
+
+impl PreparedPlanSubmission {
+    /// Get declaration warnings from the evidence used to prepare this review.
+    pub(crate) fn warnings(&self) -> Vec<PlanViolation> {
+        self.document
+            .design
+            .as_ref()
+            .and_then(|design| design.parsed.as_ref())
+            .and_then(|parsed| parsed.validation.as_ref())
+            .map_or_else(
+                Vec::new,
+                crate::declaration::DeclarationValidation::warnings,
+            )
+    }
 }
 
 /// Bind a dependent commit to the captured contents of one canonical working document.
@@ -1432,31 +1455,38 @@ impl PlanFileStore {
         current: &PlanDocument,
         document: PlanDocument,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let prepared = self.prepare_validated_submission(
+        let prepared = self.prepare_submission(
             session_id,
             plan_id,
             revision,
             expected_version,
             current,
-            document,
+            PlanSubmissionSource::Document(Box::new(document)),
         )?;
         self.commit_prepared_submission(prepared)
     }
 
-    /// Validate and render without holding either the task or working-document mutation gate.
-    pub(crate) fn prepare_validated_submission(
+    /// Prepare a review outside the mutation gates, reusing validation from sealed snapshots.
+    pub(crate) fn prepare_submission(
         &self,
         session_id: &str,
         plan_id: &str,
         revision: u32,
         expected_version: u64,
         current: &PlanDocument,
-        mut document: PlanDocument,
+        source: PlanSubmissionSource,
     ) -> Result<PreparedPlanSubmission> {
         anyhow::ensure!(
             current.version == expected_version,
             "plan version changed before validated submission"
         );
+        let sealed = matches!(&source, PlanSubmissionSource::AuthoringSnapshot(_));
+        let mut document = match source {
+            PlanSubmissionSource::AuthoringSnapshot(snapshot) => {
+                self.authoring_snapshot_read(session_id, plan_id, &snapshot)?
+            }
+            PlanSubmissionSource::Document(document) => *document,
+        };
         anyhow::ensure!(
             document.plan_id == plan_id
                 && (document.version == expected_version
@@ -1467,6 +1497,52 @@ impl PlanFileStore {
                         && expected_version.checked_add(1) == Some(document.version))),
             "validated document identity changed before submission"
         );
+
+        // Confirm that the sealed evidence still describes the current workspace inputs.
+        if sealed {
+            let design = document
+                .design
+                .as_ref()
+                .filter(|design| design.authoring_fingerprint.is_some())
+                .context("submission snapshot has no captured authoring inputs")?;
+            design.check_workspace(&self.workspace)?;
+            let configuration = crate::checks::ConfigSnapshot::load(&self.workspace)?;
+            anyhow::ensure!(
+                design.check_configuration.as_ref() == Some(&configuration),
+                "configured checks changed during planning submission; submit the current draft again"
+            );
+            let report = design
+                .parsed()?
+                .validation
+                .as_ref()
+                .context("submission snapshot has no declaration validation report")?;
+            anyhow::ensure!(
+                report.fingerprint == crate::declaration::fingerprint(design)?,
+                "submission snapshot validation does not match its declarations"
+            );
+            report.ensure_valid()?;
+        } else {
+            self.validate_submission_document(&mut document)?;
+        }
+
+        // Use the accepted document to build the review before acquiring mutation authority.
+        let rendered = if sealed {
+            self.render_validated_review(&document)?
+        } else {
+            self.render_review(&document)?
+        };
+        Ok(PreparedPlanSubmission {
+            session_id: session_id.into(),
+            plan_id: plan_id.into(),
+            revision,
+            expected: current.clone(),
+            document,
+            rendered,
+        })
+    }
+
+    /// Validate a document submitted without an authenticated authoring snapshot.
+    fn validate_submission_document(&self, document: &mut PlanDocument) -> Result<()> {
         if let Some(design) = &document.design {
             design.validate()?;
             design.check_workspace(&self.workspace)?;
@@ -1499,15 +1575,7 @@ impl PlanFileStore {
             report.ensure_valid()?;
             design.parsed_mut()?.validation = Some(report);
         }
-        let rendered = self.render_review(&document)?;
-        Ok(PreparedPlanSubmission {
-            session_id: session_id.into(),
-            plan_id: plan_id.into(),
-            revision,
-            expected: current.clone(),
-            document,
-            rendered,
-        })
+        Ok(())
     }
 
     /// Commit a prepared submission against the exact canonical baseline it validated.
@@ -1592,6 +1660,11 @@ impl PlanFileStore {
     /// Render a validated review document while reusing unchanged analysis.
     pub(crate) fn render_review(&self, document: &PlanDocument) -> Result<RenderedPlan> {
         self.review_cache.validate(document, true)?;
+        self.render_validated_review(document)
+    }
+
+    /// Render and cache a document that already passed submission validation.
+    fn render_validated_review(&self, document: &PlanDocument) -> Result<RenderedPlan> {
         if let Some(rendered) = self.review_cache.rendered(document)? {
             return Ok(rendered);
         }

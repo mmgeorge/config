@@ -1202,6 +1202,41 @@ T["retry_input_resumes_a_paused_queue"] = function()
   eq({ requests[#requests].spec.params.action.kind, requests[#requests].spec.params.action.id }, { "retry", "failed" })
 end
 
+T["queue_clear_discards_waiting_and_failed_follow_ups"] = function()
+  local state = require("forge.session").harness
+  local controller = require("forge.views.harness.controller")
+  local input = require("forge.views.harness.input_state")
+  local requests = mock_client.record()
+  state.session = { id = "clear-queue", provider = "mock" }
+  state.composer_buf = buffer.scratch({ "/queue clear" })
+  input.attach(state, function() end)
+  state.input.drafts = {
+    { id = "rejected", text = "Unsent draft", local_only = true, draft_state = "rejected" },
+    { id = "pending", text = "Submitting draft", local_only = true, draft_state = "pending", intent = "queue" },
+  }
+  requests[1].callback({ revision = 1, control_revision = 4, suspended = true, messages = {
+    { id = "queued", revision = 1, text = "Next prompt", delivery = "queued", intent = "queue" },
+    { id = "failed", revision = 2, text = "Failed prompt", delivery = "failed" },
+    { id = "unknown", revision = 3, text = "Unconfirmed prompt", delivery = "unknown" },
+    { id = "continuation", revision = 1, text = "Continue task", delivery = "queued", purpose = { kind = "task_continuation" } },
+    { id = "running", revision = 1, text = "Running prompt", delivery = "delivering", route = "turn" },
+  } })
+
+  controller.submit()
+
+  eq(buffer.text(state.composer_buf), "")
+  eq(#requests, 4)
+  for index, id in ipairs({ "queued", "failed", "unknown" }) do
+    local spec = requests[index + 1].spec
+    eq(spec.method, "session.input.apply")
+    eq(spec.params.action, { kind = "remove", id = id, revision = index })
+    eq(spec.params.control_revision, 4)
+  end
+  eq(vim.tbl_map(function(entry) return entry.id end, state.input.drafts), { "pending" })
+  eq(vim.tbl_map(function(entry) return entry.id end, state.queue), { "continuation", "pending" })
+  eq(state.input.suspended, true)
+end
+
 T["unknown_input_can_be_discarded_without_retrying"] = function()
   local state = require("forge.session").harness
   local controller = require("forge.views.harness.controller")

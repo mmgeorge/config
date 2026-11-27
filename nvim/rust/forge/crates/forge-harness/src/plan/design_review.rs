@@ -44,7 +44,6 @@ struct DesignReviewRows {
 #[derive(Default)]
 struct WalkthroughPlacement {
     before: HashMap<BlockId, Vec<usize>>,
-    after_heading: HashMap<BlockId, usize>,
     documentation: HashMap<BlockId, Vec<BlockId>>,
 }
 
@@ -376,24 +375,6 @@ pub(super) fn project(
             },
         );
         block.push(row);
-        if let Some(index) = walkthrough.after_heading.remove(&row_id) {
-            let start = block.len() - 1;
-            let frame = walkthrough_frame(index, design, width)?;
-            source_end.insert(
-                row_id.clone(),
-                BlockAnchor {
-                    block: frame.id.clone(),
-                    position: TextPosition {
-                        row: frame.text.row_count(),
-                        column: 0,
-                    },
-                },
-            );
-            block.push(frame);
-            if block[start].metadata.fold.is_empty() {
-                fold(&mut block, start, &row_id.0, FILE_FOLD)?;
-            }
-        }
         for annotation in annotation.iter().filter(|annotation| {
             i64::from(annotation.source.end_line) == index as i64 + 1 + deferred_rows
         }) {
@@ -685,7 +666,7 @@ fn walkthrough_rows(
     source: &super::calls::CallPresentation,
     steps: &[(usize, &super::DesignWalkthroughComment)],
 ) -> Result<(Vec<WalkthroughAnchor>, HashSet<usize>)> {
-    if !steps.iter().any(|(_, step)| step.symbol.is_some()) {
+    if steps.is_empty() {
         return Ok(Default::default());
     }
     let inventory = DeclarationOverview::review_symbols(path, &source.plain)
@@ -693,9 +674,7 @@ fn walkthrough_rows(
     let mut anchors = Vec::new();
     let mut visible = HashSet::new();
     for &(index, step) in steps {
-        let Some(name) = &step.symbol else {
-            continue;
-        };
+        let name = &step.symbol;
         let symbol = super::design_artifact::resolve_walkthrough_symbol(&inventory, name)
             .with_context(|| {
                 format!("walkthrough declaration `{name}` is unavailable in {path}")
@@ -1111,11 +1090,6 @@ fn rows(
             &display,
             delta,
         )?);
-        if inspection
-            && let Some(&(index, _)) = steps.iter().find(|(_, step)| step.symbol.is_none())
-        {
-            walkthrough.after_heading.insert(BlockId(id.clone()), index);
-        }
         navigation.anchor.push(PlanNavigationAnchor {
             columns: None,
             line: block.len() as u32,
@@ -2746,7 +2720,7 @@ mod tests {
         )?;
         let step = crate::plan::DesignWalkthroughComment {
             path: path.into(),
-            symbol: Some("Worker::open".into()),
+            symbol: "Worker::open".into(),
             title: None,
             comment: "Acquire the lease first.".into(),
         };

@@ -547,6 +547,26 @@ function M.discard_rejected(state, id)
   render(state)
 end
 
+---Remove the user follow-ups visible in the queue when the command starts.
+---@param state table
+function M.clear_queue(state)
+  local input = state.input
+  if not input then return end
+  local removals, discarded = {}, false
+  for _, entry in ipairs(state.queue or {}) do
+    if not host_produced(entry) then
+      if not entry.local_only then
+        removals[#removals + 1] = { kind = "remove", id = entry.id, revision = entry.revision }
+      elseif entry.draft_state ~= "pending" then
+        discard_draft(input, entry.id)
+        discarded = true
+      end
+    end
+  end
+  if discarded and #removals == 0 then render(state) end
+  for _, action in ipairs(removals) do M.perform(state, action) end
+end
+
 ---Retry explicitly rejected content, keeping uncertain delivery blocked for inspection.
 function M.retry(state, entry)
   if not entry.local_only then

@@ -855,8 +855,8 @@ T["behavior-only signature occupies one display row and keeps baseline comments"
   local marks = vim.json.decode(table.concat(vim.fn.readfile(
     "nvim/lua/forge/tests/fixtures/protocol/plan-review-behavior-signature.json"), "\n"))
   local host = dofile("nvim/lua/forge/tests/support/plan_review_host.lua").start({
-    lines = { "Changed file", "pub fn app() -> App;", "pub fn app() -> App;", "Install the plugin." },
-    metadata = { [2] = { conceal = marks.baseline }, [3] = { gutter = marks.signature } },
+    lines = { "Changed file", "pub fn app() -> App;", "pub fn app() -> App;", "Install the plugin.", "" },
+    metadata = { [2] = { conceal = marks.baseline }, [3] = { gutter = marks.signature }, [5] = { gutter = marks.signature } },
   })
   host.annotation = { { id = "original", kind = "comment",
     source = { start_line = 2, end_line = 2, body = "Keep this entry point." } } }
@@ -870,6 +870,24 @@ T["behavior-only signature occupies one display row and keeps baseline comments"
   MiniTest.expect.equality(review.owner.comment_state.range_list[1].annotation.body, "Keep this entry point.")
   vim.api.nvim_win_call(review.win, function() vim.cmd("normal! j") end)
   MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win)[1], review.owner.comment_state.range_list[1].first_row + 1)
+
+  local source_row = proposed + 1
+  local gutter = assert(require("forge.gutter").bounds(review.owner.replica, source_row))
+  vim.api.nvim_win_set_cursor(review.win, { source_row, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = review.buf })
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win), { source_row, gutter.width })
+  keymap.invoke("W", { buffer = review.buf })
+  MiniTest.expect.equality(vim.api.nvim_get_mode().mode, "V")
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win), { source_row, 0 })
+  keymap.feed("<Esc>", "nx")
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win), { source_row, gutter.width })
+
+  local blank_row = assert(buffer.find_row(review.buf, "Install the plugin.")) + 1
+  local virtualedit = vim.wo[review.win].virtualedit
+  vim.api.nvim_win_set_cursor(review.win, { blank_row, 0 })
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = review.buf })
+  MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win), { blank_row, gutter.width })
+  MiniTest.expect.equality(vim.wo[review.win].virtualedit, virtualedit)
 end
 
 T["expanded answer paints fenced Rust inside the card borders"] = function()

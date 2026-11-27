@@ -44,6 +44,7 @@ local command_list = {
   { label = "/task pause", detail = "Pause the current task" },
   { label = "/task clear", detail = "Cancel and detach the current task" },
   { label = "/task refresh", detail = "Refresh authoritative task and connection state" },
+  { label = "/queue clear", detail = "Remove queued follow-up messages" },
   { label = "/execute", detail = "Accept and execute a submitted plan" },
   { label = "/execute last", detail = "Execute the latest submitted plan in this conversation" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
@@ -95,6 +96,9 @@ end
 ---@return string? failure
 function CommandSource.accepts_prompt(text)
   local trimmed = vim.trim(text)
+  if (trimmed == "/queue" or trimmed:match("^/queue%s")) and trimmed ~= "/queue clear" then
+    return false, "Use /queue clear to remove queued follow-up messages."
+  end
   if trimmed:match("^/artifacts%s") then
     return false, "Use /artifacts to browse session artifacts."
   end

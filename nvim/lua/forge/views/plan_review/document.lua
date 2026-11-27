@@ -771,7 +771,7 @@ function M.attach(options, callback)
     if options.configure_view then options.configure_view(owner.view, owner) end
     vim.bo[options.buffer].buftype = "acwrite"
     if options.plan.historical_revision then vim.bo[options.buffer].modifiable = false end
-    owner.gutter_selection = require("forge.document_commands").attach_selection(owner.replica, { normalize = false })
+    owner.gutter_selection = require("forge.document_commands").attach_selection(owner.replica, { normalize = true })
     owner.group = vim.api.nvim_create_augroup("ForgePlanDocument" .. options.buffer, { clear = true })
     vim.api.nvim_create_autocmd("BufWriteCmd", { group = owner.group, buffer = options.buffer, callback = function() save() end })
     vim.api.nvim_create_autocmd("BufWinEnter", { group = owner.group, buffer = options.buffer, callback = function()

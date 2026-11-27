@@ -16,7 +16,7 @@ Author the plan inside the supplied planning directory using normal read tools a
 
 1. **Investigate and decide.** Inspect the repository first and keep any existing draft on continuation. Resolve consequential design choices that the code cannot settle with `question_ask`. After a baseline refresh, compare the reported changes against existing proposals and revise before resubmitting.
 2. **Author proposals in `files/`.** Capture every existing repository file with `plan_capture_file` before editing its proposal, create new proposals directly, and keep declarations consistent with the overview.
-3. **Write artifacts in `docs/`.** After the proposals settle, write `docs/overview.md`, `docs/flows.md`, `docs/tests.md`, `docs/checks.md`, and `docs/walkthrough.json`. Follow the overview examples and walkthrough authoring rules below.
+3. **Write artifacts in `docs/`.** After the proposals settle, write `docs/overview.md`, `docs/flows.md`, `docs/tests.md`, `docs/checks.md`, and `docs/walkthrough.json`. Follow the overview examples below and read [references/walkthrough.md](references/walkthrough.md) before authoring `docs/walkthrough.json`.
 4. **Verify and submit.** Call `plan_status` to check the proposal inventory and dirty state, then call `plan_submit` with the active `plan_id` and no `expected_version`. Repair reported file and line diagnostics in place and submit again. Failed submissions preserve the draft.
 5. **Wait for execution.** Further edits require resubmission before acceptance. Submission does not authorize editing repository files. Wait for Harness execution instructions.
 
@@ -150,27 +150,11 @@ List one saved check ID per line to select checks for plan execution. Discover I
 
 ### `docs/walkthrough.json`
 
-Write a JSON array in the order a reviewer should visit its comments. Each object has a repository-relative `path` to a changed file, an optional declaration `symbol`, an optional plain-text `title`, and a nonblank Markdown `comment`. Give each step a short title that names its role. PlanReview shows it beside the step count in the frame border and uses `Walkthrough` when the title is omitted. Use the destination path for a rename and the original path and declarations for a deletion. Use qualified names such as `Worker::start` for methods. A short name works when it identifies one declaration. Give each file or symbol anchor at most one comment. An empty array is valid.
+Read [references/walkthrough.md](references/walkthrough.md) before writing `docs/walkthrough.json` for full selection rules, calibration, and examples.
 
-Start at registration and the capability boundary. Follow execution through setup, initialization, and the behavior decisions that depend on them. Summarize repeated parameter forwarding in one entry where it clarifies the handoff, and finish with relevant tests. Omit purely mechanical files so they follow the annotated files in review.
+Write a JSON array in the order a reviewer should visit its comments. Each object requires a repository-relative `path` to a changed file, a declaration `symbol`, and a nonblank Markdown `comment`, plus a short plain-text `title` (2 to 5 words naming the action). Use the destination path for a rename and the original path and declarations for a deletion. Use qualified names such as `Worker::start` for methods (an unambiguous short name also works). Give each `(path, symbol)` anchor at most one comment. An empty array is valid for trivial single-change plans.
 
-Omit `symbol` for a file with one cohesive purpose. In files with several responsibilities, choose the few declarations where the reviewer needs local rationale. Start each comment with a concrete verb such as *Register*, *Isolate*, or *Validate*. Name the mechanism and the constraint, failure boundary, or handoff it addresses. Add the context a reader cannot infer from the diff.
-
-```json
-[
-  {
-    "path": "src/registry.rs",
-    "title": "Register the worker",
-    "comment": "Register the worker at startup so jobs queued before the first tick can resolve their handler."
-  },
-  {
-    "path": "src/worker.rs",
-    "symbol": "Worker::start",
-    "title": "Acquire the lease",
-    "comment": "Acquire the lease before opening the queue so two workers cannot acknowledge the same job."
-  }
-]
-```
+PlanReview sorts files by their earliest comment index, drops uncommented files afterward in dependency order, and automatically surfaces private declarations anchored by a walkthrough comment in `public_only` mode. Annotate the symbols that implement the design decisions in `docs/overview.md`, skip thin dispatchers, mechanical parameter plumbing, and routine tests already listed in `docs/tests.md`, and write 1 to 2 succinct imperative sentences (`<action>` or `<action> because <reason>`, stating a reason only when non-obvious and avoiding filler `"so ..."` clauses).
 
 ## Prose
 
