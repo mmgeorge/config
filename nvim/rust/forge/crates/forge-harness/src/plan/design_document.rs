@@ -54,6 +54,35 @@ pub struct DesignDocument {
     /// Retain reviewer-owned test coverage choices independently of project defaults.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub test_scopes: BTreeMap<String, PlanTestScope>,
+    /// Ordered, authored comments anchored to the declaration diff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub walkthrough: Vec<DesignWalkthroughComment>,
+}
+
+/// One read-only step in the plan's declaration review.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesignWalkthroughComment {
+    /// Repository-relative review path.
+    pub path: String,
+    /// Qualified declaration name, absent for a file-level comment.
+    #[serde(
+        default,
+        deserialize_with = "walkthrough_symbol",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub symbol: Option<String>,
+    /// Plain-text label displayed in the walkthrough frame's top border.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Markdown displayed above the anchor.
+    pub comment: String,
+}
+
+fn walkthrough_symbol<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 impl DesignDocument {
@@ -274,6 +303,20 @@ impl DesignDocument {
             "plan check cannot be enabled and disabled"
         );
         super::design_tests::validate(&self.tests)?;
+        for step in &self.walkthrough {
+            ensure!(
+                !step.path.trim().is_empty() && !step.path.contains('\0'),
+                "walkthrough path must contain text and no NUL bytes"
+            );
+            ensure!(
+                !step.comment.trim().is_empty() && !step.comment.contains('\0'),
+                "walkthrough comment must contain text and no NUL bytes"
+            );
+            ensure!(
+                step.symbol.as_ref().is_none_or(|name| !name.contains('\0')),
+                "walkthrough symbol contains a NUL byte"
+            );
+        }
         for section in self
             .sections()
             .into_iter()

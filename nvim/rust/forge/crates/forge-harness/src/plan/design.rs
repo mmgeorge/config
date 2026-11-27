@@ -338,6 +338,12 @@ impl DeclarationDesign {
             .any(|diagnostic| diagnostic.error);
         if !artifact_errors {
             design.document = artifacts.document;
+            if design.authoring_fingerprint.is_none() {
+                super::design_artifact::revert_authored(
+                    super::PlanArtifact::Walkthrough,
+                    &mut design,
+                );
+            }
         }
         configuration
             .config

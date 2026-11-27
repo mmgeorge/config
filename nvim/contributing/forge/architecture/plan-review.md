@@ -24,6 +24,8 @@ PlanReview and batched pull-request review share the whole-file partition, secti
 
 Visual viewed-state commands capture the distinct file headings touched by the editor selection. The host validates them against one review revision, saves the set of viewed files once, and publishes one section update.
 
+PlanReview displays the ordered comments from `docs/walkthrough.json` in read-only Markdown frames inside Changes. Each frame's top border shows its step count and plain-text title. Entries without a title use `Walkthrough`. File comments sit below the file heading. Symbol comments sit below the hunk header and immediately above the declaration's attached documentation or signature. The first comment for each file determines its place within its viewed or unviewed group. Files without comments follow in dependency order. In Public view, a walkthrough keeps its file heading, anchored private declaration, and associated behavior visible. The frames rewrap with the window and have no editable regions or canonical feedback lines. Reviewer renames update symbol anchors and refresh the authored walkthrough text.
+
 PlanReview identifies file blocks that cross the Viewed Changes heading during publication. The shared buffer view restores positions on those blocks by editor row and byte column, just as Status does when staging removes a block from its section. Each window captures its own position and scroll state at the commit boundary.
 
 Every parser and projection splits plan text into rows on LF, and a decoration computed from text that kept a CR would extend one byte past its row. Authored artifact text therefore enters a plan with LF line endings: `design_artifact::lf_line_endings` converts CRLF and bare CR both when `plan_edit` stores an artifact and when `authoring_import` reads the planning directory, whose fingerprint still binds the raw bytes. Plans stored before that conversion still open, because the review renders the Flows section's Markdown from the same rows it displays.
@@ -36,10 +38,9 @@ A review opened or reopened in a new tab draws no number, sign, fold, or status 
 
 ## Navigation
 
-The PlanReview winbar shows review state, visibility, and only the `? help`
-shortcut. Keep individual bindings such as `ov`, comment, save, and acceptance
-commands in the help popup; do not add shortcut lists to the winbar or its status
-text. The help popup reads the registered commands and configured bindings.
+The PlanReview winbar shows review state, visibility, walkthrough progress when present, and the `? help` shortcut. The help popup reads the registered commands and configured bindings.
+
+Press `]w` or `[w` for the next or previous walkthrough step. Starting forward goes to the first comment, and starting backward goes to the last. Steps follow JSON order, so a jump can return to an earlier file. Navigation stops at either end. A jump loads a deferred body, opens the destination folds, and places the cursor on the frame. Files opened by earlier jumps stay open. When the cursor is already inside a frame, navigation starts from that frame's step.
 
 `.` and `open` resolve the selected token through saved Tree-sitter coordinates. A target inside the plan is revealed in PlanReview, opening folds and restoring omitted context. A target outside the plan opens its real source buffer.
 

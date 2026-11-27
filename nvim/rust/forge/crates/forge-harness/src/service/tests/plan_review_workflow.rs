@@ -2237,6 +2237,7 @@ async fn behavior_bodies_open_in_full_and_fold_at_their_signatures() -> Result<(
         "    requirement: Option<&RuntimeRequirement>,\n",
         "    operation: ProviderOperation,\n",
         ") -> Result<Value, ProviderError>;\n",
+        "/// Process new requests.\n",
         "pub fn added();\n",
     );
     let mut design = DeclarationDesign::default();

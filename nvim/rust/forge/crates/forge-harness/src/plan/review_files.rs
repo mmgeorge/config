@@ -66,6 +66,7 @@ impl ReviewFiles {
                         sides.before.as_deref(),
                         sides.after.as_deref(),
                         &[],
+                        &[],
                     )?
                     .visibility(&sides)?
                 }

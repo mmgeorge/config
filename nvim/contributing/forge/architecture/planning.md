@@ -35,7 +35,7 @@ Turn settlement fingerprints the editable tree and records the last observed inp
 
 ### Artifacts
 
-A new filesystem draft starts with an empty `docs/overview.md`. Submission requires only non-whitespace overview text, and PlanReview displays the submitted Markdown in its authored order. Forge reads an optional `# Title` as the plan title and uses dash-list items under `## Manual checks` as Verify actions. The `forge-planning` skill supplies a suggested template, and seeded drafts retain their authored overview. Planning artifacts are ordinary Markdown files in `docs/`, so the agent can use its existing readers and editors. The internal artifact model retains virtual names for execution tools. Planning diagnostics identify the physical relative paths.
+A new filesystem draft starts with an empty `docs/overview.md`. Submission requires non-whitespace overview text, and PlanReview displays the submitted Markdown in its authored order. Forge reads an optional `# Title` as the plan title and uses dash-list items under `## Manual checks` as Verify actions. The `forge-planning` skill supplies a suggested template, and seeded drafts retain their authored overview. Planning artifacts are ordinary files in `docs/`, so the agent can use its existing readers and editors. The internal artifact model retains virtual names for execution tools. Planning diagnostics identify the physical relative paths.
 
 | Path | Contents |
 | --- | --- |
@@ -43,6 +43,9 @@ A new filesystem draft starts with an empty `docs/overview.md`. Submission requi
 | `docs/flows.md` | One `## Title` per independently triggered flow, a one-to-two-line description naming its trigger, and one `mermaid` block that opens with `sequenceDiagram`, `flowchart`, or `stateDiagram-v2`. |
 | `docs/tests.md` | One `## path` per file with `- change \`name\` [target: t]: scenario` items. |
 | `docs/checks.md` | One saved check ID per line, each selecting a check to run during Checking. `parse_checks` appends every unlisted prerequisite after the listed IDs, and listing an automatic check is harmless. |
+| `docs/walkthrough.json` | An ordered JSON array of entries with changed-file `path`, optional declaration `symbol`, optional plain-text `title`, and Markdown `comment`. Starts as `[]`. |
+
+Submission resolves walkthrough anchors against the proposed declarations and saves the qualified symbol names. Renamed files use the destination path. Deleted files use the captured path and baseline declarations. JSON errors identify the line and column, and an unknown or ambiguous symbol reports the valid candidates in that file. Each resolved file or symbol anchor can appear once. Blank or absent walkthrough files represent an empty tour, including in older drafts.
 | `plan:findings.md` | Execution findings for Resolve; read-only. |
 | `plan:evidence.md` | Completed tool results and passed checks the Verify report may cite, each with a short alias; read-only. |
 | `plan:verification.md` | The Verify report: one result row per manual check, the defect findings, and a reuse reason. Editable only in Verify. |

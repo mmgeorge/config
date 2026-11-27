@@ -14,7 +14,7 @@ pub(super) fn definition() -> ControlToolDefinition {
         description: "During execution, read a plan artifact or a project file's proposed semantic structure without changing \
                 the plan. During planning, read the supplied directory with your usual read tools instead. \
                 Supply plan_id and a path. Plan artifacts are plan:overview.md, plan:flows.md, \
-                plan:tests.md, and plan:checks.md, plus plan:findings.md, plan:evidence.md, and \
+                plan:tests.md, plan:checks.md, and plan:walkthrough.json, plus plan:findings.md, plan:evidence.md, and \
                 plan:verification.md during execution; plan:verification.md holds the Verify report and \
                 plan:evidence.md the results it may cite. Other paths are project-relative files; unedited files are read from the \
                 workspace without being added to the plan. Set baseline to read the saved original of an \

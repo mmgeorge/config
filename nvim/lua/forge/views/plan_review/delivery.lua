@@ -40,7 +40,7 @@ function M.apply(state, delivery)
       source[#source + 1] = { id = id, text = text, block = node.id, position = { row = position - 1, column = 0 },
         metadata = node.entry.metadata, target = target, source_line = retained.source_line,
         test = retained.test, test_change = retained.test_change, test_file = retained.test_file,
-        test_summary = retained.test_summary, check = retained.check }
+        test_summary = retained.test_summary, check = retained.check, walkthrough_file = retained.walkthrough_file }
     end
   end)
   state.fragment, state.anchor = fragment, anchor

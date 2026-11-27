@@ -63,6 +63,18 @@ pub(super) struct FileDiff {
 }
 
 impl FileDiff {
+    /// Reveal a walkthrough signature omitted from the saved diff without shifting saved rows.
+    pub(super) fn reveal_walkthrough(
+        &mut self,
+        side: SourceSide,
+        source: &CallPresentation,
+        rows: &[usize],
+    ) {
+        if !rows.is_empty() {
+            self.include_context(side, source, None, rows, true);
+        }
+    }
+
     /// Context and hunk boundaries do not make an otherwise hidden change reviewable.
     pub fn visibility(&self, sides: &ReviewSides) -> Result<FileVisibility> {
         let mut modes = [false; 8];
@@ -110,6 +122,7 @@ impl FileDiff {
         destination: &str,
         before: Option<&CallPresentation>,
         after: Option<&CallPresentation>,
+        walkthrough: &[(SourceSide, usize)],
         revealed: &[(SourceSide, u32)],
     ) -> Result<Self> {
         let old = before
@@ -183,85 +196,107 @@ impl FileDiff {
             (SourceSide::Old, before, old_context.as_ref()),
             (SourceSide::New, after, new_context.as_ref()),
         ] {
-            if !revealed.iter().any(|(selected, _)| *selected == side) {
-                continue;
-            }
             let Some(source) = source else {
                 continue;
             };
-            let lines = source.declaration.text.lines().collect::<Vec<_>>();
-            let mut selected = std::collections::BTreeSet::new();
-            for &(_, row) in revealed.iter().filter(|(selected, _)| *selected == side) {
-                let row = row as usize;
-                if row >= lines.len() {
+            let walkthrough_rows = walkthrough
+                .iter()
+                .filter_map(|&(selected, row)| (side == selected).then_some(row));
+            let revealed_rows = revealed
+                .iter()
+                .filter_map(|&(selected, row)| (side == selected).then_some(row as usize));
+            for (requested, contextual) in [
+                (walkthrough_rows.collect::<Vec<_>>(), false),
+                (revealed_rows.collect(), true),
+            ] {
+                if requested.is_empty() {
                     continue;
                 }
-                selected.extend(row.saturating_sub(3)..(row + 4).min(lines.len()));
-                if let Some(context) = context.and_then(|context| context.at(row)) {
-                    selected.extend(context.before);
-                    selected.extend(context.after);
-                }
+                result.include_context(side, source, context, &requested, contextual);
             }
-            let displayed = result
-                .hunk
-                .iter()
-                .flat_map(|hunk| &hunk.row)
-                .filter_map(|row| {
-                    let coordinate = if side == SourceSide::Old {
-                        (row.kind() == RowKind::Removed || row.new_coordinate().is_none())
-                            .then_some(row.old_coordinate())
-                            .flatten()
-                    } else {
-                        row.new_coordinate()
-                    };
-                    coordinate.map(|coordinate| coordinate.line)
-                })
-                .collect::<std::collections::HashSet<_>>();
-            selected.retain(|line| !displayed.contains(line));
-            let (Some(&first), Some(&last)) = (selected.first(), selected.last()) else {
-                continue;
-            };
-            let mut rows = Vec::new();
-            let mut previous = None;
-            for line in selected {
-                if previous.is_some_and(|previous| line > previous + 1) {
-                    rows.push(DisplayRow {
-                        group_index: result.hunk.len(),
-                        text: "...".into(),
-                        source: forge_diff::display::DisplaySource::Gap,
-                        raw_id: None,
-                        emphasis: Vec::new(),
-                        emphasis_fallback: None,
-                    });
-                }
-                let coordinate = SourceCoordinate {
-                    side,
-                    line,
-                    byte_column: 0,
+        }
+        Ok(result)
+    }
+
+    /// Add saved walkthrough context and transient reference excerpts without moving change hunks.
+    fn include_context(
+        &mut self,
+        side: SourceSide,
+        source: &CallPresentation,
+        context: Option<&DeclarationContext>,
+        requested: &[usize],
+        contextual: bool,
+    ) {
+        let lines = source.declaration.text.lines().collect::<Vec<_>>();
+        let mut selected = std::collections::BTreeSet::new();
+        let displayed = self
+            .hunk
+            .iter()
+            .flat_map(|hunk| &hunk.row)
+            .filter_map(|row| {
+                let coordinate = if side == SourceSide::Old {
+                    (row.kind() == RowKind::Removed || row.new_coordinate().is_none())
+                        .then_some(row.old_coordinate())
+                        .flatten()
+                } else {
+                    row.new_coordinate()
                 };
+                coordinate.map(|coordinate| coordinate.line)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for &row in requested {
+            if row >= lines.len() || (!contextual && displayed.contains(&row)) {
+                continue;
+            }
+            selected.extend(row.saturating_sub(3)..(row + 4).min(lines.len()));
+            if let Some(context) = context.and_then(|context| context.at(row)) {
+                selected.extend(context.before);
+                selected.extend(context.after);
+            }
+        }
+        selected.retain(|line| !displayed.contains(line));
+        let (Some(&first), Some(&last)) = (selected.first(), selected.last()) else {
+            return;
+        };
+        let mut rows = Vec::new();
+        let mut previous = None;
+        for line in selected {
+            if previous.is_some_and(|previous| line > previous + 1) {
                 rows.push(DisplayRow {
-                    group_index: result.hunk.len(),
-                    text: lines[line].into(),
-                    source: forge_diff::display::DisplaySource::Context(coordinate),
+                    group_index: self.hunk.len(),
+                    text: "...".into(),
+                    source: forge_diff::display::DisplaySource::Gap,
                     raw_id: None,
                     emphasis: Vec::new(),
                     emphasis_fallback: None,
                 });
-                previous = Some(line);
             }
-            let range = first..last + 1;
-            let (old_lines, new_lines) = if side == SourceSide::Old {
-                (range, 0..0)
-            } else {
-                (0..0, range)
+            let coordinate = SourceCoordinate {
+                side,
+                line,
+                byte_column: 0,
             };
-            result.hunk.push(ReviewHunk {
-                group: DisplayHunk::context(old_lines, new_lines),
-                row: rows,
-                contextual: true,
+            rows.push(DisplayRow {
+                group_index: self.hunk.len(),
+                text: lines[line].into(),
+                source: forge_diff::display::DisplaySource::Context(coordinate),
+                raw_id: None,
+                emphasis: Vec::new(),
+                emphasis_fallback: None,
             });
+            previous = Some(line);
         }
-        Ok(result)
+        let range = first..last + 1;
+        let (old_lines, new_lines) = if side == SourceSide::Old {
+            (range, 0..0)
+        } else {
+            (0..0, range)
+        };
+        self.hunk.push(ReviewHunk {
+            group: DisplayHunk::context(old_lines, new_lines),
+            row: rows,
+            contextual,
+        });
     }
 }
 

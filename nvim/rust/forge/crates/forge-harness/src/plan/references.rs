@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use forge_diff::syntax::{DeclarationCalls, DeclarationIndex, DeclarationRole};
 use serde::Serialize;
 
@@ -963,6 +963,12 @@ impl PlanReferenceIndex {
                 reparsed.len() == functions.len(),
                 "rename changed callable ownership"
             );
+            sync_walkthrough_symbols(
+                path,
+                &original_parsed.proposed[path],
+                text,
+                &mut design.document.walkthrough,
+            )?;
             renamed_paths.push(path.clone());
         }
         // Rename positions are in parsed coordinates, so each renamed file's proposed source is
@@ -1032,6 +1038,7 @@ impl PlanReferenceIndex {
                 artifact,
                 super::design_artifact::PlanArtifact::Flows
                     | super::design_artifact::PlanArtifact::Tests
+                    | super::design_artifact::PlanArtifact::Walkthrough
             ) {
                 super::design_artifact::revert_authored(artifact, &mut design);
             }
@@ -1116,6 +1123,45 @@ impl PlanReferenceIndex {
                     .then_some(reference.symbol.as_str())
             })
     }
+}
+
+/// Carry walkthrough anchors through the same source-order rename as callable ownership.
+fn sync_walkthrough_symbols(
+    path: &str,
+    before: &str,
+    after: &str,
+    walkthrough: &mut [super::DesignWalkthroughComment],
+) -> Result<()> {
+    let mut names = walkthrough
+        .iter_mut()
+        .filter(|entry| entry.path == path)
+        .filter_map(|entry| entry.symbol.as_mut())
+        .peekable();
+    if names.peek().is_none() {
+        return Ok(());
+    }
+    let inventory = |text| {
+        forge_diff::syntax::DeclarationOverview::review_symbols(path, text)
+            .context("walkthrough declarations are unavailable for rename")
+    };
+    let (before, after) = (inventory(before)?, inventory(after)?);
+    ensure!(
+        before.len() == after.len(),
+        "rename changed walkthrough declaration structure"
+    );
+    for name in names {
+        let index = before
+            .iter()
+            .position(|symbol| symbol.name == *name)
+            .context("walkthrough anchor is missing before rename")?;
+        let updated = &after[index].name;
+        ensure!(
+            super::design_artifact::resolve_walkthrough_symbol(&after, updated).is_some(),
+            "rename made walkthrough anchor `{updated}` ambiguous"
+        );
+        name.clone_from(updated);
+    }
+    Ok(())
 }
 
 /// Find the planned file a relative module path names from `importer`, trying the extensions a
@@ -1451,6 +1497,61 @@ pub(super) mod tests {
             .find(|((path, line, _), _)| path == "Rounds.rs" && *line == 2)
             .map(|(_, (identity, _))| identity.clone())
             .unwrap()
+    }
+
+    #[test]
+    fn reviewer_renames_keep_walkthrough_type_and_method_anchors() -> anyhow::Result<()> {
+        let mut plan = crate::plan::test_fixture("plan", "Worker");
+        let mut design =
+            crate::plan::DeclarationDesign::scratch(std::collections::BTreeMap::from([(
+                "worker.rs".into(),
+                "pub struct Worker;\n\nimpl Worker {\n    pub fn start(&self);\n}\n".into(),
+            )]))?;
+        design.document.walkthrough = ["Worker", "Worker::start"]
+            .map(|name| crate::plan::DesignWalkthroughComment {
+                path: "worker.rs".into(),
+                symbol: Some(name.into()),
+                title: Some("Acquire the lease".into()),
+                comment: "Describe the lease.".into(),
+            })
+            .into();
+        let artifact = crate::plan::PlanArtifact::Walkthrough;
+        design.artifact_text.insert(
+            artifact.path().into(),
+            serde_json::to_string(&design.document.walkthrough)?,
+        );
+        plan.design = Some(design);
+        let workspace = std::path::Path::new("");
+        for (line, new_name, expected) in [
+            (1, "Runner", ["Runner", "Runner::start"]),
+            (4, "begin", ["Runner", "Runner::begin"]),
+        ] {
+            let index = PlanReferenceIndex::planned(&plan, workspace)?;
+            let identity = index
+                .definition
+                .iter()
+                .find(|((path, row, _), _)| path == "worker.rs" && *row == line)
+                .map(|(_, (identity, _))| identity)
+                .unwrap();
+            plan = index.renamed(&plan, identity, new_name)?;
+            let design = plan.design.as_ref().unwrap();
+            assert!(!design.artifact_text.contains_key(artifact.path()));
+            let text = crate::plan::design_artifact_text(artifact, &plan.title, design)?;
+            let steps: Vec<crate::plan::DesignWalkthroughComment> = serde_json::from_str(&text)?;
+            assert!(
+                steps
+                    .iter()
+                    .all(|step| step.title.as_deref() == Some("Acquire the lease"))
+            );
+            assert_eq!(
+                steps
+                    .iter()
+                    .map(|step| step.symbol.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        Ok(())
     }
 
     /// A TypeScript plan that names `moneyAllocate` the ways a planner writes it: a signature in

@@ -20,6 +20,100 @@ local T = MiniTest.new_set({
   }),
 })
 
+T["walkthrough keys reveal deferred files and show the active step"] = function()
+  local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
+  local client = require("forge.client")
+  client.host_get_generation = function() return 1 end
+  client.host_is_accepting = function() return true end
+  local state = require("forge.session").harness
+  state.session = { id = "walkthrough-session" }
+  state.transcript_win = vim.api.nvim_get_current_win()
+  local path = temp.file("walkthrough.md", { "# Review" })
+  local file_a, file_b = "plan:design:file:a", "plan:design:file:b"
+  local hunk = file_b .. ":hunk:0"
+  local declaration = hunk .. ":row:0"
+  local function step(index) return "plan:walkthrough:" .. index end
+  local position = { row = 0, column = 0 }
+  local function block(id, rows, endpoint)
+    local metadata = { decoration = {}, editable_region = {}, target = {} }
+    if endpoint then
+      metadata.fold = {
+        { id = id, start = position, ["end"] = { block = endpoint, position = { row = 1, column = 0 } }, closed = true },
+      }
+    end
+    return { id = id, text = rows, metadata = metadata }
+  end
+  local function delivery(document, reviewed)
+    local tail_a = reviewed and step(3) or file_a .. ":hunk:deferred"
+    local tail_b = reviewed and declaration or file_b .. ":hunk:deferred"
+    local blocks = { block("overview", { "Plan overview" }), block(file_a, { "First file" }, tail_a) }
+    if reviewed then blocks[#blocks + 1] = block(step(1), { "╭─ 1/3 Walkthrough ─╮", "│ Open the review. │" }) end
+    blocks[#blocks + 1] = block(tail_a, { reviewed and "╭─ 3/3 Finish ─╮" or "" })
+    blocks[#blocks + 1] = block(file_b, { "Second file" }, tail_b)
+    if reviewed then
+      blocks[#blocks + 1] = block(hunk, { "@@" }, declaration)
+      blocks[#blocks + 1] = block(step(2), { "╭─ 2/3 Register ─╮" })
+      blocks[#blocks + 1] = block(declaration, { "fn register()" })
+    else
+      blocks[#blocks + 1] = block(tail_b, { "" })
+    end
+    local rows = {}
+    for _, entry in ipairs(blocks) do
+      for index = 1, #entry.text do
+        rows[#rows + 1] = { block = entry.id, position = { row = index - 1, column = 0 }, source_line = 0 }
+      end
+    end
+    return { snapshot = { document = document, revision = reviewed and 1 or 0, block = blocks },
+      source_row = rows, annotation = {} }
+  end
+  local pending
+  client.request = function(request_specification, callback)
+    local params = request_specification.params
+    callback = encode_delivery(callback)
+    if params.operation == "plan_open" then
+      local opened = delivery(params.document, false)
+      opened.path, opened.version, opened.saved_source_digest = path, 1, "walkthrough-digest"
+      opened.walkthrough = { step = 0, total = 3 }
+      callback(opened)
+    elseif params.operation == "plan_action" then
+      pending = { input = params.input, callback = callback }
+    else
+      callback({})
+    end
+  end
+  require("forge.views.plan_review.native_controller").open({
+    id = "walkthrough", state = "awaiting_review", working_path = path, review_digest = "walkthrough-digest",
+  })
+  local review = assert(state.plan_review)
+  local replica = review.owner.replica
+  local nodes = require("forge.nodes")
+  local function winbar(number)
+    assert(vim.wo[review.win].winbar:find(("Walkthrough %d/3"):format(number), 1, true))
+  end
+  winbar(0)
+  assert(nodes.closed(replica, file_a) and nodes.closed(replica, file_b))
+  keymap.invoke("]w")
+  eq(pending.input.action, "walkthrough_next")
+  local loaded = delivery(pending.input.document, true)
+  loaded.jump, loaded.walkthrough = { block = step(1), position = position }, { step = 1, total = 3 }
+  pending.callback(loaded)
+  eq(vim.api.nvim_get_current_line(), "╭─ 1/3 Walkthrough ─╮")
+  winbar(1)
+  assert(not nodes.closed(replica, file_a) and nodes.closed(replica, file_b))
+
+  local _, third = replica.sequence:position(step(3))
+  vim.api.nvim_win_set_cursor(review.win, { replica.physical_row(third) + 1, 3 })
+  keymap.invoke("[w")
+  eq(pending.input.action, "walkthrough_previous")
+  eq(pending.input.block, step(3))
+  pending.callback({ jump = { block = step(2), position = position },
+    reveal = { block = declaration, position = position }, walkthrough = { step = 2, total = 3 } })
+  eq(vim.api.nvim_get_current_line(), "╭─ 2/3 Register ─╮")
+  winbar(2)
+  assert(not nodes.closed(replica, file_a) and not nodes.closed(replica, file_b))
+  assert(not nodes.closed(replica, hunk))
+end
+
 T["controller"] = function()
   local encode_delivery = dofile("nvim/lua/forge/tests/support/plan_delivery.lua")
   local client = require("forge.client")

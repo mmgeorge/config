@@ -131,6 +131,12 @@ fn status_text(document: &PlanDocument, execution: Option<&Value>) -> Result<Str
         (PlanArtifact::Tests, tests_state),
         (PlanArtifact::Checks, checks_state),
     ];
+    if !preview.walkthrough.is_empty() {
+        rows.push((
+            PlanArtifact::Walkthrough,
+            count(preview.walkthrough.len(), "step", "steps"),
+        ));
+    }
     if let Some(state) = execution {
         let findings = state["findings"].as_array().map_or(0, Vec::len);
         rows.push((

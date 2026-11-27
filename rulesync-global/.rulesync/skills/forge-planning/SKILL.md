@@ -16,7 +16,7 @@ Author the plan inside the supplied planning directory using normal read tools a
 
 1. **Investigate and decide.** Inspect the repository first and keep any existing draft on continuation. Resolve consequential design choices that the code cannot settle with `question_ask`. After a baseline refresh, compare the reported changes against existing proposals and revise before resubmitting.
 2. **Author proposals in `files/`.** Capture every existing repository file with `plan_capture_file` before editing its proposal, create new proposals directly, and keep declarations consistent with the overview.
-3. **Write artifacts in `docs/`.** Draft `docs/overview.md` to match the [plan overview examples](#plan-overview-examples) below, then write `docs/flows.md`, `docs/tests.md`, and `docs/checks.md`.
+3. **Write artifacts in `docs/`.** After the proposals settle, write `docs/overview.md`, `docs/flows.md`, `docs/tests.md`, `docs/checks.md`, and `docs/walkthrough.json`. Follow the overview examples and walkthrough authoring rules below.
 4. **Verify and submit.** Call `plan_status` to check the proposal inventory and dirty state, then call `plan_submit` with the active `plan_id` and no `expected_version`. Repair reported file and line diagnostics in place and submit again. Failed submissions preserve the draft.
 5. **Wait for execution.** Further edits require resubmission before acceptance. Submission does not authorize editing repository files. Wait for Harness execution instructions.
 
@@ -28,10 +28,11 @@ Author the plan inside the supplied planning directory using normal read tools a
   docs/flows.md      runtime flows (starts empty)
   docs/tests.md      test coverage (starts empty)
   docs/checks.md     saved check IDs (starts empty)
+  docs/walkthrough.json   ordered inline review comments (starts as [])
   files/<path>       one proposal per added, modified, or deleted repository file
 ```
 
-`docs/` holds only these four files and no subdirectories. `files/` mirrors repository-relative paths (`src/main.rs` maps to `files/src/main.rs`). Any extra entry fails submission. Harness stores captured originals and review snapshots outside the planning directory.
+`docs/` holds only these five files and no subdirectories. `files/` mirrors repository-relative paths (`src/main.rs` maps to `files/src/main.rs`). Any extra entry fails submission. Harness stores captured originals and review snapshots outside the planning directory.
 
 ## File proposals
 
@@ -146,6 +147,30 @@ Write one `## path/to/file` heading per file with test entries in the format bel
 ### `docs/checks.md`
 
 List one saved check ID per line to select checks for plan execution. Discover IDs with `check_definition_list`. Harness adds prerequisites automatically. This file does not configure or authorize checks.
+
+### `docs/walkthrough.json`
+
+Write a JSON array in the order a reviewer should visit its comments. Each object has a repository-relative `path` to a changed file, an optional declaration `symbol`, an optional plain-text `title`, and a nonblank Markdown `comment`. Give each step a short title that names its role. PlanReview shows it beside the step count in the frame border and uses `Walkthrough` when the title is omitted. Use the destination path for a rename and the original path and declarations for a deletion. Use qualified names such as `Worker::start` for methods. A short name works when it identifies one declaration. Give each file or symbol anchor at most one comment. An empty array is valid.
+
+Start at registration and the capability boundary. Follow execution through setup, initialization, and the behavior decisions that depend on them. Summarize repeated parameter forwarding in one entry where it clarifies the handoff, and finish with relevant tests. Omit purely mechanical files so they follow the annotated files in review.
+
+Omit `symbol` for a file with one cohesive purpose. In files with several responsibilities, choose the few declarations where the reviewer needs local rationale. Start each comment with a concrete verb such as *Register*, *Isolate*, or *Validate*. Name the mechanism and the constraint, failure boundary, or handoff it addresses. Add the context a reader cannot infer from the diff.
+
+```json
+[
+  {
+    "path": "src/registry.rs",
+    "title": "Register the worker",
+    "comment": "Register the worker at startup so jobs queued before the first tick can resolve their handler."
+  },
+  {
+    "path": "src/worker.rs",
+    "symbol": "Worker::start",
+    "title": "Acquire the lease",
+    "comment": "Acquire the lease before opening the queue so two workers cannot acknowledge the same job."
+  }
+]
+```
 
 ## Prose
 

@@ -179,6 +179,19 @@ pub(super) fn order(
             result.push(file.clone());
         }
     }
+    if !design.document.walkthrough.is_empty() {
+        let mut first_step = HashMap::new();
+        for (index, step) in design.document.walkthrough.iter().enumerate() {
+            first_step.entry(step.path.as_str()).or_insert(index);
+        }
+        // A stable sort preserves the dependency order among uncommented files.
+        result.sort_by_key(|file| {
+            first_step
+                .get(file.proposed.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
     Ok(result)
 }
 

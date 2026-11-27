@@ -6,14 +6,16 @@
 //! consistent: the review check toggle and test removal change the document and drop the stored
 //! text, and the next read renders the result in the same grammar the agent edits.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use anyhow::{Context, Result, bail};
+use forge_diff::syntax::{DeclarationOverview, ReviewSymbol};
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
+use serde_json::value::RawValue;
 
 use super::design::DeclarationDesign;
-use super::design_document::DesignDocument;
+use super::design_document::{DesignDocument, DesignWalkthroughComment};
 use super::design_tests::{DesignTestCase, DesignTestChange, DesignTestFile};
 use crate::declaration::{DeclarationDiagnostic, DeclarationDiagnosticKind};
 
@@ -33,6 +35,8 @@ pub(crate) enum PlanArtifact {
     Tests,
     /// Lists configured checks with the plan's selection as checkboxes.
     Checks,
+    /// Holds the ordered inline comments for declaration review.
+    Walkthrough,
     /// Lists execution findings that Resolve must address; read-only.
     Findings,
     /// Lists the tool results a Verify report may cite; read-only.
@@ -43,14 +47,21 @@ pub(crate) enum PlanArtifact {
 
 impl PlanArtifact {
     /// Artifacts the planning agent writes, in presentation order.
-    pub(crate) const AUTHORED: [Self; 4] = [Self::Overview, Self::Flows, Self::Tests, Self::Checks];
-
-    /// Every artifact, in presentation order.
-    const ALL: [Self; 7] = [
+    pub(crate) const AUTHORED: [Self; 5] = [
         Self::Overview,
         Self::Flows,
         Self::Tests,
         Self::Checks,
+        Self::Walkthrough,
+    ];
+
+    /// Every artifact, in presentation order.
+    const ALL: [Self; 8] = [
+        Self::Overview,
+        Self::Flows,
+        Self::Tests,
+        Self::Checks,
+        Self::Walkthrough,
         Self::Findings,
         Self::Evidence,
         Self::Verification,
@@ -63,6 +74,7 @@ impl PlanArtifact {
             Self::Flows => "plan:flows.md",
             Self::Tests => "plan:tests.md",
             Self::Checks => "plan:checks.md",
+            Self::Walkthrough => "plan:walkthrough.json",
             Self::Findings => "plan:findings.md",
             Self::Evidence => "plan:evidence.md",
             Self::Verification => "plan:verification.md",
@@ -172,6 +184,7 @@ fn render(artifact: PlanArtifact, title: &str, document: &DesignDocument) -> Res
         PlanArtifact::Flows => document.flows.clone(),
         PlanArtifact::Tests => tests_text(&document.tests),
         PlanArtifact::Checks => checks_text(document),
+        PlanArtifact::Walkthrough => serde_json::to_string_pretty(&document.walkthrough)?,
         PlanArtifact::Findings | PlanArtifact::Evidence | PlanArtifact::Verification => {
             bail!("{} is generated from execution state", artifact.path())
         }
@@ -246,6 +259,7 @@ pub(crate) fn changed_artifacts(
                 || old.disabled_checks != new.disabled_checks
                 || old.test_scopes != new.test_scopes
         }
+        PlanArtifact::Walkthrough => old.walkthrough != new.walkthrough,
         _ => false,
     };
     PlanArtifact::AUTHORED
@@ -320,6 +334,15 @@ pub(crate) fn parse_authored(
             diagnostic: &mut diagnostic,
         },
     );
+    let mut walkthrough_report = ArtifactReport {
+        path: PlanArtifact::Walkthrough.path(),
+        diagnostic: &mut diagnostic,
+    };
+    document.walkthrough = validate_walkthrough(
+        design,
+        parse_walkthrough(&text(PlanArtifact::Walkthrough)?, &mut walkthrough_report),
+        &mut walkthrough_report,
+    )?;
     document.disabled_checks = design
         .document
         .disabled_checks
@@ -392,7 +415,189 @@ pub(crate) fn preview_authored(design: &DeclarationDesign) -> DesignDocument {
             },
         );
     }
+    if let Some((text, path)) = parse(PlanArtifact::Walkthrough) {
+        document.walkthrough = parse_walkthrough(
+            &text,
+            &mut ArtifactReport {
+                path,
+                diagnostic: &mut ignored,
+            },
+        )
+        .into_iter()
+        .map(|(_, comment)| comment)
+        .collect();
+    }
     document
+}
+
+/// Keep each entry's source position even when objects span lines or share a line.
+fn parse_walkthrough(
+    text: &str,
+    report: &mut ArtifactReport<'_>,
+) -> Vec<(usize, DesignWalkthroughComment)> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let entries = match serde_json::from_str::<Vec<&RawValue>>(text) {
+        Ok(entries) => entries,
+        Err(error) => {
+            walkthrough_json_error(report, &error, 1, 0);
+            return Vec::new();
+        }
+    };
+    let (mut offset, mut line, mut column) = (0, 1, 0);
+    let mut comments = Vec::new();
+    for entry in entries {
+        let entry = entry.get();
+        let start = entry.as_ptr() as usize - text.as_ptr() as usize;
+        let preceding = &text[offset..start];
+        line += preceding.bytes().filter(|byte| *byte == b'\n').count();
+        column = preceding
+            .rsplit_once('\n')
+            .map_or(column + preceding.len(), |(_, tail)| tail.len());
+        offset = start;
+        if !entry.starts_with('{') {
+            report.syntax(line, "", "walkthrough entry must be a JSON object".into());
+            continue;
+        }
+        match serde_json::from_str(entry) {
+            Ok(comment) => comments.push((line, comment)),
+            Err(error) => walkthrough_json_error(report, &error, line, column),
+        }
+    }
+    comments
+}
+
+fn walkthrough_json_error(
+    report: &mut ArtifactReport<'_>,
+    error: &serde_json::Error,
+    first_line: usize,
+    first_column: usize,
+) {
+    let line = first_line + error.line().saturating_sub(1);
+    let column = error.column() + if error.line() <= 1 { first_column } else { 0 };
+    let message = error.to_string();
+    let location = format!(" at line {} column {}", error.line(), error.column());
+    let message = message.strip_suffix(&location).unwrap_or(&message);
+    report.syntax(
+        line,
+        "",
+        format!("invalid walkthrough JSON at line {line} column {column}: {message}"),
+    );
+    report.diagnostic.last_mut().unwrap().column =
+        u32::try_from(column.saturating_sub(1)).unwrap_or(u32::MAX);
+}
+
+fn validate_walkthrough(
+    design: &DeclarationDesign,
+    entries: Vec<(usize, DesignWalkthroughComment)>,
+    report: &mut ArtifactReport<'_>,
+) -> Result<Vec<DesignWalkthroughComment>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed = design.parsed()?;
+    let changed: HashSet<_> = design
+        .changed_paths()
+        .into_iter()
+        .map(|path| design.moved.get(&path).cloned().unwrap_or(path))
+        .collect();
+    let mut inventory = HashMap::new();
+    let mut anchors = HashSet::new();
+    let mut comments = Vec::new();
+    for (line, mut entry) in entries {
+        super::resolution_deadline::ResolutionDeadline::check()?;
+        if entry
+            .title
+            .as_deref()
+            .is_some_and(|title| title.contains('\0'))
+        {
+            report.content(line, &entry.path, "title must contain no NUL bytes".into());
+        }
+        if entry.comment.trim().is_empty() || entry.comment.contains('\0') {
+            report.content(
+                line,
+                &entry.path,
+                "comment must contain text and no NUL bytes".into(),
+            );
+        }
+        if !changed.contains(&entry.path) {
+            report.content(
+                line,
+                &entry.path,
+                "path must identify a changed file at its review path".into(),
+            );
+            continue;
+        }
+        if let Some(name) = &mut entry.symbol {
+            let symbols = inventory.entry(entry.path.clone()).or_insert_with(|| {
+                let source = if design.proposed_source.contains_key(&entry.path) {
+                    parsed.proposed.get(&entry.path).map(String::as_str)
+                } else {
+                    design
+                        .baseline
+                        .get(&entry.path)
+                        .map(|file| file.text.as_str())
+                };
+                source
+                    .and_then(|source| DeclarationOverview::review_symbols(&entry.path, source))
+                    .unwrap_or_default()
+            });
+            if let Some(symbol) = resolve_walkthrough_symbol(symbols, name) {
+                name.clone_from(&symbol.name);
+            } else {
+                let candidates = symbols
+                    .iter()
+                    .map(|symbol| symbol.name.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let candidates = if candidates.is_empty() {
+                    "(none)"
+                } else {
+                    &candidates
+                };
+                report.content(
+                    line,
+                    name,
+                    format!(
+                        "unknown or ambiguous symbol in {}. Valid symbols: {candidates}",
+                        entry.path
+                    ),
+                );
+                continue;
+            }
+        }
+        if !anchors.insert((entry.path.clone(), entry.symbol.clone())) {
+            report.content(line, &entry.path, "duplicate walkthrough anchor".into());
+        }
+        comments.push(entry);
+    }
+    Ok(comments)
+}
+
+/// Resolve exact qualified names before trying an unambiguous short name.
+pub(super) fn resolve_walkthrough_symbol<'a>(
+    symbols: &'a [ReviewSymbol],
+    name: &str,
+) -> Option<&'a ReviewSymbol> {
+    let mut exact = symbols.iter().filter(|symbol| symbol.name == name);
+    if let Some(symbol) = exact.next() {
+        return exact.next().is_none().then_some(symbol);
+    }
+    let mut matches = symbols.iter().filter(|symbol| {
+        let short = symbol.name.rsplit([':', '.']).next().unwrap_or_default();
+        let short = short
+            .rsplit_once('#')
+            .filter(|(_, ordinal)| {
+                !ordinal.is_empty() && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .map_or(short, |(name, _)| name);
+        short == name
+    });
+    let symbol = matches.next()?;
+    matches.next().is_none().then_some(symbol)
 }
 
 /// Present the authored artifacts to a provider prompt as the text the agent edits.
@@ -976,6 +1181,119 @@ mod test {
             .iter()
             .map(|diagnostic| (diagnostic.line, diagnostic.kind.code()))
             .collect()
+    }
+
+    #[test]
+    fn walkthrough_keeps_order_and_resolves_moved_and_deleted_declarations() -> Result<()> {
+        let mut design = DeclarationDesign::scratch(BTreeMap::from([(
+            "src/worker.rs".into(),
+            "struct Worker;\nimpl Worker { fn start(&self); }\n".into(),
+        )]))?;
+        for (path, text) in [
+            ("old.rs", "struct Worker;\n"),
+            ("deleted.rs", "enum Old { Gone }\n"),
+        ] {
+            design.baseline.insert(
+                path.into(),
+                super::super::DeclarationFile {
+                    text: text.into(),
+                    editable_text: text.into(),
+                    source_digest: String::new(),
+                },
+            );
+        }
+        design.moved.insert("old.rs".into(), "src/worker.rs".into());
+        let input = r#"[
+  {"path":"src/worker.rs","comment":"Register the new worker."},
+  {"path":"deleted.rs","symbol":"Old","comment":"Retire the old job type."},
+  {"path":"src/worker.rs","symbol":"start","title":"Acquire the lease","comment":"Acquire the `lease` first."}
+]"#;
+        let mut diagnostic = Vec::new();
+        let comments = validate_walkthrough(
+            &design,
+            parse_walkthrough(input, &mut report(&mut diagnostic)),
+            &mut report(&mut diagnostic),
+        )?;
+        assert!(diagnostic.is_empty());
+        assert_eq!(comments[0].symbol, None);
+        assert_eq!(comments[0].title, None);
+        assert_eq!(comments[1].symbol.as_deref(), Some("Old"));
+        assert_eq!(comments[2].symbol.as_deref(), Some("Worker::start"));
+        assert_eq!(comments[2].title.as_deref(), Some("Acquire the lease"));
+        design.document.walkthrough = comments;
+        let rendered = authored_text(PlanArtifact::Walkthrough, "", &design)?;
+        assert_eq!(
+            rendered,
+            serde_json::to_string_pretty(&design.document.walkthrough)?
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<DesignWalkthroughComment>>(&rendered)?,
+            design.document.walkthrough
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn walkthrough_reports_json_locations_and_invalid_anchors() -> Result<()> {
+        let proposed = "struct First;\nimpl First { fn start(&self); }\nstruct Second;\nimpl Second { fn start(&self); }\n";
+        let unchanged = "struct Unchanged;\n";
+        let mut design = DeclarationDesign::scratch(BTreeMap::from([
+            ("worker.rs".into(), proposed.into()),
+            ("same.rs".into(), unchanged.into()),
+        ]))?;
+        design.baseline.insert(
+            "same.rs".into(),
+            super::super::DeclarationFile {
+                text: unchanged.into(),
+                editable_text: unchanged.into(),
+                source_digest: String::new(),
+            },
+        );
+        let mut diagnostic = Vec::new();
+        let invalid = r#"[
+  {"path":"worker.rs","symbol":"start","comment":"Ambiguous."},
+  {"path":"worker.rs","symbol":"run","comment":"Missing."},
+  {"path":"worker.rs","symbol":"First::start","comment":"Valid."},
+  {"path":"worker.rs","symbol":"First::start","comment":"Duplicate."},
+  {"path":"same.rs","comment":"Unchanged."},
+  {"path":"missing.rs","comment":"Missing."},
+  {"path":"worker.rs","symbol":"First","comment":"  "},
+  {"path":"worker.rs","symbol":"Second","comment":"\u0000"},
+  {"path":"worker.rs","comment":"Unknown field.","caption":"No"},
+  ["worker.rs", null, "Array entry"],
+  {"path":"worker.rs","comment":"Wrong type.","symbol":null},
+  {"path":"worker.rs","title":"\u0000","comment":"Invalid title."}
+]"#;
+        let valid_json = parse_walkthrough(invalid, &mut report(&mut diagnostic));
+        assert_eq!(
+            diagnostic.iter().map(|item| item.line).collect::<Vec<_>>(),
+            [10, 11, 12]
+        );
+        assert!(diagnostic[0].reason.contains("unknown field `caption`"));
+        assert!(diagnostic[0].column > 2);
+        diagnostic.clear();
+        validate_walkthrough(&design, valid_json, &mut report(&mut diagnostic))?;
+        assert_eq!(
+            diagnostic.iter().map(|item| item.line).collect::<Vec<_>>(),
+            [2, 3, 5, 6, 7, 8, 9, 13]
+        );
+        assert_eq!(
+            diagnostic.last().unwrap().reason,
+            "title must contain no NUL bytes"
+        );
+        for item in &diagnostic[..2] {
+            assert!(item.reason.contains("First::start"));
+            assert!(item.reason.contains("Second::start"));
+        }
+        diagnostic.clear();
+        let broken = "[\n  { \"path\": ? }\n]";
+        let error = serde_json::from_str::<Vec<&RawValue>>(broken).unwrap_err();
+        assert!(parse_walkthrough(broken, &mut report(&mut diagnostic)).is_empty());
+        assert_eq!(diagnostic[0].line, error.line() as u32);
+        assert_eq!(diagnostic[0].column + 1, error.column() as u32);
+        assert!(parse_walkthrough(" \n\t", &mut report(&mut diagnostic)).is_empty());
+        assert_eq!(diagnostic.len(), 1);
+        Ok(())
     }
 
     /// Keep headings and list items in examples out of the Verify checklist.

@@ -42,7 +42,7 @@ mod service;
 mod structure;
 mod tree;
 pub use outline::{SourceOutline, SourceScope};
-pub use structure::SourceDeclaration;
+pub use structure::{ReviewSymbol, SourceDeclaration};
 
 pub use assets::SyntaxLanguage;
 pub use context::HunkContext;

@@ -441,7 +441,11 @@ impl HarnessService {
                 if warm {
                     review_standby::activate(&registry, &controller, review_id, sink).await;
                 } else {
-                    registry.review_standby.lock().await.close_view(&session_id, &review_id);
+                    registry
+                        .review_standby
+                        .lock()
+                        .await
+                        .close_view(&session_id, &review_id);
                 }
                 return Ok(opened);
             }
@@ -455,7 +459,19 @@ impl HarnessService {
                     .load_body(document, saved_source_digest, file, &self.syntax)
                     .await;
             }
-            crate::buffer::session::PresentationRequest::PlanAction { input, selected_files } => {
+            crate::buffer::session::PresentationRequest::PlanAction {
+                input,
+                selected_files,
+            } => {
+                if matches!(
+                    input.action.as_str(),
+                    "walkthrough_next" | "walkthrough_previous"
+                ) {
+                    return controller
+                        .plan_review
+                        .walkthrough(input, &self.syntax)
+                        .await;
+                }
                 let preview_trace = (input.action == "rename_entity").then(|| crate::plan::edit_trace::PlanEditTrace::new(
                     registry.runtime.trace(), &session_id, "plan.rename.preview",
                     &json!({"operation_id":format!("preview:{}:{}", input.document.0, input.sequence.0),
@@ -480,7 +496,9 @@ impl HarnessService {
                         .await?;
                 }
                 let stage = trace.as_ref().map(|trace| trace.stage("action", None));
-                let result = controller.plan_review.action(input.clone(), selected_files.as_deref())?;
+                let result = controller
+                    .plan_review
+                    .action(input.clone(), selected_files.as_deref())?;
                 if let Some(stage) = preview {
                     stage.complete(json!({"count":result.get("rename").and_then(|rename|rename.get("preview")).and_then(Value::as_array).map_or(0,Vec::len)}));
                 }
@@ -523,7 +541,11 @@ impl HarnessService {
             }
             crate::buffer::session::PresentationRequest::PlanClose { document } => {
                 controller.plan_review.close(document).await?;
-                registry.review_standby.lock().await.close_view(&session_id, document);
+                registry
+                    .review_standby
+                    .lock()
+                    .await
+                    .close_view(&session_id, document);
                 return Ok(json!({}));
             }
             _ => {}
@@ -2832,8 +2854,7 @@ async fn route_request(
             .await;
     }
     if method == RuntimeMethod::SessionPlanQuestionAnswer {
-        return review_questions::answer(registry, controller, request, message_sink)
-            .await;
+        return review_questions::answer(registry, controller, request, message_sink).await;
     }
     if method == RuntimeMethod::SessionProviderMockResponse {
         let mock_provider = controller.provider_handle();

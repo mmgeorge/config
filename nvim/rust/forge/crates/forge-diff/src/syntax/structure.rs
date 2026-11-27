@@ -1,6 +1,104 @@
 use tree_sitter::Node;
 
-use super::{SyntaxHandle, SyntaxLanguage};
+use super::{DeclarationCalls, DeclarationOverview, SyntaxHandle, SyntaxLanguage};
+
+/// Names a declaration and its inclusive, one-based range in a plan signature document.
+#[derive(Debug)]
+pub struct ReviewSymbol {
+    /// Qualified name, including the callable ordinal when signatures repeat.
+    pub name: String,
+    /// First attached documentation, attribute, or declaration row.
+    pub start: usize,
+    /// First row of the declaration itself.
+    pub signature: usize,
+    /// Last row of the declaration.
+    pub end: usize,
+}
+
+impl DeclarationOverview {
+    /// Get type and callable anchors in source order using the plan's declaration grammar.
+    pub fn review_symbols(path: &str, overview: &str) -> Option<Vec<ReviewSymbol>> {
+        if super::ConfigurationFormat::for_path(path).is_some() {
+            return Some(Vec::new());
+        }
+        let language = Self::language(path)?;
+        let source = super::declaration::declaration_surrogate(language, overview).ok()?;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language.grammar()).ok()?;
+        let tree = parser.parse(&source, None)?;
+        let root = tree.root_node();
+        if root.has_error() {
+            return None;
+        }
+        let lines: Vec<_> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(offset, _)| offset + 1))
+            .collect();
+        let entries = declarations(root, &source, language, &lines, true);
+        let separator = if language == SyntaxLanguage::Rust {
+            "::"
+        } else {
+            "."
+        };
+        let mut symbols = Vec::new();
+        for entry in entries.iter().filter(|entry| {
+            is_review_type(&entry.kind)
+                || matches!(
+                    entry.kind.as_str(),
+                    "abstract_method_signature" | "generator_function_declaration"
+                )
+        }) {
+            let mut names = vec![entry.name.as_str()];
+            let mut parent = entry.parent;
+            while let Some(index) = parent {
+                let entry = &entries[index];
+                if entry.callable
+                    || is_review_type(&entry.kind)
+                    || matches!(
+                        entry.kind.as_str(),
+                        "mod_item" | "impl_item" | "internal_module"
+                    )
+                {
+                    names.push(entry.name.as_str());
+                }
+                parent = entry.parent;
+            }
+            names.reverse();
+            symbols.push(ReviewSymbol {
+                name: names.join(separator),
+                start: entry.start_line,
+                signature: entry.range_start_line,
+                end: entry.end_line,
+            });
+        }
+        for callable in DeclarationCalls::from_tree(&source, language, &tree, true).ok()? {
+            symbols.push(ReviewSymbol {
+                name: callable.owner,
+                start: callable.heading_line as usize,
+                signature: callable.line as usize,
+                end: callable.end_line as usize,
+            });
+        }
+        symbols.sort_by_key(|symbol| symbol.start);
+        Some(symbols)
+    }
+}
+
+fn is_review_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "type_item"
+            | "associated_type"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration"
+    )
+}
 
 /// One declaration in an exact source snapshot. Coordinates count Unicode code points from one.
 #[derive(Clone, Debug)]

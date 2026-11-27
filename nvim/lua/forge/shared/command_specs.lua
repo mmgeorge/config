@@ -168,6 +168,8 @@ M.view_specs = {
   },
   plan_review = {
     { id = "checks", label = "checks", desc = "Enable or disable checks for this plan", modes = "n", pinned = false },
+    { id = "walkthrough_next", label = "next walkthrough", desc = "Jump to the next authored walkthrough comment", modes = "n", pinned = false },
+    { id = "walkthrough_previous", label = "previous walkthrough", desc = "Jump to the previous authored walkthrough comment", modes = "n", pinned = false },
     { id = "toggle_tests", label = "tests", desc = "Show or hide planned tests", modes = "n", pinned = false },
     { id = "toggle_imports", label = "imports", desc = "Show or hide imports", modes = "n", pinned = false },
     { id = "rename_entity", label = "rename", desc = "Rename a symbol introduced by the plan and its uses", modes = "n", pinned = false },

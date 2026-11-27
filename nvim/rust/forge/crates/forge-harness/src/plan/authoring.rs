@@ -642,6 +642,10 @@ impl PlanFileStore {
         design.parsed = None;
         for artifact in PlanArtifact::AUTHORED {
             let relative = artifact_file(artifact)?;
+            if artifact == PlanArtifact::Walkthrough && !inventory.contains_key(&relative) {
+                design.document.walkthrough.clear();
+                continue;
+            }
             let text = inventory.get(&relative).with_context(|| {
                 format!(
                     "{}: required planning artifact is missing",
@@ -718,6 +722,11 @@ impl PlanFileStore {
             .context("snapshot requires semantic structure")?;
         for artifact in PlanArtifact::AUTHORED {
             let path = temporary.join(artifact_file(artifact)?);
+            if artifact == PlanArtifact::Walkthrough
+                && !design.artifact_text.contains_key(artifact.path())
+            {
+                continue;
+            }
             fs::create_dir_all(path.parent().context("artifact has no parent")?)?;
             super::write_text_atomically(&path, &design.artifact_text[artifact.path()])?;
         }
@@ -808,7 +817,11 @@ impl PlanFileStore {
             return Ok(());
         }
         self.authoring_require_current(session_id, &original)?;
-        let inventory = authored_inputs(document)?;
+        let walkthrough_exists = self
+            .authoring_directory(session_id, &document.plan_id)
+            .join(artifact_file(PlanArtifact::Walkthrough)?)
+            .try_exists()?;
+        let inventory = authored_inputs(document, walkthrough_exists)?;
         let design = document
             .design
             .as_mut()
@@ -833,7 +846,10 @@ impl PlanFileStore {
         let original = self.read_working_document(session_id, &document.plan_id)?;
         let root = self.authoring_directory(session_id, &document.plan_id);
         let current = directory_contents(&root)?;
-        let desired = authored_inputs(document)?;
+        let desired = authored_inputs(
+            document,
+            current.contains_key(&artifact_file(PlanArtifact::Walkthrough)?),
+        )?;
         let current_fingerprint = authoring_fingerprint(
             &current,
             &self
@@ -886,13 +902,22 @@ fn authoring_fingerprint(
     ))?))
 }
 
-fn authored_inputs(document: &PlanDocument) -> Result<BTreeMap<String, String>> {
+fn authored_inputs(
+    document: &PlanDocument,
+    walkthrough_exists: bool,
+) -> Result<BTreeMap<String, String>> {
     let design = document
         .design
         .as_ref()
         .context("authoring requires semantic structure")?;
     let mut inputs = BTreeMap::new();
     for artifact in PlanArtifact::AUTHORED {
+        if artifact == PlanArtifact::Walkthrough
+            && !walkthrough_exists
+            && design.document.walkthrough.is_empty()
+        {
+            continue;
+        }
         inputs.insert(
             artifact_file(artifact)?,
             super::design_artifact_text(artifact, &document.title, design)?,
@@ -907,7 +932,7 @@ fn authored_inputs(document: &PlanDocument) -> Result<BTreeMap<String, String>> 
     Ok(inputs)
 }
 
-/// Map a planning artifact to the only supported editable Markdown path.
+/// Map a planning artifact to its editable path.
 fn artifact_file(artifact: PlanArtifact) -> Result<String> {
     ensure!(
         artifact.authored(),
@@ -1732,6 +1757,73 @@ mod tests {
             "rewriting the same plan with LF line endings marked the draft changed"
         );
         files.authoring_require_current("session", &document)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn walkthrough_authoring_keeps_the_draft_current_and_accepts_legacy_inventory()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        crate::checks::configure_fixture(temporary.path());
+        let files = PlanFileStore::new(temporary.path().join("storage"), temporary.path())?;
+        let entry = files.prepare_entry("session", "Plan a worker.".into(), None, 1)?;
+        let plan_id = entry.record.id;
+        let directory = files.authoring_directory("session", &plan_id);
+        let walkthrough = directory.join("docs/walkthrough.json");
+        assert_eq!(fs::read_to_string(&walkthrough)?, "[]");
+        fs::remove_file(&walkthrough)?;
+        fs::write(
+            directory.join("docs/overview.md"),
+            "# Worker\n\nRegister the worker.",
+        )?;
+        fs::write(
+            directory.join("files/worker.rs"),
+            "\
+/// Owns queued work.
+pub struct Worker;
+
+impl Worker {
+    /// Start processing pending jobs.
+    pub fn start(&self);
+}
+",
+        )?;
+        let original = files.read_working_document("session", &plan_id)?;
+        let legacy = files.authoring_import("session", &original)?;
+        assert!(
+            legacy
+                .design
+                .as_ref()
+                .unwrap()
+                .document
+                .walkthrough
+                .is_empty()
+        );
+        files.authoring_snapshot_save("session", &legacy)?;
+        fs::write(
+            &walkthrough,
+            r#"[{"path":"worker.rs","symbol":"start","comment":"Acquire the lease first."}]"#,
+        )?;
+        let mut document = files.authoring_import("session", &original)?;
+        let validated = document
+            .design
+            .as_ref()
+            .unwrap()
+            .validated(temporary.path(), &document.title)
+            .await?;
+        document.design = Some(validated.into_design());
+        assert_eq!(
+            document.design.as_ref().unwrap().document.walkthrough[0]
+                .symbol
+                .as_deref(),
+            Some("Worker::start")
+        );
+        let snapshot = files.authoring_snapshot_save("session", &document)?;
+        assert_eq!(
+            files.authoring_snapshot_read("session", &plan_id, &snapshot)?,
+            document
+        );
+        assert!(!files.authoring_progress("session", &document)?.1);
         Ok(())
     }
 }

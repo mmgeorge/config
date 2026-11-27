@@ -55,6 +55,7 @@ mod review_diff;
 mod review_file_layout;
 pub(crate) mod review_files;
 pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest, ParsedDeclarations};
+pub use design_document::DesignWalkthroughComment;
 mod edit;
 pub(crate) mod edit_trace;
 pub(crate) mod event;

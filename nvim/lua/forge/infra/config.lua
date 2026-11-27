@@ -342,6 +342,8 @@ M.defaults = {
     },
     plan_review = {
       checks = "oc",
+      walkthrough_next = "]w",
+      walkthrough_previous = "[w",
       toggle_tests = "ot",
       toggle_imports = "oi",
       delete_tests = "j",

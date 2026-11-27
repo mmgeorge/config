@@ -143,6 +143,10 @@ local function refresh_winbar(review)
   detail = detail .. " • Showing: " .. (review.public_only and "Public" or "All")
   if review.owner.show_tests then detail = detail .. " • Tests" end
   if review.owner.show_imports then detail = detail .. " • Imports" end
+  local walkthrough = review.owner.walkthrough
+  if walkthrough and walkthrough.total > 0 then
+    detail = detail .. (" • Walkthrough %d/%d"):format(walkthrough.step, walkthrough.total)
+  end
   keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
 end
 
@@ -189,6 +193,7 @@ local function toggle_visibility(review, name)
 end
 
 local function action(review, name)
+  local walkthrough = name == "walkthrough_next" or name == "walkthrough_previous"
   local file_review = name == "viewed" or name == "unviewed"
   if review.cancel_definition then review.cancel_definition() review.cancel_definition = nil end
   if name == "toggle_visibility" or name == "toggle_tests" or name == "toggle_imports" then
@@ -204,7 +209,12 @@ local function action(review, name)
         or not vim.api.nvim_win_is_valid(review.win)
         or vim.api.nvim_win_get_buf(review.win) ~= review.buf) then return end
     if failure then notice(failure) return end
-    if name == "toggle_declaration" then
+    if walkthrough then
+      if type(result.jump) == "table" then
+        effect(review, captured, { kind = "cursor", jump = true, block = result.jump.block, position = result.jump.position })
+      end
+      refresh_winbar(review)
+    elseif name == "toggle_declaration" then
       if result.jump then
         effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
       end
@@ -398,7 +408,13 @@ local function commands(review)
   command_set.register(set, "checks", function()
     require("forge.views.plan_review.checks").open(review, function(changes, receive) update_checks(review, changes.enabled or {}, nil, receive, changes.test_scopes) end)
   end)
-  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility", "toggle_tests", "toggle_imports", "viewed", "unviewed" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({
+    "open", "jump_entity", "references", "rename_entity", "entity_info", "schema",
+    "comment", "question", "delete", "toggle_visibility", "toggle_tests", "toggle_imports",
+    "viewed", "unviewed", "walkthrough_next", "walkthrough_previous",
+  }) do
+    command_set.register(set, name, function() action(review, name) end)
+  end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function()
     prompt_decision(review, "session.plan.accept", "Approval comment (optional)")

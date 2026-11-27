@@ -13,8 +13,10 @@ use forge_diff::display::{DisplayRow, DisplaySource, RowCoordinates, RowKind};
 use forge_diff::file_header::FileChange;
 use forge_diff::intraline::{IntralineResult, compare_replacement};
 use forge_diff::presentation::{FoldPolicy, RowChange};
+use forge_diff::source::SourceSide;
 use forge_diff::syntax::{
-    AlgorithmDiffLineKind, DeclarationFilter, DeclarationVisibility, classify_algorithm_diff_line,
+    AlgorithmDiffLineKind, DeclarationFilter, DeclarationOverview, DeclarationVisibility,
+    classify_algorithm_diff_line,
 };
 
 use super::review_annotation::ReviewAnnotation;
@@ -35,6 +37,20 @@ struct DesignReviewRows {
     hidden: HashSet<BlockId>,
     contextual: HashSet<BlockId>,
     skipped: HashMap<BlockId, i64>,
+    walkthrough: WalkthroughPlacement,
+}
+
+/// Frame placement is separate from canonical rows used by reviewer annotations.
+#[derive(Default)]
+struct WalkthroughPlacement {
+    before: HashMap<BlockId, Vec<usize>>,
+    after_heading: HashMap<BlockId, usize>,
+    documentation: HashMap<BlockId, Vec<BlockId>>,
+}
+
+/// Identify the projected block for a zero-based step.
+pub(super) fn walkthrough_block(index: usize) -> BlockId {
+    BlockId(format!("plan:walkthrough:{}", index + 1))
 }
 
 const FILE_FOLD: FoldPolicy = FoldPolicy {
@@ -145,19 +161,11 @@ pub(super) fn project(
     let DesignReviewRows {
         block: mut source,
         navigation,
-        hidden,
+        mut hidden,
         contextual,
         skipped,
-    } = rows(
-        document,
-        syntax,
-        filter,
-        true,
-        trace,
-        revealed,
-        files,
-        body,
-    )?;
+        mut walkthrough,
+    } = rows(document, syntax, filter, true, trace, revealed, files, body)?;
     let check_rows = if body.is_none() {
         review_checks(document.design.as_ref(), Some(width))?
     } else {
@@ -354,6 +362,9 @@ pub(super) fn project(
             target.insert(id, anchor);
         }
         let row_id = row.id.clone();
+        for index in walkthrough.before.remove(&row_id).into_iter().flatten() {
+            block.push(walkthrough_frame(index, design, width)?);
+        }
         source_end.insert(
             row_id.clone(),
             BlockAnchor {
@@ -365,6 +376,24 @@ pub(super) fn project(
             },
         );
         block.push(row);
+        if let Some(index) = walkthrough.after_heading.remove(&row_id) {
+            let start = block.len() - 1;
+            let frame = walkthrough_frame(index, design, width)?;
+            source_end.insert(
+                row_id.clone(),
+                BlockAnchor {
+                    block: frame.id.clone(),
+                    position: TextPosition {
+                        row: frame.text.row_count(),
+                        column: 0,
+                    },
+                },
+            );
+            block.push(frame);
+            if block[start].metadata.fold.is_empty() {
+                fold(&mut block, start, &row_id.0, FILE_FOLD)?;
+            }
+        }
         for annotation in annotation.iter().filter(|annotation| {
             i64::from(annotation.source.end_line) == index as i64 + 1 + deferred_rows
         }) {
@@ -396,6 +425,12 @@ pub(super) fn project(
             }
         }
     }
+    block = attach_walkthrough_documentation(
+        block,
+        &source_end,
+        walkthrough.documentation,
+        &mut hidden,
+    )?;
     if filter.public_only || !hidden.is_empty() {
         block = filtered_blocks(block, &hidden, body.is_none(), filter.public_only)?;
         let visible_target = block
@@ -406,6 +441,349 @@ pub(super) fn project(
         target.retain(|id, _| visible_target.contains(id));
     }
     Ok((block, target))
+}
+
+/// Move detached context rows after assigning their canonical review positions.
+fn attach_walkthrough_documentation(
+    mut blocks: Vec<BufferBlock>,
+    source_end: &HashMap<BlockId, BlockAnchor>,
+    mut attachments: HashMap<BlockId, Vec<BlockId>>,
+    hidden: &mut HashSet<BlockId>,
+) -> Result<Vec<BufferBlock>> {
+    if attachments.is_empty() {
+        return Ok(blocks);
+    }
+    let positions: HashMap<_, _> = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id.clone(), index))
+        .collect();
+    let mut moved = HashSet::new();
+    for docs in attachments.values_mut() {
+        let mut span = Vec::new();
+        for doc in docs.drain(..) {
+            let first = positions[&doc];
+            let last = positions[&source_end[&doc].block];
+            span.extend(blocks[first..=last].iter().map(|block| block.id.clone()));
+        }
+        moved.extend(span.iter().cloned());
+        *docs = span;
+    }
+
+    // Trim the old folds before moving their endpoints to the destination hunk.
+    let mut preceding = None;
+    let mut replacement = HashMap::new();
+    for block in &blocks {
+        if moved.contains(&block.id) {
+            replacement.insert(block.id.clone(), preceding.clone());
+        } else {
+            preceding = Some(BlockAnchor {
+                block: block.id.clone(),
+                position: TextPosition {
+                    row: block.text.row_count(),
+                    column: 0,
+                },
+            });
+        }
+    }
+    for block in &mut blocks {
+        let owner = positions[&block.id];
+        block.metadata.fold.retain_mut(|fold| {
+            let Some(end) = replacement.get(&fold.end.block) else {
+                return true;
+            };
+            if let Some(end) = end
+                && positions[&end.block] > owner
+            {
+                fold.end = end.clone();
+                return true;
+            }
+            if fold.id.0 == block.id.0 && block.id.0.contains(":hunk:") {
+                hidden.insert(block.id.clone());
+            }
+            false
+        });
+    }
+    let (detached, remaining): (Vec<_>, Vec<_>) = blocks
+        .into_iter()
+        .partition(|block| moved.contains(&block.id));
+    let mut detached: HashMap<_, _> = detached
+        .into_iter()
+        .map(|block| (block.id.clone(), block))
+        .collect();
+    let mut projected = Vec::with_capacity(remaining.len() + detached.len());
+    for block in remaining {
+        for doc in attachments.remove(&block.id).into_iter().flatten() {
+            projected.push(
+                detached
+                    .remove(&doc)
+                    .context("walkthrough documentation row is missing")?,
+            );
+        }
+        projected.push(block);
+    }
+    anyhow::ensure!(
+        detached.is_empty(),
+        "walkthrough documentation destination is missing"
+    );
+    Ok(projected)
+}
+
+/// Wrap a read-only comment and decorate its rounded frame in display cells.
+fn walkthrough_frame(
+    index: usize,
+    design: &super::DeclarationDesign,
+    width: &WidthProfile,
+) -> Result<BufferBlock> {
+    let step = &design.document.walkthrough[index];
+    let count = format!("{}/{}", index + 1, design.document.walkthrough.len());
+    let title = step
+        .title
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = if title.is_empty() {
+        "Walkthrough"
+    } else {
+        &title
+    };
+    let heading = format!("╭─ {count} ");
+    let heading_overhead = width.cells(&heading, 0)? + width.cells(" ╮", 0)?;
+    let prefix = "│ ";
+    let suffix = " │";
+    let left = width.cells(prefix, 0)?;
+    let right = width.cells(suffix, 0)?;
+    let mut interior = width.clone();
+    let framed = width.columns >= (left + right + 2).max(heading_overhead + 1);
+    if framed {
+        interior.columns -= left + right;
+    }
+    let mut block = forge_buffer::markdown::MarkdownRenderer::render(
+        walkthrough_block(index),
+        &step.comment,
+        &interior,
+    )?
+    .block;
+    block.metadata.target.clear();
+    if !framed {
+        let mut rows = width.wrap_plain(&format!("{count} {title}"), 0)?;
+        for decoration in &mut block.metadata.decoration {
+            decoration.range.start.row += rows.len();
+            decoration.range.end.row += rows.len();
+        }
+        rows.extend(block.text.rows().map(str::to_owned));
+        block.text = BufferText::from_rows(rows)?;
+        return Ok(block);
+    }
+    let edge = |left: &str, right: &str| -> Result<String> {
+        let span = width
+            .columns
+            .saturating_sub(width.cells(left, 0)? + width.cells(right, 0)?);
+        let unit = width.cells("─", 0)?;
+        Ok(format!(
+            "{left}{}{right}",
+            "─".repeat(span / unit) + &" ".repeat(span % unit)
+        ))
+    };
+    let title_width = WidthProfile {
+        columns: width.columns - heading_overhead,
+        ..width.clone()
+    };
+    let title = title_width.clip_plain(title, "…")?;
+    let mut rows = vec![edge(&format!("{heading}{title} "), "╮")?];
+    let original = std::mem::take(&mut block.metadata.decoration);
+    let mut pending = original.as_slice();
+    let wrap_width = WidthProfile {
+        columns: width.columns - right,
+        ..width.clone()
+    };
+    for (source_row, text) in block.text.rows().enumerate() {
+        let end = pending.partition_point(|decoration| decoration.range.start.row == source_row);
+        let decorations;
+        (decorations, pending) = pending.split_at(end);
+        let wrapped;
+        let segments: Vec<&str> = if width.cells(text, left)? <= interior.columns {
+            vec![text]
+        } else {
+            // Markdown keeps preformatted rows whole. Wrap their presentation without losing
+            // the syntax spans or counting tab stops from the wrong side of the frame.
+            wrapped = wrap_width.wrap_plain(&format!("{}{text}", " ".repeat(left)), left)?;
+            wrapped
+                .iter()
+                .map(|row| &row[left.min(row.len())..])
+                .filter(|row| !row.is_empty())
+                .collect()
+        };
+        let mut offset = 0;
+        for segment in segments {
+            let row = rows.len();
+            let end = offset + segment.len();
+            for decoration in decorations {
+                let start_column = decoration.range.start.column.max(offset);
+                let end_column = decoration.range.end.column.min(end);
+                if start_column < end_column {
+                    let mut decoration = decoration.clone();
+                    decoration.range = TextRange {
+                        start: TextPosition {
+                            row,
+                            column: prefix.len() + start_column - offset,
+                        },
+                        end: TextPosition {
+                            row,
+                            column: prefix.len() + end_column - offset,
+                        },
+                    };
+                    block.metadata.decoration.push(decoration);
+                }
+            }
+            let padding = interior.columns.saturating_sub(width.cells(segment, left)?);
+            rows.push(format!("{prefix}{segment}{}{suffix}", " ".repeat(padding)));
+            offset = end;
+        }
+    }
+    rows.push(edge("╰", "╯")?);
+    let style = |row, start, end| Decoration {
+        range: TextRange {
+            start: TextPosition { row, column: start },
+            end: TextPosition { row, column: end },
+        },
+        capture: "ForgePlanWalkthroughFrame".into(),
+        priority: 160,
+    };
+    for (row, text) in rows.iter().enumerate() {
+        if row == 0 || row + 1 == rows.len() {
+            block.metadata.decoration.push(style(row, 0, text.len()));
+        } else {
+            block.metadata.decoration.push(style(row, 0, "│".len()));
+            block
+                .metadata
+                .decoration
+                .push(style(row, text.len() - "│".len(), text.len()));
+        }
+    }
+    block.text = BufferText::from_rows(rows)?;
+    Ok(block)
+}
+
+struct WalkthroughAnchor {
+    index: usize,
+    heading: usize,
+    signature: std::ops::RangeInclusive<usize>,
+}
+
+#[derive(Default)]
+struct WalkthroughPositions {
+    steps: HashMap<usize, Vec<usize>>,
+    documentation: std::collections::BTreeMap<usize, usize>,
+}
+
+/// Locate a file's symbol steps in its rendered declaration coordinates.
+fn walkthrough_rows(
+    path: &str,
+    source: &super::calls::CallPresentation,
+    steps: &[(usize, &super::DesignWalkthroughComment)],
+) -> Result<(Vec<WalkthroughAnchor>, HashSet<usize>)> {
+    if !steps.iter().any(|(_, step)| step.symbol.is_some()) {
+        return Ok(Default::default());
+    }
+    let inventory = DeclarationOverview::review_symbols(path, &source.plain)
+        .context("walkthrough declarations are unavailable")?;
+    let mut anchors = Vec::new();
+    let mut visible = HashSet::new();
+    for &(index, step) in steps {
+        let Some(name) = &step.symbol else {
+            continue;
+        };
+        let symbol = super::design_artifact::resolve_walkthrough_symbol(&inventory, name)
+            .with_context(|| {
+                format!("walkthrough declaration `{name}` is unavailable in {path}")
+            })?;
+        anchors.push(WalkthroughAnchor {
+            index,
+            heading: source.declaration_row[&(symbol.start - 1)],
+            signature: source.declaration_row[&(symbol.signature - 1)]
+                ..=source.declaration_row[&(symbol.end - 1)],
+        });
+        let mut declaration = (symbol.start - 1..symbol.end).collect::<HashSet<_>>();
+        for child in &inventory {
+            if symbol.start < child.start && child.end < symbol.end {
+                for row in child.start - 1..child.end {
+                    declaration.remove(&row);
+                }
+            }
+        }
+        visible.extend(
+            source
+                .plain_row
+                .iter()
+                .enumerate()
+                .filter_map(|(row, plain)| declaration.contains(plain).then_some(row)),
+        );
+    }
+    Ok((anchors, visible))
+}
+
+/// Select frame positions and relocate unchanged documentation split from its signature.
+fn walkthrough_positions(
+    diff: &mut super::review_diff::FileDiff,
+    side: SourceSide,
+    source: &super::calls::CallPresentation,
+    anchors: Vec<WalkthroughAnchor>,
+) -> WalkthroughPositions {
+    if anchors.is_empty() {
+        return WalkthroughPositions::default();
+    }
+    let mut hunk_by_row = HashMap::new();
+    for (index, hunk) in diff.hunk.iter().enumerate() {
+        for row in &hunk.row {
+            if let Some(coordinate) = row.new_coordinate().or_else(|| row.old_coordinate())
+                && coordinate.side == side
+            {
+                hunk_by_row
+                    .entry(coordinate.line)
+                    .or_insert((index, row.kind()));
+            }
+        }
+    }
+    let mut positions = WalkthroughPositions::default();
+    let mut missing = Vec::new();
+    for anchor in anchors {
+        let first = *anchor.signature.start();
+        let docs = anchor.heading..first;
+        let signature_hunk = hunk_by_row.get(&first).map(|&(hunk, _)| hunk);
+        let attached = docs.clone().all(|row| {
+            hunk_by_row
+                .get(&row)
+                .is_some_and(|&(hunk, _)| Some(hunk) == signature_hunk)
+        });
+        let changed = docs.clone().any(|row| {
+            hunk_by_row
+                .get(&row)
+                .is_some_and(|&(_, kind)| kind != RowKind::Context)
+        });
+        let row = if attached || changed {
+            if !hunk_by_row.contains_key(&anchor.heading) {
+                missing.push(anchor.heading);
+            }
+            anchor.heading
+        } else {
+            for doc in docs {
+                positions.documentation.entry(doc).or_insert(first);
+                if !hunk_by_row.contains_key(&doc) {
+                    missing.push(doc);
+                }
+            }
+            first
+        };
+        if signature_hunk.is_none() {
+            missing.extend(anchor.signature);
+        }
+        positions.steps.entry(row).or_default().push(anchor.index);
+    }
+    diff.reveal_walkthrough(side, source, &missing);
+    positions
 }
 
 fn rows(
@@ -432,6 +810,7 @@ fn rows(
         file_visibility: Default::default(),
     };
     let mut skipped = HashMap::new();
+    let mut walkthrough = WalkthroughPlacement::default();
     let mut hidden = HashSet::new();
     let mut contextual_path = HashSet::new();
     let mut contextual_block = HashSet::new();
@@ -450,6 +829,7 @@ fn rows(
             hidden,
             contextual: contextual_block,
             skipped,
+            walkthrough,
         });
     }
     let ordered_files =
@@ -495,13 +875,25 @@ fn rows(
             ordered_files.len(),
         );
     }
+    let mut steps_by_path = HashMap::<_, Vec<_>>::new();
+    for (index, step) in design.document.walkthrough.iter().enumerate() {
+        steps_by_path
+            .entry(step.path.as_str())
+            .or_default()
+            .push((index, step));
+    }
     for file in ordered_files {
         let path = file.baseline;
         let destination = file.proposed;
+        let steps = steps_by_path
+            .get(destination.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if let Some((inventory, heading)) =
             files.and_then(|inventory| Some((inventory, inventory.for_path(&destination)?)))
             && body.is_none()
-            && (!inventory.loaded.contains(&heading.id) || !heading.visibility.visible(filter))
+            && (!inventory.loaded.contains(&heading.id)
+                || (steps.is_empty() && !heading.visibility.visible(filter)))
             && !revealed
                 .iter()
                 .any(|(file, _, _)| file == &path || file == &destination)
@@ -539,7 +931,7 @@ fn rows(
                 label,
             });
             let deferred = BlockId(format!("{}:hunk:deferred", heading.id));
-            if !heading.visibility.visible(filter) {
+            if steps.is_empty() && !heading.visibility.visible(filter) {
                 hidden.insert(BlockId(heading.id.clone()));
                 hidden.insert(deferred.clone());
             }
@@ -553,6 +945,22 @@ fn rows(
             continue;
         }
         let sides = super::review_diff::ReviewSides::new(design, &path, &destination)?;
+        let (walkthrough_side, walkthrough_source) = sides
+            .after
+            .as_deref()
+            .map_or((SourceSide::Old, sides.before.as_deref()), |source| {
+                (SourceSide::New, Some(source))
+            });
+        let (walkthrough_anchors, walkthrough_visible) = match walkthrough_source {
+            Some(source) => walkthrough_rows(&destination, source, steps)?,
+            None => Default::default(),
+        };
+        let mut walkthrough_context: Vec<_> = walkthrough_anchors
+            .iter()
+            .map(|anchor| (walkthrough_side, anchor.heading))
+            .collect();
+        walkthrough_context.sort_unstable_by_key(|&(_, row)| row);
+        walkthrough_context.dedup();
         let explicitly_revealed = revealed
             .iter()
             .any(|(file, side, _)| file == &path && side == "baseline")
@@ -571,17 +979,25 @@ fn rows(
                 }
             })
             .collect::<Vec<_>>();
-        let diff = super::review_diff::FileDiff::new(
+        let mut diff = super::review_diff::FileDiff::new(
             &path,
             &destination,
             sides.before.as_deref(),
             sides.after.as_deref(),
+            &walkthrough_context,
             &reference_context,
         )?;
+        let mut locations = match walkthrough_source.filter(|_| inspection) {
+            Some(source) => {
+                walkthrough_positions(&mut diff, walkthrough_side, source, walkthrough_anchors)
+            }
+            None => WalkthroughPositions::default(),
+        };
         if diff.hunk.is_empty()
             && sides.before.is_some()
             && sides.after.is_some()
             && path == destination
+            && steps.is_empty()
         {
             continue;
         }
@@ -594,7 +1010,10 @@ fn rows(
                 .file_visibility
                 .insert(destination.clone(), file_visibility);
         }
-        let hide_file = inspection && !explicitly_revealed && !file_visibility.visible(filter);
+        let hide_file = inspection
+            && steps.is_empty()
+            && !explicitly_revealed
+            && !file_visibility.visible(filter);
         let super::review_diff::ReviewSides { before, after } = sides;
         let signature_replacements = if inspection {
             super::review_alignment::signature_replacements(
@@ -619,7 +1038,10 @@ fn rows(
                     super::calls::visibility(
                         &path,
                         &before,
-                        if revealed.iter().any(|(file, side, _)| file == &path && side == "baseline") {
+                        if revealed
+                            .iter()
+                            .any(|(file, side, _)| file == &path && side == "baseline")
+                        {
                             DeclarationFilter::ALL
                         } else {
                             filter
@@ -637,7 +1059,10 @@ fn rows(
                     super::calls::visibility(
                         &destination,
                         &after,
-                        if revealed.iter().any(|(file, side, _)| file == &destination && side == "proposed") {
+                        if revealed
+                            .iter()
+                            .any(|(file, side, _)| file == &destination && side == "proposed")
+                        {
                             DeclarationFilter::ALL
                         } else {
                             filter
@@ -651,6 +1076,7 @@ fn rows(
         let file = &diff;
         let hunks = &file.hunk;
         let mut declaration_rows = Vec::new();
+        let mut walkthrough_targets = Vec::new();
         let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
         let start = block.len();
         let path = file
@@ -685,6 +1111,11 @@ fn rows(
             &display,
             delta,
         )?);
+        if inspection
+            && let Some(&(index, _)) = steps.iter().find(|(_, step)| step.symbol.is_none())
+        {
+            walkthrough.after_heading.insert(BlockId(id.clone()), index);
+        }
         navigation.anchor.push(PlanNavigationAnchor {
             columns: None,
             line: block.len() as u32,
@@ -727,6 +1158,19 @@ fn rows(
                     forge_diff::source::SourceSide::New => ("proposed", path),
                 };
                 let line = coordinate.line;
+                let walkthrough_target = coordinate.side == walkthrough_side;
+                let walkthrough_reveal = walkthrough_target && walkthrough_visible.contains(&line);
+                if inspection
+                    && walkthrough_target
+                    && let Some(steps) = locations.steps.remove(&line)
+                {
+                    walkthrough
+                        .before
+                        .entry(id.clone())
+                        .or_default()
+                        .extend(steps);
+                    walkthrough_targets.push(block.len());
+                }
                 let source = &presentation[&(source_path.clone(), side.into())];
                 let syntax_row = source
                     .plain_row
@@ -820,6 +1264,7 @@ fn rows(
                 }
                 let row_text = visibility
                     .get(&(source_path.clone(), side.into()))
+                    .filter(|_| !walkthrough_reveal)
                     .and_then(|visibility| visibility.replacement.get(&line))
                     .map(String::as_str)
                     .unwrap_or(&display.text);
@@ -883,6 +1328,7 @@ fn rows(
                     });
                 }
                 if inspection
+                    && !walkthrough_reveal
                     && !visibility
                         .get(&(source_path.clone(), side.into()))
                         .and_then(|visibility| visibility.rows.get(line))
@@ -983,11 +1429,16 @@ fn rows(
             }
         }
         if inspection {
+            anyhow::ensure!(
+                locations.steps.is_empty(),
+                "walkthrough declaration rows are unavailable in {path}"
+            );
             declaration_folds(
                 &mut block,
                 [file.old_path.as_ref(), file.new_path.as_ref()],
                 &presentation,
                 &display_row,
+                &walkthrough_targets,
             )?;
             behavior_folds(
                 &mut block,
@@ -996,6 +1447,23 @@ fn rows(
                 &display_row,
                 &declaration_rows,
             )?;
+            let side = match walkthrough_side {
+                SourceSide::Old => "baseline",
+                SourceSide::New => "proposed",
+            };
+            let block_for = |row| -> Result<BlockId> {
+                let index = display_row
+                    .get(&(path.clone(), side.into(), row))
+                    .context("walkthrough documentation has no displayed declaration")?;
+                Ok(block[*index].id.clone())
+            };
+            for (doc, signature) in locations.documentation {
+                walkthrough
+                    .documentation
+                    .entry(block_for(signature)?)
+                    .or_default()
+                    .push(block_for(doc)?);
+            }
         }
         fold(&mut block, start, &id, FILE_FOLD)?;
         if hide_file {
@@ -1013,6 +1481,7 @@ fn rows(
             hidden,
             contextual: contextual_block,
             skipped,
+            walkthrough,
         });
     }
     if block.is_empty() {
@@ -1162,6 +1631,7 @@ fn rows(
         hidden,
         contextual: contextual_block,
         skipped,
+        walkthrough,
     })
 }
 
@@ -1813,6 +2283,7 @@ fn declaration_folds(
     paths: [Option<&String>; 2],
     presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>,
     display_row: &HashMap<(String, String, usize), usize>,
+    walkthrough_targets: &[usize],
 ) -> Result<()> {
     let mut candidates = Vec::new();
     for (source_path, side) in [(paths[0], "baseline"), (paths[1], "proposed")] {
@@ -1841,7 +2312,9 @@ fn declaration_folds(
             candidates.push((
                 opening,
                 closing,
-                mapped(declaration.heading).unwrap_or(opening),
+                mapped(declaration.heading)
+                    .filter(|heading| *heading <= opening)
+                    .unwrap_or(opening),
                 declaration.collapsed_suffix.clone(),
                 declaration.closed,
             ));
@@ -1869,6 +2342,18 @@ fn declaration_folds(
                 summary: suffix,
             },
         )?;
+        // Retain annotated declarations in the native fold model so jumps can open ancestors.
+        if walkthrough_targets
+            .iter()
+            .any(|&target| opening < target && target <= closing)
+        {
+            block[opening]
+                .metadata
+                .fold
+                .last_mut()
+                .unwrap()
+                .collapsed_suffix = None;
+        }
         installed.push((opening, closing));
     }
     Ok(())
@@ -1914,7 +2399,13 @@ fn behavior_folds(
                         super::digest(path.as_bytes()),
                         super::digest(behavior.owner.as_bytes())
                     ));
-                    (mapped(body.heading).unwrap_or(opening), closing, id)
+                    (
+                        mapped(body.heading)
+                            .filter(|heading| *heading <= opening)
+                            .unwrap_or(opening),
+                        closing,
+                        id,
+                    )
                 });
         }
     }
@@ -2240,6 +2731,132 @@ mod tests {
     use super::{FileChange, test_file_change};
     use crate::plan::DesignTestChange;
     use crate::plan::design_tests::DesignTestCase;
+
+    #[test]
+    fn walkthrough_reunites_a_signature_with_its_detached_doc_comment() -> anyhow::Result<()> {
+        use forge_diff::display::{DisplayHunk, DisplayRow, DisplaySource};
+        use forge_diff::source::{SourceCoordinate, SourceSide};
+
+        let path = "worker.rs";
+        let source = super::super::calls::insert(
+            path,
+            "impl Worker {\n    /// Opens pending work.\n    fn open(\n        &self,\n        queue: Queue,\n    ) -> Result<()>;\n}\n",
+            &[],
+            true,
+        )?;
+        let step = crate::plan::DesignWalkthroughComment {
+            path: path.into(),
+            symbol: Some("Worker::open".into()),
+            title: None,
+            comment: "Acquire the lease first.".into(),
+        };
+        let anchors = || super::walkthrough_rows(path, &source, &[(0, &step)]);
+        let (locations, _) = anchors()?;
+        let heading = locations[0].heading;
+        let signature = locations[0].signature.clone();
+        assert!(heading < *signature.start());
+        assert!(signature.start() < signature.end());
+        let lines: Vec<_> = source.declaration.text.lines().collect();
+        let excerpt =
+            |range: std::ops::Range<usize>, group_index| super::super::review_diff::ReviewHunk {
+                group: DisplayHunk::context(0..0, range.clone()),
+                row: range
+                    .map(|line| DisplayRow {
+                        group_index,
+                        text: lines[line].into(),
+                        source: DisplaySource::Context(SourceCoordinate {
+                            side: SourceSide::New,
+                            line,
+                            byte_column: 0,
+                        }),
+                        raw_id: None,
+                        emphasis: Vec::new(),
+                        emphasis_fallback: None,
+                    })
+                    .collect(),
+                contextual: false,
+            };
+        let mut diff = super::super::review_diff::FileDiff {
+            old_path: None,
+            new_path: Some(path.into()),
+            hunk: vec![
+                excerpt(*signature.start()..*signature.end() + 1, 0),
+                excerpt(heading..heading + 1, 1),
+            ],
+            alignment: Default::default(),
+        };
+        let positions =
+            super::walkthrough_positions(&mut diff, SourceSide::New, &source, locations);
+        assert_eq!(positions.steps[signature.start()], [0]);
+        assert_eq!(positions.documentation[&heading], *signature.start());
+        assert_eq!(diff.hunk.len(), 2);
+
+        let block = |id: &str, text: &str| -> anyhow::Result<_> {
+            Ok(super::BufferBlock {
+                id: super::BlockId(id.into()),
+                text: super::BufferText::from_rows([text])?,
+                metadata: Default::default(),
+            })
+        };
+        let mut blocks = vec![
+            block("file:hunk:0", "@@")?,
+            block("plan:walkthrough:1", "Walkthrough 1/1")?,
+            block("file:hunk:0:row:0", "fn open(")?,
+        ];
+        super::fold(&mut blocks, 0, "file:hunk:0", Default::default())?;
+        blocks.push(block("file:hunk:1", "@@")?);
+        blocks.push(block("file:hunk:1:row:0", "/// Opens pending work.")?);
+        super::fold(&mut blocks, 3, "file:hunk:1", Default::default())?;
+        let docs = blocks[4].id.clone();
+        let declaration = blocks[2].id.clone();
+        let detached_hunk = blocks[3].id.clone();
+        let end = super::BlockAnchor {
+            block: docs.clone(),
+            position: super::TextPosition { row: 1, column: 0 },
+        };
+        let mut hidden = super::HashSet::new();
+        let projected = super::attach_walkthrough_documentation(
+            blocks,
+            &[(docs.clone(), end)].into(),
+            [(declaration, vec![docs])].into(),
+            &mut hidden,
+        )?;
+        assert!(hidden.contains(&detached_hunk));
+        let projected = super::filtered_blocks(projected, &hidden, false, false)?;
+        let document = forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("plan:review".into()),
+            projected,
+        )?;
+        assert_eq!(
+            (&document)
+                .into_iter()
+                .filter_map(|block| block.text.row(0))
+                .collect::<Vec<_>>(),
+            [
+                "@@",
+                "Walkthrough 1/1",
+                "/// Opens pending work.",
+                "fn open("
+            ],
+        );
+
+        diff.hunk.remove(0);
+        let (locations, _) = anchors()?;
+        let positions =
+            super::walkthrough_positions(&mut diff, SourceSide::New, &source, locations);
+        assert_eq!(positions.steps[signature.start()], [0]);
+        assert_eq!(positions.documentation[&heading], *signature.start());
+        let supplemental = &diff.hunk[1];
+        assert!(supplemental.contextual);
+        let visible: Vec<_> = supplemental
+            .row
+            .iter()
+            .filter_map(DisplayRow::new_coordinate)
+            .map(|coordinate| coordinate.line)
+            .collect();
+        assert!(signature.into_iter().all(|row| visible.contains(&row)));
+        Ok(())
+    }
 
     #[test]
     fn file_headings_show_only_declaration_deltas_and_read_legacy_summaries() -> anyhow::Result<()>

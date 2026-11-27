@@ -10,15 +10,21 @@ local node_projection = require("forge.node_projection")
 ---@type table<string, table<string, boolean>>
 local file_fold_choices = {}
 local visibility_action = { toggle_visibility = true, toggle_tests = true, toggle_imports = true }
+local walkthrough_action = { walkthrough_next = true, walkthrough_previous = true }
+
+---@class ForgePlanWalkthroughProgress
+---@field step integer
+---@field total integer
 
 ---@class ForgePlanReviewUpdate
 ---@field snapshot? {document: string, revision: integer, block: table[]}
 ---@field patch? table
----@field source_edit {upsert: {id: string, source_line: integer, test_change?: string, test_file?: string, test_summary?: table<string, integer>}[], remove: string[]}
+---@field source_edit {upsert: {id: string, source_line: integer, test_change?: string, test_file?: string, test_summary?: table<string, integer>, walkthrough_file?: string}[], remove: string[]}
 ---@field annotation {id: string, source: {start_line: integer, end_line: integer, body: string}, kind?: string, parent_id?: string}[]
 ---@field public_only boolean
 ---@field show_tests boolean
 ---@field show_imports boolean
+---@field walkthrough? ForgePlanWalkthroughProgress
 ---@field saved_source_digest string
 ---@field version integer
 ---@field checks {id: string, name: string, stage: string, enabled: boolean, available: boolean, reason?: string}[]
@@ -36,10 +42,11 @@ function M.attach(options, callback)
   local plan_key = options.session_id .. "\0" .. options.plan.id
   local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_get_generation(), views = {}, pending_operation = {},
     public_only = false, show_tests = false, show_imports = false }
-  local function update_filters(result)
+  local function update_view_state(result)
     for _, field in ipairs({ "public_only", "show_tests", "show_imports" }) do
       if type(result[field]) == "boolean" then owner[field] = result[field] end
     end
+    if type(result.walkthrough) == "table" then owner.walkthrough = result.walkthrough end
   end
   local folded_thread
   local symbol_namespace = vim.api.nvim_create_namespace("forge.plan_review.symbols")
@@ -51,22 +58,27 @@ function M.attach(options, callback)
   -- Let independent view inputs supersede one another. A file body advances their shared
   -- document revision, so finish earlier inputs before loading it and later inputs afterward.
   local queued, active, loading_body = {}, 0, false
+  local function loads_body(params)
+    return params.operation == "plan_body" or (params.input and walkthrough_action[params.input.action])
+  end
   local dispatch_next
   local function dispatch(pending)
     local params, receive = pending.params, pending.receive
     local captured = params.input
-    if captured and (captured.action == "viewed" or captured.action == "unviewed" or visibility_action[captured.action])
+    if captured and (captured.action == "viewed" or captured.action == "unviewed" or visibility_action[captured.action]
+        or walkthrough_action[captured.action])
       and pending.digest == owner.saved_source_digest and owner.replica.block[captured.block] then
       captured.revision = owner.replica.revision
     end
     active = active + 1
-    if params.operation == "plan_body" then loading_body = true end
+    local exclusive = loads_body(params)
+    if exclusive then loading_body = true end
     local function complete(result, failure)
       if owner.closed or not vim.api.nvim_buf_is_valid(options.buffer) then return end
       if not alive() then receive(nil, "Plan host is unavailable. The local draft remains in its buffer.")
       else receive(result, failure) end
       active = active - 1
-      if params.operation == "plan_body" then loading_body = false end
+      if exclusive then loading_body = false end
       dispatch_next()
     end
     if not alive() then complete(nil) return end
@@ -74,7 +86,7 @@ function M.attach(options, callback)
   end
   dispatch_next = function()
     while queued[1] and not loading_body and not owner.closed do
-      if active > 0 and queued[1].params.operation == "plan_body" then return end
+      if active > 0 and loads_body(queued[1].params) then return end
       dispatch(table.remove(queued, 1))
     end
   end
@@ -612,7 +624,7 @@ function M.attach(options, callback)
     }, function() return apply_projection(opened, source) end)
     if applied.kind ~= "Applied" then options.recovery = nil return nil, applied.reason or applied.kind end
     options.plan = plan
-    update_filters(opened)
+    update_view_state(opened)
     owner.saved_source_digest, owner.version = opened.saved_source_digest, opened.version
     owner.checks = opened.checks or {}
     sync_view_capture()
@@ -752,7 +764,7 @@ function M.attach(options, callback)
     mark_phase("view_restore_ms")
     local render_ms = perf.elapsed_ms(render_started)
     if adopted.kind ~= "Applied" then callback(nil, adopted.kind) return end
-    update_filters(opened)
+    update_view_state(opened)
     owner.saved_source_digest, owner.version = opened.saved_source_digest, opened.version
     owner.checks = opened.checks or {}
     owner.ready = true
@@ -812,7 +824,11 @@ function M.attach(options, callback)
     if view and view.id == captured.view then
       local jump = result.jump
       local projection = owner.replica.projection
-      if type(jump) == "table" and node_projection.reveal(projection, jump.block, jump.position.row) then
+      local revealed = type(jump) == "table" and node_projection.reveal(projection, jump.block, jump.position.row)
+      if type(result.reveal) == "table" then
+        revealed = node_projection.reveal(projection, result.reveal.block, result.reveal.position.row) or revealed
+      end
+      if revealed then
         owner.replica.project_source()
       end
       view.cursor = vim.api.nvim_win_get_cursor(view.window)
@@ -878,7 +894,9 @@ function M.attach(options, callback)
       local seen = {}
       for row = first, last do
         local location = buffer.locate(owner.replica, row, 0)
-        local file = location and location.block:match("^(plan:design:file:[^:]+)")
+        local metadata = owner.projection.line_meta_list[row + 1]
+        local file = (location and location.block:match("^(plan:design:file:[^:]+)"))
+          or (metadata and metadata.walkthrough_file)
         if file and not seen[file] then
           selected_files[#selected_files + 1] = file
           seen[file] = true
@@ -907,7 +925,7 @@ function M.attach(options, callback)
       -- cursor move made this capture stale. Dropping it would leave every later input on an
       -- older revision than the host's. Staleness suppresses only the cursor effect and callback.
       local patched = not error and result.patch and result.patch ~= vim.NIL
-      if not error and not patched then update_filters(result) end
+      if not error and not patched then update_view_state(result) end
       if (patched or current and not error and type(result.jump) == "table") and alive()
         and captured.document == owner.document and (patched and result.patch.base or captured.revision) == owner.replica.revision then
         if current and action == "toggle_declaration" then
@@ -924,7 +942,7 @@ function M.attach(options, callback)
           return
         end
         captured = applied
-        update_filters(result)
+        update_view_state(result)
       end
       if settled then settled(result, error) return end
       if not current then

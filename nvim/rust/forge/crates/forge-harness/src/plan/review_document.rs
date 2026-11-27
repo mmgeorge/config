@@ -5,7 +5,7 @@ use super::review_annotation::{
 use super::review_source::PlanReviewSource;
 use anyhow::{Context, Result, ensure};
 use forge_buffer::admission::{DocumentAdmission, DocumentAdmissionStore};
-use forge_buffer::block::TextPosition;
+use forge_buffer::block::{BlockAnchor, TextPosition};
 use forge_buffer::document::BufferDocument;
 use forge_buffer::identity::{BlockId, DocumentId, InputSequence, TargetId, ViewId};
 use forge_buffer::input::DocumentInput;
@@ -57,6 +57,71 @@ impl TestChangeCounts {
 }
 
 impl PlanReviewStore {
+    /// Step in authored order and load the destination file before publishing its jump.
+    pub(crate) async fn walkthrough(
+        &self,
+        input: &DocumentInput,
+        syntax: &Arc<forge_diff::syntax::SyntaxEngine>,
+    ) -> Result<serde_json::Value> {
+        let (index, file, digest, deferred) = {
+            let mut store = self
+                .document
+                .lock()
+                .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+            let (review, admission) = store
+                .get_mut(&input.document)
+                .context("plan review document is closed")?;
+            admission.check()?;
+            review.validate_input(input.clone())?;
+            let total = review.walkthrough.len();
+            if total == 0 {
+                return Ok(serde_json::json!({}));
+            }
+            let cursor = review
+                .walkthrough_index(&input.block)
+                .or(review.active_step);
+            let index = match (input.action.as_str(), cursor) {
+                ("walkthrough_next", Some(index)) => (index + 1).min(total - 1),
+                ("walkthrough_next", None) => 0,
+                ("walkthrough_previous", Some(index)) => index.saturating_sub(1),
+                ("walkthrough_previous", None) => total - 1,
+                _ => anyhow::bail!("unknown walkthrough action"),
+            };
+            let file = &review.walkthrough[index].file;
+            let deferred = review
+                .source
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.loaded.contains(file));
+            (
+                index,
+                file.clone(),
+                review.saved_digest().to_owned(),
+                deferred,
+            )
+        };
+        let mut result = if deferred {
+            self.load_body(&input.document, &digest, &file, syntax)
+                .await?
+        } else {
+            serde_json::json!({})
+        };
+        let mut store = self
+            .document
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (review, admission) = store
+            .get_mut(&input.document)
+            .context("plan review document is closed")?;
+        admission.check()?;
+        // Deliver a committed body patch even when a newer input supersedes the cursor effect.
+        if review.saved_digest() == digest && review.view.get(&input.view) == Some(&input.sequence)
+        {
+            review.walkthrough_jump(index, &mut result)?;
+        }
+        Ok(result)
+    }
+
     /// An unfold names the saved revision and file, independently of its current section.
     /// Release the store during syntax analysis and publish against the latest file location.
     pub(crate) async fn load_body(
@@ -310,6 +375,7 @@ impl PlanReviewStore {
             "show_tests":document.source.filter.show_tests, "show_imports":document.source.filter.show_imports,
             "diff_view":document.diff_view(), "diff_capabilities":DiffCapabilities::SemanticOnly,
             "annotation":document.annotation.annotation(), "source_edit":source_edit,
+            "walkthrough":document.walkthrough_progress(),
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).transpose()?.unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
             "submission_warning_status":null});
@@ -554,7 +620,7 @@ impl PlanReviewStore {
             let selected = match selected_files {
                 Some(files) => files,
                 None => {
-                    let Some(file) = super::review_projection::change_file(&block) else {
+                    let Some(file) = document.change_file(&block) else {
                         return Ok(serde_json::json!({}));
                     };
                     cursor_file = BlockId(file.to_owned());
@@ -692,6 +758,41 @@ enum FilterToggle {
     Imports,
 }
 
+#[derive(PartialEq, Eq)]
+struct WalkthroughStep {
+    file: String,
+    block: BlockId,
+    declaration: bool,
+}
+
+impl WalkthroughStep {
+    /// Index the tour by authored step, using the baseline identity for moved files.
+    fn index(source: &PlanReviewSource) -> Vec<Self> {
+        let Some(design) = &source.document.design else {
+            return Vec::new();
+        };
+        let baseline: HashMap<_, _> = design
+            .moved
+            .iter()
+            .map(|(before, after)| (after, before))
+            .collect();
+        design
+            .document
+            .walkthrough
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let identity = baseline.get(&step.path).copied().unwrap_or(&step.path);
+                Self {
+                    file: format!("plan:design:file:{}", super::digest(identity.as_bytes())),
+                    block: super::design_review::walkthrough_block(index),
+                    declaration: step.symbol.is_some(),
+                }
+            })
+            .collect()
+    }
+}
+
 pub(crate) struct ReadOnlyPlanReview {
     reference: Mutex<HashMap<bool, super::references::PlanReferenceIndex>>,
     reference_context: Mutex<HashMap<bool, super::reference_context::ReferenceContext>>,
@@ -712,6 +813,8 @@ pub(crate) struct ReadOnlyPlanReview {
     source_anchor: HashMap<String, serde_json::Value>,
     target: HashMap<TargetId, PlanNavigationAnchor>,
     view: HashMap<ViewId, InputSequence>,
+    walkthrough: Vec<WalkthroughStep>,
+    active_step: Option<usize>,
 }
 
 struct EditablePlanReview<'document>(&'document mut ReadOnlyPlanReview);
@@ -1114,6 +1217,11 @@ impl EditablePlanReview<'_> {
             stage.complete(serde_json::json!({}));
         }
         document.source = source;
+        let walkthrough = WalkthroughStep::index(&document.source);
+        if walkthrough != document.walkthrough {
+            document.walkthrough = walkthrough;
+            document.active_step = None;
+        }
         if !tests_only {
             document.reference = Default::default();
             document.reference_context = Default::default();
@@ -1126,6 +1234,7 @@ impl EditablePlanReview<'_> {
             "annotation":document.annotation.annotation(), "public_only":document.source.filter.public_only,
             "show_tests":document.source.filter.show_tests, "show_imports":document.source.filter.show_imports,
             "saved_source_digest":document.saved_digest(), "version":document.source.document.version,
+            "walkthrough":document.walkthrough_progress(),
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).transpose()?.unwrap_or_default(),
             "submission_warnings":document.source.document.design.as_ref().and_then(|design| design.submission_warnings.as_ref()),
             "submission_warning_status":null});
@@ -1694,11 +1803,11 @@ impl ReadOnlyPlanReview {
             if let PlanReviewTarget::File { path } = &anchor.target {
                 let source = self.source.workspace.join(path);
                 if design.baseline.contains_key(path) && !source.is_file() {
-                    return Ok(serde_json::json!({"message":format!("Workspace file is no longer available: {path}")}));
+                    return Ok(
+                        serde_json::json!({"message":format!("Workspace file is no longer available: {path}")}),
+                    );
                 }
-                return Ok(
-                    serde_json::json!({"source":{"path":source,"line":1,"column":0}}),
-                );
+                return Ok(serde_json::json!({"source":{"path":source,"line":1,"column":0}}));
             }
             return self.jump_declaration(&anchor, row, column);
         }
@@ -2295,6 +2404,7 @@ impl ReadOnlyPlanReview {
         let document = BufferDocument::new(id.clone(), block)?;
         let mut view_width = DocumentViews::default();
         view_width.open(view.clone(), width.clone())?;
+        let walkthrough = WalkthroughStep::index(&source);
         Ok(Self {
             reference: Default::default(),
             reference_context: Default::default(),
@@ -2309,7 +2419,71 @@ impl ReadOnlyPlanReview {
             width,
             view_width,
             view: HashMap::from([(view, InputSequence(0))]),
+            walkthrough,
+            active_step: None,
         })
+    }
+
+    fn walkthrough_index(&self, block: &BlockId) -> Option<usize> {
+        let index = block
+            .0
+            .strip_prefix("plan:walkthrough:")?
+            .parse::<usize>()
+            .ok()?
+            .checked_sub(1)?;
+        self.walkthrough
+            .get(index)
+            .filter(|step| step.block == *block)
+            .map(|_| index)
+    }
+
+    fn change_file<'a>(&'a self, block: &'a BlockId) -> Option<&'a str> {
+        super::review_projection::change_file(block).or_else(|| {
+            self.walkthrough_index(block)
+                .map(|index| self.walkthrough[index].file.as_str())
+        })
+    }
+
+    fn walkthrough_progress(&self) -> serde_json::Value {
+        serde_json::json!({
+            "step": self.active_step.map_or(0, |index| index + 1),
+            "total": self.walkthrough.len(),
+        })
+    }
+
+    /// Publish the framed block and its declaration row so the view can open enclosing folds.
+    fn walkthrough_jump(&mut self, index: usize, result: &mut serde_json::Value) -> Result<()> {
+        let step = &self.walkthrough[index];
+        let position = TextPosition { row: 0, column: 0 };
+        let start = self
+            .document
+            .block_index(&step.block)
+            .context("walkthrough step has no visible block")?;
+        let reveal = if step.declaration {
+            self.document
+                .blocks(
+                    self.document.revision(),
+                    start + 1..self.document.block_count(),
+                )?
+                .take_while(|block| self.change_file(&block.id) == Some(step.file.as_str()))
+                .find(|block| block.id.0.contains(":row:"))
+                .map(|block| BlockAnchor {
+                    block: block.id.clone(),
+                    position,
+                })
+        } else {
+            None
+        };
+        result["jump"] = serde_json::to_value(BlockAnchor {
+            block: step.block.clone(),
+            position,
+        })?;
+        if let Some(reveal) = reveal {
+            result["reveal"] = serde_json::to_value(reveal)?;
+        }
+        self.active_step = Some(index);
+        result["walkthrough"] = self.walkthrough_progress();
+        Ok(())
     }
 
     fn source_edit(&mut self) -> serde_json::Value {
@@ -2337,6 +2511,9 @@ impl ReadOnlyPlanReview {
             }
         }
         for block in &self.document {
+            let walkthrough_file = self
+                .walkthrough_index(&block.id)
+                .map(|index| &self.walkthrough[index].file);
             for position in 0..block.text.row_count() {
                 let target = block.metadata.target.iter().find(|target| {
                     target.range.start.row <= position && position < target.range.end.row
@@ -2387,10 +2564,13 @@ impl ReadOnlyPlanReview {
                         .flatten()
                     });
                 let id = format!("{}:{}", block.id.0, position);
-                let anchor = serde_json::json!({"id":id,"source_line":line,"test":test,"check":check,
+                let mut anchor = serde_json::json!({"id":id,"source_line":line,"test":test,"check":check,
                     "test_change":test_change,"test_file":test_file,
                     "test_summary":(block.id.0 == "plan:section:tests").then_some(&test_summary)
                         .or_else(|| test_file.and_then(|path| file_summary.get(path.as_str())))});
+                if let Some(file) = walkthrough_file {
+                    anchor["walkthrough_file"] = serde_json::json!(file);
+                }
                 if self.source_anchor.get(&id) != Some(&anchor) {
                     row.push(anchor.clone());
                 }
@@ -2482,7 +2662,11 @@ impl ReadOnlyPlanReview {
     fn diff_view(&self) -> DiffViewOptions {
         DiffViewOptions {
             presentation: DiffPresentation::Semantic,
-            visibility: if self.source.filter.public_only { DiffVisibility::Public } else { DiffVisibility::All },
+            visibility: if self.source.filter.public_only {
+                DiffVisibility::Public
+            } else {
+                DiffVisibility::All
+            },
         }
     }
 
@@ -2571,12 +2755,6 @@ impl ReadOnlyPlanReview {
             }),
         )?;
         let body = forge_buffer::collapse::project(body, &self.source.collapse)?;
-        let owns = |id: &str| {
-            id == file
-                || id
-                    .strip_prefix(file)
-                    .is_some_and(|suffix| suffix.starts_with(':'))
-        };
         ensure!(!body.is_empty(), "expanded plan file is missing");
         let start = self
             .document
@@ -2587,7 +2765,15 @@ impl ReadOnlyPlanReview {
         for block in self
             .document
             .blocks(self.document.revision(), start..self.document.block_count())?
-            .take_while(|block| owns(&block.id.0))
+            .take_while(|block| {
+                block.id.0 == file
+                    || self.change_file(&block.id) == Some(file)
+                    || block
+                        .id
+                        .0
+                        .strip_prefix(file)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            })
         {
             removed.extend(block.metadata.target.iter().map(|range| range.id.clone()));
             end += 1;
@@ -2727,6 +2913,238 @@ impl ReadOnlyPlanReview {
 mod tests {
 
     use super::*;
+
+    #[tokio::test]
+    async fn walkthrough_loads_private_declarations_and_steps_in_authored_order() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path())?;
+        crate::checks::configure_fixture(&store.workspace);
+        let mut plan = crate::plan::test_fixture("plan", "Walkthrough");
+        let worker = concat!(
+            "/// Owns pending jobs.\nstruct Worker;\n\n",
+            "/// Tracks worker activity.\nenum State {\n    /// Waits for a job.\n    Idle,\n}\n\n",
+            "impl Worker {\n    fn start(&self);\n}\n\nfn publish();\n\nfn private_helper();\n",
+        );
+        let mut design =
+            crate::plan::DeclarationDesign::scratch(std::collections::BTreeMap::from([
+                ("worker.rs".into(), worker.into()),
+                ("entry.rs".into(), "fn register();\n".into()),
+                ("lib.rs".into(), "pub mod helpers;\n".into()),
+                ("helpers.rs".into(), "pub fn helper();\n".into()),
+            ]))?;
+        design.parsed_mut()?.proposed_calls.insert(
+            "worker.rs".into(),
+            vec![crate::plan::FunctionBody {
+                owner: "Worker::start".into(),
+                behavior: Some(crate::plan::FunctionBehavior::Algorithm(
+                    "acquire_lease()".into(),
+                )),
+            }],
+        );
+        let fallback = super::super::review_file_layout::order(&design, &Default::default())?;
+        assert_eq!(
+            fallback
+                .iter()
+                .filter(|file| ["lib.rs", "helpers.rs"].contains(&file.proposed.as_str()))
+                .map(|file| file.proposed.as_str())
+                .collect::<Vec<_>>(),
+            ["lib.rs", "helpers.rs"]
+        );
+        design.document.walkthrough = [
+            ("worker.rs", None, "Introduce the worker."),
+            ("entry.rs", Some("register"), "Register the worker."),
+            (
+                "worker.rs",
+                Some("Worker::start"),
+                "Acquire a `lease` before delivering pending jobs.\n\n```text\n  acquire_worker_and_persist_the_lease()\n```",
+            ),
+            ("worker.rs", Some("Worker"), "Own the worker."),
+            ("worker.rs", Some("State"), "Represent the idle phase."),
+            ("worker.rs", Some("publish"), "Deliver the job."),
+        ]
+        .map(
+            |(path, symbol, comment)| crate::plan::DesignWalkthroughComment {
+                path: path.into(),
+                symbol: symbol.map(str::to_owned),
+                title: (symbol == Some("Worker::start")).then(|| "Acquire the lease".into()),
+                comment: comment.into(),
+            },
+        )
+        .into();
+        let order = super::super::review_file_layout::order(&design, &Default::default())?;
+        assert_eq!(
+            order
+                .iter()
+                .map(|file| file.proposed.as_str())
+                .collect::<Vec<_>>(),
+            ["worker.rs", "entry.rs", "lib.rs", "helpers.rs"]
+        );
+        plan.design = Some(design);
+        store.write_working_document("session", "plan", &plan)?;
+        let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1)?;
+        let mut source = store.capture_review_source("session", "plan", None, &digest)?;
+        source.filter.public_only = true;
+        source.files = Some(crate::plan::review_files::ReviewFiles::new(
+            source.document.design.as_ref().unwrap(),
+            &source.rendered,
+            &BTreeSet::new(),
+        )?);
+        let id = DocumentId("review".into());
+        let view = ViewId("view".into());
+        let review = ReadOnlyPlanReview::new(
+            id.clone(),
+            view.clone(),
+            source,
+            WidthProfile::default(),
+            None,
+        )?;
+        let steps: Vec<_> = review
+            .walkthrough
+            .iter()
+            .map(|step| step.block.clone())
+            .collect();
+        let worker_id = review.walkthrough[0].file.clone();
+        let entry_id = review.walkthrough[1].file.clone();
+        let overview = review.snapshot().block[0].id.clone();
+        assert!(review.document.block(&steps[0]).is_none());
+        assert!(review.document.block(&BlockId(worker_id.clone())).is_some());
+        let review_store = PlanReviewStore::default();
+        let opened = review_store.insert(review, review_store.admit(id.clone())?)?;
+        assert_eq!(
+            opened["walkthrough"],
+            serde_json::json!({"step":0,"total":6})
+        );
+        let syntax = forge_diff::syntax::SyntaxEngine::new(
+            forge_diff::engine::DiffEngine::new(Default::default(), 1).analysis_pool(),
+        );
+        let action = |sequence, action: &str, block: &BlockId, row| -> Result<_> {
+            let reviews = review_store.document.lock().unwrap();
+            let document = &reviews[&id].0.document;
+            let position = TextPosition { row, column: 0 };
+            let target = document
+                .block(block)
+                .context("missing test input block")?
+                .metadata
+                .target
+                .iter()
+                .find(|range| range.range.start <= position && position < range.range.end)
+                .map(|range| range.id.clone());
+            Ok(DocumentInput {
+                document: id.clone(),
+                revision: document.revision(),
+                view: view.clone(),
+                sequence: InputSequence(sequence),
+                action: action.into(),
+                block: block.clone(),
+                position,
+                target,
+            })
+        };
+        let next = "walkthrough_next";
+        let previous = "walkthrough_previous";
+        for (sequence, name, cursor, cursor_row, destination, loads) in [
+            (1, next, &overview, 0, 0, true),
+            (2, next, &steps[0], 1, 1, true),
+            (3, next, &steps[1], 0, 2, false),
+            (4, previous, &steps[5], 1, 4, false),
+            (5, previous, &overview, 0, 3, false),
+            (6, next, &steps[4], 0, 5, false),
+            (7, next, &steps[5], 0, 5, false),
+        ] {
+            let result = review_store
+                .walkthrough(&action(sequence, name, cursor, cursor_row)?, &syntax)
+                .await?;
+            assert_eq!(result["jump"]["block"], steps[destination].0);
+            assert_eq!(result["walkthrough"]["step"], destination + 1);
+            assert_eq!(result.get("patch").is_some(), loads);
+            if destination > 0 {
+                let reviews = review_store.document.lock().unwrap();
+                let reveal = BlockId(result["reveal"]["block"].as_str().unwrap().into());
+                let row = reviews[&id]
+                    .0
+                    .document
+                    .block(&reveal)
+                    .unwrap()
+                    .text
+                    .row(0)
+                    .unwrap();
+                assert!(row.contains(
+                    [
+                        "",
+                        "fn register",
+                        "fn start",
+                        "/// Owns pending jobs.",
+                        "/// Tracks worker activity.",
+                        "fn publish"
+                    ][destination]
+                ));
+            }
+        }
+        let viewed = review_store.action(action(8, "viewed", &steps[2], 0)?, None)?;
+        assert!(viewed.get("patch").is_some());
+        let unviewed = review_store.action(action(9, "unviewed", &steps[2], 0)?, None)?;
+        assert!(unviewed.get("patch").is_some());
+        // Reflow keeps each step inside the same file subtree and leaves source anchors intact.
+        let width = WidthProfile {
+            columns: 30,
+            ..Default::default()
+        };
+        review_store.view(&id, view, Some(width.clone()))?;
+        let review = &review_store.document.lock().unwrap()[&id].0;
+        let blocks = review.snapshot().block;
+        let index = |id: &BlockId| blocks.iter().position(|block| &block.id == id).unwrap();
+        let heading = index(&BlockId(worker_id.clone()));
+        assert_eq!(heading + 1, index(&steps[0]));
+        assert_eq!(
+            blocks[index(&steps[1]) - 1].id.0,
+            format!("{entry_id}:hunk:0")
+        );
+        assert!(blocks[heading].metadata.fold.iter().any(|fold| {
+            fold.id.0 == worker_id && fold.closed && index(&fold.end.block) >= index(&steps[5])
+        }));
+        assert!(index(&steps[2]) < index(&BlockId(entry_id)));
+        assert!(
+            blocks
+                .iter()
+                .flat_map(|block| block.text.rows())
+                .any(|row| row.contains("acquire_lease()"))
+        );
+        assert!(
+            !blocks
+                .iter()
+                .flat_map(|block| block.text.rows())
+                .any(|row| row.contains("private_helper"))
+        );
+        let wrapped = &blocks[index(&steps[2])];
+        assert!(
+            wrapped
+                .text
+                .row(0)
+                .unwrap()
+                .starts_with("╭─ 3/6 Acquire the lease ")
+        );
+        assert!(
+            blocks[index(&steps[0])]
+                .text
+                .row(0)
+                .unwrap()
+                .starts_with("╭─ 1/6 Walkthrough ")
+        );
+        assert!(wrapped.metadata.editable_region.is_empty());
+        assert!(wrapped.metadata.target.is_empty());
+        assert!(wrapped.text.row_count() > 4);
+        for row in wrapped.text.rows() {
+            assert_eq!(width.cells(row, 0)?, width.columns, "{row}");
+        }
+        assert!(
+            wrapped
+                .metadata
+                .decoration
+                .iter()
+                .any(|item| item.capture == "@markup.raw")
+        );
+        Ok(())
+    }
 
     #[test]
     fn moving_a_file_preserves_proposal_order_without_requesting_navigation() -> Result<()> {
@@ -3007,9 +3425,10 @@ mod tests {
         declaration: &str,
         offset: usize,
     ) -> (BufferSnapshot, serde_json::Value) {
-        let source = file
+        let mut source = file
             .capture_review_source("session", "plan", None, checksum)
             .unwrap();
+        source.filter.show_tests = true;
         let id = DocumentId("rename".into());
         let document = ReadOnlyPlanReview::new(
             id.clone(),
