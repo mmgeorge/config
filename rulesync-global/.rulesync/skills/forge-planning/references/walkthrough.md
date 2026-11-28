@@ -1,196 +1,110 @@
 # Authoring `docs/walkthrough.json`
 
-`docs/walkthrough.json` holds an ordered JSON array of inline review comments rendered directly inside the `Changes` diff in `PlanReview`. Reviewers step through these comments in order (`1..N`) to explore the plan's design decisions without scanning every file top to bottom.
+`docs/walkthrough.json` is an ordered JSON array of inline review comments rendered above declarations in `PlanReview`. Reviewers step through entries `1..N` in order. `PlanReview` sorts files by their earliest comment index.
 
-## Schema and PlanReview Behavior
+## Schema
 
-Each element in the array is a JSON object with four fields:
+- `path` (required): changed repository-relative path (destination for renames, original for deletions).
+- `symbol` (required): qualified declaration name such as `Worker::start` (an unambiguous short name also works, and deleted files use baseline declarations).
+- `title` (required): 2 to 5 plain-text words naming the action.
+- `comment` (required): nonblank Markdown rendered above the symbol.
 
-- `path` (required): repository-relative path to a changed file. Use the destination path for a rename and the original path for a deletion.
-- `symbol` (required): qualified declaration name in that file (such as `Worker::start`). An unambiguous short name works when it identifies one declaration. For a deleted file, name a declaration from its baseline.
-- `title` (recommended): 2 to 5 plain-text words naming the action (for example `Acquire worker lease`). `PlanReview` renders it beside the step count in the frame border and falls back to `Walkthrough` when omitted.
-- `comment` (required): nonblank Markdown rendered above the anchored declaration.
+## Selection and Order
 
-Give each `(path, symbol)` anchor at most one comment. An empty array `[]` is valid for trivial single-change plans that need no guided tour.
+Order entries along the runtime path from entry point through setup, execution, and failure boundaries. In a multi-concern file, place one comment per distinct decision on its owning symbol (revisiting that file later is fine when following a caller-to-callee handoff).
 
-`PlanReview` uses `docs/walkthrough.json` in three ways:
+- **Open at the top-level entry point,** such as registration, route, command, or public constructor.
+- **Cover key runtime steps:** Include each major step through setup, initialization, and execution.
+- **Call out limits and exceptions:** Include non-obvious constraints, capability limits, protocol quirks, fail-closed checks, etc.
+- **Skip noise:** Omit mid-stack pass-through wrappers whose target helper already has a comment, mechanical parameter or error-attribution plumbing, module declarations, and tests.
 
-- **File sorting:** Files in `Unviewed Changes` sort by their earliest comment index. Uncommented files trail afterward in dependency order.
-- **Step navigation:** Next and previous comment actions step strictly in array order (`1..N`), auto-unfolding the destination file on jump.
-- **`public_only` visibility:** Private files and private declarations anchored by a walkthrough comment surface automatically in `public_only` mode, while unannotated private code stays hidden.
+## Style
 
-## What to Annotate
-
-Annotate the symbols that implement the distinct design decisions in `docs/overview.md`. Do not annotate every changed function.
-
-- **Include:** Entry points, capability or security boundaries, non-obvious protocol or error handling, state isolation rules, cross-file invariants, and private helpers or files carrying real behavioral changes that `public_only` would otherwise hide.
-- **Skip:** Thin routing or dispatch wrappers, mechanical parameter forwarding across unchanged call sites, module declarations, and routine test cases already summarized in `docs/tests.md`.
-- **Match the actual diff:** Anchor each entry to the exact symbol whose diff implements that choice. Never describe unchanged surrounding behavior or fold a decision from another function into the same comment.
-
-## Ordering
-
-Follow the runtime causal path rather than the file tree:
-
-1. Start at registration, entry points, and capability or policy boundaries.
-2. Follow execution through setup, isolation, and initialization.
-3. Cover live behavioral divergences, state transitions, and failure boundaries.
-4. End with cross-cutting error attribution or a non-obvious test harness setup when relevant.
-
-In a multi-concern file (such as a new adapter module or coordinator), place one symbol-level comment on each distinct decision at the declaration that owns it. Revisiting that file later in the array is fine when it clarifies a caller-to-callee handoff.
-
-## Writing Style
-
-Write 1 to 2 succinct sentences per comment in imperative mood:
-
-- Use `<action>` when the change is self-explanatory.
-- Use `<action> because <reason>` (or `<action>. <constraint>.`) only when a non-obvious constraint, unsupported capability, failure boundary, or cross-file handoff matters.
-- Avoid filler `"so ..."` clauses and defensive `"instead of ..."` phrasing.
-- When a `Change` or `Algorithm` block hides concrete rules behind an abstract pseudocode call, spell out the concrete limits or behavior in the comment rather than repeating the abstract name.
-
-## Calibration
-
-### Drop filler `"so ..."` on obvious actions
-
-- **Avoid:** `Register the worker at startup so jobs queued before the first tick can resolve their handler.`
-- **Prefer (obvious):** `Register the worker at startup.`
-- **Prefer (non-obvious ordering constraint):** `Register the worker before starting the poller because queued jobs arrive immediately on boot.`
-
-### Anchor on the implementation, not a pass-through wrapper
-
-- **Avoid:** Annotating `router::dispatch` when its diff only adds `"parquet"` to an existing match arm.
-- **Prefer:** Leave `router::dispatch` unannotated and anchor on `ParquetWriter::write_batch`, where streaming row groups and footer-abort behavior live.
-
-### Spell out concrete limits hidden by abstract pseudocode
-
-- **Avoid:** `Apply conservative token limits for automation credentials.`
-- **Prefer:** `Require an explicit scope allowlist and cap effective access at the owning user's role because automation tokens must not inherit full account permissions.`
-
-### Describe only what the diff at that symbol changes
-
-- **Avoid (on a caller that only threads a new parameter):** `Acquire the database transaction and roll back on error.`
-- **Prefer (on the symbol that adds the outbox write):** `Enqueue the webhook row inside the caller's database transaction, preventing orphaned webhooks on rollback.`
-
-### Keep each comment scoped to its own symbol
-
-- **Avoid:** Mentioning credential-path resolution from `apply_launch_env` inside a comment anchored on `create_profile`.
-- **Prefer:** Keep `create_profile` focused on directory isolation and place a separate entry on `apply_launch_env` for credential-path resolution.
+Write 1 to 2 succinct imperative sentences per comment. Anchor strictly to what the diff at that symbol changes, never unchanged surrounding code or another function's work. Use `<action>` when self-explanatory and `<action>  <reason>` when the reason is non-obvious. When a `Change` or `Algorithm` block hides concrete rules behind an abstract call, spell out the limits.
 
 ## Examples
 
-These examples pair with the synthetic domains in `## Plan overview examples` of `SKILL.md`.
-
-### Example 1: Multi-component backend change (Transactional webhook outbox)
+### Registration and capability limits (Scoped API tokens)
 
 ```json
 [
   {
-    "path": "src/orders.rs",
-    "symbol": "mark_paid",
-    "title": "Enqueue inside order transaction",
-    "comment": "Enqueue the `OrderPaid` webhook row inside the existing database transaction. Rolled-back order updates never emit webhooks."
+    "path": "src/http/routes.rs",
+    "symbol": "register_account_routes",
+    "title": "Register token API routes",
+    "comment": "Register `POST`, `GET`, and `DELETE /api/tokens` on the account router."
   },
-  {
-    "path": "src/outbox/worker.rs",
-    "symbol": "DeliveryWorker::claim_batch",
-    "title": "Claim due rows with lease",
-    "comment": "Claim due pending rows with `FOR UPDATE SKIP LOCKED` and stamp a lease expiry, allowing another worker to reclaim a row if the claiming process crashes mid-request."
-  },
-  {
-    "path": "src/outbox/worker.rs",
-    "symbol": "DeliveryWorker::send",
-    "title": "Attach stable delivery ID",
-    "comment": "Send `X-Delivery-Id` set to the row's event ID with the HMAC signature because retries provide at-least-once delivery and receivers deduplicate on that header."
-  },
-  {
-    "path": "src/outbox/worker.rs",
-    "symbol": "DeliveryWorker::settle",
-    "title": "Classify retryable vs dead errors",
-    "comment": "Mark HTTP `4xx` responses (other than `429`) dead immediately while applying exponential backoff up to eight attempts for network errors, timeouts, `429`, and `5xx`."
-  },
-  {
-    "path": "src/outbox/store.rs",
-    "symbol": "OutboxStore::purge_delivered",
-    "title": "Purge delivered rows after 7 days",
-    "comment": "Delete delivered rows older than 7 days to bound table growth while keeping a one-week debugging window."
-  }
-]
-```
-
-### Example 2: Auth and capability limits (Scoped API tokens)
-
-```json
-[
   {
     "path": "src/auth/token_store.rs",
     "symbol": "TokenStore::create",
-    "title": "Store prefix and SHA-256 digest",
-    "comment": "Generate a visible prefix (`app_live_` plus 8 characters) and 32 random bytes, persisting only the prefix and SHA-256 hash while returning the plaintext secret once."
+    "title": "Store prefix and SHA-256 hash",
+    "comment": "Generate an `app_live_` prefix plus 32 random bytes, store only the prefix and SHA-256 hash, and return the plaintext once. The visible prefix makes log correlation possible without ever keeping raw secrets on disk."
   },
   {
     "path": "src/auth/token_service.rs",
     "symbol": "TokenService::issue",
     "title": "Require explicit scope allowlist",
-    "comment": "Require a nonempty scope allowlist at creation because automation tokens must not inherit full account permissions."
+    "comment": "Require a nonempty scope allowlist on creation and cap access at the user's current role. Automation jobs usually need one narrow action, limiting the blast radius of a leaked CI secret."
   },
   {
     "path": "src/auth/middleware.rs",
     "symbol": "AuthMiddleware::authenticate",
     "title": "Intersect token scopes with role",
-    "comment": "Reject revoked or expired hashes with `401 Unauthorized` and intersect granted token scopes with the user's current role, returning `403 Forbidden` on missing scopes."
+    "comment": "Reject revoked or expired hashes with `401` and intersect the token's scopes with the owning user's role. Route guards then return `403` on missing scopes without changing downstream handlers."
   },
   {
     "path": "src/auth/token_store.rs",
     "symbol": "TokenStore::touch_last_used",
     "title": "Throttle last-used writes",
-    "comment": "Update `last_used_at` at most once per hour because writing on every API call adds write contention under bursty CI traffic."
+    "comment": "Throttle `last_used_at` writes to once per hour to avoid write contention on the tokens table during bursty CI runs."
   }
 ]
 ```
 
-### Example 3: Multi-concern extraction with private hooks (Scene and snapshot plugins)
+### Multi-concern module and private hooks (Scene and snapshot plugins)
 
 ```json
 [
   {
+    "path": "crates/scene/src/plugin.rs",
+    "symbol": "ScenePlugin::build",
+    "title": "Register opt-in ScenePlugin",
+    "comment": "Register `ScenePlugin` as an opt-in plugin owning scene storage, loading, and scene commands. Apps that do not use authored scenes no longer pull in scene dependencies."
+  },
+  {
     "path": "crates/runtime/src/engine.rs",
     "symbol": "Engine::defer",
     "title": "Expose frame-boundary deferral",
-    "comment": "Expose `Engine::defer` for read-only systems and gateway commands to queue ordered mutable updates before the next system pass."
+    "comment": "Make frame-boundary deferral public via `Engine::defer`. Now that scene loading lives outside core, external plugins need a way to schedule ordered world mutations from read-only systems and gateway commands."
   },
   {
     "path": "crates/runtime/src/persistence.rs",
     "symbol": "RestoreTransaction::commit",
     "title": "Validate all hooks before swap",
-    "comment": "Require an exact match on registered persistence keys and run every prepare hook against the read-only candidate world before committing, leaving live state intact on any failure."
-  },
-  {
-    "path": "crates/scene/src/store.rs",
-    "symbol": "SceneStore",
-    "title": "Key asset scenes by root entity",
-    "comment": "Key asset-backed scenes by root `EntityId` while keeping direct editor scenes keyed by `SceneId`, enabling multiple independent instances of the same scene file."
+    "comment": "Require an exact match on registered persistence keys and run every prepare hook against a read-only candidate world before swapping. Any mismatch or decode error discards the candidate and leaves live state intact."
   },
   {
     "path": "crates/scene/src/loader.rs",
     "symbol": "SceneLoader::commit_load",
     "title": "Guard against stale async loads",
-    "comment": "Re-check that the root still requests the same asset and revision before committing an async load because late completions must not overwrite a newer selection or revive an unloaded root."
+    "comment": "Re-check that the root still wants this asset and revision before committing an async load. Late loads can arrive after a root switches scenes or unloads, and committing them would corrupt live entities."
   },
   {
     "path": "crates/snapshot/src/storage.rs",
     "symbol": "SnapshotStorage::load_reload_state",
     "title": "Consume reload file once",
-    "comment": "Clear `reload-state.json` on startup even when restore fails while keeping named `snapshots/snapshot-{name}.json` files on disk after load."
+    "comment": "Clear `reload-state.json` on startup even when restore fails, while keeping named `snapshot-{name}.json` files on disk after load. Consuming reload state once prevents a broken reload file from crash-looping startup."
   },
   {
     "path": "crates/editor/src/snapshot_proxy.rs",
     "symbol": "EditorUiStateProxy",
     "title": "Preserve typed editor IDs",
-    "comment": "Decode `EditorUiState` through a dedicated snapshot proxy because reflected decoding cannot round-trip its typed IDs without changing `EditorSceneDocument`."
+    "comment": "Decode `EditorUiState` through a dedicated snapshot proxy. Reflected decoding cannot round-trip its typed IDs directly without altering `EditorSceneDocument`."
   }
 ]
 ```
 
-### Example 4: Focused internal optimization (Coalesce concurrent cache misses)
+### Small focused optimization (Coalesce concurrent cache misses)
 
 ```json
 [
@@ -198,28 +112,19 @@ These examples pair with the synthetic domains in `## Plan overview examples` of
     "path": "src/cache/metadata.rs",
     "symbol": "MetadataCache::get",
     "title": "Keep cache hits lock-light",
-    "comment": "Check the cache under a read lock first and enter the sharded flight table only on a miss, keeping concurrent hits off the single-flight path."
+    "comment": "Check the cache under a read lock first and enter the sharded flight table only on a miss. Concurrent hits stay on the read-only fast path without contending on in-flight RPCs."
   },
   {
     "path": "src/cache/flight.rs",
     "symbol": "FlightTable::join_or_spawn",
     "title": "Share one upstream fetch per key",
-    "comment": "Spawn a detached fetch task with a broadcast channel on the first miss and subscribe subsequent waiters, removing the key from the flight table before broadcasting results because callers arriving after a transient failure need a fresh fetch."
+    "comment": "Spawn one detached broadcast fetch per missing key and remove the flight entry before broadcasting the result. Clearing the entry first ensures callers arriving after a transient failure start a fresh fetch rather than seeing the stale error."
   },
   {
     "path": "src/cache/flight.rs",
     "symbol": "FlightGuard::drop",
     "title": "Cancel only after last waiter drops",
-    "comment": "Detach the fetch task from the first caller's future and cancel it only when the final waiter drops because an early caller timeout must not abort followers."
+    "comment": "Detach the fetch task from the first caller's future and cancel it only when the final waiter drops. An early timeout on the first caller lets remaining followers finish without restarting the RPC."
   }
 ]
 ```
-
-## Pre-Submit Check
-
-Before calling `plan_submit`, verify:
-
-1. Every distinct design decision in `docs/overview.md` (including private helpers or files) has an entry anchored on the symbol that implements it.
-2. Every comment matches the actual diff at its anchored symbol and spells out concrete limits hidden by abstract pseudocode.
-3. Thin dispatchers, mechanical parameter plumbing, and routine tests listed in `docs/tests.md` are omitted.
-4. No comment uses filler `"so ..."` clauses or invents reasons for self-explanatory actions.

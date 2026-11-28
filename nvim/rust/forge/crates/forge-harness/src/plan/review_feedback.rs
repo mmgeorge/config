@@ -49,6 +49,7 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
         .context("review feedback requires a declaration design")?;
     let parsed = design.parsed()?;
     let mut files = BTreeMap::<String, FeedbackFile>::new();
+    let mut walkthrough = BTreeMap::<usize, BTreeSet<usize>>::new();
     let mut general = BTreeSet::new();
     for (index, comment) in annotation.iter().enumerate() {
         for subject in &comment.subject {
@@ -59,6 +60,10 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
                 PlanReviewTarget::Call { path, side, .. }
                 | PlanReviewTarget::Behavior { path, side, .. } => (path, side == "baseline", 0),
                 PlanReviewTarget::File { path } => (path, !parsed.proposed.contains_key(path), 0),
+                PlanReviewTarget::Walkthrough { index: step, .. } => {
+                    walkthrough.entry(*step).or_default().insert(index);
+                    continue;
+                }
                 _ => {
                     general.insert(index);
                     continue;
@@ -279,6 +284,34 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
     for index in general {
         let comment = &annotation[index];
         output.push_str(&format!("{}:\n{}\n\n", comment.label, comment.body));
+    }
+    for (index, feedback) in walkthrough {
+        let step = design
+            .document
+            .walkthrough
+            .get(index)
+            .context("reviewed walkthrough comment is absent from its saved snapshot")?;
+        output.push_str(&format!(
+            "Walkthrough comment {}/{} on `{}` in `{}`\n",
+            index + 1,
+            design.document.walkthrough.len(),
+            step.symbol,
+            step.path,
+        ));
+        if let Some(title) = step
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+        {
+            output.push_str(&format!("Title: {title}\n"));
+        }
+        output.push_str(&format!(
+            "\nWalkthrough text:\n{}\n\nReview thread:\n",
+            step.comment
+        ));
+        for index in feedback {
+            output.push_str(&format!("{}\n\n", annotation[index].body));
+        }
     }
     if output.is_empty() {
         output.push_str("None");

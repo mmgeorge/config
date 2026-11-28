@@ -19,7 +19,7 @@ local walkthrough_action = { walkthrough_next = true, walkthrough_previous = tru
 ---@class ForgePlanReviewUpdate
 ---@field snapshot? {document: string, revision: integer, block: table[]}
 ---@field patch? table
----@field source_edit {upsert: {id: string, source_line: integer, test_change?: string, test_file?: string, test_summary?: table<string, integer>, walkthrough_file?: string}[], remove: string[]}
+---@field source_edit {upsert: {id: string, source_line: integer, test_change?: string, test_file?: string, test_summary?: table<string, integer>, walkthrough_file?: string, walkthrough_note?: {heading: string, body: string}}[], remove: string[]}
 ---@field annotation {id: string, source: {start_line: integer, end_line: integer, body: string}, kind?: string, parent_id?: string}[]
 ---@field public_only boolean
 ---@field show_tests boolean
@@ -162,9 +162,12 @@ function M.attach(options, callback)
     end
     local source_text, files = {}, {}
     for _, row in ipairs(owner.source or {}) do
-      if row.source_line > 0 then source_text[row.source_line] = row.text end
+      if row.source_line > 0 then
+        local note = row.walkthrough_note
+        source_text[row.source_line] = note and note.heading .. "\n" .. note.body or row.text
+      end
       if anchored[row.source_line] then
-        local file = row.block:match("^(plan:design:file:[^:]+)") or row.block:match("^(plan:tests:file:[^:]+)")
+        local file = row.walkthrough_file or row.block:match("^(plan:design:file:[^:]+)") or row.block:match("^(plan:tests:file:[^:]+)")
         if file then files[file] = true end
       end
     end
@@ -446,12 +449,19 @@ function M.attach(options, callback)
     project_source()
     if mark_phase then mark_phase("fold_projection_ms") end
     local source_lines = {}
+    local source_message = {}
     for _, row in ipairs(source) do
       local node = source_document.sequence.node[row.block]
       row.display_indent = node and require("forge.content_layout").leading_width(node.entry, row.position.row) or 0
       source_lines[#source_lines + 1] = row.text
-      row.annotation_anchor = row.target ~= nil and row.target ~= vim.NIL and row.source_line > 0
-      row.omit_text = false
+      local anchored = (row.source_line or 0) > 0
+      local note = row.walkthrough_note
+      row.annotation_anchor = anchored and (note ~= nil or row.target ~= nil and row.target ~= vim.NIL)
+      row.omit_text = note ~= nil
+      if note then
+        source_message[row.source_line] = { id = row.block, source_line = row.source_line, end_source_line = row.source_line,
+          body = note.body, heading = note.heading, readonly = true }
+      end
       for _, conceal in ipairs(row.metadata and row.metadata.conceal or {}) do
         local first, last = conceal.range.start, conceal.range["end"]
         if conceal.line and row.position.row >= first.row
@@ -502,6 +512,7 @@ function M.attach(options, callback)
     if mark_phase then mark_phase("source_layout_ms") end
     owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
       source_provider = function() return owner.optimistic_source or source end, after_render = paint,
+      source_message = source_message,
       baseline = recovered and baseline or nil,
       focused_id = focused_id,
       readonly = options.plan.historical_revision ~= nil,
@@ -997,10 +1008,12 @@ function M.rebase_recovery(recovery, opened)
   local line_by_text = {}
   local text_by_line = {}
   for _, row in ipairs(opened.source_row) do
-    if row.source_line > 0 and row.target ~= nil and row.target ~= vim.NIL then
-      line_by_text[row.text] = line_by_text[row.text] or {}
-      table.insert(line_by_text[row.text], row.source_line)
-      text_by_line[row.source_line] = row.text
+    if row.source_line > 0 and (row.walkthrough_note or row.target ~= nil and row.target ~= vim.NIL) then
+      local note = row.walkthrough_note
+      local text = note and note.heading .. "\n" .. note.body or row.text
+      line_by_text[text] = line_by_text[text] or {}
+      table.insert(line_by_text[text], row.source_line)
+      text_by_line[row.source_line] = text
     end
   end
   local function nearest(text, line)

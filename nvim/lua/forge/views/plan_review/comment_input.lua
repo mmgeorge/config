@@ -16,6 +16,7 @@ function M.open(target, question, save)
     quote = commands.quote_lines(commands.selection_lines())
     vim.cmd("normal! " .. vim.keycode("<Esc>"))
   end
+  if target.expand() then row, indent, width, offset = target.placement() end
   local heading = question and "Plan question" or target.heading
   local function reveal(footer, row_offset)
     local parent_height = vim.api.nvim_win_get_height(parent)

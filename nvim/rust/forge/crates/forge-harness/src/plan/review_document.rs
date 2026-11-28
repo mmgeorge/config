@@ -2505,17 +2505,51 @@ impl ReadOnlyPlanReview {
                 summary.add(*change);
             }
         }
+        let walkthrough_lines = self
+            .source
+            .rendered
+            .navigation
+            .anchor
+            .iter()
+            .rev()
+            .take_while(|anchor| {
+                matches!(anchor.target, super::PlanReviewTarget::Walkthrough { .. })
+            })
+            .filter_map(|anchor| match anchor.target {
+                super::PlanReviewTarget::Walkthrough { index, .. } => Some((index, anchor.line)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         for block in &self.document {
-            let walkthrough_file = self
-                .walkthrough_index(&block.id)
-                .map(|index| &self.walkthrough[index].file);
+            let walkthrough = self.walkthrough_index(&block.id);
+            let walkthrough_file = walkthrough.map(|index| &self.walkthrough[index].file);
+            let walkthrough_note = walkthrough.and_then(|index| {
+                let step = &self.source.document.design.as_ref()?.document.walkthrough[index];
+                let title = step
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or("Walkthrough")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(serde_json::json!({
+                    "heading": format!("{}/{} {title}", index + 1, self.walkthrough.len()),
+                    "body": step.comment,
+                }))
+            });
+            let walkthrough_line =
+                walkthrough.and_then(|index| walkthrough_lines.get(&index).copied());
             for position in 0..block.text.row_count() {
                 let target = block.metadata.target.iter().find(|target| {
                     target.range.start.row <= position && position < target.range.end.row
                 });
-                let line = target
-                    .and_then(|target| self.target.get(&target.id))
-                    .map(|anchor| anchor.line)
+                let line = walkthrough_line
+                    .or_else(|| {
+                        target
+                            .and_then(|target| self.target.get(&target.id))
+                            .map(|anchor| anchor.line)
+                    })
                     .unwrap_or_else(|| {
                         if self.source.document.design.is_some() {
                             0
@@ -2565,6 +2599,9 @@ impl ReadOnlyPlanReview {
                         .or_else(|| test_file.and_then(|path| file_summary.get(path.as_str())))});
                 if let Some(file) = walkthrough_file {
                     anchor["walkthrough_file"] = serde_json::json!(file);
+                }
+                if let Some(note) = &walkthrough_note {
+                    anchor["walkthrough_note"] = note.clone();
                 }
                 if self.source_anchor.get(&id) != Some(&anchor) {
                     row.push(anchor.clone());
@@ -3039,9 +3076,9 @@ mod tests {
         let previous = "walkthrough_previous";
         for (sequence, name, cursor, cursor_row, destination, loads) in [
             (1, next, &overview, 0, 0, true),
-            (2, next, &steps[0], 1, 1, true),
+            (2, next, &steps[0], 0, 1, true),
             (3, next, &steps[1], 0, 2, false),
-            (4, previous, &steps[5], 1, 4, false),
+            (4, previous, &steps[5], 0, 4, false),
             (5, previous, &overview, 0, 3, false),
             (6, next, &steps[4], 0, 5, false),
             (7, next, &steps[5], 0, 5, false),
@@ -3108,34 +3145,14 @@ mod tests {
                 .flat_map(|block| block.text.rows())
                 .any(|row| row.contains("private_helper"))
         );
-        let wrapped = &blocks[index(&steps[2])];
-        assert!(
-            wrapped
-                .text
-                .row(0)
-                .unwrap()
-                .starts_with("╭─ 3/6 Acquire the lease ")
-        );
-        assert!(
-            blocks[index(&steps[0])]
-                .text
-                .row(0)
-                .unwrap()
-                .starts_with("╭─ 1/6 Walkthrough ")
-        );
-        assert!(wrapped.metadata.editable_region.is_empty());
-        assert!(wrapped.metadata.target.is_empty());
-        assert!(wrapped.text.row_count() > 4);
-        for row in wrapped.text.rows() {
-            assert_eq!(width.cells(row, 0)?, width.columns, "{row}");
-        }
-        assert!(
-            wrapped
-                .metadata
-                .decoration
-                .iter()
-                .any(|item| item.capture == "@markup.raw")
-        );
+        let authored = |index: usize| &review.source_anchor[&format!("{}:0", steps[index].0)]["walkthrough_note"];
+        assert_eq!(authored(0)["heading"], "1/6 Walkthrough");
+        assert_eq!(authored(2)["heading"], "3/6 Acquire the lease");
+        assert!(authored(2)["body"].as_str().unwrap().contains('`'));
+        let anchor = &blocks[index(&steps[2])];
+        assert_eq!(anchor.text.row_count(), 1);
+        assert!(anchor.metadata.editable_region.is_empty());
+        assert!(anchor.metadata.fold.is_empty());
         Ok(())
     }
 

@@ -150,11 +150,7 @@ List one saved check ID per line to select checks for plan execution. Discover I
 
 ### `docs/walkthrough.json`
 
-Read [references/walkthrough.md](references/walkthrough.md) before writing `docs/walkthrough.json` for full selection rules, calibration, and examples.
-
-Write a JSON array in the order a reviewer should visit its comments. Each object requires a repository-relative `path` to a changed file, a declaration `symbol`, and a nonblank Markdown `comment`, plus a short plain-text `title` (2 to 5 words naming the action). Use the destination path for a rename and the original path and declarations for a deletion. Use qualified names such as `Worker::start` for methods (an unambiguous short name also works). Give each `(path, symbol)` anchor at most one comment. An empty array is valid for trivial single-change plans.
-
-PlanReview sorts files by their earliest comment index, drops uncommented files afterward in dependency order, and automatically surfaces private declarations anchored by a walkthrough comment in `public_only` mode. Annotate the symbols that implement the design decisions in `docs/overview.md`, skip thin dispatchers, mechanical parameter plumbing, and routine tests already listed in `docs/tests.md`, and write 1 to 2 succinct imperative sentences (`<action>` or `<action> because <reason>`, stating a reason only when non-obvious and avoiding filler `"so ..."` clauses).
+Read [references/walkthrough.md](references/walkthrough.md) before writing `docs/walkthrough.json`. It holds an ordered JSON array of `{ path, symbol, title, comment }` entries that sort `PlanReview` files by earliest comment index and surface anchored private declarations in `public_only` mode.
 
 ## Prose
 

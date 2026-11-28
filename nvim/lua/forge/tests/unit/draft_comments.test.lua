@@ -157,4 +157,48 @@ T["reopening a review cannot recycle a deleted thread identity"] = function()
   MiniTest.expect.no_equality(new_thread(), first)
 end
 
+T["an authored comment is the read-only root of its review thread"] = function()
+  local comments = require("forge.draft_comments")
+  local buffer = buffer_support.scratch()
+  local window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(window, buffer)
+  local source = {
+    { id = "walkthrough", text = "", source_line = 30, omit_text = true },
+    { id = "code", text = "fn setup();", source_line = 4 },
+    { id = "next", text = "Next declaration", source_line = 5 },
+  }
+  local state = comments.attach(buffer, window, {}, {}, {
+    source_provider = function() return source end, popup_input = true, markdown = true,
+    source_message = { [30] = { id = "walkthrough", source_line = 30, end_source_line = 30,
+      heading = "2/3 Setup", body = "Explain the setup.", readonly = true } },
+  })
+  assert(state.range_list[1].folded)
+  vim.api.nvim_win_set_cursor(window, { 1, 0 })
+  comments.delete_at_cursor(buffer)
+  assert(state.range_list[1].folded)
+  MiniTest.expect.equality(comments.capture(buffer), {})
+  local target = assert(comments.input_target(buffer))
+  assert(target.expand())
+  assert(target.append("Why this setup?", "question"))
+  local question = comments.capture(buffer)[1]
+  MiniTest.expect.equality(question.source, { start_line = 30, end_line = 30, body = "Why this setup?" })
+  MiniTest.expect.equality(question.parent_id, nil)
+
+  local question_row = assert(buffer_support.find_row(buffer, "Why this setup?"))
+  vim.api.nvim_win_set_cursor(window, { question_row, 0 })
+  local reply = assert(comments.input_target(buffer))
+  assert(reply.append("Clarify this setup."))
+  MiniTest.expect.equality(comments.capture(buffer)[2].parent_id, question.id)
+  assert(comments.toggle_thread_fold(buffer, window))
+  assert(state.range_list[1].folded and #state.range_list == 1)
+  assert(not buffer_support.find_row(buffer, "Explain the setup."))
+  assert(not buffer_support.find_row(buffer, "Clarify this setup."))
+
+  vim.api.nvim_win_set_cursor(window, { assert(buffer_support.find_row(buffer, "fn setup();")), 0 })
+  assert(assert(comments.input_target(buffer)).append("Keep this signature."))
+  MiniTest.expect.equality(comments.capture(buffer)[3].source, {
+    start_line = 4, end_line = 4, body = "Keep this signature.",
+  })
+end
+
 return T

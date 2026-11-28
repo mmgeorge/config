@@ -50,6 +50,7 @@ local blank_cursor_keys = vim.api.nvim_create_namespace("ForgeDraftCommentCursor
 ---@field source_lines string[]
 ---@field source_provider? fun(width: integer): ForgeDraftSourceRow[]
 ---@field annotation_list ForgeDraftComment[]
+---@field source_message table<integer, ForgeDraftComment> Read-only thread roots owned by the source.
 ---@field source_mark { mark: integer, source_line: integer, source_index: integer, annotation_anchor?: boolean }[]
 ---@field range_list ForgeDraftCommentRange[]
 ---@field group integer
@@ -92,6 +93,7 @@ local blank_cursor_keys = vim.api.nvim_create_namespace("ForgeDraftCommentCursor
 ---@field source_label? fun(annotation: ForgeDraftComment): string
 ---@field editable_source? fun(row: integer): boolean
 ---@field source_provider? fun(width: integer): ForgeDraftSourceRow[]
+---@field source_message? table<integer, ForgeDraftComment> Read-only thread roots keyed by source line.
 ---@field before_render? fun(buf: integer, win: integer?)
 ---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 ---@field guard_source? boolean
@@ -187,7 +189,6 @@ local function source_line_at_row(state, row, annotation_anchor)
     if mark_row(state, record.mark) == row
       and (not annotation_anchor or record.annotation_anchor ~= false) then return record.source_line end
   end
-  return nil
 end
 
 ---@param state ForgeDraftCommentState
@@ -243,13 +244,21 @@ local function find_annotation(state, annotation_id)
   for _, annotation in ipairs(state.annotation_list) do
     if tostring(annotation.id) == tostring(annotation_id) then return annotation end
   end
-  return nil
+  for _, message in pairs(state.source_message) do
+    if message.id == annotation_id then return message end
+  end
+end
+
+local function thread_parent(state, annotation)
+  if annotation.parent_id then return find_annotation(state, annotation.parent_id) end
+  local source = state.source_message[annotation.source_line]
+  if source ~= annotation and annotation.source_line == annotation.end_source_line then return source end
 end
 
 --- Resolve the shared focus owner for a conversation without changing source identity.
 local function thread_root(state, annotation)
-  for _ = 1, #state.annotation_list do
-    local parent = annotation.parent_id and find_annotation(state, annotation.parent_id)
+  for _ = 1, #state.annotation_list + 1 do
+    local parent = thread_parent(state, annotation)
     if not parent then return annotation end
     annotation = parent
   end
@@ -258,7 +267,7 @@ end
 
 local function focus_thread(state, annotation)
   local root = thread_root(state, annotation)
-  state.folded_thread[tostring(root.id)] = nil
+  state.folded_thread[tostring(root.id)] = false
   for _, candidate in ipairs(state.annotation_list) do
     candidate.focused = thread_root(state, candidate) == root
   end
@@ -403,28 +412,29 @@ local function build_projection(state, width)
       annotation_row_by_source[tonumber(source_row.source_line) or source_index] = source_index
     end
   end
-  local thread = {}
+  local thread, roots = {}, {}
+  for _, message in pairs(state.source_message) do
+    thread[message] = { message }
+    roots[#roots + 1] = message
+  end
   for _, annotation in ipairs(state.annotation_list) do
     local root = thread_root(state, annotation)
+    if root == annotation then roots[#roots + 1] = annotation end
     thread[root] = thread[root] or {}
     table.insert(thread[root], annotation)
   end
-  local ordered, summary = {}, {}
-  for _, root in ipairs(state.annotation_list) do
-    if not root.parent_id then
-      local messages = thread[root]
-      if state.folded_thread[tostring(root.id)] then
-        local questions = 0
-        for _, message in ipairs(messages) do
-          if message.kind == "question" then questions = questions + 1 end
-        end
-        local comments = #messages - questions
-        summary[root] = ("  ▸ %d question%s · %d comment%s"):format(questions,
-          questions == 1 and "" or "s", comments, comments == 1 and "" or "s")
-        ordered[#ordered + 1] = root
-      else
-        vim.list_extend(ordered, messages)
-      end
+  local ordered, header = {}, {}
+  for _, root in ipairs(roots) do
+    local messages = thread[root]
+    local folded = state.folded_thread[tostring(root.id)] == true
+    if state.popup_input or folded then
+      local authored = state.source_message[root.source_line] == root
+      header[root] = { folded = folded, message_count = #messages - (authored and 1 or 0) }
+    end
+    if folded then
+      ordered[#ordered + 1] = root
+    else
+      vim.list_extend(ordered, messages)
     end
   end
   for _, annotation in ipairs(ordered) do
@@ -466,23 +476,20 @@ local function build_projection(state, width)
     if anchors_annotation then
       for _, annotation in ipairs(annotation_by_source[source_line] or {}) do
       local first_row = #projection.line_list
+      local source_message = state.source_message[source_line] == annotation
       local heading = annotation.heading or state.heading
+      local thread_header = header[annotation]
+      local folded = thread_header and thread_header.folded or false
       local replies = annotation.replies
       if annotation.replies_body and annotation.replies_body ~= annotation.body then replies = nil end
       local reply_start_row, reply_start_list, inner_width
       local previous = projection.range_list[#projection.range_list]
-      local shared_divider = annotation.parent_id and previous
+      local shared_divider = thread_parent(state, annotation) and previous
         and previous.compact == not annotation.focused
         and thread_root(state, previous.annotation) == thread_root(state, annotation)
       local virtual_frame = state.popup_input and not annotation.focused
       if shared_divider and not virtual_frame then first_row = #projection.line_list - 1 end
-      if summary[annotation] then
-        projection.line_list[first_row + 1] = ""
-        projection.line_meta_list[first_row + 1] = { ancestor_ids = source_row.ancestor_ids or {} }
-        projection.frame_mark[#projection.frame_mark + 1] = { row = first_row, col = 0,
-          options = { virt_text = { { summary[annotation], comment_box.default_style.heading } }, virt_text_pos = "overlay" } }
-        inner_width = comment_box.inner_width(width + 1)
-      elseif annotation.focused then
+      if annotation.focused and not folded then
         local heading_row = shared_divider and #projection.line_list or #projection.line_list + 1
         projection.line_list[heading_row] = comment_editor.rule_line(
           " " .. heading .. " ",
@@ -506,15 +513,24 @@ local function build_projection(state, width)
         local descriptor = {
           id = annotation.id,
           anchor = { line = source_line },
-          heading = " " .. heading .. " • " .. state.source_label(annotation) .. " ",
+          heading = " " .. (source_message and heading or heading .. " • " .. state.source_label(annotation)) .. " ",
           body_lines = vim.split(annotation.body, "\n", { plain = true }),
           readonly = annotation.readonly == true,
           replies = replies,
           continuation = shared_divider,
           markdown = state.markdown,
+          thread = thread_header,
         }
         local box_lines = comment_box.build_box_lines(descriptor, width + 1)
-        if virtual_frame then
+        if folded then
+          projection.line_list[first_row + 1] = ""
+          projection.line_meta_list[first_row + 1] = { ancestor_ids = source_row.ancestor_ids or {} }
+          projection.frame_mark[#projection.frame_mark + 1] = { row = first_row, col = 0,
+            options = { virt_text = box_lines[1], virt_text_pos = "inline", right_gravity = false } }
+          projection.frame_mark[#projection.frame_mark + 1] = { row = first_row, col = 0,
+            options = { virt_lines = { box_lines[2] } } }
+          inner_width = box_lines.inner_width
+        elseif virtual_frame then
           inner_width = box_lines.inner_width
           reply_start_list = append_card(projection, box_lines, source_row.ancestor_ids or {}, shared_divider)
           reply_start_row = reply_start_list[1]
@@ -556,11 +572,19 @@ local function build_projection(state, width)
           end
         end
       end
+      if source_message then
+        projection.source_row_by_line[source_line] = first_row
+        projection.line_meta_list[first_row + 1].annotation_anchor = false
+        projection.line_meta_list[first_row + 1].walkthrough_file = source_row.walkthrough_file
+        projection.source_record_list[#projection.source_record_list + 1] = {
+          row = first_row, source_line = source_line, source_index = source_index,
+        }
+      end
       projection.range_list[#projection.range_list + 1] = {
         annotation = annotation,
         compact = not annotation.focused,
         inner_width = inner_width,
-        folded = summary[annotation] ~= nil,
+        folded = folded,
         first_row = first_row,
         last_row = #projection.line_list - 1,
         reply_start_row = reply_start_row,
@@ -924,6 +948,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
     win = win,
     source_lines = vim.deepcopy(source_lines),
     annotation_list = annotation_list,
+    source_message = opts.source_message or {},
     source_mark = {},
     range_list = {},
     group = 0,
@@ -943,6 +968,9 @@ function M.attach(buf, win, source_lines, annotation_list, opts, mark_phase)
     guard_source = opts.guard_source == true,
   }
   state_by_buf[buf] = state
+  for _, message in pairs(state.source_message) do
+    if state.folded_thread[message.id] == nil then state.folded_thread[message.id] = true end
+  end
   for _, annotation in ipairs(opts.baseline and {} or annotation_list) do
     state.baseline[#state.baseline + 1] = capture_annotation(annotation)
   end
@@ -1044,7 +1072,9 @@ function M.fold_all_threads(buf)
   local row = win and vim.api.nvim_win_get_cursor(win)[1] - 1
   local annotation = row and annotation_at_row(state, row)
   local source = row and source_line_at_row(state, row)
-  local folded = M.folded_roots(state.annotation_list)
+  local folded = {}
+  for _, annotation in ipairs(state.annotation_list) do folded[tostring(thread_root(state, annotation).id)] = true end
+  for _, message in pairs(state.source_message) do folded[message.id] = true end
   if vim.deep_equal(state.folded_thread, folded) then return end
   sync_focused_body(state)
   for _, message in ipairs(state.annotation_list) do message.focused = false end
@@ -1065,7 +1095,7 @@ function M.toggle_thread_fold(buf, win)
   sync_focused_body(state)
   local root = thread_root(state, annotation)
   local id = tostring(root.id)
-  state.folded_thread[id] = not state.folded_thread[id] or nil
+  state.folded_thread[id] = not state.folded_thread[id]
   for _, message in ipairs(state.annotation_list) do
     if message.focused and thread_root(state, message) == root then message.focused = false end
   end
@@ -1123,7 +1153,7 @@ function M.add(buf, annotation, start_insert)
   for _, candidate in ipairs(state.annotation_list) do candidate.focused = false end
   annotation.focused, annotation.new = not state.popup_input, true
   state.annotation_list[#state.annotation_list + 1] = annotation
-  if state.popup_input then state.folded_thread[tostring(thread_root(state, annotation).id)] = nil
+  if state.popup_input then state.folded_thread[tostring(thread_root(state, annotation).id)] = false
   else focus_thread(state, annotation) end
   render(state, { annotation_id = annotation.id })
   if not state.popup_input and start_insert ~= false then start_insert_later(state) end
@@ -1160,14 +1190,17 @@ local function comment_target(state, win)
   local parent, range, on_answer = annotation_at_row(state, cursor_row)
   local anchor = parent
   if first_row ~= last_row then anchor = state.popup_input and annotation_at_row(state, first_row) or nil end
-  if parent and anchor and (parent == anchor or thread_root(state, parent) == thread_root(state, anchor)) then
+  if parent and (state.source_message[parent.source_line]
+      or anchor and thread_root(state, parent) == thread_root(state, anchor)) then
     return parent.source_line, parent.end_source_line, parent, range, on_answer, bottom
   end
   local first, last = source_range_at_rows(state, first_row, last_row)
   if state.popup_input then
     for _, endpoint in pairs({ anchor = anchor, cursor = parent }) do
-      first = math.min(first or endpoint.source_line, endpoint.source_line)
-      last = math.max(last or endpoint.end_source_line, endpoint.end_source_line)
+      if not state.source_message[endpoint.source_line] then
+        first = math.min(first or endpoint.source_line, endpoint.source_line)
+        last = math.max(last or endpoint.end_source_line, endpoint.end_source_line)
+      end
     end
   end
   return first, last, nil, nil, nil, bottom
@@ -1219,6 +1252,7 @@ end
 ---@field window integer
 ---@field heading string
 ---@field state ForgeDraftCommentState
+---@field expand fun(): boolean Reveal the authored context before composing a reply.
 ---@field placement fun(): integer?, integer?, integer?, integer? Anchor row, column offset, interior width, and row offset.
 ---@field append fun(body: string, kind?: string, heading?: string): boolean
 
@@ -1237,6 +1271,14 @@ function M.input_target(buf)
     return
   end
   local root = parent and thread_root(state, parent)
+  local function expand()
+    if root and state.source_message[root.source_line] == root and state.folded_thread[root.id] then
+      state.folded_thread[root.id] = false
+      render(state, { annotation_id = root.id })
+      return true
+    end
+    return false
+  end
   local function placement()
     if state_by_buf[buf] ~= state or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then return end
     local usable = comment_editor.display_width(win, buf) + 1
@@ -1246,7 +1288,6 @@ function M.input_target(buf)
         if thread_root(state, range.annotation) == root then
           local footer = mark_row(state, range.border_mark or range.footer_mark)
           if not footer then return end
-          if range.folded then return footer, 2, math.max(1, math.min(range.inner_width, usable - 4)), 1 end
           if range.inner_width then
             local body_height = vim.api.nvim_win_text_height(win, { start_row = footer, start_vcol = 0, end_row = footer }).all
             return footer, 2, math.max(1, math.min(range.inner_width, usable - 4)), body_height + 1
@@ -1267,11 +1308,12 @@ function M.input_target(buf)
       return false
     end
     local annotation = { id = vim.text.hexencode(assert(vim.uv.random(16))), body = body, source_line = first, end_source_line = last,
-      kind = kind, heading = heading, parent_id = parent and tostring(parent.id) or nil }
+      kind = kind, heading = heading,
+      parent_id = parent and state.source_message[parent.source_line] ~= parent and tostring(parent.id) or nil }
     M.add(buf, annotation, false)
     return true
   end
-  return { window = win, heading = state.heading, state = state, placement = placement, append = append }
+  return { window = win, heading = state.heading, state = state, expand = expand, placement = placement, append = append }
 end
 
 --- Update thread presentation in one render without replacing local draft bodies.

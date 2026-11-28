@@ -27,7 +27,7 @@ impl PlanReviewRevision {
 
     pub(super) fn from_saved(
         document: PlanDocument,
-        rendered: RenderedPlan,
+        mut rendered: RenderedPlan,
         saved_digest: String,
     ) -> Result<Self> {
         anyhow::ensure!(
@@ -35,6 +35,7 @@ impl PlanReviewRevision {
                 && rendered.navigation.plan_version == document.version,
             "rendered plan identity changed"
         );
+        super::design_review::append_walkthrough_targets(&document, &mut rendered)?;
         Ok(Self(PlanReviewRevisionData {
             document,
             rendered,

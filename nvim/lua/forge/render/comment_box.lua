@@ -2,6 +2,7 @@
 --- Status-buffer ownership lives in views.status.comment_box_rows.
 
 local display_text = require("forge.render.display_text")
+local pad = "  "
 
 --- Box content the renderer reads; the full descriptor adds identity/anchor for dispatch.
 ---@class ForgeCommentBoxContent
@@ -11,6 +12,7 @@ local display_text = require("forge.render.display_text")
 ---@field replies { heading: string, body_lines: string[] }[]? read-only reply sub-rows
 ---@field continuation boolean? Share the preceding message's bottom border as an internal divider.
 ---@field markdown boolean? Preserve fenced examples and describe Markdown content spans.
+---@field thread? {folded: boolean, message_count: integer} Fold marker and total shown in the root header.
 
 ---@class ForgeCommentDescriptor : ForgeCommentBoxContent
 ---@field id string? stable identity; drives focus dispatch (required for editable surfaces)
@@ -93,6 +95,28 @@ function M.inner_width(window_width)
   return math.max(4, math.min(M.box_max_inner_width, window_width - 8))
 end
 
+local function top_border(text, inner_width, style, continuation, thread)
+  local marker = thread and (thread.folded and " ▸ " or " ▾ ") or ""
+  local count = thread and thread.message_count > 0 and (" " .. thread.message_count .. " ") or ""
+  local label_width = inner_width - vim.fn.strdisplaywidth(marker) - #count - 3
+  local heading = truncate_display(thread and vim.trim(text) or text, label_width - (thread and 1 or 0))
+  if thread and heading ~= "" then heading = heading .. " " end
+  heading = marker .. heading
+  local rule = math.max(inner_width - vim.fn.strdisplaywidth(heading) - #count - 2, 0)
+  local row = {
+    { pad .. (continuation and "├─" or "╭─"), style.border },
+    { heading, style.heading },
+    { ("─"):rep(rule), style.border },
+  }
+  if count ~= "" then row[#row + 1] = { count, style.heading } end
+  row[#row + 1] = { continuation and "─┤" or "─╮", style.border }
+  return row
+end
+
+local function bottom_border(inner_width, style)
+  return { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", style.border } }
+end
+
 --- Builds styled row segment lists representing a framed comment box.
 --- Wraps content text to the computed inner column budget.
 ---@param desc ForgeCommentBoxContent Comment heading, body, and reply metadata.
@@ -101,10 +125,13 @@ end
 ---@return ForgeCommentBoxLines box_lines Rendered rows and reply boundaries.
 function M.build_box_lines(desc, win_width, style)
   style = style or M.default_style
-  local pad = "  "
   local body_prefix = pad .. "│ "
   local body_column = desc.markdown and vim.fn.strdisplaywidth(body_prefix) or 0
   local inner_width = M.inner_width(tonumber(win_width) or 80)
+  if desc.thread then
+    local count_width = desc.thread.message_count > 0 and #tostring(desc.thread.message_count) + 2 or 0
+    inner_width = math.max(inner_width, count_width + 6)
+  end
   local content_width = math.max(1, inner_width - 2)
 
   ---@type { text: string, hl: string, divider?: boolean, markdown?: boolean, starts_body?: boolean }[]
@@ -137,18 +164,14 @@ function M.build_box_lines(desc, win_width, style)
     end
   end
 
-  local heading = truncate_display(tostring(desc.heading or ""), math.max(1, inner_width - 3))
-  local heading_width = vim.fn.strdisplaywidth(heading)
-
   local box_lines = {}
   box_lines.markdown_rows = {}
   box_lines.inner_width = inner_width
-  box_lines[#box_lines + 1] = {
-    { pad .. (desc.continuation and "├─" or "╭─"), style.border },
-    { heading, style.heading },
-    { ("─"):rep(math.max(inner_width - heading_width - 2, 0)), style.border },
-    { desc.continuation and "─┤" or "─╮", style.border },
-  }
+  box_lines[#box_lines + 1] = top_border(desc.heading, inner_width, style, desc.continuation, desc.thread)
+  if desc.thread and desc.thread.folded then
+    box_lines[#box_lines + 1] = bottom_border(inner_width, style)
+    return box_lines
+  end
   for _, row in ipairs(content) do
     if row.divider then
       local row_width = vim.fn.strdisplaywidth(row.text)
@@ -173,7 +196,7 @@ function M.build_box_lines(desc, win_width, style)
       }
     end
   end
-  box_lines[#box_lines + 1] = { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", style.border } }
+  box_lines[#box_lines + 1] = bottom_border(inner_width, style)
   box_lines.reply_start_row = reply_content_start
   box_lines.reply_start_list = reply_start_list
   return box_lines

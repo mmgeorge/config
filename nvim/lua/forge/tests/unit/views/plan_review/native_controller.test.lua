@@ -581,23 +581,30 @@ T["Tab folds only the selected comment chain and counts its messages"] = functio
     local row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
     for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, review.owner.comment_state.namespace,
       { row, 0 }, { row, -1 }, { details = true })) do
-      if mark[4].virt_text then return vim.trim(mark[4].virt_text[1][1]) end
+      local text = mark[4].virt_text
+      if text then return { vim.trim(text[2][1]), vim.trim(text[#text - 1][1]) } end
     end
   end
   eq(buffer_support.lines(review.buf), { "Source", "", "" })
+  local border_count = 0
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, review.owner.comment_state.namespace,
+    { 1, 0 }, { 1, -1 }, { details = true })) do
+    border_count = border_count + #(mark[4].virt_lines or {})
+  end
+  eq(border_count, 1)
   expand_thread(review, "1")
   expand_thread(review, "2")
   for _, body in ipairs({ "First question", "First answer", "Follow-up comment", "Nested question", "Nested answer" }) do
     vim.api.nvim_win_set_cursor(review.win, { assert(buffer_support.find_row(review.buf, body)), 0 })
     toggle()
-    eq(summary(), "▸ 2 questions · 1 comment")
+    eq(summary(), { "▸ Plan question • line 1", "3" })
     eq(buffer_support.lines(review.buf), { "Source", "", "Separate comment" })
     toggle()
     eq(vim.api.nvim_get_current_line(), "First question")
   end
   vim.api.nvim_win_set_cursor(review.win, { assert(buffer_support.find_row(review.buf, "Separate comment")), 0 })
   toggle()
-  eq(summary(), "▸ 0 questions · 1 comment")
+  eq(summary(), { "▸ Plan comment • line 1", "1" })
   assert(buffer_support.find_row(review.buf, "Nested answer"))
   eq({ vim.bo[review.buf].modified, host.saves }, { false, 0 })
 end

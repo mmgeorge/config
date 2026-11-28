@@ -695,6 +695,84 @@ T["plan_test_delete"] = function()
   assert(opened == 1 and closed == 0, "subsequent deletion reopened the native document")
 end
 
+T["walkthrough fold and thread commands share the comment target"] = function()
+  local client = require("forge.client")
+  local harness = require("forge.session").harness
+  harness.session = { id = "session" }
+  client.host_get_generation = function() return 1 end
+  client.host_is_accepting = function() return true end
+  local frame, code = "plan:walkthrough:1", "plan:declaration"
+  local body = "Explain setup"
+  local pending = mock_client.respond({ ["session.document"] = function() end })
+  require("forge.views.plan_review.native_controller").open({ id = "plan", state = "awaiting_review",
+    working_path = temp.file("walkthrough-review.md"), review_digest = "canonical" })
+  local review = harness.plan_review
+  local upsert = { { id = code .. ":0", source_line = 4 },
+    { id = frame .. ":0", source_line = 30, walkthrough_file = "plan:design:file:setup",
+      walkthrough_note = { heading = "1/1 Setup", body = body } } }
+  pending[1].callback({ saved_source_digest = "saved", annotation = {}, source_edit = { upsert = upsert, remove = {} },
+    snapshot = { document = review.owner.document, revision = 0, block = {
+      { id = frame, text = { "" }, metadata = { target = {}, editable_region = {}, decoration = {} } },
+      { id = code, text = { "fn setup();" }, metadata = { target = {}, editable_region = {}, decoration = {} } },
+    } } })
+  assert(review.owner.ready)
+
+  local function cursor_at(label)
+    vim.api.nvim_win_set_cursor(review.win, { assert(buffer.find_row(review.buf, label)), 0 })
+  end
+  local function press(key) keymap.invoke(key, { buffer = review.buf }) end
+  local comments = review.owner.comment_state
+  local function frame_text()
+    local text = {}
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, comments.namespace, 0, -1, { details = true })) do
+      for _, line in ipairs(mark[4].virt_lines or { mark[4].virt_text }) do
+        for _, part in ipairs(line) do text[#text + 1] = part[1] end
+      end
+    end
+    return table.concat(text)
+  end
+  local function thread_heading(text, chevron)
+    local start = assert(text:find("╭─ " .. chevron .. " 1/1 Setup", 1, true), text)
+    local _, finish = text:find("╮", start, true)
+    return text:sub(start, assert(finish))
+  end
+
+  MiniTest.expect.equality(buffer.find_row(review.buf, body), nil)
+  local folded = frame_text()
+  local empty_header = thread_heading(folded, "▸")
+  assert(not empty_header:find(" 0 ", 1, true) and folded:find("╰─", 1, true), folded)
+  local folded_row = comments.range_list[1].first_row
+  MiniTest.expect.equality(vim.api.nvim_win_text_height(review.win, {
+    start_row = folded_row, end_row = folded_row + 1, end_vcol = 0,
+  }).all, 2)
+  vim.api.nvim_win_set_cursor(review.win, { comments.range_list[1].first_row + 1, 0 })
+  press("A")
+  assert(buffer.find_row(review.buf, body), "the question composer kept its source collapsed")
+  MiniTest.expect.equality(thread_heading(frame_text(), "▾"), (empty_header:gsub("▸", "▾")))
+  finish_input({ "Why this setup?" })
+  cursor_at(body)
+  press("C")
+  finish_input({ "Clarify the setup." })
+  local drawn = frame_text()
+  local expanded_header = thread_heading(drawn, "▾")
+  assert(vim.endswith(expanded_header, " 2 ─╮") and drawn:find("├─ Plan question", 1, true)
+    and drawn:find("├─ Plan comment", 1, true), drawn)
+  cursor_at(body)
+  press("]w")
+  local next_step = pending[#pending]
+  MiniTest.expect.equality(next_step.spec.params.input.block, frame)
+  next_step.callback({ walkthrough = { step = 1, total = 1 } })
+  cursor_at("Why this setup?")
+  press("<Tab>")
+  MiniTest.expect.equality(buffer.find_row(review.buf, body), nil)
+  assert(not buffer.find_row(review.buf, "Why this setup?") and not buffer.find_row(review.buf, "Clarify the setup."))
+  MiniTest.expect.equality(thread_heading(frame_text(), "▸"), (expanded_header:gsub("▾", "▸")))
+  local captured = require("forge.draft_comments").capture(review.buf)
+  MiniTest.expect.equality(#captured, 2)
+  MiniTest.expect.equality({ captured[1].kind, captured[1].source.start_line, captured[2].source.start_line },
+    { "question", 30, 30 })
+end
+
 T["card navigation and native visual selection exclude the frame"] = function()
   local child = MiniTest.new_child_neovim()
   child.start({ "-u", "NONE", "-i", "NONE", "--noplugin" })
@@ -866,7 +944,9 @@ T["behavior-only signature occupies one display row and keeps baseline comments"
   local rows = vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)
   MiniTest.expect.equality(#vim.tbl_filter(function(text) return text:find("pub fn app() -> App;", 1, true) end, rows), 1)
   local proposed = assert(buffer.find_row(review.buf, "pub fn app() -> App;")) - 1
-  MiniTest.expect.equality(vim.api.nvim_win_text_height(review.win, { start_row = proposed, end_row = proposed }).all, 1)
+  MiniTest.expect.equality(vim.api.nvim_win_text_height(review.win, {
+    start_row = proposed, start_vcol = 0, end_row = proposed,
+  }).all, 1)
   MiniTest.expect.equality(review.owner.comment_state.range_list[1].annotation.body, "Keep this entry point.")
   vim.api.nvim_win_call(review.win, function() vim.cmd("normal! j") end)
   MiniTest.expect.equality(vim.api.nvim_win_get_cursor(review.win)[1], review.owner.comment_state.range_list[1].first_row + 1)

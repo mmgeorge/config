@@ -737,7 +737,7 @@ T["saved_follow_up_draws_its_block_like_the_others"] = function()
     end
     return headings
   end
-  local function boxed(heading) return heading:find("╭─ Plan question", 1, true) ~= nil end
+  local function boxed(heading) return heading:find("╭─ ▾ Plan question", 1, true) ~= nil end
   for index, heading in ipairs(block_headings()) do
     assert(boxed(heading), ("question block %d opened without its box: %s"):format(index, heading))
   end

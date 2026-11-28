@@ -114,6 +114,12 @@ pub enum PlanReviewTarget {
     File {
         path: String,
     },
+    /// Identifies an authored walkthrough comment in the saved review.
+    Walkthrough {
+        index: usize,
+        path: String,
+        symbol: String,
+    },
     Declaration {
         path: String,
         side: String,

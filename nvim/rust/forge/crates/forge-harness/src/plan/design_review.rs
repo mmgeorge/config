@@ -101,10 +101,57 @@ pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
         .flat_map(|block| block.text.wire_rows())
         .map(|row| format!("{row}\n"))
         .collect::<String>();
-    Ok(RenderedPlan {
+    let mut rendered = RenderedPlan {
         markdown,
         navigation,
-    })
+    };
+    append_walkthrough_targets(document, &mut rendered)?;
+    Ok(rendered)
+}
+
+/// Add one canonical annotation line per comment without shifting saved declaration lines.
+pub(super) fn append_walkthrough_targets(
+    document: &PlanDocument,
+    rendered: &mut RenderedPlan,
+) -> Result<()> {
+    let Some(design) = &document.design else {
+        return Ok(());
+    };
+    if design.document.walkthrough.is_empty()
+        || rendered
+            .navigation
+            .anchor
+            .last()
+            .is_some_and(|anchor| matches!(anchor.target, PlanReviewTarget::Walkthrough { .. }))
+    {
+        return Ok(());
+    }
+    if !rendered.markdown.ends_with('\n') {
+        rendered.markdown.push('\n');
+    }
+    let first = rendered.markdown.lines().count() + 1;
+    for (index, step) in design.document.walkthrough.iter().enumerate() {
+        let label = format!(
+            "Walkthrough comment on `{}` in `{}`",
+            step.symbol, step.path
+        )
+        .replace(['\r', '\n'], " ");
+        rendered.markdown.push_str(&label);
+        rendered.markdown.push('\n');
+        rendered.navigation.anchor.push(PlanNavigationAnchor {
+            line: (first + index).try_into()?,
+            columns: None,
+            target: PlanReviewTarget::Walkthrough {
+                index,
+                path: step.path.clone(),
+                symbol: step.symbol.clone(),
+            },
+            json_path: format!("/design/document/walkthrough/{index}"),
+            path: Some(step.path.clone()),
+            label,
+        });
+    }
+    Ok(())
 }
 
 /// Locates the canonical rows owned by the test section, excluding its separator.
@@ -362,7 +409,7 @@ pub(super) fn project(
         }
         let row_id = row.id.clone();
         for index in walkthrough.before.remove(&row_id).into_iter().flatten() {
-            block.push(walkthrough_frame(index, design, width)?);
+            block.push(walkthrough_anchor(index)?);
         }
         source_end.insert(
             row_id.clone(),
@@ -510,142 +557,13 @@ fn attach_walkthrough_documentation(
     Ok(projected)
 }
 
-/// Wrap a read-only comment and decorate its rounded frame in display cells.
-fn walkthrough_frame(
-    index: usize,
-    design: &super::DeclarationDesign,
-    width: &WidthProfile,
-) -> Result<BufferBlock> {
-    let step = &design.document.walkthrough[index];
-    let count = format!("{}/{}", index + 1, design.document.walkthrough.len());
-    let title = step
-        .title
-        .as_deref()
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let title = if title.is_empty() {
-        "Walkthrough"
-    } else {
-        &title
-    };
-    let heading = format!("╭─ {count} ");
-    let heading_overhead = width.cells(&heading, 0)? + width.cells(" ╮", 0)?;
-    let prefix = "│ ";
-    let suffix = " │";
-    let left = width.cells(prefix, 0)?;
-    let right = width.cells(suffix, 0)?;
-    let mut interior = width.clone();
-    let framed = width.columns >= (left + right + 2).max(heading_overhead + 1);
-    if framed {
-        interior.columns -= left + right;
-    }
-    let mut block = forge_buffer::markdown::MarkdownRenderer::render(
-        walkthrough_block(index),
-        &step.comment,
-        &interior,
-    )?
-    .block;
-    block.metadata.target.clear();
-    if !framed {
-        let mut rows = width.wrap_plain(&format!("{count} {title}"), 0)?;
-        for decoration in &mut block.metadata.decoration {
-            decoration.range.start.row += rows.len();
-            decoration.range.end.row += rows.len();
-        }
-        rows.extend(block.text.rows().map(str::to_owned));
-        block.text = BufferText::from_rows(rows)?;
-        return Ok(block);
-    }
-    let edge = |left: &str, right: &str| -> Result<String> {
-        let span = width
-            .columns
-            .saturating_sub(width.cells(left, 0)? + width.cells(right, 0)?);
-        let unit = width.cells("─", 0)?;
-        Ok(format!(
-            "{left}{}{right}",
-            "─".repeat(span / unit) + &" ".repeat(span % unit)
-        ))
-    };
-    let title_width = WidthProfile {
-        columns: width.columns - heading_overhead,
-        ..width.clone()
-    };
-    let title = title_width.clip_plain(title, "…")?;
-    let mut rows = vec![edge(&format!("{heading}{title} "), "╮")?];
-    let original = std::mem::take(&mut block.metadata.decoration);
-    let mut pending = original.as_slice();
-    let wrap_width = WidthProfile {
-        columns: width.columns - right,
-        ..width.clone()
-    };
-    for (source_row, text) in block.text.rows().enumerate() {
-        let end = pending.partition_point(|decoration| decoration.range.start.row == source_row);
-        let decorations;
-        (decorations, pending) = pending.split_at(end);
-        let wrapped;
-        let segments: Vec<&str> = if width.cells(text, left)? <= interior.columns {
-            vec![text]
-        } else {
-            // Markdown keeps preformatted rows whole. Wrap their presentation without losing
-            // the syntax spans or counting tab stops from the wrong side of the frame.
-            wrapped = wrap_width.wrap_plain(&format!("{}{text}", " ".repeat(left)), left)?;
-            wrapped
-                .iter()
-                .map(|row| &row[left.min(row.len())..])
-                .filter(|row| !row.is_empty())
-                .collect()
-        };
-        let mut offset = 0;
-        for segment in segments {
-            let row = rows.len();
-            let end = offset + segment.len();
-            for decoration in decorations {
-                let start_column = decoration.range.start.column.max(offset);
-                let end_column = decoration.range.end.column.min(end);
-                if start_column < end_column {
-                    let mut decoration = decoration.clone();
-                    decoration.range = TextRange {
-                        start: TextPosition {
-                            row,
-                            column: prefix.len() + start_column - offset,
-                        },
-                        end: TextPosition {
-                            row,
-                            column: prefix.len() + end_column - offset,
-                        },
-                    };
-                    block.metadata.decoration.push(decoration);
-                }
-            }
-            let padding = interior.columns.saturating_sub(width.cells(segment, left)?);
-            rows.push(format!("{prefix}{segment}{}{suffix}", " ".repeat(padding)));
-            offset = end;
-        }
-    }
-    rows.push(edge("╰", "╯")?);
-    let style = |row, start, end| Decoration {
-        range: TextRange {
-            start: TextPosition { row, column: start },
-            end: TextPosition { row, column: end },
-        },
-        capture: "ForgePlanWalkthroughFrame".into(),
-        priority: 160,
-    };
-    for (row, text) in rows.iter().enumerate() {
-        if row == 0 || row + 1 == rows.len() {
-            block.metadata.decoration.push(style(row, 0, text.len()));
-        } else {
-            block.metadata.decoration.push(style(row, 0, "│".len()));
-            block
-                .metadata
-                .decoration
-                .push(style(row, text.len() - "│".len(), text.len()));
-        }
-    }
-    block.text = BufferText::from_rows(rows)?;
-    Ok(block)
+/// Give the editor a stable source anchor for one authored comment.
+fn walkthrough_anchor(index: usize) -> Result<BufferBlock> {
+    Ok(BufferBlock {
+        id: walkthrough_block(index),
+        text: BufferText::from_rows([""])?,
+        metadata: BlockMetadata::default(),
+    })
 }
 
 struct WalkthroughAnchor {
