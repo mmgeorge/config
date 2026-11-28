@@ -70,7 +70,7 @@ pub struct DesignWalkthroughComment {
     /// Plain-text label displayed in the walkthrough frame's top border.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Markdown displayed above the anchor.
+    /// Markdown displayed after the declaration and before its pseudocode.
     pub comment: String,
 }
 

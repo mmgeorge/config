@@ -2449,33 +2449,43 @@ impl ReadOnlyPlanReview {
         })
     }
 
-    /// Publish the framed block and its declaration row so the view can open enclosing folds.
+    /// Find the declaration row immediately before the cards that follow it.
+    fn walkthrough_declaration(&self, card: &BlockId) -> Result<BlockAnchor> {
+        let start = self
+            .document
+            .block_index(card)
+            .context("walkthrough step has no visible block")?;
+        for index in (0..start).rev() {
+            let row = self
+                .document
+                .blocks(self.document.revision(), index..index + 1)?
+                .next()
+                .context("walkthrough source row is missing")?;
+            if self.walkthrough_index(&row.id).is_some() {
+                continue;
+            }
+            ensure!(
+                self.change_file(&row.id) == self.change_file(card) && row.id.0.contains(":row:"),
+                "walkthrough card does not follow its declaration"
+            );
+            return Ok(BlockAnchor {
+                block: row.id.clone(),
+                position: TextPosition { row: 0, column: 0 },
+            });
+        }
+        anyhow::bail!("walkthrough declaration is missing")
+    }
+
+    /// Publish the card and its preceding declaration so the view can open enclosing folds.
     fn walkthrough_jump(&mut self, index: usize, result: &mut serde_json::Value) -> Result<()> {
         let step = &self.walkthrough[index];
         let position = TextPosition { row: 0, column: 0 };
-        let start = self
-            .document
-            .block_index(&step.block)
-            .context("walkthrough step has no visible block")?;
-        let reveal = self
-            .document
-            .blocks(
-                self.document.revision(),
-                start + 1..self.document.block_count(),
-            )?
-            .take_while(|block| self.change_file(&block.id) == Some(step.file.as_str()))
-            .find(|block| block.id.0.contains(":row:"))
-            .map(|block| BlockAnchor {
-                block: block.id.clone(),
-                position,
-            });
+        let reveal = self.walkthrough_declaration(&step.block)?;
         result["jump"] = serde_json::to_value(BlockAnchor {
             block: step.block.clone(),
             position,
         })?;
-        if let Some(reveal) = reveal {
-            result["reveal"] = serde_json::to_value(reveal)?;
-        }
+        result["reveal"] = serde_json::to_value(reveal)?;
         self.active_step = Some(index);
         result["walkthrough"] = self.walkthrough_progress();
         Ok(())
@@ -2855,6 +2865,11 @@ impl ReadOnlyPlanReview {
             .and_then(|block| block.metadata.collapse.first())
             .cloned()
             .context("cursor is not inside a collapsible declaration")?;
+        let jump = if self.walkthrough_index(&collapse.opening.block).is_some() {
+            self.walkthrough_declaration(&collapse.opening.block)?
+        } else {
+            collapse.opening.clone()
+        };
         self.retain_annotation_revision();
         let previous = self
             .source
@@ -2885,7 +2900,7 @@ impl ReadOnlyPlanReview {
         self.focused_annotation = None;
         let source_edit = self.source_edit();
         Ok(serde_json::json!({"patch":patch,"source_edit":source_edit,
-            "annotation":self.annotation.annotation(),"jump":collapse.opening}))
+            "annotation":self.annotation.annotation(),"jump":jump}))
     }
 
     fn update_view(
@@ -2955,7 +2970,7 @@ mod tests {
         let worker = concat!(
             "/// Owns pending jobs.\nstruct Worker;\n\n",
             "/// Tracks worker activity.\nenum State {\n    /// Waits for a job.\n    Idle,\n}\n\n",
-            "impl Worker {\n    fn start(&self);\n}\n\nfn configure();\n\nfn publish();\n\nfn private_helper();\n",
+            "impl Worker {\n    fn start(\n        &self,\n    );\n}\n\nfn configure();\n\nfn publish();\n\nfn private_helper();\n",
         );
         let mut design =
             crate::plan::DeclarationDesign::scratch(std::collections::BTreeMap::from([
@@ -3103,16 +3118,34 @@ mod tests {
                 [
                     "fn configure",
                     "fn register",
-                    "fn start",
-                    "/// Owns pending jobs.",
-                    "/// Tracks worker activity.",
+                    ");",
+                    "struct Worker;",
+                    "}",
                     "fn publish"
                 ][destination]
             ));
         }
-        let viewed = review_store.action(action(8, "viewed", &steps[2], 0)?, None)?;
+        let signature = review_store.document.lock().unwrap()[&id]
+            .0
+            .walkthrough_declaration(&steps[2])?
+            .block;
+        let collapsed =
+            review_store.action(action(8, "toggle_declaration", &signature, 0)?, None)?;
+        assert_eq!(collapsed["jump"]["block"], signature.0);
+        {
+            let reviews = review_store.document.lock().unwrap();
+            let document = &reviews[&id].0.document;
+            assert!(document.block(&steps[2]).is_some());
+            assert!(
+                !document
+                    .into_iter()
+                    .any(|block| block.text.rows().any(|row| row.contains("acquire_lease()")))
+            );
+        }
+        review_store.action(action(9, "toggle_declaration", &signature, 0)?, None)?;
+        let viewed = review_store.action(action(10, "viewed", &steps[2], 0)?, None)?;
         assert!(viewed.get("patch").is_some());
-        let unviewed = review_store.action(action(9, "unviewed", &steps[2], 0)?, None)?;
+        let unviewed = review_store.action(action(11, "unviewed", &steps[2], 0)?, None)?;
         assert!(unviewed.get("patch").is_some());
         // Reflow keeps each step inside the same file subtree and leaves source anchors intact.
         let width = WidthProfile {
@@ -3125,9 +3158,13 @@ mod tests {
         let index = |id: &BlockId| blocks.iter().position(|block| &block.id == id).unwrap();
         let heading = index(&BlockId(worker_id.clone()));
         assert!(heading < index(&steps[0]));
-        assert_eq!(
-            blocks[index(&steps[1]) - 1].id.0,
-            format!("{entry_id}:hunk:0")
+        assert!(index(&BlockId(entry_id)) < index(&steps[1]));
+        assert!(
+            blocks[index(&steps[1]) - 1]
+                .text
+                .row(0)
+                .unwrap()
+                .contains("fn register();")
         );
         assert!(blocks[heading].metadata.fold.iter().any(|fold| {
             fold.id.0 == worker_id && fold.closed && index(&fold.end.block) >= index(&steps[5])

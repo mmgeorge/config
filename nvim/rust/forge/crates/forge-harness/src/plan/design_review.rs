@@ -43,7 +43,7 @@ struct DesignReviewRows {
 /// Frame placement is separate from canonical rows used by reviewer annotations.
 #[derive(Default)]
 struct WalkthroughPlacement {
-    before: HashMap<BlockId, Vec<usize>>,
+    after: HashMap<BlockId, Vec<usize>>,
     documentation: HashMap<BlockId, Vec<BlockId>>,
 }
 
@@ -408,8 +408,13 @@ pub(super) fn project(
             target.insert(id, anchor);
         }
         let row_id = row.id.clone();
-        for index in walkthrough.before.remove(&row_id).into_iter().flatten() {
-            block.push(walkthrough_anchor(index)?);
+        let steps = walkthrough.after.remove(&row_id);
+        let mut body_folds = Vec::new();
+        if steps.is_some() {
+            // Keep the comments visible when the pseudocode below the signature is folded.
+            (body_folds, row.metadata.fold) = std::mem::take(&mut row.metadata.fold)
+                .into_iter()
+                .partition(|fold| fold.id.0.starts_with("plan:calls:"));
         }
         source_end.insert(
             row_id.clone(),
@@ -422,6 +427,24 @@ pub(super) fn project(
             },
         );
         block.push(row);
+        let mut steps = steps.into_iter().flatten().peekable();
+        while let Some(index) = steps.next() {
+            let mut note = walkthrough_anchor(index)?;
+            if steps.peek().is_none() {
+                note.metadata.fold = std::mem::take(&mut body_folds);
+                source_end.insert(
+                    row_id.clone(),
+                    BlockAnchor {
+                        block: note.id.clone(),
+                        position: TextPosition {
+                            row: note.text.row_count(),
+                            column: 0,
+                        },
+                    },
+                );
+            }
+            block.push(note);
+        }
         for annotation in annotation.iter().filter(|annotation| {
             i64::from(annotation.source.end_line) == index as i64 + 1 + deferred_rows
         }) {
@@ -622,7 +645,7 @@ fn walkthrough_rows(
     Ok((anchors, visible))
 }
 
-/// Select frame positions and relocate unchanged documentation split from its signature.
+/// Anchor each card after the signature and keep detached documentation with the declaration.
 fn walkthrough_positions(
     diff: &mut super::review_diff::FileDiff,
     side: SourceSide,
@@ -648,6 +671,7 @@ fn walkthrough_positions(
     let mut missing = Vec::new();
     for anchor in anchors {
         let first = *anchor.signature.start();
+        let last = *anchor.signature.end();
         let docs = anchor.heading..first;
         let signature_hunk = hunk_by_row.get(&first).map(|&(hunk, _)| hunk);
         let attached = docs.clone().all(|row| {
@@ -660,11 +684,10 @@ fn walkthrough_positions(
                 .get(&row)
                 .is_some_and(|&(_, kind)| kind != RowKind::Context)
         });
-        let row = if attached || changed {
+        if attached || changed {
             if !hunk_by_row.contains_key(&anchor.heading) {
                 missing.push(anchor.heading);
             }
-            anchor.heading
         } else {
             for doc in docs {
                 positions.documentation.entry(doc).or_insert(first);
@@ -672,12 +695,13 @@ fn walkthrough_positions(
                     missing.push(doc);
                 }
             }
-            first
-        };
+        }
         if signature_hunk.is_none() {
             missing.extend(anchor.signature);
+        } else if !hunk_by_row.contains_key(&last) {
+            missing.push(last);
         }
-        positions.steps.entry(row).or_default().push(anchor.index);
+        positions.steps.entry(last).or_default().push(anchor.index);
     }
     diff.reveal_walkthrough(side, source, &missing);
     positions
@@ -1057,7 +1081,7 @@ fn rows(
                     && let Some(steps) = locations.steps.remove(&line)
                 {
                     walkthrough
-                        .before
+                        .after
                         .entry(id.clone())
                         .or_default()
                         .extend(steps);
@@ -2237,7 +2261,7 @@ fn declaration_folds(
         // Retain annotated declarations in the native fold model so jumps can open ancestors.
         if walkthrough_targets
             .iter()
-            .any(|&target| opening < target && target <= closing)
+            .any(|&target| opening <= target && target < closing)
         {
             block[opening]
                 .metadata
@@ -2708,7 +2732,7 @@ mod tests {
         };
         let positions =
             super::walkthrough_positions(&mut diff, SourceSide::New, &source, locations);
-        assert_eq!(positions.steps[signature.start()], [0]);
+        assert_eq!(positions.steps[signature.end()], [0]);
         assert_eq!(positions.documentation[&heading], *signature.start());
         assert_eq!(diff.hunk.len(), 2);
 
@@ -2721,16 +2745,17 @@ mod tests {
         };
         let mut blocks = vec![
             block("file:hunk:0", "@@")?,
-            block("plan:walkthrough:1", "Walkthrough 1/1")?,
             block("file:hunk:0:row:0", "fn open(")?,
+            block("file:hunk:0:row:1", ") -> Result<()>;")?,
+            super::walkthrough_anchor(0)?,
         ];
         super::fold(&mut blocks, 0, "file:hunk:0", Default::default())?;
         blocks.push(block("file:hunk:1", "@@")?);
         blocks.push(block("file:hunk:1:row:0", "/// Opens pending work.")?);
-        super::fold(&mut blocks, 3, "file:hunk:1", Default::default())?;
-        let docs = blocks[4].id.clone();
-        let declaration = blocks[2].id.clone();
-        let detached_hunk = blocks[3].id.clone();
+        super::fold(&mut blocks, 4, "file:hunk:1", Default::default())?;
+        let docs = blocks[5].id.clone();
+        let declaration = blocks[1].id.clone();
+        let detached_hunk = blocks[4].id.clone();
         let end = super::BlockAnchor {
             block: docs.clone(),
             position: super::TextPosition { row: 1, column: 0 },
@@ -2755,9 +2780,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "@@",
-                "Walkthrough 1/1",
                 "/// Opens pending work.",
-                "fn open("
+                "fn open(",
+                ") -> Result<()>;",
+                ""
             ],
         );
 
@@ -2765,7 +2791,7 @@ mod tests {
         let (locations, _) = anchors()?;
         let positions =
             super::walkthrough_positions(&mut diff, SourceSide::New, &source, locations);
-        assert_eq!(positions.steps[signature.start()], [0]);
+        assert_eq!(positions.steps[signature.end()], [0]);
         assert_eq!(positions.documentation[&heading], *signature.start());
         let supplemental = &diff.hunk[1];
         assert!(supplemental.contextual);

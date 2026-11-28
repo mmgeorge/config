@@ -1,6 +1,6 @@
 # Authoring `docs/walkthrough.json`
 
-`docs/walkthrough.json` is an ordered JSON array of inline review comments rendered above declarations in `PlanReview`. Reviewers step through entries `1..N` in order. `PlanReview` sorts files by their earliest comment index.
+`docs/walkthrough.json` is an ordered JSON array of inline review comments. `PlanReview` renders each comment after the complete declaration and before any function pseudocode. Reviewers step through entries `1..N` in order. `PlanReview` sorts files by their earliest comment index.
 
 ## Schema
 
